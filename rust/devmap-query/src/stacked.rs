@@ -43,10 +43,82 @@ pub struct BaseManifest {
     pub generation_id: u32,
     pub schema_version: i32,
     pub source_repo_root: String,
+    /// The donor's git `HEAD` the snapshot was taken at. Part of the base's
+    /// identity: two donors (or one donor rebuilt) can reuse a generation id.
+    pub head_sha: String,
     pub created_at_unix_ms: u64,
     pub base_sqlite_sha256: String,
+    /// `(len, mtime_ns, ino, dev)` of `base.sqlite` at publish. `open` runs per
+    /// MCP call, so it compares these instead of re-hashing the file; a swap
+    /// by rename changes the inode.
+    pub base_sqlite_len: u64,
+    pub base_sqlite_mtime_ns: u64,
+    pub base_sqlite_ino: u64,
+    pub base_sqlite_dev: u64,
     #[serde(default)]
     pub has_csr: bool,
+}
+
+/// What names a published base: generation id, donor `HEAD`, donor root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseKey {
+    pub generation_id: u32,
+    pub head_sha: String,
+    pub source_repo_root: String,
+}
+
+impl BaseKey {
+    pub fn new(generation_id: u32, head_sha: &str, source_root: &Path) -> Result<Self> {
+        if !is_commit_sha(head_sha) {
+            bail!(
+                "donor generation {generation_id} carries head_sha {head_sha:?}, not a git commit; \
+                 a stacked base must be taken from a built, committed checkout"
+            );
+        }
+        Ok(Self {
+            generation_id,
+            head_sha: head_sha.to_string(),
+            source_repo_root: source_root.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// `gen-<G>-<head12>-<src8>`.
+    pub fn dir_name(&self) -> String {
+        format!(
+            "gen-{}-{}-{}",
+            self.generation_id,
+            &self.head_sha[..12],
+            &sha256_str_hex(&self.source_repo_root)[..8]
+        )
+    }
+
+    fn of_manifest(manifest: &BaseManifest) -> Result<Self> {
+        Self::new(
+            manifest.generation_id,
+            &manifest.head_sha,
+            Path::new(&manifest.source_repo_root),
+        )
+    }
+}
+
+fn is_commit_sha(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Parse `gen-<G>-<head12>-<src8>`; `None` for legacy `gen-<G>` and anything else.
+fn parse_base_dir_name(name: &str) -> Option<(u32, String)> {
+    let rest = name.strip_prefix("gen-")?;
+    let mut parts = rest.split('-');
+    let gen_id = parts.next()?.parse::<u32>().ok()?;
+    let head12 = parts.next()?;
+    let src8 = parts.next()?;
+    let hex = |t: &str, n: usize| {
+        t.len() == n && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if parts.next().is_some() || !hex(head12, 12) || !hex(src8, 8) {
+        return None;
+    }
+    Some((gen_id, src8.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,13 +185,18 @@ pub fn bases_root_dir(common_git_dir: &Path) -> PathBuf {
     common_git_dir.join("devmap").join("bases")
 }
 
-pub fn base_generation_dir(common_git_dir: &Path, generation_id: u32) -> PathBuf {
-    bases_root_dir(common_git_dir).join(format!("gen-{generation_id}"))
+pub fn base_generation_dir(common_git_dir: &Path, key: &BaseKey) -> PathBuf {
+    bases_root_dir(common_git_dir).join(key.dir_name())
 }
 
 /// Publish or reuse an immutable `chmod 0444` base snapshot at
-/// `<common_git_dir>/devmap/bases/gen-<G>/` from `source_root`'s latest
-/// generation (`OQ1`).
+/// `<common_git_dir>/devmap/bases/gen-<G>-<head12>-<src8>/` from `source_root`'s
+/// latest generation (`OQ1`).
+///
+/// The donor must be a built, committed, clean checkout whose latest generation
+/// was indexed at its current `HEAD`: those three facts together mean the base
+/// holds exactly `HEAD`'s tree, so the delta (worktree against `HEAD`) is the
+/// only difference a lane can have from it.
 pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifest)> {
     let source_canon = source_root
         .canonicalize()
@@ -138,27 +215,33 @@ pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifes
             source_db.display()
         );
     }
-    let generation_id = {
+    let key = {
         let store = Store::open_read_only(&source_db)
             .with_context(|| format!("cannot read donor store {}", source_db.display()))?;
-        store.latest_generation_id()?.ok_or_else(|| {
+        let generation_id = store.latest_generation_id()?.ok_or_else(|| {
             anyhow::anyhow!(
                 "donor store {} has no indexed generation",
                 source_db.display()
             )
-        })?
+        })?;
+        let head = store.latest_generation_head_sha()?.unwrap_or_default();
+        let key = BaseKey::new(generation_id, &head, &source_canon)?;
+        assert_donor_is_head_tree(&source_canon, &store, &key.head_sha)?;
+        key
     };
 
     let bases_dir = bases_root_dir(&common_git_dir);
     fs::create_dir_all(&bases_dir)
         .with_context(|| format!("cannot create {}", bases_dir.display()))?;
-    let final_dir = base_generation_dir(&common_git_dir, generation_id);
-    if let Some(existing) = read_verified_base_manifest(&final_dir)? {
+    let final_dir = base_generation_dir(&common_git_dir, &key);
+    if fs::symlink_metadata(&final_dir).is_ok() {
+        let existing = verify_base_dir(&final_dir, &key, true)?;
         return Ok((final_dir, existing));
     }
 
     let stage_dir = bases_dir.join(format!(
-        ".stage-gen-{generation_id}-{}-{}",
+        ".stage-{}-{}-{}",
+        key.dir_name(),
         std::process::id(),
         now_unix_ms()
     ));
@@ -170,7 +253,29 @@ pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifes
         let staged_sqlite = stage_dir.join("base.sqlite");
         stage_seed_healing_wal(&source_db, &staged_sqlite)?;
         prepare_immutable_snapshot(&staged_sqlite)?;
+        // The donor may have been edited or rebuilt while it was staged:
+        // re-ask both questions, and ask the staged copy what it holds.
+        {
+            let staged = Store::open_immutable_snapshot(&staged_sqlite, None)
+                .context("staged base snapshot failed admission")?;
+            let staged_gen = staged.latest_generation_id()?;
+            let staged_head = staged.latest_generation_head_sha()?;
+            if staged_gen != Some(key.generation_id)
+                || staged_head.as_deref() != Some(key.head_sha.as_str())
+            {
+                bail!(
+                    "donor {} changed while its base was being staged (expected generation {} at {}, staged copy holds {:?} at {:?}); retry",
+                    source_canon.display(),
+                    key.generation_id,
+                    key.head_sha,
+                    staged_gen,
+                    staged_head
+                );
+            }
+        }
+        assert_donor_is_clean_head(&source_canon, &key.head_sha)?;
         let sha256 = sha256_file_hex(&staged_sqlite)?;
+        let identity = file_identity(&staged_sqlite)?;
 
         let src_csr = csr_path_for_store(&source_db);
         let staged_csr = csr_path_for_store(&staged_sqlite);
@@ -185,11 +290,16 @@ pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifes
 
         let manifest = BaseManifest {
             format_version: STACK_FORMAT_VERSION,
-            generation_id,
+            generation_id: key.generation_id,
             schema_version: CURRENT_SCHEMA_VERSION,
-            source_repo_root: source_canon.to_string_lossy().into_owned(),
+            source_repo_root: key.source_repo_root.clone(),
+            head_sha: key.head_sha.clone(),
             created_at_unix_ms: now_unix_ms(),
             base_sqlite_sha256: sha256,
+            base_sqlite_len: identity.len,
+            base_sqlite_mtime_ns: identity.mtime_ns,
+            base_sqlite_ino: identity.ino,
+            base_sqlite_dev: identity.dev,
             has_csr,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -207,10 +317,16 @@ pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifes
     };
 
     match fs::rename(&stage_dir, &final_dir) {
-        Ok(()) => Ok((final_dir, manifest)),
+        Ok(()) => {
+            // A swap by rename now needs an explicit chmod first.
+            set_dir_mode(&final_dir, 0o555)?;
+            Ok((final_dir, manifest))
+        }
         Err(err) => {
             let _ = remove_readonly_tree(&stage_dir);
-            if let Some(existing) = read_verified_base_manifest(&final_dir)? {
+            if fs::symlink_metadata(&final_dir).is_ok() {
+                // A concurrent publisher won the rename: it must be the same key.
+                let existing = verify_base_dir(&final_dir, &key, true)?;
                 Ok((final_dir, existing))
             } else {
                 Err(err).with_context(|| {
@@ -224,20 +340,334 @@ pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifes
     }
 }
 
-fn read_verified_base_manifest(base_dir: &Path) -> Result<Option<BaseManifest>> {
-    let manifest_path = base_dir.join("manifest.json");
-    let base_sqlite = base_dir.join("base.sqlite");
-    if !manifest_path.is_file() || !base_sqlite.is_file() {
-        return Ok(None);
+#[cfg(unix)]
+fn set_dir_mode(dir: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("cannot set mode {mode:04o} on {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn set_dir_mode(_dir: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+struct FileIdentity {
+    len: u64,
+    mtime_ns: u64,
+    ino: u64,
+    dev: u64,
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mtime_ns = u64::try_from(meta.mtime())
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::try_from(meta.mtime_nsec()).unwrap_or(0));
+        Ok(FileIdentity {
+            len: meta.len(),
+            mtime_ns,
+            ino: meta.ino(),
+            dev: meta.dev(),
+        })
     }
-    let raw = fs::read(&manifest_path)
-        .with_context(|| format!("cannot read {}", manifest_path.display()))?;
-    let manifest: BaseManifest = serde_json::from_slice(&raw)
-        .with_context(|| format!("invalid base manifest {}", manifest_path.display()))?;
+    #[cfg(not(unix))]
+    {
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        Ok(FileIdentity {
+            len: meta.len(),
+            mtime_ns,
+            ino: 0,
+            dev: 0,
+        })
+    }
+}
+
+fn read_base_manifest(base_dir: &Path) -> Result<BaseManifest> {
+    let manifest_path = base_dir.join("manifest.json");
+    let raw = fs::read(&manifest_path).with_context(|| {
+        format!(
+            "cannot read base manifest {}; re-run `devmap seed --stacked`",
+            manifest_path.display()
+        )
+    })?;
+    serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "base manifest {} is legacy or malformed; re-run `devmap seed --stacked`",
+            manifest_path.display()
+        )
+    })
+}
+
+/// Compare a base's recorded identity with the one a caller expects. Never
+/// returns `Ok` on a mismatch and never republishes over one: a different value
+/// under the expected name is tampering or a bug.
+fn check_manifest_matches(manifest: &BaseManifest, expected: &BaseKey, dir: &Path) -> Result<()> {
+    let mismatch = |field: &str, recorded: String, wanted: String| {
+        anyhow::anyhow!(
+            "base snapshot {} does not match its key: {field} is {recorded} but {wanted} was expected; \
+             refusing to reuse it (remove it and re-run `devmap seed --stacked`)",
+            dir.display()
+        )
+    };
+    if manifest.format_version != STACK_FORMAT_VERSION {
+        return Err(mismatch(
+            "format_version",
+            manifest.format_version.to_string(),
+            STACK_FORMAT_VERSION.to_string(),
+        ));
+    }
+    if manifest.schema_version != CURRENT_SCHEMA_VERSION {
+        return Err(mismatch(
+            "schema_version",
+            manifest.schema_version.to_string(),
+            CURRENT_SCHEMA_VERSION.to_string(),
+        ));
+    }
+    if manifest.generation_id != expected.generation_id {
+        return Err(mismatch(
+            "generation_id",
+            manifest.generation_id.to_string(),
+            expected.generation_id.to_string(),
+        ));
+    }
+    if manifest.head_sha != expected.head_sha {
+        return Err(mismatch(
+            "head_sha",
+            manifest.head_sha.clone(),
+            expected.head_sha.clone(),
+        ));
+    }
+    if manifest.source_repo_root != expected.source_repo_root {
+        return Err(mismatch(
+            "source_repo_root",
+            manifest.source_repo_root.clone(),
+            expected.source_repo_root.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_identity_matches(manifest: &BaseManifest, base_sqlite: &Path) -> Result<()> {
+    let now = file_identity(base_sqlite)?;
+    let recorded = (
+        manifest.base_sqlite_len,
+        manifest.base_sqlite_mtime_ns,
+        manifest.base_sqlite_ino,
+        manifest.base_sqlite_dev,
+    );
+    let current = (now.len, now.mtime_ns, now.ino, now.dev);
+    if recorded != current {
+        bail!(
+            "base snapshot {} was replaced or modified after it was published \
+             (recorded len/mtime_ns/ino/dev {recorded:?}, now {current:?}); \
+             remove it and re-run `devmap seed --stacked`",
+            base_sqlite.display()
+        );
+    }
+    Ok(())
+}
+
+/// Reuse check for a base directory that already exists under `expected`'s
+/// name: manifest fields, the recomputed sha256 of `base.sqlite` (when
+/// `full_hash`), and SQLite admission. `Err` on any disagreement.
+fn verify_base_dir(base_dir: &Path, expected: &BaseKey, full_hash: bool) -> Result<BaseManifest> {
+    let manifest = read_base_manifest(base_dir)?;
+    check_manifest_matches(&manifest, expected, base_dir)?;
+    let base_sqlite = base_dir.join("base.sqlite");
+    if full_hash {
+        let actual = sha256_file_hex(&base_sqlite)?;
+        if actual != manifest.base_sqlite_sha256 {
+            bail!(
+                "base snapshot {} fails its sha256 check: recorded {} but the file hashes to {actual}; \
+                 refusing to reuse it (remove it and re-run `devmap seed --stacked`)",
+                base_sqlite.display(),
+                manifest.base_sqlite_sha256
+            );
+        }
+    }
     // Verify the snapshot satisfies Store::open_immutable_snapshot invariants (`0444`, no sidecars).
-    let _ = Store::open_immutable_snapshot(&base_sqlite, None)
-        .with_context(|| format!("published base snapshot {} failed admission", base_sqlite.display()))?;
-    Ok(Some(manifest))
+    let _ = Store::open_immutable_snapshot(&base_sqlite, None).with_context(|| {
+        format!(
+            "published base snapshot {} failed admission",
+            base_sqlite.display()
+        )
+    })?;
+    Ok(manifest)
+}
+
+const GIT_BOUNDS: devmap_extract::subprocess::Bounds = devmap_extract::subprocess::Bounds {
+    deadline: std::time::Duration::from_secs(10),
+    stdout_cap: 8 * 1024 * 1024,
+    stderr_cap: 64 * 1024,
+};
+
+/// Run git in `root` under bounds. Every failure (spawn, deadline, non-success,
+/// output cap) is an `Err`: a git that could not answer must never read as an
+/// empty change set.
+fn run_git_checked(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    use devmap_extract::subprocess::{git, run_bounded};
+    let mut cmd = git(root, args.iter().copied())
+        .map_err(|e| anyhow::anyhow!("git {args:?} in {}: {e}", root.display()))?;
+    let out = run_bounded(&mut cmd, GIT_BOUNDS)
+        .map_err(|e| anyhow::anyhow!("git {args:?} in {}: {e}", root.display()))?;
+    if !out.status.success() {
+        bail!(
+            "git {args:?} failed in {} ({}): {}",
+            root.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if out.stdout_truncated {
+        bail!(
+            "git {args:?} in {} produced more than {} bytes; the answer would be incomplete",
+            root.display(),
+            GIT_BOUNDS.stdout_cap
+        );
+    }
+    Ok(out.stdout)
+}
+
+fn git_head_sha(root: &Path) -> Result<String> {
+    let out = run_git_checked(root, &["rev-parse", "HEAD"])?;
+    let head = String::from_utf8(out)
+        .map_err(|_| anyhow::anyhow!("git rev-parse HEAD in {} is not UTF-8", root.display()))?
+        .trim()
+        .to_string();
+    if !is_commit_sha(&head) {
+        bail!("git rev-parse HEAD in {} returned {head:?}", root.display());
+    }
+    Ok(head)
+}
+
+/// Repository-relative paths `git status` lists in `root`, tracked and
+/// untracked, with rename and copy origins. A non-UTF-8 path is an `Err`.
+fn git_status_paths(root: &Path) -> Result<BTreeSet<String>> {
+    let out = run_git_checked(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let mut paths = BTreeSet::new();
+    let mut entries = out.split(|&b| b == 0);
+    while let Some(entry) = entries.next() {
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.len() < 4 {
+            bail!(
+                "git status in {} returned a malformed entry {:?}",
+                root.display(),
+                String::from_utf8_lossy(entry)
+            );
+        }
+        let status = &entry[..2];
+        paths.insert(status_path(root, &entry[3..])?);
+        if status.contains(&b'R') || status.contains(&b'C') {
+            let orig = entries.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "git status in {} lists a rename with no origin path",
+                    root.display()
+                )
+            })?;
+            paths.insert(status_path(root, orig)?);
+        }
+    }
+    Ok(paths)
+}
+
+fn status_path(root: &Path, raw: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        anyhow::anyhow!(
+            "git lists a non-UTF-8 path in {} ({:?}); it cannot be tracked in a stacked delta",
+            root.display(),
+            String::from_utf8_lossy(raw)
+        )
+    })?;
+    normalize_rel_path(text)
+}
+
+fn is_tool_state_path(path: &str) -> bool {
+    path == ".devmap"
+        || path == ".devcouncil"
+        || path.starts_with(".devmap/")
+        || path.starts_with(".devcouncil/")
+}
+
+/// Refuse unless `source`'s `HEAD` is `expected_head` and its tracked and
+/// untracked files are clean against it (tool-owned state excepted).
+fn assert_donor_is_clean_head(source: &Path, expected_head: &str) -> Result<()> {
+    let remedy = format!(
+        "commit or stash in {}, run devmap build there, or pass --from a clean checkout",
+        source.display()
+    );
+    let head = git_head_sha(source)?;
+    if head != expected_head {
+        bail!(
+            "donor {} is at HEAD {head} but its index was built at {expected_head}; {remedy}",
+            source.display()
+        );
+    }
+    let dirty: Vec<String> = git_status_paths(source)?
+        .into_iter()
+        .filter(|p| !is_tool_state_path(p))
+        .collect();
+    if !dirty.is_empty() {
+        let shown: Vec<&str> = dirty.iter().take(8).map(String::as_str).collect();
+        bail!(
+            "donor {} has {} uncommitted path(s) ({}{}); a stacked base must equal HEAD's tree; {remedy}",
+            source.display(),
+            dirty.len(),
+            shown.join(", "),
+            if dirty.len() > shown.len() { ", ..." } else { "" }
+        );
+    }
+    Ok(())
+}
+
+/// The three facts that together mean "the base's indexed content is `HEAD`'s
+/// tree": the donor is clean against `HEAD`, its latest generation matches the
+/// working tree, and that generation's `head_sha` is `HEAD`.
+fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str) -> Result<()> {
+    let remedy = format!(
+        "commit or stash in {}, run devmap build there, or pass --from a clean checkout",
+        source.display()
+    );
+    assert_donor_is_clean_head(source, generation_head)?;
+    match store.latest_generation_repo_root()? {
+        Some(root) if Path::new(&root).canonicalize().ok().as_deref() == Some(source) => {}
+        other => bail!(
+            "donor store at {} was indexed for {other:?}, not for this checkout; {remedy}",
+            source.display()
+        ),
+    }
+    #[cfg(feature = "parse")]
+    match store.latest_generation_matches_working_tree() {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!(
+            "donor {} has changed since its index was built (the latest generation does not match the working tree); {remedy}",
+            source.display()
+        ),
+        Err(err) => bail!(
+            "cannot confirm donor {}'s index matches its working tree: {err}; {remedy}",
+            source.display()
+        ),
+    }
+    #[cfg(not(feature = "parse"))]
+    bail!(
+        "this build cannot confirm donor {}'s index matches its working tree (parse feature off); {remedy}",
+        source.display()
+    )
 }
 
 /// Provision a Glean-style stacked worktree lane at `worktree_root` backed by
@@ -325,7 +755,7 @@ pub fn gc_unused_bases(common_git_dir: &Path) -> Result<GcBasesReport> {
         });
     }
 
-    let mut leased_generations = BTreeSet::new();
+    let mut leased_dirs: BTreeSet<String> = BTreeSet::new();
     for wt_root in registered_worktrees_of_common_dir(&common_canon) {
         let lease_file = stack_lease_path(&wt_root);
         match fs::symlink_metadata(&lease_file) {
@@ -363,31 +793,40 @@ pub fn gc_unused_bases(common_git_dir: &Path) -> Result<GcBasesReport> {
                 lease_file.display()
             );
         }
-        leased_generations.insert(lease.generation_id);
+        if let Some(name) = Path::new(&lease.base_dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+        {
+            leased_dirs.insert(name.to_string());
+        }
     }
 
-    let mut discovered: Vec<(u32, PathBuf)> = Vec::new();
+    // Only `gen-<G>-<head12>-<src8>` directories are ours to judge; legacy
+    // `gen-<G>` directories and anything else are left alone.
+    let mut discovered: Vec<(u32, String, String, PathBuf)> = Vec::new();
     for entry in fs::read_dir(&bases_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if let Some(num) = name_str.strip_prefix("gen-") {
-            if let Ok(gen_id) = num.parse::<u32>() {
-                discovered.push((gen_id, entry.path()));
-            }
+        if let Some((gen_id, src8)) = parse_base_dir_name(name_str) {
+            discovered.push((gen_id, src8, name_str.to_string(), entry.path()));
         }
     }
-    discovered.sort_by_key(|(g, _)| *g);
-    if let Some((newest_gen, _)) = discovered.last() {
-        leased_generations.insert(*newest_gen);
+    discovered.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+    // The newest generation of each donor stays published.
+    let mut newest_per_source: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    for (gen_id, src8, _, _) in &discovered {
+        let slot = newest_per_source.entry(src8.clone()).or_insert(*gen_id);
+        *slot = (*slot).max(*gen_id);
     }
 
     let mut retained_generations = Vec::new();
     let mut removed_generations = Vec::new();
-    for (gen_id, dir_path) in discovered {
-        if leased_generations.contains(&gen_id) {
+    for (gen_id, src8, name, dir_path) in discovered {
+        if leased_dirs.contains(&name) || newest_per_source.get(&src8) == Some(&gen_id) {
             retained_generations.push(gen_id);
         } else {
             remove_readonly_tree(&dir_path)
@@ -434,6 +873,36 @@ fn make_tree_writable_best_effort(path: &Path) {
     }
 }
 
+/// The per-open check: cheap enough for every MCP call, strong enough to catch
+/// a legacy directory, a lease pointing at another base, and a swapped file.
+/// The full sha256 is verified when a base is reused at publish.
+fn verify_leased_base(lease: &StackLease, base_dir: &Path, base_sqlite: &Path) -> Result<()> {
+    let manifest = read_base_manifest(base_dir)?;
+    let key = BaseKey::of_manifest(&manifest)
+        .with_context(|| format!("base manifest in {} is invalid", base_dir.display()))?;
+    check_manifest_matches(&manifest, &key, base_dir)?;
+    if manifest.generation_id != lease.generation_id {
+        bail!(
+            "stack lease names generation {} but base {} holds generation {}; re-run `devmap seed --stacked`",
+            lease.generation_id,
+            base_dir.display(),
+            manifest.generation_id
+        );
+    }
+    let dir_name = base_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if dir_name != key.dir_name() {
+        bail!(
+            "base directory {} is not named for its manifest (expected {}); re-run `devmap seed --stacked`",
+            base_dir.display(),
+            key.dir_name()
+        );
+    }
+    check_identity_matches(&manifest, base_sqlite)
+}
+
 pub struct StackedStore {
     worktree_root: PathBuf,
     lease: StackLease,
@@ -476,15 +945,15 @@ impl StackedStore {
 
         let base_dir = PathBuf::from(&lease.base_dir);
         let base_sqlite_path = base_dir.join("base.sqlite");
+        verify_leased_base(&lease, &base_dir, &base_sqlite_path)?;
         let wt_root_str = wt_canon.to_string_lossy().into_owned();
-        let base =
-            Store::open_immutable_snapshot(&base_sqlite_path, Some(wt_root_str.clone()))
-                .with_context(|| {
-                    format!(
-                        "cannot open immutable base snapshot {}",
-                        base_sqlite_path.display()
-                    )
-                })?;
+        let base = Store::open_immutable_snapshot(&base_sqlite_path, Some(wt_root_str.clone()))
+            .with_context(|| {
+                format!(
+                    "cannot open immutable base snapshot {}",
+                    base_sqlite_path.display()
+                )
+            })?;
 
         let csr_candidate = csr_path_for_store(&base_sqlite_path);
         let base_csr_path = csr_candidate.is_file().then_some(csr_candidate);
@@ -655,7 +1124,8 @@ impl StackedStore {
                 }
                 self.sync_file_from_disk(rel_path)?;
                 synced_files += 1;
-            } else if self.base.latest_path_is_indexed(rel_path)? || existing_delta.contains(rel_path)
+            } else if self.base.latest_path_is_indexed(rel_path)?
+                || existing_delta.contains(rel_path)
             {
                 self.record_deleted_file(rel_path)?;
                 deleted_files += 1;
@@ -663,21 +1133,28 @@ impl StackedStore {
         }
 
         for prev in existing_delta {
-            if !changed_paths.contains(&prev) {
-                let full = self.worktree_root.join(&prev);
-                if full.is_file() {
-                    if let Ok(bytes) = fs::read(&full) {
-                        if let Ok(src) = std::str::from_utf8(&bytes) {
-                            if let Some(base_file) = self.base.latest_file(&prev)? {
-                                let lang = devmap_extract::languages::detect_language(Path::new(&prev));
-                                let key = devmap_extract::cache::CacheKey::for_source(lang, src);
-                                if key.content_hash == base_file.content_hash {
-                                    self.clear_reverted_file(&prev)?;
-                                    cleaned_files += 1;
-                                }
-                            }
-                        }
-                    }
+            if changed_paths.contains(&prev) {
+                continue;
+            }
+            let full = self.worktree_root.join(&prev);
+            if !full.is_file() {
+                continue;
+            }
+            let bytes = match fs::read(&full) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("cannot read {}", full.display()))
+                }
+            };
+            let src = std::str::from_utf8(&bytes)
+                .with_context(|| format!("{} is not valid UTF-8", full.display()))?;
+            if let Some(base_file) = self.base.latest_file(&prev)? {
+                let lang = devmap_extract::languages::detect_language(Path::new(&prev));
+                let key = devmap_extract::cache::CacheKey::for_source(lang, src);
+                if key.content_hash == base_file.content_hash {
+                    self.clear_reverted_file(&prev)?;
+                    cleaned_files += 1;
                 }
             }
         }
@@ -805,8 +1282,12 @@ impl StackedStore {
                 .map(|p| p.rows)
                 .unwrap_or_default()
         } else {
-            self.base
-                .search_symbols(query, limit.saturating_add(self.overlay.modified_files.len() * 8).max(64))?
+            self.base.search_symbols(
+                query,
+                limit
+                    .saturating_add(self.overlay.modified_files.len() * 8)
+                    .max(64),
+            )?
         };
         for sym in base_rows {
             let p = Path::new(&sym.path);
@@ -938,8 +1419,11 @@ fn build_overlay_from_delta(
         } else {
             overlay.record_modified_file(&file_rec.path, &file_rec.content_hash, Some(dirty_id));
             if let Some(ext) = file_rec.extraction {
-                let current_symbols: BTreeSet<String> =
-                    ext.symbols.iter().map(|s| s.qualified_name.clone()).collect();
+                let current_symbols: BTreeSet<String> = ext
+                    .symbols
+                    .iter()
+                    .map(|s| s.qualified_name.clone())
+                    .collect();
                 for removed_sym in base_symbols.difference(&current_symbols) {
                     overlay.mark_symbol_tombstone(removed_sym.clone(), Some(dirty_id));
                 }
@@ -1016,219 +1500,52 @@ fn normalize_rel_path(rel_path: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-#[cfg(feature = "parse")]
+/// Paths that differ from the base: `git status` plus `base_head..HEAD`.
+/// Every git failure is an `Err`; an empty set only ever means "clean".
 fn git_changed_paths_against_head(worktree_root: &Path, base: &Store) -> Result<BTreeSet<String>> {
-    use devmap_extract::subprocess::{git, run_bounded, Bounds};
-    use std::time::Duration;
-
-    let mut paths = BTreeSet::new();
-    let bounds = Bounds {
-        deadline: Duration::from_secs(10),
-        stdout_cap: 8 * 1024 * 1024,
-        stderr_cap: 64 * 1024,
-    };
-
-    if let Ok(mut cmd) = git(
+    let mut paths = git_status_paths(worktree_root)?;
+    let base_head = base.latest_generation_head_sha()?.ok_or_else(|| {
+        anyhow::anyhow!("base snapshot records no head_sha; re-run `devmap seed --stacked`")
+    })?;
+    if !is_commit_sha(&base_head) {
+        bail!(
+            "base snapshot head_sha {base_head:?} is not a commit; re-run `devmap seed --stacked`"
+        );
+    }
+    let diff = run_git_checked(
         worktree_root,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    ) {
-        if let Ok(out) = run_bounded(&mut cmd, bounds) {
-            if out.status.success() {
-                let mut entries = out.stdout.split(|&b| b == 0).peekable();
-                while let Some(entry) = entries.next() {
-                    if entry.len() < 4 {
-                        continue;
-                    }
-                    let status = &entry[..2];
-                    let path_bytes = &entry[3..];
-                    if let Ok(p) = std::str::from_utf8(path_bytes) {
-                        if let Ok(norm) = normalize_rel_path(p) {
-                            paths.insert(norm);
-                        }
-                    }
-                    if status.contains(&b'R') || status.contains(&b'C') {
-                        if let Some(orig) = entries.next() {
-                            if let Ok(p) = std::str::from_utf8(orig) {
-                                if let Ok(norm) = normalize_rel_path(p) {
-                                    paths.insert(norm);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        &["diff", "--name-only", "-z", &base_head, "HEAD"],
+    )?;
+    for raw in diff.split(|&b| b == 0) {
+        if !raw.is_empty() {
+            paths.insert(status_path(worktree_root, raw)?);
         }
     }
-
-    if let Ok(Some(base_head)) = base.latest_generation_head_sha() {
-        if let Ok(mut diff_cmd) = git(
-            worktree_root,
-            ["diff", "--name-only", "-z", &base_head, "HEAD"],
-        ) {
-            if let Ok(out) = run_bounded(&mut diff_cmd, bounds) {
-                if out.status.success() {
-                    for raw in out.stdout.split(|&b| b == 0) {
-                        if raw.is_empty() {
-                            continue;
-                        }
-                        if let Ok(p) = std::str::from_utf8(raw) {
-                            if let Ok(norm) = normalize_rel_path(p) {
-                                paths.insert(norm);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     Ok(paths)
 }
 
-// ---- Streaming FIPS 180-4 SHA-256 -------------------------------------------
-
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-    0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-    0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-    0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-    0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-    0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-    0xc67178f2,
-];
-
-struct Sha256 {
-    h: [u32; 8],
-    buf: [u8; 64],
-    buffered: usize,
-    bits: u64,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Self {
-            h: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
-                0x1f83d9ab, 0x5be0cd19,
-            ],
-            buf: [0u8; 64],
-            buffered: 0,
-            bits: 0,
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.bits = self.bits.wrapping_add((data.len() as u64) * 8);
-        if self.buffered > 0 {
-            let take = (64 - self.buffered).min(data.len());
-            self.buf[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
-            self.buffered += take;
-            data = &data[take..];
-            if self.buffered < 64 {
-                return;
-            }
-            let block = self.buf;
-            self.compress(&block);
-            self.buffered = 0;
-        }
-        while data.len() >= 64 {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[..64]);
-            self.compress(&block);
-            data = &data[64..];
-        }
-        self.buf[..data.len()].copy_from_slice(data);
-        self.buffered = data.len();
-    }
-
-    fn compress(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(SHA256_K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (slot, add) in self.h.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(add);
-        }
-    }
-
-    fn finish(mut self) -> [u8; 32] {
-        let bits = self.bits;
-        self.buf[self.buffered] = 0x80;
-        self.buffered += 1;
-        if self.buffered > 56 {
-            self.buf[self.buffered..64].fill(0);
-            let block = self.buf;
-            self.compress(&block);
-            self.buffered = 0;
-        }
-        self.buf[self.buffered..56].fill(0);
-        self.buf[56..64].copy_from_slice(&bits.to_be_bytes());
-        let block = self.buf;
-        self.compress(&block);
-        let mut out = [0u8; 32];
-        for (i, word) in self.h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
-}
-
-pub fn sha256_bytes_hex(bytes: &[u8]) -> String {
-    let mut s = Sha256::new();
-    s.update(bytes);
-    crate::digest::hex(&s.finish())
-}
-
+/// Streaming sha256 of a file, 64 KiB at a time.
 pub fn sha256_file_hex(path: &Path) -> Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("cannot open {} for sha256", path.display()))?;
-    let mut s = Sha256::new();
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("cannot open {} for sha256", path.display()))?;
+    let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("cannot read {} for sha256", path.display()))?;
         if n == 0 {
             break;
         }
-        s.update(&buf[..n]);
+        hasher.update(&buf[..n]);
     }
-    Ok(crate::digest::hex(&s.finish()))
+    Ok(crate::digest::hex(&hasher.finalize()))
+}
+
+fn sha256_str_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    crate::digest::hex(&Sha256::digest(text.as_bytes()))
 }
 
 #[cfg(test)]
@@ -1273,18 +1590,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sha256_matches_nist_fips_180_4_vectors() {
-        assert_eq!(
-            sha256_bytes_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_bytes_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
     #[cfg(feature = "parse")]
     fn seed_indexed_git_repo(anchor: &Path) {
         fs::create_dir_all(anchor.join("src")).unwrap();
@@ -1308,30 +1613,48 @@ mod tests {
         run_git_ok(anchor, &["add", "."]);
         run_git_ok(anchor, &["commit", "-m", "initial"]);
 
+        index_tree(anchor, &["src/svc.go", "src/routes.ts", "src/limits.rs"]);
+    }
+
+    #[cfg(feature = "parse")]
+    fn git_head(cwd: &Path) -> String {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Index `rels` (the whole committed tree) as a new generation stamped with
+    /// the real `HEAD`, as `devmap build` does. `save_generation` stamps
+    /// `"unknown"`, which a stacked base now refuses.
+    #[cfg(feature = "parse")]
+    fn index_tree(anchor: &Path, rels: &[&str]) {
         let db_path = store_path(anchor);
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let store = Store::open(&db_path).unwrap();
         let anchor_canon = anchor.canonicalize().unwrap();
         store.bind_repo_root(&anchor_canon).unwrap();
-        let exts = vec![
-            devmap_extract::extract_file(
-                "src/svc.go",
-                &fs::read_to_string(anchor.join("src/svc.go")).unwrap(),
-            ),
-            devmap_extract::extract_file(
-                "src/routes.ts",
-                &fs::read_to_string(anchor.join("src/routes.ts")).unwrap(),
-            ),
-            devmap_extract::extract_file(
-                "src/limits.rs",
-                &fs::read_to_string(anchor.join("src/limits.rs")).unwrap(),
-            ),
-        ];
+        let exts: Vec<_> = rels
+            .iter()
+            .map(|rel| {
+                devmap_extract::extract_file(rel, &fs::read_to_string(anchor.join(rel)).unwrap())
+            })
+            .collect();
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&exts);
         let res = resolver.resolve_all(&exts).unwrap();
         let analysis = devmap_analyze::analyze(&exts, &res);
-        store.save_generation(&exts, &res, &analysis).unwrap();
+        store
+            .save_generation_with_metadata(
+                &exts,
+                &res,
+                &analysis,
+                devmap_store::GenerationWriteOpts::default(),
+                &git_head(anchor),
+            )
+            .unwrap();
         let _ = store.write_latest_csr_sidecar().unwrap();
     }
 
@@ -1391,29 +1714,50 @@ mod tests {
         // Go receiver methods `Handle` AND `Shutdown` must be live; deleted `Helper` must be masked!
         let go_syms = stacked.symbols_for_file("src/svc.go").unwrap();
         let go_names: Vec<&str> = go_syms.iter().map(|s| s.name.as_str()).collect();
-        assert!(go_names.contains(&"Handle"), "Go receiver method Handle lost: {go_names:?}");
-        assert!(go_names.contains(&"Shutdown"), "Go receiver method Shutdown lost: {go_names:?}");
-        assert!(!go_names.contains(&"Helper"), "Removed Helper should be tombstoned: {go_names:?}");
         assert!(
-            stacked
-                .search_symbols("Helper", 10)
-                .unwrap()
-                .is_empty(),
+            go_names.contains(&"Handle"),
+            "Go receiver method Handle lost: {go_names:?}"
+        );
+        assert!(
+            go_names.contains(&"Shutdown"),
+            "Go receiver method Shutdown lost: {go_names:?}"
+        );
+        assert!(
+            !go_names.contains(&"Helper"),
+            "Removed Helper should be tombstoned: {go_names:?}"
+        );
+        assert!(
+            stacked.search_symbols("Helper", 10).unwrap().is_empty(),
             "Removed Helper must not leak from immutable base"
         );
 
         // TS `API_ROUTE` (`export const`) and `dispatch`/`health` class methods must survive!
         let ts_syms = stacked.symbols_for_file("src/routes.ts").unwrap();
         let ts_names: Vec<&str> = ts_syms.iter().map(|s| s.name.as_str()).collect();
-        assert!(ts_names.contains(&"API_ROUTE"), "TS export const lost: {ts_names:?}");
-        assert!(ts_names.contains(&"dispatch"), "TS class method lost: {ts_names:?}");
-        assert!(ts_names.contains(&"health"), "TS new class method lost: {ts_names:?}");
+        assert!(
+            ts_names.contains(&"API_ROUTE"),
+            "TS export const lost: {ts_names:?}"
+        );
+        assert!(
+            ts_names.contains(&"dispatch"),
+            "TS class method lost: {ts_names:?}"
+        );
+        assert!(
+            ts_names.contains(&"health"),
+            "TS new class method lost: {ts_names:?}"
+        );
 
         // Rust `MAX_BATCH` (`pub const`) and `check_cap` (`macro_rules!`) must survive!
         let rs_syms = stacked.symbols_for_file("src/limits.rs").unwrap();
         let rs_names: Vec<&str> = rs_syms.iter().map(|s| s.name.as_str()).collect();
-        assert!(rs_names.contains(&"MAX_BATCH"), "Rust pub const lost: {rs_names:?}");
-        assert!(rs_names.contains(&"check_cap"), "Rust macro_rules! lost: {rs_names:?}");
+        assert!(
+            rs_names.contains(&"MAX_BATCH"),
+            "Rust pub const lost: {rs_names:?}"
+        );
+        assert!(
+            rs_names.contains(&"check_cap"),
+            "Rust macro_rules! lost: {rs_names:?}"
+        );
 
         // Lazy CSR mmap works without scanning SQLite edges!
         assert!(stacked.csr_reader().unwrap().is_some());
@@ -1449,21 +1793,24 @@ mod tests {
             &["worktree", "add", "-b", "lane-b", lane_b.to_str().unwrap()],
         );
 
+        let lease_a_head = git_head(&anchor);
         let lease_a = provision_stacked_worktree(&anchor, &lane_a).unwrap();
         assert_eq!(lease_a.generation_id, 1);
 
-        // Advance anchor to generation 2 and provision lane-b on gen-2.
-        {
-            let store = Store::open(store_path(&anchor)).unwrap();
-            let ext = devmap_extract::extract_file("src/extra.rs", "pub fn gen2() {}\n");
-            let mut resolver = devmap_resolve::Resolver::new();
-            resolver.index_extractions(std::slice::from_ref(&ext));
-            let res = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
-            let analysis = devmap_analyze::analyze(std::slice::from_ref(&ext), &res);
-            store
-                .save_generation(std::slice::from_ref(&ext), &res, &analysis)
-                .unwrap();
-        }
+        // Advance anchor to generation 2 (committed, indexed at the new HEAD) and
+        // provision lane-b on it.
+        fs::write(anchor.join("src/extra.rs"), "pub fn gen2() {}\n").unwrap();
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "gen2"]);
+        index_tree(
+            &anchor,
+            &[
+                "src/svc.go",
+                "src/routes.ts",
+                "src/limits.rs",
+                "src/extra.rs",
+            ],
+        );
         let lease_b = provision_stacked_worktree(&anchor, &lane_b).unwrap();
         assert_eq!(lease_b.generation_id, 2);
 
@@ -1480,7 +1827,11 @@ mod tests {
             gc_unused_bases(&common).is_err(),
             "corrupt stack_lease.json must fail closed"
         );
-        assert!(base_generation_dir(&common, 1).is_dir());
+        assert!(base_generation_dir(
+            &common,
+            &BaseKey::new(1, &lease_a_head, &anchor.canonicalize().unwrap()).unwrap()
+        )
+        .is_dir());
 
         // Restore valid lease with low dirty-file threshold (2 files) to exercise auto-rebase!
         let mut custom_lease = lease_a.clone();
@@ -1512,6 +1863,197 @@ mod tests {
         assert_eq!(gc2.removed_generations, vec![1]);
         assert_eq!(gc2.retained_generations, vec![2]);
 
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    fn add_lane(anchor: &Path, root: &Path, name: &str) -> PathBuf {
+        let lane = root.join(name);
+        run_git_ok(
+            anchor,
+            &["worktree", "add", "-b", name, lane.to_str().unwrap()],
+        );
+        lane
+    }
+
+    #[cfg(feature = "parse")]
+    fn make_tree_writable(dir: &Path) {
+        make_tree_writable_best_effort(dir);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn base_key_includes_source_and_head() {
+        let root = temp_repo_dir("base-key");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let sib = add_lane(&anchor, &root, "sib");
+        fs::write(sib.join("src/sib_only.rs"), "pub fn only_in_sibling() {}\n").unwrap();
+        run_git_ok(&sib, &["add", "."]);
+        run_git_ok(&sib, &["commit", "-m", "sibling"]);
+        index_tree(
+            &sib,
+            &[
+                "src/svc.go",
+                "src/routes.ts",
+                "src/limits.rs",
+                "src/sib_only.rs",
+            ],
+        );
+        let lane_main = add_lane(&anchor, &root, "lane-main");
+        let lane_sib = add_lane(&sib, &root, "lane-sib");
+
+        let lease_main = provision_stacked_worktree(&anchor, &lane_main).unwrap();
+        let lease_sib = provision_stacked_worktree(&sib, &lane_sib).unwrap();
+        assert_eq!(
+            lease_main.generation_id, lease_sib.generation_id,
+            "fixture must reproduce the colliding generation id"
+        );
+        assert_ne!(
+            lease_main.base_dir, lease_sib.base_dir,
+            "two donors with the same generation id must not share a base directory"
+        );
+        let stacked = StackedStore::open(&lane_sib).unwrap();
+        let names: Vec<String> = stacked
+            .symbols_for_file("src/sib_only.rs")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "only_in_sibling"),
+            "lane provisioned from the sibling must read the sibling's symbols, got {names:?}"
+        );
+        drop(stacked);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn reuse_refuses_manifest_or_sha_mismatch() {
+        let root = temp_repo_dir("reuse-sha");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane_a = add_lane(&anchor, &root, "lane-a");
+        let lane_b = add_lane(&anchor, &root, "lane-b");
+        let lease = provision_stacked_worktree(&anchor, &lane_a).unwrap();
+
+        let base_dir = PathBuf::from(&lease.base_dir);
+        let base_sqlite = base_dir.join("base.sqlite");
+        make_tree_writable(&base_dir);
+        let mut bytes = fs::read(&base_sqlite).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&base_sqlite, &bytes).unwrap();
+        set_file_readonly(&base_sqlite).unwrap();
+
+        let err = provision_stacked_worktree(&anchor, &lane_b)
+            .expect_err("a base whose bytes no longer hash to the manifest must not be reused")
+            .to_string();
+        assert!(err.contains("sha256"), "unexpected error: {err}");
+
+        // A manifest that names another HEAD under the expected directory name is refused too.
+        let manifest_path = base_dir.join("manifest.json");
+        let mut manifest: BaseManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.head_sha = "0".repeat(40);
+        set_file_writable(&manifest_path).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let err = provision_stacked_worktree(&anchor, &lane_b)
+            .expect_err("a manifest for another head must not be reused")
+            .to_string();
+        assert!(err.contains("head_sha"), "unexpected error: {err}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn open_refuses_swapped_base() {
+        let root = temp_repo_dir("swap");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let base_dir = PathBuf::from(&lease.base_dir);
+        let base_sqlite = base_dir.join("base.sqlite");
+
+        // Without the explicit chmod, the published directory cannot be swapped into.
+        let impostor = root.join("impostor.sqlite");
+        fs::copy(&base_sqlite, &impostor).unwrap();
+        set_file_readonly(&impostor).unwrap();
+        assert!(
+            fs::rename(&impostor, &base_sqlite).is_err() || cfg!(not(unix)),
+            "published base directory must not accept a rename"
+        );
+
+        // With it, an identical-looking, valid, 0444 file under another inode is still refused.
+        make_tree_writable(&base_dir);
+        fs::rename(&impostor, &base_sqlite).unwrap();
+        set_file_readonly(&base_sqlite).unwrap();
+        let err = StackedStore::open(&lane)
+            .expect_err("a swapped base.sqlite must be refused")
+            .to_string();
+        assert!(
+            err.contains("replaced or modified"),
+            "unexpected error: {err}"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn sync_reports_git_failure_not_clean() {
+        let root = temp_repo_dir("sync-git");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        // Break git for the lane: a gitlink to nowhere.
+        fs::write(lane.join(".git"), "gitdir: /nonexistent/devmap-test\n").unwrap();
+        let err = stacked
+            .sync_worktree()
+            .expect_err("a git failure must not read as a clean tree");
+        assert!(
+            err.to_string().contains("git"),
+            "error must name git: {err}"
+        );
+        drop(stacked);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn publish_refuses_a_dirty_or_unbuilt_donor() {
+        let root = temp_repo_dir("dirty-donor");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+
+        fs::write(
+            anchor.join("src/svc.go"),
+            "package svc\n\nfunc Dirty() {}\n",
+        )
+        .unwrap();
+        let err = provision_stacked_worktree(&anchor, &lane)
+            .expect_err("a donor with uncommitted edits must be refused")
+            .to_string();
+        assert!(err.contains("uncommitted"), "unexpected error: {err}");
+        assert!(
+            err.contains("src/svc.go"),
+            "must name the dirty path: {err}"
+        );
+
+        run_git_ok(&anchor, &["commit", "-am", "move head without reindexing"]);
+        let err = provision_stacked_worktree(&anchor, &lane)
+            .expect_err("a donor whose index predates HEAD must be refused")
+            .to_string();
+        assert!(err.contains("HEAD"), "unexpected error: {err}");
         let _ = remove_readonly_tree(&root);
     }
 }
