@@ -516,6 +516,14 @@ mod parsing {
                 facts.read_subtree(node, bytes);
                 PdgStatementKind::Raise
             }
+            "break_statement" => {
+                facts.read_subtree(node, bytes);
+                PdgStatementKind::Break
+            }
+            "continue_statement" => {
+                facts.read_subtree(node, bytes);
+                PdgStatementKind::Continue
+            }
             "if_statement" => {
                 if let Some(condition) = node.child_by_field_name("condition") {
                     facts.read_subtree(condition, bytes);
@@ -1049,6 +1057,8 @@ mod tests {
                 PdgStatementKind::Try { .. } => "try",
                 PdgStatementKind::Return => "return",
                 PdgStatementKind::Raise => "raise",
+                PdgStatementKind::Break => "break",
+                PdgStatementKind::Continue => "continue",
             })
             .collect();
         assert_eq!(kinds, vec!["loop", "loop", "branch", "try", "raise"]);
@@ -1307,6 +1317,341 @@ mod tests {
                     .any(|node| node.leader_line == sink_line),
                 "{label} has no node at the sink line {sink_line}"
             );
+        }
+    }
+
+    fn control_false_enters(graph: &crate::pdg::FunctionPdg, line: u32) -> bool {
+        graph.edges.iter().any(|edge| {
+            edge.edge_kind == "control:false"
+                && graph
+                    .nodes
+                    .get(&edge.target_node)
+                    .is_some_and(|node| node.leader_line == line)
+        })
+    }
+
+    /// A statement node at `line`. Entry and exit reuse the function's line
+    /// range, so a sink on the last line is not the exit node.
+    fn statement_at(graph: &crate::pdg::FunctionPdg, line: u32) -> bool {
+        graph.nodes.values().any(|node| {
+            node.leader_line == line
+                && !matches!(
+                    node.kind,
+                    crate::pdg::CfgNodeKind::Entry | crate::pdg::CfgNodeKind::Exit
+                )
+        })
+    }
+
+    /// `break` on every path through the body must not take the header's
+    /// false edge into the else. `--taint` is the tree walk
+    /// (`FunctionPdgInput::taint_sinks`), so it may still name that sink.
+    #[test]
+    fn a_loop_that_breaks_on_every_path_does_not_enter_its_else() {
+        let cases = [
+            (
+                "for-break",
+                "def f(c):\n    for _ in range(1):\n        break\n    else:\n        os.system(c)\n    return c\n",
+                "c",
+                3,
+                5,
+                6,
+            ),
+            (
+                "while-break",
+                "def f(c):\n    while True:\n        break\n    else:\n        os.system(c)\n    return c\n",
+                "c",
+                3,
+                5,
+                6,
+            ),
+            (
+                "both-arms",
+                "def f(c):\n    for _ in range(1):\n        if c:\n            break\n        else:\n            break\n    else:\n        os.system(c)\n",
+                "c",
+                4,
+                8,
+                0,
+            ),
+            (
+                "elif-arms",
+                "def f(c):\n    for _ in range(1):\n        if c:\n            break\n        elif c:\n            break\n        else:\n            break\n    else:\n        os.system(c)\n",
+                "c",
+                4,
+                10,
+                0,
+            ),
+            (
+                "crlf",
+                "def f(c):\r\n    for _ in range(1):\r\n        break\r\n    else:\r\n        os.system(c)\r\n",
+                "c",
+                3,
+                5,
+                0,
+            ),
+            (
+                "unicode",
+                "def f(名前):\n    while 名前:\n        break\n    else:\n        os.system(名前)\n",
+                "名前",
+                3,
+                5,
+                0,
+            ),
+            (
+                "inner-else-breaks-outer",
+                "def f(c):\n    for _ in range(1):\n        for __ in range(1):\n            pass\n        else:\n            break\n    else:\n        os.system(c)\n",
+                "c",
+                6,
+                8,
+                0,
+            ),
+        ];
+        for (label, source, variable, break_line, sink_line, after_line) in cases {
+            let mut extracted = python_function_pdgs(source, "odd 'quote' 名前.py", 1, 7);
+            assert!(
+                extracted.parse == ParseStatus::Ok && extracted.functions.len() == 1,
+                "{label} did not parse: {extracted:#?}"
+            );
+            let pdg = extracted.functions.remove(0);
+            assert!(
+                pdg.taint_sinks()
+                    .iter()
+                    .any(|(line, name)| *line == sink_line && name == variable),
+                "{label} tree walk dropped the else sink; --taint lists taint_sinks: {source}"
+            );
+            let graph = crate::pdg::build_function_pdg(&pdg)
+                .unwrap_or_else(|error| panic!("{label} must build: {error}"));
+            assert!(
+                !control_false_enters(&graph, sink_line),
+                "{label} still takes control:false into the else at {sink_line}: {:#?}",
+                graph.edges
+            );
+            assert!(
+                !statement_at(&graph, sink_line),
+                "{label} lowered the else sink into the CFG: {:#?}",
+                graph.nodes
+            );
+            if after_line != 0 {
+                let reaches_after = graph.edges.iter().any(|edge| {
+                    let source_line = graph
+                        .nodes
+                        .get(&edge.source_node)
+                        .map(|node| node.leader_line);
+                    let target_line = graph
+                        .nodes
+                        .get(&edge.target_node)
+                        .map(|node| node.leader_line);
+                    source_line == Some(break_line) && target_line == Some(after_line)
+                });
+                assert!(
+                    reaches_after,
+                    "{label} break at {break_line} does not reach the statement after the loop \
+                     at {after_line}: {:#?}",
+                    graph.edges
+                );
+            }
+            if label == "inner-else-breaks-outer" {
+                assert!(
+                    control_false_enters(&graph, break_line),
+                    "{label} inner else was not entered: {:#?}",
+                    graph.edges
+                );
+            }
+        }
+    }
+
+    /// A path that can finish the loop, including `continue`, still enters the else.
+    #[test]
+    fn a_loop_that_can_finish_still_enters_its_else() {
+        let cases = [
+            (
+                "conditional-break",
+                "def f(c):\n    for _ in range(1):\n        if c:\n            break\n    else:\n        os.system(c)\n",
+                "c",
+                6,
+            ),
+            (
+                "continue",
+                "def f(c):\n    for _ in range(1):\n        continue\n    else:\n        os.system(c)\n",
+                "c",
+                5,
+            ),
+            (
+                "while-continue",
+                "def f(c):\n    while c:\n        continue\n    else:\n        os.system(c)\n",
+                "c",
+                5,
+            ),
+            (
+                "continue-or-break",
+                "def f(c):\n    for _ in range(1):\n        if c:\n            continue\n        else:\n            break\n    else:\n        os.system(c)\n",
+                "c",
+                8,
+            ),
+            (
+                "inner-break",
+                "def f(c):\n    for _ in range(1):\n        for __ in range(1):\n            break\n        else:\n            pass\n    else:\n        os.system(c)\n",
+                "c",
+                8,
+            ),
+            (
+                "unicode-continue",
+                "def f(名前):\n    for _ in range(1):\n        continue\n    else:\n        os.system(名前)\n",
+                "名前",
+                5,
+            ),
+            (
+                "crlf-continue",
+                "def f(c):\r\n    while c:\r\n        continue\r\n    else:\r\n        os.system(c)\r\n",
+                "c",
+                5,
+            ),
+        ];
+        for (label, source, variable, sink_line) in cases {
+            let mut extracted = python_function_pdgs(source, "C:\\work\\名字.py", 1, 7);
+            assert!(
+                extracted.parse == ParseStatus::Ok && extracted.functions.len() == 1,
+                "{label} did not parse: {extracted:#?}"
+            );
+            let pdg = extracted.functions.remove(0);
+            assert!(
+                pdg.taint_sinks()
+                    .iter()
+                    .any(|(line, name)| *line == sink_line && name == variable),
+                "{label} --taint lost the else sink: {:?}",
+                pdg.taint_sinks()
+            );
+            let graph = crate::pdg::build_function_pdg(&pdg)
+                .unwrap_or_else(|error| panic!("{label} must build: {error}"));
+            assert!(
+                control_false_enters(&graph, sink_line),
+                "{label} else at {sink_line} was not entered by control:false: {:#?}",
+                graph.edges
+            );
+            let again = crate::pdg::build_function_pdg(&pdg).expect("stable");
+            assert_eq!(graph.edges, again.edges, "{label} CFG was not stable");
+        }
+    }
+
+    /// A `try` whose body is only `break` still has the builder's unhandled
+    /// exception edge, so the loop is not "every path breaks". The break
+    /// itself must not fall into the else. Implicit exceptions stay the
+    /// parent card's open note.
+    #[test]
+    fn a_break_inside_finally_does_not_fall_into_the_loop_else() {
+        let source = "def f(c):\n    for _ in range(1):\n        try:\n            break\n        finally:\n            pass\n    else:\n        os.system(c)\n";
+        let mut extracted = python_function_pdgs(source, "m.py", 1, 7);
+        assert_eq!(extracted.parse, ParseStatus::Ok);
+        let pdg = extracted.functions.remove(0);
+        assert!(pdg
+            .taint_sinks()
+            .iter()
+            .any(|(line, name)| *line == 8 && name == "c"));
+        let graph = crate::pdg::build_function_pdg(&pdg).expect("build");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.edge_kind == "control:break"),
+            "finally swallowed the break: {:#?}",
+            graph.edges
+        );
+        let else_node = graph
+            .nodes
+            .values()
+            .find(|node| {
+                node.leader_line == 8
+                    && !matches!(
+                        node.kind,
+                        crate::pdg::CfgNodeKind::Entry | crate::pdg::CfgNodeKind::Exit
+                    )
+            })
+            .expect("else sink");
+        assert!(
+            graph.edges.iter().all(|edge| {
+                edge.target_node != else_node.id
+                    || matches!(
+                        edge.edge_kind.as_str(),
+                        "control:false" | "param" | "taint" | "data"
+                    )
+            }),
+            "a body edge reached the else: {:#?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn a_statement_after_break_or_continue_is_not_lowered() {
+        for (label, source, dead_line) in [
+            (
+                "after-break",
+                "def f(c):\n    for _ in range(1):\n        break\n        os.system(c)\n",
+                4,
+            ),
+            (
+                "after-continue",
+                "def f(c):\n    while c:\n        continue\n        os.system(c)\n",
+                4,
+            ),
+        ] {
+            let pdg = only(source);
+            assert!(
+                pdg.taint_sinks()
+                    .iter()
+                    .any(|(line, name)| *line == dead_line && name == "c"),
+                "{label} tree walk should still name the unreachable sink"
+            );
+            let graph = crate::pdg::build_function_pdg(&pdg).expect(label);
+            assert!(
+                !statement_at(&graph, dead_line),
+                "{label} lowered a statement no path reaches: {:#?}",
+                graph.nodes
+            );
+        }
+    }
+
+    #[test]
+    fn break_and_continue_are_not_basic_statements() {
+        let pdg = only(
+            "def f(xs):\n    for x in xs:\n        if x:\n            break\n        continue\n",
+        );
+        let PdgStatementKind::Loop { body, .. } = &pdg.body[0].kind else {
+            panic!("for was not a loop: {pdg:#?}");
+        };
+        let PdgStatementKind::Branch { then_body, .. } = &body[0].kind else {
+            panic!("if was not a branch: {body:#?}");
+        };
+        assert!(
+            matches!(then_body[0].kind, PdgStatementKind::Break),
+            "break stayed basic: {then_body:#?}"
+        );
+        assert!(
+            matches!(body[1].kind, PdgStatementKind::Continue),
+            "continue stayed basic: {body:#?}"
+        );
+    }
+
+    #[test]
+    fn hostile_break_inputs_do_not_panic() {
+        for (label, source) in [
+            ("top-break", "def f(c):\n    break\n"),
+            ("top-continue", "def f(c):\n    continue\n"),
+            (
+                "else-break",
+                "def f(c):\n    for _ in range(1):\n        pass\n    else:\n        break\n",
+            ),
+            (
+                "nul",
+                "def f(c):\n    for _ in range(1):\n        break\n    else:\n        os.system(c)\n\0",
+            ),
+            ("empty", ""),
+            ("only-else", "def f(c):\n    else:\n        break\n"),
+        ] {
+            let extracted = python_function_pdgs(source, "odd 'quote' 名前.py", 1, 7);
+            for function in &extracted.functions {
+                crate::pdg::build_function_pdg(function).unwrap_or_else(|error| {
+                    panic!("{label} refused a tree the extractor emitted: {error}")
+                });
+            }
         }
     }
 

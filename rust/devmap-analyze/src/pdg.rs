@@ -147,7 +147,9 @@ pub enum PdgStatementKind {
         body: Vec<PdgStatement>,
         /// The `else` suite. Python runs it when the loop finishes without
         /// `break`. Empty when the source has no else, which keeps a loop
-        /// that never had one on the same false edge it had before.
+        /// that never had one on the same false edge it had before. A body
+        /// whose every path is `break` does not take that edge into a
+        /// present suite. `continue` is not a `break`.
         #[serde(default)]
         else_body: Vec<PdgStatement>,
     },
@@ -162,6 +164,10 @@ pub enum PdgStatementKind {
     },
     Return,
     Raise,
+    /// Leaves the innermost loop without running its `else`.
+    Break,
+    /// Starts the next iteration. It does not suppress the loop's `else`.
+    Continue,
 }
 
 impl FunctionPdgInput {
@@ -210,7 +216,9 @@ impl FunctionPdgInput {
                     }
                     PdgStatementKind::Basic
                     | PdgStatementKind::Return
-                    | PdgStatementKind::Raise => {}
+                    | PdgStatementKind::Raise
+                    | PdgStatementKind::Break
+                    | PdgStatementKind::Continue => {}
                 }
             }
         }
@@ -245,12 +253,18 @@ struct Flow {
     /// off every terminating path, and with no node at all when every path
     /// into it terminated.
     abrupt: Vec<Incoming>,
+    /// `break` of the innermost loop that has not consumed it yet.
+    breaks: Vec<Incoming>,
+    /// `continue` of the innermost loop that has not consumed it yet.
+    continues: Vec<Incoming>,
 }
 
 impl Flow {
     fn absorb(&mut self, other: Flow) {
         self.normal.extend(other.normal);
         self.abrupt.extend(other.abrupt);
+        self.breaks.extend(other.breaks);
+        self.continues.extend(other.continues);
     }
 
     /// Duplicate `(node, edge kind)` pairs add nothing but work: the edges
@@ -258,10 +272,15 @@ impl Flow {
     /// with many empty handlers would hand the next statement the same
     /// predecessor once per handler.
     fn dedup(&mut self) {
-        self.normal.sort();
-        self.normal.dedup();
-        self.abrupt.sort();
-        self.abrupt.dedup();
+        for edges in [
+            &mut self.normal,
+            &mut self.abrupt,
+            &mut self.breaks,
+            &mut self.continues,
+        ] {
+            edges.sort();
+            edges.dedup();
+        }
     }
 }
 
@@ -351,7 +370,9 @@ impl<'a> PdgBuilder<'a> {
 
     fn add_statement_node(&mut self, statement: &PdgStatement) -> String {
         let kind = match statement.kind {
-            PdgStatementKind::Basic => CfgNodeKind::Block,
+            PdgStatementKind::Basic | PdgStatementKind::Break | PdgStatementKind::Continue => {
+                CfgNodeKind::Block
+            }
             PdgStatementKind::Branch { .. } => CfgNodeKind::Branch,
             PdgStatementKind::Loop { .. } => CfgNodeKind::Loop,
             PdgStatementKind::Try { .. } => CfgNodeKind::Try,
@@ -392,7 +413,7 @@ impl<'a> PdgBuilder<'a> {
         }
         let mut flow = Flow {
             normal: incoming,
-            abrupt: Vec::new(),
+            ..Flow::default()
         };
         for statement in statements {
             if flow.normal.is_empty() {
@@ -409,14 +430,28 @@ impl<'a> PdgBuilder<'a> {
                         node,
                         edge_kind: "control:fallthrough",
                     }],
-                    abrupt: Vec::new(),
+                    ..Flow::default()
                 },
                 PdgStatementKind::Return | PdgStatementKind::Raise => Flow {
-                    normal: Vec::new(),
                     abrupt: vec![Incoming {
                         node,
                         edge_kind: "control:terminate",
                     }],
+                    ..Flow::default()
+                },
+                PdgStatementKind::Break => Flow {
+                    breaks: vec![Incoming {
+                        node,
+                        edge_kind: "control:break",
+                    }],
+                    ..Flow::default()
+                },
+                PdgStatementKind::Continue => Flow {
+                    continues: vec![Incoming {
+                        node,
+                        edge_kind: "control:continue",
+                    }],
+                    ..Flow::default()
                 },
                 PdgStatementKind::Branch {
                     then_body,
@@ -462,34 +497,52 @@ impl<'a> PdgBuilder<'a> {
                     out
                 }
                 PdgStatementKind::Loop { body, else_body } => {
+                    let header = node;
                     let body_flow = self.build_sequence(
                         body,
                         vec![Incoming {
-                            node: node.clone(),
+                            node: header.clone(),
                             edge_kind: "control:true",
                         }],
                         inner,
                     )?;
-                    for tail in body_flow.normal {
-                        self.add_control(&tail.node, &node, "control:loop");
+                    // Finishing the body, and `continue`, both take the next
+                    // iteration. `break` leaves the loop instead.
+                    for tail in body_flow.normal.iter().chain(&body_flow.continues) {
+                        self.add_control(&tail.node, &header, "control:loop");
                     }
-                    // An empty else leaves the false edge on the header, which
-                    // is the exit a loop without an else already had. A present
-                    // else is that exit: it runs when the iterator is exhausted
-                    // or the condition is false, and not when the body returns.
-                    let else_flow = self.build_sequence(
-                        else_body,
+                    // An empty else is the exit a loop without one already had,
+                    // so the false edge stays even when the body always breaks.
+                    // A present else runs only when some path can finish without
+                    // `break`. `continue` is one of those paths. A `return` or
+                    // `raise` is not a break, and the false edge is still the
+                    // zero-iteration exit, so those do not suppress the suite.
+                    let every_path_breaks = !else_body.is_empty()
+                        && body_flow.normal.is_empty()
+                        && body_flow.continues.is_empty()
+                        && body_flow.abrupt.is_empty()
+                        && !body_flow.breaks.is_empty();
+                    let else_incoming = if every_path_breaks {
+                        Vec::new()
+                    } else {
                         vec![Incoming {
-                            node,
+                            node: header,
                             edge_kind: "control:false",
-                        }],
-                        inner,
-                    )?;
+                        }]
+                    };
+                    let else_flow = self.build_sequence(else_body, else_incoming, inner)?;
+                    // Breaks in the body skip the else and become the loop's
+                    // normal exit. Breaks and continues in the else belong to
+                    // the enclosing loop.
+                    let mut normal = else_flow.normal;
+                    normal.extend(body_flow.breaks);
                     let mut abrupt = body_flow.abrupt;
                     abrupt.extend(else_flow.abrupt);
                     Flow {
-                        normal: else_flow.normal,
+                        normal,
                         abrupt,
+                        breaks: else_flow.breaks,
+                        continues: else_flow.continues,
                     }
                 }
                 PdgStatementKind::Try {
@@ -509,6 +562,8 @@ impl<'a> PdgBuilder<'a> {
             };
             flow.normal = after.normal;
             flow.abrupt.extend(after.abrupt);
+            flow.breaks.extend(after.breaks);
+            flow.continues.extend(after.continues);
         }
         flow.dedup();
         Ok(flow)
@@ -594,19 +649,28 @@ impl<'a> PdgBuilder<'a> {
         }
         let entered_normally = !out.normal.is_empty();
         let entered_abruptly = !out.abrupt.is_empty();
+        let entered_break = !out.breaks.is_empty();
+        let entered_continue = !out.continues.is_empty();
         let entry = out
             .normal
             .into_iter()
             .chain(out.abrupt)
+            .chain(out.breaks)
+            .chain(out.continues)
             .map(|source| Incoming {
                 node: source.node,
                 edge_kind: "control:finally",
             })
             .collect();
         let finally = self.build_sequence(finally_body, entry, inner)?;
+        // A `break` or `continue` inside `finally` replaces the pending exit.
+        // A finally that falls through resumes it. Copying both is the same
+        // over-approximation the normal and abrupt tails already share.
         let mut result = Flow {
-            normal: Vec::new(),
-            abrupt: finally.abrupt,
+            abrupt: finally.abrupt.clone(),
+            breaks: finally.breaks.clone(),
+            continues: finally.continues.clone(),
+            ..Flow::default()
         };
         if entered_abruptly {
             result
@@ -617,7 +681,23 @@ impl<'a> PdgBuilder<'a> {
                 }));
         }
         if entered_normally {
-            result.normal = finally.normal;
+            result.normal.extend(finally.normal.iter().cloned());
+        }
+        if entered_break {
+            result
+                .breaks
+                .extend(finally.normal.iter().map(|tail| Incoming {
+                    node: tail.node.clone(),
+                    edge_kind: "control:break",
+                }));
+        }
+        if entered_continue {
+            result
+                .continues
+                .extend(finally.normal.iter().map(|tail| Incoming {
+                    node: tail.node.clone(),
+                    edge_kind: "control:continue",
+                }));
         }
         Ok(result)
     }
@@ -631,7 +711,13 @@ impl<'a> PdgBuilder<'a> {
             }],
             0,
         )?;
-        for tail in flow.normal.into_iter().chain(flow.abrupt) {
+        for tail in flow
+            .normal
+            .into_iter()
+            .chain(flow.abrupt)
+            .chain(flow.breaks)
+            .chain(flow.continues)
+        {
             self.add_control(&tail.node, &self.exit.clone(), tail.edge_kind);
         }
         self.add_data_edges()?;
@@ -932,7 +1018,11 @@ fn validate_statements(
                 validate_statements(else_body, start_line, end_line, inner, budget)?;
                 validate_statements(finally_body, start_line, end_line, inner, budget)?;
             }
-            PdgStatementKind::Basic | PdgStatementKind::Return | PdgStatementKind::Raise => {}
+            PdgStatementKind::Basic
+            | PdgStatementKind::Return
+            | PdgStatementKind::Raise
+            | PdgStatementKind::Break
+            | PdgStatementKind::Continue => {}
         }
     }
     Ok(())
