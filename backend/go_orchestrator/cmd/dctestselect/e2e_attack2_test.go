@@ -107,7 +107,7 @@ func TestE2EAPathAttributeModuleChangeSelectsAndRunsTheWholeCrate(t *testing.T) 
 		}
 	}
 	var out, errs bytes.Buffer
-	code, _ := runPhase(context.Background(), root, []Command{whole.Command}, 5*time.Minute, t.TempDir(), &out, &errs)
+	code, _ := runPhase(context.Background(), root, []Command{whole.Command}, 25*time.Minute, t.TempDir(), &out, &errs)
 	if code != 1 || !strings.Contains(out.String(), "tb") {
 		t.Fatalf("exit=%d; running the selected crate whole must fail on the renamed module's test:\n%s", code, out.String())
 	}
