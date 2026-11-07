@@ -333,9 +333,12 @@ func decodeMetadata(raw []byte, repo string) (*RustWorkspace, error) {
 // phase time, under-selection builds a crate with fewer features than the full
 // suite does. driverClosure has already refused a missing resolve graph.
 func dependents(w *metadataWire, ws *RustWorkspace) map[string][]string {
-	nameOf := map[string]string{}
+	nameOf, idOf, member := map[string]string{}, map[string]string{}, map[string]bool{}
 	for _, p := range w.Packages {
-		nameOf[p.ID] = p.Name
+		nameOf[p.ID], idOf[p.Name] = p.Name, p.ID
+	}
+	for _, pkg := range ws.Packages {
+		member[pkg.Name] = true
 	}
 	rev := map[string][]string{}
 	for _, n := range w.Resolve.Nodes {
@@ -343,29 +346,9 @@ func dependents(w *metadataWire, ws *RustWorkspace) map[string][]string {
 			rev[d.Pkg] = append(rev[d.Pkg], n.ID)
 		}
 	}
-	idOf := map[string]string{}
-	member := map[string]bool{}
-	for _, p := range w.Packages {
-		idOf[p.Name] = p.ID
-	}
-	for _, pkg := range ws.Packages {
-		member[pkg.Name] = true
-	}
 	out := map[string][]string{}
 	for _, pkg := range ws.Packages {
-		seen := map[string]bool{idOf[pkg.Name]: true}
-		queue := []string{idOf[pkg.Name]}
-		for len(queue) > 0 {
-			id := queue[0]
-			queue = queue[1:]
-			for _, up := range rev[id] {
-				if !seen[up] {
-					seen[up] = true
-					queue = append(queue, up)
-				}
-			}
-		}
-		for id := range seen {
+		for id := range reach([]string{idOf[pkg.Name]}, rev) {
 			if name := nameOf[id]; name != pkg.Name && member[name] {
 				out[pkg.Name] = append(out[pkg.Name], name)
 			}
@@ -373,6 +356,20 @@ func dependents(w *metadataWire, ws *RustWorkspace) map[string][]string {
 		sort.Strings(out[pkg.Name])
 	}
 	return out
+}
+
+// reach is every node reachable from start over edges, start included.
+func reach(start []string, edges map[string][]string) map[string]bool {
+	seen := map[string]bool{}
+	for len(start) > 0 {
+		n := start[0]
+		start = start[1:]
+		if !seen[n] {
+			seen[n] = true
+			start = append(start, edges[n]...)
+		}
+	}
+	return seen
 }
 
 // driverClosure is the set of workspace members compiled into a binary a Go
@@ -419,17 +416,9 @@ func driverClosure(w *metadataWire, ws *RustWorkspace) (map[string]bool, error) 
 			queue = append(queue, idOf[pkg.Name])
 		}
 	}
-	seen := map[string]bool{}
 	closure := map[string]bool{}
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
+	for id := range reach(queue, deps) {
 		closure[nameOf[id]] = true
-		queue = append(queue, deps[id]...)
 	}
 	return closure, nil
 }

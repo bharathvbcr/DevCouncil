@@ -9,21 +9,15 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
 )
 
-// pkgSel is what one cargo package contributes to the selection: the crate,
-// whole (every target `cargo test -p` runs: lib, every bin including
-// auto-discovered ones, every test, the doctests). Nothing narrower exists: a
-// module path libtest prints is not a path the source tree spells (`#[path]`,
-// `include!`), and a per-target choice misses a file another target includes.
-type pkgSel struct {
-	pkg   RustPackage
-	why   string
-	files map[string]bool
-}
-
-type goSel struct {
-	pkg   GoPackage
-	why   string
-	files map[string]bool
+// unitSel is what one cargo package or Go package contributes to the selection.
+// A crate is selected whole (every target `cargo test -p` runs: lib, every bin
+// including auto-discovered ones, every test, the doctests). Nothing narrower
+// exists: a module path libtest prints is not a path the source tree spells
+// (`#[path]`, `include!`), and a per-target choice misses a file another target
+// includes.
+type unitSel struct {
+	dir, why string
+	files    map[string]bool
 }
 
 // selection maps changed and reached paths onto the commands the job's full
@@ -32,13 +26,13 @@ type goSel struct {
 type selection struct {
 	in       Inputs
 	excluded map[string]bool
-	rust     map[string]*pkgSel
-	gos      map[string]*goSel
+	rust     map[string]*unitSel
+	gos      map[string]*unitSel
 	dropped  []Dropped
 }
 
 func newSelection(in Inputs) *selection {
-	s := &selection{in: in, excluded: map[string]bool{}, rust: map[string]*pkgSel{}, gos: map[string]*goSel{}}
+	s := &selection{in: in, excluded: map[string]bool{}, rust: map[string]*unitSel{}, gos: map[string]*unitSel{}}
 	for _, ex := range in.Excludes {
 		s.excluded[ex] = true
 	}
@@ -72,22 +66,13 @@ func (s *selection) goOwner(p string) (GoPackage, bool) {
 	return GoPackage{}, false
 }
 
-func (s *selection) rustSel(pkg RustPackage) *pkgSel {
-	if ps, ok := s.rust[pkg.Name]; ok {
-		return ps
+func unit(m map[string]*unitSel, name, dir string) *unitSel {
+	if u, ok := m[name]; ok {
+		return u
 	}
-	ps := &pkgSel{pkg: pkg, files: map[string]bool{}}
-	s.rust[pkg.Name] = ps
-	return ps
-}
-
-func (s *selection) goSel(pkg GoPackage) *goSel {
-	if gs, ok := s.gos[pkg.ImportPath]; ok {
-		return gs
-	}
-	gs := &goSel{pkg: pkg, files: map[string]bool{}}
-	s.gos[pkg.ImportPath] = gs
-	return gs
+	u := &unitSel{dir: dir, files: map[string]bool{}}
+	m[name] = u
+	return u
 }
 
 // widenOwner selects every test of the unit that owns a changed file, for a
@@ -100,11 +85,11 @@ func (s *selection) widenOwner(p, reason string) (string, bool) {
 			s.drop(p, fmt.Sprintf("package %s is excluded from this job's full suite", pkg.Name))
 			return "", true
 		}
-		s.rustSel(pkg).why = "every target of " + pkg.Name + ": " + p + " changed outside any symbol (" + reason + ")"
+		unit(s.rust, pkg.Name, pkg.Dir).why = "every target of " + pkg.Name + ": " + p + " changed outside any symbol (" + reason + ")"
 		return "crate " + pkg.Name, true
 	}
 	if pkg, ok := s.goOwner(p); ok {
-		s.goSel(pkg).why = "go test " + pkg.ImportPath + ": " + p + " changed outside any symbol (" + reason + ")"
+		unit(s.gos, pkg.ImportPath, pkg.Dir).why = "go test " + pkg.ImportPath + ": " + p + " changed outside any symbol (" + reason + ")"
 		return "go package " + pkg.ImportPath, true
 	}
 	return "", false
@@ -121,7 +106,7 @@ func (s *selection) widenGoImporters(ws *GoWorkspace) {
 		}
 		for _, imp := range pkg.Imports {
 			if drivers[imp] {
-				s.goSel(pkg).why = "go test " + pkg.ImportPath + ": it imports " + strings.TrimPrefix(imp, ws.Module+"/") + ", which drives a Rust binary"
+				unit(s.gos, pkg.ImportPath, pkg.Dir).why = "go test " + pkg.ImportPath + ": it imports " + strings.TrimPrefix(imp, ws.Module+"/") + ", which drives a Rust binary"
 				break
 			}
 		}
@@ -145,7 +130,11 @@ func (s *selection) place(p string) (reason string, ok bool) {
 		if !found {
 			return p + " is a Go file in no package of the module", false
 		}
-		s.goSel(pkg).files[p] = true
+		gs := unit(s.gos, pkg.ImportPath, pkg.Dir)
+		gs.files[p] = true
+		if gs.why == "" {
+			gs.why = "blast tests"
+		}
 		return "", true
 	case strings.HasSuffix(p, ".rs"):
 		pkg, found := s.rustOwner(p)
@@ -160,7 +149,7 @@ func (s *selection) place(p string) (reason string, ok bool) {
 			s.drop(p, fmt.Sprintf("package %s is excluded from this job's full suite", pkg.Name))
 			return "", true
 		}
-		ps := s.rustSel(pkg)
+		ps := unit(s.rust, pkg.Name, pkg.Dir)
 		ps.files[p] = true
 		if ps.why == "" {
 			ps.why = "every target of " + pkg.Name + ": " + p
@@ -185,147 +174,89 @@ func sortedKeys[V any](m map[string]V) []string {
 // crate would build each with fewer features than the full suite gives it.
 func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 	out := []Selected{}
-	if c, ok := s.rustCommand(seeds); ok {
-		out = append(out, c)
+	if len(s.rust) > 0 {
+		byName := map[string]RustPackage{}
+		for _, pkg := range s.in.Rust.Packages {
+			byName[pkg.Name] = pkg
+		}
+		chosen := map[string]bool{}
+		for name := range s.rust {
+			chosen[name] = true
+			for _, dep := range s.in.Rust.Dependents[name] {
+				if s.excluded[dep] {
+					s.drop(byName[dep].Dir, fmt.Sprintf("package %s depends on %s and is excluded from this job's full suite", dep, name))
+				} else {
+					chosen[dep] = true
+				}
+			}
+		}
+		out = append(out, assemble("rust", "dependents", s.rust, chosen, seeds, func(file, dir string) bool { return strings.HasPrefix(file, dir+"/") },
+			func(names []string) Command {
+				argv := []string{"cargo", "test", "--locked"}
+				for _, n := range names {
+					argv = append(argv, "-p", n)
+				}
+				return newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)
+			}))
 	}
-	if c, ok := s.goCommand(seeds); ok {
-		out = append(out, c)
+	if len(s.gos) > 0 {
+		importers := map[string][]string{}
+		tested := map[string]bool{}
+		for _, pkg := range s.in.Go.Packages {
+			tested[pkg.ImportPath] = len(pkg.TestFiles) > 0
+			for _, imp := range pkg.Imports {
+				importers[imp] = append(importers[imp], pkg.ImportPath)
+			}
+		}
+		chosen := reach(sortedKeys(s.gos), importers)
+		for ip := range chosen {
+			if !tested[ip] {
+				delete(chosen, ip)
+			}
+		}
+		if len(chosen) > 0 {
+			out = append(out, assemble("go", "importers", s.gos, chosen, seeds, func(file, dir string) bool { return path.Dir(file) == dir },
+				func(names []string) Command {
+					return newCommand(s.in.GoDir, append([]string{"go", "test", "-count=1", "-json"}, names...)...)
+				}))
+		}
 	}
 	return out
 }
 
-// rustCommand selects the changed crates and every workspace member that
-// depends on them. A dependent the full suite excludes is dropped and logged.
-func (s *selection) rustCommand(seeds []devmap.BlastSeed) (Selected, bool) {
-	if len(s.rust) == 0 {
-		return Selected{}, false
-	}
-	byName := map[string]RustPackage{}
-	for _, pkg := range s.in.Rust.Packages {
-		byName[pkg.Name] = pkg
-	}
-	direct := sortedKeys(s.rust)
-	chosen := map[string]bool{}
-	var whys, files []string
-	fileSet := map[string]bool{}
-	for _, name := range direct {
-		ps := s.rust[name]
-		chosen[name] = true
-		whys = append(whys, ps.why)
-		for f := range ps.files {
-			fileSet[f] = true
-		}
-		for _, dep := range s.in.Rust.Dependents[name] {
-			if s.excluded[dep] {
-				s.drop(byName[dep].Dir, fmt.Sprintf("package %s depends on %s and is excluded from this job's full suite", dep, name))
-				continue
-			}
-			chosen[dep] = true
-		}
-	}
-	files = sortedKeys(fileSet)
-	var extra []string
-	argv := []string{"cargo", "test", "--locked"}
+// assemble builds the one command of a kind over the chosen units: the changed
+// ones (direct) and those that depend on them.
+func assemble(kind, label string, direct map[string]*unitSel, chosen map[string]bool, seeds []devmap.BlastSeed,
+	under func(file, dir string) bool, command func(names []string) Command) Selected {
 	var units []Unit
-	for _, name := range sortedKeys(chosen) {
-		argv = append(argv, "-p", name)
-		units = append(units, Unit{Kind: "rust", Pkg: name})
-		if s.rust[name] == nil {
+	var whys, extra []string
+	files := map[string]bool{}
+	for _, name := range sortedKeys(direct) {
+		whys = append(whys, direct[name].why)
+		for f := range direct[name].files {
+			files[f] = true
+		}
+	}
+	names := sortedKeys(chosen)
+	for _, name := range names {
+		units = append(units, Unit{Kind: kind, Pkg: name})
+		if direct[name] == nil {
 			extra = append(extra, name)
 		}
 	}
 	why := strings.Join(whys, "; ")
 	if len(extra) > 0 {
-		why += "; with dependents " + strings.Join(extra, ", ")
-	}
-	dirs := map[string]bool{}
-	for _, name := range direct {
-		dirs[s.rust[name].pkg.Dir+"/"] = true
+		why += "; with " + label + " " + strings.Join(extra, ", ")
 	}
 	own := seedsUnder(seeds, func(file string) bool {
-		for d := range dirs {
-			if strings.HasPrefix(file, d) {
+		for _, u := range direct {
+			if under(file, u.dir) {
 				return true
 			}
 		}
 		return false
 	})
-	return Selected{
-		Command: logged(newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)),
-		Units:   units, Files: files, Seeds: own, Why: why,
-	}, true
-}
-
-// goCommand selects the changed packages and every package of the module that
-// imports one of them, transitively, keeping those with test files: a package
-// whose dependency changed can fail without a line of its own changing.
-func (s *selection) goCommand(seeds []devmap.BlastSeed) (Selected, bool) {
-	if len(s.gos) == 0 {
-		return Selected{}, false
-	}
-	importers := map[string][]string{}
-	byPath := map[string]GoPackage{}
-	for _, pkg := range s.in.Go.Packages {
-		byPath[pkg.ImportPath] = pkg
-		for _, imp := range pkg.Imports {
-			importers[imp] = append(importers[imp], pkg.ImportPath)
-		}
-	}
-	chosen := map[string]bool{}
-	queue := sortedKeys(s.gos)
-	for _, ip := range queue {
-		chosen[ip] = true
-	}
-	for len(queue) > 0 {
-		ip := queue[0]
-		queue = queue[1:]
-		for _, up := range importers[ip] {
-			if !chosen[up] {
-				chosen[up] = true
-				queue = append(queue, up)
-			}
-		}
-	}
-	var whys, pkgs []string
-	var units []Unit
-	fileSet := map[string]bool{}
-	dirs := map[string]bool{}
-	for _, ip := range sortedKeys(s.gos) {
-		gs := s.gos[ip]
-		why := "blast tests"
-		if gs.why != "" {
-			why = gs.why
-		}
-		whys = append(whys, why)
-		dirs[gs.pkg.Dir] = true
-		for f := range gs.files {
-			fileSet[f] = true
-		}
-	}
-	var extra []string
-	for _, ip := range sortedKeys(chosen) {
-		if len(byPath[ip].TestFiles) == 0 {
-			continue
-		}
-		pkgs = append(pkgs, ip)
-		units = append(units, Unit{Kind: "go", Pkg: ip})
-		if s.gos[ip] == nil {
-			extra = append(extra, ip)
-		}
-	}
-	if len(pkgs) == 0 {
-		return Selected{}, false
-	}
-	why := strings.Join(whys, "; ")
-	if len(extra) > 0 {
-		why += "; with importers " + strings.Join(extra, ", ")
-	}
-	own := seedsUnder(seeds, func(file string) bool { return dirs[path.Dir(file)] })
-	argv := append([]string{"go", "test", "-count=1", "-json"}, pkgs...)
-	return Selected{
-		Command: logged(newCommand(s.in.GoDir, argv...)),
-		Units:   units, Files: sortedKeys(fileSet), Seeds: own, Why: why,
-	}, true
+	return Selected{Command: logged(command(names)), Units: units, Files: sortedKeys(files), Seeds: own, Why: why}
 }
 
 func seedsUnder(seeds []devmap.BlastSeed, in func(file string) bool) []string {
