@@ -386,6 +386,12 @@ func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatu
 	}
 	sel := phaseStatus{Schema: statusSchema, PlanSHA256: sha}
 	for _, s := range plan.Selected {
+		// A healthy fast phase left an examined log for each kind it ran.
+		if s.GoJSON {
+			writeFile(t, dir, "selected-go.jsonl", goPass)
+		} else {
+			writeFile(t, dir, "selected-rust.log", "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest ok ... ok\n\ntest result: ok. 1 passed; 0 failed\n")
+		}
 		sel.Commands = append(sel.Commands, ExitInfo{Cmd: s.Display, Log: s.Log, Completed: true, Detail: "exit status 0"})
 	}
 	if err := writeJSON(filepath.Join(dir, "selected-status.json"), sel); err != nil {

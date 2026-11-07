@@ -27,6 +27,10 @@ type Failure struct {
 	Name string
 }
 
+// unknownPkg is Failure.Pkg when cargo's footer never named the package. Such a
+// failure can match no unit, so it is never a verdict about the selection.
+const unknownPkg = "?"
+
 // Key is the stable identity compared across runs.
 func (f Failure) Key() string {
 	if f.Kind == "go" {
@@ -590,6 +594,10 @@ func Audit(in AuditInput) (Recall, []string) {
 	if in.Ran != nil {
 		ran = in.Ran
 	}
+	// A miss is a verdict about the whole suite and the whole selection, so it
+	// needs both examined. This is the one place that says so; Exit reads the
+	// same facts in the same order.
+	missable := baseKnown && fullExamined && !in.PlanUnusable && in.SelectionNote == ""
 	covered := 0
 	for _, f := range attributable {
 		switch {
@@ -597,7 +605,7 @@ func Audit(in AuditInput) (Recall, []string) {
 			r.Unclassified = append(r.Unclassified, f.Key())
 		case ran.Covers(f):
 			covered++
-		case baseKnown && in.SelectionNote == "":
+		case missable && f.Pkg != unknownPkg:
 			r.Missed = append(r.Missed, f.Key())
 			notes = append(notes, annotate("error", "selection missed "+f.Key()))
 		default:
@@ -634,4 +642,21 @@ func Audit(in AuditInput) (Recall, []string) {
 		r.RecallNote = fmt.Sprintf("%d of %d new failure(s) were inside the selection", covered, r.NFailed)
 	}
 	return r, notes
+}
+
+// Exit is the audit's exit code, decided in one place so the order is
+// structural: every way the suites or the selection were not examined (2) comes
+// before a miss (1), and before a clean 0. A suite that was not examined has
+// no verdict, so it never reaches the miss check.
+func Exit(in AuditInput, r Recall) int {
+	switch {
+	case in.PlanUnusable, !r.Full.Rust.Examined, !r.Full.Go.Examined, in.SelectionNote != "":
+		return 2
+	case len(r.Missed) > 0:
+		return 1
+	case len(r.Unclassified) > 0:
+		// Failures that cannot be called misses or not: not a pass.
+		return 2
+	}
+	return 0
 }

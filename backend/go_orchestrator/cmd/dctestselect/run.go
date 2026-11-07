@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"time"
 )
 
@@ -24,6 +25,13 @@ const (
 	// unusable and run used its built-in full suite.
 	builtinPlan = "builtin"
 )
+
+// fullSuite is the full phase's commands: rust.yml's Test step and every Go
+// package. The plan records them (plan.Full) for the reader; it never decides
+// them. A variable so a test can run a stand-in through the real command.
+var fullSuite = func() []Command {
+	return fullCommands(Inputs{Excludes: DefaultRustExcludes, RustDir: defaultRustDir, GoDir: defaultGoDir})
+}
 
 func jsonIndent(v any) ([]byte, error) {
 	body, err := json.MarshalIndent(v, "", "  ")
@@ -228,7 +236,12 @@ func runCmdPhase(ctx context.Context, args []string, stdout, stderr io.Writer) (
 			cmds = append(cmds, s.Command)
 		}
 	} else {
-		cmds = plan.Full
+		// Never the plan's own list: a plan edited by hand, or written by an
+		// older build, must not be able to drop a suite from the gate.
+		cmds = fullSuite()
+		if !reflect.DeepEqual(cmds, plan.Full) && planSHA != builtinPlan {
+			fmt.Fprintln(stdout, annotate("warning", "the plan's full-suite list differs from the built-in suite; running the built-in suite"))
+		}
 	}
 	code, statuses := runPhase(ctx, root, cmds, *timeout, *logDir, stdout, stderr)
 	if err := writeAtomic(statusPath, phaseStatus{Schema: statusSchema, PlanSHA256: planSHA, Commands: statuses}); err != nil {

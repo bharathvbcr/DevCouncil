@@ -193,6 +193,7 @@ func TestEveryCommandOfAPhaseLeavesAStatus(t *testing.T) {
 	failing.Log = "b.log"
 	good := helper("ok")
 	good.Log = "c.log"
+	useFullSuite(t, missing, failing, good)
 	planPath := filepath.Join(dir, "plan.json")
 	if err := writeJSON(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{missing, failing, good}}); err != nil {
 		t.Fatal(err)
@@ -247,6 +248,7 @@ func TestAPhaseRemovesTheStaleStatusAtStartAndWritesItsOwnWhole(t *testing.T) {
 	}
 	c := helper("no-status")
 	c.Log = "c.log"
+	useFullSuite(t, c)
 	planPath := filepath.Join(dir, "plan.json")
 	if err := writeJSON(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{c}}); err != nil {
 		t.Fatal(err)

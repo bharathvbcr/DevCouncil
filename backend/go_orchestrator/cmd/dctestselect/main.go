@@ -220,10 +220,10 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	}
 	in.Rust = suite("full-rust.log", "the cargo test log", parseLibtest)
 	in.Go = suite("full-go.jsonl", "the go test -json log", parseGoJSON)
-	if planErr == nil {
-		in.Ran, in.SelectionNote = ranSelection(plan, filepath.Join(*logDir, "selected-status.json"), planSHA)
-	}
 	in.SelectedRust, in.SelectedGo, in.SelectedKnown = readSelected(*logDir, plan)
+	if planErr == nil {
+		in.Ran, in.SelectionNote = ranSelection(plan, filepath.Join(*logDir, "selected-status.json"), planSHA, in.SelectedRust, in.SelectedGo)
+	}
 	in.BaseWhy = "no base-branch artifact was given"
 	if *baseArtifact != "" {
 		if body, err := os.ReadFile(*baseArtifact); err != nil {
@@ -246,28 +246,17 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	for _, n := range notes {
 		fmt.Fprintln(stdout, n)
 	}
-	switch {
-	case planErr != nil:
-		// Before the miss check, and the miss list is empty by construction:
-		// with no plan nothing is known about what the selection ran.
-		return 2, nil
-	case len(recall.Missed) > 0:
-		return 1, nil
-	case !recall.Full.Rust.Examined, !recall.Full.Go.Examined, in.SelectionNote != "":
-		return 2, nil
-	case recall.BaseFailed == nil && len(recall.Unclassified) > 0:
-		// Failures that cannot be called misses or not: not a pass.
-		return 2, nil
-	}
-	return 0, nil
+	return Exit(in, recall), nil
 }
 
 // ranSelection is the selection as it ran, read from the fast phase's status
 // file: the plan less every selected command whose status does not say it
-// completed. A plan that selected nothing, or everything, has no fast phase to
-// read. Otherwise a status that is missing, stale (another plan's) or lacks a
-// selected command means what ran is unknown, and the note says so.
-func ranSelection(plan Plan, statusPath, planSHA string) (*Plan, string) {
+// completed or whose log was not examined (a cargo compile error exits 101 and
+// leaves no `test result:`: it completed, and ran nothing). A plan that selected
+// nothing, or everything, has no fast phase to read. Otherwise a status that is
+// missing, stale (another plan's) or lacks a selected command means what ran is
+// unknown, and the note says so.
+func ranSelection(plan Plan, statusPath, planSHA string, rust, golang SuiteRun) (*Plan, string) {
 	if plan.Everything || len(plan.Selected) == 0 {
 		return &plan, ""
 	}
@@ -281,11 +270,17 @@ func ranSelection(plan Plan, statusPath, planSHA string) (*Plan, string) {
 	note := ""
 	for _, s := range plan.Selected {
 		st := by[s.Display]
+		log := rust
+		if s.GoJSON {
+			log = golang
+		}
 		switch {
 		case st == nil:
 			note = "the status has no entry for " + s.Display
 		case !st.Completed:
 			note = s.Display + " did not run to completion (" + st.Detail + ")"
+		case !log.Examined:
+			note = s.Display + " left a log that was not examined (" + log.Note + ")"
 		default:
 			ran.Selected = append(ran.Selected, s)
 		}

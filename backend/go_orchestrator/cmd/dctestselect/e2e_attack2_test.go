@@ -134,6 +134,7 @@ func TestE2EAStaleStatusFromAnotherPlanIsNotReadAsThisRuns(t *testing.T) {
 	logDir := t.TempDir()
 	plan := Plan{Schema: planSchema, Widened: []Widening{}, Selected: []Selected{}, Dropped: []Dropped{}, Notices: []string{},
 		Full: []Command{{Display: "sleep", Dir: ".", Argv: []string{"sleep", "30"}, Log: "full-rust.log"}}}
+	useFullSuite(t, plan.Full...)
 	pp := filepath.Join(t.TempDir(), "plan.json")
 	if err := writeJSON(pp, plan); err != nil {
 		t.Fatal(err)
