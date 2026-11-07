@@ -74,7 +74,7 @@ func TestAPathAttributeModuleSelectsEveryTargetOfItsCrateWithNoFilter(t *testing
 func TestASourceFileSelectsEveryTargetOfItsCrateIncludingTheDoctests(t *testing.T) {
 	p := BuildPlan(inputs(withSeed("rust/ca/src/engine.rs", "run"), withChanged("rust/ca/src/engine.rs"), withTests("rust/ca/src/engine.rs")))
 	whole := wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
-	if len(whole.Units) != 1 || whole.Units[0].Target != "" {
+	if len(whole.Units) != 1 || whole.Units[0].Pkg != "ca" {
 		t.Fatalf("units = %+v; a whole-crate unit covers lib, every bin, every test and the doctests", whole.Units)
 	}
 }

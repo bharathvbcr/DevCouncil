@@ -20,18 +20,16 @@ type Widening struct {
 	Reason string `json:"reason"`
 }
 
-// Unit is what a command covers, in the terms a failure is reported in.
+// Unit is what a command covers, in the terms a failure is reported in: a
+// crate (every target cargo test -p runs) or a Go package.
 //
 // Audit decides whether a failed test was inside the selection by matching its
-// package and target against these, so the unit is the same shape cargo prints
-// in its `to rerun pass` line, not a path this program invented.
+// package against these, so the unit is the same shape cargo prints in its
+// `to rerun pass` line, not a path this program invented.
 type Unit struct {
 	Kind string `json:"kind"` // "rust" or "go"
 	// Pkg is a cargo package name or a Go import path.
 	Pkg string `json:"pkg"`
-	// Target is `--test x`. Empty means every target of the package: lib,
-	// every bin, every test, the doctests.
-	Target string `json:"target,omitempty"`
 }
 
 // Selected is one command of the fast phase.
@@ -83,11 +81,10 @@ type Plan struct {
 
 // RustTarget is one cargo target, from `cargo metadata`.
 type RustTarget struct {
-	Name             string
-	Kinds            []string
-	Src              string // repository-relative
-	RequiredFeatures []string
-	Test             bool
+	Name  string
+	Kinds []string
+	Src   string // repository-relative
+	Test  bool
 }
 
 func (t RustTarget) is(kind string) bool {
@@ -116,6 +113,11 @@ type RustWorkspace struct {
 	Packages []RustPackage
 	// DriverClosure names the members compiled into a binary Go tests run.
 	DriverClosure map[string]bool
+	// Dependents maps a member to every other member that depends on it,
+	// transitively, through normal, build and dev edges on any platform. A
+	// crate selected without them would be built with fewer features than the
+	// full suite's --workspace builds it with.
+	Dependents map[string][]string
 }
 
 // GoPackage is one `go list` package.
@@ -321,8 +323,8 @@ func BuildPlan(in Inputs) Plan {
 			sel.drop(t.Path, reason)
 		}
 	}
-	p.Dropped = sel.dropped
 	p.Selected = sel.commands(blast.Seeds)
+	p.Dropped = sel.dropped
 	return p
 }
 

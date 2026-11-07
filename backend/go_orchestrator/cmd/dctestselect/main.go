@@ -235,8 +235,9 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 
 // ranSelection is the selection as it ran, read from the fast phase's status
 // file: the plan less every selected command whose status does not say it
-// completed or whose log was not examined (a cargo compile error exits 101 and
-// leaves no `test result:`: it completed, and ran nothing). A plan that selected
+// completed, whose log was not examined, or that ran nothing for a unit (a cargo
+// compile error exits 101 and leaves no `test result:`: it completed, and ran
+// nothing). A plan that selected
 // nothing, or everything, has no fast phase to read. Otherwise a status that is
 // missing, stale (another plan's) or lacks a selected command means what ran is
 // unknown, and the note says so.
@@ -266,10 +267,42 @@ func ranSelection(plan Plan, statusPath, planSHA string, rust, golang SuiteRun) 
 		case !log.Examined:
 			note = s.Display + " left a log that was not examined (" + log.Note + ")"
 		default:
+			if why := unexaminedUnits(s, st, log); why != "" {
+				note = s.Display + " " + why
+				continue
+			}
 			ran.Selected = append(ran.Selected, s)
 		}
 	}
 	return &ran, note
+}
+
+// unexaminedUnits says why a selected command that completed ran nothing for
+// one of its units, or "" when every unit was examined. The fast phase is one
+// cargo command and one go command, each over several units, so the log's
+// shape is read against that command's own exit status:
+//
+//   - cargo compiles every requested target before running any, so a build or
+//     build-script failure leaves no `test result:` at all; a non-zero exit is
+//     tests that ran only when the log holds a `test result: FAILED`;
+//   - go test names each package it ran in a final action, so a selected
+//     package with none (a listing error, a build failure printed as text) ran
+//     nothing;
+//   - an exit status that contradicts the failures in the log is not trusted.
+func unexaminedUnits(s Selected, st *ExitInfo, log SuiteRun) string {
+	switch {
+	case st.Code == 0 && len(log.Failures) > 0:
+		return "exited 0 but its log shows failures"
+	case s.GoJSON:
+		for _, u := range s.Units {
+			if !log.Done[u.Pkg] {
+				return "ran nothing for " + u.Pkg + ": its log has no final pass, fail or skip action for it"
+			}
+		}
+	case st.Code != 0 && log.FailedResults == 0:
+		return fmt.Sprintf("exited %d and its log records no `test result: FAILED`, so no test ran", st.Code)
+	}
+	return ""
 }
 
 // readSelected reads the fast phase's logs. They are known only when every

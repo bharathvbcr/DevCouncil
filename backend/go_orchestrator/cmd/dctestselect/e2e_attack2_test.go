@@ -39,7 +39,7 @@ func TestE2EARustFixtureUnderTestsSelectsTheWholeCrateIncludingItsLib(t *testing
 	lib := false
 	for _, s := range p.Selected {
 		for _, u := range s.Units {
-			if u.Pkg == "ca" && u.Target == "" {
+			if u.Pkg == "ca" {
 				lib = true // a whole-crate unit runs the lib
 			}
 		}

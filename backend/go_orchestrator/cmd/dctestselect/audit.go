@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const recallSchema = 2
+const recallSchema = 3
 
 // Failure is one failed test, in the terms a unit is described in.
 type Failure struct {
@@ -47,19 +47,25 @@ type SuiteRun struct {
 	Examined bool
 	Note     string
 	Failures []Failure
+	// FailedResults counts the `test result: FAILED` lines of a cargo log: the
+	// proof that a non-zero exit came from tests that ran.
+	FailedResults int
+	// Done is the Go packages with a final pass, fail or skip action.
+	Done map[string]bool
 }
 
 var (
 	// Cargo's own header shapes, exactly: five spaces and `Running`, an
 	// optional `unittests`, a path and the binary in parentheses; three spaces
 	// and `Doc-tests <crate>`. Anything looser matches a test's own output.
-	libtestSection = regexp.MustCompile(`^ {5}Running (?:unittests )?\S.* \([^()\s]+\)$|^ {3}Doc-tests \S+$`)
-	libtestBlock   = regexp.MustCompile(`^---- (.+) stdout ----$`)
-	libtestFailed  = regexp.MustCompile(`(?:^|\W)test (.+?) \.\.\. FAILED$`)
-	libtestFooter  = regexp.MustCompile("^error: (?:test|doctest) failed, to rerun pass `([^`]+)`$")
-	libtestResult  = regexp.MustCompile(`^test result: `)
-	libtestCompile = regexp.MustCompile(`^error: could not compile `)
-	ansiEscape     = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	libtestSection      = regexp.MustCompile(`^ {5}Running (?:unittests )?\S.* \([^()\s]+\)$|^ {3}Doc-tests \S+$`)
+	libtestBlock        = regexp.MustCompile(`^---- (.+) stdout ----$`)
+	libtestFailed       = regexp.MustCompile(`(?:^|\W)test (.+?) \.\.\. FAILED$`)
+	libtestFooter       = regexp.MustCompile("^error: (?:test|doctest) failed, to rerun pass `([^`]+)`$")
+	libtestResult       = regexp.MustCompile(`^test result: `)
+	libtestResultFailed = regexp.MustCompile(`^test result: FAILED`)
+	libtestCompile      = regexp.MustCompile(`^error: could not compile `)
+	ansiEscape          = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 )
 
 const maxLogLine = 4 << 20
@@ -90,9 +96,12 @@ func parseLibtest(r io.Reader) SuiteRun {
 		if section == nil {
 			return
 		}
-		failed, pkg, target, done := readSection(section)
+		failed, pkg, target, done, resultFailed := readSection(section)
 		if done {
 			results++
+			if resultFailed {
+				run.FailedResults++
+			}
 		} else {
 			incomplete++
 		}
@@ -183,7 +192,7 @@ func (b *blockState) feed(line string) {
 
 // readSection reads one test binary's output. done is whether it reached its
 // own `test result:` line.
-func readSection(lines []string) (failed []string, pkg, target string, done bool) {
+func readSection(lines []string) (failed []string, pkg, target string, done, resultFailed bool) {
 	result := -1
 	for i, l := range lines {
 		if libtestResult.MatchString(l) {
@@ -209,7 +218,7 @@ func readSection(lines []string) (failed []string, pkg, target string, done bool
 	failed = fromLines
 	pkg, target = "?", ""
 	if result < 0 {
-		return failed, pkg, target, false
+		return failed, pkg, target, false, false
 	}
 	// The summary: the names listed after the last `failures:` before the result.
 	last := -1
@@ -237,7 +246,7 @@ func readSection(lines []string) (failed []string, pkg, target string, done bool
 			break
 		}
 	}
-	return failed, pkg, target, true
+	return failed, pkg, target, true, libtestResultFailed.MatchString(lines[result])
 }
 
 // splitRerun splits `-p cb --test it` into the package and `--test it`.
@@ -312,6 +321,7 @@ func parseGoJSON(r io.Reader) SuiteRun {
 		}
 	}
 	sortFailures(run.Failures)
+	run.Done = donePkg
 	var unfinished []string
 	for pkg := range seenPkg {
 		if !donePkg[pkg] {
@@ -334,19 +344,15 @@ func sortFailures(fs []Failure) {
 	sort.Slice(fs, func(i, j int) bool { return fs[i].Key() < fs[j].Key() })
 }
 
-// Covers reports whether the plan's selection ran the failed test. A unit with
-// no target is a whole package (a Go package, or every target of a crate); one
-// with a target covers that target only.
+// Covers reports whether the plan's selection ran the failed test's crate or
+// package. Every unit is whole: a Go package, or every target of a crate.
 func (p Plan) Covers(f Failure) bool {
 	if p.Everything {
 		return true
 	}
 	for _, sel := range p.Selected {
 		for _, u := range sel.Units {
-			if u.Kind != f.Kind || u.Pkg != f.Pkg {
-				continue
-			}
-			if f.Kind == "go" || u.Target == "" || u.Target == f.Target {
+			if u.Kind == f.Kind && u.Pkg == f.Pkg {
 				return true
 			}
 		}
@@ -407,6 +413,10 @@ type Recall struct {
 	BaseRecord *BaseRecord `json:"base_record"`
 	// Missed are failures the selection did not run and the base did not have.
 	Missed []string `json:"missed"`
+	// SelectedNotReproduced are new failures in a crate or package the
+	// selection ran, that the fast phase did not itself fail: a phase
+	// difference (features, ordering), not a miss. They count against recall.
+	SelectedNotReproduced []string `json:"selected_not_reproduced"`
 	// Unclassified are failures outside the selection while the base is
 	// unknown: they may be the base's own.
 	Unclassified []string `json:"unclassified"`
@@ -533,7 +543,7 @@ func Audit(in AuditInput) (Recall, []string) {
 		Schema: recallSchema, SHA: in.SHA, Ref: in.Ref, Event: in.Event, RunID: in.ID,
 		Base: in.Plan.Base, Trigger: in.Plan.Trigger, Blast: in.Plan.Blast,
 		Everything: in.Plan.Everything, Widened: in.Plan.Widened, Selected: []RecallSelected{},
-		Missed: []string{}, Unclassified: []string{},
+		Missed: []string{}, SelectedNotReproduced: []string{}, Unclassified: []string{},
 	}
 	for _, s := range in.Plan.Selected {
 		r.Selected = append(r.Selected, RecallSelected{Cmd: s.Display, Files: s.Files, Seeds: s.Seeds, Why: s.Why})
@@ -553,6 +563,12 @@ func Audit(in AuditInput) (Recall, []string) {
 		fullFailed[f.Key()] = true
 	}
 	fullExamined := in.Rust.Examined && in.Go.Examined
+	selectedFailed := map[string]bool{}
+	for _, f := range append(append([]Failure{}, in.SelectedRust.Failures...), in.SelectedGo.Failures...) {
+		selectedFailed[f.Key()] = true
+	}
+	// The fast phase's own failures are evidence only when it was examined.
+	selectedUsable := in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && in.SelectionNote == ""
 	if in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && fullExamined {
 		r.SelectedPhaseFailedOnly = []string{}
 		for _, f := range append(append([]Failure{}, in.SelectedRust.Failures...), in.SelectedGo.Failures...) {
@@ -598,13 +614,19 @@ func Audit(in AuditInput) (Recall, []string) {
 	// needs both examined. This is the one place that says so; Exit reads the
 	// same facts in the same order.
 	missable := baseKnown && fullExamined && !in.PlanUnusable && in.SelectionNote == ""
-	covered := 0
+	reproduced := 0
 	for _, f := range attributable {
 		switch {
 		case in.PlanUnusable:
 			r.Unclassified = append(r.Unclassified, f.Key())
+		case ran.Covers(f) && selectedFailed[f.Key()] && selectedUsable:
+			reproduced++
+		case ran.Covers(f) && selectedUsable && !in.Plan.Everything:
+			r.SelectedNotReproduced = append(r.SelectedNotReproduced, f.Key())
+			notes = append(notes, annotate("warning", "selection ran "+f.Pkg+" but the fast phase did not fail "+f.Name))
 		case ran.Covers(f):
-			covered++
+			// Inside the selection, with no examined fast phase to say more;
+			// recall is null in every such case.
 		case missable && f.Pkg != unknownPkg:
 			r.Missed = append(r.Missed, f.Key())
 			notes = append(notes, annotate("error", "selection missed "+f.Key()))
@@ -637,9 +659,9 @@ func Audit(in AuditInput) (Recall, []string) {
 	case r.NFailed == 0:
 		r.RecallNote = "nothing failed that the base did not, so there was no test for the selection to find"
 	default:
-		v := float64(covered) / float64(r.NFailed)
+		v := float64(reproduced) / float64(r.NFailed)
 		r.Recall = &v
-		r.RecallNote = fmt.Sprintf("%d of %d new failure(s) were inside the selection", covered, r.NFailed)
+		r.RecallNote = fmt.Sprintf("%d of %d new failure(s) were reproduced by the fast phase", reproduced, r.NFailed)
 	}
 	return r, notes
 }

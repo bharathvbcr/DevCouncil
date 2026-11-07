@@ -113,17 +113,24 @@ var (
 	failCaFoo = Failure{Kind: "rust", Pkg: "ca", Target: "--test foo", Name: "integ_bad"}
 	failCdLib = Failure{Kind: "rust", Pkg: "cd", Target: "--lib", Name: "engine::t::bad"}
 	failGoBad = Failure{Kind: "go", Pkg: "toy/bad", Name: "TestBroken"}
-	// selectedCa selects ca's `foo` test target and the whole of crate cd.
+	// selectedCa selects crates ca and cd, whole, in one cargo command.
 	selectedCa = Plan{Schema: planSchema, Base: baseSHA,
 		Full: []Command{newCommand("rust", "cargo", "test", "--locked", "--workspace", "--no-fail-fast")},
 		Selected: []Selected{
-			{Command: newCommand("rust", "cargo", "test", "-p", "ca", "--test", "foo"), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--test foo"}}},
-			{Command: newCommand("rust", "cargo", "test", "-p", "cd"), Units: []Unit{{Kind: "rust", Pkg: "cd"}}},
+			{Command: logged(newCommand("rust", "cargo", "test", "--locked", "-p", "ca", "-p", "cd", "--no-fail-fast")), Units: []Unit{{Kind: "rust", Pkg: "ca"}, {Kind: "rust", Pkg: "cd"}}},
 		}}
 )
 
+// fastPhase is the audit input's view of a fast phase that ran and was
+// examined, with exactly these failures.
+func fastPhase(in AuditInput, fs ...Failure) AuditInput {
+	in.SelectedKnown = true
+	in.SelectedRust, in.SelectedGo = examined(fs...), examined()
+	return in
+}
+
 func TestAFailureTheSelectionDidNotRunAndTheBaseDidNotHaveIsAMiss(t *testing.T) {
-	r, notes := Audit(AuditInput{Plan: selectedCa, SHA: "s", Rust: examined(failCaFoo, failCbIt), Go: examined(), Base: []string{}})
+	r, notes := Audit(fastPhase(AuditInput{Plan: selectedCa, SHA: "s", Rust: examined(failCaFoo, failCbIt), Go: examined(), Base: []string{}}, failCaFoo))
 	if len(r.Missed) != 1 || r.Missed[0] != failCbIt.Key() {
 		t.Fatalf("missed = %v", r.Missed)
 	}
@@ -139,7 +146,7 @@ func TestAFailureTheSelectionDidNotRunAndTheBaseDidNotHaveIsAMiss(t *testing.T) 
 }
 
 func TestAFailureTheBaseAlreadyHadIsNotAMissAndIsNotCounted(t *testing.T) {
-	r, notes := Audit(AuditInput{Plan: selectedCa, Rust: examined(failCbIt, failCaFoo), Go: examined(), Base: []string{failCbIt.Key()}})
+	r, notes := Audit(fastPhase(AuditInput{Plan: selectedCa, Rust: examined(failCbIt, failCaFoo), Go: examined(), Base: []string{failCbIt.Key()}}, failCaFoo))
 	if len(r.Missed) != 0 {
 		t.Fatalf("a failure the base had was reported as a miss: %v", r.Missed)
 	}
@@ -222,35 +229,33 @@ func TestAnEverythingPlanCoversEveryFailureButSaysNothingAboutRecall(t *testing.
 	}
 }
 
-func TestACoveredFailureMatchesPackageAndTargetOnly(t *testing.T) {
-	if !selectedCa.Covers(failCaFoo) || !selectedCa.Covers(failCdLib) {
-		t.Fatal("a failure in a selected target, or anywhere in a wholly selected crate, is covered")
-	}
+func TestACoveredFailureMatchesTheCrateOrPackageWhole(t *testing.T) {
+	// A unit is a whole crate or package: any target of it is inside the selection.
 	for name, f := range map[string]Failure{
-		"another package": failCbIt,
-		"another target":  {Kind: "rust", Pkg: "ca", Target: "--test bar", Name: "x"},
-		"the lib of a crate whose only selected target is a test": {Kind: "rust", Pkg: "ca", Target: "--lib", Name: "x"},
-		"a doctest of the same":                                   {Kind: "rust", Pkg: "ca", Target: "--doc", Name: "ca/src/lib.rs - d (line 3)"},
-		"go":                                                      failGoBad,
+		"a test target of a selected crate": failCaFoo,
+		"the lib of another selected crate": failCdLib,
+		"a doctest of a selected crate":     {Kind: "rust", Pkg: "ca", Target: "--doc", Name: "ca/src/lib.rs - d (line 3)"},
+		"whatever the module path":          {Kind: "rust", Pkg: "cd", Target: "--lib", Name: "db::payload_serialization_tests::roundtrip"},
 	} {
+		if !selectedCa.Covers(f) {
+			t.Errorf("%s was not reported as covered", name)
+		}
+	}
+	for name, f := range map[string]Failure{"another package": failCbIt, "go": failGoBad} {
 		if selectedCa.Covers(f) {
 			t.Errorf("%s was reported as covered", name)
 		}
 	}
-	// A module path never narrows a unit: the name of the test is not consulted.
-	if !selectedCa.Covers(Failure{Kind: "rust", Pkg: "cd", Target: "--lib", Name: "db::payload_serialization_tests::roundtrip"}) {
-		t.Error("a test of a wholly selected crate is covered whatever its module path")
-	}
-	whole := Plan{Selected: []Selected{{Units: []Unit{{Kind: "rust", Pkg: "ca"}, {Kind: "rust", Pkg: "cd"}, {Kind: "go", Pkg: "toy/bad"}}}}}
-	if !whole.Covers(failCaFoo) || !whole.Covers(failCdLib) || !whole.Covers(failGoBad) {
-		t.Error("a unit with no target covers every target of its package, and a Go package covers its tests")
+	both := Plan{Selected: []Selected{{Units: []Unit{{Kind: "rust", Pkg: "ca"}, {Kind: "go", Pkg: "toy/bad"}}}}}
+	if !both.Covers(failCaFoo) || !both.Covers(failGoBad) || both.Covers(failCdLib) {
+		t.Error("a Go package covers its tests, a crate covers its targets, and nothing else")
 	}
 }
 
 const mainRef = "refs/heads/main"
 
 func baseDoc(mutate func(string) string) []byte {
-	return []byte(mutate(`{"schema":2,"sha":"abc","ref":"refs/heads/main","event":"push","run_id":"7","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["a","b"]}}`))
+	return []byte(mutate(`{"schema":3,"sha":"abc","ref":"refs/heads/main","event":"push","run_id":"7","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["a","b"]}}`))
 }
 
 func TestBaseFailuresAcceptsOnlyAnExaminedSameSchemaPushRecordOfTheBaseBranch(t *testing.T) {
@@ -263,7 +268,7 @@ func TestBaseFailuresAcceptsOnlyAnExaminedSameSchemaPushRecordOfTheBaseBranch(t 
 		t.Fatalf("an examined base with no failures is an empty list, not unknown: got=%v why=%q", got, why)
 	}
 	for name, mutate := range map[string]func(string) string{
-		"other schema":   func(s string) string { return strings.Replace(s, `"schema":2`, `"schema":1`, 1) },
+		"other schema":   func(s string) string { return strings.Replace(s, `"schema":3`, `"schema":2`, 1) },
 		"other ref":      func(s string) string { return strings.Replace(s, `refs/heads/main`, `refs/pull/9/merge`, 1) },
 		"no ref":         func(s string) string { return strings.Replace(s, `"ref":"refs/heads/main",`, ``, 1) },
 		"pull request":   func(s string) string { return strings.Replace(s, `"event":"push"`, `"event":"pull_request"`, 1) },
@@ -432,7 +437,7 @@ const goPass = `{"Action":"pass","Package":"toy/ok"}` + "\n"
 func TestAuditCommandEndToEndReportsAPlantedMissAndExitsOne(t *testing.T) {
 	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
 	// The base had a different failure, so the planted one is new.
-	base := writeFile(t, dir, "base.json", `{"schema":2,"sha":"bb","ref":"refs/heads/main","event":"push","run_id":"1","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["rust:cb:--test it:old"]}}`)
+	base := writeFile(t, dir, "base.json", `{"schema":3,"sha":"bb","ref":"refs/heads/main","event":"push","run_id":"1","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["rust:cb:--test it:old"]}}`)
 	code, stdout, r := auditIn(t, dir, "--base-artifact", base)
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1; stdout:\n%s", code, stdout)
@@ -440,7 +445,7 @@ func TestAuditCommandEndToEndReportsAPlantedMissAndExitsOne(t *testing.T) {
 	if !strings.Contains(stdout, "::error::selection missed rust:cb:--test it:m::in_m") {
 		t.Errorf("stdout = %q", stdout)
 	}
-	if r.SHA != "abc" || r.Ref != mainRef || r.Event != "push" || r.RunID != "9" || r.Schema != 2 {
+	if r.SHA != "abc" || r.Ref != mainRef || r.Event != "push" || r.RunID != "9" || r.Schema != recallSchema {
 		t.Errorf("provenance = %s %s %s %s schema %d", r.SHA, r.Ref, r.Event, r.RunID, r.Schema)
 	}
 	if len(r.Missed) != 1 || r.Recall == nil || *r.Recall != 0 || r.NFailed != 1 || r.BaseRecord == nil || r.BaseRecord.RunID != "1" {
@@ -511,7 +516,7 @@ func TestAuditCommandWithAnUnusablePlanStillWritesTheArtifact(t *testing.T) {
 
 func TestTheFastPhasesLogsNameASelectedOnlyFailure(t *testing.T) {
 	plan := selectedCa
-	plan.Selected = []Selected{{Command: logged(newCommand("rust", "cargo", "test")), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--lib"}}}}
+	plan.Selected = []Selected{{Command: logged(newCommand("rust", "cargo", "test")), Units: []Unit{{Kind: "rust", Pkg: "ca"}}}}
 	dir := phaseDir(t, plan, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
 	writeFile(t, dir, "selected-rust.log", "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest only_here ... FAILED\n\nfailures:\n\n---- only_here stdout ----\n\nfailures:\n    only_here\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p ca --lib`\n")
 	_, stdout, r := auditIn(t, dir)
@@ -559,12 +564,10 @@ func TestRecallIsNullWhenASelectedCommandDidNotComplete(t *testing.T) {
 	base := func(dir string) string {
 		return writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
 	}
-	// The fast phase's `-p cd` command was killed: nothing says it ran.
+	// The fast phase's cargo command was killed: nothing says it ran.
 	dir := phaseDir(t, selectedCa, failCd, goPass, finished(101))
-	sha := planSHA(t, filepath.Join(dir, "plan.json"))
-	killed := phaseStatus{Schema: statusSchema, PlanSHA256: sha, Commands: []ExitInfo{
-		{Cmd: selectedCa.Selected[0].Display, Log: "selected-rust.log", Completed: true, Detail: "exit status 0"},
-		{Cmd: selectedCa.Selected[1].Display, Log: "selected-rust.log", Code: -1, Detail: "signal: killed"},
+	killed := phaseStatus{Schema: statusSchema, PlanSHA256: planSHA(t, filepath.Join(dir, "plan.json")), Commands: []ExitInfo{
+		{Cmd: selectedCa.Selected[0].Display, Log: "selected-rust.log", Code: -1, Detail: "signal: killed"},
 	}}
 	if err := writeAtomic(filepath.Join(dir, "selected-status.json"), killed); err != nil {
 		t.Fatal(err)
@@ -582,8 +585,10 @@ func TestRecallIsNullWhenASelectedCommandDidNotComplete(t *testing.T) {
 	if code != 2 || r.Recall != nil || len(r.Missed) != 0 || !strings.Contains(r.RecallNote, "not examined") {
 		t.Fatalf("missing: exit=%d recall=%v missed=%v note=%q", code, r.Recall, r.Missed, r.RecallNote)
 	}
-	// A healthy fast phase, with the same failure inside the selection, is a recall of 1.
+	// A healthy fast phase that failed the same test is a recall of 1.
 	dir = phaseDir(t, selectedCa, failCd, goPass, finished(101))
+	selectedStatus(t, dir, selectedCa, ExitInfo{Code: 101, Detail: "exit status 101"})
+	writeFile(t, dir, "selected-rust.log", failCd)
 	if code, _, r := auditIn(t, dir, "--base-artifact", base(dir)); code != 0 || r.Recall == nil || *r.Recall != 1 {
 		t.Fatalf("healthy: exit=%d recall=%v", code, r.Recall)
 	}
@@ -604,5 +609,39 @@ func TestAStatusFromAnotherPlanIsRefused(t *testing.T) {
 	code, _, r := auditIn(t, dir)
 	if code != 2 || r.Full.Rust.Examined || !strings.Contains(r.Full.Rust.Note, "stale status") {
 		t.Fatalf("exit=%d rust=%+v", code, r.Full.Rust)
+	}
+}
+
+// Recall is measured on the fast phase's own failures: a failure in a crate the
+// selection ran that the fast phase did not fail is a phase difference (the
+// features it was built with), not a catch and not a miss.
+func TestAFailureInASelectedCrateTheFastPhaseDidNotFailIsNotReproducedNotAMissAndExitsZero(t *testing.T) {
+	in := fastPhase(AuditInput{Plan: selectedCa, Rust: examined(failCdLib), Go: examined(), Base: []string{}})
+	r, notes := Audit(in)
+	if len(r.SelectedNotReproduced) != 1 || r.SelectedNotReproduced[0] != failCdLib.Key() || len(r.Missed) != 0 {
+		t.Fatalf("selected_not_reproduced=%v missed=%v", r.SelectedNotReproduced, r.Missed)
+	}
+	if r.Recall == nil || *r.Recall != 0 || r.NFailed != 1 {
+		t.Errorf("recall=%v n_failed=%d, want 0 of 1", r.Recall, r.NFailed)
+	}
+	if !contains(notes, annotate("warning", "selection ran cd but the fast phase did not fail engine::t::bad")) {
+		t.Errorf("notes = %q", notes)
+	}
+	if code := Exit(in, r); code != 0 {
+		t.Errorf("exit = %d, want 0: a phase difference is priced in recall, not a gate", code)
+	}
+	body, _ := json.Marshal(r)
+	if !bytes.Contains(body, []byte(`"selected_not_reproduced":["rust:cd:--lib:engine::t::bad"]`)) {
+		t.Errorf("artifact = %s", body)
+	}
+	// The same failure, reproduced by the fast phase, is a recall of 1.
+	r, _ = Audit(fastPhase(AuditInput{Plan: selectedCa, Rust: examined(failCdLib), Go: examined(), Base: []string{}}, failCdLib))
+	if r.Recall == nil || *r.Recall != 1 || len(r.SelectedNotReproduced) != 0 {
+		t.Errorf("recall=%v not_reproduced=%v", r.Recall, r.SelectedNotReproduced)
+	}
+	// And with no examined fast phase to read, coverage is not claimed either way.
+	r, _ = Audit(AuditInput{Plan: selectedCa, Rust: examined(failCdLib), Go: examined(), Base: []string{}})
+	if len(r.SelectedNotReproduced) != 0 || len(r.Missed) != 0 {
+		t.Errorf("without a fast phase log: not_reproduced=%v missed=%v", r.SelectedNotReproduced, r.Missed)
 	}
 }

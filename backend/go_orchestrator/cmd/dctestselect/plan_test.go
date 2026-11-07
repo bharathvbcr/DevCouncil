@@ -38,7 +38,7 @@ func workspace() *RustWorkspace {
 		}},
 		{Name: "cf", Dir: "rust/cf", Targets: []RustTarget{
 			t("cf", "rust/cf/src/lib.rs", "lib"),
-			{Name: "gated", Kinds: []string{"test"}, Src: "rust/cf/tests/gated.rs", Test: true, RequiredFeatures: []string{"slow"}},
+			t("gated", "rust/cf/tests/gated.rs", "test"),
 		}},
 		{Name: "devmap-cli", Dir: "rust/devmap-cli", Targets: []RustTarget{
 			t("devmap", "rust/devmap-cli/src/main.rs", "bin"), t("it", "rust/devmap-cli/tests/it.rs", "test"),
@@ -177,9 +177,9 @@ func TestAChangedSourceFileSelectsItsCrateWhetherOrNotTheGraphReachedATest(t *te
 	wantCmd(t, BuildPlan(in), "cargo test --locked -p ca --no-fail-fast")
 }
 
-func TestADeclaredTestTargetSelectsThatTargetOnly(t *testing.T) {
+func TestADeclaredTestTargetSelectsItsWholeCrateWithNoTargetFilter(t *testing.T) {
 	p := BuildPlan(inputs(withTests("rust/ca/tests/foo.rs", "rust/ca/tests/bar.rs")))
-	wantCmd(t, p, "cargo test --locked -p ca --test bar --test foo --no-fail-fast")
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 }
 
 func TestAnyOtherFileUnderTestsSelectsEveryTargetOfItsCrate(t *testing.T) {
@@ -222,7 +222,6 @@ func TestAGoTestFileRunsItsPackage(t *testing.T) {
 func TestReachedPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testing.T) {
 	p := BuildPlan(inputs(withTests(
 		"rust/dc-store/src/lib.rs",  // excluded package
-		"rust/cf/tests/gated.rs",    // needs a feature the suite does not enable
 		"rust/elsewhere/tests/x.rs", // not a workspace member
 		"go/nowhere/n_test.go",      // not a go list package
 		"docs/notes.md",             // not a test file
@@ -238,7 +237,6 @@ func TestReachedPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testi
 	}
 	for path, part := range map[string]string{
 		"rust/dc-store/src/lib.rs":  "excluded",
-		"rust/cf/tests/gated.rs":    "requires features",
 		"rust/elsewhere/tests/x.rs": "outside every main-workspace member",
 		"go/nowhere/n_test.go":      "in no package of the module",
 		"docs/notes.md":             "neither a Rust nor a Go file",
@@ -249,7 +247,7 @@ func TestReachedPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testi
 		}
 	}
 	for _, c := range cmds(p) {
-		if strings.Contains(c, "dc-store") || strings.Contains(c, "-p cf") {
+		if strings.Contains(c, "dc-store") {
 			t.Errorf("a command outside the full suite's universe was selected: %q", c)
 		}
 	}
@@ -460,10 +458,7 @@ func TestARustDcOrDevmapCliChangeSelectsTheGoPackagesThatDriveThoseBinaries(t *t
 				t.Fatalf("widened to everything: %v", p.Widened)
 			}
 			got := cmds(p)
-			want := []string{"go test -count=1 -json " + module + "/drv", "go test -count=1 -json " + module + "/viadevmap"}
-			for _, w := range want {
-				wantCmd(t, p, w)
-			}
+			wantCmd(t, p, "go test -count=1 -json "+module+"/drv "+module+"/viadevmap")
 			for _, c := range got {
 				if strings.Contains(c, "plain") || strings.Contains(c, "pkga") || strings.Contains(c, "testsupport") {
 					t.Errorf("a package that drives no Rust binary was selected: %q", c)
@@ -532,8 +527,7 @@ func TestARealThreeCommitBlastWidensTheCratesItCouldNotPlaceAndDropsTheExcludedO
 	if p.Everything {
 		t.Fatalf("a real three-commit blast widened to everything: %v", p.Widened)
 	}
-	wantCmd(t, p, "cargo test --locked -p devmap-cli --no-fail-fast")
-	wantCmd(t, p, "cargo test --locked -p devmap-extract --no-fail-fast")
+	wantCmd(t, p, "cargo test --locked -p devmap-cli -p devmap-extract --no-fail-fast")
 	for _, c := range cmds(p) {
 		if strings.Contains(c, "dc-grep") {
 			t.Errorf("dc-grep is outside the full suite: %q", c)
@@ -562,8 +556,7 @@ func TestARealGoBlastSelectsThePackagesItsTestFilesLiveIn(t *testing.T) {
 	if p.Everything {
 		t.Fatalf("widened: %v", p.Widened)
 	}
-	wantCmd(t, p, "go test -count=1 -json "+module+"/cmd/devcouncil")
-	policy := wantCmd(t, p, "go test -count=1 -json "+module+"/policy")
+	policy := wantCmd(t, p, "go test -count=1 -json "+module+"/cmd/devcouncil "+module+"/policy")
 	if len(policy.Seeds) == 0 || !strings.Contains(policy.Seeds[0], "backend/go_orchestrator/policy/command.go::") {
 		t.Errorf("policy's seeds = %v", policy.Seeds)
 	}
@@ -614,5 +607,48 @@ func TestSelectedCommandsLogToThePhasesLogsAndGoRunsAsJSON(t *testing.T) {
 	}
 	if rust == 0 || golang == 0 {
 		t.Fatalf("rust=%d go=%d: %q", rust, golang, cmds(p))
+	}
+}
+
+// A crate is built with the features its dependents ask for, so the selection
+// is the crate and every workspace member that depends on it, in one command:
+// separate commands would build the crate with fewer features than the full
+// suite's --workspace does.
+func TestACrateWithADependentSelectsBothInOneCargoCommand(t *testing.T) {
+	in := inputs(withChanged("rust/ca/src/engine.rs"), withTests("rust/ca/src/engine.rs"))
+	in.Rust.Dependents = map[string][]string{"ca": {"cb", "cc"}}
+	p := BuildPlan(in)
+	sel := wantCmd(t, p, "cargo test --locked -p ca -p cb -p cc --no-fail-fast")
+	if len(p.Selected) != 1 || len(sel.Units) != 3 || !strings.Contains(sel.Why, "with dependents cb, cc") {
+		t.Fatalf("selected %q units=%+v why=%q", cmds(p), sel.Units, sel.Why)
+	}
+	// Two changed crates still make one command.
+	in = inputs(withChanged("rust/ca/src/engine.rs", "rust/cb/src/lib.rs"))
+	in.Rust.Dependents = map[string][]string{"ca": {"cb"}}
+	wantCmd(t, BuildPlan(in), "cargo test --locked -p ca -p cb --no-fail-fast")
+}
+
+func TestADependentTheFullSuiteExcludesIsDroppedAndLoggedNotSelected(t *testing.T) {
+	in := inputs(withChanged("rust/ca/src/engine.rs"), withTests("rust/ca/src/engine.rs"))
+	in.Rust.Dependents = map[string][]string{"ca": {"dc-store", "cb"}}
+	p := BuildPlan(in)
+	wantCmd(t, p, "cargo test --locked -p ca -p cb --no-fail-fast")
+	if len(p.Dropped) != 1 || p.Dropped[0].Path != "rust/dc-store" || !strings.Contains(p.Dropped[0].Reason, "excluded") {
+		t.Errorf("dropped = %+v", p.Dropped)
+	}
+}
+
+func TestAGoPackageIsSelectedWithEveryTestedPackageThatImportsItTransitively(t *testing.T) {
+	in := inputs(withChanged("go/lib/l.go"), withSeed("go/lib/l.go", "L"))
+	in.Go = &GoWorkspace{Module: module, Packages: []GoPackage{
+		{ImportPath: module + "/lib", Dir: "go/lib", GoFiles: []string{"go/lib/l.go"}, TestFiles: []string{"go/lib/l_test.go"}},
+		{ImportPath: module + "/mid", Dir: "go/mid", GoFiles: []string{"go/mid/m.go"}, Imports: []string{module + "/lib"}},
+		{ImportPath: module + "/top", Dir: "go/top", TestFiles: []string{"go/top/t_test.go"}, Imports: []string{module + "/mid", "testing"}},
+		{ImportPath: module + "/other", Dir: "go/other", TestFiles: []string{"go/other/o_test.go"}, Imports: []string{"strings"}},
+	}}
+	p := BuildPlan(in)
+	sel := wantCmd(t, p, "go test -count=1 -json "+module+"/lib "+module+"/top")
+	if len(p.Selected) != 1 || len(sel.Units) != 2 || !strings.Contains(sel.Why, "with importers "+module+"/top") {
+		t.Fatalf("selected %q units=%+v why=%q: top imports lib through mid, which has no tests of its own; other imports nothing selected", cmds(p), sel.Units, sel.Why)
 	}
 }

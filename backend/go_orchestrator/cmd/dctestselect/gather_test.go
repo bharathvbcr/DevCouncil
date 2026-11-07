@@ -122,3 +122,27 @@ func TestMetadataWithoutAResolveGraphIsRefused(t *testing.T) {
 		t.Fatalf("err = %v; a closure that cannot be computed must not be an empty one", err)
 	}
 }
+
+// A crate selected without its dependents is built with fewer features than the
+// full suite builds it with, so the reverse closure follows every edge: a dev
+// edge is a dependent here, though the driver closure leaves it out.
+func TestDependentsAreTheTransitiveReverseClosureOverEveryEdgeKind(t *testing.T) {
+	root, doc := metadataFixture(t, true)
+	ws, err := decodeMetadata(doc, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"devmap-leaf":     "devmap-cli devmap-lib",
+		"devmap-testonly": "devmap-cli devmap-lib",
+		"devmap-lib":      "devmap-cli",
+		"dc-lib":          "dc-tool",
+		"unrelated":       "",
+		"devmap-cli":      "",
+	}
+	for name, deps := range want {
+		if got := strings.Join(ws.Dependents[name], " "); got != deps {
+			t.Errorf("dependents of %s = %q, want %q", name, got, deps)
+		}
+	}
+}

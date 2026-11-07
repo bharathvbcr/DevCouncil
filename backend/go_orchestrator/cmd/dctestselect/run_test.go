@@ -390,7 +390,7 @@ func TestCargoCommandsRunWithoutColour(t *testing.T) {
 			t.Errorf("%q env = %v; ANSI escapes hide lines from the audit", c.Display, c.Env)
 		}
 	}
-	if cargo < 3 {
+	if cargo < 2 {
 		t.Errorf("only %d cargo commands checked", cargo)
 	}
 }

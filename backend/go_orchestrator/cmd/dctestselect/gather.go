@@ -245,11 +245,10 @@ type metadataWire struct {
 		ID           string `json:"id"`
 		ManifestPath string `json:"manifest_path"`
 		Targets      []struct {
-			Name             string   `json:"name"`
-			Kind             []string `json:"kind"`
-			SrcPath          string   `json:"src_path"`
-			RequiredFeatures []string `json:"required-features"`
-			Test             *bool    `json:"test"`
+			Name    string   `json:"name"`
+			Kind    []string `json:"kind"`
+			SrcPath string   `json:"src_path"`
+			Test    *bool    `json:"test"`
 		} `json:"targets"`
 	} `json:"packages"`
 	WorkspaceMembers []string `json:"workspace_members"`
@@ -312,7 +311,7 @@ func decodeMetadata(raw []byte, repo string) (*RustWorkspace, error) {
 			if err != nil {
 				return nil, fmt.Errorf("target %s of %s: %w", t.Name, p.Name, err)
 			}
-			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, RequiredFeatures: t.RequiredFeatures, Test: *t.Test})
+			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, Test: *t.Test})
 		}
 		ws.Packages = append(ws.Packages, pkg)
 	}
@@ -324,7 +323,56 @@ func decodeMetadata(raw []byte, repo string) (*RustWorkspace, error) {
 		return nil, err
 	}
 	ws.DriverClosure = closure
+	ws.Dependents = dependents(&w, ws)
 	return ws, nil
+}
+
+// dependents is, for each member, the members that depend on it transitively.
+// Every edge counts, dev and build edges and platform-specific ones included
+// (cargo metadata lists all platforms): over-selection costs a little fast
+// phase time, under-selection builds a crate with fewer features than the full
+// suite does. driverClosure has already refused a missing resolve graph.
+func dependents(w *metadataWire, ws *RustWorkspace) map[string][]string {
+	nameOf := map[string]string{}
+	for _, p := range w.Packages {
+		nameOf[p.ID] = p.Name
+	}
+	rev := map[string][]string{}
+	for _, n := range w.Resolve.Nodes {
+		for _, d := range n.Deps {
+			rev[d.Pkg] = append(rev[d.Pkg], n.ID)
+		}
+	}
+	idOf := map[string]string{}
+	member := map[string]bool{}
+	for _, p := range w.Packages {
+		idOf[p.Name] = p.ID
+	}
+	for _, pkg := range ws.Packages {
+		member[pkg.Name] = true
+	}
+	out := map[string][]string{}
+	for _, pkg := range ws.Packages {
+		seen := map[string]bool{idOf[pkg.Name]: true}
+		queue := []string{idOf[pkg.Name]}
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			for _, up := range rev[id] {
+				if !seen[up] {
+					seen[up] = true
+					queue = append(queue, up)
+				}
+			}
+		}
+		for id := range seen {
+			if name := nameOf[id]; name != pkg.Name && member[name] {
+				out[pkg.Name] = append(out[pkg.Name], name)
+			}
+		}
+		sort.Strings(out[pkg.Name])
+	}
+	return out
 }
 
 // driverClosure is the set of workspace members compiled into a binary a Go
