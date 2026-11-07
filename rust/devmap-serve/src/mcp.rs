@@ -3067,6 +3067,12 @@ fn attach_stacked_incompleteness(
             st.dirty_files, st.tombstoned_files, st.delta_edges
         ));
     }
+    if !stacked.delta_present() {
+        reasons.push(
+            "this lane has no delta.sqlite yet (no sync has run): its delta is read as empty"
+                .to_string(),
+        );
+    }
     match stacked.unsynced_paths() {
         Ok(paths) if !paths.is_empty() => {
             let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
