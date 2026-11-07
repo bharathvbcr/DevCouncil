@@ -215,8 +215,11 @@ describe("ci:local runs the DevMap test selector's tests", () => {
   const source = () => readFileSync(path.join(root, "scripts", "ci-local.mjs"), "utf8");
 
   it("has a step that runs the selector's end-to-end tests under the e2e tag, from the Go module", () => {
-    const step = /run\(\s*"test selector end-to-end",\s*"go",\s*\["test", "-tags", "e2e", "\.\/cmd\/dctestselect", "-run", "\^TestE2E", "-count=1", "-p", "1"\],\s*\{\s*cwd: GO_MODULE,?\s*\}\s*\)/.exec(source());
-    assert.ok(step, "ci-local.mjs does not run `go test -tags e2e ./cmd/dctestselect -run ^TestE2E` from GO_MODULE");
+    const step = /run\(\s*"test selector end-to-end",\s*"go",\s*\["test", "-tags", "e2e", "\.\/cmd\/dctestselect", "-run", "\^TestE2E", "-count=1", "-p", "1", "-timeout", "(\d+)m"\],\s*\{\s*cwd: GO_MODULE,?\s*\}\s*\)/.exec(source());
+    assert.ok(step, "ci-local.mjs does not run `go test -tags e2e ./cmd/dctestselect -run ^TestE2E -timeout Nm` from GO_MODULE");
+    // go test's default package timeout is 10 minutes; the whole-crate e2e test
+    // bounds itself at 25, which only works if -timeout is longer than that.
+    assert.ok(Number(step[1]) > 25, `-timeout ${step[1]}m must exceed the 25-minute in-test bound`);
   });
 
   it("does not run the selector twice: the e2e tests are tagged out of ./..., so only this step runs them", () => {

@@ -221,7 +221,7 @@ function main() {
   // compile them, and this is their only run here; the selector's unit tests
   // are in `./...`. They drive the real `devmap` on PATH and fail, not skip,
   // without one.
-  run("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1"], {
+  run("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1", "-timeout", "30m"], {
     cwd: GO_MODULE,
   });
   run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {

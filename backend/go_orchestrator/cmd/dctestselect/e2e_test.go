@@ -290,7 +290,7 @@ func TestE2EDevmapExitsZeroPrintingNothing(t *testing.T) {
 	if code := run(context.Background(), []string{"plan", "--repo", root, "--devmap", fake, "--base", "HEAD~1", "--out", out}, &so, &se); code != 0 {
 		t.Fatalf("exit %d %s", code, se.String())
 	}
-	p, err := readPlan(out)
+	p, _, err := loadPlan(out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestE2EStaleIndexIsNotTrusted(t *testing.T) {
 	if code := run(context.Background(), []string{"plan", "--repo", root, "--devmap", bin, "--base", "HEAD~2", "--out", out}, &so, &se); code != 0 {
 		t.Fatalf("exit %d %s", code, se.String())
 	}
-	p, _ := readPlan(out)
+	p, _, _ := loadPlan(out)
 	t.Logf("stale index: everything=%t selected=%q widened=%v blast=%+v", p.Everything, cmds(p), p.Widened, p.Blast)
 	if !p.Everything && !coversUnit(p, "rust", "cb") {
 		t.Fatalf("index built at HEAD~1, change in HEAD (cb) is missing from the selection: %q", cmds(p))
@@ -580,7 +580,7 @@ func TestE2EThePlanHonoursItsTimeoutForADevmapThatHangs(t *testing.T) {
 	if code != 0 || time.Since(started) > 60*time.Second {
 		t.Fatalf("exit=%d after %s; a 2s timeout was not honoured", code, time.Since(started))
 	}
-	p, err := readPlan(out)
+	p, _, err := loadPlan(out)
 	if err != nil {
 		t.Fatal(err)
 	}

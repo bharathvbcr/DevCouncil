@@ -175,7 +175,7 @@ func TestAPlanOfTheWrongSchemaOrWithUnknownFieldsIsRefused(t *testing.T) {
 		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readPlan(p); err == nil {
+		if _, _, err := loadPlan(p); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

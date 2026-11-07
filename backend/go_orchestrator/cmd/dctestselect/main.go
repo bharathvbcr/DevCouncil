@@ -162,11 +162,6 @@ func logPlan(w io.Writer, p Plan) {
 	}
 }
 
-func readPlan(path string) (Plan, error) {
-	p, _, err := loadPlan(path)
-	return p, err
-}
-
 func auditCmd(args []string, stdout io.Writer) (int, error) {
 	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
 	planPath := fs.String("plan", "plan.json", "the plan the run followed")

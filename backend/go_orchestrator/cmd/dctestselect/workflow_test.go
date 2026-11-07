@@ -2,12 +2,14 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These tests read the workflow files as text. The repository has no YAML
@@ -175,6 +177,49 @@ func TestTheWorkflowRunsTheSelectorsEndToEndTestsUnderTheE2ETagAndOnlyThose(t *t
 	s := f.step(t, "Selector end-to-end")
 	if !s.has("-tags e2e") || !s.has("-run '^TestE2E'") || !s.has("./cmd/dctestselect") {
 		t.Errorf("the end-to-end step must run `go test -tags e2e ./cmd/dctestselect -run '^TestE2E'`:\n%s", strings.Join(s.lines, "\n"))
+	}
+	// go test's default package timeout is 10 minutes and panics the binary, so
+	// the 25-minute bound inside the whole-crate test only works if -timeout
+	// is passed and is longer than it.
+	m := regexp.MustCompile(`-timeout (\S+)`).FindStringSubmatch(strings.Join(s.lines, "\n"))
+	if m == nil {
+		t.Fatalf("the end-to-end step passes no -timeout, so go test's 10-minute default kills the 25-minute bound:\n%s", strings.Join(s.lines, "\n"))
+	}
+	if d, err := time.ParseDuration(m[1]); err != nil || d <= 25*time.Minute {
+		t.Errorf("-timeout %s must be a duration longer than the 25-minute in-test bound", m[1])
+	}
+}
+
+// The fetch step's esc() is the shell twin of escapeData: gh's error text goes
+// into a ::warning:: line, and a %, CR or LF in it must not end the annotation.
+func TestTheFetchStepsEscapeMatchesEscapeData(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	fetch := f.step(t, "Fetch the base")
+	def := ""
+	for _, l := range fetch.lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "esc() {") {
+			def = strings.TrimSpace(l)
+		}
+	}
+	if def == "" {
+		t.Fatal("the fetch step defines no esc() for gh's error text")
+	}
+	if strings.Contains(strings.Join(fetch.lines, "\n"), "tr '\\n' ' '") {
+		t.Error("a warning still flattens newlines with tr, which leaves % and CR unescaped")
+	}
+	for _, v := range []string{"plain", "a\nb", "100%\r\nx", "::error::injected", "%0A%"} {
+		out, err := exec.Command("bash", "-c", def+`; esc "$1"`, "bash", v).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != escapeData(v) {
+			t.Errorf("esc(%q) = %q, escapeData = %q", v, out, escapeData(v))
+		}
+	}
+	for _, want := range []string{`$(esc "$(head -c 300`, `$(esc "$(head -c 200`} {
+		if !fetch.has(want) {
+			t.Errorf("the fetch step does not pass its gh error text through esc: missing %q", want)
+		}
 	}
 }
 

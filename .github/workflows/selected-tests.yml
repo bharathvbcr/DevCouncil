@@ -151,12 +151,15 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/base"
+          # What dctestselect's escapeData does: gh's text is not ours, and a
+          # %, CR or LF in it would end the annotation and start another.
+          esc() { local s="$1"; s="${s//'%'/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"; printf '%s' "$s"; }
           # A failure here leaves the base unknown and says why; it does not
           # fail the job, and it is not swallowed.
           if ! ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow selected-tests.yml --branch "$BASE_BRANCH" \
             --event push --status completed --limit 10 \
             --json databaseId,conclusion --jq '.[] | select(.conclusion != "cancelled") | .databaseId' 2>"$RUNNER_TEMP/gh.err")"; then
-            echo "::warning::gh run list failed ($(head -c 300 "$RUNNER_TEMP/gh.err" | tr '\n' ' ')); base_failed is unknown"
+            echo "::warning::gh run list failed ($(esc "$(head -c 300 "$RUNNER_TEMP/gh.err")")); base_failed is unknown"
             exit 0
           fi
           for id in $ids; do
@@ -166,7 +169,7 @@ jobs:
               echo "base record: run $id"
               exit 0
             fi
-            echo "::warning::run $id has no usable selection-recall artifact ($(head -c 200 "$RUNNER_TEMP/gh.err" | tr '\n' ' '))"
+            echo "::warning::run $id has no usable selection-recall artifact ($(esc "$(head -c 200 "$RUNNER_TEMP/gh.err")"))"
           done
           echo "::warning::no selection-recall.json from a completed $BASE_BRANCH run; base_failed is unknown"
 
@@ -215,7 +218,7 @@ jobs:
       - name: Selector end-to-end
         if: ${{ !cancelled() }}
         working-directory: backend/go_orchestrator
-        run: go test -tags e2e ./cmd/dctestselect -run '^TestE2E' -count=1 -p 1
+        run: go test -tags e2e ./cmd/dctestselect -run '^TestE2E' -count=1 -p 1 -timeout 30m
 
       - name: Upload selection-recall.json
         if: ${{ always() }}
