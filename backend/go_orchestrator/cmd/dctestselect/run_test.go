@@ -150,7 +150,7 @@ func TestRunPhaseSelectedSkipsWhenThePlanIsEverythingAndRunsTheSelectionOtherwis
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if code := run(context.Background(), []string{"run", "--plan", skip, "--phase", "selected", "--repo", dir}, &out, &bytes.Buffer{}); code != 0 || !strings.Contains(out.String(), "fast phase is skipped") {
+	if code := run(context.Background(), []string{"run", "--plan", skip, "--phase", "selected", "--repo", dir, "--log-dir", dir}, &out, &bytes.Buffer{}); code != 0 || !strings.Contains(out.String(), "fast phase is skipped") {
 		t.Errorf("everything plan: code=%d out=%q", code, out.String())
 	}
 	some := filepath.Join(dir, "some.json")
@@ -159,7 +159,7 @@ func TestRunPhaseSelectedSkipsWhenThePlanIsEverythingAndRunsTheSelectionOtherwis
 		t.Fatal(err)
 	}
 	out.Reset()
-	if code := run(context.Background(), []string{"run", "--plan", some, "--phase", "selected", "--repo", dir}, &out, &bytes.Buffer{}); code != 0 || !strings.Contains(out.String(), "fine") {
+	if code := run(context.Background(), []string{"run", "--plan", some, "--phase", "selected", "--repo", dir, "--log-dir", dir}, &out, &bytes.Buffer{}); code != 0 || !strings.Contains(out.String(), "fine") {
 		t.Errorf("selection: code=%d out=%q", code, out.String())
 	}
 	if code := run(context.Background(), []string{"run", "--plan", some, "--phase", "bogus"}, &out, &bytes.Buffer{}); code != 2 {
@@ -291,7 +291,7 @@ func TestAMissingPlanRunsTheBuiltInFullSuiteAndSaysSoButNotTheFastPhase(t *testi
 		t.Errorf("status file = %q err=%v", body, err)
 	}
 	out.Reset()
-	if code := run(context.Background(), []string{"run", "--plan", filepath.Join(dir, "absent.json"), "--phase", "selected", "--repo", dir}, &out, &bytes.Buffer{}); code != 2 || strings.Contains(out.String(), "cargo") {
+	if code := run(context.Background(), []string{"run", "--plan", filepath.Join(dir, "absent.json"), "--phase", "selected", "--repo", dir, "--log-dir", dir}, &out, &bytes.Buffer{}); code != 2 || strings.Contains(out.String(), "cargo") {
 		t.Errorf("the selected phase with no plan: exit=%d out=%q", code, out.String())
 	}
 }
