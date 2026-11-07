@@ -100,7 +100,7 @@ func TestE2EAPathAttributeModuleChangeSelectsAndRunsTheWholeCrate(t *testing.T) 
 	put(t, root, "rust/ca/src/sub/b.rs", "#[test]\nfn tb() {\n    panic!(\"the renamed module's test runs only if the crate is selected whole\");\n}\n")
 	commit(t, root, "break the renamed module")
 	p, _ := planOf(t, root, bin, "HEAD~1")
-	whole := findCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
+	whole := findCmd(t, p, "cargo test --locked -p ca -p cb --no-fail-fast") // cb depends on ca
 	for _, c := range cmds(p) {
 		if strings.Contains(c, " -- ") {
 			t.Errorf("a libtest filter was emitted: %q", c)
@@ -124,7 +124,7 @@ func TestE2EAModuleOfAnAutoDiscoveredBinSelectsTheWholeCrate(t *testing.T) {
 	put(t, root, "rust/ca/src/bin/tool/helper.rs", "pub fn h() {\n    println!(\"x\");\n}\n")
 	commit(t, root, "change the module")
 	p, _ := planOf(t, root, bin, "HEAD~1")
-	findCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
+	findCmd(t, p, "cargo test --locked -p ca -p cb --no-fail-fast") // cb depends on ca
 }
 
 // The selected-status file from an earlier run, or from another plan, is not

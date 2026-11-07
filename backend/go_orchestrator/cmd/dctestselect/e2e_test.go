@@ -143,7 +143,7 @@ func TestE2EARustChangeSelectsItsTestsAndAGoChangeSelectsItsPackage(t *testing.T
 		t.Fatalf("the real blast named no seed: %+v", p.Blast)
 	}
 	t.Logf("rust change: selected=%q dropped=%v notices=%q", cmds(p), p.Dropped, p.Notices)
-	ca := findCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
+	ca := findCmd(t, p, "cargo test --locked -p ca -p cb --no-fail-fast")
 	if len(ca.Seeds) == 0 || !strings.Contains(strings.Join(ca.Seeds, " "), "price") {
 		t.Errorf("the selected command does not name the seed that selected it: %v", ca.Seeds)
 	}
@@ -152,7 +152,7 @@ func TestE2EARustChangeSelectsItsTestsAndAGoChangeSelectsItsPackage(t *testing.T
 			t.Errorf("a Rust-only change selected Go: %q", s.Display)
 		}
 	}
-	if !strings.Contains(log, "::notice::selected cargo test --locked -p ca --no-fail-fast") {
+	if !strings.Contains(log, "::notice::selected cargo test --locked -p ca -p cb --no-fail-fast") {
 		t.Errorf("the log does not say what was selected and from which seeds:\n%s", log)
 	}
 
