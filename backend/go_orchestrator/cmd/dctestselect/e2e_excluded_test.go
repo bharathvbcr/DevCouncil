@@ -59,11 +59,20 @@ func TestE2EChangeInAnExcludedCrateSelectsTheDependentTheFullSuiteFails(t *testi
 	logs := map[string]string{}
 	p := a3plan(ws, "rust/dc-proc/src/lib.rs")
 	full := a3cargo(t, root, logs, []string{"cargo", "test", "--workspace", "--exclude", "dc-proc", "--no-fail-fast"})
-	if p.Everything || len(p.Selected) != 1 || p.Selected[0].Display != "cargo test --locked -p user --no-fail-fast" {
+	// The fixture has no Go module, so the plan may also carry Go commands; the
+	// cargo command is the one under test.
+	var sel *Selected
+	for i := range p.Selected {
+		if p.Selected[i].Argv[0] == "cargo" {
+			sel = &p.Selected[i]
+		}
+	}
+	if p.Everything || sel == nil || sel.Display != "cargo test --locked -p user --no-fail-fast" {
 		t.Fatalf("selected %v everything=%v; user_bad fails in the full suite:\n%s", cmds(p), p.Everything, full)
 	}
-	r, code := a3audit(t, p, full, a3cargo(t, root, logs, p.Selected[0].Argv))
-	if !keyed(r, "user_bad") || !a3selectedFailed(a3cargo(t, root, logs, p.Selected[0].Argv), "user_bad") || len(r.SelectedPhaseFailedOnly) != 0 || code != 0 {
+	selLog := a3cargo(t, root, logs, sel.Argv)
+	r, code := a3audit(t, p, full, selLog)
+	if !keyed(r, "user_bad") || !a3selectedFailed(selLog, "user_bad") || len(r.SelectedPhaseFailedOnly) != 0 || code != 0 {
 		t.Fatalf("selected_only=%v exit=%d: the fast phase must fail user_bad as the full suite does; full failed %v", r.SelectedPhaseFailedOnly, code, r.Full.Failed)
 	}
 }
