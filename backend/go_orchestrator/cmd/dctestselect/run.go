@@ -164,6 +164,10 @@ func (s *phaseStatus) byCmd() map[string]*ExitInfo {
 	return out
 }
 
+// renameFile is os.Rename; a test replaces it to fail the one step that
+// publishes the file.
+var renameFile = os.Rename
+
 // writeAtomic writes a file by renaming a finished temp file over it, so a
 // reader sees the whole document or none of it.
 func writeAtomic(path string, v any) error {
@@ -181,7 +185,7 @@ func writeAtomic(path string, v any) error {
 		os.Remove(tmp.Name())
 		return err
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if err := renameFile(tmp.Name(), path); err != nil {
 		os.Remove(tmp.Name())
 		return err
 	}

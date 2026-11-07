@@ -368,7 +368,7 @@ func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatu
 	t.Helper()
 	dir := t.TempDir()
 	planPath := filepath.Join(dir, "plan.json")
-	if err := writeJSON(planPath, plan); err != nil {
+	if err := writeAtomic(planPath, plan); err != nil {
 		t.Fatal(err)
 	}
 	sha := planSHA(t, planPath)
@@ -380,7 +380,7 @@ func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatu
 	}
 	if status != nil {
 		status.PlanSHA256 = sha
-		if err := writeJSON(filepath.Join(dir, "full-status.json"), *status); err != nil {
+		if err := writeAtomic(filepath.Join(dir, "full-status.json"), *status); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -394,7 +394,7 @@ func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatu
 		}
 		sel.Commands = append(sel.Commands, ExitInfo{Cmd: s.Display, Log: s.Log, Completed: true, Detail: "exit status 0"})
 	}
-	if err := writeJSON(filepath.Join(dir, "selected-status.json"), sel); err != nil {
+	if err := writeAtomic(filepath.Join(dir, "selected-status.json"), sel); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -566,7 +566,7 @@ func TestRecallIsNullWhenASelectedCommandDidNotComplete(t *testing.T) {
 		{Cmd: selectedCa.Selected[0].Display, Log: "selected-rust.log", Completed: true, Detail: "exit status 0"},
 		{Cmd: selectedCa.Selected[1].Display, Log: "selected-rust.log", Code: -1, Detail: "signal: killed"},
 	}}
-	if err := writeJSON(filepath.Join(dir, "selected-status.json"), killed); err != nil {
+	if err := writeAtomic(filepath.Join(dir, "selected-status.json"), killed); err != nil {
 		t.Fatal(err)
 	}
 	code, stdout, r := auditIn(t, dir, "--base-artifact", base(dir))

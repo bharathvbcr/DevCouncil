@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -142,7 +143,7 @@ func TestALogNameThatIsAPathIsRefused(t *testing.T) {
 func TestRunPhaseSelectedSkipsWhenThePlanIsEverythingAndRunsTheSelectionOtherwise(t *testing.T) {
 	dir := t.TempDir()
 	skip := filepath.Join(dir, "everything.json")
-	if err := writeJSON(skip, Plan{Schema: planSchema, Everything: true, Selected: []Selected{}, Full: []Command{helper("ok")}}); err != nil {
+	if err := writeAtomic(skip, Plan{Schema: planSchema, Everything: true, Selected: []Selected{}, Full: []Command{helper("ok")}}); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
@@ -151,7 +152,7 @@ func TestRunPhaseSelectedSkipsWhenThePlanIsEverythingAndRunsTheSelectionOtherwis
 	}
 	some := filepath.Join(dir, "some.json")
 	sel := Selected{Command: helper("ok"), Units: []Unit{{Kind: "go", Pkg: "p"}}}
-	if err := writeJSON(some, Plan{Schema: planSchema, Selected: []Selected{sel}, Full: []Command{helper("ok")}}); err != nil {
+	if err := writeAtomic(some, Plan{Schema: planSchema, Selected: []Selected{sel}, Full: []Command{helper("ok")}}); err != nil {
 		t.Fatal(err)
 	}
 	out.Reset()
@@ -195,7 +196,7 @@ func TestEveryCommandOfAPhaseLeavesAStatus(t *testing.T) {
 	good.Log = "c.log"
 	useFullSuite(t, missing, failing, good)
 	planPath := filepath.Join(dir, "plan.json")
-	if err := writeJSON(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{missing, failing, good}}); err != nil {
+	if err := writeAtomic(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{missing, failing, good}}); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
@@ -250,7 +251,7 @@ func TestAPhaseRemovesTheStaleStatusAtStartAndWritesItsOwnWhole(t *testing.T) {
 	c.Log = "c.log"
 	useFullSuite(t, c)
 	planPath := filepath.Join(dir, "plan.json")
-	if err := writeJSON(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{c}}); err != nil {
+	if err := writeAtomic(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{c}}); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
@@ -267,21 +268,66 @@ func TestAPhaseRemovesTheStaleStatusAtStartAndWritesItsOwnWhole(t *testing.T) {
 	}
 }
 
-func TestWriteAtomicLeavesTheWholeDocumentOrTheOldOne(t *testing.T) {
+func failRename(t *testing.T) {
+	t.Helper()
+	prev := renameFile
+	renameFile = func(string, string) error { return errors.New("injected: the rename failed") }
+	t.Cleanup(func() { renameFile = prev })
+}
+
+// A write that fails after the temp file is complete but before it is
+// published must leave the old document whole and no temp file behind. A plain
+// os.WriteFile has no such step, so it replaces the content and fails this.
+func TestWriteAtomicLeavesTheOldDocumentWholeWhenPublishingFails(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "s.json")
 	if err := writeAtomic(p, map[string]int{"a": 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeAtomic(p, map[string]int{"b": 2}); err != nil {
-		t.Fatal(err)
+	old, _ := os.ReadFile(p)
+	failRename(t)
+	if err := writeAtomic(p, map[string]int{"b": 2}); err == nil {
+		t.Fatal("a failed rename was reported as success")
 	}
-	body, _ := os.ReadFile(p)
-	if !strings.Contains(string(body), `"b": 2`) || strings.Contains(string(body), `"a"`) {
-		t.Errorf("body = %s", body)
+	if body, _ := os.ReadFile(p); string(body) != string(old) {
+		t.Errorf("body = %s, want the old document %s", body, old)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.tmp*")); len(left) != 0 {
+		t.Errorf("temp files left behind: %v", left)
 	}
 	if err := writeAtomic(filepath.Join(dir, "no", "such", "s.json"), 1); err == nil {
 		t.Error("a write into a missing directory succeeded")
+	}
+}
+
+func TestWriteAtomicReplacesTheDocument(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "s.json")
+	for _, v := range []map[string]int{{"a": 1}, {"b": 2}} {
+		if err := writeAtomic(p, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if body, _ := os.ReadFile(p); !strings.Contains(string(body), `"b": 2`) || strings.Contains(string(body), `"a"`) {
+		t.Errorf("body = %s", body)
+	}
+}
+
+// plan.json is published the same way: a Plan step killed or failing mid-write
+// must not leave a truncated plan over the last whole one.
+func TestThePlanIsPublishedAtomically(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(out, []byte("old plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failRename(t)
+	var stdout bytes.Buffer
+	code := run(context.Background(), []string{"plan", "--repo", dir, "--devmap", filepath.Join(dir, "no-devmap"), "--timeout", "10s", "--out", out}, &stdout, &bytes.Buffer{})
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 when the plan could not be published", code)
+	}
+	if body, _ := os.ReadFile(out); string(body) != "old plan\n" {
+		t.Errorf("plan.json = %q; a failed publish replaced the old plan", body)
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, "*.tmp*")); len(left) != 0 {
 		t.Errorf("temp files left behind: %v", left)

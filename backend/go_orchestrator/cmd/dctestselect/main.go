@@ -125,7 +125,7 @@ func planCmd(ctx context.Context, args []string, stdout io.Writer) (int, error) 
 		return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 	}
 	plan := BuildPlan(gather(ctx, execRunner{timeout: o.Timeout}, o, readFile))
-	if err := writeJSON(*out, plan); err != nil {
+	if err := writeAtomic(*out, plan); err != nil {
 		return 2, err
 	}
 	logPlan(stdout, plan)
@@ -160,17 +160,6 @@ func logPlan(w io.Writer, p Plan) {
 	if !p.Everything && len(p.Selected) == 0 {
 		fmt.Fprintln(w, annotate("notice", "the change reaches no test the full suite runs; the full suite runs next"))
 	}
-}
-
-func writeJSON(path string, v any) error {
-	body, err := jsonIndent(v)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	return nil
 }
 
 func readPlan(path string) (Plan, error) {

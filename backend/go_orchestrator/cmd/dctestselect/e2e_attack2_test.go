@@ -136,13 +136,13 @@ func TestE2EAStaleStatusFromAnotherPlanIsNotReadAsThisRuns(t *testing.T) {
 		Full: []Command{{Display: "sleep", Dir: ".", Argv: []string{"sleep", "30"}, Log: "full-rust.log"}}}
 	useFullSuite(t, plan.Full...)
 	pp := filepath.Join(t.TempDir(), "plan.json")
-	if err := writeJSON(pp, plan); err != nil {
+	if err := writeAtomic(pp, plan); err != nil {
 		t.Fatal(err)
 	}
 	stale := phaseStatus{Schema: statusSchema, PlanSHA256: "another-plan", Commands: []ExitInfo{
 		{Cmd: "cargo test", Log: "full-rust.log", Completed: true, Detail: "exit status 0"},
 		{Cmd: "go test", Log: "full-go.jsonl", Completed: true, Detail: "exit status 0"}}}
-	if err := writeJSON(filepath.Join(logDir, "full-status.json"), stale); err != nil {
+	if err := writeAtomic(filepath.Join(logDir, "full-status.json"), stale); err != nil {
 		t.Fatal(err)
 	}
 	// A log cut at a binary boundary, which the parser cannot tell from a short suite.

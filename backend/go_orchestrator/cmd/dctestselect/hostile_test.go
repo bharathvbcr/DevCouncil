@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"os"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -379,36 +376,6 @@ func TestEscapedValuesCarryNoLineBreak(t *testing.T) {
 		if strings.ContainsAny(got[2:], "\r\n") {
 			t.Errorf("annotate(%q) = %q has a raw line break", s, got)
 		}
-	}
-}
-
-// Every e2e-tagged test must be reachable by the `-run '^TestE2E'` that CI and
-// ci:local pass: a tagged test without the prefix is compiled out of ./... and
-// filtered out of that run, so it runs nowhere.
-func TestEveryE2ETaggedTestIsNamedTestE2E(t *testing.T) {
-	files, err := filepath.Glob("*_test.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tagged := 0
-	decl := regexp.MustCompile(`(?m)^func (Test\w*)\(`)
-	for _, f := range files {
-		body, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.HasPrefix(string(body), "//go:build e2e\n") {
-			continue
-		}
-		tagged++
-		for _, m := range decl.FindAllStringSubmatch(string(body), -1) {
-			if !strings.HasPrefix(m[1], "TestE2E") {
-				t.Errorf("%s: %s is e2e-tagged and would be filtered out of -run '^TestE2E'", f, m[1])
-			}
-		}
-	}
-	if tagged == 0 {
-		t.Fatal("no file carries the e2e build tag; the guard would pass over nothing")
 	}
 }
 

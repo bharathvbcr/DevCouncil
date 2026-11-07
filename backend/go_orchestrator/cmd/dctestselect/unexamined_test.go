@@ -104,7 +104,7 @@ func TestAOneSuitePlanNeverMakesTheFullPhaseGreenWithoutTheRustSuite(t *testing.
 	ok := helper("ok")
 	ok.Log = "full-go.jsonl"
 	planPath := filepath.Join(dir, "plan.json")
-	if err := writeJSON(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{ok}}); err != nil {
+	if err := writeAtomic(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{ok}}); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
