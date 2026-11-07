@@ -89,13 +89,15 @@ func (f wfFile) step(t *testing.T, prefix string) wfStep {
 	return wfStep{}
 }
 
-const notCancelled = "if: ${{ !cancelled() }}"
+// gated is the condition of every step that needs the selector binary: it runs
+// whatever earlier steps did, but only when the selector was built.
+const gated = "if: ${{ !cancelled() && steps.selector.outcome == 'success' }}"
 
 func TestTheWorkflowRunsThePlanAndTheFullSuiteWhateverEarlierStepsDid(t *testing.T) {
 	f := loadWorkflow(t, "selected-tests.yml")
 	for _, name := range []string{"Plan the selection", "Full suite", "Audit the selection"} {
-		if s := f.step(t, name); !s.has(notCancelled) {
-			t.Errorf("step %q lacks `%s`: a failed devmap build or index would skip it, and the full suite and the artifact with it", name, notCancelled)
+		if s := f.step(t, name); !s.has(gated) {
+			t.Errorf("step %q lacks `%s`: a failed devmap build or index would skip it, and the full suite and the artifact with it", name, gated)
 		}
 	}
 	if full := f.step(t, "Full suite"); full.has("continue-on-error") {
@@ -221,5 +223,35 @@ func TestTheExcludeListIsRustYmlsTestStepList(t *testing.T) {
 	sort.Strings(want)
 	if len(got) == 0 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("rust.yml's Test step excludes %v, DefaultRustExcludes is %v", got, want)
+	}
+}
+
+func TestAFailedSelectorBuildSaysSoInsteadOfFailingWithExit127(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	build := f.step(t, "Build the selector")
+	if !build.has("id: selector") || build.has("continue-on-error") {
+		t.Error("the selector build must have id `selector` and must stay fatal: the job is red when it fails")
+	}
+	gate := f.step(t, "Selector build gate")
+	if !gate.has("steps.selector.outcome != 'success'") || !gate.has("::error::selector build failed; full suite not run") || !gate.has("exit 1") {
+		t.Errorf("the gate step must name the failure and keep the job red:\n%s", strings.Join(gate.lines, "\n"))
+	}
+	for _, name := range []string{"Plan the selection", "Selected tests", "Full suite", "Audit the selection"} {
+		if !f.step(t, name).has("steps.selector.outcome == 'success'") {
+			t.Errorf("step %q runs the selector binary without checking that it was built", name)
+		}
+	}
+}
+
+func TestTheBaseFetchDoesNotSwallowGhErrors(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	fetch := f.step(t, "Fetch the base")
+	if fetch.has("|| true") {
+		t.Error("`|| true` hides why gh failed")
+	}
+	for _, want := range []string{"::warning::gh run list failed", "gh.err", "base_failed is unknown"} {
+		if !fetch.has(want) {
+			t.Errorf("the fetch step lacks %q: a failure must be logged as a warning with its reason", want)
+		}
 	}
 }

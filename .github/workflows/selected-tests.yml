@@ -109,9 +109,19 @@ jobs:
       - name: Put devmap on PATH
         run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
 
+      # Fatal: nothing else here can run the full suite without it. The steps
+      # after it are gated on its outcome and say so, instead of failing with a
+      # bare exit 127 for a binary that does not exist. The job stays red.
       - name: Build the selector
+        id: selector
         working-directory: backend/go_orchestrator
         run: go build -o "$RUNNER_TEMP/dctestselect" ./cmd/dctestselect
+
+      - name: Selector build gate
+        if: ${{ !cancelled() && steps.selector.outcome != 'success' }}
+        run: |
+          echo "::error::selector build failed; full suite not run"
+          exit 1
 
       # A cold index, on the debug binary: no store is cached and `devmap seed`
       # is not relied on. The elapsed time is logged so the cost is a number.
@@ -141,23 +151,29 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/base"
-          ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow selected-tests.yml --branch "$BASE_BRANCH" \
+          # A failure here leaves the base unknown and says why; it does not
+          # fail the job, and it is not swallowed.
+          if ! ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow selected-tests.yml --branch "$BASE_BRANCH" \
             --event push --status completed --limit 10 \
-            --json databaseId,conclusion --jq '.[] | select(.conclusion != "cancelled") | .databaseId' || true)"
+            --json databaseId,conclusion --jq '.[] | select(.conclusion != "cancelled") | .databaseId' 2>"$RUNNER_TEMP/gh.err")"; then
+            echo "::warning::gh run list failed ($(head -c 300 "$RUNNER_TEMP/gh.err" | tr '\n' ' ')); base_failed is unknown"
+            exit 0
+          fi
           for id in $ids; do
             [ "$id" = "$GITHUB_RUN_ID" ] && continue
-            if gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selection-recall --dir "$RUNNER_TEMP/base" \
+            if gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selection-recall --dir "$RUNNER_TEMP/base" 2>"$RUNNER_TEMP/gh.err" \
               && [ -f "$RUNNER_TEMP/base/selection-recall.json" ]; then
               echo "base record: run $id"
               exit 0
             fi
+            echo "::warning::run $id has no usable selection-recall artifact ($(head -c 200 "$RUNNER_TEMP/gh.err" | tr '\n' ' '))"
           done
           echo "::warning::no selection-recall.json from a completed $BASE_BRANCH run; base_failed is unknown"
 
       # Whatever happened above: a missing devmap is a blast error, which runs
       # everything.
       - name: Plan the selection
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.selector.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           mkdir -p "$RUNNER_TEMP/selection"
@@ -167,6 +183,7 @@ jobs:
 
       # The fast signal: only the targets the plan names are compiled and run.
       - name: Selected tests
+        if: ${{ steps.selector.outcome == 'success' }}
         run: |
           "$RUNNER_TEMP/dctestselect" run --repo . --plan "$RUNNER_TEMP/selection/plan.json" --phase selected \
             --log-dir "$RUNNER_TEMP/selection"
@@ -174,7 +191,7 @@ jobs:
       # Still the gate. --no-fail-fast, so every failure is in the log. With no
       # usable plan it runs the built-in full suite and says so.
       - name: Full suite
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.selector.outcome == 'success' }}
         run: |
           "$RUNNER_TEMP/dctestselect" run --repo . --plan "$RUNNER_TEMP/selection/plan.json" --phase full \
             --log-dir "$RUNNER_TEMP/selection"
@@ -183,7 +200,7 @@ jobs:
       # on its own would otherwise colour every audit. The `::error::selection
       # missed` annotations still show, and the artifact below is still written.
       - name: Audit the selection against the full suite
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.selector.outcome == 'success' }}
         continue-on-error: true
         run: |
           "$RUNNER_TEMP/dctestselect" audit --plan "$RUNNER_TEMP/selection/plan.json" \
