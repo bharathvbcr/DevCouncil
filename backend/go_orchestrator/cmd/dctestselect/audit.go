@@ -440,6 +440,14 @@ type AuditInput struct {
 	SelectedKnown            bool
 }
 
+// fastPhaseExamined is the one decision of whether the fast phase was read: no
+// reason (SelectionNote) says a selected command, its status or its log could
+// not be examined, after each log was qualified by its own exit status. Audit's
+// selected_phase_failed_only and Exit's code both ask this, so they cannot
+// disagree. The raw SelectedRust and SelectedGo logs are not that answer: they
+// are parsed before Qualify.
+func (in AuditInput) fastPhaseExamined() bool { return in.SelectionNote == "" }
+
 // Audit computes selection-recall.json and the annotations that go with it. It
 // records; it does not measure the selection against the full suite.
 func Audit(in AuditInput) (Recall, []string) {
@@ -466,7 +474,7 @@ func Audit(in AuditInput) (Recall, []string) {
 		r.Full.Failed = append(r.Full.Failed, f.Key())
 		fullFailed[f.Key()] = true
 	}
-	if in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && in.Rust.Examined && in.Go.Examined {
+	if in.SelectedKnown && in.fastPhaseExamined() && in.SelectedRust.Examined && in.SelectedGo.Examined && in.Rust.Examined && in.Go.Examined {
 		r.SelectedPhaseFailedOnly = []string{}
 		for _, f := range append(append([]Failure{}, in.SelectedRust.Failures...), in.SelectedGo.Failures...) {
 			if !fullFailed[f.Key()] {
@@ -496,7 +504,7 @@ func Audit(in AuditInput) (Recall, []string) {
 // could not be examined, otherwise 0. The job's gate is the full suite's own
 // step; this is a loud report, never a verdict on the selection.
 func Exit(in AuditInput, r Recall) int {
-	if in.PlanUnusable || !r.Full.Rust.Examined || !r.Full.Go.Examined || in.SelectionNote != "" {
+	if in.PlanUnusable || !r.Full.Rust.Examined || !r.Full.Go.Examined || !in.fastPhaseExamined() {
 		return 2
 	}
 	return 0

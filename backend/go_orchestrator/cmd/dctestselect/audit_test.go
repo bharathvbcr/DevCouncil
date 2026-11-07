@@ -342,7 +342,8 @@ func TestTheFastPhasesLogsNameASelectedOnlyFailure(t *testing.T) {
 	plan := selectedCa
 	plan.Selected = []Selected{{Command: logged(newCommand("rust", "cargo", "test")), Units: []Unit{{Kind: "rust", Pkg: "ca"}}}}
 	dir := phaseDir(t, plan, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
-	writeFile(t, dir, "selected-rust.log", "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest only_here ... FAILED\n\nfailures:\n\n---- only_here stdout ----\n\nfailures:\n    only_here\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p ca --lib`\n")
+	// The fast phase is read only with its own status, and a failing test's exit is 101.
+	setSelected(t, dir, plan, "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest only_here ... FAILED\n\nfailures:\n\n---- only_here stdout ----\n\nfailures:\n    only_here\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p ca --lib`\n", 101)
 	_, stdout, r := auditIn(t, dir)
 	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != "rust:ca:--lib:only_here" || !strings.Contains(stdout, "selected phase only") {
 		t.Fatalf("selected_phase_failed_only=%v stdout:\n%s", r.SelectedPhaseFailedOnly, stdout)
