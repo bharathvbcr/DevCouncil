@@ -507,7 +507,7 @@ impl Store {
     /// already there, is opened read-only. That open takes the shared lock
     /// and waits out `busy_timeout`. An immutable open does not, so a
     /// momentary exclusive lock would look like an uncontended read.
-    pub(super) fn open_owner_peek(path: &Path) -> Result<Connection> {
+    pub(crate) fn open_owner_peek(path: &Path) -> Result<Connection> {
         let mut wal = path.as_os_str().to_os_string();
         wal.push("-wal");
         let wal_present = std::path::Path::new(&wal).is_file();
@@ -1071,10 +1071,32 @@ impl Store {
         db_path: P,
         repo_root_override: Option<String>,
     ) -> Result<Self> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
             .map_err(|error| refusal(error.to_string()))?;
-        let path = resolved.as_path();
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        let file = SafeFile::open(&resolved, Access::Read, Creation::Never).map_err(|error| {
+            refusal(format!(
+                "cannot open immutable snapshot {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        Self::open_immutable_snapshot_file(&file, &resolved, repo_root_override)
+    }
+
+    /// [`Self::open_immutable_snapshot`] for a file the caller already holds.
+    ///
+    /// On Unix the connection is bound to `file`'s descriptor (`/dev/fd/N`), so
+    /// renaming, replacing or deleting the name `label` afterwards cannot change
+    /// what the store reads. `label` is the name the store reports and where
+    /// its sidecars would sit; it is not opened. Elsewhere the connection opens
+    /// `label`.
+    pub fn open_immutable_snapshot_file(
+        file: &std::fs::File,
+        label: &Path,
+        repo_root_override: Option<String>,
+    ) -> Result<Self> {
+        let path = label;
+        let metadata = file.metadata().map_err(|error| {
             refusal(format!(
                 "cannot inspect immutable snapshot {}: {error}",
                 path.display()
@@ -1133,6 +1155,12 @@ impl Store {
         let setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        #[cfg(unix)]
+        let conn = {
+            use std::os::fd::AsRawFd;
+            Self::open_immutable(Path::new(&format!("/dev/fd/{}", file.as_raw_fd())))?
+        };
+        #[cfg(not(unix))]
         let conn = Self::open_immutable(path)?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

@@ -6,7 +6,8 @@
 //! - `devmap seed [--from <checkout>] [--stacked] [--sync-delta] [--gc-bases] [path]`:
 //!   sub-15ms CoW/WAL-healing standalone seeding from any registered checkout of
 //!   the same repository, or zero-copy stacked delta provisioning (`stack_lease.json`
-//!   + `delta.sqlite` over `.git/devmap/bases/<gen>-<sha8>/`).
+//!   + `delta.sqlite` over the lane's own clone of a base published to
+//!   `.git/devmap/bases/<gen>-<head12>-<src8>/`).
 
 use std::path::{Path, PathBuf};
 
@@ -34,7 +35,8 @@ pub(crate) struct Args {
     pub(crate) from: Option<PathBuf>,
 
     /// Provision a zero-copy stacked worktree (`stack_lease.json` + `delta.sqlite`)
-    /// over a shared immutable base snapshot instead of cloning `devmap.sqlite`.
+    /// over the lane's own immutable clone of a shared base snapshot instead of
+    /// a writable `devmap.sqlite`.
     #[arg(long)]
     pub(crate) stacked: bool,
 
@@ -42,7 +44,8 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) sync_delta: bool,
 
-    /// Garbage-collect unreferenced base snapshots under `<common_git_dir>/devmap/bases/`.
+    /// Garbage-collect superseded base snapshots under `<common_git_dir>/devmap/bases/`
+    /// (the newest per donor stays; lanes keep their own clones).
     #[arg(long)]
     pub(crate) gc_bases: bool,
 
@@ -133,7 +136,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             "root": root,
             "source": source,
             "generation_id": lease.generation_id,
-            "base_dir": lease.base_dir,
+            "base_dir": lease.base_dir(),
             "base_sqlite_path": lease.base_sqlite_path(),
             "synced_files": sync.synced_files,
             "deleted_files": sync.deleted_files,

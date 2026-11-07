@@ -500,22 +500,67 @@ pub fn set_file_writable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Promote a sealed `0444` `base.sqlite` snapshot into an independent writable
-/// WAL-mode `devmap.sqlite` rebound to `worktree_root`, atomically placed at
-/// `target_db` (`OQ2` auto-rebase / promotion).
+/// Create `name` in `dir` from the open file `source`: a copy-on-write clone
+/// (`fclonefileat` / `FICLONE`), or a plain copy where the filesystem has no
+/// reflink. `source` is held open, so no name is resolved for it; `name` must
+/// not exist.
+pub fn clone_open_file_into(source: &std::fs::File, dir: &Path, name: &std::ffi::OsStr) -> Result<SeedMethod> {
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    let pinned = PinnedDir::open(dir, false)
+        .with_context(|| format!("cannot pin {}", dir.display()))?;
+    if pinned.clone_file_to_child(source, name).is_ok() {
+        return Ok(SeedMethod::Clone);
+    }
+    let mut output = pinned
+        .open_file(name, Access::ReadWrite, Creation::New)
+        .with_context(|| format!("cannot create {}", dir.join(name).display()))?;
+    let copied = copy_open_file(source, &mut output).and_then(|()| Ok(output.sync_all()?));
+    if copied.is_err() {
+        drop(output);
+        let _ = pinned.remove_child(name);
+    }
+    copied.map(|()| SeedMethod::Copy)
+}
+
+/// Copy all of `source` into `output` by absolute offset, so the shared file
+/// offset of `source` (and of every descriptor duplicated from it) is neither
+/// used nor moved.
+fn copy_open_file(source: &std::fs::File, output: &mut std::fs::File) -> Result<()> {
+    use std::io::Write;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    loop {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(source, &mut buf, offset)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(source, &mut buf, offset)?;
+        if n == 0 {
+            return Ok(());
+        }
+        output.write_all(&buf[..n])?;
+        offset += n as u64;
+    }
+}
+
+/// Promote the open sealed `0444` base snapshot `base` into an independent
+/// writable WAL-mode `devmap.sqlite` rebound to `worktree_root`, atomically
+/// placed at `target_db` (`OQ2` auto-rebase / promotion). `base` is the file
+/// the lane admitted, not a name that something else could have re-pointed.
 pub fn promote_immutable_base_to_store(
-    base_sqlite: &Path,
+    base: &std::fs::File,
     target_db: &Path,
     worktree_root: &Path,
 ) -> Result<SeedMethod> {
-    if let Some(parent) = target_db.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
+    let parent = target_db.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create {}", parent.display()))?;
     let staged = sidecar(target_db, &format!(".promote-{}", std::process::id()));
     discard_staged(&staged);
     let result = (|| -> Result<SeedMethod> {
-        let method = clone_or_copy(base_sqlite, &staged)?;
+        let staged_name = staged
+            .file_name()
+            .context("promote target has no file name")?;
+        let method = clone_open_file_into(base, parent, staged_name)?;
         set_file_writable(&staged)?;
         {
             let conn = Connection::open(&staged)?;
@@ -837,6 +882,109 @@ mod tests {
         drop(reader);
         drop(writer);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn sealed_snapshot_with_head(path: &Path, head: &str) {
+        {
+            let store = Store::open(path).unwrap();
+            drop(store);
+            let conn = Connection::open(path).unwrap();
+            conn.execute(
+                "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
+                 VALUES (1730000000.0, ?1, '{}', '/tmp/anchor')",
+                [head],
+            )
+            .unwrap();
+        }
+        prepare_immutable_snapshot(path).unwrap();
+    }
+
+    /// The probe the redesign rests on: the bundled SQLite build (with
+    /// `SQLITE_OPEN_URI`) opens `/dev/fd/N?immutable=1` and keeps reading the
+    /// file it was handed after the name is replaced, then deleted.
+    #[cfg(unix)]
+    #[test]
+    fn immutable_snapshot_opened_through_its_descriptor_ignores_the_name_after_open() {
+        let tmp = temp_test_dir("fdbound");
+        let db = tmp.join("base.sqlite");
+        sealed_snapshot_with_head(&db, "aaaa");
+        let held = std::fs::File::open(&db).unwrap();
+        let snap = Store::open_immutable_snapshot_file(&held, &db, None).unwrap();
+        assert_eq!(
+            snap.latest_generation_head_sha().unwrap().as_deref(),
+            Some("aaaa")
+        );
+
+        let other = tmp.join("other.sqlite");
+        sealed_snapshot_with_head(&other, "bbbb");
+        std::fs::rename(&db, tmp.join("moved.sqlite")).unwrap();
+        std::fs::rename(&other, &db).unwrap();
+        assert_eq!(
+            Store::open_immutable_snapshot(&db, None)
+                .unwrap()
+                .latest_generation_head_sha()
+                .unwrap()
+                .as_deref(),
+            Some("bbbb"),
+            "the name now holds the other database"
+        );
+        assert_eq!(
+            snap.latest_generation_head_sha().unwrap().as_deref(),
+            Some("aaaa"),
+            "the descriptor-bound store must still read the file it was opened on"
+        );
+        std::fs::remove_file(&db).unwrap();
+        std::fs::remove_file(tmp.join("moved.sqlite")).unwrap();
+        assert_eq!(
+            snap.latest_generation_head_sha().unwrap().as_deref(),
+            Some("aaaa")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn clone_open_file_into_copies_the_held_file_not_the_name() {
+        let tmp = temp_test_dir("cloneheld");
+        let src = tmp.join("src.bin");
+        std::fs::write(&src, b"original bytes").unwrap();
+        let held = std::fs::File::open(&src).unwrap();
+        std::fs::remove_file(&src).unwrap();
+        std::fs::write(&src, b"impostor").unwrap();
+        clone_open_file_into(&held, &tmp, std::ffi::OsStr::new("dst.bin")).unwrap();
+        assert_eq!(std::fs::read(tmp.join("dst.bin")).unwrap(), b"original bytes");
+        assert!(
+            clone_open_file_into(&held, &tmp, std::ffi::OsStr::new("dst.bin")).is_err(),
+            "a clone never replaces a name"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The non-reflink fallback: on a filesystem without `clonefile`/`FICLONE`
+    /// the same call copies, reports `Copy`, and the result is byte-identical.
+    /// Needs a directory on such a volume (an HFS+ disk image on macOS), so it
+    /// runs only when `DEVMAP_NON_REFLINK_DIR` names one:
+    /// `DEVMAP_NON_REFLINK_DIR=/Volumes/X cargo test -p devmap-store --lib -- --ignored non_reflink`.
+    #[test]
+    #[ignore = "needs DEVMAP_NON_REFLINK_DIR on a filesystem without reflink"]
+    fn clone_open_file_into_falls_back_to_a_copy_without_reflink() {
+        let base = std::env::var_os("DEVMAP_NON_REFLINK_DIR")
+            .map(PathBuf::from)
+            .expect("set DEVMAP_NON_REFLINK_DIR to a directory on a non-reflink filesystem");
+        let dir = base.join(format!("devmap-nonreflink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &payload).unwrap();
+        let held = std::fs::File::open(&src).unwrap();
+        let method = clone_open_file_into(&held, &dir, std::ffi::OsStr::new("dst.bin")).unwrap();
+        assert_eq!(method, SeedMethod::Copy, "this volume was expected to have no reflink");
+        assert_eq!(std::fs::read(dir.join("dst.bin")).unwrap(), payload);
+        assert!(
+            clone_open_file_into(&held, &dir, std::ffi::OsStr::new("dst.bin")).is_err(),
+            "a copy never replaces a name either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -123,18 +123,19 @@ impl DeltaStore {
 
     /// Open an existing `delta.sqlite` for reading: no creation, no schema
     /// statements, no journal-mode change. `None` when the file does not exist.
-    /// Opening a WAL database read-only may still create its `-shm`/`-wal`
-    /// sidecars; the database file itself is never written.
+    ///
+    /// Creates no `-shm`/`-wal` sidecar and needs no write access to the state
+    /// directory: a WAL database with no `-wal` beside it (its last writer
+    /// closed and checkpointed) holds everything in the main file and is read
+    /// immutable. While a writer's `-wal` exists the open is an ordinary
+    /// read-only one, which must share that writer's index.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
         let path = path.as_ref().to_path_buf();
         if !path.is_file() {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
+        let conn = crate::Store::open_owner_peek(&path)
+            .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Some(Self {
@@ -373,5 +374,76 @@ impl DeltaStore {
             symbols,
             edges,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devmap-delta-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A read of `delta.sqlite` writes nothing: after its last writer closes (and
+    /// checkpoints) no `-wal`/`-shm` exists, and opening it read-only must not
+    /// create them, even when the directory is writable; a read-only directory
+    /// must still open.
+    #[cfg(unix)]
+    #[test]
+    fn open_read_only_creates_no_sidecar_and_opens_in_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("readonly");
+        let path = dir.join("delta.sqlite");
+        {
+            let writer = DeltaStore::open(&path).unwrap();
+            writer.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
+        }
+        assert_eq!(names_in(&dir), vec!["delta.sqlite".to_string()], "fixture: a closed writer leaves one file");
+
+        let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
+        assert_eq!(reader.dirty_file_count().unwrap(), 1);
+        assert_eq!(reader.load_snapshot().unwrap().files.len(), 1);
+        drop(reader);
+        assert_eq!(names_in(&dir), vec!["delta.sqlite".to_string()], "a read created a sidecar");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let reader = DeltaStore::open_read_only(&path);
+        let rows = reader.as_ref().ok().and_then(|r| r.as_ref()).map(|r| r.dirty_file_count().unwrap());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(reader.is_ok(), "a read-only directory must still open: {:?}", reader.err());
+        assert_eq!(rows, Some(1));
+        assert_eq!(names_in(&dir), vec!["delta.sqlite".to_string()]);
+        assert!(DeltaStore::open_read_only(dir.join("missing.sqlite")).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While a writer holds the database open its `-wal` exists, and a read
+    /// must see that writer's committed rows (an immutable open would not).
+    #[test]
+    fn open_read_only_sees_rows_a_live_writer_has_not_checkpointed() {
+        let dir = temp_dir("livewriter");
+        let path = dir.join("delta.sqlite");
+        let writer = DeltaStore::open(&path).unwrap();
+        writer.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
+        writer.tombstone_file("src/b.rs", "CAS_TOMBSTONE", 2).unwrap();
+        let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
+        assert_eq!(reader.dirty_file_count().unwrap(), 2);
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
