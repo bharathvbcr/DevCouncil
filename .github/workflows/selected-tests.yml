@@ -20,14 +20,20 @@ name: selected tests (DevMap)
 # (DefaultRustExcludes, fullCommands), so the selection and the full suite
 # cannot disagree about it.
 #
-# The selected commands are `-p <crate> ...`, so cargo resolves their features
-# per package, and the full suite's `--workspace` resolves them across the
-# workspace. A test can therefore fail in one phase and not the other. Cargo's
-# `resolver.feature-unification = "workspace"` would make them agree, but it is
-# unstable on the pinned 1.99.0 (it needs `-Z feature-unification`, nightly
-# only; tracking issue rust-lang/cargo#14774), so it is not set. The audit
-# records such a failure as `selected_phase_failed_only`, so a red that only
-# the fast phase has is named rather than mysterious.
+# The selection is a crate, whole, together with every workspace member that
+# depends on it, run as ONE `cargo test --locked -p <a> -p <b> ...`. Cargo
+# unifies a package's features across the packages in the build set, so a crate
+# built with all of its workspace dependents gets the feature set the full
+# suite's `--workspace` gives it; built alone (`-p a`, or `--workspace
+# --exclude b`) it would not. Cargo's `resolver.feature-unification =
+# "workspace"` would make any set agree, but it is unstable on the pinned 1.99.0
+# (it needs `-Z feature-unification`, nightly only; tracking issue
+# rust-lang/cargo#14774), so it is not set. Go is the same shape: one
+# `go test -json <pkgs...>` over the changed packages and the packages that
+# import them. Recall is measured on the fast phase's own failures: a failure
+# the selection ran but the fast phase did not fail is listed as
+# `selected_not_reproduced`, and one only the fast phase has as
+# `selected_phase_failed_only`.
 
 on:
   push:
@@ -184,7 +190,7 @@ jobs:
             --event "$GITHUB_EVENT_NAME" --ref-name "$GITHUB_REF_NAME" --before "$EVENT_BEFORE" \
             --base-ref "$BASE_BRANCH" --trigger "$GITHUB_EVENT_NAME" --timeout 5m --out "$RUNNER_TEMP/selection/plan.json"
 
-      # The fast signal: only the targets the plan names are compiled and run.
+      # The fast signal: only the crates and packages the plan names are built and run.
       - name: Selected tests
         if: ${{ steps.selector.outcome == 'success' }}
         run: |
