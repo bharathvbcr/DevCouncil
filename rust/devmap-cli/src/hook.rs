@@ -1432,17 +1432,7 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("DevMap blast from {label}:"));
     if let HookStore::Stacked(stacked) = &hook_store {
-        let in_delta = stacked
-            .status()
-            .ok()
-            .map(|st| st.dirty_files.saturating_add(st.tombstoned_files));
-        let unsynced = stacked.unsynced_paths().ok().map(|paths| paths.len());
-        parts.push(match (in_delta, unsynced) {
-            (Some(delta), Some(unsynced)) => format!(
-                "stacked lane: {delta} file(s) are dirty or deleted in the delta and {unsynced} more are not synced yet; the walk reads the immutable base, so this list is a lower bound."
-            ),
-            _ => "stacked lane: the dirty and unsynced file counts could not be read; the walk reads the immutable base, so this list is a lower bound.".into(),
-        });
+        parts.push(stacked_blast_note(stacked));
     }
     for (examined, (path, start, end)) in locations.iter().take(MAX_LOCATIONS).enumerate() {
         if started.elapsed() >= budget {
@@ -1475,6 +1465,28 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
         ));
     }
     Some(truncate(&parts.join("\n"), POST_TOOL_BLAST_CONTEXT_CAP))
+}
+
+/// The stacked-lane line of a hook blast report. It reads only what is already
+/// open (the delta's counts): `unsynced_paths` runs two git processes bounded at
+/// 10 s each, which does not fit in the hook's 400 ms budget, so the unsynced
+/// count is named as not computed rather than computed late.
+fn stacked_blast_note(stacked: &devmap_query::StackedStore) -> String {
+    let in_delta = stacked
+        .status()
+        .ok()
+        .map(|st| st.dirty_files.saturating_add(st.tombstoned_files));
+    let missing = if stacked.delta_present() {
+        ""
+    } else {
+        " (no delta.sqlite yet: the delta reads as empty)"
+    };
+    match in_delta {
+        Some(delta) => format!(
+            "stacked lane: {delta} file(s) are dirty or deleted in the delta{missing}; unsynced count not computed within the hook budget; the walk reads the immutable base, so this list is a lower bound."
+        ),
+        None => "stacked lane: the delta counts could not be read and the unsynced count was not computed within the hook budget; the walk reads the immutable base, so this list is a lower bound.".into(),
+    }
 }
 
 fn format_blast_for_hook(report: &dc_regress::BlastReport) -> String {
@@ -4496,11 +4508,9 @@ mod tests {
         );
     }
 
-    /// A stacked lane's hook must not answer from the donor's base as if the
-    /// file just edited were unchanged, nor name the donor's root.
-    #[test]
-    fn stacked_lane_skeleton_names_edits_not_in_the_base_index() {
-        let base = scratch("stacked-skeleton");
+    /// A committed, indexed donor `main` and a provisioned stacked `lane`.
+    fn stacked_lane_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = scratch(tag);
         let run = |cwd: &Path, args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
@@ -4552,7 +4562,14 @@ mod tests {
                 .unwrap();
         }
         devmap_query::provision_stacked_worktree(&main, &lane).unwrap();
+        (base, main, lane)
+    }
 
+    /// A stacked lane's hook must not answer from the donor's base as if the
+    /// file just edited were unchanged, nor name the donor's root.
+    #[test]
+    fn stacked_lane_skeleton_names_edits_not_in_the_base_index() {
+        let (base, main, lane) = stacked_lane_fixture("stacked-skeleton");
         // Untouched: the base answer, naming the lane and never the donor.
         let clean = render_skeleton_context(&lane, &lane.join("lib.rs"), Duration::from_secs(10))
             .expect("a clean stacked file answers from the base");
@@ -4573,6 +4590,33 @@ mod tests {
         );
         assert!(!dirty.contains("base_only"), "{dirty}");
         assert!(!dirty.contains(main.to_str().unwrap()), "{dirty}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The blast note must come from what is already open: it may not spend git
+    /// time inside the hook's 400 ms budget. With the lane's `.git` broken any git
+    /// call would fail, so a note that still reports the delta count and says the
+    /// unsynced count was not computed proves no git ran.
+    #[test]
+    fn stacked_blast_note_names_the_budget_and_runs_no_git() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-blast-note");
+        let stacked = devmap_query::StackedStore::open(&lane).expect("open lane");
+        std::fs::write(lane.join(".git"), "gitdir: /nonexistent/devmap-hook-test\n").unwrap();
+        let started = Instant::now();
+        let note = stacked_blast_note(&stacked);
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            note.contains("unsynced count not computed within the hook budget"),
+            "{note}"
+        );
+        assert!(note.contains("0 file(s) are dirty or deleted"), "{note}");
+        assert!(note.contains("no delta.sqlite yet"), "{note}");
+        assert!(note.contains("lower bound"), "{note}");
+        drop(stacked);
         let _ = std::fs::remove_dir_all(&base);
     }
 

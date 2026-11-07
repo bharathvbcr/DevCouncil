@@ -1340,3 +1340,37 @@ async fn nested_unregistered_repo_cwd_is_served_from_the_root() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_same_repo_cwd_refusal_holds_via_symlink_dotdot_and_case() {
+    let base = scratch("cwd-refusal-spellings");
+    let anchor = base.join("anchor");
+    let sibling = base.join("wt-unindexed");
+    wire_registered_worktree(&anchor, "wt-unindexed", &sibling);
+    plant_store(&anchor);
+
+    let link = base.join("link-to-sibling");
+    std::os::unix::fs::symlink(&sibling, &link).unwrap();
+    let dotdot = base.join("anchor").join("..").join("wt-unindexed");
+    let mut spellings = vec![("symlink", link), ("dotdot", dotdot)];
+    // On a case-insensitive filesystem (APFS default) another case names the
+    // same directory; on a case-sensitive one it does not exist and is skipped.
+    let upper = base.join("WT-UNINDEXED");
+    if upper.is_dir() {
+        spellings.push(("case", upper));
+    }
+    for (label, cwd) in spellings {
+        let slot = Arc::new(StoreSlot::resolving(None, cwd.clone(), None));
+        slot.set_mcp_roots(vec![anchor.clone()]);
+        let response = call(&slot, "devmap_status", json!({})).await;
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "{label}: a cwd in another registered worktree of the same repo must be refused: {response}"
+        );
+        let text = tool_error_text(&response);
+        assert!(names(&text, &anchor), "{label}: {text}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
