@@ -162,7 +162,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             source_store.display()
         );
     }
-    if target_db.exists() {
+    if std::fs::symlink_metadata(&target_db).is_ok() {
         bail!(
             "devmap seed: target store {} already exists",
             target_db.display()
@@ -174,9 +174,16 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     }
 
     let _writer = Store::lock_writer_at(&target_db, Store::WRITER_LOCK_WAIT)?;
+    if std::fs::symlink_metadata(&target_db).is_ok() {
+        bail!(
+            "devmap seed: target store {} already exists",
+            target_db.display()
+        );
+    }
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
     let staged_csr = csr_path_for_store(&staged);
     seed::discard_staged(&staged);
+    let _ = std::fs::remove_file(&staged_csr);
     let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
         let m = seed::stage_seed_healing_wal(&source_store, &staged)
             .with_context(|| format!("cannot seed from {}", source_store.display()))?;
@@ -208,7 +215,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                     format!("cannot stage CSR sidecar from {}", src_csr.display())
                 })?;
             } else {
-                let _ = staged_store.write_latest_csr_sidecar()?;
+                staged_store.write_latest_csr_sidecar_strict()?;
                 drop(staged_store);
             }
         } else {
@@ -218,19 +225,31 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             let _ = std::fs::remove_file(seed::sidecar(&staged, ".lock"));
         }
         seed::settle_staged(&staged)?;
-        if staged_csr.is_file() {
-            let final_csr = csr_path_for_store(&target_db);
+        // Sweep any orphaned `-wal` / `-shm` left beside an absent `target_db` so
+        // SQLite cannot replay stale WAL frames onto the newly placed store.
+        let _ = std::fs::remove_file(seed::sidecar(&target_db, "-wal"));
+        let _ = std::fs::remove_file(seed::sidecar(&target_db, "-shm"));
+        let final_csr = csr_path_for_store(&target_db);
+        let placed_csr = if staged_csr.is_file() {
             std::fs::rename(&staged_csr, &final_csr)
                 .with_context(|| format!("cannot place CSR sidecar {}", final_csr.display()))?;
+            true
+        } else {
+            false
+        };
+        if let Err(err) = std::fs::rename(&staged, &target_db) {
+            if placed_csr {
+                let _ = std::fs::remove_file(&final_csr);
+            }
+            return Err(err).with_context(|| format!("cannot place {}", target_db.display()));
         }
-        std::fs::rename(&staged, &target_db)
-            .with_context(|| format!("cannot place {}", target_db.display()))?;
         Ok((m, tree_matches_donor))
     })();
     let (method, tree_matches_donor) = match staged_outcome {
         Ok(pair) => pair,
         Err(err) => {
             seed::discard_staged(&staged);
+            let _ = std::fs::remove_file(&staged_csr);
             return Err(err);
         }
     };
@@ -295,15 +314,36 @@ impl<'a> StagedSeed<'a> {
         &self.staged_db
     }
 
-    pub(crate) fn commit(mut self, progress: &ProgressReporter) -> anyhow::Result<Store> {
-        seed::settle_staged(&self.staged_db)?;
-        std::fs::rename(&self.staged_db, &self.final_db)
-            .with_context(|| format!("cannot place {}", self.final_db.display()))?;
-        self.committed = true;
-        let src_csr = csr_path_for_store(&self.plan.source_store);
-        if src_csr.is_file() {
-            let _ = seed::seed_artifact(&src_csr, &csr_path_for_store(&self.final_db));
+    pub(crate) fn commit(
+        mut self,
+        progress: &ProgressReporter,
+        tree_matches_donor: bool,
+    ) -> anyhow::Result<Store> {
+        let staged_csr = csr_path_for_store(&self.staged_db);
+        let final_csr = csr_path_for_store(&self.final_db);
+        if tree_matches_donor {
+            let src_csr = csr_path_for_store(&self.plan.source_store);
+            if src_csr.is_file() {
+                let _ = seed::seed_artifact(&src_csr, &staged_csr);
+            }
         }
+        seed::settle_staged(&self.staged_db)?;
+        if std::fs::symlink_metadata(&self.final_db).is_err() {
+            let _ = std::fs::remove_file(seed::sidecar(&self.final_db, "-wal"));
+            let _ = std::fs::remove_file(seed::sidecar(&self.final_db, "-shm"));
+        }
+        let placed_csr = if staged_csr.is_file() {
+            std::fs::rename(&staged_csr, &final_csr).is_ok()
+        } else {
+            false
+        };
+        if let Err(err) = std::fs::rename(&self.staged_db, &self.final_db) {
+            if placed_csr {
+                let _ = std::fs::remove_file(&final_csr);
+            }
+            return Err(err).with_context(|| format!("cannot place {}", self.final_db.display()));
+        }
+        self.committed = true;
         self.plan.seed_artifacts(progress);
         Store::open(&self.final_db)
             .with_context(|| format!("cannot reopen placed store {}", self.final_db.display()))
@@ -314,6 +354,7 @@ impl Drop for StagedSeed<'_> {
     fn drop(&mut self) {
         if !self.committed {
             seed::discard_staged(&self.staged_db);
+            let _ = std::fs::remove_file(csr_path_for_store(&self.staged_db));
         }
     }
 }

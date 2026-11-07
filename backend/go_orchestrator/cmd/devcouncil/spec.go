@@ -1,9 +1,16 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/spec"
 )
 
@@ -222,6 +229,10 @@ func runSpecExportTasks(args []string) int {
 		console.Errorln("spec export-tasks requires a feature name or directory")
 		return 2
 	}
+	if !taskStatuses[targetStatus] {
+		console.Errorf("unknown status %q (want inbox, backlog, ready, in_progress, review or done)\n", targetStatus)
+		return 2
+	}
 
 	root, err := resolveRoot(root)
 	if err != nil {
@@ -239,6 +250,13 @@ func runSpecExportTasks(args []string) int {
 	if err != nil {
 		console.Errorf("spec export-tasks failed: %v\n", err)
 		return 1
+	}
+
+	if !dryRun {
+		if err := persistExportedTasks(root, res); err != nil {
+			console.Errorf("spec export-tasks store sync failed: %v\n", err)
+			return 1
+		}
 	}
 
 	if jsonOut {
@@ -263,4 +281,159 @@ func runSpecExportTasks(args []string) int {
 	}
 
 	return 0
+}
+
+func persistExportedTasks(root string, res *spec.ExportResult) error {
+	if len(res.Tasks) == 0 {
+		return nil
+	}
+	client, _, err := taskClient(root, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	ctx := console.Context()
+	repo, err := client.LocalRepository(ctx)
+	if err != nil {
+		return err
+	}
+
+	idxByID := make(map[string]int, len(res.Tasks))
+	blocksByUpstream := make(map[string][]string, len(res.Tasks))
+	for i, t := range res.Tasks {
+		idxByID[t.TaskID] = i
+	}
+	for _, t := range res.Tasks {
+		seenDep := make(map[string]bool, len(t.DependsOn))
+		for _, dep := range t.DependsOn {
+			if !seenDep[dep] {
+				seenDep[dep] = true
+				blocksByUpstream[dep] = append(blocksByUpstream[dep], t.TaskID)
+			}
+		}
+	}
+
+	// Post-order DFS over `blocksByUpstream` ensures every downstream dependent B
+	// is created in `work_items` before its upstream blocker A writes `links` -> B.
+	visited := make(map[string]bool, len(res.Tasks))
+	order := make([]int, 0, len(res.Tasks))
+	var visit func(id string)
+	visit = func(id string) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		for _, downstream := range blocksByUpstream[id] {
+			visit(downstream)
+		}
+		if idx, ok := idxByID[id]; ok {
+			order = append(order, idx)
+		}
+	}
+	for _, t := range res.Tasks {
+		visit(t.TaskID)
+	}
+
+	for _, idx := range order {
+		t := res.Tasks[idx]
+		reqGet, err := json.Marshal(map[string]string{"id": t.TaskID})
+		if err != nil {
+			return err
+		}
+		var expectedRev int64
+		raw, err := client.Workbench(ctx, "items.get", reqGet)
+		if err != nil {
+			var refusal *store.WorkbenchError
+			if errors.As(err, &refusal) && refusal.Code == "not_found" {
+				expectedRev = 0
+			} else {
+				return fmt.Errorf("items.get %s: %w", t.TaskID, err)
+			}
+		} else {
+			var got struct {
+				Item struct {
+					Revision int64 `json:"revision"`
+				} `json:"item"`
+			}
+			if err := json.Unmarshal(raw, &got); err != nil {
+				return fmt.Errorf("items.get %s decode: %w", t.TaskID, err)
+			}
+			expectedRev = got.Item.Revision
+		}
+
+		title := truncateRunes(t.Title, 300)
+		var desc strings.Builder
+		desc.WriteString(t.Title)
+		desc.WriteString("\n\nFeature: ")
+		desc.WriteString(res.FeatureID)
+		if t.UserStoryRef != "" {
+			desc.WriteString("\nUser Story: ")
+			desc.WriteString(t.UserStoryRef)
+		}
+		if t.ParallelSafe {
+			desc.WriteString("\nParallel Safe: true")
+		}
+		if len(t.DependsOn) > 0 {
+			desc.WriteString("\nDepends On: ")
+			desc.WriteString(strings.Join(t.DependsOn, ", "))
+		}
+
+		labels := []string{"spec:" + res.FeatureID}
+		if t.UserStoryRef != "" {
+			labels = append(labels, "story:"+t.UserStoryRef)
+		}
+		if t.ParallelSafe {
+			labels = append(labels, "parallel-safe")
+		}
+
+		links := make([]map[string]string, 0, len(blocksByUpstream[t.TaskID]))
+		for _, targetID := range blocksByUpstream[t.TaskID] {
+			links = append(links, map[string]string{
+				"kind":    "blocks",
+				"item_id": targetID,
+			})
+		}
+
+		put := map[string]any{
+			"id":                    t.TaskID,
+			"expected_revision":     expectedRev,
+			"title":                 title,
+			"description":           desc.String(),
+			"kind":                  "feature",
+			"status":                t.Status,
+			"priority":              t.Priority,
+			"position":              idx + 1,
+			"labels":                labels,
+			"links":                 links,
+			"scope":                 t.ScopeEnvelope,
+			"repository_ids":        []string{repo},
+			"primary_repository_id": repo,
+		}
+		canonBytes, err := json.Marshal(put)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(canonBytes)
+		put["request_id"] = fmt.Sprintf("spec-export-%s-r%d-%s", t.TaskID, expectedRev, hex.EncodeToString(sum[:4]))
+		body, err := json.Marshal(put)
+		if err != nil {
+			return err
+		}
+		if _, err := client.Workbench(ctx, "items.put", body); err != nil {
+			return fmt.Errorf("items.put %s: %w", t.TaskID, err)
+		}
+	}
+	return nil
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "..."
 }

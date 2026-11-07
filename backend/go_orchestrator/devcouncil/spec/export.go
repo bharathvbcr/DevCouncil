@@ -42,6 +42,10 @@ func ExportTasks(projectRoot, specDir, targetStatus string, dryRun bool) (*Expor
 		return nil, fmt.Errorf("failed to parse tasks: %w", err)
 	}
 
+	if err := validateTaskDAG(specTasks); err != nil {
+		return nil, err
+	}
+
 	if targetStatus == "" {
 		targetStatus = "ready"
 	}
@@ -74,19 +78,15 @@ func ExportTasks(projectRoot, specDir, targetStatus string, dryRun bool) (*Expor
 			expectedTests = []string{"go test ./..."}
 		}
 
+		// Canonical dc-store workbench scope schema (`rust/dc-store/src/workbench/scope.rs`).
 		scopeEnv := map[string]any{
-			"$schema":         "https://devcouncil.dev/schemas/scope-envelope.v1.json",
-			"task_id":         st.ID,
-			"user_story_id":   st.UserStoryRef,
 			"requirement_ids": []string{featureID},
 			"planned_files":   plannedFiles,
 			"allowed_commands": []string{
 				"go test ./...",
 				"cargo test",
 			},
-			"expected_tests":  expectedTests,
-			"parallel_safe":   st.ParallelSafe,
-			"max_scope_bytes": 65536,
+			"expected_tests": expectedTests,
 		}
 
 		expTask := ExportedTask{
@@ -103,18 +103,75 @@ func ExportTasks(projectRoot, specDir, targetStatus string, dryRun bool) (*Expor
 		res.Tasks = append(res.Tasks, expTask)
 	}
 
-	// If not dry-run, persist exported tasks to .devcouncil/workbench/ or state store
+	// If not dry-run, persist exported task envelopes to .devcouncil/workbench/tasks/.
 	if !dryRun && projectRoot != "" {
 		outDir := filepath.Join(projectRoot, ".devcouncil", "workbench", "tasks")
-		_ = os.MkdirAll(outDir, 0755)
+		if err := os.MkdirAll(outDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create workbench tasks dir: %w", err)
+		}
 		for _, t := range res.Tasks {
 			taskPath := filepath.Join(outDir, t.TaskID+".json")
 			data, err := json.MarshalIndent(t, "", "  ")
-			if err == nil {
-				_ = os.WriteFile(taskPath, data, 0644)
+			if err != nil {
+				return nil, fmt.Errorf("marshal task %s: %w", t.TaskID, err)
+			}
+			if err := os.WriteFile(taskPath, data, 0o644); err != nil {
+				return nil, fmt.Errorf("write task %s: %w", t.TaskID, err)
 			}
 		}
 	}
 
 	return res, nil
+}
+
+func validateTaskDAG(tasks []SpecTask) error {
+	depsByID := make(map[string][]string, len(tasks))
+	for _, t := range tasks {
+		if t.ID == "" {
+			return fmt.Errorf("task has empty ID")
+		}
+		if _, dup := depsByID[t.ID]; dup {
+			return fmt.Errorf("duplicate task ID %s in tasks.md", t.ID)
+		}
+		depsByID[t.ID] = t.DependsOn
+	}
+	for _, t := range tasks {
+		for _, dep := range t.DependsOn {
+			if dep == t.ID {
+				return fmt.Errorf("task %s cannot depend on itself", t.ID)
+			}
+			if _, ok := depsByID[dep]; !ok {
+				return fmt.Errorf("task %s depends on unknown task %s", t.ID, dep)
+			}
+		}
+	}
+	const (
+		unvisited = 0
+		visiting  = 1
+		visited   = 2
+	)
+	state := make(map[string]int, len(tasks))
+	var visit func(id string) error
+	visit = func(id string) error {
+		switch state[id] {
+		case visiting:
+			return fmt.Errorf("cyclic task dependency detected involving %s", id)
+		case visited:
+			return nil
+		}
+		state[id] = visiting
+		for _, dep := range depsByID[id] {
+			if err := visit(dep); err != nil {
+				return err
+			}
+		}
+		state[id] = visited
+		return nil
+	}
+	for _, t := range tasks {
+		if err := visit(t.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

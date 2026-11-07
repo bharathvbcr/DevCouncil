@@ -161,3 +161,47 @@ func TestExportTasks(t *testing.T) {
 		t.Errorf("unexpected task 3 dependencies: %+v", t3.DependsOn)
 	}
 }
+
+func TestParseTasksExcludesProseBackticksAndExportValidatesDAG(t *testing.T) {
+	tmpDir := t.TempDir()
+	tasksMd := filepath.Join(tmpDir, "tasks.md")
+	content := `# Tasks: 002 - Zero-Copy Worktrees
+## Phase 1: Stop-Bleed
+- [x] [T-001] [US1] Implement ` + "`same_registered_repo`" + `, ` + "`--root`" + ` in ` + "`mcp::open_for_call`" + `, ` + "`<32 KiB`" + `, and ` + "`/crates/dc-*`" + ` ` + "`Manvi/.ignore`" + ` ` + "`rust/devmap-extract/src/paths.rs`" + ` tests: cargo test
+- [ ] [T-002] [US2] Follow-up task ` + "`src-tauri/src/codeintel/mod.rs`" + ` depends_on: [T-001] tests: cargo test
+`
+	if err := os.WriteFile(tasksMd, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ExportTasks(tmpDir, tmpDir, "ready", true)
+	if err != nil {
+		t.Fatalf("ExportTasks failed: %v", err)
+	}
+	if res.TotalTasks != 2 {
+		t.Fatalf("expected 2 tasks, got %d", res.TotalTasks)
+	}
+	planned, _ := res.Tasks[0].ScopeEnvelope["planned_files"].([]string)
+	want := []string{"Manvi/.ignore", "rust/devmap-extract/src/paths.rs"}
+	if len(planned) != len(want) || planned[0] != want[0] || planned[1] != want[1] {
+		t.Fatalf("planned_files polluted with prose backticks: got %v, want %v", planned, want)
+	}
+	for _, forbiddenKey := range []string{"$schema", "task_id", "user_story_id", "parallel_safe", "max_scope_bytes"} {
+		if _, exists := res.Tasks[0].ScopeEnvelope[forbiddenKey]; exists {
+			t.Fatalf("ScopeEnvelope contains non-canonical key %q rejected by dc-store workbench/scope.rs", forbiddenKey)
+		}
+	}
+
+	// Cycle detection: A -> B -> A must be rejected.
+	cycleDir := t.TempDir()
+	cycleMd := `# Tasks: Cycle
+- [ ] [T-A] First depends_on: [T-B]
+- [ ] [T-B] Second depends_on: [T-A]
+`
+	if err := os.WriteFile(filepath.Join(cycleDir, "tasks.md"), []byte(cycleMd), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportTasks(cycleDir, cycleDir, "ready", true); err == nil {
+		t.Fatalf("expected ExportTasks to reject cyclic depends_on DAG, got nil")
+	}
+}

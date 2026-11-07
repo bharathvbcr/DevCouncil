@@ -286,14 +286,9 @@ func ParseTasksContent(content string) ([]SpecTask, error) {
 			rawRest = strings.TrimSpace(reTestCommand.ReplaceAllString(rawRest, ""))
 		}
 
-		// Extract target files in backticks
-		if fileMatches := reBacktickFile.FindAllStringSubmatch(rawRest, -1); len(fileMatches) > 0 {
-			for _, fm := range fileMatches {
-				if len(fm) > 1 {
-					task.TargetFiles = append(task.TargetFiles, fm[1])
-				}
-			}
-		}
+		// Extract repository-relative target files from backticks, excluding prose
+		// symbols (`mcp::open_for_call`), CLI flags (`--root`), globs, and bare extensions.
+		task.TargetFiles = extractTargetFilesFromBackticks(rawRest)
 
 		// Extract Task ID
 		if idMatch := reTaskBracketID.FindStringSubmatch(rawRest); len(idMatch) > 2 {
@@ -343,4 +338,85 @@ func fileExists(p string) bool {
 func dirExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+func extractTargetFilesFromBackticks(rawRest string) []string {
+	matches := reBacktickFile.FindAllStringSubmatch(rawRest, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	var slashPaths []string
+	var rootFiles []string
+	seenSlash := make(map[string]bool)
+	seenRoot := make(map[string]bool)
+
+	for _, fm := range matches {
+		if len(fm) < 2 {
+			continue
+		}
+		cand := strings.TrimSpace(fm[1])
+		if !isPlausibleRepoRelFile(cand) {
+			continue
+		}
+		if strings.Contains(cand, "/") {
+			if !seenSlash[cand] {
+				seenSlash[cand] = true
+				slashPaths = append(slashPaths, cand)
+			}
+		} else {
+			if !seenRoot[cand] {
+				seenRoot[cand] = true
+				rootFiles = append(rootFiles, cand)
+			}
+		}
+	}
+	// When explicit directory-qualified paths are named on the task line, inline
+	// bare filenames (`overlay.json`, `hook.rs`) in the prose description are prose
+	// references rather than root-level files.
+	if len(slashPaths) > 0 {
+		return slashPaths
+	}
+	return rootFiles
+}
+
+func isPlausibleRepoRelFile(s string) bool {
+	if s == "" || strings.HasPrefix(s, "/") || strings.HasPrefix(s, "-") || strings.HasSuffix(s, "/") {
+		return false
+	}
+	if strings.ContainsAny(s, " \t\r\n\\*!<>()=:;$|\"'") {
+		return false
+	}
+	parts := strings.Split(s, "/")
+	for _, seg := range parts {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	base := parts[len(parts)-1]
+	if strings.HasPrefix(base, ".") {
+		switch base {
+		case ".gitignore", ".ignore", ".gitattributes", ".editorconfig", ".dockerignore":
+			return true
+		default:
+			return false
+		}
+	}
+	dotIdx := strings.LastIndexByte(base, '.')
+	if dotIdx <= 0 || dotIdx == len(base)-1 {
+		// Allow conventional extensionless build files when directory-qualified or at root.
+		switch base {
+		case "Makefile", "Dockerfile", "Justfile", "justfile":
+			return true
+		default:
+			return false
+		}
+	}
+	ext := base[dotIdx+1:]
+	for i := 0; i < len(ext); i++ {
+		c := ext[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return len(ext) <= 12
 }

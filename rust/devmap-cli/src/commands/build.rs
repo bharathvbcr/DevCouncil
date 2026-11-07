@@ -185,7 +185,7 @@ pub(crate) fn build_staged_seed_store(
     run_build_inner(&staged_cli, Some(&reporter), build_args, false)
         .map_err(|error| refuse_if_damaged(staged_db, error))?;
     let store = Store::open(staged_db)?;
-    let _ = store.write_latest_csr_sidecar()?;
+    store.write_latest_csr_sidecar_strict()?;
     Ok(())
 }
 
@@ -609,7 +609,7 @@ fn run_build_inner(
             store.restamp_latest_head(&head)?;
             let store = if let Some(staged) = staged_seed.take() {
                 drop(store);
-                staged.commit(progress)?
+                staged.commit(progress, true)?
             } else {
                 store
             };
@@ -1138,8 +1138,9 @@ fn run_build_inner(
     }
 
     let store = if let Some(staged) = staged_seed.take() {
+        store.write_latest_csr_sidecar_strict()?;
         drop(store);
-        staged.commit(progress)?
+        staged.commit(progress, false)?
     } else {
         store
     };
@@ -1780,9 +1781,7 @@ fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = dest.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = dest.with_file_name(tmp_name);
-    if let Err(error) = std::fs::write(&tmp, bytes) {
-        return Err(error);
-    }
+    std::fs::write(&tmp, bytes)?;
     match std::fs::remove_file(dest) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
