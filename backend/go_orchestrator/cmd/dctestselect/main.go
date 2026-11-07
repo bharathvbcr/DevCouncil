@@ -4,7 +4,7 @@
 //
 //	dctestselect plan  [--repo DIR] [--devmap BIN] [--event E --ref-name R --before SHA --base-ref B | --base REV] --out plan.json
 //	dctestselect run   --plan plan.json --phase selected|full [--log-dir DIR]
-//	dctestselect audit --plan plan.json --rust-log F --go-log F [--base-artifact F] --sha SHA --out selection-recall.json
+//	dctestselect audit --plan plan.json [--log-dir DIR] [--base-artifact F] --sha SHA --out selection-recall.json
 //
 // The selection orders the work and prices the graph; it never replaces the
 // full suite. So every doubt widens it, and the audit reports a failure that
@@ -13,7 +13,8 @@
 // Exit codes: plan 0 a plan was written (possibly "everything") · 2 it could
 // not be written. run 0 every command passed · 1 a command failed · 2 a
 // command could not run. audit 0 no miss · 1 a miss · 2 a suite was not
-// examined or the artifact could not be written.
+// examined, failures could not be classified, or the artifact could not be
+// written. The artifact is written on every path that can write it.
 package main
 
 import (
@@ -59,12 +60,25 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
-// annotate renders a GitHub workflow command, escaping what the runner would
-// otherwise read as the end of the message.
-func annotate(level, msg string) string {
-	r := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
-	return "::" + level + "::" + r.Replace(msg)
+// escapeData escapes a workflow command's message the way the runner reads it:
+// `%`, CR and LF, so a value cannot end the command and start another.
+func escapeData(s string) string {
+	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(s)
 }
+
+// escapeProperty is escapeData plus `:` and `,`, which end a property.
+func escapeProperty(s string) string {
+	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A", ":", "%3A", ",", "%2C").Replace(s)
+}
+
+// annotate renders a workflow command with an escaped message. Every value
+// this program writes after `::` goes through here or group, because paths and
+// test names come from the tree under test.
+func annotate(level, msg string) string {
+	return "::" + level + "::" + escapeData(msg)
+}
+
+func group(title string) string { return "::group::" + escapeData(title) }
 
 type listFlag []string
 
@@ -84,10 +98,10 @@ func planCmd(ctx context.Context, args []string, stdout io.Writer) (int, error) 
 	fs.StringVar(&o.Before, "before", "", "github.event.before")
 	fs.StringVar(&o.BaseRef, "base-ref", "main", "the default branch")
 	fs.StringVar(&o.Trigger, "trigger", "", "label for the artifact (default: the event)")
-	fs.StringVar(&o.RustDir, "rust-dir", "rust", "cargo workspace, relative to the repository")
-	fs.StringVar(&o.GoDir, "go-dir", "backend/go_orchestrator", "Go module, relative to the repository")
+	fs.StringVar(&o.RustDir, "rust-dir", defaultRustDir, "cargo workspace, relative to the repository")
+	fs.StringVar(&o.GoDir, "go-dir", defaultGoDir, "Go module, relative to the repository")
 	fs.Var(&excludes, "exclude", "cargo package the full suite leaves out (repeatable; default: rust.yml's list)")
-	timeout := fs.Duration("timeout", 5*time.Minute, "bound for each question the plan asks")
+	fs.DurationVar(&o.Timeout, "timeout", 5*time.Minute, "bound for each question the plan asks, the devmap blast included")
 	if err := fs.Parse(args); err != nil {
 		return 2, nil
 	}
@@ -115,7 +129,7 @@ func planCmd(ctx context.Context, args []string, stdout io.Writer) (int, error) 
 		}
 		return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 	}
-	plan := BuildPlan(gather(ctx, execRunner{timeout: *timeout}, o, readFile))
+	plan := BuildPlan(gather(ctx, execRunner{timeout: o.Timeout}, o, readFile))
 	if err := writeJSON(*out, plan); err != nil {
 		return 2, err
 	}
@@ -182,30 +196,60 @@ func readPlan(path string) (Plan, error) {
 func auditCmd(args []string, stdout io.Writer) (int, error) {
 	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
 	planPath := fs.String("plan", "plan.json", "the plan the run followed")
-	rustLog := fs.String("rust-log", "", "the full suite's cargo test output")
-	goLog := fs.String("go-log", "", "the full suite's go test -json output")
+	logDir := fs.String("log-dir", "", "where run kept its logs and status files (default: beside --plan)")
 	baseArtifact := fs.String("base-artifact", "", "the base branch's selection-recall.json (optional)")
+	baseBranch := fs.String("base-branch", "main", "the branch whose record is the base")
 	sha := fs.String("sha", "", "the commit under test")
+	ref := fs.String("ref", "", "GITHUB_REF")
+	event := fs.String("event", "", "GITHUB_EVENT_NAME")
+	runID := fs.String("run-id", "", "GITHUB_RUN_ID")
 	out := fs.String("out", "selection-recall.json", "where the artifact is written")
 	if err := fs.Parse(args); err != nil {
 		return 2, nil
 	}
-	plan, err := readPlan(*planPath)
-	if err != nil {
-		return 2, err
+	if *logDir == "" {
+		*logDir = filepath.Dir(*planPath)
 	}
-	in := AuditInput{Plan: plan, SHA: *sha}
-	in.Rust = readSuite(*rustLog, "the cargo test log", parseLibtest)
-	in.Go = readSuite(*goLog, "the go test -json log", parseGoJSON)
+	in := AuditInput{SHA: *sha, Ref: *ref, Event: *event, ID: *runID}
+	plan, planErr := readPlan(*planPath)
+	if planErr != nil {
+		// The artifact is written whatever happened: an absent record and a
+		// record of "could not examine" are different facts.
+		plan = Plan{Schema: planSchema, Widened: []Widening{}, Selected: []Selected{}, Dropped: []Dropped{}, Full: []Command{}, Notices: []string{}}
+	}
+	in.Plan = plan
+	status, statusErr := readStatus(filepath.Join(*logDir, "full-status.json"))
+	suite := func(logName, what string, parse func(io.Reader) SuiteRun) SuiteRun {
+		run := readSuite(filepath.Join(*logDir, logName), what, parse)
+		if statusErr != nil {
+			if run.Examined {
+				run.Examined, run.Note = false, "no usable exit status: "+statusErr.Error()
+			}
+			return run
+		}
+		return Qualify(run, status[logName])
+	}
+	in.Rust = suite("full-rust.log", "the cargo test log", parseLibtest)
+	in.Go = suite("full-go.jsonl", "the go test -json log", parseGoJSON)
+	in.SelectedRust, in.SelectedGo, in.SelectedKnown = readSelected(*logDir, plan)
 	in.BaseWhy = "no base-branch artifact was given"
 	if *baseArtifact != "" {
 		if body, err := os.ReadFile(*baseArtifact); err != nil {
 			in.BaseWhy = "the base artifact could not be read: " + err.Error()
 		} else {
-			in.Base, in.BaseWhy = BaseFailures(body)
+			var rec BaseRecord
+			in.Base, rec, in.BaseWhy = BaseFailures(body, "refs/heads/"+*baseBranch)
+			if in.Base != nil {
+				in.BaseInfo = &rec
+			}
 		}
 	}
 	recall, notes := Audit(in)
+	if planErr != nil {
+		recall.RecallNote = "the plan was unusable (" + planErr.Error() + "), so nothing is known about the selection"
+		recall.Recall = nil
+		notes = append(notes, annotate("error", "the plan was unusable: "+planErr.Error()))
+	}
 	if err := writeJSON(*out, recall); err != nil {
 		return 2, err
 	}
@@ -215,10 +259,38 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	switch {
 	case len(recall.Missed) > 0:
 		return 1, nil
-	case !recall.Full.Rust.Examined || !recall.Full.Go.Examined:
+	case planErr != nil, !recall.Full.Rust.Examined, !recall.Full.Go.Examined:
+		return 2, nil
+	case recall.BaseFailed == nil && len(recall.Unclassified) > 0:
+		// Failures that cannot be called misses or not: not a pass.
 		return 2, nil
 	}
 	return 0, nil
+}
+
+// readSelected reads the fast phase's logs. They are known only when every
+// kind of command the plan selected left an examined log; a plan that selected
+// nothing has nothing to read.
+func readSelected(dir string, plan Plan) (rust, golang SuiteRun, known bool) {
+	var wantRust, wantGo bool
+	for _, s := range plan.Selected {
+		if s.GoJSON {
+			wantGo = true
+		} else {
+			wantRust = true
+		}
+	}
+	if plan.Everything || (!wantRust && !wantGo) {
+		return SuiteRun{}, SuiteRun{}, false
+	}
+	rust, golang = SuiteRun{Examined: true}, SuiteRun{Examined: true}
+	if wantRust {
+		rust = readSuite(filepath.Join(dir, "selected-rust.log"), "the selected phase's cargo log", parseLibtest)
+	}
+	if wantGo {
+		golang = readSuite(filepath.Join(dir, "selected-go.jsonl"), "the selected phase's go log", parseGoJSON)
+	}
+	return rust, golang, true
 }
 
 func readSuite(path, what string, parse func(io.Reader) SuiteRun) SuiteRun {

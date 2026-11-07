@@ -216,11 +216,12 @@ function main() {
   run("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], {
     cwd: GO_MODULE,
   });
-  // The DevMap test selector (selected-tests.yml runs it on every push). Named
-  // on its own so a break in it reads as the selector's, not as one of
-  // ./...'s hundreds; its end-to-end test drives the real `devmap` on PATH and
-  // fails, not skips, without one.
-  run("test selector", "go", ["test", "./cmd/dctestselect", "-count=1"], {
+  // The DevMap test selector's end-to-end tests (selected-tests.yml runs them
+  // on every push). They are behind the e2e tag, so `./...` below does not
+  // compile them, and this is their only run here; the selector's unit tests
+  // are in `./...`. They drive the real `devmap` on PATH and fail, not skip,
+  // without one.
+  run("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1"], {
     cwd: GO_MODULE,
   });
   run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {

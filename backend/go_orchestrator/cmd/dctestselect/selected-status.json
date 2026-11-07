@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "commands": [
+    {
+      "cmd": "helper ok",
+      "log": "",
+      "exit_code": 0,
+      "detail": "exit status 0",
+      "completed": true
+    }
+  ]
+}

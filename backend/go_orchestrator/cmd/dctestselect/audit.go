@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const recallSchema = 1
+const recallSchema = 2
 
 // Failure is one failed test, in the terms a unit is described in.
 type Failure struct {
@@ -47,55 +47,77 @@ type SuiteRun struct {
 
 var (
 	libtestSection = regexp.MustCompile(`^\s+(?:Running|Doc-tests)\b`)
-	libtestFailed  = regexp.MustCompile(`^test (.+) \.\.\. FAILED$`)
+	libtestFailed  = regexp.MustCompile(`(?:^|\W)test (.+?) \.\.\. FAILED$`)
 	libtestFooter  = regexp.MustCompile("^error: (?:test|doctest) failed, to rerun pass `([^`]+)`$")
 	libtestResult  = regexp.MustCompile(`^test result: `)
 	libtestCompile = regexp.MustCompile(`^error: could not compile `)
+	ansiEscape     = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 )
 
 const maxLogLine = 4 << 20
 
+func stripANSI(s string) string { return ansiEscape.ReplaceAllString(s, "") }
+
 // parseLibtest reads `cargo test --no-fail-fast` output.
 //
-// libtest's JSON format is nightly-only, so this reads the text. Cargo prints
-// a failing target's tests first and then a footer naming the package and the
-// target (`-p cb --test it`); the footer is what attributes them, because the
-// `Running tests/it.rs` header carries a path relative to the package, and two
-// packages both have a src/lib.rs.
+// libtest's JSON format is nightly-only, so this reads the text, and a test can
+// print anything into it. Only the lines libtest itself writes outside a
+// failing test's captured `---- name stdout ----` block are structure: the
+// `Running` header, the `failures:` summary's name list, and `test result:`.
+// So a section's failures are the summary's names (the pre-summary FAILED
+// lines are the fallback when there is none), and its package is named by the
+// footer cargo prints after `test result:`. A footer or FAILED line inside a
+// captured block comes before the section's own `test result:` and the summary,
+// and changes nothing. A section with no `test result:` line was cut off or
+// aborted, and the suite is then not examined.
 func parseLibtest(r io.Reader) SuiteRun {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), maxLogLine)
 	var run SuiteRun
-	var pending []string
-	results, compileErrors := 0, 0
-	flush := func(pkg, target string) {
-		for _, name := range pending {
-			run.Failures = append(run.Failures, Failure{Kind: "rust", Pkg: pkg, Target: target, Name: name})
+	var section []string
+	compileErrors, results, incomplete := 0, 0, 0
+	seen := map[Failure]bool{}
+	finish := func() {
+		if section == nil {
+			return
 		}
-		pending = nil
+		failed, pkg, target, done := readSection(section)
+		if done {
+			results++
+		} else {
+			incomplete++
+		}
+		for _, name := range failed {
+			f := Failure{Kind: "rust", Pkg: pkg, Target: target, Name: name}
+			if !seen[f] {
+				seen[f] = true
+				run.Failures = append(run.Failures, f)
+			}
+		}
+		section = nil
 	}
 	for sc.Scan() {
-		line := sc.Text()
-		switch {
-		case libtestSection.MatchString(line):
-			flush("?", "")
-		case libtestFailed.MatchString(line):
-			pending = append(pending, libtestFailed.FindStringSubmatch(line)[1])
-		case libtestFooter.MatchString(line):
-			pkg, target := splitRerun(libtestFooter.FindStringSubmatch(line)[1])
-			flush(pkg, target)
-		case libtestResult.MatchString(line):
-			results++
-		case libtestCompile.MatchString(line):
+		line := stripANSI(sc.Text())
+		if libtestCompile.MatchString(line) {
 			compileErrors++
 		}
+		if libtestSection.MatchString(line) {
+			finish()
+			section = []string{}
+			continue
+		}
+		if section != nil {
+			section = append(section, line)
+		}
 	}
-	flush("?", "")
+	finish()
 	switch {
 	case sc.Err() != nil:
 		run.Note = "the libtest log could not be read to the end: " + sc.Err().Error()
 	case compileErrors > 0:
 		run.Note = fmt.Sprintf("%d target(s) failed to compile, so their tests never ran", compileErrors)
+	case incomplete > 0:
+		run.Note = fmt.Sprintf("%d test binary(ies) have a `Running` header and no `test result:` line: killed, aborted or cut off", incomplete)
 	case results == 0:
 		run.Note = "the libtest log holds no `test result:` line, so no test ran"
 	default:
@@ -103,6 +125,65 @@ func parseLibtest(r io.Reader) SuiteRun {
 	}
 	sortFailures(run.Failures)
 	return run
+}
+
+// readSection reads one test binary's output. done is whether it reached its
+// own `test result:` line.
+func readSection(lines []string) (failed []string, pkg, target string, done bool) {
+	result := -1
+	for i, l := range lines {
+		if libtestResult.MatchString(l) {
+			result = i
+		}
+	}
+	pre := lines
+	if result >= 0 {
+		pre = lines[:result]
+	}
+	for i, l := range pre {
+		if l == "failures:" {
+			pre = pre[:i]
+			break
+		}
+	}
+	var fromLines []string
+	for _, l := range pre {
+		if m := libtestFailed.FindStringSubmatch(l); m != nil {
+			fromLines = append(fromLines, m[1])
+		}
+	}
+	failed = fromLines
+	pkg, target = "?", ""
+	if result < 0 {
+		return failed, pkg, target, false
+	}
+	// The summary: the names listed after the last `failures:` before the result.
+	last := -1
+	for i := 0; i < result; i++ {
+		if lines[i] == "failures:" {
+			last = i
+		}
+	}
+	if last >= 0 {
+		var names []string
+		for _, l := range lines[last+1 : result] {
+			if strings.HasPrefix(l, "    ") && strings.TrimSpace(l) != "" {
+				names = append(names, strings.TrimSpace(l))
+			} else if strings.TrimSpace(l) != "" || len(names) > 0 {
+				break
+			}
+		}
+		if len(names) > 0 {
+			failed = names
+		}
+	}
+	for _, l := range lines[result+1:] {
+		if m := libtestFooter.FindStringSubmatch(l); m != nil {
+			pkg, target = splitRerun(m[1])
+			break
+		}
+	}
+	return failed, pkg, target, true
 }
 
 // splitRerun splits `-p cb --test it` into the package and `--test it`.
@@ -129,14 +210,17 @@ type goEvent struct {
 	Test    string `json:"Test"`
 }
 
-// parseGoJSON reads a `go test -json` stream.
+// parseGoJSON reads a `go test -json` stream. A package that has events and
+// no final pass, fail or skip of its own was killed or cut off, so the stream
+// is not examined.
 func parseGoJSON(r io.Reader) SuiteRun {
 	var run SuiteRun
 	dec := json.NewDecoder(r)
 	testFailed := map[string]bool{}
 	pkgFailed := map[string]bool{}
+	seenPkg := map[string]bool{}
+	donePkg := map[string]bool{}
 	seen := map[Failure]bool{}
-	finished := 0
 	for {
 		var ev goEvent
 		if err := dec.Decode(&ev); errors.Is(err, io.EOF) {
@@ -146,11 +230,14 @@ func parseGoJSON(r io.Reader) SuiteRun {
 			run.Failures = nil
 			return run
 		}
+		if ev.Package != "" {
+			seenPkg[ev.Package] = true
+		}
 		if ev.Action != "fail" && ev.Action != "pass" && ev.Action != "skip" {
 			continue
 		}
 		if ev.Test == "" {
-			finished++
+			donePkg[ev.Package] = true
 			if ev.Action == "fail" {
 				pkgFailed[ev.Package] = true
 			}
@@ -171,11 +258,21 @@ func parseGoJSON(r io.Reader) SuiteRun {
 		}
 	}
 	sortFailures(run.Failures)
-	if finished == 0 {
-		run.Note = "the go test -json log holds no package result, so no test ran"
-		return run
+	var unfinished []string
+	for pkg := range seenPkg {
+		if !donePkg[pkg] {
+			unfinished = append(unfinished, pkg)
+		}
 	}
-	run.Examined = true
+	sort.Strings(unfinished)
+	switch {
+	case len(donePkg) == 0:
+		run.Note = "the go test -json log holds no package result, so no test ran"
+	case len(unfinished) > 0:
+		run.Note = "the go test -json log has package(s) with no final result, killed or cut off: " + strings.Join(unfinished, ", ")
+	default:
+		run.Examined = true
+	}
 	return run
 }
 
@@ -233,10 +330,25 @@ type FullReport struct {
 	Failed []string    `json:"failed"`
 }
 
+// BaseRecord is where the base's failures came from. A record of another
+// commit than the one the plan measured from can misattribute a failure that
+// was fixed or introduced between the two, so the difference is surfaced.
+type BaseRecord struct {
+	SHA   string `json:"sha"`
+	RunID string `json:"run_id"`
+	Ref   string `json:"ref"`
+	Event string `json:"event"`
+	// MatchesPlanBase is whether SHA is the commit the plan measured from.
+	MatchesPlanBase bool `json:"matches_plan_base"`
+}
+
 // Recall is selection-recall.json.
 type Recall struct {
 	Schema     int              `json:"schema"`
 	SHA        string           `json:"sha"`
+	Ref        string           `json:"ref"`
+	Event      string           `json:"event"`
+	RunID      string           `json:"run_id"`
 	Base       string           `json:"base"`
 	Trigger    string           `json:"trigger"`
 	Blast      *BlastSummary    `json:"blast"`
@@ -246,25 +358,35 @@ type Recall struct {
 	Full       FullReport       `json:"full"`
 	// BaseFailed is null when the base run's failures are not known, which is
 	// not the same as an empty list.
-	BaseFailed []string `json:"base_failed"`
+	BaseFailed []string    `json:"base_failed"`
+	BaseRecord *BaseRecord `json:"base_record"`
 	// Missed are failures the selection did not run and the base did not have.
 	Missed []string `json:"missed"`
 	// Unclassified are failures outside the selection while the base is
 	// unknown: they may be the base's own.
 	Unclassified []string `json:"unclassified"`
 	NFailed      int      `json:"n_failed"`
+	// SelectedPhaseFailedOnly are failures of the fast phase that the full
+	// suite did not have: a red only the selected commands' feature set or
+	// ordering produced. Null when either phase was not examined.
+	SelectedPhaseFailedOnly []string `json:"selected_phase_failed_only"`
 	// Recall is null when it cannot be asserted: nothing failed, the base is
-	// unknown, or a suite was not examined. It is never 1.0 by default.
+	// unknown, a suite was not examined, or the selection was everything.
 	Recall     *float64 `json:"recall"`
 	RecallNote string   `json:"recall_note"`
 }
 
 // BaseFailures reads the failures a base-branch run recorded. It returns nil,
-// with the reason, when they cannot be trusted: a different schema, a run that
-// did not examine both suites, or a document that is not one.
-func BaseFailures(raw []byte) ([]string, string) {
+// with the reason, when they cannot be trusted: a different schema, a record
+// that is not of a push to wantRef, a run that did not examine both suites, or
+// a document that is not one.
+func BaseFailures(raw []byte, wantRef string) ([]string, BaseRecord, string) {
 	var b struct {
-		Schema int `json:"schema"`
+		Schema int    `json:"schema"`
+		SHA    string `json:"sha"`
+		Ref    string `json:"ref"`
+		Event  string `json:"event"`
+		RunID  string `json:"run_id"`
 		Full   *struct {
 			Rust   SuiteReport `json:"rust"`
 			Go     SuiteReport `json:"go"`
@@ -272,27 +394,75 @@ func BaseFailures(raw []byte) ([]string, string) {
 		} `json:"full"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, "the base artifact is not JSON: " + err.Error()
+		return nil, BaseRecord{}, "the base artifact is not JSON: " + err.Error()
 	}
+	rec := BaseRecord{SHA: b.SHA, RunID: b.RunID, Ref: b.Ref, Event: b.Event}
 	switch {
 	case b.Schema != recallSchema:
-		return nil, fmt.Sprintf("the base artifact has schema %d, this build reads %d", b.Schema, recallSchema)
+		return nil, rec, fmt.Sprintf("the base artifact has schema %d, this build reads %d", b.Schema, recallSchema)
+	case b.Ref != wantRef:
+		return nil, rec, fmt.Sprintf("the base artifact is from ref %q, not %q", b.Ref, wantRef)
+	case b.Event != "push":
+		return nil, rec, fmt.Sprintf("the base artifact is from a %q run, not a push", b.Event)
 	case b.Full == nil || b.Full.Failed == nil:
-		return nil, "the base artifact carries no full.failed list"
+		return nil, rec, "the base artifact carries no full.failed list"
 	case !b.Full.Rust.Examined || !b.Full.Go.Examined:
-		return nil, "the base run did not examine both suites, so its failures are not its whole set"
+		return nil, rec, "the base run did not examine both suites, so its failures are not its whole set"
 	}
-	return *b.Full.Failed, ""
+	return *b.Full.Failed, rec, ""
+}
+
+// ExitInfo is how one command of a phase ended, as run recorded it.
+type ExitInfo struct {
+	Cmd  string `json:"cmd"`
+	Log  string `json:"log"`
+	Code int    `json:"exit_code"`
+	// Detail is the process state ("exit status 101", "signal: killed") or why
+	// the command could not run.
+	Detail string `json:"detail"`
+	// Completed is true only when the process exited on its own.
+	Completed bool `json:"completed"`
+}
+
+// Qualify demotes a suite that its own exit status contradicts. A run that was
+// killed, did not start, exited non-zero with no failing test to show for it,
+// or exited zero with failures in its output is not one whose log says what
+// happened, whatever the log parses to.
+func Qualify(run SuiteRun, st *ExitInfo) SuiteRun {
+	if !run.Examined {
+		return run
+	}
+	why := ""
+	switch {
+	case st == nil:
+		why = "no exit status was recorded for the command"
+	case !st.Completed:
+		why = "the command did not run to completion (" + st.Detail + ")"
+	case st.Code != 0 && len(run.Failures) == 0:
+		why = fmt.Sprintf("the command exited %d with no failing test in its log", st.Code)
+	case st.Code == 0 && len(run.Failures) > 0:
+		why = "the command exited 0 but its log shows failures"
+	}
+	if why != "" {
+		run.Examined = false
+		run.Note = why
+	}
+	return run
 }
 
 // AuditInput is everything Audit measures.
 type AuditInput struct {
-	Plan    Plan
-	SHA     string
-	Rust    SuiteRun
-	Go      SuiteRun
-	Base    []string // nil: unknown
-	BaseWhy string
+	Plan                Plan
+	SHA, Ref, Event, ID string
+	Rust                SuiteRun
+	Go                  SuiteRun
+	Base                []string // nil: unknown
+	BaseWhy             string
+	BaseInfo            *BaseRecord
+	// SelectedRust and SelectedGo are the fast phase's logs; SelectedKnown is
+	// false when they could not be read.
+	SelectedRust, SelectedGo SuiteRun
+	SelectedKnown            bool
 }
 
 // Audit computes selection-recall.json and the annotations that go with it.
@@ -305,7 +475,8 @@ type AuditInput struct {
 func Audit(in AuditInput) (Recall, []string) {
 	var notes []string
 	r := Recall{
-		Schema: recallSchema, SHA: in.SHA, Base: in.Plan.Base, Trigger: in.Plan.Trigger, Blast: in.Plan.Blast,
+		Schema: recallSchema, SHA: in.SHA, Ref: in.Ref, Event: in.Event, RunID: in.ID,
+		Base: in.Plan.Base, Trigger: in.Plan.Trigger, Blast: in.Plan.Blast,
 		Everything: in.Plan.Everything, Widened: in.Plan.Widened, Selected: []RecallSelected{},
 		Missed: []string{}, Unclassified: []string{},
 	}
@@ -321,10 +492,23 @@ func Audit(in AuditInput) (Recall, []string) {
 	failures = append(failures, in.Rust.Failures...)
 	failures = append(failures, in.Go.Failures...)
 	sortFailures(failures)
-	byKey := map[string]Failure{}
+	fullFailed := map[string]bool{}
 	for _, f := range failures {
 		r.Full.Failed = append(r.Full.Failed, f.Key())
-		byKey[f.Key()] = f
+		fullFailed[f.Key()] = true
+	}
+	fullExamined := in.Rust.Examined && in.Go.Examined
+	if in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && fullExamined {
+		r.SelectedPhaseFailedOnly = []string{}
+		for _, f := range append(append([]Failure{}, in.SelectedRust.Failures...), in.SelectedGo.Failures...) {
+			if !fullFailed[f.Key()] {
+				r.SelectedPhaseFailedOnly = append(r.SelectedPhaseFailedOnly, f.Key())
+			}
+		}
+		sort.Strings(r.SelectedPhaseFailedOnly)
+		for _, k := range r.SelectedPhaseFailedOnly {
+			notes = append(notes, annotate("warning", "failed in the selected phase only, not in the full suite: "+k))
+		}
 	}
 
 	baseKnown := in.Base != nil
@@ -334,15 +518,22 @@ func Audit(in AuditInput) (Recall, []string) {
 		for _, k := range in.Base {
 			baseSet[k] = true
 		}
+		if in.BaseInfo != nil {
+			rec := *in.BaseInfo
+			rec.MatchesPlanBase = rec.SHA != "" && rec.SHA == in.Plan.Base
+			r.BaseRecord = &rec
+			if !rec.MatchesPlanBase {
+				notes = append(notes, annotate("notice", fmt.Sprintf("the base record is from %s (run %s) and the plan measured from %s; a test fixed or broken between them is misattributed", rec.SHA, rec.RunID, in.Plan.Base)))
+			}
+		}
 	} else {
-		notes = append(notes, "::warning::base_failed is unknown ("+in.BaseWhy+"); failures outside the selection are unclassified, not misses")
+		notes = append(notes, annotate("warning", "base_failed is unknown ("+in.BaseWhy+"); failures outside the selection are unclassified, not misses"))
 	}
 	var attributable []Failure
 	for _, f := range failures {
-		if baseSet[f.Key()] {
-			continue
+		if !baseSet[f.Key()] {
+			attributable = append(attributable, f)
 		}
-		attributable = append(attributable, f)
 	}
 	covered := 0
 	for _, f := range attributable {
@@ -351,7 +542,7 @@ func Audit(in AuditInput) (Recall, []string) {
 			covered++
 		case baseKnown:
 			r.Missed = append(r.Missed, f.Key())
-			notes = append(notes, "::error::selection missed "+f.Key())
+			notes = append(notes, annotate("error", "selection missed "+f.Key()))
 		default:
 			r.Unclassified = append(r.Unclassified, f.Key())
 		}
@@ -359,16 +550,18 @@ func Audit(in AuditInput) (Recall, []string) {
 	r.NFailed = len(attributable)
 
 	switch {
-	case !in.Rust.Examined || !in.Go.Examined:
+	case !fullExamined:
 		r.RecallNote = "a suite was not examined, so a failure may be absent from the record"
 		for _, s := range []struct {
 			name string
 			run  SuiteRun
 		}{{"Rust", in.Rust}, {"Go", in.Go}} {
 			if !s.run.Examined {
-				notes = append(notes, "::warning::the full "+s.name+" suite was not examined: "+s.run.Note)
+				notes = append(notes, annotate("warning", "the full "+s.name+" suite was not examined: "+s.run.Note))
 			}
 		}
+	case in.Plan.Everything:
+		r.RecallNote = "the selection was everything, so every failure was inside it and the figure would say nothing about DevMap"
 	case !baseKnown:
 		r.RecallNote = "the base's failures are unknown, so which failures belong to this change is unknown"
 	case r.NFailed == 0:

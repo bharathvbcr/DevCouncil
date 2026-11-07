@@ -214,16 +214,25 @@ describe("ci:local runs the DevMap test selector's tests", () => {
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
   const source = () => readFileSync(path.join(root, "scripts", "ci-local.mjs"), "utf8");
 
-  it("has a step that runs ./cmd/dctestselect from the Go module, as its own failure", () => {
-    const step = /run\(\s*"test selector",\s*"go",\s*\["test", "\.\/cmd\/dctestselect", "-count=1"\],\s*\{\s*cwd: GO_MODULE,?\s*\}\s*\)/.exec(source());
-    assert.ok(step, "ci-local.mjs has no `run(\"test selector\", \"go\", [\"test\", \"./cmd/dctestselect\", \"-count=1\"], { cwd: GO_MODULE })`");
+  it("has a step that runs the selector's end-to-end tests under the e2e tag, from the Go module", () => {
+    const step = /run\(\s*"test selector end-to-end",\s*"go",\s*\["test", "-tags", "e2e", "\.\/cmd\/dctestselect", "-run", "\^TestE2E", "-count=1", "-p", "1"\],\s*\{\s*cwd: GO_MODULE,?\s*\}\s*\)/.exec(source());
+    assert.ok(step, "ci-local.mjs does not run `go test -tags e2e ./cmd/dctestselect -run ^TestE2E` from GO_MODULE");
+  });
+
+  it("does not run the selector twice: the e2e tests are tagged out of ./..., so only this step runs them", () => {
+    const text = source();
+    assert.equal((text.match(/\.\/cmd\/dctestselect/g) ?? []).length, 1);
+    for (const file of ["e2e_test.go"]) {
+      const head = readFileSync(path.join(root, "backend", "go_orchestrator", "cmd", "dctestselect", file), "utf8").split("\n")[0];
+      assert.equal(head, "//go:build e2e", `${file} must carry the e2e build tag`);
+    }
   });
 
   it("names a package that exists, and a workflow that runs the selector", () => {
     const goMain = readFileSync(path.join(root, "backend", "go_orchestrator", "cmd", "dctestselect", "main.go"), "utf8");
     assert.match(goMain, /^package main$/m);
     const workflow = readFileSync(path.join(root, ".github", "workflows", "selected-tests.yml"), "utf8");
-    for (const phase of ["plan", "--phase selected", "--phase full", "audit"]) {
+    for (const phase of ["plan", "--phase selected", "--phase full", "audit", "-tags e2e"]) {
       assert.ok(workflow.includes(phase), `selected-tests.yml does not run dctestselect ${phase}`);
     }
   });

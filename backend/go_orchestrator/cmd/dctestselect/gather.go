@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -26,10 +27,20 @@ type Command struct {
 	GoJSON bool `json:"go_json,omitempty"`
 	// Log names the file the command's output is kept in, for the audit.
 	Log string `json:"log,omitempty"`
+	// Env is added to the process environment. Cargo commands carry
+	// CARGO_TERM_COLOR=never, so no ANSI escape can hide a line from the audit.
+	Env []string `json:"env,omitempty"`
+	// Fallback is the same command without its libtest filter. A filtered run
+	// in which no test ran proves nothing, so run re-runs it whole.
+	Fallback []string `json:"fallback,omitempty"`
 }
 
 func newCommand(dir string, argv ...string) Command {
-	return Command{Display: strings.Join(argv, " "), Dir: dir, Argv: argv}
+	c := Command{Display: strings.Join(argv, " "), Dir: dir, Argv: argv}
+	if len(argv) > 0 && argv[0] == "cargo" {
+		c.Env = []string{"CARGO_TERM_COLOR=never"}
+	}
+	return c
 }
 
 const (
@@ -42,7 +53,7 @@ const (
 // runProcess is the one place this program starts a child. The deadline covers
 // the fork as well as the process, the whole process group dies with it, and
 // the caller supplies the writers (a capped buffer, or a log).
-func runProcess(ctx context.Context, timeout time.Duration, dir string, argv []string, stdout, stderr io.Writer) error {
+func runProcess(ctx context.Context, timeout time.Duration, dir string, env, argv []string, stdout, stderr io.Writer) error {
 	if len(argv) == 0 {
 		return errors.New("empty command")
 	}
@@ -51,6 +62,9 @@ func runProcess(ctx context.Context, timeout time.Duration, dir string, argv []s
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	proc.ConfigureGroup(cmd)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 2 * time.Second
@@ -76,7 +90,7 @@ type execRunner struct{ timeout time.Duration }
 func (r execRunner) Output(ctx context.Context, dir string, argv ...string) ([]byte, error) {
 	out := &proc.CappedBuffer{Limit: maxCaptured}
 	errs := &proc.CappedBuffer{Limit: maxStderr}
-	if err := runProcess(ctx, r.timeout, dir, argv, out, errs); err != nil {
+	if err := runProcess(ctx, r.timeout, dir, nil, argv, out, errs); err != nil {
 		return nil, fmt.Errorf("%s failed: %w%s", strings.Join(argv, " "), err, tail(errs.String()))
 	}
 	if out.Overflowed() {
@@ -110,6 +124,8 @@ type Options struct {
 	Excludes []string
 	RustDir  string
 	GoDir    string
+	// Timeout bounds each question the plan asks, the devmap blast included.
+	Timeout time.Duration
 }
 
 var (
@@ -178,6 +194,15 @@ func resolveBase(ctx context.Context, run Runner, o Options) (base, head string,
 	if !fullSHAre.MatchString(base) {
 		return "", head, fmt.Errorf("git merge-base answered %q", base)
 	}
+	if base == head {
+		// HEAD is the default branch's tip (a manual run there): the merge
+		// base measures an empty change, which would select nothing. Measure
+		// the last commit instead.
+		base, err = resolveRev(ctx, run, o.Repo, head+"~1")
+		if err != nil {
+			return "", head, fmt.Errorf("the change from %s is empty and it has no parent to measure instead: %w", remote, err)
+		}
+	}
 	return base, head, nil
 }
 
@@ -226,15 +251,30 @@ type metadataWire struct {
 			SrcPath          string   `json:"src_path"`
 			RequiredFeatures []string `json:"required-features"`
 			Test             *bool    `json:"test"`
+			Doctest          *bool    `json:"doctest"`
 		} `json:"targets"`
 	} `json:"packages"`
 	WorkspaceMembers []string `json:"workspace_members"`
+	Resolve          *struct {
+		Nodes []struct {
+			ID   string `json:"id"`
+			Deps []struct {
+				Pkg      string `json:"pkg"`
+				DepKinds []struct {
+					Kind *string `json:"kind"`
+				} `json:"dep_kinds"`
+			} `json:"deps"`
+		} `json:"nodes"`
+	} `json:"resolve"`
 }
+
+// maxResolveNodes bounds the dependency graph read from cargo metadata.
+const maxResolveNodes = 200000
 
 // loadRust reads the cargo workspace from `cargo metadata`, which is the
 // authority for targets, their sources and their required features.
 func loadRust(ctx context.Context, run Runner, repo, rustDir string) (*RustWorkspace, error) {
-	out, err := run.Output(ctx, filepath.Join(repo, rustDir), "cargo", "metadata", "--no-deps", "--format-version", "1", "--locked")
+	out, err := run.Output(ctx, filepath.Join(repo, rustDir), "cargo", "metadata", "--format-version", "1", "--locked")
 	if err != nil {
 		return nil, err
 	}
@@ -274,14 +314,78 @@ func decodeMetadata(raw []byte, repo string) (*RustWorkspace, error) {
 			if err != nil {
 				return nil, fmt.Errorf("target %s of %s: %w", t.Name, p.Name, err)
 			}
-			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, RequiredFeatures: t.RequiredFeatures, Test: *t.Test})
+			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, RequiredFeatures: t.RequiredFeatures, Test: *t.Test, Doctest: t.Doctest == nil || *t.Doctest})
 		}
 		ws.Packages = append(ws.Packages, pkg)
 	}
 	if len(ws.Packages) == 0 {
 		return nil, errors.New("no cargo package is a workspace member")
 	}
+	closure, err := driverClosure(&w, ws)
+	if err != nil {
+		return nil, err
+	}
+	ws.DriverClosure = closure
 	return ws, nil
+}
+
+// driverClosure is the set of workspace members compiled into a binary a Go
+// test runs: devmap-cli and every dc-* package with a bin target, and what they
+// depend on through normal or build edges. The graph has no edge from Rust
+// source to the Go tests that exec these binaries, so a change in any member of
+// the closure selects those Go packages (see crossProcess).
+func driverClosure(w *metadataWire, ws *RustWorkspace) (map[string]bool, error) {
+	if w.Resolve == nil || len(w.Resolve.Nodes) == 0 {
+		return nil, errors.New("cargo metadata carries no resolve graph, so the binaries' dependency closure is unknown")
+	}
+	if len(w.Resolve.Nodes) > maxResolveNodes {
+		return nil, fmt.Errorf("cargo metadata's resolve graph has %d nodes, over the %d bound", len(w.Resolve.Nodes), maxResolveNodes)
+	}
+	nameOf := map[string]string{}
+	for _, p := range w.Packages {
+		nameOf[p.ID] = p.Name
+	}
+	deps := map[string][]string{}
+	for _, n := range w.Resolve.Nodes {
+		for _, d := range n.Deps {
+			dev := len(d.DepKinds) > 0
+			for _, k := range d.DepKinds {
+				if k.Kind == nil || *k.Kind != "dev" {
+					dev = false
+				}
+			}
+			if !dev {
+				deps[n.ID] = append(deps[n.ID], d.Pkg)
+			}
+		}
+	}
+	idOf := map[string]string{}
+	for _, p := range w.Packages {
+		idOf[p.Name] = p.ID
+	}
+	var queue []string
+	for _, pkg := range ws.Packages {
+		hasBin := false
+		for _, t := range pkg.Targets {
+			hasBin = hasBin || t.is("bin")
+		}
+		if pkg.Name == "devmap-cli" || (strings.HasPrefix(pkg.Name, "dc-") && hasBin) {
+			queue = append(queue, idOf[pkg.Name])
+		}
+	}
+	seen := map[string]bool{}
+	closure := map[string]bool{}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		closure[nameOf[id]] = true
+		queue = append(queue, deps[id]...)
+	}
+	return closure, nil
 }
 
 type goListWire struct {
@@ -365,7 +469,7 @@ func gather(ctx context.Context, run Runner, o Options, readFile func(string) ([
 	if in.BaseErr == nil {
 		in.GitChanged, in.GitErr = gitChanged(ctx, run, o.Repo, in.Base, in.Head)
 		client := devmap.New(o.Devmap, o.Repo)
-		client.Timeout = 5 * time.Minute
+		client.Timeout = o.Timeout
 		in.Blast, in.BlastErr = client.Blast(ctx, in.Base)
 	}
 	in.Rust, in.RustErr = loadRust(ctx, run, o.Repo, o.RustDir)

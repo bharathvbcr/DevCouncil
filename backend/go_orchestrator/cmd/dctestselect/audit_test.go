@@ -207,10 +207,13 @@ func TestASuiteThatWasNotExaminedNeverLooksLikeOneThatPassed(t *testing.T) {
 	}
 }
 
-func TestAnEverythingPlanCoversEveryFailure(t *testing.T) {
+func TestAnEverythingPlanCoversEveryFailureButSaysNothingAboutRecall(t *testing.T) {
 	r, _ := Audit(AuditInput{Plan: Plan{Everything: true}, Rust: examined(failCbIt), Go: examined(failGoBad), Base: []string{}})
-	if len(r.Missed) != 0 || r.Recall == nil || *r.Recall != 1 || r.NFailed != 2 {
-		t.Fatalf("missed=%v recall=%v n_failed=%d", r.Missed, r.Recall, r.NFailed)
+	if len(r.Missed) != 0 || r.NFailed != 2 {
+		t.Fatalf("missed=%v n_failed=%d", r.Missed, r.NFailed)
+	}
+	if r.Recall != nil || !strings.Contains(r.RecallNote, "everything") {
+		t.Fatalf("recall=%v note=%q; a widened run must not report a recall of 1.0", r.Recall, r.RecallNote)
 	}
 }
 
@@ -235,26 +238,96 @@ func TestACoveredFailureMatchesTargetFilterAndPackage(t *testing.T) {
 	}
 }
 
-func TestBaseFailuresAcceptsOnlyAnExaminedSameSchemaRecord(t *testing.T) {
-	good := `{"schema":1,"full":{"rust":{"examined":true},"go":{"examined":true},"failed":["a","b"]}}`
-	if got, why := BaseFailures([]byte(good)); len(got) != 2 || why != "" {
-		t.Fatalf("got=%v why=%q", got, why)
+const mainRef = "refs/heads/main"
+
+func baseDoc(mutate func(string) string) []byte {
+	return []byte(mutate(`{"schema":2,"sha":"abc","ref":"refs/heads/main","event":"push","run_id":"7","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["a","b"]}}`))
+}
+
+func TestBaseFailuresAcceptsOnlyAnExaminedSameSchemaPushRecordOfTheBaseBranch(t *testing.T) {
+	got, rec, why := BaseFailures(baseDoc(func(s string) string { return s }), mainRef)
+	if len(got) != 2 || why != "" || rec.SHA != "abc" || rec.RunID != "7" {
+		t.Fatalf("got=%v rec=%+v why=%q", got, rec, why)
 	}
-	empty := `{"schema":1,"full":{"rust":{"examined":true},"go":{"examined":true},"failed":[]}}`
-	if got, why := BaseFailures([]byte(empty)); got == nil || why != "" {
+	empty := baseDoc(func(s string) string { return strings.Replace(s, `"failed":["a","b"]`, `"failed":[]`, 1) })
+	if got, _, why := BaseFailures(empty, mainRef); got == nil || why != "" {
 		t.Fatalf("an examined base with no failures is an empty list, not unknown: got=%v why=%q", got, why)
 	}
-	for name, doc := range map[string]string{
-		"not json":        "nope",
-		"other schema":    `{"schema":2,"full":{"rust":{"examined":true},"go":{"examined":true},"failed":[]}}`,
-		"no failed list":  `{"schema":1,"full":{"rust":{"examined":true},"go":{"examined":true}}}`,
-		"null failed":     `{"schema":1,"full":{"rust":{"examined":true},"go":{"examined":true},"failed":null}}`,
-		"base unexamined": `{"schema":1,"full":{"rust":{"examined":false},"go":{"examined":true},"failed":[]}}`,
-		"no full":         `{"schema":1}`,
+	for name, mutate := range map[string]func(string) string{
+		"other schema":   func(s string) string { return strings.Replace(s, `"schema":2`, `"schema":1`, 1) },
+		"other ref":      func(s string) string { return strings.Replace(s, `refs/heads/main`, `refs/pull/9/merge`, 1) },
+		"no ref":         func(s string) string { return strings.Replace(s, `"ref":"refs/heads/main",`, ``, 1) },
+		"pull request":   func(s string) string { return strings.Replace(s, `"event":"push"`, `"event":"pull_request"`, 1) },
+		"no failed list": func(s string) string { return strings.Replace(s, `,"failed":["a","b"]`, ``, 1) },
+		"null failed":    func(s string) string { return strings.Replace(s, `["a","b"]`, `null`, 1) },
+		"base unexamined": func(s string) string {
+			return strings.Replace(s, `"rust":{"examined":true}`, `"rust":{"examined":false}`, 1)
+		},
+		"not json": func(string) string { return "nope" },
 	} {
-		if got, why := BaseFailures([]byte(doc)); got != nil || why == "" {
+		if got, _, why := BaseFailures(baseDoc(mutate), mainRef); got != nil || why == "" {
 			t.Errorf("%s: got=%v why=%q; an untrustworthy base must be unknown", name, got, why)
 		}
+	}
+}
+
+func TestADifferentBaseCommitIsNotedAndRecorded(t *testing.T) {
+	plan := Plan{Base: "planbase"}
+	base := []string{}
+	r, notes := Audit(AuditInput{Plan: plan, Rust: examined(), Go: examined(), Base: base, BaseInfo: &BaseRecord{SHA: "other", RunID: "7", Ref: mainRef, Event: "push"}})
+	if r.BaseRecord == nil || r.BaseRecord.MatchesPlanBase || r.BaseRecord.SHA != "other" || r.BaseRecord.RunID != "7" {
+		t.Fatalf("base_record = %+v", r.BaseRecord)
+	}
+	if !contains(notes, annotate("notice", "the base record is from other (run 7) and the plan measured from planbase; a test fixed or broken between them is misattributed")) {
+		t.Errorf("notes = %q", notes)
+	}
+	r, notes = Audit(AuditInput{Plan: plan, Rust: examined(), Go: examined(), Base: base, BaseInfo: &BaseRecord{SHA: "planbase"}})
+	if !r.BaseRecord.MatchesPlanBase || len(notes) != 0 {
+		t.Errorf("matching base: %+v notes=%q", r.BaseRecord, notes)
+	}
+}
+
+func TestQualifyDemotesASuiteItsExitStatusContradicts(t *testing.T) {
+	ran := func(code int) *ExitInfo { return &ExitInfo{Code: code, Completed: true, Detail: "exit status"} }
+	for name, tc := range map[string]struct {
+		run  SuiteRun
+		st   *ExitInfo
+		want bool
+	}{
+		"clean pass":                  {examined(), ran(0), true},
+		"failures and exit 101":       {examined(failCbIt), ran(101), true},
+		"no status":                   {examined(), nil, false},
+		"killed":                      {examined(failCbIt), &ExitInfo{Code: -1, Detail: "signal: killed"}, false},
+		"exit 101 and nothing parsed": {examined(), ran(101), false},
+		"exit 0 with failures":        {examined(failCbIt), ran(0), false},
+	} {
+		got := Qualify(tc.run, tc.st)
+		if got.Examined != tc.want || (!tc.want && got.Note == "") {
+			t.Errorf("%s: examined=%t note=%q, want examined=%t", name, got.Examined, got.Note, tc.want)
+		}
+	}
+	if got := Qualify(SuiteRun{Note: "already not examined"}, ran(0)); got.Examined || got.Note != "already not examined" {
+		t.Errorf("an unexamined suite was altered: %+v", got)
+	}
+}
+
+func TestASelectedPhaseRedTheFullSuiteDidNotHaveIsNamed(t *testing.T) {
+	in := AuditInput{Plan: selectedCa, Rust: examined(failCaFoo), Go: examined(), Base: []string{}, SelectedKnown: true,
+		SelectedRust: examined(failCaFoo, failCaLib), SelectedGo: examined()}
+	r, notes := Audit(in)
+	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != failCaLib.Key() {
+		t.Fatalf("selected_phase_failed_only = %v", r.SelectedPhaseFailedOnly)
+	}
+	if !contains(notes, annotate("warning", "failed in the selected phase only, not in the full suite: "+failCaLib.Key())) {
+		t.Errorf("notes = %q", notes)
+	}
+	in.SelectedKnown = false
+	if r, _ := Audit(in); r.SelectedPhaseFailedOnly != nil {
+		t.Errorf("with the fast phase unread the field must be null, got %v", r.SelectedPhaseFailedOnly)
+	}
+	in.SelectedKnown, in.SelectedGo = true, SuiteRun{Note: "cut off"}
+	if r, _ := Audit(in); r.SelectedPhaseFailedOnly != nil {
+		t.Errorf("with the fast phase unexamined the field must be null, got %v", r.SelectedPhaseFailedOnly)
 	}
 }
 
@@ -268,59 +341,143 @@ func writeFile(t *testing.T, dir, name, body string) string {
 	return p
 }
 
-func TestAuditCommandEndToEndReportsAPlantedMissAndExitsOne(t *testing.T) {
+// phaseDir writes a plan and a full phase's logs and status into one directory.
+func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatus) string {
+	t.Helper()
 	dir := t.TempDir()
-	planPath := filepath.Join(dir, "plan.json")
-	if err := writeJSON(planPath, selectedCa); err != nil {
+	if err := writeJSON(filepath.Join(dir, "plan.json"), plan); err != nil {
 		t.Fatal(err)
 	}
-	rustLog := writeFile(t, dir, "rust.log",
-		"   Running tests/it.rs (t/it-1)\ntest m::in_m ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed\n"+
-			"error: test failed, to rerun pass `-p cb --test it`\n")
-	goLog := writeFile(t, dir, "go.jsonl", `{"Action":"pass","Package":"toy/ok"}`+"\n")
-	// The base had a different failure, so the planted one is new.
-	base := writeFile(t, dir, "base.json", `{"schema":1,"full":{"rust":{"examined":true},"go":{"examined":true},"failed":["rust:cb:--test it:old"]}}`)
+	if rustLog != "" {
+		writeFile(t, dir, "full-rust.log", rustLog)
+	}
+	if goLog != "" {
+		writeFile(t, dir, "full-go.jsonl", goLog)
+	}
+	if status != nil {
+		if err := writeJSON(filepath.Join(dir, "full-status.json"), *status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func finished(code int) *phaseStatus {
+	return &phaseStatus{Schema: statusSchema, Commands: []ExitInfo{
+		{Cmd: "cargo", Log: "full-rust.log", Code: code, Completed: true, Detail: "exit status"},
+		{Cmd: "go", Log: "full-go.jsonl", Code: 0, Completed: true, Detail: "exit status 0"},
+	}}
+}
+
+func auditIn(t *testing.T, dir string, extra ...string) (int, string, Recall) {
+	t.Helper()
 	out := filepath.Join(dir, "selection-recall.json")
+	args := append([]string{"audit", "--plan", filepath.Join(dir, "plan.json"), "--sha", "abc", "--event", "push", "--ref", mainRef, "--run-id", "9", "--out", out}, extra...)
 	var stdout bytes.Buffer
-	code := run(context.Background(), []string{"audit", "--plan", planPath, "--rust-log", rustLog, "--go-log", goLog,
-		"--base-artifact", base, "--sha", "abc", "--out", out}, &stdout, &bytes.Buffer{})
-	if code != 1 {
-		t.Fatalf("exit = %d, want 1; stdout:\n%s", code, stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "::error::selection missed rust:cb:--test it:m::in_m") {
-		t.Errorf("stdout = %q", stdout.String())
-	}
+	code := run(context.Background(), args, &stdout, &bytes.Buffer{})
 	var r Recall
-	body, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatal(err)
+	if body, err := os.ReadFile(out); err == nil {
+		if err := json.Unmarshal(body, &r); err != nil {
+			t.Fatalf("artifact is not JSON: %v\n%s", err, body)
+		}
+	} else {
+		t.Errorf("the artifact was not written (exit %d): %v", code, err)
 	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		t.Fatal(err)
+	return code, stdout.String(), r
+}
+
+const plantedMiss = "   Running tests/it.rs (t/it-1)\ntest m::in_m ... FAILED\n\nfailures:\n\n---- m::in_m stdout ----\n\nfailures:\n    m::in_m\n\ntest result: FAILED. 0 passed; 1 failed\n" +
+	"error: test failed, to rerun pass `-p cb --test it`\n"
+
+const goPass = `{"Action":"pass","Package":"toy/ok"}` + "\n"
+
+func TestAuditCommandEndToEndReportsAPlantedMissAndExitsOne(t *testing.T) {
+	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
+	// The base had a different failure, so the planted one is new.
+	base := writeFile(t, dir, "base.json", `{"schema":2,"sha":"bb","ref":"refs/heads/main","event":"push","run_id":"1","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["rust:cb:--test it:old"]}}`)
+	code, stdout, r := auditIn(t, dir, "--base-artifact", base)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stdout:\n%s", code, stdout)
 	}
-	if r.SHA != "abc" || len(r.Missed) != 1 || r.Recall == nil || *r.Recall != 0 || r.NFailed != 1 {
-		t.Errorf("artifact = %s", body)
+	if !strings.Contains(stdout, "::error::selection missed rust:cb:--test it:m::in_m") {
+		t.Errorf("stdout = %q", stdout)
+	}
+	if r.SHA != "abc" || r.Ref != mainRef || r.Event != "push" || r.RunID != "9" || r.Schema != 2 {
+		t.Errorf("provenance = %s %s %s %s schema %d", r.SHA, r.Ref, r.Event, r.RunID, r.Schema)
+	}
+	if len(r.Missed) != 1 || r.Recall == nil || *r.Recall != 0 || r.NFailed != 1 || r.BaseRecord == nil || r.BaseRecord.RunID != "1" {
+		t.Errorf("artifact = %+v", r)
 	}
 }
 
-func TestAuditCommandWithAMissingLogWritesTheArtifactAndExitsTwo(t *testing.T) {
-	dir := t.TempDir()
-	planPath := filepath.Join(dir, "plan.json")
-	if err := writeJSON(planPath, selectedCa); err != nil {
+func TestAuditCommandWithMissingLogsWritesTheArtifactAndExitsTwo(t *testing.T) {
+	dir := phaseDir(t, selectedCa, "", "", nil)
+	code, stdout, r := auditIn(t, dir)
+	if code != 2 || r.Recall != nil || r.Full.Rust.Examined || r.Full.Go.Examined || r.BaseFailed != nil {
+		t.Fatalf("exit=%d recall=%v full=%+v base=%v stdout:\n%s", code, r.Recall, r.Full, r.BaseFailed, stdout)
+	}
+}
+
+func TestAuditOfATruncatedFullSuiteExitsTwoWithNullRecall(t *testing.T) {
+	// Passing logs, but no status file: nothing says the commands finished.
+	dir := phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, nil)
+	code, _, r := auditIn(t, dir)
+	if code != 2 || r.Recall != nil || r.Full.Rust.Examined {
+		t.Fatalf("exit=%d recall=%v rust=%+v", code, r.Recall, r.Full.Rust)
+	}
+	// A status file that says the command was killed.
+	killed := finished(0)
+	killed.Commands[0] = ExitInfo{Cmd: "cargo", Log: "full-rust.log", Code: -1, Detail: "signal: killed"}
+	dir = phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, killed)
+	if code, _, r := auditIn(t, dir); code != 2 || r.Full.Rust.Examined || !strings.Contains(r.Full.Rust.Note, "did not run to completion") {
+		t.Fatalf("killed: exit=%d rust=%+v", code, r.Full.Rust)
+	}
+	// Exit 101 with no failing test in the log.
+	dir = phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(101))
+	if code, _, r := auditIn(t, dir); code != 2 || r.Full.Rust.Examined {
+		t.Fatalf("exit 101 with nothing parsed: exit=%d rust=%+v", code, r.Full.Rust)
+	}
+	// A clean, finished run is examined and exits 0.
+	dir = phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
+	base := writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
+	if code, _, r := auditIn(t, dir, "--base-artifact", base); code != 0 || !r.Full.Rust.Examined || r.Recall != nil {
+		t.Fatalf("clean: exit=%d rust=%+v recall=%v", code, r.Full.Rust, r.Recall)
+	}
+}
+
+func TestAnUnknownBaseWithUnclassifiedFailuresExitsTwo(t *testing.T) {
+	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
+	code, stdout, r := auditIn(t, dir)
+	if code != 2 || len(r.Unclassified) != 1 || len(r.Missed) != 0 || r.BaseFailed != nil {
+		t.Fatalf("exit=%d unclassified=%v missed=%v stdout:\n%s", code, r.Unclassified, r.Missed, stdout)
+	}
+}
+
+func TestAuditCommandWithAnUnusablePlanStillWritesTheArtifact(t *testing.T) {
+	dir := phaseDir(t, selectedCa, "", "", nil)
+	if err := os.WriteFile(filepath.Join(dir, "plan.json"), []byte("{broken"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out := filepath.Join(dir, "selection-recall.json")
-	var stdout bytes.Buffer
-	code := run(context.Background(), []string{"audit", "--plan", planPath, "--rust-log", filepath.Join(dir, "absent.log"),
-		"--go-log", filepath.Join(dir, "absent.jsonl"), "--out", out}, &stdout, &bytes.Buffer{})
-	if code != 2 {
-		t.Fatalf("exit = %d, want 2 (could not measure); stdout:\n%s", code, stdout.String())
+	code, stdout, r := auditIn(t, dir)
+	if code != 2 || r.Recall != nil || !strings.Contains(r.RecallNote, "plan was unusable") || !strings.Contains(stdout, "::error::the plan was unusable") {
+		t.Fatalf("exit=%d note=%q stdout:\n%s", code, r.RecallNote, stdout)
 	}
-	body, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatalf("the artifact must be written even when nothing could be measured: %v", err)
+	// And with no plan at all.
+	if err := os.Remove(filepath.Join(dir, "plan.json")); err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`"recall": null`)) || !bytes.Contains(body, []byte(`"base_failed": null`)) {
-		t.Errorf("artifact = %s", body)
+	if code, _, r := auditIn(t, dir); code != 2 || r.Schema != recallSchema {
+		t.Fatalf("no plan: exit=%d schema=%d", code, r.Schema)
+	}
+}
+
+func TestTheFastPhasesLogsNameASelectedOnlyFailure(t *testing.T) {
+	plan := selectedCa
+	plan.Selected = []Selected{{Command: logged(newCommand("rust", "cargo", "test")), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--lib"}}}}
+	dir := phaseDir(t, plan, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
+	writeFile(t, dir, "selected-rust.log", "   Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest only_here ... FAILED\n\nfailures:\n\n---- only_here stdout ----\n\nfailures:\n    only_here\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p ca --lib`\n")
+	_, stdout, r := auditIn(t, dir)
+	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != "rust:ca:--lib:only_here" || !strings.Contains(stdout, "selected phase only") {
+		t.Fatalf("selected_phase_failed_only=%v stdout:\n%s", r.SelectedPhaseFailedOnly, stdout)
 	}
 }

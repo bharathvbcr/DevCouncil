@@ -1,0 +1,225 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// These tests read the workflow files as text. The repository has no YAML
+// dependency and takes none for this; the workflow's shape (where an `if:` or a
+// permission sits) is what they pin, and a step is a block that starts at
+// `      - ` under `steps:`.
+
+const workflowDir = "../../../../.github/workflows"
+
+type wfStep struct {
+	name  string
+	lines []string
+}
+
+// has reports whether the step's own YAML, comments excluded, contains sub.
+// A comment above the next step is split onto this one, and must not count.
+func (s wfStep) has(sub string) bool {
+	var code []string
+	for _, l := range s.lines {
+		if !strings.HasPrefix(strings.TrimSpace(l), "#") {
+			code = append(code, l)
+		}
+	}
+	return strings.Contains(strings.Join(code, "\n"), sub)
+}
+
+type wfFile struct {
+	text   string
+	header []string // everything before `steps:`
+	steps  []wfStep
+}
+
+func loadWorkflow(t *testing.T, name string) wfFile {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(workflowDir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := wfFile{text: string(body)}
+	inSteps := false
+	for _, line := range strings.Split(f.text, "\n") {
+		if !inSteps {
+			f.header = append(f.header, line)
+			if line == "    steps:" {
+				inSteps = true
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "      - ") {
+			f.steps = append(f.steps, wfStep{})
+		}
+		if len(f.steps) > 0 {
+			cur := &f.steps[len(f.steps)-1]
+			cur.lines = append(cur.lines, line)
+			if m := regexp.MustCompile(`^      - (?:name|uses): (.*)$`).FindStringSubmatch(line); m != nil && cur.name == "" {
+				cur.name = strings.TrimSpace(m[1])
+			}
+			if m := regexp.MustCompile(`^        name: (.*)$`).FindStringSubmatch(line); m != nil {
+				cur.name = strings.TrimSpace(m[1])
+			}
+		}
+	}
+	return f
+}
+
+func (f wfFile) step(t *testing.T, prefix string) wfStep {
+	t.Helper()
+	for _, s := range f.steps {
+		if strings.HasPrefix(s.name, prefix) {
+			return s
+		}
+	}
+	t.Fatalf("no step starting %q; steps are %v", prefix, func() (n []string) {
+		for _, s := range f.steps {
+			n = append(n, s.name)
+		}
+		return
+	}())
+	return wfStep{}
+}
+
+const notCancelled = "if: ${{ !cancelled() }}"
+
+func TestTheWorkflowRunsThePlanAndTheFullSuiteWhateverEarlierStepsDid(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	for _, name := range []string{"Plan the selection", "Full suite", "Audit the selection"} {
+		if s := f.step(t, name); !s.has(notCancelled) {
+			t.Errorf("step %q lacks `%s`: a failed devmap build or index would skip it, and the full suite and the artifact with it", name, notCancelled)
+		}
+	}
+	if full := f.step(t, "Full suite"); full.has("continue-on-error") {
+		t.Error("the Full suite step is the gate and must not continue on error")
+	}
+	upload := f.step(t, "Upload selection-recall.json")
+	if !upload.has("if: ${{ always() }}") {
+		t.Error("the artifact must be uploaded on every run")
+	}
+}
+
+func TestADevmapBuildOrIndexFailureIsAWarningNotAFailedJob(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	for _, name := range []string{"Build devmap", "Index this commit"} {
+		s := f.step(t, name)
+		if !s.has("continue-on-error: true") {
+			t.Errorf("step %q must continue on error: its failure is a blast error, which runs everything", name)
+		}
+	}
+	index := f.step(t, "Index this commit")
+	if !index.has("::warning::") {
+		t.Error("a failed index must say so with ::warning::")
+	}
+	for _, name := range []string{"Index this commit", "Plan the selection"} {
+		if !f.step(t, name).has("timeout-minutes:") {
+			t.Errorf("step %q has no timeout-minutes", name)
+		}
+	}
+}
+
+func TestTheJobCanOnlyReadActionsAndTheTokenIsInOneStepOnly(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	header := strings.Join(f.header, "\n")
+	if !regexp.MustCompile(`(?m)^    permissions:\n      contents: read\n      actions: read\n`).MatchString(header) {
+		t.Errorf("job permissions must be exactly contents: read and actions: read:\n%s", header)
+	}
+	if strings.Contains(header, "actions: write") || strings.Contains(f.text, "actions: write\n") {
+		t.Error("actions: write is wider than gh run list/download need, and upload-artifact needs none")
+	}
+	if strings.Contains(header, "GH_TOKEN") {
+		t.Error("GH_TOKEN is in the job's environment, so cargo build and test run the changed code with it")
+	}
+	holders := 0
+	for _, s := range f.steps {
+		if s.has("GH_TOKEN") {
+			holders++
+			if !strings.HasPrefix(s.name, "Fetch the base") {
+				t.Errorf("step %q holds GH_TOKEN; only the base fetch may", s.name)
+			}
+		}
+	}
+	if holders != 1 {
+		t.Errorf("GH_TOKEN is in %d steps, want exactly the base fetch", holders)
+	}
+}
+
+func TestTheBaseIsOnlyACompletedPushRunOfTheBaseBranchAndTheAuditIsToldWhoItIs(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	fetch := f.step(t, "Fetch the base")
+	for _, want := range []string{`--branch "$BASE_BRANCH"`, "--event push", "--status completed", "cancelled"} {
+		if !fetch.has(want) {
+			t.Errorf("the base fetch lacks %q", want)
+		}
+	}
+	audit := f.step(t, "Audit the selection")
+	for _, want := range []string{`--ref "$GITHUB_REF"`, `--event "$GITHUB_EVENT_NAME"`, `--run-id "$GITHUB_RUN_ID"`, `--base-branch "$BASE_BRANCH"`} {
+		if !audit.has(want) {
+			t.Errorf("the audit step does not pass %s", want)
+		}
+	}
+}
+
+func TestTheWorkflowRunsTheSelectorsEndToEndTestsUnderTheE2ETagAndOnlyThose(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	s := f.step(t, "Selector end-to-end")
+	if !s.has("-tags e2e") || !s.has("-run '^TestE2E'") || !s.has("./cmd/dctestselect") {
+		t.Errorf("the end-to-end step must run `go test -tags e2e ./cmd/dctestselect -run '^TestE2E'`:\n%s", strings.Join(s.lines, "\n"))
+	}
+}
+
+func TestOnlyTheBaseBranchSavesTheCache(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	if s := f.step(t, "Swatinem/rust-cache"); !s.has("save-if: ${{ github.ref == 'refs/heads/main' }}") {
+		t.Error("rust-cache must save only on main: another cache entry per branch is cost with no reader")
+	}
+}
+
+func TestTheSelectedAndFullPhasesAreExplainedAsDifferingInFeatures(t *testing.T) {
+	f := loadWorkflow(t, "selected-tests.yml")
+	if !strings.Contains(f.text, "feature-unification") || !strings.Contains(f.text, "selected_phase_failed_only") {
+		t.Error("the workflow must say why a selected-only red is possible and where it is recorded")
+	}
+}
+
+var excludeFlag = regexp.MustCompile(`--exclude\s+(\S+)`)
+
+// rust.yml's Test step is the definition this job's universe copies. A new
+// crate excluded there and not here would be tested twice and mean different
+// things; one dropped there and kept here would stop being tested here.
+func TestTheExcludeListIsRustYmlsTestStepList(t *testing.T) {
+	f := loadWorkflow(t, "rust.yml")
+	var test wfStep
+	found := false
+	for _, s := range f.steps {
+		// The first: the `test` job's, whose universe this job copies.
+		if s.name == "Test" && !found {
+			test, found = s, true
+		}
+	}
+	if !found {
+		t.Fatal("rust.yml has no step named Test")
+	}
+	var got []string
+	for _, line := range test.lines {
+		if strings.Contains(line, "cargo test") {
+			for _, m := range excludeFlag.FindAllStringSubmatch(line, -1) {
+				got = append(got, m[1])
+			}
+		}
+	}
+	want := append([]string{}, DefaultRustExcludes...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("rust.yml's Test step excludes %v, DefaultRustExcludes is %v", got, want)
+	}
+}

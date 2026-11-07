@@ -91,6 +91,8 @@ type RustTarget struct {
 	Src              string // repository-relative
 	RequiredFeatures []string
 	Test             bool
+	// Doctest is whether `cargo test --doc` runs this library's doc examples.
+	Doctest bool
 }
 
 func (t RustTarget) is(kind string) bool {
@@ -117,6 +119,8 @@ type RustPackage struct {
 // RustWorkspace is the authority for which targets exist.
 type RustWorkspace struct {
 	Packages []RustPackage
+	// DriverClosure names the members compiled into a binary Go tests run.
+	DriverClosure map[string]bool
 }
 
 // GoPackage is one `go list` package.
@@ -243,6 +247,15 @@ func BuildPlan(in Inputs) Plan {
 			return everything(reason)
 		}
 	}
+	// A file that is neither Rust nor Go has no rule here for which test reads
+	// it: a script a test spawns, a fixture it includes. The graph may index
+	// it and still have no edge to the test, so it cannot be trusted to select.
+	// Rust and Go sources keep the graph-based rule.
+	for _, file := range changedPaths(in) {
+		if !strings.HasSuffix(file, ".rs") && !strings.HasSuffix(file, ".go") {
+			return everything(file + " changed with no graph edge to a test")
+		}
+	}
 
 	for _, u := range blast.Unavailable {
 		switch u.Kind {
@@ -355,13 +368,13 @@ func changedPaths(in Inputs) []string {
 // testsupport (gap blast-no-cross-process-rust-to-go-tests-2026-11-06).
 func crossProcess(in Inputs, changed []string) (scope, reason string, ok bool) {
 	for _, pkg := range in.Rust.Packages {
-		if !strings.HasPrefix(pkg.Name, "dc-") && pkg.Name != "devmap-cli" {
+		if !in.Rust.DriverClosure[pkg.Name] && !strings.HasPrefix(pkg.Name, "dc-") && pkg.Name != "devmap-cli" {
 			continue
 		}
 		for _, file := range changed {
 			if strings.HasPrefix(file, pkg.Dir+"/") {
 				return "go packages importing testsupport or dc/devmap",
-					"cross-process: " + file + " is in " + pkg.Name + ", whose binary Go tests run (gap blast-no-cross-process-rust-to-go-tests-2026-11-06)", true
+					"cross-process: " + file + " is in " + pkg.Name + ", compiled into a binary Go tests run (gap blast-no-cross-process-rust-to-go-tests-2026-11-06)", true
 			}
 		}
 	}

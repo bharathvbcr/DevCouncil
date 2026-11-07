@@ -309,7 +309,7 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 		base := []string{"cargo", "test", "--locked", "-p", name}
 		if ps.whole != "" {
 			out = append(out, Selected{
-				Command: newCommand(s.in.RustDir, append(base, "--no-fail-fast")...),
+				Command: logged(newCommand(s.in.RustDir, append(base, "--no-fail-fast")...)),
 				Units:   []Unit{{Kind: "rust", Pkg: name}}, Files: files, Seeds: own, Why: ps.whole,
 			})
 			continue
@@ -322,7 +322,7 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 				units = append(units, Unit{Kind: "rust", Pkg: name, Target: arg})
 			}
 			out = append(out, Selected{
-				Command: newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...),
+				Command: logged(newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)),
 				Units:   units, Files: files, Seeds: own, Why: "blast tests",
 			})
 		}
@@ -332,11 +332,33 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 			}
 			filters := sortedKeys(ps.filtered[arg])
 			argv := append(append([]string{}, base...), strings.Fields(arg)...)
+			fallback := append(append([]string{}, argv...), "--no-fail-fast")
 			argv = append(append(argv, "--no-fail-fast", "--"), filters...)
+			cmd := logged(newCommand(s.in.RustDir, argv...))
+			cmd.Fallback = fallback
 			out = append(out, Selected{
-				Command: newCommand(s.in.RustDir, argv...),
+				Command: cmd,
 				Units:   []Unit{{Kind: "rust", Pkg: name, Target: arg, Filters: filters}}, Files: files, Seeds: own, Why: "blast tests",
 			})
+		}
+	}
+	// Doctests are a separate cargo target the blast never names. A library
+	// whose source is selected has its doc examples selected with it.
+	for _, name := range sortedKeys(s.rust) {
+		ps := s.rust[name]
+		if ps.whole != "" || !(ps.unfiltered["--lib"] || len(ps.filtered["--lib"]) > 0) {
+			continue
+		}
+		for _, t := range ps.pkg.Targets {
+			if t.isLib() && t.Doctest && t.Test {
+				out = append(out, Selected{
+					Command: logged(newCommand(s.in.RustDir, "cargo", "test", "--locked", "-p", name, "--doc", "--no-fail-fast")),
+					Units:   []Unit{{Kind: "rust", Pkg: name, Target: "--doc"}},
+					Files:   sortedKeys(ps.files), Seeds: seedsUnder(seeds, func(file string) bool { return strings.HasPrefix(file, ps.pkg.Dir+"/") }),
+					Why: "doc examples of the selected library",
+				})
+				break
+			}
 		}
 	}
 	for _, ip := range sortedKeys(s.gos) {
@@ -347,7 +369,7 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 			why = gs.whole
 		}
 		out = append(out, Selected{
-			Command: newCommand(s.in.GoDir, "go", "test", "-count=1", ip),
+			Command: logged(newCommand(s.in.GoDir, "go", "test", "-count=1", "-json", ip)),
 			Units:   []Unit{{Kind: "go", Pkg: ip}}, Files: sortedKeys(gs.files), Seeds: own, Why: why,
 		})
 	}
@@ -370,4 +392,16 @@ func seedsUnder(seeds []devmap.BlastSeed, in func(file string) bool) []string {
 		names = append(names, fmt.Sprintf("... and %d more", total-len(names)))
 	}
 	return names
+}
+
+// logged routes a selected command's output into the fast phase's logs, so the
+// audit can tell a failure only the selected phase saw from one the full suite
+// also had. Go commands run with -json for the same reason.
+func logged(c Command) Command {
+	if len(c.Argv) > 0 && c.Argv[0] == "go" {
+		c.GoJSON, c.Log = true, "selected-go.jsonl"
+	} else {
+		c.Log = "selected-rust.log"
+	}
+	return c
 }

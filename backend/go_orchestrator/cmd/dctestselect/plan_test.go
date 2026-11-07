@@ -23,7 +23,7 @@ const (
 // crate the job excludes (dc-store), and a target that needs a feature (cf).
 func workspace() *RustWorkspace {
 	t := func(name, src string, kinds ...string) RustTarget {
-		return RustTarget{Name: name, Kinds: kinds, Src: src, Test: true}
+		return RustTarget{Name: name, Kinds: kinds, Src: src, Test: true, Doctest: true}
 	}
 	return &RustWorkspace{Packages: []RustPackage{
 		{Name: "ca", Dir: "rust/ca", Targets: []RustTarget{
@@ -212,7 +212,7 @@ func TestABinOnlyCratesSourceRunsThroughItsBinary(t *testing.T) {
 
 func TestAGoTestFileRunsItsPackage(t *testing.T) {
 	p := BuildPlan(inputs(withSeed("go/pkga/a.go", "Do"), withTests("go/pkga/a_test.go")))
-	got := wantCmd(t, p, "go test -count=1 "+module+"/pkga")
+	got := wantCmd(t, p, "go test -count=1 -json "+module+"/pkga")
 	if got.Dir != "go" || len(got.Seeds) != 1 || len(got.Files) != 1 {
 		t.Errorf("dir=%q seeds=%v files=%v", got.Dir, got.Seeds, got.Files)
 	}
@@ -260,7 +260,7 @@ func TestChangeUnattributedRunsEveryTargetOfTheOwningCrate(t *testing.T) {
 		t.Fatalf("an unattributed range widens to its crate, not to everything: %v", p.Widened)
 	}
 	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
-	wantCmd(t, p, "go test -count=1 "+module+"/pkga")
+	wantCmd(t, p, "go test -count=1 -json "+module+"/pkga")
 	found := false
 	for _, w := range p.Widened {
 		found = found || (w.Scope == "crate ca" && strings.Contains(w.Reason, "rust/ca/src/lib.rs"))
@@ -272,7 +272,7 @@ func TestChangeUnattributedRunsEveryTargetOfTheOwningCrate(t *testing.T) {
 
 func TestChangeUnattributedInAGoFileRunsThatPackage(t *testing.T) {
 	p := BuildPlan(inputs(withUnattributed("go/pkga/a.go", "outside_every_symbol")))
-	wantCmd(t, p, "go test -count=1 "+module+"/pkga")
+	wantCmd(t, p, "go test -count=1 -json "+module+"/pkga")
 }
 
 func TestChangeUnattributedInAnExcludedCrateIsLoggedAsDroppedNotWidened(t *testing.T) {
@@ -327,7 +327,7 @@ func TestEveryRunEverythingPathRunsEverything(t *testing.T) {
 
 func TestAnOrdinarySourceChangeIsNotARunEverythingPath(t *testing.T) {
 	in := inputs(withTests("rust/ca/src/engine.rs"))
-	in.GitChanged = []string{"rust/ca/src/engine.rs", "backend/go_orchestrator/pkga/a.go", "docs/readme.md"}
+	in.GitChanged = []string{"rust/ca/src/engine.rs", "backend/go_orchestrator/pkga/a.go"}
 	p := BuildPlan(in)
 	if p.Everything {
 		t.Fatalf("widened on ordinary files: %v", p.Widened)
@@ -392,7 +392,7 @@ func TestARustDcOrDevmapCliChangeSelectsTheGoPackagesThatDriveThoseBinaries(t *t
 				t.Fatalf("widened to everything: %v", p.Widened)
 			}
 			got := cmds(p)
-			want := []string{"go test -count=1 " + module + "/drv", "go test -count=1 " + module + "/viadevmap"}
+			want := []string{"go test -count=1 -json " + module + "/drv", "go test -count=1 -json " + module + "/viadevmap"}
 			for _, w := range want {
 				wantCmd(t, p, w)
 			}
@@ -494,8 +494,8 @@ func TestARealGoBlastSelectsThePackagesItsTestFilesLiveIn(t *testing.T) {
 	if p.Everything {
 		t.Fatalf("widened: %v", p.Widened)
 	}
-	wantCmd(t, p, "go test -count=1 "+module+"/cmd/devcouncil")
-	policy := wantCmd(t, p, "go test -count=1 "+module+"/policy")
+	wantCmd(t, p, "go test -count=1 -json "+module+"/cmd/devcouncil")
+	policy := wantCmd(t, p, "go test -count=1 -json "+module+"/policy")
 	if len(policy.Seeds) == 0 || !strings.Contains(policy.Seeds[0], "backend/go_orchestrator/policy/command.go::") {
 		t.Errorf("policy's seeds = %v", policy.Seeds)
 	}
@@ -513,4 +513,66 @@ func TestEveryRealBlastDecodesAndTheUnindexedOneRunsEverything(t *testing.T) {
 	in.Blast = b
 	in.Blast.Change = baseSHA + ".." + headSHA
 	wantEverything(t, BuildPlan(in), "not indexed")
+}
+
+func TestAChangedFileThatIsNeitherRustNorGoRunsEverything(t *testing.T) {
+	for _, file := range []string{"scripts/helper.py", "scripts/helper.mjs", "rust/ca/tests/data/x.json", "docs/readme.md", "rust/.cargo/config.toml"} {
+		t.Run(file, func(t *testing.T) {
+			wantEverything(t, BuildPlan(inputs(withChanged(file), withTests("rust/ca/src/engine.rs"))), file+" changed with no graph edge to a test")
+			in := inputs(withTests("rust/ca/src/engine.rs"))
+			in.GitChanged = []string{file}
+			wantEverything(t, BuildPlan(in), "no graph edge to a test")
+		})
+	}
+}
+
+func TestDoctestsAreSelectedWithTheLibraryUnlessThereAreNone(t *testing.T) {
+	p := BuildPlan(inputs(withTests("rust/ca/src/engine.rs")))
+	doc := wantCmd(t, p, "cargo test --locked -p ca --doc --no-fail-fast")
+	if len(doc.Units) != 1 || !reflect.DeepEqual(doc.Units[0], Unit{Kind: "rust", Pkg: "ca", Target: "--doc"}) {
+		t.Errorf("units = %+v", doc.Units)
+	}
+	// A whole-crate selection already includes the doctests.
+	p = BuildPlan(inputs(withUnattributed("rust/ca/src/lib.rs", "outside_every_symbol")))
+	for _, c := range cmds(p) {
+		if strings.Contains(c, "--doc") {
+			t.Errorf("a whole-crate command is followed by a redundant --doc: %q", c)
+		}
+	}
+	// doctest = false, a bin-only crate, and a binary-only selection select none.
+	in := inputs(withTests("rust/ca/src/engine.rs", "rust/devmap-cli/src/hook.rs"))
+	for i := range in.Rust.Packages {
+		if in.Rust.Packages[i].Name == "ca" {
+			for j := range in.Rust.Packages[i].Targets {
+				in.Rust.Packages[i].Targets[j].Doctest = false
+			}
+		}
+	}
+	for _, c := range cmds(BuildPlan(in)) {
+		if strings.Contains(c, "--doc") {
+			t.Errorf("doctest=false or bin-only crate got %q", c)
+		}
+	}
+}
+
+func TestSelectedCommandsLogToThePhasesLogsAndGoRunsAsJSON(t *testing.T) {
+	p := BuildPlan(inputs(withTests("rust/ca/src/engine.rs", "go/pkga/a_test.go")))
+	rust, golang := 0, 0
+	for _, s := range p.Selected {
+		switch {
+		case s.Argv[0] == "go":
+			golang++
+			if !s.GoJSON || s.Log != "selected-go.jsonl" {
+				t.Errorf("%q: GoJSON=%t log=%q", s.Display, s.GoJSON, s.Log)
+			}
+		default:
+			rust++
+			if s.Log != "selected-rust.log" {
+				t.Errorf("%q log = %q", s.Display, s.Log)
+			}
+		}
+	}
+	if rust == 0 || golang == 0 {
+		t.Fatalf("rust=%d go=%d: %q", rust, golang, cmds(p))
+	}
 }
