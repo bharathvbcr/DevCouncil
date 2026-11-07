@@ -244,7 +244,11 @@ func selectionNote(plan Plan, statusPath, planSHA string, rust, golang SuiteRun)
 			return "the status has no entry for " + s.Display
 		case !st.Completed:
 			return s.Display + " did not run to completion (" + st.Detail + ")"
-		case !log.Examined:
+		}
+		// The same rule as the full suite's: a log its own exit status contradicts
+		// (a result-shaped line planted before an abort) is not examined.
+		log = Qualify(log, st)
+		if !log.Examined {
 			return s.Display + " left a log that was not examined (" + log.Note + ")"
 		}
 		if why := unexaminedUnits(s, st, log); why != "" {

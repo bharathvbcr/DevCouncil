@@ -93,7 +93,8 @@ func TestASelectedGoCommandWithNoFinalActionForAPackageRanNothingForItAndIsNotEx
 	}}
 	dir := phaseDir(t, plan, rustOK, fullGo, full)
 	selectedStatus(t, dir, plan, ExitInfo{Code: 1, Detail: "exit status 1"})
-	writeFile(t, dir, "selected-go.jsonl", goPass)
+	// toy/ok failed a test (so exit 1 is explained) and toy/gone has no action.
+	writeFile(t, dir, "selected-go.jsonl", `{"Action":"fail","Package":"toy/ok","Test":"TestX"}`+"\n"+`{"Action":"fail","Package":"toy/ok"}`+"\n")
 	code, stdout, _ := auditIn(t, dir)
 	if code != 2 || !strings.Contains(stdout, "ran nothing for toy/gone") {
 		t.Fatalf("exit=%d: toy/gone has no final action in the fast phase's log\n%s", code, stdout)
