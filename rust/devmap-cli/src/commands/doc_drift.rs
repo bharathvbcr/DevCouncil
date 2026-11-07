@@ -1,7 +1,7 @@
-use devmap_query::{DocDriftReport, StoreQueryEngine};
+use devmap_query::DocDriftReport;
 
 use crate::cli::Cli;
-use crate::output::{emit_json, emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{emit_json, emit_truncation, emit_unavailable, open_read_store};
 
 #[derive(clap::Args)]
 #[group(id = "DocDrift")]
@@ -27,9 +27,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         no_default_excludes,
         budget,
     } = args;
-    let store = open_for_read(cli)?;
-    let report =
-        StoreQueryEngine::new(&store).doc_drift(paths, exclude, *budget, !no_default_excludes)?;
+    let store = open_read_store(cli)?;
+    let report = store
+        .engine()
+        .doc_drift(paths, exclude, *budget, !no_default_excludes)?;
     if cli.json {
         emit_json(cli, &serde_json::to_value(&report)?)?;
     } else {

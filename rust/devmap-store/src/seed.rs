@@ -89,12 +89,14 @@ impl Fingerprint {
     }
 }
 
-/// Remove `path` and its `-wal` / `-shm`. For files this process staged.
+/// Remove `path` and its staged sidecars (`-wal`, `-shm`, `.lock`, `.csr`). For files this process staged.
 pub fn discard_staged(path: &Path) {
     for file in [
         path.to_path_buf(),
         sidecar(path, "-wal"),
         sidecar(path, "-shm"),
+        sidecar(path, ".lock"),
+        sidecar(path, ".csr"),
     ] {
         let _ = std::fs::remove_file(file);
     }

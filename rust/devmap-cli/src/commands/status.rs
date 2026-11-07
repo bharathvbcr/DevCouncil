@@ -30,9 +30,12 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let stored_schema = Store::stored_schema_version(cli.db())?;
     let Some(stored_schema) = stored_schema else {
         let root_hint = cli.root_hint();
-        if cli.db.is_none() && devmap_extract::paths::stack_lease_path(&root_hint).is_file() {
-            match devmap_query::StackedStore::open(&root_hint) {
-                Ok(stacked) => {
+        if cli.db.is_none()
+            && (devmap_extract::paths::stack_lease_path(&root_hint).is_file()
+                || devmap_extract::paths::find_legacy_base_store_ref(&root_hint).is_some())
+        {
+            match devmap_query::StackedStore::open_if_leased(&root_hint) {
+                Ok(Some(stacked)) => {
                     let st = stacked.status()?;
                     let base_path = std::path::PathBuf::from(&st.base_dir).join("base.sqlite");
                     let mut payload = store_status_fields(stacked.base_store(), &base_path)?;
@@ -61,6 +64,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                     emit_json(cli, &serde_json::Value::Object(payload))?;
                     return Ok(());
                 }
+                Ok(None) => {}
                 Err(err) => {
                     let mut payload = serde_json::json!({
                         "generation_id": serde_json::Value::Null,

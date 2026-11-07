@@ -627,3 +627,253 @@ fn seeded_build_writes_manifest_even_when_main_has_no_manifest_artifacts() {
         "seeded worktree lacked code_graph.json when main omitted --manifest"
     );
 }
+
+#[test]
+fn standalone_seed_builds_lane_edits_and_stamps_lane_head_before_atomic_placement() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+
+    // Advance `lane` with its own committed symbol so `lane` HEAD != `main` HEAD.
+    fs::write(
+        lane.join("src/a.py"),
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n\n\ndef lane_committed_only():\n    return beta()\n",
+    )
+    .unwrap();
+    git(&lane, &["add", "."]);
+    git(&lane, &["commit", "-qm", "lane-diverged"]);
+    let lane_head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&lane)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Run standalone `devmap seed` WITHOUT running `devmap build` afterwards (`F-g`).
+    let seed_out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    let seed_json: Value = serde_json::from_slice(&seed_out.stdout).unwrap();
+    assert_eq!(seed_json["mode"], "cow");
+
+    // Immediately queryable for `lane_committed_only`, fresh, and stamped with `lane`'s HEAD.
+    let search_out = fx.devmap(&lane, &["--json", "search", "--", "lane_committed_only"]);
+    assert!(search_out.status.success(), "{}", stderr(&search_out));
+    let search_json: Value = serde_json::from_slice(&search_out.stdout).unwrap();
+    assert_eq!(
+        search_json["shown"], 1,
+        "standalone seed must index lane's own edits before placement: {search_json}"
+    );
+
+    let status_out = fx.devmap(&lane, &["--json", "status"]);
+    assert!(status_out.status.success(), "{}", stderr(&status_out));
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["is_fresh"], true, "{status_json}");
+    assert_eq!(status_json["query_ready"], true, "{status_json}");
+    assert!(
+        status_json["generation_id"].as_i64().unwrap_or(0) >= 2,
+        "expected generation +1 for diverged lane: {status_json}"
+    );
+
+    let recorded_head: String = scalar(
+        &lane,
+        "SELECT head_sha FROM generations ORDER BY id DESC LIMIT 1",
+    );
+    assert_eq!(recorded_head, lane_head);
+    assert!(
+        lane.join(".devmap/codeintel/devmap.sqlite.csr").is_file(),
+        "CSR sidecar must be materialized alongside placed store"
+    );
+
+    // Simulated build failure on staged store (`DROP TABLE nodes_fts_data` in donor + diverged
+    // `sibling` tree) must fail before placement and leave zero store or staged files in `sibling`.
+    let donor_db = fx.main().join(".devmap/codeintel/devmap.sqlite");
+    {
+        let conn = Connection::open(&donor_db).unwrap();
+        conn.execute_batch("DROP TABLE nodes_fts_data;").unwrap();
+    }
+    let sibling = fx.at("sibling");
+    edit(&sibling);
+    let failed_seed = fx.devmap(&sibling, &["--json", "seed"]);
+    assert!(
+        !failed_seed.status.success(),
+        "staged build failure must fail devmap seed; stdout: {}",
+        String::from_utf8_lossy(&failed_seed.stdout)
+    );
+    assert!(
+        !sibling.join(".devmap/codeintel/devmap.sqlite").exists(),
+        "failed staged build must never place partial devmap.sqlite"
+    );
+    let leftovers: Vec<_> = fs::read_dir(sibling.join(".devmap/codeintel"))
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        leftovers
+            .iter()
+            .all(|e| !e.file_name().to_string_lossy().contains(".seed-")),
+        "staged files left behind after build failure: {leftovers:?}"
+    );
+}
+
+#[test]
+fn stacked_cli_read_commands_merge_delta_without_writing_a_single_byte_and_refuse_legacy_pointer() {
+    fn snapshot(path: &Path) -> Option<(u64, std::time::SystemTime, Vec<u8>)> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        let mtime = meta.modified().unwrap();
+        let bytes = fs::read(path).unwrap();
+        Some((meta.len(), mtime, bytes))
+    }
+
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+
+    // Seed stacked while `lane` is clean -> no `delta.sqlite` created yet.
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    let seed_json: Value = serde_json::from_slice(&seed_out.stdout).unwrap();
+    let base_sqlite = PathBuf::from(seed_json["base_sqlite_path"].as_str().unwrap());
+    let lease_path = lane.join(".devmap/codeintel/stack_lease.json");
+    let delta_path = lane.join(".devmap/codeintel/delta.sqlite");
+    assert!(!delta_path.exists());
+
+    // Make a dirty edit WITHOUT syncing. Read commands must NOT create `delta.sqlite` or touch lease/base!
+    fs::write(
+        lane.join("src/a.py"),
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n\n\ndef stacked_delta_fn():\n    return beta()\n",
+    )
+    .unwrap();
+    let lease_before = snapshot(&lease_path).expect("lease must exist");
+    let base_before = snapshot(&base_sqlite).expect("base.sqlite must exist");
+
+    for args in [
+        &["--json", "search", "--", "alpha"][..],
+        &["--json", "impact", "--", "beta"][..],
+        &["--json", "explore", "--", "alpha"][..],
+        &["--json", "deps", "--", "src/a.py"][..],
+        &["--json", "status"][..],
+        &["--json", "paths"][..],
+    ] {
+        let out = fx.devmap(&lane, args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert!(
+        !delta_path.exists(),
+        "CLI read commands must never create delta.sqlite on a dirty unsynced lane"
+    );
+    assert_eq!(snapshot(&lease_path).unwrap(), lease_before);
+    assert_eq!(snapshot(&base_sqlite).unwrap(), base_before);
+
+    // Explicitly sync delta via write command `devmap seed --sync-delta`.
+    let sync_out = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(sync_out.status.success(), "{}", stderr(&sync_out));
+    assert!(delta_path.is_file());
+    assert!(!lane.join(".devmap/codeintel/delta.sqlite-wal").exists());
+    assert!(!lane.join(".devmap/codeintel/delta.sqlite-shm").exists());
+
+    // Make a second unsynced edit so disk is dirty relative to `delta.sqlite` too.
+    fs::write(
+        lane.join("src/b.py"),
+        "from a import alpha\n\n\ndef gamma():\n    return alpha()\n\n\ndef unsynced_after_delta():\n    return 2\n",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let delta_before = snapshot(&delta_path).expect("delta.sqlite must exist");
+    let lease_before_2 = snapshot(&lease_path).unwrap();
+    let base_before_2 = snapshot(&base_sqlite).unwrap();
+
+    // CLI read commands must serve the synced delta symbols/edges while leaving every file untouched!
+    let search_delta = fx.devmap(&lane, &["--json", "search", "--", "stacked_delta_fn"]);
+    assert!(search_delta.status.success(), "{}", stderr(&search_delta));
+    let search_val: Value = serde_json::from_slice(&search_delta.stdout).unwrap();
+    assert_eq!(search_val["shown"], 1, "{search_val}");
+
+    let impact_delta = fx.devmap(&lane, &["--json", "impact", "--", "beta"]);
+    assert!(impact_delta.status.success(), "{}", stderr(&impact_delta));
+    let impact_val: Value = serde_json::from_slice(&impact_delta.stdout).unwrap();
+    let callers: Vec<&str> = impact_val["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["source_symbol"].as_str())
+        .collect();
+    assert!(
+        callers.iter().any(|c| c.contains("stacked_delta_fn")),
+        "CLI impact over stacked lane must include synced delta caller: {impact_val}"
+    );
+
+    let explore_delta = fx.devmap(&lane, &["--json", "explore", "--", "stacked_delta_fn"]);
+    assert!(explore_delta.status.success(), "{}", stderr(&explore_delta));
+
+    let search_unsynced = fx.devmap(&lane, &["--json", "search", "--", "unsynced_after_delta"]);
+    assert!(
+        search_unsynced.status.success(),
+        "{}",
+        stderr(&search_unsynced)
+    );
+    let unsynced_val: Value = serde_json::from_slice(&search_unsynced.stdout).unwrap();
+    assert_eq!(
+        unsynced_val["shown"], 0,
+        "CLI read must NOT auto-sync dirty edits on read: {unsynced_val}"
+    );
+
+    assert_eq!(
+        snapshot(&delta_path).unwrap(),
+        delta_before,
+        "delta.sqlite mutated on read"
+    );
+    assert_eq!(
+        snapshot(&lease_path).unwrap(),
+        lease_before_2,
+        "stack_lease.json mutated on read"
+    );
+    assert_eq!(
+        snapshot(&base_sqlite).unwrap(),
+        base_before_2,
+        "base.sqlite mutated on read"
+    );
+    assert!(!lane.join(".devmap/codeintel/delta.sqlite-wal").exists());
+    assert!(!lane.join(".devmap/codeintel/delta.sqlite-shm").exists());
+
+    // Owner Stop #2: legacy `base_store_ref.json` is refused cleanly naming `devmap seed --stacked --from`
+    // and never auto-upgraded on read.
+    let cold = fx.at("cold");
+    let legacy_ref = cold.join(".devmap/codeintel/base_store_ref.json");
+    fs::create_dir_all(legacy_ref.parent().unwrap()).unwrap();
+    fs::write(
+        &legacy_ref,
+        serde_json::json!({
+            "anchor_repo_root": fx.main(),
+            "base_sqlite_path": fx.main().join(".devmap/codeintel/devmap.sqlite"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let legacy_search = fx.devmap(&cold, &["--json", "search", "--", "alpha"]);
+    assert!(!legacy_search.status.success());
+    assert!(
+        stderr(&legacy_search).contains("seed --stacked --from"),
+        "legacy refusal must name explicit upgrade command: {}",
+        stderr(&legacy_search)
+    );
+    assert!(!cold.join(".devmap/codeintel/stack_lease.json").exists());
+    assert!(!cold.join(".devmap/codeintel/delta.sqlite").exists());
+
+    let legacy_status = fx.devmap(&cold, &["--json", "status"]);
+    assert!(legacy_status.status.success());
+    let legacy_st: Value = serde_json::from_slice(&legacy_status.stdout).unwrap();
+    assert_eq!(legacy_st["query_ready"], false, "{legacy_st}");
+    assert!(
+        legacy_st["degraded_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("seed --stacked --from"),
+        "{legacy_st}"
+    );
+    assert!(!cold.join(".devmap/codeintel/stack_lease.json").exists());
+}

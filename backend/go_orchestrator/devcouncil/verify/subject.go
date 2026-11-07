@@ -447,6 +447,7 @@ func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root
 
 	rawTargets := make(map[string]string, len(symEntries))
 	if len(unmatSyms) > 0 {
+		targetByKey := make(map[string]string, len(unmatSyms))
 		if err := streamCatFileBlobs(ctx, git, unmatSyms, func(e indexEntry, r io.Reader, size int64) error {
 			if size > 64<<10 {
 				return fmt.Errorf("symlink blob for %s exceeds 64 KiB (%d bytes)", e.path, size)
@@ -455,10 +456,15 @@ func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root
 			if _, err := io.ReadFull(r, buf); err != nil {
 				return err
 			}
-			rawTargets[e.path] = string(buf)
+			targetByKey[blobKey(e)] = string(buf)
 			return nil
 		}); err != nil {
 			return err
+		}
+		for _, e := range unmatSyms {
+			if t, ok := targetByKey[blobKey(e)]; ok {
+				rawTargets[e.path] = t
+			}
 		}
 	}
 	for _, e := range symEntries {

@@ -8,23 +8,69 @@
     { "$ref": "#/$defs/StackLease" }
   ],
   "$defs": {
+    "FileRecord": {
+      "type": "object",
+      "required": ["sha256", "len", "mtime_ns", "ctime_ns", "ino", "dev"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "len": { "type": "integer", "minimum": 0 },
+        "mtime_ns": { "type": "integer", "minimum": 0 },
+        "ctime_ns": { "type": "integer", "minimum": 0 },
+        "ino": { "type": "integer", "minimum": 0 },
+        "dev": { "type": "integer", "minimum": 0 }
+      }
+    },
     "BaseManifest": {
       "type": "object",
-      "required": ["format_version", "generation_id", "schema_version", "source_repo_root", "created_at_unix_ms", "base_sqlite_sha256"],
+      "required": [
+        "format_version",
+        "generation_id",
+        "schema_version",
+        "source_repo_root",
+        "head_sha",
+        "created_at_unix_ms",
+        "base_sqlite_sha256",
+        "base_sqlite_len",
+        "base_sqlite_mtime_ns",
+        "base_sqlite_ctime_ns",
+        "base_sqlite_ino",
+        "base_sqlite_dev"
+      ],
       "additionalProperties": false,
       "properties": {
         "format_version": { "const": 1 },
         "generation_id": { "type": "integer", "minimum": 1 },
         "schema_version": { "type": "integer", "const": 29 },
         "source_repo_root": { "type": "string", "minLength": 1 },
+        "head_sha": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" },
         "created_at_unix_ms": { "type": "integer", "minimum": 0 },
         "base_sqlite_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "has_csr": { "type": "boolean" }
+        "base_sqlite_len": { "type": "integer", "minimum": 0 },
+        "base_sqlite_mtime_ns": { "type": "integer", "minimum": 0 },
+        "base_sqlite_ctime_ns": { "type": "integer", "minimum": 0 },
+        "base_sqlite_ino": { "type": "integer", "minimum": 0 },
+        "base_sqlite_dev": { "type": "integer", "minimum": 0 },
+        "has_csr": { "type": "boolean" },
+        "csr": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/FileRecord" }
+          ]
+        }
       }
     },
     "StackLease": {
       "type": "object",
-      "required": ["format_version", "generation_id", "base_dir", "worktree_root", "leased_at_unix_ms", "rebases_after_dirty_files", "rebases_after_delta_bytes"],
+      "required": [
+        "format_version",
+        "generation_id",
+        "base_dir",
+        "worktree_root",
+        "leased_at_unix_ms",
+        "rebases_after_dirty_files",
+        "rebases_after_delta_bytes"
+      ],
       "additionalProperties": false,
       "properties": {
         "format_version": { "const": 1 },

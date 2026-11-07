@@ -436,6 +436,7 @@ pub fn effective_store_for_root(root: &Path) -> Result<Option<PathBuf>, String> 
     }
     let lease_path = paths::stack_lease_path(root);
     if !lease_path.is_file() {
+        devmap_query::stacked::refuse_legacy_base_store_ref(root).map_err(|err| err.to_string())?;
         return Ok(None);
     }
     let lease = devmap_query::stacked::StackLease::read_from(&lease_path).map_err(|err| {

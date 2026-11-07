@@ -175,39 +175,78 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
 
     let _writer = Store::lock_writer_at(&target_db, Store::WRITER_LOCK_WAIT)?;
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
+    let staged_csr = csr_path_for_store(&staged);
     seed::discard_staged(&staged);
-    let method = (|| -> anyhow::Result<SeedMethod> {
+    let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
         let m = seed::stage_seed_healing_wal(&source_store, &staged)
             .with_context(|| format!("cannot seed from {}", source_store.display()))?;
         seed::rebind_staged(&staged, &root)?;
-        Store::open(&staged)
+        let staged_store = Store::open(&staged)
             .with_context(|| "the seeded store cannot be opened by this devmap".to_string())?;
+        if let Some(damage) = staged_store.search_index_unreadable()? {
+            bail!(
+                "the donor devmap store {} has a damaged search index ({damage}); run `devmap build --full` on {} before seeding",
+                source_store.display(),
+                source.display(),
+            );
+        }
+        let tree_matches_donor = staged_store.latest_generation_matches_working_tree()?
+            && staged_store
+                .latest_budget_refusals()?
+                .is_none_or(|refused| refused.total == 0);
+        if tree_matches_donor {
+            if let Ok(lane_head) = devmap_store::current_git_head(&root) {
+                if staged_store.latest_generation_head_sha()?.as_deref() != Some(lane_head.as_str())
+                {
+                    staged_store.restamp_latest_head(&lane_head)?;
+                }
+            }
+            let src_csr = csr_path_for_store(&source_store);
+            if src_csr.is_file() {
+                drop(staged_store);
+                seed::seed_artifact(&src_csr, &staged_csr).with_context(|| {
+                    format!("cannot stage CSR sidecar from {}", src_csr.display())
+                })?;
+            } else {
+                let _ = staged_store.write_latest_csr_sidecar()?;
+                drop(staged_store);
+            }
+        } else {
+            drop(staged_store);
+            seed_resolution_reuse_dirs(&source, &root);
+            crate::commands::build::build_staged_seed_store(&staged, &root)?;
+            let _ = std::fs::remove_file(seed::sidecar(&staged, ".lock"));
+        }
         seed::settle_staged(&staged)?;
+        if staged_csr.is_file() {
+            let final_csr = csr_path_for_store(&target_db);
+            std::fs::rename(&staged_csr, &final_csr)
+                .with_context(|| format!("cannot place CSR sidecar {}", final_csr.display()))?;
+        }
         std::fs::rename(&staged, &target_db)
             .with_context(|| format!("cannot place {}", target_db.display()))?;
-        Ok(m)
+        Ok((m, tree_matches_donor))
     })();
-    let method = match method {
-        Ok(m) => m,
+    let (method, tree_matches_donor) = match staged_outcome {
+        Ok(pair) => pair,
         Err(err) => {
             seed::discard_staged(&staged);
             return Err(err);
         }
     };
 
-    let src_csr = csr_path_for_store(&source_store);
-    if src_csr.is_file() {
-        let _ = seed::seed_artifact(&src_csr, &csr_path_for_store(&target_db));
-    }
-    // The store is placed: nothing after this point may fail the command. A
-    // missing artifact or reuse cache costs the next manifest a full write,
-    // never correctness, so it is a named note, not an error that would leave a
-    // placed store behind a non-zero exit.
-    if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
-        eprintln!(
-            "devmap seed: store placed at {}, but derived artifacts were not seeded (the next manifest is written in full): {error:#}",
-            target_db.display()
-        );
+    // The store is placed: nothing after this point may fail the command. When
+    // the lane's tree matched the donor's, seed consumer artifacts and reuse
+    // caches as a best-effort note; when the lane diverged, `resolution-reuse-*`
+    // was already seeded and updated during the staged incremental build, and
+    // donor artifacts would describe the wrong tree.
+    if tree_matches_donor {
+        if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
+            eprintln!(
+                "devmap seed: store placed at {}, but derived artifacts were not seeded (the next manifest is written in full): {error:#}",
+                target_db.display()
+            );
+        }
     }
 
     let elapsed_ms = started.elapsed().as_millis();
@@ -379,18 +418,7 @@ impl Plan {
     }
 
     fn seed_resolution_reuse(&self) {
-        let src_state = state_dir(&self.main);
-        let dst_state = state_dir(&self.root);
-        if let Ok(entries) = std::fs::read_dir(&src_state) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if let Some(name_str) = name.to_str() {
-                    if name_str.starts_with("resolution-reuse-") && entry.path().is_dir() {
-                        let _ = seed::seed_directory_cow(&entry.path(), &dst_state.join(name_str));
-                    }
-                }
-            }
-        }
+        seed_resolution_reuse_dirs(&self.main, &self.root);
     }
 
     /// Clone the main checkout's manifest artifacts beside the placed store so
@@ -434,5 +462,20 @@ impl Plan {
             .with_context(|| "the seed store cannot be opened by this devmap".to_string())?;
         seed::settle_staged(staged)?;
         Ok(method)
+    }
+}
+
+fn seed_resolution_reuse_dirs(source_root: &Path, target_root: &Path) {
+    let src_state = state_dir(source_root);
+    let dst_state = state_dir(target_root);
+    if let Ok(entries) = std::fs::read_dir(&src_state) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(name_str) = name.to_str() {
+                if name_str.starts_with("resolution-reuse-") && entry.path().is_dir() {
+                    let _ = seed::seed_directory_cow(&entry.path(), &dst_state.join(name_str));
+                }
+            }
+        }
     }
 }

@@ -19,25 +19,25 @@ So that graph navigation (`explore`, `impact`, `affected`) is immediately query-
   - **Given** an unpinned `devmap mcp` server with `mcp_roots = [<MAIN>]` where `<MAIN>` is indexed and `client_cwd` is inside an unindexed linked worktree `<WT>`
   - **When** a tool call omits `repo_path`
   - **Then** `RootResolveInput::resolve` refuses ambiguity instead of silently serving `<MAIN>`'s stale graph.
-- **Scenario 3: Overflow-Free Rebind & Live-WAL CoW Seed**
-  - **Given** an anchor `devmap.sqlite` with a large `generations.analysis_json` payload and non-empty `-wal`
-  - **When** `devmap seed` provisions a linked worktree
-  - **Then** `stage_seed` heals/checkpoints under pinned `WAL_READ_LOCK`, clones via `clonefile`, and writes `pending_state.seeded_repo_root` without rewriting `generations` overflow pages.
+- **Scenario 3: Overflow-Free Rebind, Staged Lane Build (`F-g`), & Live-WAL CoW Seed**
+  - **Given** an anchor `devmap.sqlite` with a large `generations.analysis_json` payload and non-empty `-wal`, and a linked worktree `<WT>` with its own committed or working edits
+  - **When** `devmap seed` provisions `<WT>`
+  - **Then** `stage_seed_healing_wal` checkpoints/clones under pinned `WAL_READ_LOCK`, `rebind_staged` writes `seed_rebind` + `pending_state.repo_root` without rewriting historical `generations` overflow pages, any diverged `<WT>` tree runs an incremental build + `HEAD` stamp on the staged store before atomic placement, and no partial store is placed on failure.
 
-### US2: Glean-Style StackedStore & Overlay Poisoning Elimination (Priority: P1)
+### US2: Glean-Style StackedStore, Zero-Write-on-Read, & Overlay Poisoning Elimination (Priority: P1)
 As an agent editing files inside a worktree lane,
-I want incremental edits to update a Tree-sitter worktree delta layered over an immutable `0444` shared base snapshot,
-So that anchor CAS stores are never poisoned by regex ASTs and multi-edit queries stay accurate without duplicating `270 MiB` stores per lane.
+I want explicit delta sync commands to update a Tree-sitter worktree delta layered over an immutable `0444` shared base snapshot while all read paths (`devmap mcp`, CLI read commands, `status`, `hook`) stay strictly zero-write-on-read,
+So that anchor stores are never poisoned by regex ASTs, read paths never mutate `delta.sqlite` or `stack_lease.json`, and legacy `base_store_ref.json` pointers fail closed naming `devmap seed --stacked --from <main>`.
 
 **Acceptance Scenarios**:
-- **Scenario 1: Immutable Base Snapshot & Lease GC**
-  - **Given** a built generation `G` in `<common_git_dir>/devmap/bases/gen-<G>/` with `0444` `base.sqlite` and `base.csr`
+- **Scenario 1: Immutable Base Snapshot (`gen-<G>-<head12>-<src8>`) & Lease GC**
+  - **Given** a clean, committed donor generation `G` in `<common_git_dir>/devmap/bases/gen-<G>-<head12>-<src8>/` with `0444` `base.sqlite` and `base.csr`
   - **When** worktree lanes hold `stack_lease.json` leases and an older unleased base exists
-  - **Then** `StackedStore` opens `base.sqlite` read-only with `?mode=ro&immutable=1` only after verifying `0444` permissions and `gc_unused_bases` prunes only unleased generations.
-- **Scenario 2: Tree-Sitter Delta & RoaringBitmap Tombstoning**
-  - **Given** a stacked worktree lane where a source file modifies functions and deletes a symbol
-  - **When** `StackedStore` queries symbols or callers
-  - **Then** base facts for dirty `FileId`s are masked via `WorktreeOverlay` `RoaringBitmap` bitsets and replaced by Tree-sitter extracted `delta.sqlite` symbols/edges without touching the anchor store.
+  - **Then** `publish_base_snapshot` refuses dirty donors, `StackedStore::open` verifies `(len, mtime_ns, ctime_ns, ino, dev, mode == 0444)` via `fstat` before opening `base.sqlite` read-only, and `gc_unused_bases` prunes only unleased generations under `.lock`.
+- **Scenario 2: Zero-Write-on-Read Tree-Sitter Delta & RoaringBitmap Tombstoning**
+  - **Given** a stacked worktree lane synced via `devmap seed --stacked` or `devmap seed --sync-delta` where a source file modifies functions and deletes a symbol
+  - **When** CLI or MCP read tools query symbols, callers, dependencies, dead code, or doc drift (even with subsequent unsynced scratch edits on disk)
+  - **Then** base facts for synced `FileId`s are masked via `WorktreeOverlay` `RoaringBitmap` bitsets and merged with `delta.sqlite` symbols/edges while leaving `delta.sqlite`, `stack_lease.json`, and `base.sqlite` byte-for-byte untouched.
 
 ### US3: Nested Hybrid Build Cache & Zero-Copy Source Materialization (Priority: P2)
 As a worktree orchestrator (`GitPulse` and `Manvi`),
@@ -78,7 +78,7 @@ So that sparse monorepo lanes pass strict safety gates and subagents can isolate
 - **SC-006**: Zero regressions across existing Rust and Go test suites in `DevCouncil`, `GitPulse`, and `Manvi`.
 
 ## 4. Edge Cases & Exclusions
-- **Edge Case**: Pre-existing schema-29 SQLite stores opened read-only (`?mode=ro`) before `seeded_repo_root` DDL runs must dynamically fall back to `generations.repo_root` without `no such column` errors.
-- **Edge Case**: `seed -> git worktree move -> devmap build` must clear stale `seeded_repo_root` on `RepoRootOwner::Gone` transition.
+- **Edge Case**: Pre-existing schema-29 SQLite stores opened read-only (`?mode=ro`) before `seed_rebind` DDL runs must dynamically fall back to `generations.repo_root` without `no such table` errors.
+- **Edge Case**: `seed -> git worktree move -> devmap build` (including by an older writer) honors `seed_rebind` only while `pending_state.repo_root` agrees with it, and clears stale `seed_rebind` on the next generation commit or restamp.
 - **Exclusion**: Non-cone (`core.sparseCheckoutCone=false`) arbitrary gitignore-pattern sparse checkouts remain refused fail-closed in `WorkingTreeSubject`.
 - **Exclusion**: Cargo `build.build-dir` sharing across concurrent worktrees is explicitly excluded due to Cargo `1.99.0` cross-branch `.rlib` corruption (`F12`).

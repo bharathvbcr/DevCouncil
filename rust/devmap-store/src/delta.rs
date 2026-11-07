@@ -122,9 +122,8 @@ impl DeltaStore {
     }
 
     /// Open an existing `delta.sqlite` for reading: no creation, no schema
-    /// statements, no journal-mode change. `None` when the file does not exist.
-    /// Opening a WAL database read-only may still create its `-shm`/`-wal`
-    /// sidecars; the database file itself is never written.
+    /// statements, no journal-mode change, and zero `-wal`/`-shm` sidecars.
+    /// `None` when the file does not exist.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
         let path = path.as_ref().to_path_buf();
         if !path.is_file() {
@@ -155,7 +154,7 @@ impl DeltaStore {
         conn.execute_batch(
             "PRAGMA trusted_schema = OFF;
              PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
+             PRAGMA journal_mode = DELETE;
              PRAGMA synchronous = NORMAL;",
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;

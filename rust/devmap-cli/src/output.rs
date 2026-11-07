@@ -6,9 +6,47 @@ use devmap_store::Store;
 
 use crate::cli::Cli;
 
+pub(crate) enum ReadStore {
+    Plain(Box<Store>),
+    Stacked(Box<devmap_query::StackedStore>),
+}
+
+impl ReadStore {
+    pub(crate) fn engine(&self) -> devmap_query::StoreQueryEngine<'_> {
+        match self {
+            Self::Plain(store) => devmap_query::StoreQueryEngine::new(store),
+            Self::Stacked(stacked) => devmap_query::StoreQueryEngine::new(stacked.base_store())
+                .with_stacked(Some(stacked)),
+        }
+    }
+}
+
+pub(crate) fn open_read_store(cli: &Cli) -> anyhow::Result<ReadStore> {
+    let db = cli.db();
+    if !db.is_file() && cli.db.is_none() {
+        if let Some(stacked) = devmap_query::StackedStore::open_if_leased(&cli.root_hint())? {
+            return Ok(ReadStore::Stacked(Box::new(stacked)));
+        }
+    }
+    open_for_read(cli).map(|store| ReadStore::Plain(Box::new(store)))
+}
+
 pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
     let db = cli.db();
     if !db.is_file() {
+        if cli.db.is_none() {
+            let root = cli.root_hint();
+            if devmap_extract::paths::find_legacy_base_store_ref(&root).is_some() {
+                let _ = devmap_query::StackedStore::open_if_leased(&root)?;
+            }
+            if devmap_extract::paths::stack_lease_path(&root).is_file() {
+                anyhow::bail!(
+                    "worktree at {} uses a stacked delta store (no standalone {}); run `devmap build` first for full-store commands",
+                    root.display(),
+                    db.display()
+                );
+            }
+        }
         anyhow::bail!(
             "no devmap store at {} — run `devmap build` first",
             db.display()

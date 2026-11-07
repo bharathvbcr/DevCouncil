@@ -158,10 +158,43 @@ pub(crate) fn run(
     progress: Option<&ProgressReporter>,
     args: &Args,
 ) -> anyhow::Result<()> {
-    run_build(cli, progress, args).map_err(|error| refuse_if_damaged(&cli.db(), error))
+    run_build_inner(cli, progress, args, true).map_err(|error| refuse_if_damaged(&cli.db(), error))
 }
 
-fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> anyhow::Result<()> {
+/// Run a silent incremental build against a staged seed store (`<db>.seed-<pid>`)
+/// for `root` before atomic placement (`F-g`), and write its CSR sidecar.
+pub(crate) fn build_staged_seed_store(
+    staged_db: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<()> {
+    use clap::Parser;
+    let staged_cli = Cli::try_parse_from([
+        std::ffi::OsStr::new("devmap"),
+        std::ffi::OsStr::new("--progress"),
+        std::ffi::OsStr::new("never"),
+        std::ffi::OsStr::new("--db"),
+        staged_db.as_os_str(),
+        std::ffi::OsStr::new("--root"),
+        root.as_os_str(),
+        std::ffi::OsStr::new("build"),
+    ])?;
+    let crate::cli::Commands::Build(ref build_args) = staged_cli.command else {
+        unreachable!("parsed `build` subcommand");
+    };
+    let reporter = ProgressReporter::new(crate::cli::ProgressMode::Never, false, false);
+    run_build_inner(&staged_cli, Some(&reporter), build_args, false)
+        .map_err(|error| refuse_if_damaged(staged_db, error))?;
+    let store = Store::open(staged_db)?;
+    let _ = store.write_latest_csr_sidecar()?;
+    Ok(())
+}
+
+fn run_build_inner(
+    cli: &Cli,
+    progress: Option<&ProgressReporter>,
+    args: &Args,
+    emit_output: bool,
+) -> anyhow::Result<()> {
     let Args {
         // Read through `cli.root_hint()` below, which already falls back to
         // this positional when `--root` is absent. Binding it here as well
@@ -620,6 +653,9 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
                 .collect();
             drop(_writer);
             progress.up_to_date(generation, file_count);
+            if !emit_output {
+                return Ok(());
+            }
             if cli.json {
                 // Built through `serde_json` and carrying `timings`,
                 // like every other build result.
@@ -1125,6 +1161,9 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     )?;
     drop(_writer);
     progress.complete(gen_id);
+    if !emit_output {
+        return Ok(());
+    }
     if cli.json {
         let mut result = serde_json::json!({
                 "generation_id": gen_id,

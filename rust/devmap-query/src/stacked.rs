@@ -4,7 +4,7 @@
 //! `WorktreeOverlay` (`RoaringBitmap` dirty-node masking) (`F1`, `F4`, `F6`,
 //! `F10`, `OQ1`, `OQ2`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,12 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use devmap_extract::model::Extraction;
+use devmap_extract::model::{Extraction, WiringKind};
 use devmap_extract::paths::{
-    code_graph_path, compact_code_graph_path, csr_path_for_store, registered_common_git_dir,
-    registered_worktrees_of_common_dir, repo_map_path, same_registered_repo, stack_delta_path,
-    stack_lease_path, state_dir, store_path,
+    code_graph_path, compact_code_graph_path, csr_path_for_store, find_legacy_base_store_ref,
+    main_checkout_of, registered_common_git_dir, registered_worktrees_of_common_dir, repo_map_path,
+    repo_root_from_store, same_registered_repo, stack_delta_path, stack_lease_path, state_dir,
+    store_path,
 };
+use devmap_resolve::model::LangFamily;
 use devmap_store::csr::CsrGraphReader;
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
@@ -25,7 +27,10 @@ use devmap_store::seed::{
     discard_staged, prepare_immutable_snapshot, promote_immutable_base_to_store, seed_artifact,
     seed_directory_cow, set_file_readonly, set_file_writable, stage_seed_healing_wal,
 };
-use devmap_store::{Store, StoredSymbol};
+use devmap_store::{
+    CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
+    StoredEdge, StoredFile, StoredSymbol,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::write_atomic;
@@ -35,6 +40,7 @@ use crate::overlay::{OverlayEdge, RoaringBitmap, WorktreeOverlay};
 pub const STACK_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_REBASE_DIRTY_FILES: usize = 250;
 pub const DEFAULT_REBASE_DELTA_BYTES: u64 = 16 * 1024 * 1024;
+pub type ScopeInputs = (u32, Option<String>, Vec<(String, String)>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -758,6 +764,13 @@ fn git_status_paths(root: &Path) -> Result<BTreeSet<String>> {
 }
 
 fn git_status_paths_within(root: &Path, deadline: std::time::Duration) -> Result<BTreeSet<String>> {
+    git_status_paths_and_deletions_within(root, deadline).map(|(paths, _)| paths)
+}
+
+fn git_status_paths_and_deletions_within(
+    root: &Path,
+    deadline: std::time::Duration,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let out = run_git_within(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -771,6 +784,7 @@ fn git_status_paths_within(root: &Path, deadline: std::time::Duration) -> Result
         );
     }
     let mut paths = BTreeSet::new();
+    let mut status_deleted = BTreeSet::new();
     let mut entries = out.split(|&b| b == 0);
     while let Some(entry) = entries.next() {
         if entry.is_empty() {
@@ -790,7 +804,11 @@ fn git_status_paths_within(root: &Path, deadline: std::time::Duration) -> Result
             );
         }
         let status = &entry[..2];
-        paths.insert(status_path(root, &entry[3..])?);
+        let norm = status_path(root, &entry[3..])?;
+        if status.contains(&b'D') {
+            status_deleted.insert(norm.clone());
+        }
+        paths.insert(norm);
         if status.contains(&b'R') || status.contains(&b'C') {
             let orig = entries.next().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -798,10 +816,14 @@ fn git_status_paths_within(root: &Path, deadline: std::time::Duration) -> Result
                     root.display()
                 )
             })?;
-            paths.insert(status_path(root, orig)?);
+            let orig_norm = status_path(root, orig)?;
+            if status.contains(&b'R') {
+                status_deleted.insert(orig_norm.clone());
+            }
+            paths.insert(orig_norm);
         }
     }
-    Ok(paths)
+    Ok((paths, status_deleted))
 }
 
 fn status_path(root: &Path, raw: &[u8]) -> Result<String> {
@@ -820,6 +842,66 @@ fn is_tool_state_path(path: &str) -> bool {
         || path == ".devcouncil"
         || path.starts_with(".devmap/")
         || path.starts_with(".devcouncil/")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyBaseStoreRef {
+    #[serde(default)]
+    anchor_repo_root: Option<String>,
+    #[serde(default, alias = "base_store_path", alias = "base_sqlite_path")]
+    anchor_db_path: Option<String>,
+}
+
+/// Inspect `<worktree_root>/<state>/codeintel/base_store_ref.json` (if present) and
+/// return the bidirectionally verified registered anchor checkout root when its
+/// store exists. Never provisions or mutates state on disk.
+pub fn legacy_base_store_anchor_root(worktree_root: &Path) -> Option<PathBuf> {
+    let ref_path = find_legacy_base_store_ref(worktree_root)?;
+    let meta = fs::symlink_metadata(&ref_path).ok()?;
+    if !meta.is_file() || meta.len() > 64 * 1024 {
+        return None;
+    }
+    let raw = fs::read_to_string(&ref_path).ok()?;
+    let parsed: LegacyBaseStoreRef = serde_json::from_str(&raw).ok()?;
+    let anchor_raw = parsed
+        .anchor_repo_root
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            parsed
+                .anchor_db_path
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|p| repo_root_from_store(Path::new(&p)))
+        })?;
+    let anchor_canon = anchor_raw.canonicalize().ok()?;
+    let wt_canon = worktree_root.canonicalize().ok()?;
+    if anchor_canon == wt_canon || !same_registered_repo(&anchor_canon, &wt_canon) {
+        return None;
+    }
+    store_path(&anchor_canon).is_file().then_some(anchor_canon)
+}
+
+/// Fail closed on retired `base_store_ref.json` pointers without writing or
+/// auto-upgrading any state on read (`Owner Stop #2`).
+pub fn refuse_legacy_base_store_ref(worktree_root: &Path) -> Result<()> {
+    let wt_canon = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    if store_path(&wt_canon).is_file() || stack_lease_path(&wt_canon).is_file() {
+        return Ok(());
+    }
+    let Some(ref_path) = find_legacy_base_store_ref(&wt_canon) else {
+        return Ok(());
+    };
+    let donor_hint = legacy_base_store_anchor_root(&wt_canon)
+        .or_else(|| main_checkout_of(&wt_canon))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<main>".to_string());
+    bail!(
+        "retired legacy worktree pointer {} is no longer accepted on read; \
+         run `devmap seed --stacked --from {donor_hint}` (or `devmap build --manifest`) to upgrade",
+        ref_path.display()
+    )
 }
 
 /// Refuse unless `source`'s `HEAD` is `expected_head` and its tracked and
@@ -869,7 +951,6 @@ fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str
             source.display()
         ),
     }
-    #[cfg(feature = "parse")]
     match store.latest_generation_matches_working_tree() {
         Ok(true) => Ok(()),
         Ok(false) => bail!(
@@ -881,11 +962,6 @@ fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str
             source.display()
         ),
     }
-    #[cfg(not(feature = "parse"))]
-    bail!(
-        "this build cannot confirm donor {}'s index matches its working tree (parse feature off); {remedy}",
-        source.display()
-    )
 }
 
 /// Provision a Glean-style stacked worktree lane at `worktree_root` backed by
@@ -1256,8 +1332,9 @@ pub struct StackedStore {
     manifest: BaseManifest,
     base: Store,
     csr: Mutex<Option<Arc<CsrGraphReader>>>,
-    /// `None` until `delta.sqlite` exists. A read path (hook, MCP, status) never
-    /// creates or migrates it: a missing delta reads as an empty one.
+    merged_edges: Mutex<Option<(u32, Arc<GenerationEdges>)>>,
+    /// `None` until `delta.sqlite` exists. A read path (hook, CLI, MCP, status)
+    /// never creates or migrates it: a missing delta reads as an empty one.
     delta: Option<DeltaStore>,
     delta_writable: bool,
     overlay: WorktreeOverlay,
@@ -1275,11 +1352,15 @@ impl std::fmt::Debug for StackedStore {
 
 impl StackedStore {
     /// Open the stacked worktree store declared by `<worktree_root>/<state>/codeintel/stack_lease.json`.
+    /// Purely read-only: never provisions, upgrades, or writes to disk.
     pub fn open(worktree_root: &Path) -> Result<Self> {
         let wt_canon = worktree_root
             .canonicalize()
             .with_context(|| format!("cannot canonicalize {}", worktree_root.display()))?;
         let lease_path = stack_lease_path(&wt_canon);
+        if !lease_path.is_file() {
+            refuse_legacy_base_store_ref(&wt_canon)?;
+        }
         let raw_lease = fs::read(&lease_path)
             .with_context(|| format!("cannot read stack lease {}", lease_path.display()))?;
         let lease: StackLease = serde_json::from_slice(&raw_lease)
@@ -1327,14 +1408,18 @@ impl StackedStore {
             manifest,
             base,
             csr: Mutex::new(None),
+            merged_edges: Mutex::new(None),
             delta,
             delta_writable: false,
             overlay,
         })
     }
 
+    /// Purely read-only stacked open: returns `Ok(None)` when unleased, `Err`
+    /// when a retired `base_store_ref.json` is present (`Owner Stop #2`).
     pub fn open_if_leased(worktree_root: &Path) -> Result<Option<Self>> {
         if !stack_lease_path(worktree_root).is_file() {
+            refuse_legacy_base_store_ref(worktree_root)?;
             return Ok(None);
         }
         Self::open(worktree_root).map(Some)
@@ -1346,6 +1431,18 @@ impl StackedStore {
 
     pub fn lease(&self) -> &StackLease {
         &self.lease
+    }
+
+    pub fn manifest(&self) -> &BaseManifest {
+        &self.manifest
+    }
+
+    pub fn base_sqlite_path(&self) -> &Path {
+        &self.base_sqlite_path
+    }
+
+    pub fn base_csr_path(&self) -> Option<&Path> {
+        self.base_csr_path.as_deref()
     }
 
     pub fn base_store(&self) -> &Store {
@@ -1362,7 +1459,7 @@ impl StackedStore {
         self.delta.is_some()
     }
 
-    /// The writable delta, created on first use. Only write paths call this.
+    /// The writable delta, created on first use. Only explicit write paths call this.
     fn writable_delta(&mut self) -> Result<&DeltaStore> {
         if !self.delta_writable || self.delta.is_none() {
             self.delta = Some(DeltaStore::open(stack_delta_path(&self.worktree_root))?);
@@ -1375,6 +1472,19 @@ impl StackedStore {
 
     pub fn overlay(&self) -> &WorktreeOverlay {
         &self.overlay
+    }
+
+    pub fn has_delta_changes(&self) -> bool {
+        !self.overlay.modified_files.is_empty() || !self.overlay.tombstoned_files.is_empty()
+    }
+
+    pub fn delta_source_freshness(&self) -> crate::model::SourceFreshness {
+        crate::model::SourceFreshness::unverified(format!(
+            "answered over immutable base generation {} merged with {} uncommitted stacked delta file(s) ({} deleted)",
+            self.lease.generation_id,
+            self.overlay.modified_files.len(),
+            self.overlay.tombstoned_files.len()
+        ))
     }
 
     /// Lazily map `base.sqlite.csr` on first traversal (`F6` — zero eager edge scan at open).
@@ -1399,11 +1509,34 @@ impl StackedStore {
         Ok(Some(reader))
     }
 
+    fn lock_delta_writer(&self) -> Result<(PathBuf, devmap_store::WriterLock)> {
+        let delta_path = stack_delta_path(&self.worktree_root);
+        let guard = Store::lock_writer_at(&delta_path, Store::WRITER_LOCK_WAIT)?;
+        Ok((delta_path, guard))
+    }
+
+    fn cleanup_delta_lock(delta_path: &Path, guard: devmap_store::WriterLock) {
+        drop(guard);
+        let _ = fs::remove_file(devmap_store::seed::sidecar(delta_path, ".lock"));
+    }
+
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
     /// `delta.sqlite` and refresh the `WorktreeOverlay` (`F4`).
     ///
     /// Never invokes regex fallback and never writes to any shared/anchor CAS.
     pub fn record_extracted_file(
+        &mut self,
+        rel_path: &str,
+        source_bytes: &[u8],
+        extraction: &Extraction,
+    ) -> Result<()> {
+        let (delta_path, guard) = self.lock_delta_writer()?;
+        let res = self.record_extracted_file_locked(rel_path, source_bytes, extraction);
+        Self::cleanup_delta_lock(&delta_path, guard);
+        res
+    }
+
+    fn record_extracted_file_locked(
         &mut self,
         rel_path: &str,
         source_bytes: &[u8],
@@ -1425,7 +1558,17 @@ impl StackedStore {
     /// Mark `rel_path` as deleted in the worktree's private `delta.sqlite` and
     /// mask all of its base symbols in `WorktreeOverlay` (`F4`).
     pub fn record_deleted_file(&mut self, rel_path: &str) -> Result<()> {
+        let (delta_path, guard) = self.lock_delta_writer()?;
+        let res = self.record_deleted_file_locked(rel_path);
+        Self::cleanup_delta_lock(&delta_path, guard);
+        res
+    }
+
+    fn record_deleted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
+        if self.overlay.is_file_tombstoned(Path::new(&normalized)) {
+            return Ok(());
+        }
         self.writable_delta()?
             .tombstone_file(&normalized, CAS_TOMBSTONE, now_unix_ms())?;
         self.reload_overlay()
@@ -1433,6 +1576,13 @@ impl StackedStore {
 
     /// Clear `rel_path` from `delta.sqlite` when it matches the base snapshot again.
     pub fn clear_reverted_file(&mut self, rel_path: &str) -> Result<()> {
+        let (delta_path, guard) = self.lock_delta_writer()?;
+        let res = self.clear_reverted_file_locked(rel_path);
+        Self::cleanup_delta_lock(&delta_path, guard);
+        res
+    }
+
+    fn clear_reverted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         self.writable_delta()?.remove_clean_file(&normalized)?;
         self.reload_overlay()
@@ -1442,6 +1592,14 @@ impl StackedStore {
     /// Tree-sitter frontend (`devmap_extract::extract_file`) — never regex!
     #[cfg(feature = "parse")]
     pub fn sync_file_from_disk(&mut self, rel_path: &str) -> Result<()> {
+        let (delta_path, guard) = self.lock_delta_writer()?;
+        let res = self.sync_file_from_disk_locked(rel_path);
+        Self::cleanup_delta_lock(&delta_path, guard);
+        res
+    }
+
+    #[cfg(feature = "parse")]
+    fn sync_file_from_disk_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         if devmap_extract::languages::is_ignored_path(&normalized) {
             return Ok(());
@@ -1449,10 +1607,10 @@ impl StackedStore {
         let full = self.worktree_root.join(&normalized);
         match fs::symlink_metadata(&full) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.record_deleted_file(&normalized)
+                self.record_deleted_file_locked(&normalized)
             }
             Err(err) => Err(err).with_context(|| format!("cannot stat {}", full.display())),
-            Ok(meta) if !meta.is_file() => self.record_deleted_file(&normalized),
+            Ok(meta) if !meta.is_file() => self.record_deleted_file_locked(&normalized),
             Ok(_) => {
                 if !devmap_extract::languages::is_indexable_source(&normalized) {
                     return Ok(());
@@ -1463,14 +1621,29 @@ impl StackedStore {
                     return Ok(());
                 };
                 if let Some(base_file) = self.base.latest_file(&normalized)? {
-                    let lang = devmap_extract::languages::detect_language(Path::new(&normalized));
-                    let key = devmap_extract::cache::CacheKey::for_source(lang, source_str);
-                    if key.content_hash == base_file.content_hash {
-                        return self.clear_reverted_file(&normalized);
+                    if devmap_extract::content_hash(source_str) == base_file.content_hash {
+                        if self
+                            .overlay
+                            .modified_files
+                            .contains_key(Path::new(&normalized))
+                            || self.overlay.is_file_tombstoned(Path::new(&normalized))
+                        {
+                            return self.clear_reverted_file_locked(&normalized);
+                        }
+                        return Ok(());
                     }
                 }
+                let cas_hash = blake3_hash(&bytes);
+                if self
+                    .overlay
+                    .modified_files
+                    .get(Path::new(&normalized))
+                    .is_some_and(|existing| existing == &cas_hash)
+                {
+                    return Ok(());
+                }
                 let extraction = devmap_extract::extract_file(&normalized, source_str);
-                self.record_extracted_file(&normalized, &bytes, &extraction)
+                self.record_extracted_file_locked(&normalized, &bytes, &extraction)
             }
         }
     }
@@ -1480,66 +1653,113 @@ impl StackedStore {
     /// `devmap.sqlite` when thresholds (`250` dirty files / `16 MiB`) are exceeded.
     #[cfg(feature = "parse")]
     pub fn sync_worktree(&mut self) -> Result<StackedSyncReport> {
-        let changed_paths = git_changed_paths_against_head(&self.worktree_root, &self.base)?;
-        let existing_delta: BTreeSet<String> = match &self.delta {
-            Some(delta) => delta
-                .load_snapshot()?
-                .files
-                .into_iter()
-                .map(|f| f.path)
-                .collect(),
-            None => BTreeSet::new(),
-        };
+        let (delta_path, guard) = self.lock_delta_writer()?;
+        let sync_res = (|| -> Result<(usize, usize, usize)> {
+            let (changed_paths, status_deleted_paths) =
+                git_changed_paths_and_deletions_against_head(&self.worktree_root, &self.base)?;
+            let existing_delta: BTreeSet<String> = match &self.delta {
+                Some(delta) => delta
+                    .load_snapshot()?
+                    .files
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect(),
+                None => BTreeSet::new(),
+            };
 
-        let mut synced_files = 0usize;
-        let mut deleted_files = 0usize;
-        let mut cleaned_files = 0usize;
+            let mut synced_files = 0usize;
+            let mut deleted_files = 0usize;
+            let mut cleaned_files = 0usize;
 
-        for rel_path in &changed_paths {
-            if devmap_extract::languages::is_ignored_path(rel_path) {
-                continue;
-            }
-            let full = self.worktree_root.join(rel_path);
-            if full.is_file() {
-                if !devmap_extract::languages::is_indexable_source(rel_path) {
+            for rel_path in &changed_paths {
+                if devmap_extract::languages::is_ignored_path(rel_path) {
                     continue;
                 }
-                self.sync_file_from_disk(rel_path)?;
-                synced_files += 1;
-            } else if self.base.latest_path_is_indexed(rel_path)?
-                || existing_delta.contains(rel_path)
-            {
-                self.record_deleted_file(rel_path)?;
-                deleted_files += 1;
-            }
-        }
-
-        for prev in existing_delta {
-            if changed_paths.contains(&prev) {
-                continue;
-            }
-            let full = self.worktree_root.join(&prev);
-            if !full.is_file() {
-                continue;
-            }
-            let bytes = match fs::read(&full) {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| format!("cannot read {}", full.display()))
+                let full = self.worktree_root.join(rel_path);
+                if full.is_file() {
+                    if !devmap_extract::languages::is_indexable_source(rel_path) {
+                        continue;
+                    }
+                    self.sync_file_from_disk_locked(rel_path)?;
+                    synced_files += 1;
+                } else {
+                    let sparse_head_blob = if !status_deleted_paths.contains(rel_path)
+                        && devmap_extract::languages::is_indexable_source(rel_path)
+                    {
+                        git_read_head_blob(&self.worktree_root, rel_path)
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) = sparse_head_blob {
+                        if let Ok(source_str) = std::str::from_utf8(&bytes) {
+                            let matches_base = self.base.latest_file(rel_path)?.is_some_and(|bf| {
+                                devmap_extract::content_hash(source_str) == bf.content_hash
+                            });
+                            if matches_base {
+                                if existing_delta.contains(rel_path) {
+                                    self.clear_reverted_file_locked(rel_path)?;
+                                    cleaned_files += 1;
+                                }
+                            } else {
+                                let cas_hash = blake3_hash(&bytes);
+                                let unchanged_delta = self
+                                    .overlay
+                                    .modified_files
+                                    .get(Path::new(rel_path))
+                                    .is_some_and(|existing| existing == &cas_hash);
+                                if !unchanged_delta {
+                                    let extraction =
+                                        devmap_extract::extract_file(rel_path, source_str);
+                                    self.record_extracted_file_locked(
+                                        rel_path,
+                                        &bytes,
+                                        &extraction,
+                                    )?;
+                                }
+                                synced_files += 1;
+                            }
+                        }
+                    } else if self.base.latest_path_is_indexed(rel_path)?
+                        || existing_delta.contains(rel_path)
+                    {
+                        self.record_deleted_file_locked(rel_path)?;
+                        deleted_files += 1;
+                    }
                 }
-            };
-            let src = std::str::from_utf8(&bytes)
-                .with_context(|| format!("{} is not valid UTF-8", full.display()))?;
-            if let Some(base_file) = self.base.latest_file(&prev)? {
-                let lang = devmap_extract::languages::detect_language(Path::new(&prev));
-                let key = devmap_extract::cache::CacheKey::for_source(lang, src);
-                if key.content_hash == base_file.content_hash {
-                    self.clear_reverted_file(&prev)?;
+            }
+
+            for prev in existing_delta {
+                if changed_paths.contains(&prev) {
+                    continue;
+                }
+                let full = self.worktree_root.join(&prev);
+                if full.is_file() {
+                    let bytes = match fs::read(&full) {
+                        Ok(bytes) => bytes,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => {
+                            return Err(err)
+                                .with_context(|| format!("cannot read {}", full.display()))
+                        }
+                    };
+                    let src = std::str::from_utf8(&bytes)
+                        .with_context(|| format!("{} is not valid UTF-8", full.display()))?;
+                    if let Some(base_file) = self.base.latest_file(&prev)? {
+                        if devmap_extract::content_hash(src) == base_file.content_hash {
+                            self.clear_reverted_file_locked(&prev)?;
+                            cleaned_files += 1;
+                        }
+                    }
+                } else if !self.base.latest_path_is_indexed(&prev)? {
+                    self.clear_reverted_file_locked(&prev)?;
                     cleaned_files += 1;
                 }
             }
-        }
+
+            Ok((synced_files, deleted_files, cleaned_files))
+        })();
+        Self::cleanup_delta_lock(&delta_path, guard);
+        let (synced_files, deleted_files, cleaned_files) = sync_res?;
 
         let rebased_to_standalone = if self.needs_rebase()? {
             Some(self.materialize_seeded_store()?)
@@ -1679,6 +1899,584 @@ impl StackedStore {
         Ok(target_db)
     }
 
+    pub fn latest_file(&self, rel_path: &str) -> Result<Option<StoredFile>> {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return Ok(None);
+        };
+        let p = Path::new(&normalized);
+        if self.overlay.is_file_tombstoned(p) {
+            return Ok(None);
+        }
+        if let Some(ext) = self.overlay.added_extractions.get(&normalized) {
+            return Ok(Some(StoredFile {
+                path: normalized,
+                language: ext.language.clone(),
+                content_hash: ext.content_hash,
+                parse_outcome: ext.parse_outcome.clone(),
+                engine: ext.engine.clone(),
+            }));
+        }
+        Ok(self.base.latest_file(&normalized)?)
+    }
+
+    pub fn latest_extraction_for_path(&self, rel_path: &str) -> Result<Option<Extraction>> {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return Ok(None);
+        };
+        let p = Path::new(&normalized);
+        if self.overlay.is_file_tombstoned(p) {
+            return Ok(None);
+        }
+        if let Some(ext) = self.overlay.added_extractions.get(&normalized) {
+            return Ok(Some(ext.clone()));
+        }
+        Ok(self.base.latest_extraction_for_path(&normalized)?)
+    }
+
+    /// Return a unified `GenerationEdges` adjacency merging non-masked immutable
+    /// base edges with Tree-sitter delta `Contains`, `Calls`, and `Imports` edges
+    /// so every `StoreQueryEngine` traversal (`impact`, `trace`, `neighbors`,
+    /// `explore`, `affected_tests`, `dependencies`, `ask`) sees worktree edits
+    /// and deletions without split-brain (`F1`, `F4`, `F10`).
+    pub fn generation_edges_with_id(&self) -> Result<Option<(u32, Arc<GenerationEdges>)>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.generation_edges_with_id()?);
+        }
+        let mut guard = self
+            .merged_edges
+            .lock()
+            .map_err(|_| anyhow::anyhow!("StackedStore merged_edges mutex poisoned"))?;
+        if let Some(ref cached) = *guard {
+            return Ok(Some((cached.0, Arc::clone(&cached.1))));
+        }
+
+        let Some((gen_id, base_index)) = self.base.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+
+        let mut merged: Vec<StoredEdge> = Vec::with_capacity(base_index.len() + 64);
+        let mut seen: HashSet<(String, String, String, String, String)> = HashSet::new();
+
+        for id in 0..base_index.len() as u32 {
+            let src_file = base_index.source_file(id);
+            let dst_file = base_index.target_file(id);
+            let src_sym = base_index.source_symbol(id);
+            let dst_sym = base_index.target_symbol(id);
+            let src_p = Path::new(src_file);
+            let dst_p = Path::new(dst_file);
+            if self.overlay.is_file_tombstoned(src_p)
+                || self.overlay.modified_files.contains_key(src_p)
+                || self.overlay.is_file_tombstoned(dst_p)
+                || self.overlay.is_symbol_tombstoned(src_sym)
+                || self.overlay.is_symbol_tombstoned(dst_sym)
+            {
+                continue;
+            }
+            let edge = base_index.stored_edge(id);
+            seen.insert((
+                edge.source_file.clone(),
+                edge.target_file.clone(),
+                edge.source_symbol.clone(),
+                edge.target_symbol.clone(),
+                edge.edge_kind.clone(),
+            ));
+            merged.push(edge);
+        }
+
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for rel_path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(rel_path) {
+                for edge in resolve_delta_stored_edges(rel_path, ext, &self.overlay, &self.base)? {
+                    if seen.insert((
+                        edge.source_file.clone(),
+                        edge.target_file.clone(),
+                        edge.source_symbol.clone(),
+                        edge.target_symbol.clone(),
+                        edge.edge_kind.clone(),
+                    )) {
+                        merged.push(edge);
+                    }
+                }
+            }
+        }
+
+        let built = Arc::new(
+            GenerationEdges::build(Arc::new(merged), base_index.analysis().cloned())?
+                .with_generation(gen_id),
+        );
+        *guard = Some((gen_id, Arc::clone(&built)));
+        Ok(Some((gen_id, built)))
+    }
+
+    pub fn file_edges(&self, path: &str, min_confidence: f32) -> Result<Option<FileEdges>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.file_edges(path, min_confidence)?);
+        }
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some(file) = self.latest_file(path)? else {
+            return Ok(None);
+        };
+        let Some((generation, index)) = self.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let mut edges = Vec::new();
+        let mut inbound_edges = 0usize;
+        for id in 0..index.len() as u32 {
+            if !index.admits(id, min_confidence) {
+                continue;
+            }
+            if index.source_file(id) == file.path {
+                edges.push(index.stored_edge(id));
+            } else if index.target_file(id) == file.path {
+                inbound_edges += 1;
+            }
+        }
+        edges.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.source_file.cmp(&b.source_file))
+                .then_with(|| a.target_file.cmp(&b.target_file))
+                .then_with(|| a.source_symbol.cmp(&b.source_symbol))
+                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+                .then_with(|| a.edge_kind.cmp(&b.edge_kind))
+        });
+        Ok(Some(FileEdges {
+            generation,
+            file,
+            edges,
+            inbound_edges,
+            analysis: index.analysis().cloned(),
+        }))
+    }
+
+    pub fn all_indexed_files(&self) -> Result<Option<ScopeInputs>> {
+        let Some((gen_id, _root, base_files)) = self.base.latest_scope_inputs()? else {
+            return Ok(None);
+        };
+        let mut by_path: std::collections::BTreeMap<String, String> = base_files
+            .into_iter()
+            .filter(|(p, _)| {
+                let path_ref = Path::new(p);
+                !self.overlay.is_file_tombstoned(path_ref)
+                    && !self.overlay.modified_files.contains_key(path_ref)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            by_path.insert(path.clone(), ext.language.clone());
+        }
+        let wt_root = Some(self.worktree_root.to_string_lossy().into_owned());
+        Ok(Some((gen_id, wt_root, by_path.into_iter().collect())))
+    }
+
+    pub fn all_merged_symbols(&self) -> Result<Option<SearchPage>> {
+        let Some(mut page) = self.base.all_symbols_page()? else {
+            return Ok(None);
+        };
+        page.rows.retain(|sym| {
+            let p = Path::new(&sym.path);
+            !self.overlay.is_file_tombstoned(p)
+                && !self.overlay.modified_files.contains_key(p)
+                && !self.overlay.is_symbol_tombstoned(&sym.qualified_name)
+        });
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(path) {
+                for sym in &ext.symbols {
+                    page.rows.push(StoredSymbol {
+                        name: sym.name.clone(),
+                        qualified_name: sym.qualified_name.clone(),
+                        kind: sym.kind.as_str().to_string(),
+                        path: path.clone(),
+                        span_start: sym.span.start_byte,
+                        span_end: sym.span.end_byte,
+                        is_exported: sym.is_exported,
+                        content_hash: ext.content_hash,
+                    });
+                }
+            }
+        }
+        page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        page.repo_root = Some(self.worktree_root.to_string_lossy().into_owned());
+        Ok(Some(page))
+    }
+
+    pub fn keyword_page(
+        &self,
+        query: &str,
+        pool: usize,
+        filter: Option<&crate::scope::NameQueryFilter>,
+    ) -> Result<Option<SearchPage>> {
+        let Some(mut page) = self.all_merged_symbols()? else {
+            return Ok(None);
+        };
+        let Some((_, root, all_files)) = self.all_indexed_files()? else {
+            return Ok(None);
+        };
+        let corpus_files = u32::try_from(all_files.len()).unwrap_or(u32::MAX);
+        let corpus_symbols = page.total;
+
+        if let Some(filter) = filter {
+            let mut scope_paths = Vec::new();
+            let mut scope_langs = Vec::new();
+            if let Some(scope) = filter.symbol_scope().map_err(anyhow::Error::msg)? {
+                let resolved = scope.resolve(&all_files, root.as_deref())?;
+                scope_paths = resolved.report.paths.clone();
+                scope_langs = resolved.report.languages.clone();
+                page.rows.retain(|row| resolved.contains(&row.path));
+            }
+            let kinds = filter.kinds();
+            if !kinds.is_empty() {
+                let present: BTreeSet<String> =
+                    page.rows.iter().map(|row| row.kind.clone()).collect();
+                let missing: Vec<String> = kinds
+                    .iter()
+                    .filter(|k| !present.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    bail!(crate::scope::missing_kind_message(
+                        &missing,
+                        &present,
+                        !scope_paths.is_empty() || !scope_langs.is_empty()
+                    ));
+                }
+                page.rows.retain(|row| kinds.iter().any(|k| k == &row.kind));
+            }
+            let scoped_files = page
+                .rows
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let scoped_symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+            page.narrowing = Some(SearchNarrowing {
+                paths: scope_paths,
+                languages: scope_langs,
+                kinds: kinds.to_vec(),
+                files: u32::try_from(scoped_files).unwrap_or(u32::MAX),
+                symbols: scoped_symbols,
+                corpus_files,
+                corpus_symbols,
+            });
+        }
+
+        let trimmed = query.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            let terms: Vec<&str> = trimmed
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+                .collect();
+            page.rows.retain(|sym| {
+                let name_l = sym.name.to_ascii_lowercase();
+                let qual_l = sym.qualified_name.to_ascii_lowercase();
+                if terms.is_empty() {
+                    name_l.contains(&trimmed) || qual_l.contains(&trimmed)
+                } else {
+                    terms
+                        .iter()
+                        .all(|term| name_l.contains(term) || qual_l.contains(term))
+                }
+            });
+        }
+
+        page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        page.rows.sort_by(|a, b| {
+            let exact_a = a.name.eq_ignore_ascii_case(&trimmed);
+            let exact_b = b.name.eq_ignore_ascii_case(&trimmed);
+            exact_b
+                .cmp(&exact_a)
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        if page.rows.len() > pool {
+            page.rows.truncate(pool);
+        }
+        Ok(Some(page))
+    }
+
+    pub fn ranking_corpus(
+        &self,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> Result<Option<(SearchPage, Option<crate::scope::ResolvedScope>)>> {
+        let Some(mut page) = self.all_merged_symbols()? else {
+            return Ok(None);
+        };
+        let Some(scope) = scope else {
+            return Ok(Some((page, None)));
+        };
+        let Some((_, root, files)) = self.all_indexed_files()? else {
+            return Ok(None);
+        };
+        let mut resolved = scope.resolve(&files, root.as_deref())?;
+        let corpus_symbols = page.rows.len();
+        page.rows.retain(|row| resolved.contains(&row.path));
+        resolved.report.symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        resolved.report.corpus_symbols = u32::try_from(corpus_symbols).unwrap_or(u32::MAX);
+        page.total = resolved.report.symbols;
+        Ok(Some((page, Some(resolved))))
+    }
+
+    pub fn latest_test_entry_symbols(&self) -> Result<HashSet<String>> {
+        let mut symbols = self.base.latest_test_entry_symbols()?;
+        if !self.has_delta_changes() {
+            return Ok(symbols);
+        }
+        symbols.retain(|sym| {
+            if self.overlay.is_symbol_tombstoned(sym) {
+                return false;
+            }
+            if let Some((file_part, _)) = sym.split_once("::") {
+                let p = Path::new(file_part);
+                if self.overlay.is_file_tombstoned(p) || self.overlay.modified_files.contains_key(p)
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        for ext in self.overlay.added_extractions.values() {
+            for annotation in &ext.wiring {
+                if annotation.kind == WiringKind::RuntimeEntryPoint
+                    && devmap_extract::wiring::is_test_harness_reason(&annotation.details)
+                {
+                    symbols.insert(annotation.target_symbol.clone());
+                }
+            }
+        }
+        Ok(symbols)
+    }
+
+    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.dead_page(limit)?);
+        }
+        let fetch = limit.saturating_add(self.overlay.modified_files.len() * 8 + 64);
+        let Some(mut page) = self.base.dead_page(fetch)? else {
+            return Ok(None);
+        };
+        let edges_opt = self.generation_edges_with_id()?.map(|(_, idx)| idx);
+        let before_filter = page.rows.len();
+        page.rows.retain(|row| {
+            let p = Path::new(&row.file_path);
+            let qn = qualify_symbol(&row.file_path, &row.symbol_name);
+            if self.overlay.is_file_tombstoned(p)
+                || self.overlay.modified_files.contains_key(p)
+                || self.overlay.is_symbol_tombstoned(&qn)
+                || self.overlay.is_symbol_tombstoned(&row.symbol_name)
+            {
+                return false;
+            }
+            if let Some(ref idx) = edges_opt {
+                let has_inbound_call = idx
+                    .into_target_symbol(&qn)
+                    .iter()
+                    .chain(idx.into_target_symbol(&row.symbol_name).iter())
+                    .any(|id| {
+                        idx.kind(*id) != devmap_extract::model::EdgeKind::Contains
+                            && idx.source_symbol(*id) != qn
+                            && idx.source_symbol(*id) != row.symbol_name
+                    });
+                if has_inbound_call {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed_count = before_filter.saturating_sub(page.rows.len());
+        page.total_non_exempt = page.total_non_exempt.saturating_sub(removed_count);
+        if page.rows.len() > limit {
+            page.rows.truncate(limit);
+        }
+        Ok(Some(page))
+    }
+
+    pub fn callers_page(
+        &self,
+        targets: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Option<CallersPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self
+                .base
+                .callers_page(targets, exclude_file, min_confidence)?);
+        }
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some((generation, index)) = self.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let mut callers = Vec::new();
+        let mut total_unfiltered = 0usize;
+        let target_set: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+        for target in target_set {
+            for id in index.into_target_symbol(target) {
+                if index.kind(*id) != devmap_extract::model::EdgeKind::Calls
+                    || index.source_file(*id) == exclude_file
+                {
+                    continue;
+                }
+                total_unfiltered += 1;
+                if index.admits(*id, min_confidence) {
+                    callers.push(index.stored_edge(*id));
+                }
+            }
+        }
+        callers.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+                .then_with(|| left.source_file.cmp(&right.source_file))
+                .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        });
+        Ok(Some(CallersPage {
+            generation,
+            callers,
+            total_unfiltered,
+        }))
+    }
+
+    pub fn latest_parse_failures(&self) -> Result<(usize, Vec<String>)> {
+        let (base_total, base_paths) = self.base.latest_parse_failures()?;
+        if !self.has_delta_changes() {
+            return Ok((base_total, base_paths));
+        }
+        let mut paths: Vec<String> = base_paths
+            .into_iter()
+            .filter(|p| {
+                let pr = Path::new(p);
+                !self.overlay.is_file_tombstoned(pr)
+                    && !self.overlay.modified_files.contains_key(pr)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            if matches!(
+                ext.parse_outcome,
+                devmap_extract::model::ParseOutcome::Failed { .. }
+            ) {
+                paths.push(path.clone());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let total = paths.len();
+        Ok((total, paths))
+    }
+
+    pub fn merged_extractions_cancellable(
+        &self,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Vec<Extraction>> {
+        let mut exts = self
+            .base
+            .latest_extractions_until(&mut || cancel.check().is_err())?
+            .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))?;
+        if !self.has_delta_changes() {
+            return Ok(exts);
+        }
+        exts.retain(|ext| {
+            let p = Path::new(&ext.file_path);
+            !self.overlay.is_file_tombstoned(p) && !self.overlay.modified_files.contains_key(p)
+        });
+        for ext in self.overlay.added_extractions.values() {
+            exts.push(ext.clone());
+        }
+        Ok(exts)
+    }
+
+    pub fn latest_clone_candidates(&self) -> Result<(Vec<devmap_analyze::CloneCandidate>, usize)> {
+        let (mut candidates, mut unsigned) = self.base.latest_clone_candidates()?;
+        if !self.has_delta_changes() {
+            return Ok((candidates, unsigned));
+        }
+        candidates.retain(|cand| {
+            let p = Path::new(&cand.file_path);
+            !self.overlay.is_file_tombstoned(p)
+                && !self.overlay.modified_files.contains_key(p)
+                && !self.overlay.is_symbol_tombstoned(&cand.qualified_name)
+        });
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(path) {
+                for sym in &ext.symbols {
+                    if let Some(sig) = sym.body_signature {
+                        candidates.push(devmap_analyze::CloneCandidate {
+                            file_path: path.clone(),
+                            symbol_name: sym.name.clone(),
+                            qualified_name: sym.qualified_name.clone(),
+                            span_start: sym.span.start_byte,
+                            span_end: sym.span.end_byte,
+                            kind: sym.kind,
+                            exact: sig.exact,
+                            structural: sig.structural,
+                            nodes: sig.nodes,
+                        });
+                    } else {
+                        unsigned += 1;
+                    }
+                }
+            }
+        }
+        Ok((candidates, unsigned))
+    }
+
+    pub fn search_literals(
+        &self,
+        query: &str,
+        exact: bool,
+        page_cap: usize,
+    ) -> Result<Option<devmap_store::LiteralPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.search_literals(query, exact, page_cap)?);
+        }
+        let fetch = page_cap.saturating_add(self.overlay.modified_files.len() * 16 + 64);
+        let Some(base_page) = self.base.search_literals(query, exact, fetch)? else {
+            return Ok(None);
+        };
+        let mut rows: Vec<devmap_store::StoredLiteral> = base_page
+            .rows
+            .into_iter()
+            .filter(|lit| {
+                let p = Path::new(&lit.file_path);
+                !self.overlay.is_file_tombstoned(p) && !self.overlay.modified_files.contains_key(p)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            for lit in &ext.literals {
+                let matched = if exact {
+                    lit.value == query
+                } else {
+                    lit.value.contains(query)
+                };
+                if matched {
+                    rows.push(devmap_store::StoredLiteral {
+                        file_path: path.clone(),
+                        line: lit.line,
+                        span_start: u32::try_from(lit.start_byte).unwrap_or(u32::MAX),
+                        value: lit.value.clone(),
+                        qualified_name: lit.enclosing_qualified_name.clone(),
+                        symbol_name: lit.enclosing_name.clone(),
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.span_start.cmp(&b.span_start))
+        });
+        let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        if rows.len() > page_cap.max(1) {
+            rows.truncate(page_cap.max(1));
+        }
+        Ok(Some(devmap_store::LiteralPage { total, rows }))
+    }
+
     pub fn symbols_for_file(&self, rel_path: &str) -> Result<Vec<StoredSymbol>> {
         let normalized = normalize_rel_path(rel_path)?;
         let path_ref = Path::new(&normalized);
@@ -1734,24 +2532,23 @@ impl StackedStore {
         for path in modified_paths {
             if let Some(ext) = self.overlay.added_extractions.get(path) {
                 for sym in &ext.symbols {
-                    if needle.is_empty()
+                    if (needle.is_empty()
                         || sym.name.to_ascii_lowercase().contains(&needle)
-                        || sym.qualified_name.to_ascii_lowercase().contains(&needle)
+                        || sym.qualified_name.to_ascii_lowercase().contains(&needle))
+                        && seen.insert((path.clone(), sym.qualified_name.clone()))
                     {
-                        if seen.insert((path.clone(), sym.qualified_name.clone())) {
-                            results.push(StoredSymbol {
-                                name: sym.name.clone(),
-                                qualified_name: sym.qualified_name.clone(),
-                                kind: sym.kind.as_str().to_string(),
-                                path: path.clone(),
-                                span_start: sym.span.start_byte,
-                                span_end: sym.span.end_byte,
-                                is_exported: sym.is_exported,
-                                content_hash: ext.content_hash,
-                            });
-                            if results.len() >= limit {
-                                return Ok(results);
-                            }
+                        results.push(StoredSymbol {
+                            name: sym.name.clone(),
+                            qualified_name: sym.qualified_name.clone(),
+                            kind: sym.kind.as_str().to_string(),
+                            path: path.clone(),
+                            span_start: sym.span.start_byte,
+                            span_end: sym.span.end_byte,
+                            is_exported: sym.is_exported,
+                            content_hash: ext.content_hash,
+                        });
+                        if results.len() >= limit {
+                            return Ok(results);
                         }
                     }
                 }
@@ -1790,55 +2587,28 @@ impl StackedStore {
     }
 
     pub fn edges_for_symbol(&self, symbol: &str) -> Result<Vec<OverlayEdge>> {
+        let Some((_, index)) = self.generation_edges_with_id()? else {
+            return Ok(Vec::new());
+        };
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        for e in self
-            .overlay
-            .delta_edges
-            .iter()
-            .filter(|e| e.source == symbol || e.target == symbol)
-        {
-            if seen.insert((e.source.clone(), e.target.clone(), e.kind.clone())) {
-                out.push(e.clone());
-            }
-        }
-
-        let mut base_edges = self.base.callers_of(&[symbol.to_string()], "", 0.0)?;
-        let mut defining_files = BTreeSet::new();
-        for sym in self.base.search_symbols(symbol, 64)? {
-            if sym.name == symbol || sym.qualified_name == symbol {
-                defining_files.insert(sym.path);
-            }
-        }
-        for file_path in defining_files {
-            for edge in self.base.latest_edges_for_file(&file_path, 0.0)? {
-                if edge.source_symbol == symbol || edge.target_symbol == symbol {
-                    base_edges.push(edge);
-                }
-            }
-        }
-
-        for edge in base_edges {
-            let src_path = Path::new(&edge.source_file);
-            let dst_path = Path::new(&edge.target_file);
-            if self.overlay.is_file_tombstoned(src_path)
-                || self.overlay.modified_files.contains_key(src_path)
-                || self.overlay.is_file_tombstoned(dst_path)
-                || self.overlay.is_symbol_tombstoned(&edge.source_symbol)
-                || self.overlay.is_symbol_tombstoned(&edge.target_symbol)
-            {
+        for id in 0..index.len() as u32 {
+            let src = index.source_symbol(id);
+            let dst = index.target_symbol(id);
+            let matches = src == symbol
+                || dst == symbol
+                || bare_tail(src) == Some(symbol)
+                || bare_tail(dst) == Some(symbol);
+            if !matches {
                 continue;
             }
-            if seen.insert((
-                edge.source_symbol.clone(),
-                edge.target_symbol.clone(),
-                edge.edge_kind.clone(),
-            )) {
+            let kind = index.kind_label(id).to_string();
+            if seen.insert((src.to_string(), dst.to_string(), kind.clone())) {
                 out.push(OverlayEdge {
-                    source: edge.source_symbol,
-                    target: edge.target_symbol,
-                    kind: edge.edge_kind,
-                    confidence: (edge.confidence * 100.0).round().clamp(0.0, 100.0) as u8,
+                    source: src.to_string(),
+                    target: dst.to_string(),
+                    kind,
+                    confidence: (index.confidence(id) * 100.0).round().clamp(0.0, 100.0) as u8,
                 });
             }
         }
@@ -1869,6 +2639,9 @@ impl StackedStore {
     }
 
     fn reload_overlay(&mut self) -> Result<()> {
+        if let Ok(mut guard) = self.merged_edges.lock() {
+            *guard = None;
+        }
         let wt_str = self.worktree_root.to_string_lossy().into_owned();
         self.overlay = build_overlay_from_delta(
             &wt_str,
@@ -1878,6 +2651,263 @@ impl StackedStore {
         )?;
         Ok(())
     }
+}
+
+fn qualify_symbol(file_path: &str, symbol_name: &str) -> String {
+    if file_path.is_empty() {
+        return symbol_name.to_string();
+    }
+    if symbol_name.is_empty() {
+        return file_path.to_string();
+    }
+    if symbol_name == file_path
+        || symbol_name
+            .strip_prefix(file_path)
+            .is_some_and(|rest| rest.starts_with("::"))
+    {
+        return symbol_name.to_string();
+    }
+    format!("{file_path}::{symbol_name}")
+}
+
+fn bare_tail(symbol: &str) -> Option<&str> {
+    let tail = symbol.rsplit("::").next().unwrap_or(symbol);
+    let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
+fn specifier_matches_path(specifier: &str, candidate_path: &str) -> bool {
+    let norm_spec = specifier
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches("../")
+        .replace("::", "/");
+    if norm_spec.is_empty() {
+        return false;
+    }
+    let cand_no_ext = candidate_path
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(candidate_path);
+    cand_no_ext == norm_spec
+        || cand_no_ext.ends_with(&format!("/{norm_spec}"))
+        || cand_no_ext.ends_with(&format!("/{norm_spec}/mod"))
+        || cand_no_ext.ends_with(&format!("/{norm_spec}/index"))
+}
+
+fn resolve_delta_stored_edges(
+    rel_path: &str,
+    ext: &Extraction,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+) -> Result<Vec<StoredEdge>> {
+    let mut out = Vec::new();
+    let caller_family = LangFamily::from_lang(devmap_extract::languages::detect_language(
+        Path::new(rel_path),
+    ));
+
+    for sym in &ext.symbols {
+        out.push(StoredEdge {
+            source_file: rel_path.to_string(),
+            target_file: rel_path.to_string(),
+            source_symbol: rel_path.to_string(),
+            target_symbol: sym.qualified_name.clone(),
+            edge_kind: "Contains".to_string(),
+            confidence: 1.0,
+            resolution: Some("Structural".to_string()),
+        });
+    }
+
+    for call in &ext.calls {
+        let callee = call.callee_name.trim();
+        if callee.is_empty() {
+            continue;
+        }
+        let source_symbol = call
+            .caller_symbol
+            .as_deref()
+            .map(|caller| {
+                let want_qual = qualify_symbol(rel_path, caller);
+                ext.symbols
+                    .iter()
+                    .find(|s| {
+                        s.qualified_name == caller
+                            || s.name == caller
+                            || qualify_symbol(rel_path, &s.qualified_name) == want_qual
+                    })
+                    .map(|s| s.qualified_name.clone())
+                    .unwrap_or(want_qual)
+            })
+            .unwrap_or_else(|| rel_path.to_string());
+        let recv =
+            call.receiver_expr.as_deref().map(str::trim).filter(|r| {
+                !r.is_empty() && !matches!(*r, "self" | "this" | "Self" | "super" | "cls")
+            });
+
+        // 1. SameFile resolution (deterministic 1.0).
+        let same_file: Vec<&devmap_extract::model::ExtractedSymbol> = ext
+            .symbols
+            .iter()
+            .filter(|s| {
+                let tail_ok = s.name == callee || bare_tail(&s.qualified_name) == Some(callee);
+                if !tail_ok {
+                    return false;
+                }
+                match recv {
+                    Some(r) => {
+                        s.qualified_name.contains(&format!("{r}.{callee}"))
+                            || s.qualified_name.contains(&format!("{r}::{callee}"))
+                    }
+                    None => true,
+                }
+            })
+            .collect();
+        if same_file.len() == 1 {
+            out.push(StoredEdge {
+                source_file: rel_path.to_string(),
+                target_file: rel_path.to_string(),
+                source_symbol,
+                target_symbol: same_file[0].qualified_name.clone(),
+                edge_kind: "Calls".to_string(),
+                confidence: 1.0,
+                resolution: Some("SameFile".to_string()),
+            });
+            continue;
+        }
+        if !same_file.is_empty() {
+            continue;
+        }
+
+        // 2. Cross-file resolution across other delta extractions + non-masked base symbols.
+        let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+        for (other_path, other_ext) in &overlay.added_extractions {
+            if other_path == rel_path {
+                continue;
+            }
+            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(
+                other_path,
+            )));
+            if fam != caller_family {
+                continue;
+            }
+            for s in &other_ext.symbols {
+                if s.name == callee || bare_tail(&s.qualified_name) == Some(callee) {
+                    candidates.insert((other_path.clone(), s.qualified_name.clone()));
+                }
+            }
+        }
+        for sym in base.search_symbols(callee, 48)? {
+            if sym.path == rel_path {
+                continue;
+            }
+            let p = Path::new(&sym.path);
+            if overlay.is_file_tombstoned(p)
+                || overlay.modified_files.contains_key(p)
+                || overlay.is_symbol_tombstoned(&sym.qualified_name)
+            {
+                continue;
+            }
+            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
+            if fam != caller_family {
+                continue;
+            }
+            if sym.name == callee || bare_tail(&sym.qualified_name) == Some(callee) {
+                candidates.insert((sym.path.clone(), sym.qualified_name.clone()));
+            }
+        }
+
+        if let Some(r) = recv {
+            let narrowed: BTreeSet<(String, String)> = candidates
+                .iter()
+                .filter(|(cand_file, cand_qual)| {
+                    cand_qual.contains(&format!("{r}.{callee}"))
+                        || cand_qual.contains(&format!("{r}::{callee}"))
+                        || Path::new(cand_file).file_stem().and_then(|s| s.to_str()) == Some(r)
+                })
+                .cloned()
+                .collect();
+            if !narrowed.is_empty() {
+                candidates = narrowed;
+            }
+        }
+
+        let imported: Vec<&(String, String)> = candidates
+            .iter()
+            .filter(|(cand_file, _)| {
+                Path::new(cand_file).parent() == Path::new(rel_path).parent()
+                    || ext
+                        .imports
+                        .iter()
+                        .any(|imp| specifier_matches_path(&imp.module_specifier, cand_file))
+            })
+            .collect();
+
+        if imported.len() == 1 {
+            let (target_file, target_symbol) = imported[0];
+            out.push(StoredEdge {
+                source_file: rel_path.to_string(),
+                target_file: target_file.clone(),
+                source_symbol,
+                target_symbol: target_symbol.clone(),
+                edge_kind: "Calls".to_string(),
+                confidence: 0.9,
+                resolution: Some("ImportScoped".to_string()),
+            });
+        } else if candidates.len() == 1 {
+            if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
+                out.push(StoredEdge {
+                    source_file: rel_path.to_string(),
+                    target_file,
+                    source_symbol,
+                    target_symbol,
+                    edge_kind: "Calls".to_string(),
+                    confidence: 0.9,
+                    resolution: Some("UniqueGlobal".to_string()),
+                });
+            }
+        }
+    }
+
+    for imp in &ext.imports {
+        let spec = imp.module_specifier.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let mut matched_files: BTreeSet<String> = BTreeSet::new();
+        for other_path in overlay.added_extractions.keys() {
+            if other_path != rel_path && specifier_matches_path(spec, other_path) {
+                matched_files.insert(other_path.clone());
+            }
+        }
+        if matched_files.is_empty() {
+            if let Some((_, _, base_files)) = base.latest_scope_inputs()? {
+                for (bp, _) in base_files {
+                    let p = Path::new(&bp);
+                    if bp != rel_path
+                        && !overlay.is_file_tombstoned(p)
+                        && specifier_matches_path(spec, &bp)
+                    {
+                        matched_files.insert(bp);
+                    }
+                }
+            }
+        }
+        if matched_files.len() == 1 {
+            if let Some(target_file) = matched_files.into_iter().next() {
+                out.push(StoredEdge {
+                    source_file: rel_path.to_string(),
+                    target_file: target_file.clone(),
+                    source_symbol: rel_path.to_string(),
+                    target_symbol: target_file,
+                    edge_kind: "Imports".to_string(),
+                    confidence: 1.0,
+                    resolution: Some("ImportScoped".to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn build_overlay_from_delta(
@@ -1991,8 +3021,12 @@ fn normalize_rel_path(rel_path: &str) -> Result<String> {
 
 /// Paths that differ from the base: `git status` plus `base_head..HEAD`.
 /// Every git failure is an `Err`; an empty set only ever means "clean".
-fn git_changed_paths_against_head(worktree_root: &Path, base: &Store) -> Result<BTreeSet<String>> {
-    git_changed_paths_within(worktree_root, base, GIT_BOUNDS.deadline)
+#[cfg(feature = "parse")]
+fn git_changed_paths_and_deletions_against_head(
+    worktree_root: &Path,
+    base: &Store,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    git_changed_paths_and_deletions_within(worktree_root, base, GIT_BOUNDS.deadline)
 }
 
 fn git_changed_paths_within(
@@ -2000,7 +3034,16 @@ fn git_changed_paths_within(
     base: &Store,
     deadline: std::time::Duration,
 ) -> Result<BTreeSet<String>> {
-    let mut paths = git_status_paths_within(worktree_root, deadline)?;
+    git_changed_paths_and_deletions_within(worktree_root, base, deadline).map(|(paths, _)| paths)
+}
+
+fn git_changed_paths_and_deletions_within(
+    worktree_root: &Path,
+    base: &Store,
+    deadline: std::time::Duration,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let (mut paths, status_deleted) =
+        git_status_paths_and_deletions_within(worktree_root, deadline)?;
     let base_head = base.latest_generation_head_sha()?.ok_or_else(|| {
         anyhow::anyhow!("base snapshot records no head_sha; re-run `devmap seed --stacked`")
     })?;
@@ -2026,7 +3069,33 @@ fn git_changed_paths_within(
             paths.insert(status_path(worktree_root, raw)?);
         }
     }
-    Ok(paths)
+    Ok((paths, status_deleted))
+}
+
+#[cfg(feature = "parse")]
+fn git_read_head_blob(worktree_root: &Path, rel_path: &str) -> Option<Vec<u8>> {
+    use devmap_extract::subprocess::{git, run_bounded, Bounds};
+    use std::time::Duration;
+
+    let spec = format!("HEAD:{rel_path}");
+    let bounds = Bounds {
+        deadline: Duration::from_secs(5),
+        stdout_cap: (devmap_extract::MAX_SOURCE_BYTES as usize).saturating_add(1),
+        stderr_cap: 16 * 1024,
+    };
+    let mut type_cmd = git(worktree_root, ["cat-file", "-t", &spec]).ok()?;
+    let type_out = run_bounded(&mut type_cmd, bounds).ok()?;
+    if !type_out.status.success() || type_out.stdout.trim_ascii() != b"blob" {
+        return None;
+    }
+    let mut blob_cmd = git(worktree_root, ["cat-file", "blob", &spec]).ok()?;
+    let blob_out = run_bounded(&mut blob_cmd, bounds).ok()?;
+    if !blob_out.status.success()
+        || (blob_out.stdout.len() as u64) > devmap_extract::MAX_SOURCE_BYTES
+    {
+        return None;
+    }
+    Some(blob_out.stdout)
 }
 
 /// Streaming sha256 of a file, 64 KiB at a time.
@@ -2055,6 +3124,7 @@ fn sha256_str_hex(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "parse")]
     use super::*;
     #[cfg(feature = "parse")]
     use std::process::Command;
@@ -3478,6 +4548,391 @@ mod tests {
         let again = StackedStore::open(&lane).unwrap();
         assert!(again.delta_present());
         assert_eq!(again.status().unwrap().dirty_files, 1);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn legacy_base_store_ref_is_cleanly_refused_without_silent_upgrade() {
+        let root = temp_repo_dir("legacy-ref-refused");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+
+        let lane_a = add_lane(&anchor, &root, "lane-a");
+        let lane_b = add_lane(&anchor, &root, "lane-b");
+
+        // Unrelated repo anchor_repo_root is recognized as unverified, still refused cleanly.
+        let unrelated = root.join("unrelated");
+        seed_indexed_git_repo(&unrelated);
+        let ref_a = lane_a.join(".devcouncil/codeintel/base_store_ref.json");
+        fs::create_dir_all(ref_a.parent().unwrap()).unwrap();
+        fs::write(
+            &ref_a,
+            serde_json::to_vec(&serde_json::json!({
+                "anchor_repo_root": unrelated.canonicalize().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            legacy_base_store_anchor_root(&lane_a).is_none(),
+            "unrelated anchor_repo_root must not resolve as a sibling anchor"
+        );
+        let err_unrelated = StackedStore::open_if_leased(&lane_a)
+            .expect_err("legacy base_store_ref.json must be refused on open_if_leased")
+            .to_string();
+        assert!(
+            err_unrelated.contains("devmap seed --stacked --from"),
+            "expected explicit upgrade command in refusal: {err_unrelated}"
+        );
+        assert!(
+            !stack_lease_path(lane_a.canonicalize().unwrap()).exists(),
+            "open_if_leased must never silently create stack_lease.json"
+        );
+
+        // Sibling registered anchor includes the exact anchor path in the upgrade command.
+        fs::write(
+            &ref_a,
+            serde_json::to_vec(&serde_json::json!({
+                "anchor_repo_root": anchor.canonicalize().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let anchor_canon = anchor.canonicalize().unwrap();
+        assert_eq!(
+            legacy_base_store_anchor_root(&lane_a),
+            Some(anchor_canon.clone())
+        );
+        let err_a = StackedStore::open_if_leased(&lane_a)
+            .expect_err("sibling legacy base_store_ref.json must still refuse without auto-upgrade")
+            .to_string();
+        assert!(
+            err_a.contains(&format!(
+                "devmap seed --stacked --from {}",
+                anchor_canon.display()
+            )),
+            "expected concrete upgrade command in refusal: {err_a}"
+        );
+        assert!(!stack_lease_path(lane_a.canonicalize().unwrap()).exists());
+
+        // Alternate `.devmap/codeintel/base_store_ref.json` path is also refused cleanly.
+        let ref_b = lane_b.join(".devmap/codeintel/base_store_ref.json");
+        fs::create_dir_all(ref_b.parent().unwrap()).unwrap();
+        fs::write(
+            &ref_b,
+            serde_json::to_vec(&serde_json::json!({
+                "base_store_path": store_path(&anchor_canon),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err_b = StackedStore::open_if_leased(&lane_b)
+            .expect_err("alternate .devmap legacy pointer must also be refused")
+            .to_string();
+        assert!(err_b.contains("devmap seed --stacked --from"));
+        assert!(!stack_lease_path(lane_b.canonicalize().unwrap()).exists());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn store_query_engine_with_stacked_answers_all_graph_and_search_surfaces_over_delta_edits_and_deletions(
+    ) {
+        let root = temp_repo_dir("full-engine-surfaces");
+        let anchor = root.join("anchor");
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        fs::create_dir_all(anchor.join("tests")).unwrap();
+
+        fs::write(
+            anchor.join("src/db.rs"),
+            "pub fn run_query() -> i32 { 42 }\npub fn legacy_literal_holder() -> &'static str { \"OLD_SECRET_TAG\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("src/dead_mod.rs"),
+            "pub(crate) fn orphan_fn() -> i32 { 0 }\npub(crate) fn soon_called() -> i32 { 7 }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("src/obsolete.rs"),
+            "pub(crate) fn vanished_api() -> &'static str { \"VANISHED_LITERAL\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("src/lib.rs"),
+            "pub mod db;\npub mod dead_mod;\npub mod obsolete;\npub fn handle_req() -> i32 { db::run_query() }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("tests/smoke.rs"),
+            "#[test]\nfn test_handle_req() {\n    let _ = handle_req();\n}\n",
+        )
+        .unwrap();
+
+        fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
+
+        run_git_ok(&anchor, &["init", "-b", "main"]);
+        run_git_ok(&anchor, &["config", "user.email", "t@t"]);
+        run_git_ok(&anchor, &["config", "user.name", "t"]);
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "initial"]);
+
+        {
+            let db_path = store_path(&anchor);
+            fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let store = Store::open(&db_path).unwrap();
+            let anchor_canon = anchor.canonicalize().unwrap();
+            store.bind_repo_root(&anchor_canon).unwrap();
+            let rel_paths = [
+                "src/db.rs",
+                "src/dead_mod.rs",
+                "src/obsolete.rs",
+                "src/lib.rs",
+                "tests/smoke.rs",
+            ];
+            let exts: Vec<Extraction> = rel_paths
+                .iter()
+                .map(|p| {
+                    devmap_extract::extract_file(p, &fs::read_to_string(anchor.join(p)).unwrap())
+                })
+                .collect();
+            let mut resolver = devmap_resolve::Resolver::new();
+            resolver.index_extractions(&exts);
+            let res = resolver.resolve_all(&exts).unwrap();
+            let analysis = devmap_analyze::analyze(&exts, &res);
+            store
+                .save_generation_with_metadata(
+                    &exts,
+                    &res,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts {
+                        repo_root: Some(anchor_canon.to_string_lossy().into_owned()),
+                        ..devmap_store::GenerationWriteOpts::default()
+                    },
+                    &git_head(&anchor),
+                )
+                .unwrap();
+            let _ = store.write_latest_csr_sidecar().unwrap();
+        }
+
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        fs::write(
+            lane.join("src/db.rs"),
+            "// header comment shifting spans\npub fn run_query() -> i32 { 99 }\npub fn stream_rows() -> i32 {\n    let _tag = \"LIVE_DELTA_LITERAL\";\n    run_query() + soon_called()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lane.join("src/api.rs"),
+            "use crate::db;\npub fn serve_stream() -> i32 {\n    stream_rows()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lane.join("tests/smoke.rs"),
+            "#[test]\nfn test_handle_req() {\n    let _ = handle_req();\n}\n\n#[test]\nfn test_stream_pipeline() {\n    let _ = serve_stream();\n}\n",
+        )
+        .unwrap();
+        fs::remove_file(lane.join("src/obsolete.rs")).unwrap();
+
+        // Explicit write step syncs worktree into delta.sqlite under WriterLock.
+        {
+            let mut writer = StackedStore::open(&lane).unwrap();
+            writer.sync_worktree().unwrap();
+        }
+
+        let lane_canon = lane.canonicalize().unwrap();
+        let delta_file = stack_delta_path(&lane_canon);
+        let lease_file = stack_lease_path(&lane_canon);
+        let delta_before = fs::read(&delta_file).unwrap();
+        let lease_before = fs::read(&lease_file).unwrap();
+
+        // Subsequent dirty edit NOT synced yet: read-only open + queries must NOT touch delta.sqlite!
+        fs::write(
+            lane.join("src/unsynced_scratch.rs"),
+            "pub fn unsynced_only_on_disk() {}\n",
+        )
+        .unwrap();
+
+        let stacked = StackedStore::open(&lane).unwrap();
+        let engine =
+            crate::StoreQueryEngine::new(stacked.base_store()).with_stacked(Some(&stacked));
+
+        let search_new = engine
+            .search(crate::Request {
+                query: "stream_rows".to_string(),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .unwrap();
+        assert_eq!(search_new.items.len(), 1);
+        assert!(search_new.items[0]
+            .source_span
+            .contains("LIVE_DELTA_LITERAL"));
+
+        let search_unsynced = engine
+            .search(crate::Request {
+                query: "unsynced_only_on_disk".to_string(),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .unwrap();
+        assert!(
+            search_unsynced.items.is_empty(),
+            "read-only open must not silently ingest unsynced dirty files"
+        );
+
+        let search_deleted = engine
+            .search(crate::Request {
+                query: "vanished_api".to_string(),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .unwrap();
+        assert!(search_deleted.items.is_empty());
+
+        let sem = engine.search_semantic("stream rows", 4000).unwrap();
+        assert!(sem.items.iter().any(|h| h.symbol_name == "stream_rows"));
+        let ask_res = engine.ask("stream rows", 4000, 0.0).unwrap();
+        assert!(ask_res.items.iter().any(|h| h.symbol_name == "stream_rows"));
+
+        let exp = engine.explore("stream_rows", 10, 4000, 0.0, 2).unwrap();
+        assert_eq!(exp.definitions.items.len(), 1);
+        let entry = &exp.definitions.items[0];
+        assert!(entry
+            .callers
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("serve_stream")));
+        assert!(entry
+            .callees
+            .items
+            .iter()
+            .any(|e| e.target_symbol.contains("run_query")));
+
+        let imp = engine
+            .impact(crate::Request {
+                query: "run_query".to_string(),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 5,
+            })
+            .unwrap();
+        assert!(imp
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("stream_rows")));
+        assert!(imp
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("test_stream_pipeline")));
+
+        let layered = engine
+            .impact_layered(crate::Request {
+                query: "run_query".to_string(),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 5,
+            })
+            .unwrap();
+        assert!(!layered.edges.items.is_empty());
+
+        let neigh = engine
+            .neighbors(&["stream_rows".to_string()], 4000, 0.0, 1)
+            .unwrap();
+        assert_eq!(neigh.len(), 1);
+        assert!(!neigh[0].callers.items.is_empty());
+        assert!(!neigh[0].callees.items.is_empty());
+
+        let tr = engine
+            .trace_between(crate::Request {
+                query: ("test_stream_pipeline".to_string(), "run_query".to_string()),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 5,
+            })
+            .unwrap();
+        assert!(!tr.items.is_empty());
+
+        let deps_api = engine
+            .dependencies(crate::Request {
+                query: "src/api.rs".to_string(),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .unwrap();
+        assert!(deps_api.items.iter().any(|e| e.target_file == "src/db.rs"));
+
+        let aff = engine
+            .affected_tests(&["src/db.rs".to_string()], 4000, 0.0, 5)
+            .unwrap();
+        assert!(aff
+            .tests
+            .items
+            .iter()
+            .any(|t| t.symbols.iter().any(|s| s.contains("test_stream_pipeline"))));
+
+        // Skeleton works with both repo-relative and worktree-absolute paths!
+        let abs_db = lane_canon.join("src/db.rs");
+        let skel_db = engine.skeleton(abs_db.to_str().unwrap(), 4000).unwrap();
+        assert_eq!(skel_db.presence, crate::SkeletonPresence::Indexed);
+        assert!(skel_db
+            .items
+            .iter()
+            .any(|i| i.qualified_name.contains("stream_rows")));
+        let skel_del = engine.skeleton("src/obsolete.rs", 4000).unwrap();
+        assert_eq!(skel_del.presence, crate::SkeletonPresence::NotInIndex);
+
+        let dead = engine.dead_symbols(4000).unwrap();
+        let dead_names: Vec<&str> = dead.items.iter().map(|d| d.symbol_name.as_str()).collect();
+        assert!(dead_names.contains(&"orphan_fn"));
+        assert!(!dead_names.contains(&"soon_called"));
+        assert!(!dead_names.contains(&"vanished_api"));
+
+        let lit_live = engine.literals("LIVE_DELTA_LITERAL", false, 4000).unwrap();
+        assert_eq!(lit_live.items.len(), 1);
+        let lit_old = engine.literals("OLD_SECRET_TAG", false, 4000).unwrap();
+        assert!(lit_old.items.is_empty());
+        let lit_vanished = engine.literals("VANISHED_LITERAL", false, 4000).unwrap();
+        assert!(lit_vanished.items.is_empty());
+
+        let prev = engine
+            .preview(
+                "src/db.rs",
+                "pub fn run_query() -> i32 { 99 }\npub fn stream_rows(limit: usize) -> i32 { limit as i32 }\n",
+                4000,
+                0.0,
+            )
+            .unwrap();
+        assert!(prev.delta_available);
+        assert!(prev
+            .broken_callers
+            .items
+            .iter()
+            .any(|e| e.caller_symbol.contains("serve_stream")));
+
+        drop(engine);
+        drop(stacked);
+        assert_eq!(
+            fs::read(&delta_file).unwrap(),
+            delta_before,
+            "queries must not mutate a single byte of delta.sqlite"
+        );
+        assert_eq!(
+            fs::read(&lease_file).unwrap(),
+            lease_before,
+            "queries must not mutate stack_lease.json"
+        );
+        assert!(!delta_file.with_extension("sqlite-wal").exists());
+        assert!(!delta_file.with_extension("sqlite-shm").exists());
+        assert!(!delta_file.with_extension("sqlite.lock").exists());
+
         let _ = remove_readonly_tree(&root);
     }
 }

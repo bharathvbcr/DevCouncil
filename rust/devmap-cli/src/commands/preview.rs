@@ -1,7 +1,5 @@
-use devmap_query::StoreQueryEngine;
-
 use crate::cli::Cli;
-use crate::output::{emit_json, emit_truncation, open_for_read};
+use crate::output::{emit_json, emit_truncation, open_read_store};
 
 #[derive(clap::Args)]
 #[group(id = "Preview")]
@@ -44,8 +42,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         devmap_extract::read_source(std::path::Path::new(content))
             .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
     };
-    let store = open_for_read(cli)?;
-    let report = StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
+    let store = open_read_store(cli)?;
+    let report = store
+        .engine()
+        .preview(file, &source, *budget, *min_confidence)?;
     if cli.json {
         emit_json(cli, &serde_json::to_value(&report)?)?;
     } else {

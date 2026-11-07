@@ -15,25 +15,25 @@ This plan eliminates all 17 verified worktree/code-intelligence failure modes (`
    - Include `--manifest` in `hook::build_args`; trigger `detach_seeded_build` on `PostToolUse` for unindexed linked worktrees (preserving `PreToolUse` silence contract).
    - Keep `build --seed-from` staged until `lane`'s generation commits so concurrent `SessionStart` hooks never observe `main`'s stale symbol count at `cli.db()`.
 4. **Stop-Bleed & Warm Navigation (`GitPulse`, `Manvi`, `dc/devmap`)**:
-   - Remove regex fallback writes to `anchor_cas_store`, make CSR loading lazy, upgrade legacy `base_store_ref.json`, add `Manvi/.devmapignore` for upstream symlinked `crates/dc-*`, and add a warm `devmap mcp` stdio client in Go `dc/devmap`.
+   - Retire `GitPulse`'s legacy `overlay.json`, `base_store_ref.json` writer, `CasAstStore`, and regex `extract_fallback_ast` in favor of canonical `StackedStore`, refuse legacy `base_store_ref.json` on read naming `devmap seed --stacked --from <main>`, add `Manvi/.ignore` for upstream symlinked `/crates/dc-*`, and add a warm `devmap mcp` stdio client with hung-server restart and full graph verbs in Go `dc/devmap`.
 
-### Phase 1: `<15ms` `devmap seed`, Nested Cache Cloner & Sparse `verify`
-1. **Schema-29 Compatible `seeded_repo_root` (`devmap-store`)**:
-   - Add `seeded_repo_root TEXT` to `pending_state` DDL + idempotent migration; `latest_generation_repo_root` and `latest_repo_root` query `COALESCE(pending_state.seeded_repo_root, generations.repo_root)` when column exists; clear on `save_generation` and `RepoRootOwner::Gone`.
-2. **Live-WAL `TRUNCATE` Heal + Pinned `WAL_READ_LOCK` (`seed.rs`)**:
+### Phase 1: `<15ms` `devmap seed`, Staged Lane Build (`F-g`), Nested Cache Cloner & Sparse `verify`
+1. **Schema-29 Compatible `seed_rebind` (`devmap-store`)**:
+   - Record `seed_rebind.seeded_repo_root` alongside `pending_state.repo_root` during `rebind_staged` without rewriting historical `generations` overflow pages; honor `seed_rebind` only while `pending_state.repo_root` agrees (`0d285d0b`), and normalize `generations` + clear `seed_rebind` when a generation commits or restamps on a seeded store.
+2. **Live-WAL `TRUNCATE` Heal, Pinned `WAL_READ_LOCK`, & Build-Before-Place (`seed.rs`)**:
    - Checkpoint via `busy_timeout = 20` + `TRUNCATE`; if busy, `PASSIVE` + `BEGIN DEFERRED; SELECT 1 FROM sqlite_master LIMIT 1;` + verify `(busy == 0 && log == checkpointed)` + `clonefile` while holding read mark.
-   - Standalone `devmap seed` CLI cloning `{repo_map.json, code_graph.json, compact_code_graph.json, devmap.sqlite.csr, resolution-reuse-1/}`.
+   - Standalone `devmap seed` (`F-g`): under target `WriterLock`, stage donor store + CSR, verify search index health, run silent incremental build + `HEAD` stamp on the staged store when the lane's tree diverged, settle WAL, and atomically rename `devmap.sqlite` last so readers immediately see the lane's edits and `HEAD`.
 3. **Nested Hybrid Cache Cloner (`GitPulse` `cow_clone.rs`)**:
    - Discover nested Cargo `target/` (`depth <= 3`) + `dist`/`frontend/dist`; `libc::clonefile` `{deps, build, .fingerprint}`; boundary-checked `build/*/{output, root-output, out/**}` path rewrite with `(atime, mtime)` restoration; `tmutil addexclusion` + async teardown.
 4. **Zero-Index-Trust Sparse `WorkingTreeSubject` (`verify/subject.go`)**:
-   - Require `core.sparseCheckoutCone=true`, parse `<git_dir>/info/sparse-checkout`, `git read-tree HEAD` into scratch index, mark `SKIP_WORKTREE` only on out-of-cone `ENOENT` entries, `git add --sparse --all`, stream unmaterialized `HEAD` blobs via `git cat-file --batch`, and validate symlink targets lexically + against `tmpIdx`.
+   - Require `core.sparseCheckoutCone=true`, parse `<git_dir>/info/sparse-checkout`, `git read-tree HEAD` into scratch index, mark `SKIP_WORKTREE` only on out-of-cone `ENOENT` entries, `git add --sparse --all`, stream unmaterialized `HEAD` blobs via `git cat-file --batch` keyed by `(oid, mode)`, and validate symlink targets per entry lexically + against `tmpIdx`.
 
-### Phase 2: Glean-Style `StackedStore` & Overlay Retirement
+### Phase 2: Glean-Style `StackedStore`, Zero-Write-on-Read, & Legacy Overlay Retirement
 1. **Immutable Shared Base Snapshots (`devmap-store` & `devmap-query`)**:
-   - Publish `chmod 0444` snapshots under `<common_git_dir>/devmap/bases/gen-<G>/{base.sqlite, base.csr, manifest.json}` with `stack_lease.json` lease tracking and `gc_unused_bases`.
-   - Wire `devmap_query::overlay::{WorktreeOverlay, RoaringBitmap}` into `StackedStore` (`?mode=ro&immutable=1` verified `0444` base + Tree-sitter `delta.sqlite` + auto-rebase above `250` dirty files or `16 MiB`).
-2. **Re-Vendor & Retire Split-Brain (`GitPulse`)**:
-   - Re-vendor `devmap-*` crates via `scripts/vendor-crates.mjs`, migrate `GitPulse` codeintel onto canonical seeded/stacked stores, and retire `base_store_ref.json` split-brain.
+   - Refuse dirty donors (`BLOCK 2`) and publish `chmod 0444` snapshots under `<common_git_dir>/devmap/bases/gen-<G>-<head12>-<src8>/{base.sqlite, base.csr, manifest.json}` (`BLOCK 1`) with `stack_lease.json` lease tracking and `.lock`-serialized `gc_unused_bases` (`F-b`).
+   - Wire `devmap_query::overlay::{WorktreeOverlay, RoaringBitmap}` into `StackedStore`: strictly read-only `StackedStore::open` / `open_if_leased` for MCP, CLI `ReadStore`, and `status` (zero write-on-read; `is_fresh` never forced true when `dirty_files > 0`), and explicit `WriterLock`-guarded `sync_worktree` / `materialize_seeded_store` (`F-d`) on write commands (`devmap seed --stacked`, `devmap seed --sync-delta`).
+2. **Re-Vendor & Retire Legacy `worktree_overlay.rs` (`GitPulse` `P2.3`)**:
+   - Re-vendor all 11 `devmap-*` / `dc-*` crates via `scripts/vendor-crates.mjs`, migrate `GitPulse` codeintel, `agent_bus`, `cow_clone`, `live.rs`, and `gitpulse_worktree_overlay_sync` completely onto canonical `StackedStore`, and delete `overlay.json`, `base_store_ref.json` writer, `CasAstStore`, and regex `extract_fallback_ast`.
 
 ### Phase 3: Hardened Compiler CAS, CoW Source Checkout & Multi-Lane `Manvi`
 1. **Proc-Macro Allowlist (`gitpulse-worktree/src/build_cache.rs`)**:
