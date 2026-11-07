@@ -15,9 +15,14 @@ import (
 // exists: a module path libtest prints is not a path the source tree spells
 // (`#[path]`, `include!`), and a per-target choice misses a file another target
 // includes.
+//
+// skipped marks a crate the full suite excludes: a change in it is logged and
+// the crate is not run, but its non-excluded dependents are selected through
+// the same reverse closure, because the full suite builds them against it.
 type unitSel struct {
 	dir, why string
 	files    map[string]bool
+	skipped  bool
 }
 
 // selection maps changed and reached paths onto the commands the job's full
@@ -41,6 +46,17 @@ func newSelection(in Inputs) *selection {
 
 func (s *selection) drop(p, reason string) {
 	s.dropped = append(s.dropped, Dropped{Path: p, Reason: reason})
+}
+
+// skip records a change in a crate the full suite excludes: logged, not run,
+// and its dependents are still selected (see unitSel).
+func (s *selection) skip(p string, pkg RustPackage) {
+	s.drop(p, fmt.Sprintf("package %s is excluded from this job's full suite and is not run; its non-excluded dependents are selected", pkg.Name))
+	u := unit(s.rust, pkg.Name, pkg.Dir)
+	u.skipped = true
+	if u.why == "" {
+		u.why = p + " changed in excluded " + pkg.Name
+	}
 }
 
 func (s *selection) rustOwner(p string) (RustPackage, bool) {
@@ -82,7 +98,7 @@ func unit(m map[string]*unitSel, name, dir string) *unitSel {
 func (s *selection) widenOwner(p, reason string) (string, bool) {
 	if pkg, ok := s.rustOwner(p); ok {
 		if s.excluded[pkg.Name] {
-			s.drop(p, fmt.Sprintf("package %s is excluded from this job's full suite", pkg.Name))
+			s.skip(p, pkg)
 			return "", true
 		}
 		unit(s.rust, pkg.Name, pkg.Dir).why = "every target of " + pkg.Name + ": " + p + " changed outside any symbol (" + reason + ")"
@@ -146,7 +162,7 @@ func (s *selection) place(p string) (reason string, ok bool) {
 			return p + " is Rust outside src/ and tests/ of " + pkg.Name, false
 		}
 		if s.excluded[pkg.Name] {
-			s.drop(p, fmt.Sprintf("package %s is excluded from this job's full suite", pkg.Name))
+			s.skip(p, pkg)
 			return "", true
 		}
 		ps := unit(s.rust, pkg.Name, pkg.Dir)
@@ -180,8 +196,10 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 			byName[pkg.Name] = pkg
 		}
 		chosen := map[string]bool{}
-		for name := range s.rust {
-			chosen[name] = true
+		for name, u := range s.rust {
+			if !u.skipped {
+				chosen[name] = true
+			}
 			for _, dep := range s.in.Rust.Dependents[name] {
 				if s.excluded[dep] {
 					s.drop(byName[dep].Dir, fmt.Sprintf("package %s depends on %s and is excluded from this job's full suite", dep, name))
@@ -190,14 +208,18 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 				}
 			}
 		}
-		out = append(out, assemble("rust", "dependents", s.rust, chosen, seeds, func(file, dir string) bool { return strings.HasPrefix(file, dir+"/") },
-			func(names []string) Command {
-				argv := []string{"cargo", "test", "--locked"}
-				for _, n := range names {
-					argv = append(argv, "-p", n)
-				}
-				return newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)
-			}))
+		// A changed excluded crate with no non-excluded dependents leaves nothing
+		// to run; a command with no -p would run the whole workspace.
+		if len(chosen) > 0 {
+			out = append(out, assemble("rust", "dependents", s.rust, chosen, seeds, func(file, dir string) bool { return strings.HasPrefix(file, dir+"/") },
+				func(names []string) Command {
+					argv := []string{"cargo", "test", "--locked"}
+					for _, n := range names {
+						argv = append(argv, "-p", n)
+					}
+					return newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)
+				}))
+		}
 	}
 	if len(s.gos) > 0 {
 		importers := map[string][]string{}
