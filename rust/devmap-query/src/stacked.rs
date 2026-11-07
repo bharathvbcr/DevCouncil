@@ -1072,6 +1072,7 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
             .with_context(|| format!("cannot place {}", final_stack.display()))?;
         write_atomic(&lease_path, &serde_json::to_vec_pretty(&lease)?)
             .map(|_| ())
+            .with_context(|| format!("cannot write the lease {}", lease_path.display()))
             .inspect_err(|_| {
                 let _ = fs::remove_dir_all(&final_stack);
             })
@@ -1221,7 +1222,6 @@ pub struct StackedStore {
     /// The lane's own `base.sqlite`, held open: the connection, a materialize
     /// and any re-check all go through this descriptor, never a name.
     base_file: File,
-    base_sqlite_path: PathBuf,
     csr_file: Option<File>,
     base_csr_path: Option<PathBuf>,
     base: Store,
@@ -1332,7 +1332,6 @@ impl StackedStore {
             worktree_root: wt_canon,
             lease,
             base_file,
-            base_sqlite_path,
             csr_file,
             base_csr_path,
             base,
@@ -2857,6 +2856,14 @@ mod tests {
             "pub fn only_in_other() {}\n",
         );
         let lane_o = add_lane(&other, &root, "lane-o");
+        // `other_repo_with` commits the donor's index, so the new checkout
+        // carries a store; a stacked lane has none.
+        let committed_store = store_path(&lane_o);
+        for suffix in ["", "-wal", "-shm", ".csr"] {
+            let mut p = committed_store.clone().into_os_string();
+            p.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(p));
+        }
         provision_stacked_worktree(&anchor, &lane_a).unwrap();
         provision_stacked_worktree(&other, &lane_o).unwrap();
 
@@ -3541,11 +3548,12 @@ mod tests {
         // Tamper while the store is open: only the content check can catch it now.
         let base_dir = lease.base_dir();
         let csr = csr_path_for_store(base_dir.join("base.sqlite"));
-        make_tree_writable(&base_dir);
+        set_file_writable(&csr).unwrap();
         let mut bytes = fs::read(&csr).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         fs::write(&csr, &bytes).unwrap();
+        set_file_readonly(&csr).unwrap();
         let err = stacked
             .materialize_seeded_store()
             .expect_err("a tampered CSR must not be copied into a standalone store")
