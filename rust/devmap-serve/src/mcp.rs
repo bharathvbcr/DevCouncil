@@ -3111,13 +3111,9 @@ fn dispatch_with_stacked_overlay(
     cancel: &devmap_query::Cancel,
     unapplied: &crate::protocol::UnappliedEdits,
 ) -> anyhow::Result<Value> {
-    let is_stacked = !devmap_extract::paths::store_path(attr_root).is_file()
-        && devmap_extract::paths::stack_lease_path(attr_root).is_file();
-    if !is_stacked {
+    let Some(stacked) = devmap_query::stacked::StackedStore::open_if_leased(attr_root)? else {
         return dispatch(engine, request, cancel, unapplied);
-    }
-
-    let stacked = devmap_query::stacked::StackedStore::open(attr_root)?;
+    };
     let st = stacked.status()?;
     let is_status = matches!(request.command, IpcCommand::Status);
     let plain_search = match &request.command {

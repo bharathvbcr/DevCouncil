@@ -342,21 +342,99 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
     Ok(Some(method))
 }
 
+/// Create `staged` from the file at `source`: a copy-on-write clone, or a plain
+/// copy where the filesystem has no reflink. See [`clone_or_copy_file`].
 pub fn clone_or_copy(source: &Path, staged: &Path) -> Result<SeedMethod> {
-    if try_clone(source, staged) {
+    clone_or_copy_file(&std::fs::File::open(source)?, staged)
+}
+
+/// Create `staged` from the open file `source`: a copy-on-write clone
+/// (`fclonefileat` / `FICLONE`), or a plain copy where the filesystem has no
+/// reflink. No name is resolved for `source`, so a caller that admitted a file
+/// by descriptor clones exactly that file. `staged` must not exist: neither a
+/// clone nor a copy ever writes through, or replaces, something already there.
+pub fn clone_or_copy_file(source: &std::fs::File, staged: &Path) -> Result<SeedMethod> {
+    if try_clone_file(source, staged) {
         return Ok(SeedMethod::Clone);
     }
-    // `create_new`: never write through something already at `staged`.
-    let mut input = std::fs::File::open(source)?;
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(staged)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
-    Ok(SeedMethod::Copy)
+    let copied = copy_open_file(source, &mut output).and_then(|()| Ok(output.sync_all()?));
+    if copied.is_err() {
+        drop(output);
+        let _ = std::fs::remove_file(staged);
+    }
+    copied.map(|()| SeedMethod::Copy)
 }
 
+/// `read` of `file` at an absolute `offset`: the shared file offset of `file`
+/// (and of every descriptor duplicated from it) is neither used nor moved.
+pub fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+fn copy_open_file(source: &std::fs::File, output: &mut std::fs::File) -> Result<()> {
+    use std::io::Write;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    loop {
+        let n = read_file_at(source, &mut buf, offset)?;
+        if n == 0 {
+            return Ok(());
+        }
+        output.write_all(&buf[..n])?;
+        offset += n as u64;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn try_clone_file(source: &std::fs::File, staged: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(dst) = std::ffi::CString::new(staged.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: the descriptor and the NUL-terminated path are live for the
+    // call; `fclonefileat` fails with EEXIST rather than replacing `staged`.
+    unsafe { libc::fclonefileat(source.as_raw_fd(), libc::AT_FDCWD, dst.as_ptr(), 0) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn try_clone_file(source: &std::fs::File, staged: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // _IOW(0x94, 9, int)
+    const FICLONE: u32 = 0x4004_9409;
+    let Ok(output) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)
+    else {
+        return false;
+    };
+    // SAFETY: both descriptors are open for the duration of the call.
+    let cloned = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE as _, source.as_raw_fd()) == 0 };
+    if !cloned {
+        drop(output);
+        let _ = std::fs::remove_file(staged);
+    }
+    cloned
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn try_clone_file(_source: &std::fs::File, _staged: &Path) -> bool {
+    false
+}
+
+/// Clone a whole directory tree in one `clonefile` call (APFS only).
 #[cfg(target_os = "macos")]
 fn try_clone(source: &Path, staged: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -371,31 +449,7 @@ fn try_clone(source: &Path, staged: &Path) -> bool {
     unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) == 0 }
 }
 
-#[cfg(target_os = "linux")]
-fn try_clone(source: &Path, staged: &Path) -> bool {
-    use std::os::unix::io::AsRawFd;
-    // _IOW(0x94, 9, int)
-    const FICLONE: u32 = 0x4004_9409;
-    let Ok(input) = std::fs::File::open(source) else {
-        return false;
-    };
-    let Ok(output) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staged)
-    else {
-        return false;
-    };
-    // SAFETY: both descriptors are open for the duration of the call.
-    let cloned = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE as _, input.as_raw_fd()) == 0 };
-    if !cloned {
-        drop(output);
-        let _ = std::fs::remove_file(staged);
-    }
-    cloned
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(target_os = "macos"))]
 fn try_clone(_source: &Path, _staged: &Path) -> bool {
     false
 }
@@ -500,48 +554,6 @@ pub fn set_file_writable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create `name` in `dir` from the open file `source`: a copy-on-write clone
-/// (`fclonefileat` / `FICLONE`), or a plain copy where the filesystem has no
-/// reflink. `source` is held open, so no name is resolved for it; `name` must
-/// not exist.
-pub fn clone_open_file_into(source: &std::fs::File, dir: &Path, name: &std::ffi::OsStr) -> Result<SeedMethod> {
-    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
-    let pinned = PinnedDir::open(dir, false)
-        .with_context(|| format!("cannot pin {}", dir.display()))?;
-    if pinned.clone_file_to_child(source, name).is_ok() {
-        return Ok(SeedMethod::Clone);
-    }
-    let mut output = pinned
-        .open_file(name, Access::ReadWrite, Creation::New)
-        .with_context(|| format!("cannot create {}", dir.join(name).display()))?;
-    let copied = copy_open_file(source, &mut output).and_then(|()| Ok(output.sync_all()?));
-    if copied.is_err() {
-        drop(output);
-        let _ = pinned.remove_child(name);
-    }
-    copied.map(|()| SeedMethod::Copy)
-}
-
-/// Copy all of `source` into `output` by absolute offset, so the shared file
-/// offset of `source` (and of every descriptor duplicated from it) is neither
-/// used nor moved.
-fn copy_open_file(source: &std::fs::File, output: &mut std::fs::File) -> Result<()> {
-    use std::io::Write;
-    let mut buf = vec![0u8; 1 << 20];
-    let mut offset = 0u64;
-    loop {
-        #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::read_at(source, &mut buf, offset)?;
-        #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_read(source, &mut buf, offset)?;
-        if n == 0 {
-            return Ok(());
-        }
-        output.write_all(&buf[..n])?;
-        offset += n as u64;
-    }
-}
-
 /// Promote the open sealed `0444` base snapshot `base` into an independent
 /// writable WAL-mode `devmap.sqlite` rebound to `worktree_root`, atomically
 /// placed at `target_db` (`OQ2` auto-rebase / promotion). `base` is the file
@@ -557,10 +569,7 @@ pub fn promote_immutable_base_to_store(
     let staged = sidecar(target_db, &format!(".promote-{}", std::process::id()));
     discard_staged(&staged);
     let result = (|| -> Result<SeedMethod> {
-        let staged_name = staged
-            .file_name()
-            .context("promote target has no file name")?;
-        let method = clone_open_file_into(base, parent, staged_name)?;
+        let method = clone_or_copy_file(base, &staged)?;
         set_file_writable(&staged)?;
         {
             let conn = Connection::open(&staged)?;
@@ -899,21 +908,22 @@ mod tests {
         prepare_immutable_snapshot(path).unwrap();
     }
 
-    /// The probe the redesign rests on: the bundled SQLite build (with
-    /// `SQLITE_OPEN_URI`) opens `/dev/fd/N?immutable=1` and keeps reading the
-    /// file it was handed after the name is replaced, then deleted.
-    #[cfg(unix)]
+    /// The probe the redesign rests on, on macOS: the name is swapped for
+    /// another database BEFORE the connection is opened, and a connection
+    /// opened on the held descriptor (`/dev/fd/N?immutable=1`, bundled SQLite
+    /// with `SQLITE_OPEN_URI`) still reads the file it was handed. A connection
+    /// opened by the name reads the other database, which the test also
+    /// asserts, so a path-bound implementation cannot pass. On Linux
+    /// `/dev/fd/N` is a symlink that SQLite resolves to a name, so the open is
+    /// path-bound there (inside the lane's own directory) and this test does not
+    /// apply.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn immutable_snapshot_opened_through_its_descriptor_ignores_the_name_after_open() {
+    fn immutable_snapshot_opened_on_a_held_descriptor_ignores_a_name_swapped_before_open() {
         let tmp = temp_test_dir("fdbound");
         let db = tmp.join("base.sqlite");
         sealed_snapshot_with_head(&db, "aaaa");
         let held = std::fs::File::open(&db).unwrap();
-        let snap = Store::open_immutable_snapshot_file(&held, &db, None).unwrap();
-        assert_eq!(
-            snap.latest_generation_head_sha().unwrap().as_deref(),
-            Some("aaaa")
-        );
 
         let other = tmp.join("other.sqlite");
         sealed_snapshot_with_head(&other, "bbbb");
@@ -926,12 +936,14 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("bbbb"),
-            "the name now holds the other database"
+            "fixture: a connection opened by the name reads the other database"
         );
+
+        let snap = Store::open_immutable_snapshot_file(&held, &db, None).unwrap();
         assert_eq!(
             snap.latest_generation_head_sha().unwrap().as_deref(),
             Some("aaaa"),
-            "the descriptor-bound store must still read the file it was opened on"
+            "a connection opened on the held descriptor must read the file it was handed"
         );
         std::fs::remove_file(&db).unwrap();
         std::fs::remove_file(tmp.join("moved.sqlite")).unwrap();
@@ -943,17 +955,17 @@ mod tests {
     }
 
     #[test]
-    fn clone_open_file_into_copies_the_held_file_not_the_name() {
+    fn clone_or_copy_file_copies_the_held_file_not_the_name() {
         let tmp = temp_test_dir("cloneheld");
         let src = tmp.join("src.bin");
         std::fs::write(&src, b"original bytes").unwrap();
         let held = std::fs::File::open(&src).unwrap();
         std::fs::remove_file(&src).unwrap();
         std::fs::write(&src, b"impostor").unwrap();
-        clone_open_file_into(&held, &tmp, std::ffi::OsStr::new("dst.bin")).unwrap();
+        clone_or_copy_file(&held, &tmp.join("dst.bin")).unwrap();
         assert_eq!(std::fs::read(tmp.join("dst.bin")).unwrap(), b"original bytes");
         assert!(
-            clone_open_file_into(&held, &tmp, std::ffi::OsStr::new("dst.bin")).is_err(),
+            clone_or_copy_file(&held, &tmp.join("dst.bin")).is_err(),
             "a clone never replaces a name"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -961,15 +973,19 @@ mod tests {
 
     /// The non-reflink fallback: on a filesystem without `clonefile`/`FICLONE`
     /// the same call copies, reports `Copy`, and the result is byte-identical.
-    /// Needs a directory on such a volume (an HFS+ disk image on macOS), so it
-    /// runs only when `DEVMAP_NON_REFLINK_DIR` names one:
-    /// `DEVMAP_NON_REFLINK_DIR=/Volumes/X cargo test -p devmap-store --lib -- --ignored non_reflink`.
+    /// Needs a directory on such a volume (an HFS+ disk image on macOS):
+    /// `DEVMAP_NON_REFLINK_DIR=/Volumes/X cargo test -p devmap-store --lib clone_or_copy_file_falls_back`.
+    /// Without the variable the test logs why it did not exercise the fallback
+    /// (the cargo summary cannot report a skip, so the line below is the record).
     #[test]
-    #[ignore = "needs DEVMAP_NON_REFLINK_DIR on a filesystem without reflink"]
-    fn clone_open_file_into_falls_back_to_a_copy_without_reflink() {
-        let base = std::env::var_os("DEVMAP_NON_REFLINK_DIR")
-            .map(PathBuf::from)
-            .expect("set DEVMAP_NON_REFLINK_DIR to a directory on a non-reflink filesystem");
+    fn clone_or_copy_file_falls_back_to_a_copy_without_reflink() {
+        let Some(base) = std::env::var_os("DEVMAP_NON_REFLINK_DIR").map(PathBuf::from) else {
+            eprintln!(
+                "SKIPPED clone_or_copy_file_falls_back_to_a_copy_without_reflink: \
+                 DEVMAP_NON_REFLINK_DIR is not set; the copy fallback was NOT exercised"
+            );
+            return;
+        };
         let dir = base.join(format!("devmap-nonreflink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -977,11 +993,11 @@ mod tests {
         let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
         std::fs::write(&src, &payload).unwrap();
         let held = std::fs::File::open(&src).unwrap();
-        let method = clone_open_file_into(&held, &dir, std::ffi::OsStr::new("dst.bin")).unwrap();
+        let method = clone_or_copy_file(&held, &dir.join("dst.bin")).unwrap();
         assert_eq!(method, SeedMethod::Copy, "this volume was expected to have no reflink");
         assert_eq!(std::fs::read(dir.join("dst.bin")).unwrap(), payload);
         assert!(
-            clone_open_file_into(&held, &dir, std::ffi::OsStr::new("dst.bin")).is_err(),
+            clone_or_copy_file(&held, &dir.join("dst.bin")).is_err(),
             "a copy never replaces a name either"
         );
         let _ = std::fs::remove_dir_all(&dir);

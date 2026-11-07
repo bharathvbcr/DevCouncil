@@ -507,7 +507,7 @@ impl Store {
     /// already there, is opened read-only. That open takes the shared lock
     /// and waits out `busy_timeout`. An immutable open does not, so a
     /// momentary exclusive lock would look like an uncontended read.
-    pub(crate) fn open_owner_peek(path: &Path) -> Result<Connection> {
+    pub(super) fn open_owner_peek(path: &Path) -> Result<Connection> {
         let mut wal = path.as_os_str().to_os_string();
         wal.push("-wal");
         let wal_present = std::path::Path::new(&wal).is_file();
@@ -1085,11 +1085,14 @@ impl Store {
 
     /// [`Self::open_immutable_snapshot`] for a file the caller already holds.
     ///
-    /// On Unix the connection is bound to `file`'s descriptor (`/dev/fd/N`), so
-    /// renaming, replacing or deleting the name `label` afterwards cannot change
-    /// what the store reads. `label` is the name the store reports and where
-    /// its sidecars would sit; it is not opened. Elsewhere the connection opens
-    /// `label`.
+    /// On macOS the connection is bound to `file`'s descriptor (`/dev/fd/N`,
+    /// which is not a symlink there), so renaming, replacing or deleting the name
+    /// `label` before or after the open cannot change what the store reads. On
+    /// Linux `/dev/fd/N` is a symlink into `/proc/self/fd`, which SQLite resolves
+    /// to a name, so the open is path-bound there: callers rely on that name
+    /// being inside a directory only the owner writes (the lane's own `stack/`).
+    /// `label` is the name the store reports and where its sidecars would sit.
+    /// Elsewhere the connection opens `label`.
     pub fn open_immutable_snapshot_file(
         file: &std::fs::File,
         label: &Path,

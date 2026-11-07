@@ -1290,7 +1290,7 @@ fn render_skeleton_context(root: &Path, absolute: &Path, budget: Duration) -> Op
     if budget.is_zero() {
         return None;
     }
-    let hook_store = HookStore::open(root)?;
+    let hook_store = HookStore::open(root).ok().flatten()?;
     if started.elapsed() >= budget {
         return None;
     }
@@ -1384,11 +1384,20 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
     if !has_store {
         return None;
     }
-    let Some(hook_store) = HookStore::open(root) else {
-        return Some(
-            "DevMap blast: the on-disk index could not be opened; list is empty because the store was unavailable."
-                .into(),
-        );
+    let hook_store = match HookStore::open(root) {
+        Ok(Some(hook_store)) => hook_store,
+        Ok(None) => {
+            return Some(
+                "DevMap blast: the on-disk index could not be opened; list is empty because the store was unavailable."
+                    .into(),
+            );
+        }
+        Err(reason) => {
+            return Some(format!(
+                "DevMap blast: the stacked index could not be opened ({reason}); \
+                 list is empty because the store was unavailable."
+            ));
+        }
     };
     let store = hook_store.store();
     if started.elapsed() >= budget {
@@ -1685,7 +1694,10 @@ enum HookStore {
 }
 
 impl HookStore {
-    fn open(root: &Path) -> Option<Self> {
+    /// `Ok(None)`: nothing is stored here. `Err`: a lane's lease exists but its
+    /// store cannot be opened; the text names the recovery command, so the hook
+    /// can say why instead of "could not be opened".
+    fn open(root: &Path) -> Result<Option<Self>, String> {
         let plain = [
             root.join(".devcouncil/codeintel/devmap.sqlite"),
             root.join(".devmap/codeintel/devmap.sqlite"),
@@ -1693,22 +1705,13 @@ impl HookStore {
         .into_iter()
         .find(|path| path.is_file());
         if let Some(db) = plain {
-            return devmap_store::Store::open_read_only(&db)
+            return Ok(devmap_store::Store::open_read_only(&db)
                 .ok()
-                .map(|store| Self::Plain(Box::new(store)));
+                .map(|store| Self::Plain(Box::new(store))));
         }
-        let leased = [
-            root.join(".devcouncil/codeintel/stack_lease.json"),
-            root.join(".devmap/codeintel/stack_lease.json"),
-        ]
-        .into_iter()
-        .any(|path| path.is_file());
-        if !leased {
-            return None;
-        }
-        devmap_query::StackedStore::open(root)
-            .ok()
-            .map(|stacked| Self::Stacked(Box::new(stacked)))
+        devmap_query::StackedStore::open_if_leased(root)
+            .map(|opened| opened.map(|stacked| Self::Stacked(Box::new(stacked))))
+            .map_err(|err| format!("{err:#}"))
     }
 
     fn store(&self) -> &devmap_store::Store {
@@ -4617,6 +4620,55 @@ mod tests {
         assert!(note.contains("no delta.sqlite yet"), "{note}");
         assert!(note.contains("lower bound"), "{note}");
         drop(stacked);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hook surfaces why a stacked lane cannot be read, with the recovery
+    /// command, instead of the bare "could not be opened": here a lease left by
+    /// an earlier format (v1).
+    #[test]
+    fn a_stranded_stacked_lane_names_its_recovery_command_in_the_blast_note() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-stranded");
+        let lease_path = devmap_extract::paths::stack_lease_path(lane.canonicalize().unwrap());
+        let mut lease: Value =
+            serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+        lease["format_version"] = json!(1);
+        std::fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+        let payload = json!({"file_path": lane.join("lib.rs").to_str().unwrap()});
+        let note = compose_write_blast(&lane, &payload, Duration::from_secs(10))
+            .expect("a stranded lane must still speak");
+        assert!(
+            note.contains("devmap seed --stacked --from <donor checkout>"),
+            "the note must name the recovery command: {note}"
+        );
+        assert!(!note.contains("could not be opened; list is empty"), "{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One entry point: the hook's open retires a stale lease (a lease beside
+    /// the store that a materialize placed) instead of reading the stale stack.
+    #[test]
+    fn the_hooks_open_retires_a_stale_lease_beside_a_store() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-stale");
+        let canon = lane.canonicalize().unwrap();
+        let lease_path = devmap_extract::paths::stack_lease_path(&canon);
+        let lease_bytes = std::fs::read(&lease_path).unwrap();
+        let store = devmap_query::StackedStore::open(&lane)
+            .unwrap()
+            .materialize_seeded_store()
+            .unwrap();
+        assert!(store.is_file());
+        // The interrupted state: the store is placed, the lease is back.
+        std::fs::write(&lease_path, &lease_bytes).unwrap();
+        // Plain store first, as before; the lease is not read at all.
+        assert!(matches!(HookStore::open(&lane), Ok(Some(HookStore::Plain(_)))));
+        // Without the plain store the hook would reach the lease; the single
+        // entry point retires it and says "not stacked".
+        assert!(matches!(
+            devmap_query::StackedStore::open_if_leased(&lane),
+            Ok(None)
+        ));
+        assert!(!lease_path.exists(), "the stale lease is retired");
         let _ = std::fs::remove_dir_all(&base);
     }
 

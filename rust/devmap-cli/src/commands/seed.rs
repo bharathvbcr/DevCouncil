@@ -81,7 +81,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     }
 
     if args.sync_delta {
-        let mut stacked = StackedStore::open(&root)?;
+        let mut stacked = StackedStore::open_if_leased(&root)?.with_context(|| {
+            format!(
+                "{} has no stack lease (or has its own store, which makes a lease stale); \
+                 nothing to sync",
+                root.display()
+            )
+        })?;
         let report = stacked.sync_worktree()?;
         if cli.json {
             emit_json(cli, &serde_json::to_value(&report)?)?;

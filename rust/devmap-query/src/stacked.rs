@@ -44,9 +44,9 @@ use devmap_store::csr::CsrGraphReader;
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
-    clone_open_file_into, discard_staged, prepare_immutable_snapshot,
-    promote_immutable_base_to_store, seed_artifact, seed_directory_cow, set_file_readonly,
-    set_file_writable, stage_seed_healing_wal,
+    clone_or_copy_file, discard_staged, prepare_immutable_snapshot,
+    promote_immutable_base_to_store, read_file_at, seed_artifact, seed_directory_cow,
+    set_file_readonly, set_file_writable, stage_seed_healing_wal,
 };
 use devmap_store::{Store, StoredSymbol};
 use serde::{Deserialize, Serialize};
@@ -526,8 +526,9 @@ fn check_identity(file: &File, record: &FileRecord, what: &str, lease_path: &Pat
     Ok(())
 }
 
-/// Refuse a file anyone can write to: an immutable snapshot is `0444`.
-fn require_sealed(file: &File, what: &str) -> Result<()> {
+/// Refuse a file anyone can write to: an immutable snapshot is `0444`. A lane's
+/// own files name the recovery command (`lease_path`); a cache entry's do not.
+fn require_sealed(file: &File, what: &str, lease_path: Option<&Path>) -> Result<()> {
     let meta = file.metadata().with_context(|| format!("cannot stat {what}"))?;
     if !meta.is_file() {
         bail!("{what} is not a regular file");
@@ -537,8 +538,9 @@ fn require_sealed(file: &File, what: &str) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         if meta.mode() & 0o222 != 0 {
             bail!(
-                "{what} is writable (mode {:04o}); refusing to serve it as an immutable snapshot",
-                meta.mode() & 0o7777
+                "{what} is writable (mode {:04o}); refusing to serve it as an immutable snapshot{}",
+                meta.mode() & 0o7777,
+                lease_path.map_or_else(String::new, |p| format!("; {}", restack_hint(p)))
             );
         }
     }
@@ -621,30 +623,27 @@ fn check_manifest_matches(manifest: &BaseManifest, expected: &BaseKey, dir: &Pat
     Ok(())
 }
 
-/// Reuse check for a cache entry that already exists under `expected`'s name:
-/// manifest fields, the recomputed sha256 of `base.sqlite`, and SQLite
-/// admission. `Err` on any disagreement.
+/// Reuse check for a cache entry that already exists under `expected`'s name,
+/// run under the bases lock: the manifest's fields, and the recomputed sha256 of
+/// each file it records. What the SQLite holds is checked at admission, which
+/// reads it through descriptors; an entry that fails there is replaced once.
 fn verify_base_dir(base_dir: &Path, expected: &BaseKey) -> Result<BaseManifest> {
     let manifest = read_base_manifest(base_dir)?;
     check_manifest_matches(&manifest, expected, base_dir)?;
-    let base_sqlite = base_dir.join(BASE_SQLITE);
-    let actual = sha256_file_hex(&base_sqlite)?;
-    if actual != manifest.base_sqlite_sha256 {
-        bail!(
-            "base snapshot {} fails its sha256 check: recorded {} but the file hashes to {actual}",
-            base_sqlite.display(),
-            manifest.base_sqlite_sha256
-        );
+    for (name, recorded) in [
+        (BASE_SQLITE, Some(&manifest.base_sqlite_sha256)),
+        (BASE_CSR, manifest.csr_sha256.as_ref()),
+    ] {
+        let Some(recorded) = recorded else { continue };
+        let path = base_dir.join(name);
+        let actual = sha256_file_hex(&path)?;
+        if actual != *recorded {
+            bail!(
+                "{} fails its sha256 check: recorded {recorded} but the file hashes to {actual}",
+                path.display()
+            );
+        }
     }
-    // Verify the snapshot satisfies Store::open_immutable_snapshot invariants
-    // (`0444`, no sidecars) and holds what its name says it holds.
-    let store = Store::open_immutable_snapshot(&base_sqlite, None).with_context(|| {
-        format!(
-            "published base snapshot {} failed admission",
-            base_sqlite.display()
-        )
-    })?;
-    check_store_holds_key(&store, expected, &format!("base snapshot {}", base_dir.display()))?;
     Ok(manifest)
 }
 
@@ -690,87 +689,70 @@ fn require_child_absent(dir: &PinnedDir, name: &str, what: &str) -> Result<()> {
 /// only through descriptors: the entry's directory is pinned with
 /// `O_DIRECTORY|O_NOFOLLOW`, each file is opened relative to it and checked
 /// (regular, `0444`, no `-wal`/`-shm`/`-journal`), and what is cloned out is the
-/// open file, not a name. The clone is then held to what the donor says it
-/// built: its bytes must hash to the manifest, and the SQLite handle opened on
-/// the clone must report the donor's generation, `HEAD` and root.
+/// open file, not a name. The clone is then held to `published`, the manifest
+/// [`publish_base_snapshot`] returned (whose sha256s it computed itself; the
+/// manifest inside the entry is never read here), and the SQLite handle opened
+/// on the clone must report the donor's generation, `HEAD` and root.
 ///
-/// So a swap of the entry's directory, files or manifest at any moment leaves
-/// the lane with either the admitted bytes or a refusal.
-fn admit_published_base(published: &Path, key: &BaseKey, private: &Path) -> Result<AdmittedBase> {
-    let dir = PinnedDir::open(published, false)
-        .with_context(|| format!("cannot pin published base {}", published.display()))?;
-    let what = format!("published base {}", published.display());
-    let manifest = {
-        let mut file = dir
-            .open_file(std::ffi::OsStr::new(MANIFEST), Access::Read, Creation::Never)
-            .with_context(|| format!("cannot open the manifest of {what}"))?;
-        let text = file
-            .read_text(MAX_MANIFEST_BYTES)
-            .with_context(|| format!("cannot read the manifest of {what}"))?;
-        parse_manifest(text.as_bytes(), &published.join(MANIFEST))?
-    };
-    check_manifest_matches(&manifest, key, published)?;
-
+/// So a swap of the entry's directory or files at any moment leaves the lane
+/// with either the admitted bytes or a refusal.
+fn admit_published_base(
+    entry: &Path,
+    key: &BaseKey,
+    published: &BaseManifest,
+    private: &Path,
+) -> Result<AdmittedBase> {
+    let dir = PinnedDir::open(entry, false)
+        .with_context(|| format!("cannot pin published base {}", entry.display()))?;
+    let what = format!("published base {}", entry.display());
     for suffix in ["-wal", "-shm", "-journal"] {
         require_child_absent(&dir, &format!("{BASE_SQLITE}{suffix}"), &what)?;
     }
-    let sqlite_src = dir
-        .open_file(std::ffi::OsStr::new(BASE_SQLITE), Access::Read, Creation::Never)
-        .with_context(|| format!("cannot open base.sqlite of {what}"))?;
-    require_sealed(&sqlite_src, "published base.sqlite")?;
-    let csr_src = match manifest.csr_sha256 {
-        Some(_) => {
-            let file = dir
-                .open_file(std::ffi::OsStr::new(BASE_CSR), Access::Read, Creation::Never)
-                .with_context(|| format!("cannot open the CSR sidecar of {what}"))?;
-            require_sealed(&file, "published CSR sidecar")?;
-            Some(file)
-        }
+    let open_entry = |name: &str| -> Result<File> {
+        let file = dir
+            .open_file(std::ffi::OsStr::new(name), Access::Read, Creation::Never)
+            .with_context(|| format!("cannot open {name} of {what}"))?
+            .try_clone()?;
+        require_sealed(&file, &format!("published {name}"), None)?;
+        Ok(file)
+    };
+    let sqlite_src = open_entry(BASE_SQLITE)?;
+    let csr_src = match published.csr_sha256 {
+        Some(_) => Some(open_entry(BASE_CSR)?),
         None => {
             require_child_absent(&dir, BASE_CSR, &what)?;
             None
         }
     };
 
-    let clone_in = |source: &File, name: &str| -> Result<(File, PathBuf)> {
-        clone_open_file_into(source, private, std::ffi::OsStr::new(name))?;
+    // Clone the open file, then admit the clone: it is a separate inode in the
+    // lane's own directory, so what is hashed is what will be served.
+    let admit_clone = |source: &File, name: &str, expected_sha: &str| -> Result<(File, PathBuf, FileRecord)> {
         let path = private.join(name);
+        clone_or_copy_file(source, &path)?;
         set_file_readonly(&path)?;
-        let pinned = PinnedDir::open(private, false)?;
-        let clone = pinned
-            .open_file(std::ffi::OsStr::new(name), Access::Read, Creation::Never)?
-            .try_clone()?;
-        Ok((clone, path))
+        let clone = File::open(&path).with_context(|| format!("cannot open {}", path.display()))?;
+        let sha = sha256_of_open_file(&clone)?;
+        if sha != expected_sha {
+            bail!(
+                "{what} holds {name} bytes that hash to {sha}, not the {expected_sha} publish verified; \
+                 the cache entry changed while it was being admitted"
+            );
+        }
+        let record = file_record(&clone, sha)?;
+        Ok((clone, path, record))
     };
 
-    let (sqlite, sqlite_path) = clone_in(&sqlite_src, BASE_SQLITE)?;
-    let sqlite_sha = sha256_of_open_file(&sqlite)?;
-    if sqlite_sha != manifest.base_sqlite_sha256 {
-        bail!(
-            "{what} holds base.sqlite bytes that hash to {sqlite_sha}, not the {} its manifest records; \
-             another checkout changed the cache entry while it was being admitted, retry",
-            manifest.base_sqlite_sha256
-        );
-    }
+    let (sqlite, sqlite_path, sqlite_record) =
+        admit_clone(&sqlite_src, BASE_SQLITE, &published.base_sqlite_sha256)?;
     {
         let admitted = Store::open_immutable_snapshot_file(&sqlite, &sqlite_path, None)
             .context("the cloned base failed admission")?;
         check_store_holds_key(&admitted, key, &format!("the clone of {what}"))
-            .context("another checkout changed the cache entry while it was being admitted, retry")?;
+            .context("the cache entry changed while it was being admitted")?;
     }
-    let sqlite_record = file_record(&sqlite, sqlite_sha)?;
-
-    let csr_record = match (csr_src, manifest.csr_sha256) {
-        (Some(src), Some(expected)) => {
-            let (csr, _) = clone_in(&src, BASE_CSR)?;
-            let sha = sha256_of_open_file(&csr)?;
-            if sha != expected {
-                bail!(
-                    "{what} holds a CSR sidecar that hashes to {sha}, not the {expected} its manifest records; retry"
-                );
-            }
-            Some(file_record(&csr, sha)?)
-        }
+    let csr_record = match (csr_src, &published.csr_sha256) {
+        (Some(src), Some(expected)) => Some(admit_clone(&src, BASE_CSR, expected)?.2),
         _ => None,
     };
     Ok(AdmittedBase {
@@ -778,6 +760,7 @@ fn admit_published_base(published: &Path, key: &BaseKey, private: &Path) -> Resu
         csr: csr_record,
     })
 }
+
 const GIT_BOUNDS: devmap_extract::subprocess::Bounds = devmap_extract::subprocess::Bounds {
     deadline: std::time::Duration::from_secs(10),
     stdout_cap: 8 * 1024 * 1024,
@@ -1017,16 +1000,31 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
         std::process::id(),
         now_unix_ms()
     ));
-    let _ = fs::remove_dir_all(&stage);
-    fs::create_dir_all(&stage).with_context(|| format!("cannot create {}", stage.display()))?;
 
     // Everything that can fail comes before the lease: a failed provision must
     // not leave a leased lane behind a non-zero exit. `delta.sqlite` is not
     // created here either; only a sync or a build creates it.
-    let admitted = admit_published_base(&published, &key, &stage).and_then(|admitted| {
-        seed_derived_artifacts_and_reuse_caches(&source_canon, &wt_canon)?;
-        Ok(admitted)
-    });
+    let admit_once = |entry: &Path, verified: &BaseManifest| -> Result<AdmittedBase> {
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(&stage).with_context(|| format!("cannot create {}", stage.display()))?;
+        admit_published_base(entry, &key, verified, &stage)
+    };
+    let admitted = admit_once(&published, &manifest)
+        .or_else(|first| {
+            // The entry held what its manifest said but not what the donor
+            // built (an impostor, or a rebuilt donor that reused the name). No
+            // lane reads the entry, so replace it once and admit the fresh one.
+            remove_readonly_tree(&published)
+                .with_context(|| format!("cannot replace base {}", published.display()))?;
+            let (entry, verified) = publish_base_snapshot(&source_canon)?;
+            admit_once(&entry, &verified).with_context(|| {
+                format!("the replacement cache entry was refused too (first refusal: {first:#})")
+            })
+        })
+        .and_then(|admitted| {
+            seed_derived_artifacts_and_reuse_caches(&source_canon, &wt_canon)?;
+            Ok(admitted)
+        });
     let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(err) => {
@@ -1216,6 +1214,91 @@ fn make_tree_writable_best_effort(path: &Path) {
     }
 }
 
+/// A lane's lease and its base, admitted for reading: the one place a lane's
+/// base is opened, shared by [`StackedStore::open`] and the MCP engine.
+struct LaneBase {
+    lease: StackLease,
+    lease_path: PathBuf,
+    stack: PathBuf,
+    pinned: PinnedDir,
+    base_file: File,
+    base: Store,
+}
+
+/// Read the lease of the canonical worktree `wt_canon`, refuse it unless it is
+/// this lane's, and open the lane's own `base.sqlite`: its directory by
+/// descriptor, the file checked against the identity the lease admitted, the
+/// connection bound to that descriptor. Nothing under `bases/` is named.
+fn open_lane_base(wt_canon: &Path, repo_root_override: Option<String>) -> Result<LaneBase> {
+    let lease_path = stack_lease_path(wt_canon);
+    let hint = restack_hint(&lease_path);
+    let raw_lease = fs::read(&lease_path)
+        .with_context(|| format!("cannot read stack lease {}; {hint}", lease_path.display()))?;
+    let lease = parse_lease(&raw_lease, &lease_path)?;
+
+    // The lease must belong to the lane being opened: one copied in from
+    // another lane or repository records another root.
+    let lease_root = Path::new(&lease.worktree_root).canonicalize().ok();
+    if lease_root.as_deref() != Some(wt_canon) {
+        bail!(
+            "stack lease in {} was issued for {} (refusing a lease that belongs to another lane); {hint}",
+            wt_canon.display(),
+            lease.worktree_root
+        );
+    }
+
+    let stack = stack_dir(wt_canon);
+    let pinned = PinnedDir::open(&stack, false).with_context(|| {
+        format!("cannot open the lane's base directory {}; {hint}", stack.display())
+    })?;
+    let base_sqlite_path = stack.join(BASE_SQLITE);
+    let base_file = pinned
+        .open_file(std::ffi::OsStr::new(BASE_SQLITE), Access::Read, Creation::Never)
+        .with_context(|| format!("cannot open {BASE_SQLITE} in {}; {hint}", stack.display()))?
+        .try_clone()?;
+    require_sealed(&base_file, "the lane's base snapshot", Some(&lease_path))?;
+    check_identity(&base_file, &lease.base, "base snapshot", &lease_path)?;
+    let base = Store::open_immutable_snapshot_file(&base_file, &base_sqlite_path, repo_root_override)
+        .with_context(|| {
+            format!(
+                "cannot open the lane's base snapshot {}; {hint}",
+                base_sqlite_path.display()
+            )
+        })?;
+    Ok(LaneBase {
+        lease,
+        lease_path,
+        stack,
+        pinned,
+        base_file,
+        base,
+    })
+}
+
+/// Open the base of the lane whose private `base.sqlite` is `base_sqlite`, with
+/// the same lease and identity checks as [`StackedStore::open`], for readers
+/// that want only the SQLite store (the MCP engine) and are handed a path.
+pub fn open_lane_base_store(base_sqlite: &Path) -> Result<Store> {
+    let lease_path = base_sqlite
+        .parent()
+        .and_then(Path::parent)
+        .map(|codeintel| codeintel.join("stack_lease.json"))
+        .with_context(|| format!("{} is not inside a lane's stack/ directory", base_sqlite.display()))?;
+    let lease = StackLease::read_from(&lease_path)?;
+    let wt_canon = Path::new(&lease.worktree_root)
+        .canonicalize()
+        .with_context(|| format!("cannot canonicalize {}; {}", lease.worktree_root, restack_hint(&lease_path)))?;
+    if stack_lease_path(&wt_canon) != lease_path {
+        bail!(
+            "{} is not the lane's own base for lease {}; {}",
+            base_sqlite.display(),
+            lease_path.display(),
+            restack_hint(&lease_path)
+        );
+    }
+    open_lane_base(&wt_canon, None).map(|lane| lane.base)
+}
+
 pub struct StackedStore {
     worktree_root: PathBuf,
     lease: StackLease,
@@ -1254,66 +1337,24 @@ impl StackedStore {
         let wt_canon = worktree_root
             .canonicalize()
             .with_context(|| format!("cannot canonicalize {}", worktree_root.display()))?;
-        let lease_path = stack_lease_path(&wt_canon);
-        let hint = restack_hint(&lease_path);
-        let raw_lease = fs::read(&lease_path)
-            .with_context(|| format!("cannot read stack lease {}; {hint}", lease_path.display()))?;
-        let lease = parse_lease(&raw_lease, &lease_path)?;
-
-        // The lease must belong to the lane being opened: one copied in from
-        // another lane or repository records another root.
-        let lease_root = Path::new(&lease.worktree_root).canonicalize().ok();
-        if lease_root.as_deref() != Some(wt_canon.as_path()) {
-            bail!(
-                "stack lease in {} was issued for {} (refusing a lease that belongs to another lane); {hint}",
-                wt_canon.display(),
-                lease.worktree_root
-            );
-        }
-
-        let stack = stack_dir(&wt_canon);
-        let pinned = PinnedDir::open(&stack, false).with_context(|| {
-            format!("cannot open the lane's base directory {}; {hint}", stack.display())
-        })?;
-        let open_child = |name: &str| -> Result<File> {
-            Ok(pinned
-                .open_file(std::ffi::OsStr::new(name), Access::Read, Creation::Never)
-                .with_context(|| format!("cannot open {} in {}; {hint}", name, stack.display()))?
-                .try_clone()?)
-        };
-        let base_sqlite_path = stack.join(BASE_SQLITE);
-        let base_file = open_child(BASE_SQLITE)?;
-        require_sealed(&base_file, "the lane's base snapshot")?;
-        check_identity(&base_file, &lease.base, "base snapshot", &lease_path)?;
-
         let wt_root_str = wt_canon.to_string_lossy().into_owned();
-        let base = Store::open_immutable_snapshot_file(
-            &base_file,
-            &base_sqlite_path,
-            Some(wt_root_str.clone()),
-        )
-        .with_context(|| {
-            format!(
-                "cannot open the lane's base snapshot {}; {hint}",
-                base_sqlite_path.display()
-            )
-        })?;
-        if base.latest_generation_id()? != Some(lease.generation_id)
-            || base.latest_generation_head_sha()?.as_deref() != Some(lease.head_sha.as_str())
-        {
-            bail!(
-                "the lane's base snapshot holds generation {:?} at {:?} but the lease admitted generation {} at {}; {hint}",
-                base.latest_generation_id()?,
-                base.latest_generation_head_sha()?,
-                lease.generation_id,
-                lease.head_sha
-            );
-        }
+        let LaneBase {
+            lease,
+            lease_path,
+            stack,
+            pinned,
+            base_file,
+            base,
+        } = open_lane_base(&wt_canon, Some(wt_root_str.clone()))?;
+        let hint = restack_hint(&lease_path);
 
         let (csr_file, base_csr_path) = match &lease.csr {
             Some(record) => {
-                let file = open_child(BASE_CSR)?;
-                require_sealed(&file, "the lane's CSR sidecar")?;
+                let file = pinned
+                    .open_file(std::ffi::OsStr::new(BASE_CSR), Access::Read, Creation::Never)
+                    .with_context(|| format!("cannot open {BASE_CSR} in {}; {hint}", stack.display()))?
+                    .try_clone()?;
+                require_sealed(&file, "the lane's CSR sidecar", Some(&lease_path))?;
                 check_identity(&file, record, "CSR sidecar", &lease_path)?;
                 (Some(file), Some(stack.join(BASE_CSR)))
             }
@@ -1658,10 +1699,8 @@ impl StackedStore {
         let dst_csr = csr_path_for_store(&target_db);
         let placed = (|| -> Result<()> {
             promote_immutable_base_to_store(&self.base_file, &target_db, &self.worktree_root)?;
-            if let (Some(csr_file), Some(parent), Some(name)) =
-                (&self.csr_file, dst_csr.parent(), dst_csr.file_name())
-            {
-                clone_open_file_into(csr_file, parent, name)?;
+            if let Some(csr_file) = &self.csr_file {
+                clone_or_copy_file(csr_file, &dst_csr)?;
                 set_file_writable(&dst_csr)?;
             }
             Ok(())
@@ -2084,18 +2123,6 @@ fn retire_stack(worktree_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The first `read` of `file` at `offset`, without touching its file offset.
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::FileExt::read_at(file, buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
-    }
-}
-
 /// Streaming sha256 of an open file, 64 KiB at a time, from offset 0.
 fn sha256_of_open_file(file: &File) -> Result<String> {
     use sha2::{Digest, Sha256};
@@ -2103,7 +2130,7 @@ fn sha256_of_open_file(file: &File) -> Result<String> {
     let mut buf = [0u8; 64 * 1024];
     let mut offset = 0u64;
     loop {
-        let n = read_at(file, &mut buf, offset).context("cannot read a file for sha256")?;
+        let n = read_file_at(file, &mut buf, offset).context("cannot read a file for sha256")?;
         if n == 0 {
             break;
         }
@@ -3795,8 +3822,19 @@ mod tests {
         assert!(a2_swap(&entry, &imp_dir));
         let stage = lane.canonicalize().unwrap().join("stage");
         fs::create_dir_all(&stage).unwrap();
-        let err = match admit_published_base(&entry, &key, &stage) {
+        // Held to the sha publish computed (the entry's own manifest is never
+        // read), the impostor's bytes are refused.
+        let err = match admit_published_base(&entry, &key, &manifest, &stage) {
             Ok(_) => panic!("an impostor swapped in after publish was admitted"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("publish verified"), "unexpected refusal: {err}");
+        // Even when the sha is the impostor's own, its generation, HEAD and root
+        // are not the donor's.
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(&stage).unwrap();
+        let err = match admit_published_base(&entry, &key, &forged, &stage) {
+            Ok(_) => panic!("an impostor with a self-consistent sha was admitted"),
             Err(err) => format!("{err:#}"),
         };
         assert!(err.contains("generation"), "unexpected refusal: {err}");
@@ -3810,7 +3848,7 @@ mod tests {
         assert!(a2_swap(&entry, &imp_dir));
         let _ = fs::remove_dir_all(&stage);
         fs::create_dir_all(&stage).unwrap();
-        assert!(admit_published_base(&entry, &key, &stage).is_err());
+        assert!(admit_published_base(&entry, &key, &manifest, &stage).is_err());
         let _ = remove_readonly_tree(&root);
     }
 
@@ -4285,7 +4323,7 @@ mod tests {
         let admit = || {
             let _ = fs::remove_dir_all(&stage);
             fs::create_dir_all(&stage).unwrap();
-            admit_published_base(&entry, &key, &stage).map(|_| ()).map_err(|e| format!("{e:#}"))
+            admit_published_base(&entry, &key, &manifest, &stage).map(|_| ()).map_err(|e| format!("{e:#}"))
         };
         admit().expect("an honest entry is admitted");
         let admitted = fs::metadata(stage.join("base.sqlite")).unwrap();
@@ -4309,7 +4347,7 @@ mod tests {
         if csr.exists() {
             fs::remove_file(&csr).unwrap();
             let err = admit().expect_err("a CSR the manifest records but the entry lacks is refused");
-            assert!(err.contains("CSR"), "{err}");
+            assert!(err.contains("csr"), "{err}");
         }
         let _ = remove_readonly_tree(&root);
     }
@@ -4369,6 +4407,12 @@ mod tests {
         let wt = lane.canonicalize().unwrap();
         let hint = "devmap seed --stacked --from <donor checkout>";
 
+        // A private base that became writable strands the lane too.
+        set_file_writable(&lease.base_sqlite_path()).unwrap();
+        let err = format!("{:#}", StackedStore::open(&lane).expect_err("a writable base"));
+        assert!(err.contains("writable") && err.contains(hint), "{err}");
+        set_file_readonly(&lease.base_sqlite_path()).unwrap();
+
         fs::remove_file(lease.base_sqlite_path()).unwrap();
         let err = format!("{:#}", StackedStore::open(&lane).expect_err("a missing base"));
         assert!(err.contains(hint), "{err}");
@@ -4382,6 +4426,32 @@ mod tests {
 
         provision_stacked_worktree(&anchor, &lane).expect("the named command recovers the lane");
         StackedStore::open(&lane).unwrap();
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// The MCP engine opens the lane's base through the same lease-checked path
+    /// as `StackedStore::open`: an honest base opens, a swapped one is refused.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn the_mcp_engines_base_open_checks_the_lease_identity() {
+        let root = temp_repo_dir("inv-mcp");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let base = lease.base_sqlite_path();
+        let store = open_lane_base_store(&base).expect("an honest lane base opens");
+        assert_eq!(store.latest_generation_head_sha().unwrap().as_deref(), Some(lease.head_sha.as_str()));
+        drop(store);
+        // A same-content file under another inode is not the admitted file.
+        let impostor = lease.base_dir().join("impostor.sqlite");
+        fs::copy(&base, &impostor).unwrap();
+        set_file_readonly(&impostor).unwrap();
+        fs::rename(&impostor, &base).unwrap();
+        let err = format!("{:#}", open_lane_base_store(&base).err().expect("a swapped base is refused"));
+        assert!(err.contains("replaced or modified"), "{err}");
+        // A path that is not a lane's stack/base.sqlite has no lease to check.
+        assert!(open_lane_base_store(&root.join("nowhere/base.sqlite")).is_err());
         let _ = remove_readonly_tree(&root);
     }
 

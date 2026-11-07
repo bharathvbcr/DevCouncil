@@ -124,20 +124,35 @@ impl DeltaStore {
     /// Open an existing `delta.sqlite` for reading: no creation, no schema
     /// statements, no journal-mode change. `None` when the file does not exist.
     ///
-    /// Creates no `-shm`/`-wal` sidecar and needs no write access to the state
-    /// directory: a WAL database with no `-wal` beside it (its last writer
-    /// closed and checkpointed) holds everything in the main file and is read
-    /// immutable. While a writer's `-wal` exists the open is an ordinary
-    /// read-only one, which must share that writer's index.
+    /// An ordinary read-only connection, never an immutable one: a live delta is
+    /// rewritten by the detached `seed --sync-delta`, and an immutable open takes
+    /// no lock, so it could read a torn page or a stale file. The delta is kept
+    /// in rollback-journal mode (see `configure`), so this open takes SQLite's
+    /// shared lock, creates no `-shm`/`-wal` sidecar and needs no write access
+    /// to the state directory. A delta left in WAL mode by an older build cannot
+    /// be read without creating those sidecars: in a read-only directory that is
+    /// an error naming the reason, never an empty or stale answer.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
         let path = path.as_ref().to_path_buf();
         if !path.is_file() {
             return Ok(None);
         }
-        let conn = crate::Store::open_owner_peek(&path)
-            .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // SQLite opens lazily: read now, so a refusal is reported here.
+        conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+            .with_context(|| {
+                format!(
+                    "delta store {} cannot be read read-only (a WAL-mode delta from an earlier \
+                     build in a read-only state directory is unreadable, not empty)",
+                    path.display()
+                )
+            })?;
         Ok(Some(Self {
             conn: Mutex::new(conn),
             path,
@@ -156,8 +171,7 @@ impl DeltaStore {
         conn.execute_batch(
             "PRAGMA trusted_schema = OFF;
              PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA journal_mode = DELETE;",
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(())
@@ -444,6 +458,74 @@ mod tests {
         assert_eq!(reader.dirty_file_count().unwrap(), 2);
         drop(reader);
         drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader that opened while no writer was running must follow a writer
+    /// that then starts, commits and closes: an immutable open would assume the
+    /// file never changes and could serve the old page, a torn one, or an error.
+    #[test]
+    fn open_read_only_follows_a_writer_that_starts_after_the_reader_opened() {
+        let dir = temp_dir("lateWriter");
+        let path = dir.join("delta.sqlite");
+        {
+            let writer = DeltaStore::open(&path).unwrap();
+            writer.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
+        }
+        let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
+        assert_eq!(reader.dirty_file_count().unwrap(), 1);
+        {
+            let writer = DeltaStore::open(&path).unwrap();
+            for i in 0..50 {
+                writer
+                    .tombstone_file(&format!("src/late_{i}.rs"), "CAS_TOMBSTONE", 10 + i)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            reader.dirty_file_count().unwrap(),
+            51,
+            "a reader opened before the writer must see what the writer committed"
+        );
+        assert_eq!(reader.load_snapshot().unwrap().files.len(), 51);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delta an earlier build left in WAL mode, in a read-only directory: it
+    /// is either read correctly or refused with a reason, never read stale or
+    /// empty (no immutable fallback that would miss a live `-wal`).
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_wal_delta_in_a_read_only_directory_is_read_correctly_or_refused_never_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("legacywal");
+        let path = dir.join("delta.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+            conn.execute_batch(DELTA_SCHEMA_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
+                 VALUES ('src/a.rs', 'x', 1, NULL, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let opened = DeltaStore::open_read_only(&path);
+        let rows = match &opened {
+            Ok(Some(store)) => Some(store.dirty_file_count().unwrap()),
+            _ => None,
+        };
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match opened {
+            Ok(Some(_)) => assert_eq!(rows, Some(1), "an answer must be the committed rows"),
+            Ok(None) => panic!("the delta exists"),
+            Err(err) => {
+                let text = format!("{err:#}");
+                assert!(text.contains("read-only") && text.contains("not empty"), "{text}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

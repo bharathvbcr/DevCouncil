@@ -180,7 +180,9 @@ pub fn canonicalize_path(path: &Path) -> PathBuf {
 /// not even be that repository.
 pub fn open_mcp_store(path: &Path) -> Result<Store, String> {
     if path.file_name().and_then(|n| n.to_str()) == Some("base.sqlite") {
-        return Store::open_immutable_snapshot(path, None).map_err(|err| {
+        // A lane's private base: opened through its lease and recorded identity,
+        // the same checks `StackedStore::open` makes.
+        return devmap_query::stacked::open_lane_base_store(path).map_err(|err| {
             format!(
                 "immutable base snapshot at {} could not be opened: {err}",
                 path.display()
