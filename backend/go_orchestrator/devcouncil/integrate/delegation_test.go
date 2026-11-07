@@ -21,6 +21,12 @@ import (
 // never executed; it only has to be absolute and recognisable.
 const fakeSelf = "/opt/devcouncil-test/bin/devcouncil"
 
+// fakeDevmap is the devmap command written into the host entries. The binary
+// that runs is testsupport's copy under target/devcouncil-testbin, and devmap
+// refuses to register that path, because it goes away with the worktree. This
+// one is never executed either; it only has to be absolute.
+const fakeDevmap = "/opt/devcouncil-test/bin/devmap"
+
 // devmapForTest returns a devmap binary and isolates HOME.
 func devmapForTest(t *testing.T) string {
 	t.Helper()
@@ -62,7 +68,7 @@ func devmapHosts(t *testing.T, bin string) []string {
 
 func apply(t *testing.T, bin, root, host string) *Receipt {
 	t.Helper()
-	receipt, err := Run(Options{Root: root, Host: host, Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf})
+	receipt, err := Run(Options{Root: root, Host: host, Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err != nil {
 		t.Fatalf("integrate %s --apply: %v", host, err)
 	}
@@ -81,7 +87,13 @@ func TestEveryHostRegistersDevCouncilAndAChecksAgrees(t *testing.T) {
 			if !registersDevCouncil(t, root, receipt) {
 				t.Fatalf("%s: no written file carries the devcouncil entry: %v", host, receipt.Files)
 			}
-			check, err := Run(Options{Root: root, Host: host, Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf})
+			if !anyWrittenFileContains(root, receipt, fakeDevmap) {
+				t.Fatalf("%s: no written file names the devmap command %s: %v", host, fakeDevmap, receipt.Files)
+			}
+			if anyWrittenFileContains(root, receipt, "devcouncil-testbin") {
+				t.Fatalf("%s: a written file names the test copy that ran: %v", host, receipt.Files)
+			}
+			check, err := Run(Options{Root: root, Host: host, Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,13 +126,27 @@ func registersDevCouncil(t *testing.T, root string, receipt *Receipt) bool {
 	return false
 }
 
+// anyWrittenFileContains reports whether some file the receipt names holds
+// want.
+func anyWrittenFileContains(root string, receipt *Receipt, want string) bool {
+	for path := range receipt.Files {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		if body, err := os.ReadFile(path); err == nil && strings.Contains(string(body), want) {
+			return true
+		}
+	}
+	return false
+}
+
 // A dry run and a check write nothing into the repository.
 func TestDryRunAndCheckWriteNothing(t *testing.T) {
 	bin := devmapForTest(t)
 	for _, mode := range []Mode{ModeDryRun, ModeCheck} {
 		t.Run(string(mode), func(t *testing.T) {
 			root := t.TempDir()
-			receipt, err := Run(Options{Root: root, Host: "cursor", Mode: mode, DevmapBin: bin, SelfBin: fakeSelf})
+			receipt, err := Run(Options{Root: root, Host: "cursor", Mode: mode, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 			if err != nil {
 				t.Fatal(err)
 			}

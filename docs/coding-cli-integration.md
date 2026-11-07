@@ -96,6 +96,10 @@ document in the host's own shape, beside its own `devmap` entry, and reports
 every file it examined; the Go receipt is that report. It needs a `devmap`
 (`--devmap-bin`, `DEVMAP_BIN`, or one on `PATH` outside the repository) and
 refuses without one. `--check` asks DevMap too, so it covers DevMap's assets.
+DevMap writes its own path as the `devmap` command unless
+`--devmap-command PATH` (absolute) names another, passed on as `devmap
+integrate --binary`; DevMap refuses to register a copy under
+`target/devcouncil-testbin`.
 
 For Antigravity only, that call is preceded by `devmap agents install
 --agents-stdin`. Go embeds four agents and one always-on rule and DevMap writes

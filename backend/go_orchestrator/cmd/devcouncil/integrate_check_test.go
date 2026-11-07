@@ -27,6 +27,11 @@ func integrateEnv(t *testing.T) (home, repo string) {
 	return home, repo
 }
 
+// testDevmapCommand is the devmap path these tests have written into host
+// entries. The devmap that runs is testsupport's copy under
+// target/devcouncil-testbin, which devmap refuses to register. Never executed.
+const testDevmapCommand = "/opt/devcouncil-test/bin/devmap"
+
 func runDispatch(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	out, restoreOut := swapStdout(t)
@@ -42,7 +47,8 @@ func runDispatch(t *testing.T, args ...string) (code int, stdout, stderr string)
 // command returned success regardless of what the report said.
 func TestIntegrateCheckExitsOneOnDrift(t *testing.T) {
 	_, repo := integrateEnv(t)
-	code, stdout, stderr := runDispatch(t, "integrate", "claude", "--check", "--project-root", repo)
+	code, stdout, stderr := runDispatch(t, "integrate", "claude", "--check", "--project-root", repo,
+		"--devmap-command", testDevmapCommand)
 	if code != 1 {
 		t.Fatalf("exit %d, want 1 (drift)\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
@@ -53,10 +59,12 @@ func TestIntegrateCheckExitsOneOnDrift(t *testing.T) {
 
 func TestIntegrateCheckExitsZeroOnceInstalled(t *testing.T) {
 	_, repo := integrateEnv(t)
-	if code, stdout, stderr := runDispatch(t, "integrate", "claude", "--apply", "--project-root", repo); code != 0 {
+	if code, stdout, stderr := runDispatch(t, "integrate", "claude", "--apply", "--project-root", repo,
+		"--devmap-command", testDevmapCommand); code != 0 {
 		t.Fatalf("apply: exit %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
-	code, stdout, stderr := runDispatch(t, "integrate", "claude", "--check", "--project-root", repo)
+	code, stdout, stderr := runDispatch(t, "integrate", "claude", "--check", "--project-root", repo,
+		"--devmap-command", testDevmapCommand)
 	if code != 0 {
 		t.Fatalf("check after apply: exit %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
@@ -75,7 +83,8 @@ func TestIntegrateCheckDistinguishesARefusalFromDrift(t *testing.T) {
 	if err := os.WriteFile(jsonc, []byte("// my servers\n{\"mcpServers\":{}}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr := runDispatch(t, "integrate", "cursor", "--check", "--project-root", repo)
+	code, stdout, stderr := runDispatch(t, "integrate", "cursor", "--check", "--project-root", repo,
+		"--devmap-command", testDevmapCommand)
 	if code != exitDevmapRefused {
 		t.Fatalf("exit %d, want %d (devmap refused)\nstdout=%s\nstderr=%s", code, exitDevmapRefused, stdout, stderr)
 	}
@@ -121,7 +130,8 @@ func TestIntegrateRemoveUndoesAnApplyThroughTheCLI(t *testing.T) {
 	if err := os.WriteFile(codexConfig, []byte(userConfig), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if code, stdout, stderr := runDispatch(t, "integrate", "codex", "--apply", "--project-root", repo); code != 0 {
+	if code, stdout, stderr := runDispatch(t, "integrate", "codex", "--apply", "--project-root", repo,
+		"--devmap-command", testDevmapCommand); code != 0 {
 		t.Fatalf("apply: exit %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
 	registered, _ := os.ReadFile(codexConfig)
@@ -146,5 +156,31 @@ func TestIntegrateRemoveUndoesAnApplyThroughTheCLI(t *testing.T) {
 	// The receipt is spent: a second remove has nothing to follow.
 	if code, _, stderr := runDispatch(t, "integrate", "codex", "--remove", "--apply", "--project-root", repo); code != 1 || !strings.Contains(stderr, "no apply receipt") {
 		t.Fatalf("second remove: exit %d, stderr=%q", code, stderr)
+	}
+}
+
+// --devmap-command is refused at the command line when it names nothing, and
+// with --remove, which writes no entry for it to name, and when relative. Each
+// is a usage error (2), never drift (1). None of these reaches devmap.
+func TestIntegrateDevmapCommandFlagIsValidated(t *testing.T) {
+	_, repo := integrateEnv(t)
+	for _, tc := range []struct {
+		args []string
+		code int
+		want string
+	}{
+		{[]string{"--devmap-command"}, 2, "--devmap-command needs a path"},
+		{[]string{"--devmap-command", " "}, 2, "--devmap-command needs a path"},
+		{[]string{"--remove", "--devmap-command", testDevmapCommand}, 2, "--remove writes no entry"},
+		{[]string{"--apply", "--devmap-command", "bin/devmap"}, 2, "must be an absolute path"},
+	} {
+		args := append([]string{"integrate", "claude", "--project-root", repo}, tc.args...)
+		code, stdout, stderr := runDispatch(t, args...)
+		if code != tc.code || !strings.Contains(stderr, tc.want) {
+			t.Errorf("%v: exit %d, want %d and %q\nstdout=%s\nstderr=%s", tc.args, code, tc.code, tc.want, stdout, stderr)
+		}
+	}
+	if entries, _ := os.ReadDir(repo); len(entries) != 1 {
+		t.Fatalf("a refused flag wrote into the repository: %v", entries)
 	}
 }

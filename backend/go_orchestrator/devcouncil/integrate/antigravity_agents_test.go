@@ -43,7 +43,7 @@ func TestAntigravitySendsAgentsBeforeTheMCPInstall(t *testing.T) {
 			t.Fatalf("%s bytes differ from the embedded library", rel)
 		}
 	}
-	check, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf})
+	check, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestCursorDoesNotSpawnAgentsInstall(t *testing.T) {
 func TestAntigravityDryRunWritesNoAgents(t *testing.T) {
 	bin := devmapForTest(t)
 	root := t.TempDir()
-	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeDryRun, DevmapBin: bin, SelfBin: fakeSelf})
+	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeDryRun, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ exit 0
 	t.Setenv("DEVMAP_LOG", log)
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
-	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf})
+	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err == nil {
 		t.Fatal("a check that could not run succeeded")
 	}
@@ -184,7 +184,7 @@ exit 1
 `)
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
-	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf})
+	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err == nil || !strings.Contains(err.Error(), "mcp document refused") {
 		t.Fatalf("want the MCP refusal, got %v", err)
 	}

@@ -18,7 +18,7 @@ func TestUnknownHostIsRefusedAndWritesNothing(t *testing.T) {
 	for _, host := range []string{"banana", "vscode", "GEMINI-2", "  "} {
 		t.Run(host, func(t *testing.T) {
 			root := t.TempDir()
-			receipt, err := Run(Options{Root: root, Host: host, Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf})
+			receipt, err := Run(Options{Root: root, Host: host, Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 			if err == nil {
 				t.Fatalf("accepted unsupported host %q (receipt %+v)", host, receipt)
 			}

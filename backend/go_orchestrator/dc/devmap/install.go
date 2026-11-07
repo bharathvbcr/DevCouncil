@@ -126,12 +126,18 @@ type Skill struct {
 // Integrate runs `devmap integrate <host>` for the client's repository and
 // registers `servers` beside DevMap's own entry.
 //
+// command, when set, is passed as `--binary`: the devmap path written into the
+// host entries. Empty sends no flag, and devmap writes its own path.
+//
 // Under InstallCheck a tree that differs is an answer, not a failure: the
 // report comes back with CheckOK false. Anything else that exits non-zero is
 // an error, and so is a check that produced no report — a check that could
 // not run must not read as one that ran.
-func (c *Client) Integrate(ctx context.Context, host string, mode InstallMode, servers []Server) (*IntegrateReport, error) {
+func (c *Client) Integrate(ctx context.Context, host string, mode InstallMode, servers []Server, command string) (*IntegrateReport, error) {
 	args := []string{"integrate", host, "--project-root", c.Root}
+	if command != "" {
+		args = append(args, "--binary", command)
+	}
 	var stdin []byte
 	if len(servers) > 0 {
 		encoded, err := json.Marshal(map[string]any{"servers": servers})

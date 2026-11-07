@@ -145,7 +145,9 @@ Usage:
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--devmap-bin PATH]
-                                   default --check: exits 1 if a file differs or is missing, 3 if devmap refused
+                         [--devmap-command PATH]
+                                   default --check: exits 1 if a file differs or is missing, 3 if devmap refused;
+                                   --devmap-command is the absolute devmap path written into host entries
   devcouncil integrate HOST --remove [--apply|--check|--dry-run]
                                    take back what the last --apply registered, following its receipt
                                    (.devcouncil-integrate-HOST.json); default --check
@@ -607,6 +609,17 @@ func runIntegrate(args []string) int {
 				return 2
 			}
 			opts.DevmapBin = args[i]
+		case "--devmap-command":
+			i++
+			if i >= len(args) || strings.TrimSpace(args[i]) == "" {
+				console.Errorln("--devmap-command needs a path")
+				return 2
+			}
+			if !filepath.IsAbs(args[i]) {
+				console.Errorf("--devmap-command %q is relative; it must be an absolute path\n", args[i])
+				return 2
+			}
+			opts.DevmapCommand = args[i]
 		case "--json":
 			// always print receipt JSON on stdout for scripting
 		default:
@@ -623,6 +636,12 @@ func runIntegrate(args []string) int {
 	self, _ := os.Executable()
 	opts.SelfBin = self
 	if remove {
+		if opts.DevmapCommand != "" {
+			// --remove only cuts entries by name; it writes none, so the
+			// command would be ignored, and an ignored flag reads as obeyed.
+			console.Errorln("--devmap-command names the command an apply writes; --remove writes no entry")
+			return 2
+		}
 		return runIntegrateRemove(opts)
 	}
 	receipt, err := integrate.Run(opts)

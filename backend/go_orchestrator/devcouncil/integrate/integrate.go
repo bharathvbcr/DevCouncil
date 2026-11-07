@@ -64,6 +64,10 @@ type Options struct {
 	Mode      Mode
 	DevmapBin string // explicit devmap; used or refused, never replaced
 	SelfBin   string // path to this devcouncil binary
+	// DevmapCommand is the devmap path written into host MCP entries. Empty
+	// leaves the choice to devmap, which names itself. It is written, never
+	// run, so it must be absolute but need not exist yet.
+	DevmapCommand string
 }
 
 // Receipt records what was written or would be written.
@@ -161,6 +165,10 @@ func Run(opts Options) (*Receipt, error) {
 			return nil, fmt.Errorf("cannot name this devcouncil binary for the MCP entry: %w", err)
 		}
 	}
+	if opts.DevmapCommand != "" && !filepath.IsAbs(opts.DevmapCommand) {
+		return nil, fmt.Errorf("the devmap command %q is relative; a host launches it from "+
+			"its own directory, so it must be an absolute path", opts.DevmapCommand)
+	}
 	// PATH discovery refuses any candidate inside the repository: running
 	// repository content is what that refusal prevents. An explicit binary
 	// stays an operator's choice, used or refused.
@@ -199,7 +207,7 @@ func Run(opts Options) (*Receipt, error) {
 	}
 
 	report, err := client.Integrate(context.Background(), host, installMode,
-		[]devmap.Server{devcouncilServer(selfBin, root)})
+		[]devmap.Server{devcouncilServer(selfBin, root)}, opts.DevmapCommand)
 	if err != nil {
 		// Agents that landed stay landed. The receipt names them; the error
 		// is the MCP install that did not. An empty receipt still reads as
