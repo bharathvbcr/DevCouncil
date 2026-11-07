@@ -9,8 +9,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,9 +32,6 @@ type Command struct {
 	// Env is added to the process environment. Cargo commands carry
 	// CARGO_TERM_COLOR=never, so no ANSI escape can hide a line from the audit.
 	Env []string `json:"env,omitempty"`
-	// Fallback is the same command without its libtest filter. A filtered run
-	// in which no test ran proves nothing, so run re-runs it whole.
-	Fallback []string `json:"fallback,omitempty"`
 }
 
 func newCommand(dir string, argv ...string) Command {
@@ -251,7 +250,6 @@ type metadataWire struct {
 			SrcPath          string   `json:"src_path"`
 			RequiredFeatures []string `json:"required-features"`
 			Test             *bool    `json:"test"`
-			Doctest          *bool    `json:"doctest"`
 		} `json:"targets"`
 	} `json:"packages"`
 	WorkspaceMembers []string `json:"workspace_members"`
@@ -314,7 +312,7 @@ func decodeMetadata(raw []byte, repo string) (*RustWorkspace, error) {
 			if err != nil {
 				return nil, fmt.Errorf("target %s of %s: %w", t.Name, p.Name, err)
 			}
-			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, RequiredFeatures: t.RequiredFeatures, Test: *t.Test, Doctest: t.Doctest == nil || *t.Doctest})
+			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, RequiredFeatures: t.RequiredFeatures, Test: *t.Test})
 		}
 		ws.Packages = append(ws.Packages, pkg)
 	}
@@ -464,7 +462,8 @@ func decodeGoList(raw []byte, repo string) (*GoWorkspace, error) {
 // answer carries its own error, and BuildPlan turns any of them into a full
 // run, so a failure of one source is not decided here by whichever came first.
 func gather(ctx context.Context, run Runner, o Options, readFile func(string) ([]byte, error)) Inputs {
-	in := Inputs{Trigger: o.Trigger, Excludes: o.Excludes, RustDir: o.RustDir, GoDir: o.GoDir, ReadFile: readFile}
+	in := Inputs{Trigger: o.Trigger, Excludes: o.Excludes, RustDir: o.RustDir, GoDir: o.GoDir}
+	in.GussetDirs, in.GussetErr = gussetDependencies(o.RustDir, readFile)
 	in.Base, in.Head, in.BaseErr = resolveBase(ctx, run, o)
 	if in.BaseErr == nil {
 		in.GitChanged, in.GitErr = gitChanged(ctx, run, o.Repo, in.Base, in.Head)
@@ -475,4 +474,42 @@ func gather(ctx context.Context, run Runner, o Options, readFile func(string) ([
 	in.Rust, in.RustErr = loadRust(ctx, run, o.Repo, o.RustDir)
 	in.Go, in.GoErr = loadGo(ctx, run, o.Repo, o.GoDir)
 	return in
+}
+
+var cargoPath = regexp.MustCompile(`path\s*=\s*"([^"]+)"`)
+
+// gussetDependencies names the in-repository crates rust/gusset-engine's
+// Cargo.toml path-depends on, read from the manifest rather than listed here, so
+// a dependency added there is covered without a change to this program. A path
+// that leaves the repository (the Gusset sibling checkout) is not ours to watch.
+// A manifest that names no in-repository dependency is an error: this one
+// names dc-glob, and an empty answer would be the rule silently gone.
+func gussetDependencies(rustDir string, readFile func(string) ([]byte, error)) ([]string, error) {
+	engine := rustDir + "/gusset-engine"
+	body, err := readFile(engine + "/Cargo.toml")
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		m := cargoPath.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		dir := path.Clean(engine + "/" + m[1])
+		if dir == ".." || strings.HasPrefix(dir, "../") || path.IsAbs(dir) || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	if len(dirs) == 0 {
+		return nil, errors.New(engine + "/Cargo.toml names no path dependency inside the repository")
+	}
+	sort.Strings(dirs)
+	return dirs, nil
 }

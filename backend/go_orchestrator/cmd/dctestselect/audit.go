@@ -46,7 +46,11 @@ type SuiteRun struct {
 }
 
 var (
-	libtestSection = regexp.MustCompile(`^\s+(?:Running|Doc-tests)\b`)
+	// Cargo's own header shapes, exactly: five spaces and `Running`, an
+	// optional `unittests`, a path and the binary in parentheses; three spaces
+	// and `Doc-tests <crate>`. Anything looser matches a test's own output.
+	libtestSection = regexp.MustCompile(`^ {5}Running (?:unittests )?\S.* \([^()\s]+\)$|^ {3}Doc-tests \S+$`)
+	libtestBlock   = regexp.MustCompile(`^---- (.+) stdout ----$`)
 	libtestFailed  = regexp.MustCompile(`(?:^|\W)test (.+?) \.\.\. FAILED$`)
 	libtestFooter  = regexp.MustCompile("^error: (?:test|doctest) failed, to rerun pass `([^`]+)`$")
 	libtestResult  = regexp.MustCompile(`^test result: `)
@@ -75,6 +79,7 @@ func parseLibtest(r io.Reader) SuiteRun {
 	sc.Buffer(make([]byte, 64<<10), maxLogLine)
 	var run SuiteRun
 	var section []string
+	var st blockState
 	compileErrors, results, incomplete := 0, 0, 0
 	seen := map[Failure]bool{}
 	finish := func() {
@@ -101,13 +106,19 @@ func parseLibtest(r io.Reader) SuiteRun {
 		if libtestCompile.MatchString(line) {
 			compileErrors++
 		}
-		if libtestSection.MatchString(line) {
+		// A header-shaped line is a new test binary only outside a failing
+		// test's captured output. Inside it (after a `---- x stdout ----`
+		// marker, until the `failures:` summary naming exactly those tests) it
+		// is the test's own text: a migration log, a spawned cargo.
+		if libtestSection.MatchString(line) && (section == nil || st.closed()) {
 			finish()
 			section = []string{}
+			st = blockState{}
 			continue
 		}
 		if section != nil {
 			section = append(section, line)
+			st.feed(line)
 		}
 	}
 	finish()
@@ -125,6 +136,45 @@ func parseLibtest(r io.Reader) SuiteRun {
 	}
 	sortFailures(run.Failures)
 	return run
+}
+
+// blockState follows one test binary's output far enough to know whether a
+// header-shaped line can begin a new binary: it cannot while a failing test's
+// captured output is open, which is from its `---- name stdout ----` marker
+// until the `failures:` summary lists exactly the tests that had markers.
+type blockState struct {
+	blocks     map[string]bool
+	names      map[string]bool
+	collecting bool
+	summaryOK  bool
+}
+
+func (b *blockState) closed() bool { return len(b.blocks) == 0 || b.summaryOK }
+
+func (b *blockState) feed(line string) {
+	if m := libtestBlock.FindStringSubmatch(line); m != nil {
+		if b.blocks == nil {
+			b.blocks = map[string]bool{}
+		}
+		b.blocks[m[1]] = true
+		b.collecting, b.summaryOK = false, false
+		return
+	}
+	switch {
+	case line == "failures:":
+		b.collecting, b.names = true, map[string]bool{}
+	case b.collecting && strings.HasPrefix(line, "    ") && strings.TrimSpace(line) != "":
+		b.names[strings.TrimSpace(line)] = true
+	case b.collecting:
+		if len(b.names) > 0 && len(b.names) == len(b.blocks) {
+			same := true
+			for n := range b.names {
+				same = same && b.blocks[n]
+			}
+			b.summaryOK = same
+		}
+		b.collecting = false
+	}
 }
 
 // readSection reads one test binary's output. done is whether it reached its
@@ -280,7 +330,9 @@ func sortFailures(fs []Failure) {
 	sort.Slice(fs, func(i, j int) bool { return fs[i].Key() < fs[j].Key() })
 }
 
-// Covers reports whether the plan's selection ran the failed test.
+// Covers reports whether the plan's selection ran the failed test. A unit with
+// no target is a whole package (a Go package, or every target of a crate); one
+// with a target covers that target only.
 func (p Plan) Covers(f Failure) bool {
 	if p.Everything {
 		return true
@@ -290,19 +342,8 @@ func (p Plan) Covers(f Failure) bool {
 			if u.Kind != f.Kind || u.Pkg != f.Pkg {
 				continue
 			}
-			if f.Kind == "go" {
+			if f.Kind == "go" || u.Target == "" || u.Target == f.Target {
 				return true
-			}
-			if u.Target != "" && u.Target != f.Target {
-				continue
-			}
-			if len(u.Filters) == 0 {
-				return true
-			}
-			for _, filter := range u.Filters {
-				if strings.Contains(f.Name, filter) {
-					return true
-				}
 			}
 		}
 	}
@@ -459,6 +500,16 @@ type AuditInput struct {
 	Base                []string // nil: unknown
 	BaseWhy             string
 	BaseInfo            *BaseRecord
+	// PlanUnusable is set when the plan could not be read: nothing is known
+	// about the selection, so no failure can be called a miss or a catch.
+	PlanUnusable bool
+	// Ran is the selection as it ran: the plan less every selected command
+	// whose status does not say it completed. Covers works from it. Nil means
+	// the plan itself.
+	Ran *Plan
+	// SelectionNote is non-empty when the fast phase could not be examined (a
+	// selected command did not complete, or its status is missing or stale).
+	SelectionNote string
 	// SelectedRust and SelectedGo are the fast phase's logs; SelectedKnown is
 	// false when they could not be read.
 	SelectedRust, SelectedGo SuiteRun
@@ -522,7 +573,7 @@ func Audit(in AuditInput) (Recall, []string) {
 			rec := *in.BaseInfo
 			rec.MatchesPlanBase = rec.SHA != "" && rec.SHA == in.Plan.Base
 			r.BaseRecord = &rec
-			if !rec.MatchesPlanBase {
+			if !rec.MatchesPlanBase && !in.PlanUnusable {
 				notes = append(notes, annotate("notice", fmt.Sprintf("the base record is from %s (run %s) and the plan measured from %s; a test fixed or broken between them is misattributed", rec.SHA, rec.RunID, in.Plan.Base)))
 			}
 		}
@@ -535,12 +586,18 @@ func Audit(in AuditInput) (Recall, []string) {
 			attributable = append(attributable, f)
 		}
 	}
+	ran := &in.Plan
+	if in.Ran != nil {
+		ran = in.Ran
+	}
 	covered := 0
 	for _, f := range attributable {
 		switch {
-		case in.Plan.Covers(f):
+		case in.PlanUnusable:
+			r.Unclassified = append(r.Unclassified, f.Key())
+		case ran.Covers(f):
 			covered++
-		case baseKnown:
+		case baseKnown && in.SelectionNote == "":
 			r.Missed = append(r.Missed, f.Key())
 			notes = append(notes, annotate("error", "selection missed "+f.Key()))
 		default:
@@ -549,17 +606,22 @@ func Audit(in AuditInput) (Recall, []string) {
 	}
 	r.NFailed = len(attributable)
 
+	for _, s := range []struct {
+		name string
+		run  SuiteRun
+	}{{"Rust", in.Rust}, {"Go", in.Go}} {
+		if !s.run.Examined {
+			notes = append(notes, annotate("warning", "the full "+s.name+" suite was not examined: "+s.run.Note))
+		}
+	}
 	switch {
+	case in.PlanUnusable:
+		r.RecallNote = "the plan was unusable, so nothing is known about the selection"
 	case !fullExamined:
 		r.RecallNote = "a suite was not examined, so a failure may be absent from the record"
-		for _, s := range []struct {
-			name string
-			run  SuiteRun
-		}{{"Rust", in.Rust}, {"Go", in.Go}} {
-			if !s.run.Examined {
-				notes = append(notes, annotate("warning", "the full "+s.name+" suite was not examined: "+s.run.Note))
-			}
-		}
+	case in.SelectionNote != "":
+		r.RecallNote = "the fast phase was not examined (" + in.SelectionNote + "), so what the selection ran is unknown"
+		notes = append(notes, annotate("warning", "the selected phase was not examined: "+in.SelectionNote))
 	case in.Plan.Everything:
 		r.RecallNote = "the selection was everything, so every failure was inside it and the figure would say nothing about DevMap"
 	case !baseKnown:

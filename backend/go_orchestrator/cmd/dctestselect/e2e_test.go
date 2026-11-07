@@ -97,6 +97,9 @@ func e2eRepo(t *testing.T) string {
 	put(t, root, "backend/go_orchestrator/lib/lib_test.go", "package lib\n\nimport \"testing\"\n\nfunc TestName(t *testing.T) {\n\tif Name() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n")
 	put(t, root, "backend/go_orchestrator/other/other.go", "package other\n\nfunc Other() int {\n\treturn 1\n}\n")
 	put(t, root, "backend/go_orchestrator/other/other_test.go", "package other\n\nimport \"testing\"\n\nfunc TestOther(t *testing.T) {\n\tif Other() != 1 {\n\t\tt.Fatal(\"no\")\n\t}\n}\n")
+	// A stand-in for rust/gusset-engine: its own workspace, depending on a crate
+	// that is not in the main one. The plan reads its dependencies from here.
+	put(t, root, "rust/gusset-engine/Cargo.toml", "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\ndc-glob = { path = \"../dc-glob\" }\n")
 	sh(t, filepath.Join(root, "rust"), "cargo", "generate-lockfile", "--offline")
 	commit(t, root, "base")
 	return root
@@ -140,7 +143,7 @@ func TestE2EARustChangeSelectsItsTestsAndAGoChangeSelectsItsPackage(t *testing.T
 		t.Fatalf("the real blast named no seed: %+v", p.Blast)
 	}
 	t.Logf("rust change: selected=%q dropped=%v notices=%q", cmds(p), p.Dropped, p.Notices)
-	ca := findCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast")
+	ca := findCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 	if len(ca.Seeds) == 0 || !strings.Contains(strings.Join(ca.Seeds, " "), "price") {
 		t.Errorf("the selected command does not name the seed that selected it: %v", ca.Seeds)
 	}
@@ -149,7 +152,7 @@ func TestE2EARustChangeSelectsItsTestsAndAGoChangeSelectsItsPackage(t *testing.T
 			t.Errorf("a Rust-only change selected Go: %q", s.Display)
 		}
 	}
-	if !strings.Contains(log, "::notice::selected cargo test --locked -p ca --lib") {
+	if !strings.Contains(log, "::notice::selected cargo test --locked -p ca --no-fail-fast") {
 		t.Errorf("the log does not say what was selected and from which seeds:\n%s", log)
 	}
 

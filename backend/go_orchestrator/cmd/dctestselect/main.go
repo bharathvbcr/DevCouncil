@@ -66,11 +66,6 @@ func escapeData(s string) string {
 	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(s)
 }
 
-// escapeProperty is escapeData plus `:` and `,`, which end a property.
-func escapeProperty(s string) string {
-	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A", ":", "%3A", ",", "%2C").Replace(s)
-}
-
 // annotate renders a workflow command with an escaped message. Every value
 // this program writes after `::` goes through here or group, because paths and
 // test names come from the tree under test.
@@ -179,18 +174,8 @@ func writeJSON(path string, v any) error {
 }
 
 func readPlan(path string) (Plan, error) {
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return Plan{}, err
-	}
-	var p Plan
-	if err := strictUnmarshal(body, &p); err != nil {
-		return Plan{}, fmt.Errorf("%s is not a plan: %w", path, err)
-	}
-	if p.Schema != planSchema {
-		return Plan{}, fmt.Errorf("%s has schema %d, this build reads %d", path, p.Schema, planSchema)
-	}
-	return p, nil
+	p, _, err := loadPlan(path)
+	return p, err
 }
 
 func auditCmd(args []string, stdout io.Writer) (int, error) {
@@ -211,14 +196,18 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 		*logDir = filepath.Dir(*planPath)
 	}
 	in := AuditInput{SHA: *sha, Ref: *ref, Event: *event, ID: *runID}
-	plan, planErr := readPlan(*planPath)
+	plan, planSHA, planErr := loadPlan(*planPath)
 	if planErr != nil {
 		// The artifact is written whatever happened: an absent record and a
 		// record of "could not examine" are different facts.
 		plan = Plan{Schema: planSchema, Widened: []Widening{}, Selected: []Selected{}, Dropped: []Dropped{}, Full: []Command{}, Notices: []string{}}
+		in.PlanUnusable = true
 	}
 	in.Plan = plan
-	status, statusErr := readStatus(filepath.Join(*logDir, "full-status.json"))
+	status, statusErr := loadStatus(filepath.Join(*logDir, "full-status.json"), planSHA)
+	if planErr != nil {
+		statusErr = planErr
+	}
 	suite := func(logName, what string, parse func(io.Reader) SuiteRun) SuiteRun {
 		run := readSuite(filepath.Join(*logDir, logName), what, parse)
 		if statusErr != nil {
@@ -227,10 +216,13 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 			}
 			return run
 		}
-		return Qualify(run, status[logName])
+		return Qualify(run, status.byLog()[logName])
 	}
 	in.Rust = suite("full-rust.log", "the cargo test log", parseLibtest)
 	in.Go = suite("full-go.jsonl", "the go test -json log", parseGoJSON)
+	if planErr == nil {
+		in.Ran, in.SelectionNote = ranSelection(plan, filepath.Join(*logDir, "selected-status.json"), planSHA)
+	}
 	in.SelectedRust, in.SelectedGo, in.SelectedKnown = readSelected(*logDir, plan)
 	in.BaseWhy = "no base-branch artifact was given"
 	if *baseArtifact != "" {
@@ -246,26 +238,59 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	}
 	recall, notes := Audit(in)
 	if planErr != nil {
-		recall.RecallNote = "the plan was unusable (" + planErr.Error() + "), so nothing is known about the selection"
-		recall.Recall = nil
 		notes = append(notes, annotate("error", "the plan was unusable: "+planErr.Error()))
 	}
-	if err := writeJSON(*out, recall); err != nil {
+	if err := writeAtomic(*out, recall); err != nil {
 		return 2, err
 	}
 	for _, n := range notes {
 		fmt.Fprintln(stdout, n)
 	}
 	switch {
+	case planErr != nil:
+		// Before the miss check, and the miss list is empty by construction:
+		// with no plan nothing is known about what the selection ran.
+		return 2, nil
 	case len(recall.Missed) > 0:
 		return 1, nil
-	case planErr != nil, !recall.Full.Rust.Examined, !recall.Full.Go.Examined:
+	case !recall.Full.Rust.Examined, !recall.Full.Go.Examined, in.SelectionNote != "":
 		return 2, nil
 	case recall.BaseFailed == nil && len(recall.Unclassified) > 0:
 		// Failures that cannot be called misses or not: not a pass.
 		return 2, nil
 	}
 	return 0, nil
+}
+
+// ranSelection is the selection as it ran, read from the fast phase's status
+// file: the plan less every selected command whose status does not say it
+// completed. A plan that selected nothing, or everything, has no fast phase to
+// read. Otherwise a status that is missing, stale (another plan's) or lacks a
+// selected command means what ran is unknown, and the note says so.
+func ranSelection(plan Plan, statusPath, planSHA string) (*Plan, string) {
+	if plan.Everything || len(plan.Selected) == 0 {
+		return &plan, ""
+	}
+	status, err := loadStatus(statusPath, planSHA)
+	if err != nil {
+		return &Plan{Selected: []Selected{}}, "no usable fast-phase status: " + err.Error()
+	}
+	by := status.byCmd()
+	ran := plan
+	ran.Selected = nil
+	note := ""
+	for _, s := range plan.Selected {
+		st := by[s.Display]
+		switch {
+		case st == nil:
+			note = "the status has no entry for " + s.Display
+		case !st.Completed:
+			note = s.Display + " did not run to completion (" + st.Detail + ")"
+		default:
+			ran.Selected = append(ran.Selected, s)
+		}
+	}
+	return &ran, note
 }
 
 // readSelected reads the fast phase's logs. They are known only when every

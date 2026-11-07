@@ -9,15 +9,17 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
 )
 
-// pkgSel accumulates what one cargo package contributes to the selection.
+// pkgSel accumulates what one cargo package contributes to the selection. A
+// package is selected whole (every target `cargo test -p` runs: lib, every bin
+// including auto-discovered ones, every test, the doctests) or by declared test
+// targets. Nothing narrower exists: a module path libtest prints is not a path
+// the source tree spells (`#[path]`, `include!`), so a filter on one can match
+// nothing, or match only part of what it was meant to, and pass.
 type pkgSel struct {
-	pkg   RustPackage
-	whole string // non-empty: every target of the package, and why
-	// unfiltered and filtered are keyed by target argument (`--lib`,
-	// `--test it`). A target in both runs whole.
-	unfiltered map[string]bool
-	filtered   map[string]map[string]bool
-	files      map[string]bool
+	pkg     RustPackage
+	whole   string          // non-empty: every target of the package, and why
+	targets map[string]bool // declared test targets, as `--test name`
+	files   map[string]bool
 }
 
 type goSel struct {
@@ -26,9 +28,9 @@ type goSel struct {
 	files map[string]bool
 }
 
-// selection maps blast paths onto the commands the job's full suite also runs.
-// A path it cannot map is dropped with its reason, never run: a command outside
-// that universe could fail for a reason the full suite would never see.
+// selection maps changed and reached paths onto the commands the job's full
+// suite also runs. A path inside the mapping is placed; a path it cannot place
+// is refused with a reason, and the caller runs everything.
 type selection struct {
 	in       Inputs
 	excluded map[string]bool
@@ -76,7 +78,7 @@ func (s *selection) rustSel(pkg RustPackage) *pkgSel {
 	if ps, ok := s.rust[pkg.Name]; ok {
 		return ps
 	}
-	ps := &pkgSel{pkg: pkg, unfiltered: map[string]bool{}, filtered: map[string]map[string]bool{}, files: map[string]bool{}}
+	ps := &pkgSel{pkg: pkg, targets: map[string]bool{}, files: map[string]bool{}}
 	s.rust[pkg.Name] = ps
 	return ps
 }
@@ -128,166 +130,58 @@ func (s *selection) widenGoImporters(ws *GoWorkspace) {
 	}
 }
 
-// add maps one blast test path onto the commands that run it.
-func (s *selection) add(p string) {
+// place maps one changed or reached .rs or .go path onto the commands that run
+// it, or says why it cannot. The mapping is exactly:
+//
+//   - a main-workspace member's tests/ file that is a declared test target
+//     selects that target;
+//   - any other file under a member's tests/ or src/ selects every target of
+//     that member;
+//   - a Go file selects its package.
+//
+// Every other path (examples/, benches/, fixtures outside tests/, a crate of
+// another cargo workspace, a Go file outside every package of the module) is
+// not placed.
+func (s *selection) place(p string) (reason string, ok bool) {
 	switch {
-	case strings.HasSuffix(p, "_test.go"):
-		pkg, ok := s.goOwner(p)
-		if !ok {
-			s.drop(p, "no `go list` package of this module contains it")
-			return
+	case strings.HasSuffix(p, ".go"):
+		pkg, found := s.goOwner(p)
+		if !found {
+			return p + " is a Go file in no package of the module", false
 		}
 		s.goSel(pkg).files[p] = true
+		return "", true
 	case strings.HasSuffix(p, ".rs"):
-		pkg, ok := s.rustOwner(p)
-		if !ok {
-			s.drop(p, "it is outside every cargo workspace member")
-			return
+		pkg, found := s.rustOwner(p)
+		if !found {
+			return p + " is Rust outside every main-workspace member", false
+		}
+		rel := strings.TrimPrefix(p, pkg.Dir+"/")
+		if !strings.HasPrefix(rel, "src/") && !strings.HasPrefix(rel, "tests/") {
+			return p + " is Rust outside src/ and tests/ of " + pkg.Name, false
 		}
 		if s.excluded[pkg.Name] {
 			s.drop(p, fmt.Sprintf("package %s is excluded from this job's full suite", pkg.Name))
-			return
+			return "", true
 		}
-		s.addRust(s.rustSel(pkg), p)
-	default:
-		s.drop(p, "it is neither a Rust nor a Go test file")
-	}
-}
-
-func (s *selection) addRust(ps *pkgSel, file string) {
-	pkg := ps.pkg
-	rel := strings.TrimPrefix(file, pkg.Dir+"/")
-	bySrc := func(src string) *RustTarget {
-		for i := range pkg.Targets {
-			if pkg.Targets[i].Src == src {
-				return &pkg.Targets[i]
-			}
-		}
-		return nil
-	}
-	switch {
-	case strings.HasPrefix(rel, "tests/"):
-		if t := bySrc(file); t != nil {
-			s.target(ps, *t, nil, file)
-			return
-		}
-		sub := strings.TrimPrefix(rel, "tests/")
-		if i := strings.Index(sub, "/"); i >= 0 {
-			// tests/<dir>/...: the target whose root is that directory owns it.
-			dir := pkg.Dir + "/tests/" + sub[:i]
-			for _, t := range pkg.Targets {
-				if t.is("test") && path.Dir(t.Src) == dir {
-					s.target(ps, t, nil, file)
-					return
-				}
-			}
-		} else {
-			// tests/<f>.rs that is not a target is a module of a harness
-			// target. Confirm it is declared there; the filter `<f>::` is then
-			// the module prefix libtest prints.
-			name := strings.TrimSuffix(sub, ".rs")
-			for _, t := range pkg.Targets {
-				if !t.is("test") || path.Dir(t.Src) != pkg.Dir+"/tests" {
-					continue
-				}
-				src, err := s.in.ReadFile(t.Src)
-				if err == nil && modDecl(name).Match(src) {
-					s.target(ps, t, []string{name + "::"}, file)
-					return
-				}
-			}
-		}
-		// A support directory, or a module no harness declares: every test
-		// target of the crate could include it.
-		hit := false
+		ps := s.rustSel(pkg)
+		ps.files[p] = true
 		for _, t := range pkg.Targets {
-			if t.is("test") {
-				s.target(ps, t, nil, file)
-				hit = true
+			if t.Src == p && t.is("test") {
+				if len(t.RequiredFeatures) > 0 {
+					s.drop(p, fmt.Sprintf("target %s requires features %v, which this job's full suite does not enable", t.Name, t.RequiredFeatures))
+				} else {
+					ps.targets["--test "+t.Name] = true
+				}
+				return "", true
 			}
 		}
-		if !hit {
-			s.drop(file, "the crate has no test target")
+		if ps.whole == "" {
+			ps.whole = "every target of " + pkg.Name + ": " + p + " is a module or fixture of it"
 		}
-	case strings.HasPrefix(rel, "src/"):
-		if t := bySrc(file); t != nil {
-			s.target(ps, *t, nil, file)
-			return
-		}
-		hit := false
-		for _, t := range pkg.Targets {
-			// A bin whose main.rs sits in its own directory owns that tree.
-			if t.is("bin") && path.Base(t.Src) == "main.rs" && path.Dir(t.Src) != pkg.Dir+"/src" && strings.HasPrefix(file, path.Dir(t.Src)+"/") {
-				s.target(ps, t, modFilter(strings.TrimPrefix(file, path.Dir(t.Src)+"/")), file)
-				hit = true
-			}
-		}
-		if hit {
-			return
-		}
-		filter := modFilter(strings.TrimPrefix(rel, "src/"))
-		for _, t := range pkg.Targets {
-			// The library owns a module of the crate root; so does a src/main.rs
-			// binary, which declares its own modules. A file cannot be told
-			// apart from here, so both are asked and a filter that matches
-			// nothing costs only a launch.
-			if t.isLib() || (t.is("bin") && t.Src == pkg.Dir+"/src/main.rs") {
-				s.target(ps, t, filter, file)
-				hit = true
-			}
-		}
-		if !hit {
-			s.drop(file, "no library or src/main.rs target of the crate can hold it")
-		}
-	default:
-		s.drop(file, "it is not under tests/ or src/ of its crate")
+		return "", true
 	}
-}
-
-// modFilter is the libtest filter for a module file: `a/b.rs` and `a/b/mod.rs`
-// are both `a::b::`. The crate root (`lib`, `main`) has no module prefix, so
-// the whole target runs.
-func modFilter(rel string) []string {
-	rel = strings.TrimSuffix(rel, ".rs")
-	rel = strings.TrimSuffix(rel, "/mod")
-	if rel == "lib" || rel == "main" || rel == "" {
-		return nil
-	}
-	return []string{strings.ReplaceAll(rel, "/", "::") + "::"}
-}
-
-func (s *selection) target(ps *pkgSel, t RustTarget, filters []string, file string) {
-	var arg string
-	switch {
-	case t.isLib():
-		arg = "--lib"
-	case t.is("bin"):
-		arg = "--bin " + t.Name
-	case t.is("test"):
-		arg = "--test " + t.Name
-	default:
-		s.drop(file, fmt.Sprintf("target %s (%s) is not run by cargo test", t.Name, strings.Join(t.Kinds, ",")))
-		return
-	}
-	if len(t.RequiredFeatures) > 0 {
-		s.drop(file, fmt.Sprintf("target %s requires features %v, which this job's full suite does not enable", t.Name, t.RequiredFeatures))
-		return
-	}
-	if !t.Test {
-		s.drop(file, fmt.Sprintf("target %s is not run by cargo test", t.Name))
-		return
-	}
-	ps.files[file] = true
-	if len(filters) == 0 {
-		ps.unfiltered[arg] = true
-		return
-	}
-	if ps.filtered[arg] == nil {
-		ps.filtered[arg] = map[string]bool{}
-	}
-	for _, f := range filters {
-		ps.filtered[arg][f] = true
-	}
+	return p + " is neither a Rust nor a Go file", false
 }
 
 func sortedKeys[V any](m map[string]V) []string {
@@ -306,60 +200,26 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 		ps := s.rust[name]
 		own := seedsUnder(seeds, func(file string) bool { return strings.HasPrefix(file, ps.pkg.Dir+"/") })
 		files := sortedKeys(ps.files)
-		base := []string{"cargo", "test", "--locked", "-p", name}
+		argv := []string{"cargo", "test", "--locked", "-p", name}
 		if ps.whole != "" {
 			out = append(out, Selected{
-				Command: logged(newCommand(s.in.RustDir, append(base, "--no-fail-fast")...)),
+				Command: logged(newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)),
 				Units:   []Unit{{Kind: "rust", Pkg: name}}, Files: files, Seeds: own, Why: ps.whole,
 			})
 			continue
 		}
-		if len(ps.unfiltered) > 0 {
-			argv := append([]string{}, base...)
-			var units []Unit
-			for _, arg := range sortedKeys(ps.unfiltered) {
-				argv = append(argv, strings.Fields(arg)...)
-				units = append(units, Unit{Kind: "rust", Pkg: name, Target: arg})
-			}
-			out = append(out, Selected{
-				Command: logged(newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)),
-				Units:   units, Files: files, Seeds: own, Why: "blast tests",
-			})
+		var units []Unit
+		for _, arg := range sortedKeys(ps.targets) {
+			argv = append(argv, strings.Fields(arg)...)
+			units = append(units, Unit{Kind: "rust", Pkg: name, Target: arg})
 		}
-		for _, arg := range sortedKeys(ps.filtered) {
-			if ps.unfiltered[arg] {
-				continue
-			}
-			filters := sortedKeys(ps.filtered[arg])
-			argv := append(append([]string{}, base...), strings.Fields(arg)...)
-			fallback := append(append([]string{}, argv...), "--no-fail-fast")
-			argv = append(append(argv, "--no-fail-fast", "--"), filters...)
-			cmd := logged(newCommand(s.in.RustDir, argv...))
-			cmd.Fallback = fallback
-			out = append(out, Selected{
-				Command: cmd,
-				Units:   []Unit{{Kind: "rust", Pkg: name, Target: arg, Filters: filters}}, Files: files, Seeds: own, Why: "blast tests",
-			})
-		}
-	}
-	// Doctests are a separate cargo target the blast never names. A library
-	// whose source is selected has its doc examples selected with it.
-	for _, name := range sortedKeys(s.rust) {
-		ps := s.rust[name]
-		if ps.whole != "" || !(ps.unfiltered["--lib"] || len(ps.filtered["--lib"]) > 0) {
+		if len(units) == 0 {
 			continue
 		}
-		for _, t := range ps.pkg.Targets {
-			if t.isLib() && t.Doctest && t.Test {
-				out = append(out, Selected{
-					Command: logged(newCommand(s.in.RustDir, "cargo", "test", "--locked", "-p", name, "--doc", "--no-fail-fast")),
-					Units:   []Unit{{Kind: "rust", Pkg: name, Target: "--doc"}},
-					Files:   sortedKeys(ps.files), Seeds: seedsUnder(seeds, func(file string) bool { return strings.HasPrefix(file, ps.pkg.Dir+"/") }),
-					Why: "doc examples of the selected library",
-				})
-				break
-			}
-		}
+		out = append(out, Selected{
+			Command: logged(newCommand(s.in.RustDir, append(argv, "--no-fail-fast")...)),
+			Units:   units, Files: files, Seeds: own, Why: "blast tests",
+		})
 	}
 	for _, ip := range sortedKeys(s.gos) {
 		gs := s.gos[ip]

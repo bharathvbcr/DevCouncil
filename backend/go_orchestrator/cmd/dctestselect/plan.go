@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -30,11 +29,9 @@ type Unit struct {
 	Kind string `json:"kind"` // "rust" or "go"
 	// Pkg is a cargo package name or a Go import path.
 	Pkg string `json:"pkg"`
-	// Target is `--lib`, `--bin x` or `--test x`. Empty means every target of
-	// the package, doctests included.
+	// Target is `--test x`. Empty means every target of the package: lib,
+	// every bin, every test, the doctests.
 	Target string `json:"target,omitempty"`
-	// Filters are libtest substring filters. Empty means the whole target.
-	Filters []string `json:"filters,omitempty"`
 }
 
 // Selected is one command of the fast phase.
@@ -91,8 +88,6 @@ type RustTarget struct {
 	Src              string // repository-relative
 	RequiredFeatures []string
 	Test             bool
-	// Doctest is whether `cargo test --doc` runs this library's doc examples.
-	Doctest bool
 }
 
 func (t RustTarget) is(kind string) bool {
@@ -157,9 +152,12 @@ type Inputs struct {
 	Go    *GoWorkspace
 	GoErr error
 
-	// ReadFile reads a repository-relative file. It is how a `mod x;`
-	// declaration in a test harness is confirmed.
-	ReadFile func(rel string) ([]byte, error)
+	// GussetDirs are the repository directories rust/gusset-engine's
+	// Cargo.toml path-depends on. That crate is its own cargo workspace and is
+	// linked into the Go host through cgo, so a change in any of them reaches
+	// Go tests no graph edge shows.
+	GussetDirs []string
+	GussetErr  error
 
 	// Excludes are the cargo packages the job's full suite leaves out.
 	Excludes []string
@@ -232,6 +230,8 @@ func BuildPlan(in Inputs) Plan {
 		return everything("go list failed: " + in.GoErr.Error())
 	case in.Go == nil:
 		return everything("go list returned no answer")
+	case in.GussetErr != nil:
+		return everything("rust/gusset-engine's dependencies could not be read: " + in.GussetErr.Error())
 	}
 	blast := in.Blast
 	p.Blast = summarize(blast)
@@ -256,6 +256,26 @@ func BuildPlan(in Inputs) Plan {
 			return everything(file + " changed with no graph edge to a test")
 		}
 	}
+	// rust/gusset-engine is a second cargo workspace, linked into Go through
+	// cgo. A change in a crate it depends on (dc-glob) is a change in the
+	// library Go's policy and cmd/devcouncil tests link, which no graph edge
+	// shows and no closure of the main workspace covers. The rule is pinned
+	// rather than computed: any such change runs everything.
+	for _, file := range changedPaths(in) {
+		for _, dir := range in.GussetDirs {
+			if strings.HasPrefix(file, dir+"/") {
+				return everything(file + " is in " + dir + ", which rust/gusset-engine depends on and Go links through cgo")
+			}
+		}
+	}
+	sel := newSelection(in)
+	// Every changed Rust or Go file is placed or refused. A refusal is a path
+	// the mapping has no rule for, and the answer is everything.
+	for _, file := range changedPaths(in) {
+		if reason, ok := sel.place(file); !ok {
+			return everything(reason)
+		}
+	}
 
 	for _, u := range blast.Unavailable {
 		switch u.Kind {
@@ -276,7 +296,6 @@ func BuildPlan(in Inputs) Plan {
 	if hasKind(blast.Unavailable, "change_unattributed") != (len(blast.Unattributed) > 0) {
 		return everything("devmap blast's change_unattributed and unattributed list disagree")
 	}
-	sel := newSelection(in)
 	for _, u := range blast.Unattributed {
 		if u.Reason == "file_not_indexed" {
 			return everything("a changed file is not indexed: " + u.Path)
@@ -296,7 +315,11 @@ func BuildPlan(in Inputs) Plan {
 	}
 
 	for _, t := range blast.Tests {
-		sel.add(t.Path)
+		if reason, ok := sel.place(t.Path); !ok {
+			// A test the graph reached that no rule places is not a reason to
+			// run it: it is outside what the full suite runs. It is logged.
+			sel.drop(t.Path, reason)
+		}
 	}
 	p.Dropped = sel.dropped
 	p.Selected = sel.commands(blast.Seeds)
@@ -394,8 +417,4 @@ func fullCommands(in Inputs) []Command {
 	golang.GoJSON = true
 	golang.Log = "full-go.jsonl"
 	return []Command{cargo, golang}
-}
-
-var modDecl = func(name string) *regexp.Regexp {
-	return regexp.MustCompile(`(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+` + regexp.QuoteMeta(name) + `\s*[;{]`)
 }

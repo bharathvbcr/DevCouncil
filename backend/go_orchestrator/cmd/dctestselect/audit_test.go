@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -57,7 +59,7 @@ func TestLibtestFailuresAreAttributedByCargosFooterNotByTheRunningHeader(t *test
 }
 
 func TestALibtestFailureWithNoFooterIsKeptAndUnattributed(t *testing.T) {
-	run := parseLibtest(strings.NewReader("   Running tests/x.rs (t/debug/deps/x-1)\n\nrunning 1 test\ntest boom ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed\n"))
+	run := parseLibtest(strings.NewReader("     Running tests/x.rs (t/debug/deps/x-1)\n\nrunning 1 test\ntest boom ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed\n"))
 	if got := keys(run.Failures); len(got) != 1 || got[0] != "rust:?::boom" {
 		t.Fatalf("failures = %v", got)
 	}
@@ -67,7 +69,7 @@ func TestALibtestLogThatNeverRanATestIsNotExamined(t *testing.T) {
 	for name, log := range map[string]string{
 		"empty":        "",
 		"compile only": "   Compiling a v0.1.0\nerror: could not compile `a` (lib) due to 1 previous error\n",
-		"compile after a pass": "   Running tests/x.rs (t/x)\ntest result: ok. 1 passed\n" +
+		"compile after a pass": "     Running tests/x.rs (t/x)\ntest result: ok. 1 passed\n" +
 			"error: could not compile `b` (lib test) due to 1 previous error\n",
 	} {
 		run := parseLibtest(strings.NewReader(log))
@@ -107,14 +109,17 @@ func TestAGoLogThatIsTruncatedOrEmptyIsNotExamined(t *testing.T) {
 func examined(fs ...Failure) SuiteRun { return SuiteRun{Examined: true, Failures: fs} }
 
 var (
-	failCbIt   = Failure{Kind: "rust", Pkg: "cb", Target: "--test it", Name: "m::in_m"}
-	failCaFoo  = Failure{Kind: "rust", Pkg: "ca", Target: "--test foo", Name: "integ_bad"}
-	failCaLib  = Failure{Kind: "rust", Pkg: "ca", Target: "--lib", Name: "engine::t::bad"}
-	failGoBad  = Failure{Kind: "go", Pkg: "toy/bad", Name: "TestBroken"}
-	selectedCa = Plan{Schema: planSchema, Base: baseSHA, Selected: []Selected{
-		{Command: newCommand("rust", "cargo", "test", "-p", "ca", "--test", "foo"), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--test foo"}}},
-		{Command: newCommand("rust", "cargo", "test", "-p", "ca", "--lib"), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--lib", Filters: []string{"engine::"}}}},
-	}}
+	failCbIt  = Failure{Kind: "rust", Pkg: "cb", Target: "--test it", Name: "m::in_m"}
+	failCaFoo = Failure{Kind: "rust", Pkg: "ca", Target: "--test foo", Name: "integ_bad"}
+	failCdLib = Failure{Kind: "rust", Pkg: "cd", Target: "--lib", Name: "engine::t::bad"}
+	failGoBad = Failure{Kind: "go", Pkg: "toy/bad", Name: "TestBroken"}
+	// selectedCa selects ca's `foo` test target and the whole of crate cd.
+	selectedCa = Plan{Schema: planSchema, Base: baseSHA,
+		Full: []Command{newCommand("rust", "cargo", "test", "--locked", "--workspace", "--no-fail-fast")},
+		Selected: []Selected{
+			{Command: newCommand("rust", "cargo", "test", "-p", "ca", "--test", "foo"), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--test foo"}}},
+			{Command: newCommand("rust", "cargo", "test", "-p", "cd"), Units: []Unit{{Kind: "rust", Pkg: "cd"}}},
+		}}
 )
 
 func TestAFailureTheSelectionDidNotRunAndTheBaseDidNotHaveIsAMiss(t *testing.T) {
@@ -217,23 +222,27 @@ func TestAnEverythingPlanCoversEveryFailureButSaysNothingAboutRecall(t *testing.
 	}
 }
 
-func TestACoveredFailureMatchesTargetFilterAndPackage(t *testing.T) {
-	if !selectedCa.Covers(failCaFoo) || !selectedCa.Covers(failCaLib) {
-		t.Fatal("a failure in a selected target, inside its filter, is covered")
+func TestACoveredFailureMatchesPackageAndTargetOnly(t *testing.T) {
+	if !selectedCa.Covers(failCaFoo) || !selectedCa.Covers(failCdLib) {
+		t.Fatal("a failure in a selected target, or anywhere in a wholly selected crate, is covered")
 	}
 	for name, f := range map[string]Failure{
-		"another package":  failCbIt,
-		"another target":   {Kind: "rust", Pkg: "ca", Target: "--test bar", Name: "x"},
-		"outside a filter": {Kind: "rust", Pkg: "ca", Target: "--lib", Name: "other::t::bad"},
-		"a doctest":        {Kind: "rust", Pkg: "ca", Target: "--doc", Name: "ca/src/lib.rs - d (line 3)"},
-		"go":               failGoBad,
+		"another package": failCbIt,
+		"another target":  {Kind: "rust", Pkg: "ca", Target: "--test bar", Name: "x"},
+		"the lib of a crate whose only selected target is a test": {Kind: "rust", Pkg: "ca", Target: "--lib", Name: "x"},
+		"a doctest of the same":                                   {Kind: "rust", Pkg: "ca", Target: "--doc", Name: "ca/src/lib.rs - d (line 3)"},
+		"go":                                                      failGoBad,
 	} {
 		if selectedCa.Covers(f) {
 			t.Errorf("%s was reported as covered", name)
 		}
 	}
-	whole := Plan{Selected: []Selected{{Units: []Unit{{Kind: "rust", Pkg: "ca"}, {Kind: "go", Pkg: "toy/bad"}}}}}
-	if !whole.Covers(failCaFoo) || !whole.Covers(failCaLib) || !whole.Covers(failGoBad) {
+	// A module path never narrows a unit: the name of the test is not consulted.
+	if !selectedCa.Covers(Failure{Kind: "rust", Pkg: "cd", Target: "--lib", Name: "db::payload_serialization_tests::roundtrip"}) {
+		t.Error("a test of a wholly selected crate is covered whatever its module path")
+	}
+	whole := Plan{Selected: []Selected{{Units: []Unit{{Kind: "rust", Pkg: "ca"}, {Kind: "rust", Pkg: "cd"}, {Kind: "go", Pkg: "toy/bad"}}}}}
+	if !whole.Covers(failCaFoo) || !whole.Covers(failCdLib) || !whole.Covers(failGoBad) {
 		t.Error("a unit with no target covers every target of its package, and a Go package covers its tests")
 	}
 }
@@ -313,12 +322,12 @@ func TestQualifyDemotesASuiteItsExitStatusContradicts(t *testing.T) {
 
 func TestASelectedPhaseRedTheFullSuiteDidNotHaveIsNamed(t *testing.T) {
 	in := AuditInput{Plan: selectedCa, Rust: examined(failCaFoo), Go: examined(), Base: []string{}, SelectedKnown: true,
-		SelectedRust: examined(failCaFoo, failCaLib), SelectedGo: examined()}
+		SelectedRust: examined(failCaFoo, failCdLib), SelectedGo: examined()}
 	r, notes := Audit(in)
-	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != failCaLib.Key() {
+	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != failCdLib.Key() {
 		t.Fatalf("selected_phase_failed_only = %v", r.SelectedPhaseFailedOnly)
 	}
-	if !contains(notes, annotate("warning", "failed in the selected phase only, not in the full suite: "+failCaLib.Key())) {
+	if !contains(notes, annotate("warning", "failed in the selected phase only, not in the full suite: "+failCdLib.Key())) {
 		t.Errorf("notes = %q", notes)
 	}
 	in.SelectedKnown = false
@@ -341,13 +350,28 @@ func writeFile(t *testing.T, dir, name, body string) string {
 	return p
 }
 
+// planSHA is the hash run embeds in a status file.
+func planSHA(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
 // phaseDir writes a plan and a full phase's logs and status into one directory.
+// The fast phase is recorded as having completed every selected command, as a
+// healthy run would leave it; tests that need otherwise overwrite the file.
 func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatus) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := writeJSON(filepath.Join(dir, "plan.json"), plan); err != nil {
+	planPath := filepath.Join(dir, "plan.json")
+	if err := writeJSON(planPath, plan); err != nil {
 		t.Fatal(err)
 	}
+	sha := planSHA(t, planPath)
 	if rustLog != "" {
 		writeFile(t, dir, "full-rust.log", rustLog)
 	}
@@ -355,9 +379,17 @@ func phaseDir(t *testing.T, plan Plan, rustLog, goLog string, status *phaseStatu
 		writeFile(t, dir, "full-go.jsonl", goLog)
 	}
 	if status != nil {
+		status.PlanSHA256 = sha
 		if err := writeJSON(filepath.Join(dir, "full-status.json"), *status); err != nil {
 			t.Fatal(err)
 		}
+	}
+	sel := phaseStatus{Schema: statusSchema, PlanSHA256: sha}
+	for _, s := range plan.Selected {
+		sel.Commands = append(sel.Commands, ExitInfo{Cmd: s.Display, Log: s.Log, Completed: true, Detail: "exit status 0"})
+	}
+	if err := writeJSON(filepath.Join(dir, "selected-status.json"), sel); err != nil {
+		t.Fatal(err)
 	}
 	return dir
 }
@@ -386,7 +418,7 @@ func auditIn(t *testing.T, dir string, extra ...string) (int, string, Recall) {
 	return code, stdout.String(), r
 }
 
-const plantedMiss = "   Running tests/it.rs (t/it-1)\ntest m::in_m ... FAILED\n\nfailures:\n\n---- m::in_m stdout ----\n\nfailures:\n    m::in_m\n\ntest result: FAILED. 0 passed; 1 failed\n" +
+const plantedMiss = "     Running tests/it.rs (t/it-1)\ntest m::in_m ... FAILED\n\nfailures:\n\n---- m::in_m stdout ----\n\nfailures:\n    m::in_m\n\ntest result: FAILED. 0 passed; 1 failed\n" +
 	"error: test failed, to rerun pass `-p cb --test it`\n"
 
 const goPass = `{"Action":"pass","Package":"toy/ok"}` + "\n"
@@ -420,7 +452,7 @@ func TestAuditCommandWithMissingLogsWritesTheArtifactAndExitsTwo(t *testing.T) {
 
 func TestAuditOfATruncatedFullSuiteExitsTwoWithNullRecall(t *testing.T) {
 	// Passing logs, but no status file: nothing says the commands finished.
-	dir := phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, nil)
+	dir := phaseDir(t, selectedCa, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, nil)
 	code, _, r := auditIn(t, dir)
 	if code != 2 || r.Recall != nil || r.Full.Rust.Examined {
 		t.Fatalf("exit=%d recall=%v rust=%+v", code, r.Recall, r.Full.Rust)
@@ -428,17 +460,17 @@ func TestAuditOfATruncatedFullSuiteExitsTwoWithNullRecall(t *testing.T) {
 	// A status file that says the command was killed.
 	killed := finished(0)
 	killed.Commands[0] = ExitInfo{Cmd: "cargo", Log: "full-rust.log", Code: -1, Detail: "signal: killed"}
-	dir = phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, killed)
+	dir = phaseDir(t, selectedCa, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, killed)
 	if code, _, r := auditIn(t, dir); code != 2 || r.Full.Rust.Examined || !strings.Contains(r.Full.Rust.Note, "did not run to completion") {
 		t.Fatalf("killed: exit=%d rust=%+v", code, r.Full.Rust)
 	}
 	// Exit 101 with no failing test in the log.
-	dir = phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(101))
+	dir = phaseDir(t, selectedCa, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(101))
 	if code, _, r := auditIn(t, dir); code != 2 || r.Full.Rust.Examined {
 		t.Fatalf("exit 101 with nothing parsed: exit=%d rust=%+v", code, r.Full.Rust)
 	}
 	// A clean, finished run is examined and exits 0.
-	dir = phaseDir(t, selectedCa, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
+	dir = phaseDir(t, selectedCa, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
 	base := writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
 	if code, _, r := auditIn(t, dir, "--base-artifact", base); code != 0 || !r.Full.Rust.Examined || r.Recall != nil {
 		t.Fatalf("clean: exit=%d rust=%+v recall=%v", code, r.Full.Rust, r.Recall)
@@ -474,10 +506,97 @@ func TestAuditCommandWithAnUnusablePlanStillWritesTheArtifact(t *testing.T) {
 func TestTheFastPhasesLogsNameASelectedOnlyFailure(t *testing.T) {
 	plan := selectedCa
 	plan.Selected = []Selected{{Command: logged(newCommand("rust", "cargo", "test")), Units: []Unit{{Kind: "rust", Pkg: "ca", Target: "--lib"}}}}
-	dir := phaseDir(t, plan, "   Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
-	writeFile(t, dir, "selected-rust.log", "   Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest only_here ... FAILED\n\nfailures:\n\n---- only_here stdout ----\n\nfailures:\n    only_here\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p ca --lib`\n")
+	dir := phaseDir(t, plan, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
+	writeFile(t, dir, "selected-rust.log", "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest only_here ... FAILED\n\nfailures:\n\n---- only_here stdout ----\n\nfailures:\n    only_here\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p ca --lib`\n")
 	_, stdout, r := auditIn(t, dir)
 	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != "rust:ca:--lib:only_here" || !strings.Contains(stdout, "selected phase only") {
 		t.Fatalf("selected_phase_failed_only=%v stdout:\n%s", r.SelectedPhaseFailedOnly, stdout)
+	}
+}
+
+func TestAnUnusablePlanDoesNotBlameTheSelection(t *testing.T) {
+	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
+	// The plan is replaced by one with no full-suite command: unusable.
+	if err := os.WriteFile(filepath.Join(dir, "plan.json"), []byte(`{"schema":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
+	code, stdout, r := auditIn(t, dir, "--base-artifact", base)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2; stdout:\n%s", code, stdout)
+	}
+	if len(r.Missed) != 0 || len(r.Unclassified) != 1 || r.Recall != nil {
+		t.Fatalf("missed=%v unclassified=%v recall=%v; with no usable plan every failure is unclassified", r.Missed, r.Unclassified, r.Recall)
+	}
+	if strings.Contains(stdout, "selection missed") || strings.Contains(stdout, "measured from") {
+		t.Errorf("a verdict or a base notice about a selection nobody knows:\n%s", stdout)
+	}
+}
+
+func TestAPlanWithNoFullCommandOrAnUnknownSchemaIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"no full":         `{"schema":1}`,
+		"empty full":      `{"schema":1,"full":[]}`,
+		"unknown schema":  `{"schema":9,"full":[{"cmd":"x","dir":".","argv":["x"]}]}`,
+		"command no argv": `{"schema":1,"full":[{"cmd":"x","dir":".","argv":[]}]}`,
+	} {
+		p := writeFile(t, dir, name+".json", body)
+		if _, _, err := loadPlan(p); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestRecallIsNullWhenASelectedCommandDidNotComplete(t *testing.T) {
+	failCd := "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest engine::t::bad ... FAILED\n\nfailures:\n\n---- engine::t::bad stdout ----\n\nfailures:\n    engine::t::bad\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p cd --lib`\n"
+	base := func(dir string) string {
+		return writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
+	}
+	// The fast phase's `-p cd` command was killed: nothing says it ran.
+	dir := phaseDir(t, selectedCa, failCd, goPass, finished(101))
+	sha := planSHA(t, filepath.Join(dir, "plan.json"))
+	killed := phaseStatus{Schema: statusSchema, PlanSHA256: sha, Commands: []ExitInfo{
+		{Cmd: selectedCa.Selected[0].Display, Log: "selected-rust.log", Completed: true, Detail: "exit status 0"},
+		{Cmd: selectedCa.Selected[1].Display, Log: "selected-rust.log", Code: -1, Detail: "signal: killed"},
+	}}
+	if err := writeJSON(filepath.Join(dir, "selected-status.json"), killed); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, r := auditIn(t, dir, "--base-artifact", base(dir))
+	if code != 2 || r.Recall != nil || len(r.Missed) != 0 || len(r.Unclassified) != 1 || !strings.Contains(r.RecallNote, "fast phase was not examined") {
+		t.Fatalf("killed: exit=%d recall=%v missed=%v unclassified=%v note=%q\n%s", code, r.Recall, r.Missed, r.Unclassified, r.RecallNote, stdout)
+	}
+	// And with no selected status at all.
+	dir = phaseDir(t, selectedCa, failCd, goPass, finished(101))
+	if err := os.Remove(filepath.Join(dir, "selected-status.json")); err != nil {
+		t.Fatal(err)
+	}
+	code, _, r = auditIn(t, dir, "--base-artifact", base(dir))
+	if code != 2 || r.Recall != nil || len(r.Missed) != 0 || !strings.Contains(r.RecallNote, "not examined") {
+		t.Fatalf("missing: exit=%d recall=%v missed=%v note=%q", code, r.Recall, r.Missed, r.RecallNote)
+	}
+	// A healthy fast phase, with the same failure inside the selection, is a recall of 1.
+	dir = phaseDir(t, selectedCa, failCd, goPass, finished(101))
+	if code, _, r := auditIn(t, dir, "--base-artifact", base(dir)); code != 0 || r.Recall == nil || *r.Recall != 1 {
+		t.Fatalf("healthy: exit=%d recall=%v", code, r.Recall)
+	}
+}
+
+func TestAStatusFromAnotherPlanIsRefused(t *testing.T) {
+	log := "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n"
+	dir := phaseDir(t, selectedCa, log, goPass, finished(0))
+	st, err := os.ReadFile(filepath.Join(dir, "full-status.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := strings.Replace(string(st), `"plan_sha256": "`, `"plan_sha256": "0000`, 1)
+	if stale == string(st) {
+		t.Fatal("fixture has no plan hash to alter")
+	}
+	writeFile(t, dir, "full-status.json", stale)
+	code, _, r := auditIn(t, dir)
+	if code != 2 || r.Full.Rust.Examined || !strings.Contains(r.Full.Rust.Note, "stale status") {
+		t.Fatalf("exit=%d rust=%+v", code, r.Full.Rust)
 	}
 }

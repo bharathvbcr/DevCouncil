@@ -72,8 +72,8 @@ func metadataFixture(t *testing.T, withResolve bool) (string, []byte) {
 		}
 		id := "path+file://" + dir + "#0.1.0"
 		members = append(members, fmt.Sprintf("%q", id))
-		packages = append(packages, fmt.Sprintf(`{"name":%q,"id":%q,"manifest_path":%q,"targets":[{"name":%q,"kind":[%q],"src_path":%q,"test":true,"doctest":%t}]}`,
-			p.name, id, filepath.Join(dir, "Cargo.toml"), p.name, p.kind, src, p.kind == "lib"))
+		packages = append(packages, fmt.Sprintf(`{"name":%q,"id":%q,"manifest_path":%q,"targets":[{"name":%q,"kind":[%q],"src_path":%q,"test":true}]}`,
+			p.name, id, filepath.Join(dir, "Cargo.toml"), p.name, p.kind, src))
 	}
 	id := func(name string) string { return "path+file://" + filepath.Join(root, "rust", name) + "#0.1.0" }
 	dep := func(name, kind string) string {
@@ -113,9 +113,6 @@ func TestTheDriverClosureIsWhatTheBinariesCompileNotTheTestOnlyDependencies(t *t
 		if ws.DriverClosure[out] {
 			t.Errorf("%s is not compiled into any such binary but is in the closure", out)
 		}
-	}
-	if lib := ws.Packages[1]; lib.Name != "devmap-lib" || !lib.Targets[0].Doctest {
-		t.Errorf("doctest was not decoded: %+v", lib)
 	}
 }
 

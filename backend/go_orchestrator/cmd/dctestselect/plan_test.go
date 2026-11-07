@@ -23,7 +23,7 @@ const (
 // crate the job excludes (dc-store), and a target that needs a feature (cf).
 func workspace() *RustWorkspace {
 	t := func(name, src string, kinds ...string) RustTarget {
-		return RustTarget{Name: name, Kinds: kinds, Src: src, Test: true, Doctest: true}
+		return RustTarget{Name: name, Kinds: kinds, Src: src, Test: true}
 	}
 	return &RustWorkspace{Packages: []RustPackage{
 		{Name: "ca", Dir: "rust/ca", Targets: []RustTarget{
@@ -100,16 +100,10 @@ func inputs(opts ...blastOpt) Inputs {
 	for _, o := range opts {
 		o(b)
 	}
-	files := map[string]string{"rust/cb/tests/it.rs": "mod m;\nmod other;\n"}
 	return Inputs{
 		Base: baseSHA, Head: headSHA, Trigger: "push", Blast: b,
 		Rust: workspace(), Go: goWorkspace(), Excludes: DefaultRustExcludes, RustDir: "rust", GoDir: "go",
-		ReadFile: func(rel string) ([]byte, error) {
-			if s, ok := files[rel]; ok {
-				return []byte(s), nil
-			}
-			return nil, os.ErrNotExist
-		},
+		GussetDirs: []string{"rust/dc-glob"},
 	}
 }
 
@@ -145,64 +139,71 @@ func wantEverything(t *testing.T, p Plan, reasonPart string) {
 	}
 }
 
-func TestASourceOnlyChangeSelectsTheModuleInTheLibAndTheMainBinary(t *testing.T) {
+func TestASourceFileSelectsEveryTargetOfItsCrate(t *testing.T) {
 	p := BuildPlan(inputs(
 		withSeed("rust/ca/src/engine.rs", "run"),
+		withChanged("rust/ca/src/engine.rs"),
 		withTests("rust/ca/src/engine.rs")))
 	if p.Everything {
-		t.Fatalf("a source change with a complete mapping must not widen: %v", p.Widened)
+		t.Fatalf("a source change inside the mapping must not widen: %v", p.Widened)
 	}
-	lib := wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- engine::")
-	wantCmd(t, p, "cargo test --locked -p ca --bin ca --no-fail-fast -- engine::")
-	if lib.Dir != "rust" || len(lib.Units) != 1 || !reflect.DeepEqual(lib.Units[0], Unit{Kind: "rust", Pkg: "ca", Target: "--lib", Filters: []string{"engine::"}}) {
-		t.Errorf("unit = %+v dir=%q", lib.Units, lib.Dir)
+	whole := wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
+	if whole.Dir != "rust" || len(whole.Units) != 1 || !reflect.DeepEqual(whole.Units[0], Unit{Kind: "rust", Pkg: "ca"}) {
+		t.Errorf("unit = %+v dir=%q", whole.Units, whole.Dir)
 	}
-	if len(lib.Seeds) != 1 || lib.Seeds[0] != "rust/ca/src/engine.rs::run" || len(lib.Files) != 1 {
-		t.Errorf("a selected command must name the files and the seeds it came from: files=%v seeds=%v", lib.Files, lib.Seeds)
+	if len(whole.Seeds) != 1 || whole.Seeds[0] != "rust/ca/src/engine.rs::run" || len(whole.Files) != 1 {
+		t.Errorf("a selected command must name the files and the seeds it came from: files=%v seeds=%v", whole.Files, whole.Seeds)
 	}
-}
-
-func TestAModuleFileBecomesItsPathAsAFilterAndModRsIsItsDirectory(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/ca/src/a/b.rs", "rust/ca/src/c/mod.rs", "rust/ca/src/lib.rs")))
-	// lib.rs is the crate root: the whole target, which absorbs the filtered runs.
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast")
 	for _, c := range cmds(p) {
-		if strings.Contains(c, "--lib") && strings.Contains(c, "--") && strings.Contains(c, "a::b::") {
-			t.Errorf("a target that runs whole must not also run filtered: %q", c)
+		if strings.Contains(c, " -- ") {
+			t.Errorf("a libtest filter was emitted: %q", c)
 		}
 	}
-	p = BuildPlan(inputs(withTests("rust/ca/src/a/b.rs", "rust/ca/src/c/mod.rs")))
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- a::b:: c::")
 }
 
-func TestAHarnessModuleRunsThroughTheItTargetWithItsPrefix(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/cb/tests/m.rs")))
-	wantCmd(t, p, "cargo test --locked -p cb --test it --no-fail-fast -- m::")
+func TestAModuleFileAndTheCrateRootBothSelectTheWholeCrateWithNoFilter(t *testing.T) {
+	for _, files := range [][]string{{"rust/ca/src/a/b.rs"}, {"rust/ca/src/c/mod.rs"}, {"rust/ca/src/lib.rs"}, {"rust/ca/src/a/b.rs", "rust/ca/src/c/mod.rs", "rust/ca/src/lib.rs"}} {
+		p := BuildPlan(inputs(withTests(files...)))
+		if got := cmds(p); len(got) != 1 || got[0] != "cargo test --locked -p ca --no-fail-fast" {
+			t.Errorf("%v selected %q, want the one whole-crate command", files, got)
+		}
+	}
 }
 
-func TestAHarnessModuleNoHarnessDeclaresRunsEveryTestTarget(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/cb/tests/orphan.rs")))
-	wantCmd(t, p, "cargo test --locked -p cb --test it --no-fail-fast")
+func TestAChangedSourceFileSelectsItsCrateWhetherOrNotTheGraphReachedATest(t *testing.T) {
+	// The blast names no test at all: the rule still selects the crate.
+	in := inputs(withSeed("rust/ca/src/engine.rs", "run"))
+	in.GitChanged = []string{"rust/ca/src/engine.rs"}
+	wantCmd(t, BuildPlan(in), "cargo test --locked -p ca --no-fail-fast")
 }
 
-func TestAnIsolatedTargetRunsAsItsOwnTest(t *testing.T) {
+func TestADeclaredTestTargetSelectsThatTargetOnly(t *testing.T) {
 	p := BuildPlan(inputs(withTests("rust/ca/tests/foo.rs", "rust/ca/tests/bar.rs")))
 	wantCmd(t, p, "cargo test --locked -p ca --test bar --test foo --no-fail-fast")
 }
 
-func TestASupportDirectoryRunsEveryTestTargetOfItsCrate(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/ca/tests/support/mod.rs")))
-	wantCmd(t, p, "cargo test --locked -p ca --test bar --test foo --no-fail-fast")
+func TestAnyOtherFileUnderTestsSelectsEveryTargetOfItsCrate(t *testing.T) {
+	for _, file := range []string{"rust/cb/tests/m.rs", "rust/cb/tests/orphan.rs", "rust/ca/tests/support/mod.rs", "rust/cc/tests/deep/helper.rs", "rust/ca/tests/fixtures/sample.rs"} {
+		pkg := strings.Split(file, "/")[1]
+		p := BuildPlan(inputs(withTests(file)))
+		wantCmd(t, p, "cargo test --locked -p "+pkg+" --no-fail-fast")
+	}
 }
 
-func TestATargetDirectoryRunsThatTarget(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/cc/tests/deep/helper.rs")))
-	wantCmd(t, p, "cargo test --locked -p cc --test deep --no-fail-fast")
+func TestAModuleOfAnAutoDiscoveredBinSelectsEveryTargetIncludingThatBin(t *testing.T) {
+	in := inputs(withSeed("rust/ca/src/bin/tool/helper.rs", "h"), withChanged("rust/ca/src/bin/tool/helper.rs"), withTests("rust/ca/src/bin/tool/helper.rs"))
+	for i := range in.Rust.Packages {
+		if in.Rust.Packages[i].Name == "ca" {
+			in.Rust.Packages[i].Targets = append(in.Rust.Packages[i].Targets, RustTarget{Name: "tool", Kinds: []string{"bin"}, Src: "rust/ca/src/bin/tool.rs", Test: true})
+		}
+	}
+	// `-p ca` runs every bin cargo metadata lists, auto-discovered ones included.
+	wantCmd(t, BuildPlan(in), "cargo test --locked -p ca --no-fail-fast")
 }
 
-func TestABinOnlyCratesSourceRunsThroughItsBinary(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/devmap-cli/src/hook.rs")))
-	wantCmd(t, p, "cargo test --locked -p devmap-cli --bin devmap --no-fail-fast -- hook::")
+func TestABinOnlyCratesSourceSelectsTheCrateNotALibThatDoesNotExist(t *testing.T) {
+	p := BuildPlan(inputs(withChanged("rust/devmap-cli/src/hook.rs"), withTests("rust/devmap-cli/src/hook.rs")))
+	wantCmd(t, p, "cargo test --locked -p devmap-cli --no-fail-fast")
 	for _, c := range cmds(p) {
 		if strings.Contains(c, "--lib") {
 			t.Errorf("devmap-cli has no lib target, so --lib would be a cargo error: %q", c)
@@ -218,7 +219,7 @@ func TestAGoTestFileRunsItsPackage(t *testing.T) {
 	}
 }
 
-func TestPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testing.T) {
+func TestReachedPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testing.T) {
 	p := BuildPlan(inputs(withTests(
 		"rust/dc-store/src/lib.rs",  // excluded package
 		"rust/cf/tests/gated.rs",    // needs a feature the suite does not enable
@@ -227,7 +228,10 @@ func TestPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testing.T) {
 		"docs/notes.md",             // not a test file
 		"rust/ca/benches/b.rs",      // neither tests/ nor src/
 		"rust/ca/src/engine.rs")))
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- engine::")
+	if p.Everything {
+		t.Fatalf("a reached test the mapping cannot place is dropped, not a reason to run everything: %v", p.Widened)
+	}
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 	reasons := map[string]string{}
 	for _, d := range p.Dropped {
 		reasons[d.Path] = d.Reason
@@ -235,10 +239,10 @@ func TestPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testing.T) {
 	for path, part := range map[string]string{
 		"rust/dc-store/src/lib.rs":  "excluded",
 		"rust/cf/tests/gated.rs":    "requires features",
-		"rust/elsewhere/tests/x.rs": "outside every cargo workspace member",
-		"go/nowhere/n_test.go":      "no `go list` package",
-		"docs/notes.md":             "neither a Rust nor a Go test file",
-		"rust/ca/benches/b.rs":      "not under tests/ or src/",
+		"rust/elsewhere/tests/x.rs": "outside every main-workspace member",
+		"go/nowhere/n_test.go":      "in no package of the module",
+		"docs/notes.md":             "neither a Rust nor a Go file",
+		"rust/ca/benches/b.rs":      "outside src/ and tests/",
 	} {
 		if !strings.Contains(reasons[path], part) {
 			t.Errorf("%s: reason = %q, want it to say %q", path, reasons[path], part)
@@ -248,6 +252,70 @@ func TestPathsOutsideTheJobsFullSuiteAreDroppedAndLoggedNeverRun(t *testing.T) {
 		if strings.Contains(c, "dc-store") || strings.Contains(c, "-p cf") {
 			t.Errorf("a command outside the full suite's universe was selected: %q", c)
 		}
+	}
+}
+
+func TestAChangedRustOrGoPathTheMappingCannotPlaceRunsEverything(t *testing.T) {
+	for file, reason := range map[string]string{
+		"rust/ca/examples/demo.rs":      "outside src/ and tests/ of ca",
+		"rust/ca/benches/b.rs":          "outside src/ and tests/ of ca",
+		"rust/ca/fixtures/sample.rs":    "outside src/ and tests/ of ca",
+		"rust/gusset-engine/src/lib.rs": "outside every main-workspace member",
+		"rust/outside/src/lib.rs":       "outside every main-workspace member",
+		"go/pkga/testdata/sample.go":    "in no package of the module",
+		"go/orphan/x.go":                "in no package of the module",
+	} {
+		t.Run(file, func(t *testing.T) {
+			in := inputs(withTests("rust/ca/src/engine.rs"))
+			in.GitChanged = []string{file}
+			wantEverything(t, BuildPlan(in), reason)
+			wantEverything(t, BuildPlan(inputs(withChanged(file), withTests("rust/ca/src/engine.rs"))), reason)
+		})
+	}
+}
+
+func TestAChangeInACrateRustGussetEngineDependsOnRunsEverything(t *testing.T) {
+	in := inputs(withSeed("rust/dc-glob/src/lib.rs", "m"), withChanged("rust/dc-glob/src/lib.rs"))
+	wantEverything(t, BuildPlan(in), "rust/gusset-engine depends on and Go links through cgo")
+	// A change elsewhere in the same workspace does not.
+	other := inputs(withChanged("rust/ca/src/engine.rs"))
+	if p := BuildPlan(other); p.Everything {
+		t.Fatalf("an unrelated crate widened: %v", p.Widened)
+	}
+	// And an unreadable manifest fails closed.
+	broken := inputs(withChanged("rust/ca/src/engine.rs"))
+	broken.GussetErr = errors.New("no such file")
+	wantEverything(t, BuildPlan(broken), "gusset-engine's dependencies could not be read")
+}
+
+// The real manifest, as read from this repository's rust/gusset-engine/Cargo.toml.
+const gussetManifest = `[package]
+name = "devcouncil-gusset-engine"
+
+[workspace]
+
+[dependencies]
+gusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }
+dc-glob = { path = "../dc-glob" }
+# other = { path = "../not-a-dependency" }
+`
+
+func TestGussetDependenciesAreReadFromTheManifest(t *testing.T) {
+	read := func(rel string) ([]byte, error) {
+		if rel != "rust/gusset-engine/Cargo.toml" {
+			return nil, os.ErrNotExist
+		}
+		return []byte(gussetManifest), nil
+	}
+	dirs, err := gussetDependencies("rust", read)
+	if err != nil || !reflect.DeepEqual(dirs, []string{"rust/dc-glob"}) {
+		t.Fatalf("dirs=%v err=%v; the Gusset sibling is outside the repository and a commented line is not a dependency", dirs, err)
+	}
+	if _, err := gussetDependencies("rust", func(string) ([]byte, error) { return nil, os.ErrNotExist }); err == nil {
+		t.Error("an unreadable manifest was accepted")
+	}
+	if _, err := gussetDependencies("rust", func(string) ([]byte, error) { return []byte("[package]\n"), nil }); err == nil {
+		t.Error("a manifest naming no in-repository dependency was accepted: the rule would be silently gone")
 	}
 }
 
@@ -285,7 +353,7 @@ func TestChangeUnattributedInAnExcludedCrateIsLoggedAsDroppedNotWidened(t *testi
 	if len(p.Dropped) != 1 || p.Dropped[0].Path != "rust/dc-store/src/lib.rs" {
 		t.Errorf("dropped = %+v", p.Dropped)
 	}
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- engine::")
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 }
 
 func TestAChangeOutsideAnySymbolWithNoOwnerRunsEverything(t *testing.T) {
@@ -301,7 +369,7 @@ func TestImpactIncompleteIsLoggedWithItsDepthAndDoesNotWiden(t *testing.T) {
 	if p.Everything || len(p.Widened) != 0 {
 		t.Fatalf("impact_incomplete widened the selection: everything=%t widened=%v", p.Everything, p.Widened)
 	}
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- engine::")
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 	if len(p.Notices) != 1 || !strings.Contains(p.Notices[0], "depth=3 reached=238") || !strings.Contains(p.Notices[0], "full suite gates") {
 		t.Errorf("notices = %q; want depth and reached, and who gates", p.Notices)
 	}
@@ -327,12 +395,12 @@ func TestEveryRunEverythingPathRunsEverything(t *testing.T) {
 
 func TestAnOrdinarySourceChangeIsNotARunEverythingPath(t *testing.T) {
 	in := inputs(withTests("rust/ca/src/engine.rs"))
-	in.GitChanged = []string{"rust/ca/src/engine.rs", "backend/go_orchestrator/pkga/a.go"}
+	in.GitChanged = []string{"rust/ca/src/engine.rs", "go/pkga/a.go"}
 	p := BuildPlan(in)
 	if p.Everything {
 		t.Fatalf("widened on ordinary files: %v", p.Widened)
 	}
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- engine::")
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 }
 
 func TestAnUnknownOrCappedLimitRunsEverything(t *testing.T) {
@@ -412,7 +480,7 @@ func TestACrateOutsideTheDriverRuleDoesNotSelectGoPackages(t *testing.T) {
 	in := inputs(withTests("rust/ca/src/engine.rs"))
 	in.GitChanged = []string{"rust/ca/src/engine.rs"}
 	p := BuildPlan(in)
-	wantCmd(t, p, "cargo test --locked -p ca --lib --no-fail-fast -- engine::")
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
 	for _, c := range cmds(p) {
 		if strings.HasPrefix(c, "go test") {
 			t.Errorf("a non-driver crate selected Go: %q", c)
@@ -512,6 +580,7 @@ func TestEveryRealBlastDecodesAndTheUnindexedOneRunsEverything(t *testing.T) {
 	in := inputs()
 	in.Blast = b
 	in.Blast.Change = baseSHA + ".." + headSHA
+	in.Go = &GoWorkspace{Module: module, Packages: []GoPackage{{ImportPath: module + "/policy", Dir: "backend/go_orchestrator/policy", GoFiles: []string{"backend/go_orchestrator/policy/policy.go"}}}}
 	wantEverything(t, BuildPlan(in), "not indexed")
 }
 
@@ -523,35 +592,6 @@ func TestAChangedFileThatIsNeitherRustNorGoRunsEverything(t *testing.T) {
 			in.GitChanged = []string{file}
 			wantEverything(t, BuildPlan(in), "no graph edge to a test")
 		})
-	}
-}
-
-func TestDoctestsAreSelectedWithTheLibraryUnlessThereAreNone(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/ca/src/engine.rs")))
-	doc := wantCmd(t, p, "cargo test --locked -p ca --doc --no-fail-fast")
-	if len(doc.Units) != 1 || !reflect.DeepEqual(doc.Units[0], Unit{Kind: "rust", Pkg: "ca", Target: "--doc"}) {
-		t.Errorf("units = %+v", doc.Units)
-	}
-	// A whole-crate selection already includes the doctests.
-	p = BuildPlan(inputs(withUnattributed("rust/ca/src/lib.rs", "outside_every_symbol")))
-	for _, c := range cmds(p) {
-		if strings.Contains(c, "--doc") {
-			t.Errorf("a whole-crate command is followed by a redundant --doc: %q", c)
-		}
-	}
-	// doctest = false, a bin-only crate, and a binary-only selection select none.
-	in := inputs(withTests("rust/ca/src/engine.rs", "rust/devmap-cli/src/hook.rs"))
-	for i := range in.Rust.Packages {
-		if in.Rust.Packages[i].Name == "ca" {
-			for j := range in.Rust.Packages[i].Targets {
-				in.Rust.Packages[i].Targets[j].Doctest = false
-			}
-		}
-	}
-	for _, c := range cmds(BuildPlan(in)) {
-		if strings.Contains(c, "--doc") {
-			t.Errorf("doctest=false or bin-only crate got %q", c)
-		}
 	}
 }
 

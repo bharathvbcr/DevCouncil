@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,20 +13,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"time"
-
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 const (
 	defaultRustDir = "rust"
 	defaultGoDir   = "backend/go_orchestrator"
-	statusSchema   = 1
-	// maxCapture bounds the output kept to see whether a filtered run ran
-	// anything. The count is in libtest's first lines, so little is needed.
-	maxCapture = 8 << 20
+	statusSchema   = 2
+	// builtinPlan is the plan hash a status file carries when the plan was
+	// unusable and run used its built-in full suite.
+	builtinPlan = "builtin"
 )
 
 func jsonIndent(v any) ([]byte, error) {
@@ -98,13 +96,18 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 
 // phaseStatus is the status file one phase leaves next to its logs. The audit
 // reads it: a log says what a process printed, not whether it was allowed to
-// finish.
+// finish. It carries the hash of the plan it ran, so a file left by another
+// plan, or by an earlier run that was killed before it wrote its own, is not
+// read as this run's.
 type phaseStatus struct {
-	Schema   int        `json:"schema"`
-	Commands []ExitInfo `json:"commands"`
+	Schema     int        `json:"schema"`
+	PlanSHA256 string     `json:"plan_sha256"`
+	Commands   []ExitInfo `json:"commands"`
 }
 
-func readStatus(path string) (map[string]*ExitInfo, error) {
+// loadStatus reads a phase's status file and refuses one written for another
+// plan.
+func loadStatus(path, planSHA string) (*phaseStatus, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -116,19 +119,65 @@ func readStatus(path string) (map[string]*ExitInfo, error) {
 	if s.Schema != statusSchema {
 		return nil, fmt.Errorf("%s has schema %d, this build reads %d", path, s.Schema, statusSchema)
 	}
-	byLog := map[string]*ExitInfo{}
+	if s.PlanSHA256 != planSHA {
+		return nil, fmt.Errorf("%s was written for plan %s, not the plan being audited (%s): it is a stale status", path, s.PlanSHA256, planSHA)
+	}
+	return &s, nil
+}
+
+// byLog indexes a status by the log each command wrote.
+func (s *phaseStatus) byLog() map[string]*ExitInfo {
+	out := map[string]*ExitInfo{}
 	for i := range s.Commands {
 		c := s.Commands[i]
 		if c.Log == "" {
 			continue
 		}
 		// A log shared by several commands is as healthy as its worst one.
-		if prev, ok := byLog[c.Log]; ok && (!prev.Completed || prev.Code != 0) {
+		if prev, ok := out[c.Log]; ok && (!prev.Completed || prev.Code != 0) {
 			continue
 		}
-		byLog[c.Log] = &c
+		out[c.Log] = &c
 	}
-	return byLog, nil
+	return out
+}
+
+// byCmd indexes a status by command line. A command that appears twice is as
+// healthy as its worst entry.
+func (s *phaseStatus) byCmd() map[string]*ExitInfo {
+	out := map[string]*ExitInfo{}
+	for i := range s.Commands {
+		c := s.Commands[i]
+		if prev, ok := out[c.Cmd]; ok && !prev.Completed {
+			continue
+		}
+		out[c.Cmd] = &c
+	}
+	return out
+}
+
+// writeAtomic writes a file by renaming a finished temp file over it, so a
+// reader sees the whole document or none of it.
+func writeAtomic(path string, v any) error {
+	body, err := jsonIndent(v)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	_, werr := tmp.Write(body)
+	cerr := tmp.Close()
+	if err := errors.Join(werr, cerr); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
 }
 
 func runCmdPhase(ctx context.Context, args []string, stdout, stderr io.Writer) (int, error) {
@@ -148,17 +197,25 @@ func runCmdPhase(ctx context.Context, args []string, stdout, stderr io.Writer) (
 	if err != nil {
 		return 2, err
 	}
-	plan, err := readPlan(*planPath)
+	plan, planSHA, err := loadPlan(*planPath)
 	if err != nil {
 		if *phase == "selected" {
 			return 2, err
 		}
-		// The full suite is the gate. A plan that is missing or unreadable is
-		// a reason to say so, not a reason not to run it.
+		// The full suite is the gate. A plan that is missing, unreadable or
+		// empty is a reason to say so, not a reason not to run it.
 		fmt.Fprintln(stdout, annotate("error", "the plan is unusable ("+err.Error()+"); running the built-in full suite"))
 		plan = Plan{Full: fullCommands(Inputs{Excludes: DefaultRustExcludes, RustDir: defaultRustDir, GoDir: defaultGoDir})}
+		planSHA = builtinPlan
 	}
 	if err := os.MkdirAll(*logDir, 0o755); err != nil {
+		return 2, err
+	}
+	// A status from an earlier run must not outlive this run's start: if this
+	// process is killed before it writes its own, there is none, and the audit
+	// says so.
+	statusPath := filepath.Join(*logDir, *phase+"-status.json")
+	if err := os.Remove(statusPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 2, err
 	}
 	var cmds []Command
@@ -174,7 +231,7 @@ func runCmdPhase(ctx context.Context, args []string, stdout, stderr io.Writer) (
 		cmds = plan.Full
 	}
 	code, statuses := runPhase(ctx, root, cmds, *timeout, *logDir, stdout, stderr)
-	if err := writeJSON(filepath.Join(*logDir, *phase+"-status.json"), phaseStatus{Schema: statusSchema, Commands: statuses}); err != nil {
+	if err := writeAtomic(statusPath, phaseStatus{Schema: statusSchema, PlanSHA256: planSHA, Commands: statuses}); err != nil {
 		return 2, err
 	}
 	return code, nil
@@ -202,13 +259,9 @@ func runPhase(ctx context.Context, root string, cmds []Command, timeout time.Dur
 			f.Close()
 		}
 	}()
-	one := func(c Command) {
+	for _, c := range cmds {
 		fmt.Fprintln(stdout, group(c.Display))
-		var capture *proc.CappedBuffer
-		if c.Fallback != nil {
-			capture = &proc.CappedBuffer{Limit: maxCapture}
-		}
-		info, code := runOne(ctx, root, c, timeout, logDir, logs, capture, stdout, stderr)
+		info, code := runOne(ctx, root, c, timeout, logDir, logs, stdout, stderr)
 		fmt.Fprintln(stdout, "::endgroup::")
 		if code != 0 {
 			fmt.Fprintln(stdout, annotate("error", fmt.Sprintf("%s exited %d", c.Display, code)))
@@ -217,42 +270,8 @@ func runPhase(ctx context.Context, root string, cmds []Command, timeout time.Dur
 		if code > worst {
 			worst = code
 		}
-		if capture != nil && code == 0 && ranNothing(capture.String()) {
-			// A filter that matches no test is not a pass. It names a module
-			// by a path libtest does not use (a #[path] module, an include!),
-			// and the tests in it never ran.
-			fmt.Fprintln(stdout, annotate("notice", "filter matched nothing: "+c.Display+"; running the target unfiltered"))
-			whole := Command{Display: strings.Join(c.Fallback, " "), Dir: c.Dir, Argv: c.Fallback, Log: c.Log, Env: c.Env}
-			fmt.Fprintln(stdout, group(whole.Display))
-			info, code := runOne(ctx, root, whole, timeout, logDir, logs, nil, stdout, stderr)
-			fmt.Fprintln(stdout, "::endgroup::")
-			if code != 0 {
-				fmt.Fprintln(stdout, annotate("error", fmt.Sprintf("%s exited %d", whole.Display, code)))
-			}
-			statuses = append(statuses, info)
-			if code > worst {
-				worst = code
-			}
-		}
-	}
-	for _, c := range cmds {
-		one(c)
 	}
 	return worst, statuses
-}
-
-var libtestRunning = regexp.MustCompile(`(?m)^running (\d+) tests?$`)
-
-// ranNothing reports whether libtest's output shows no test ran: no `running
-// N tests` line, or only zeros.
-func ranNothing(output string) bool {
-	counts := libtestRunning.FindAllStringSubmatch(stripANSI(output), -1)
-	for _, m := range counts {
-		if m[1] != "0" {
-			return false
-		}
-	}
-	return true
 }
 
 // logFile opens a phase's log: the first command to name it truncates it.
@@ -271,7 +290,7 @@ func logFile(logDir, name string, logs map[string]*os.File) (*os.File, error) {
 	return f, nil
 }
 
-func runOne(ctx context.Context, root string, c Command, timeout time.Duration, logDir string, logs map[string]*os.File, capture *proc.CappedBuffer, stdout, stderr io.Writer) (ExitInfo, int) {
+func runOne(ctx context.Context, root string, c Command, timeout time.Duration, logDir string, logs map[string]*os.File, stdout, stderr io.Writer) (ExitInfo, int) {
 	info := ExitInfo{Cmd: c.Display, Log: c.Log, Code: -1}
 	var out, errw io.Writer = stdout, stderr
 	if logDir != "" && c.Log != "" {
@@ -289,16 +308,6 @@ func runOne(ctx context.Context, root string, c Command, timeout time.Duration, 
 		}
 	} else if c.GoJSON {
 		out = &goJSONTee{log: io.Discard, console: stdout}
-	}
-	if capture != nil {
-		t := &teeWriter{a: out, b: capture}
-		// Only a command whose two streams share one writer is captured whole;
-		// a second writer on the capture would race the first. Filtered
-		// commands are cargo's, which are.
-		if errw == out {
-			errw = t
-		}
-		out = t
 	}
 	dir := filepath.Join(root, filepath.FromSlash(c.Dir))
 	err := runProcess(ctx, timeout, dir, c.Env, c.Argv, out, errw)
@@ -318,4 +327,31 @@ func runOne(ctx context.Context, root string, c Command, timeout time.Duration, 
 		info.Detail = err.Error()
 		return info, 2
 	}
+}
+
+// loadPlan reads and validates a plan, and returns the hash of its bytes. A plan
+// with an unknown schema, or with no full-suite command, is unusable: a plan
+// that lists nothing to run would make the gate pass having run nothing.
+func loadPlan(path string) (Plan, string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Plan{}, "", err
+	}
+	var p Plan
+	if err := strictUnmarshal(body, &p); err != nil {
+		return Plan{}, "", fmt.Errorf("%s is not a plan: %w", path, err)
+	}
+	if p.Schema != planSchema {
+		return Plan{}, "", fmt.Errorf("%s has schema %d, this build reads %d", path, p.Schema, planSchema)
+	}
+	if len(p.Full) == 0 {
+		return Plan{}, "", fmt.Errorf("%s lists no full-suite command", path)
+	}
+	for _, c := range p.Full {
+		if len(c.Argv) == 0 {
+			return Plan{}, "", fmt.Errorf("%s has a full-suite command with no argv", path)
+		}
+	}
+	sum := sha256.Sum256(body)
+	return p, hex.EncodeToString(sum[:]), nil
 }

@@ -17,7 +17,7 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], helperFlag) {
 		switch strings.TrimPrefix(os.Args[1], helperFlag) {
 		case "cargo-fail":
-			fmt.Fprintln(os.Stderr, "   Running tests/x.rs (t/x-1)")
+			fmt.Fprintln(os.Stderr, "     Running tests/x.rs (t/x-1)")
 			fmt.Fprintln(os.Stdout, "test boom ... FAILED")
 			fmt.Fprintln(os.Stdout, "test result: FAILED. 0 passed; 1 failed")
 			fmt.Fprintln(os.Stderr, "error: test failed, to rerun pass `-p cb --test it`")
@@ -29,16 +29,12 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		case "hang":
 			time.Sleep(time.Minute)
-		case "scan":
-			// A stand-in for a libtest binary: with a filter (a `--`) it ran
-			// nothing, without one it ran two tests.
-			for _, a := range os.Args[2:] {
-				if a == "--" {
-					fmt.Println("running 0 tests")
-					os.Exit(0)
-				}
+		case "no-status":
+			// Fails if a status file from an earlier run is still there.
+			if _, err := os.Stat("full-status.json"); err == nil {
+				fmt.Println("a stale full-status.json was still present")
+				os.Exit(3)
 			}
-			fmt.Println("running 2 tests")
 		case "ok":
 			fmt.Println("fine")
 		}
@@ -97,7 +93,7 @@ func TestTheFullPhaseKeepsCargosInterleavedOutputInOrderForTheAudit(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "   Running tests/x.rs (t/x-1)\ntest boom ... FAILED\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p cb --test it`\n"
+	want := "     Running tests/x.rs (t/x-1)\ntest boom ... FAILED\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p cb --test it`\n"
 	if string(log) != want {
 		t.Fatalf("log = %q\nwant %q (stderr and stdout interleaved, as a person read them)", log, want)
 	}
@@ -146,7 +142,7 @@ func TestALogNameThatIsAPathIsRefused(t *testing.T) {
 func TestRunPhaseSelectedSkipsWhenThePlanIsEverythingAndRunsTheSelectionOtherwise(t *testing.T) {
 	dir := t.TempDir()
 	skip := filepath.Join(dir, "everything.json")
-	if err := writeJSON(skip, Plan{Schema: planSchema, Everything: true, Selected: []Selected{}, Full: []Command{}}); err != nil {
+	if err := writeJSON(skip, Plan{Schema: planSchema, Everything: true, Selected: []Selected{}, Full: []Command{helper("ok")}}); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
@@ -155,7 +151,7 @@ func TestRunPhaseSelectedSkipsWhenThePlanIsEverythingAndRunsTheSelectionOtherwis
 	}
 	some := filepath.Join(dir, "some.json")
 	sel := Selected{Command: helper("ok"), Units: []Unit{{Kind: "go", Pkg: "p"}}}
-	if err := writeJSON(some, Plan{Schema: planSchema, Selected: []Selected{sel}, Full: []Command{}}); err != nil {
+	if err := writeJSON(some, Plan{Schema: planSchema, Selected: []Selected{sel}, Full: []Command{helper("ok")}}); err != nil {
 		t.Fatal(err)
 	}
 	out.Reset()
@@ -190,45 +186,6 @@ func TestAnnotationsEscapeWhatTheRunnerWouldReadAsTheEndOfTheMessage(t *testing.
 	}
 }
 
-func TestAFilteredRunThatRanNoTestIsRerunWhole(t *testing.T) {
-	dir := t.TempDir()
-	filtered := Command{Display: "filtered", Dir: ".", Log: "selected-rust.log", Argv: append(helper("scan").Argv, "--", "x::"), Fallback: helper("scan").Argv}
-	var out, errs bytes.Buffer
-	code, statuses := runPhase(context.Background(), t.TempDir(), []Command{filtered}, time.Minute, dir, &out, &errs)
-	if code != 0 || len(statuses) != 2 {
-		t.Fatalf("code=%d statuses=%d, want 0 and the filtered run plus the whole one\n%s", code, len(statuses), out.String())
-	}
-	if !strings.Contains(out.String(), "::notice::filter matched nothing: filtered") {
-		t.Errorf("the re-run is not logged: %q", out.String())
-	}
-	log, _ := os.ReadFile(filepath.Join(dir, "selected-rust.log"))
-	if !strings.Contains(string(log), "running 0 tests") || !strings.Contains(string(log), "running 2 tests") {
-		t.Errorf("the log must hold both runs, appended: %q", log)
-	}
-	// A filtered run that ran tests is not repeated.
-	ran := Command{Display: "ran", Dir: ".", Log: "selected-rust.log", Argv: helper("scan").Argv, Fallback: helper("scan").Argv}
-	out.Reset()
-	if _, statuses := runPhase(context.Background(), t.TempDir(), []Command{ran}, time.Minute, dir, &out, &errs); len(statuses) != 1 {
-		t.Errorf("a run that ran tests was repeated: %d statuses", len(statuses))
-	}
-}
-
-func TestRanNothingReadsLibtestsCountLines(t *testing.T) {
-	for out, want := range map[string]bool{
-		"":                                   true,
-		"running 0 tests\n":                  true,
-		"running 0 tests\nrunning 0 tests\n": true,
-		"running 1 test\n":                   false,
-		"running 0 tests\nrunning 3 tests\n": false,
-		"\x1b[1mrunning 2 tests\x1b[0m\n":    false,
-		"cargo said nothing useful\n":        true,
-	} {
-		if got := ranNothing(out); got != want {
-			t.Errorf("ranNothing(%q) = %t, want %t", out, got, want)
-		}
-	}
-}
-
 func TestEveryCommandOfAPhaseLeavesAStatus(t *testing.T) {
 	dir := t.TempDir()
 	missing := Command{Display: "missing", Dir: ".", Log: "a.log", Argv: []string{filepath.Join(dir, "no-such-binary")}}
@@ -245,34 +202,107 @@ func TestEveryCommandOfAPhaseLeavesAStatus(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("exit = %d, want 2 for a command that could not start", code)
 	}
-	st, err := readStatus(filepath.Join(dir, "full-status.json"))
+	st, err := loadStatus(filepath.Join(dir, "full-status.json"), planSHA(t, planPath))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a := st["a.log"]; a == nil || a.Completed || a.Code != -1 || a.Detail == "" {
+	byLog := st.byLog()
+	if a := byLog["a.log"]; a == nil || a.Completed || a.Code != -1 || a.Detail == "" {
 		t.Errorf("a command that never started: %+v", a)
 	}
-	if b := st["b.log"]; b == nil || !b.Completed || b.Code != 101 {
+	if b := byLog["b.log"]; b == nil || !b.Completed || b.Code != 101 {
 		t.Errorf("a command that exited 101: %+v", b)
 	}
-	if c := st["c.log"]; c == nil || !c.Completed || c.Code != 0 {
+	if c := byLog["c.log"]; c == nil || !c.Completed || c.Code != 0 {
 		t.Errorf("a command that passed: %+v", c)
 	}
 }
 
 func TestAnUnreadableStatusFileIsAnError(t *testing.T) {
 	dir := t.TempDir()
-	for name, body := range map[string]string{"junk": "x", "schema": `{"schema":9,"commands":[]}`, "unknown": `{"schema":1,"commands":[],"x":1}`} {
+	for name, body := range map[string]string{
+		"junk":       "x",
+		"schema":     `{"schema":9,"plan_sha256":"p","commands":[]}`,
+		"unknown":    `{"schema":2,"plan_sha256":"p","commands":[],"x":1}`,
+		"other plan": `{"schema":2,"plan_sha256":"q","commands":[]}`,
+	} {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readStatus(p); err == nil {
+		if _, err := loadStatus(p, "p"); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	if _, err := readStatus(filepath.Join(dir, "absent")); err == nil {
+	if _, err := loadStatus(filepath.Join(dir, "absent"), "p"); err == nil {
 		t.Error("an absent status file was accepted")
+	}
+}
+
+func TestAPhaseRemovesTheStaleStatusAtStartAndWritesItsOwnWhole(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "full-status.json")
+	if err := os.WriteFile(stale, []byte(`{"stale":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := helper("no-status")
+	c.Log = "c.log"
+	planPath := filepath.Join(dir, "plan.json")
+	if err := writeJSON(planPath, Plan{Schema: planSchema, Selected: []Selected{}, Full: []Command{c}}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	// --repo dir makes the command's working directory the log directory.
+	if code := run(context.Background(), []string{"run", "--plan", planPath, "--phase", "full", "--repo", dir, "--log-dir", dir}, &out, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("exit = %d: a stale full-status.json was still there while the phase ran\n%s", code, out.String())
+	}
+	st, err := loadStatus(stale, planSHA(t, planPath))
+	if err != nil || len(st.Commands) != 1 || !st.Commands[0].Completed {
+		t.Fatalf("status = %+v err=%v", st, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.tmp*")); len(left) != 0 {
+		t.Errorf("temp files left behind: %v", left)
+	}
+}
+
+func TestWriteAtomicLeavesTheWholeDocumentOrTheOldOne(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "s.json")
+	if err := writeAtomic(p, map[string]int{"a": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(p, map[string]int{"b": 2}); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(p)
+	if !strings.Contains(string(body), `"b": 2`) || strings.Contains(string(body), `"a"`) {
+		t.Errorf("body = %s", body)
+	}
+	if err := writeAtomic(filepath.Join(dir, "no", "such", "s.json"), 1); err == nil {
+		t.Error("a write into a missing directory succeeded")
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.tmp*")); len(left) != 0 {
+		t.Errorf("temp files left behind: %v", left)
+	}
+}
+
+func TestAPlanWithNoFullCommandsRunsTheBuiltInSuiteAndExitsNonZero(t *testing.T) {
+	dir := t.TempDir() // no rust/ or go directory: every built-in command fails to start
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(planPath, []byte(`{"schema":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	code := run(context.Background(), []string{"run", "--repo", dir, "--plan", planPath, "--phase", "full", "--log-dir", dir}, &out, &bytes.Buffer{})
+	if code == 0 {
+		t.Fatalf("run --phase full exited 0 having run nothing\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "::error::the plan is unusable") || !strings.Contains(out.String(), "cargo test --locked --workspace") {
+		t.Errorf("the built-in suite was not attempted, or the plan not called unusable:\n%s", out.String())
+	}
+	st, err := loadStatus(filepath.Join(dir, "full-status.json"), builtinPlan)
+	if err != nil || len(st.Commands) != 2 {
+		t.Errorf("status = %+v err=%v", st, err)
 	}
 }
 
@@ -297,7 +327,7 @@ func TestAMissingPlanRunsTheBuiltInFullSuiteAndSaysSoButNotTheFastPhase(t *testi
 }
 
 func TestCargoCommandsRunWithoutColour(t *testing.T) {
-	p := BuildPlan(inputs(withTests("rust/ca/src/engine.rs", "go/pkga/a_test.go")))
+	p := BuildPlan(inputs(withTests("rust/ca/src/engine.rs", "rust/cb/src/lib.rs", "go/pkga/a_test.go")))
 	all := append([]Command{}, p.Full...)
 	for _, s := range p.Selected {
 		all = append(all, s.Command)
@@ -320,9 +350,6 @@ func TestCargoCommandsRunWithoutColour(t *testing.T) {
 func TestWorkflowCommandValuesAreEscaped(t *testing.T) {
 	if got := annotate("error", "a\nb%c\r"); got != "::error::a%0Ab%25c%0D" {
 		t.Errorf("annotate = %q", got)
-	}
-	if got := escapeProperty("k:v,w%\n"); got != "k%3Av%2Cw%25%0A" {
-		t.Errorf("escapeProperty = %q", got)
 	}
 	if got := escapeData("a:b,c"); got != "a:b,c" {
 		t.Errorf("escapeData must leave : and , alone in a message: %q", got)

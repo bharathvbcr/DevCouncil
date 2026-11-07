@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,7 +21,7 @@ import (
 
 func realShapeWorkspace() *RustWorkspace {
 	t := func(name, src string, kinds ...string) RustTarget {
-		return RustTarget{Name: name, Kinds: kinds, Src: src, Test: true, Doctest: true}
+		return RustTarget{Name: name, Kinds: kinds, Src: src, Test: true}
 	}
 	return &RustWorkspace{DriverClosure: map[string]bool{"devmap-cli": true, "devmap-store": true, "devmap-query": true, "devmap-extract": true}, Packages: []RustPackage{
 		{Name: "devmap-store", Dir: "rust/devmap-store", Targets: []RustTarget{t("devmap_store", "rust/devmap-store/src/lib.rs", "lib")}},
@@ -54,57 +57,29 @@ func TestADevmapLibraryChangeSelectsTheGoPackagesThatRunDevmap(t *testing.T) {
 //	#[path = "db/tests/payload_serialization_tests.rs"] mod payload_serialization_tests;
 //
 // so libtest names those tests db::payload_serialization_tests::..., not after
-// the file's path, and a filter built from the path matches nothing. Deriving
-// every #[path] is not cheap, so the selection carries a backstop: the filtered
-// command names its unfiltered form, and run re-runs it whole when the filtered
-// run ran no test (TestAFilteredRunThatRanNoTestIsRerunWhole).
-func TestAPathAttributeModulesFilterFallsBackToTheWholeTarget(t *testing.T) {
+// the file's path, and any filter built from the path can match nothing, or
+// only part of what it was meant to. Selection therefore never filters: the
+// file selects every target of its crate.
+func TestAPathAttributeModuleSelectsEveryTargetOfItsCrateWithNoFilter(t *testing.T) {
 	in := inputs(withSeed("rust/devmap-store/src/db/tests/payload_serialization_tests.rs", "t"),
+		withChanged("rust/devmap-store/src/db/tests/payload_serialization_tests.rs"),
 		withTests("rust/devmap-store/src/db/tests/payload_serialization_tests.rs"))
 	in.Rust = realShapeWorkspace()
 	p := BuildPlan(in)
-	var filtered *Selected
-	for i, s := range p.Selected {
-		if len(s.Units) == 1 && s.Units[0].Pkg == "devmap-store" && len(s.Units[0].Filters) > 0 {
-			filtered = &p.Selected[i]
-		}
-	}
-	if filtered == nil {
-		t.Fatalf("no filtered command for devmap-store: %q", cmds(p))
-	}
-	want := "cargo test --locked -p devmap-store --lib --no-fail-fast"
-	if got := strings.Join(filtered.Fallback, " "); got != want {
-		t.Fatalf("fallback = %q, want %q", got, want)
-	}
+	wantCmd(t, p, "cargo test --locked -p devmap-store --no-fail-fast")
 	for _, s := range p.Selected {
-		if len(s.Units[0].Filters) == 0 && s.Fallback != nil {
-			t.Errorf("an unfiltered command has a fallback: %q", s.Display)
+		if strings.Contains(s.Display, " -- ") {
+			t.Errorf("a libtest filter was emitted: %q", s.Display)
 		}
 	}
 }
 
-func filtersOf(p Plan) [][]string {
-	var out [][]string
-	for _, s := range p.Selected {
-		for _, u := range s.Units {
-			out = append(out, u.Filters)
-		}
+func TestASourceFileSelectsEveryTargetOfItsCrateIncludingTheDoctests(t *testing.T) {
+	p := BuildPlan(inputs(withSeed("rust/ca/src/engine.rs", "run"), withChanged("rust/ca/src/engine.rs"), withTests("rust/ca/src/engine.rs")))
+	whole := wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
+	if len(whole.Units) != 1 || whole.Units[0].Target != "" {
+		t.Fatalf("units = %+v; a whole-crate unit covers lib, every bin, every test and the doctests", whole.Units)
 	}
-	return out
-}
-
-// ATTACK 1c: doc tests are a separate cargo target (`--doc`); a lib-source
-// change that breaks a doctest is never selected.
-func TestALibrarySelectionAlsoSelectsItsDoctests(t *testing.T) {
-	p := BuildPlan(inputs(withSeed("rust/ca/src/engine.rs", "run"), withTests("rust/ca/src/engine.rs")))
-	for _, s := range p.Selected {
-		for _, u := range s.Units {
-			if u.Pkg == "ca" && (u.Target == "" || u.Target == "--doc") {
-				return
-			}
-		}
-	}
-	t.Fatalf("selection %q has no --doc for ca; a changed doc example is invisible to the fast phase", cmds(p))
 }
 
 // ATTACK 1d: a changed path that git reports but the blast does not (only
@@ -321,5 +296,134 @@ func TestAFileNameCannotInjectAWorkflowCommand(t *testing.T) {
 		if strings.HasPrefix(line, "::warning::") {
 			t.Fatalf("a file name made the runner see a workflow command: %q", line)
 		}
+	}
+}
+
+// A failing test's own output can look like anything cargo prints. These are
+// the shapes the attacks planted, read back through the parser.
+const (
+	hdrHead = "     Running unittests src/lib.rs (target/debug/deps/zz-1)\n\nrunning 2 tests\ntest a ... ok\ntest b ... FAILED\n\nfailures:\n\n---- b stdout ----\n"
+	hdrTail = "\nfailures:\n    b\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\nerror: test failed, to rerun pass `-p zz --lib`\n"
+	// cargo's exact header, as a spawned cargo or a migration log would print it.
+	plantedHeader = "     Running unittests src/lib.rs (target/debug/deps/ca-9)\n"
+)
+
+func TestAnIndentedRunningLineInAFailingTestsOutputDoesNotSplitTheSection(t *testing.T) {
+	r := parseLibtest(strings.NewReader(hdrHead + "   Running migrations\n" + hdrTail))
+	if len(r.Failures) != 1 || r.Failures[0].Pkg != "zz" || !r.Examined {
+		t.Fatalf("examined=%t note=%q failures=%+v; want 1 failure in zz, examined", r.Examined, r.Note, r.Failures)
+	}
+}
+
+func TestACargoShapedHeaderInsideAFailingTestsOutputIsNotABinary(t *testing.T) {
+	// Without a following `test result:` line: the old parser started a section
+	// that never finished, and the whole suite read as not examined.
+	r := parseLibtest(strings.NewReader(hdrHead + plantedHeader + hdrTail))
+	if len(r.Failures) != 1 || r.Failures[0].Pkg != "zz" || r.Failures[0].Name != "b" || !r.Examined {
+		t.Fatalf("bare planted header: examined=%t note=%q failures=%+v", r.Examined, r.Note, r.Failures)
+	}
+	// With a `test result:` line and a footer after it: a phantom failure of ca.
+	planted := plantedHeader + "running 1 test\ntest a::bad ... FAILED\n\nfailures:\n    a::bad\n\ntest result: FAILED. 0 passed; 1 failed\n\nerror: test failed, to rerun pass `-p ca --lib`\n"
+	r = parseLibtest(strings.NewReader(hdrHead + planted + hdrTail))
+	if len(r.Failures) != 1 || r.Failures[0].Pkg != "zz" || !r.Examined {
+		t.Fatalf("planted binary: examined=%t note=%q failures=%+v", r.Examined, r.Note, r.Failures)
+	}
+	// A child process that inherited stdout and printed the header after the
+	// test's own output was captured: it arrives while the block is open.
+	r = parseLibtest(strings.NewReader(hdrHead + "captured\n" + plantedHeader + "captured\n" + hdrTail))
+	if len(r.Failures) != 1 || r.Failures[0].Pkg != "zz" || !r.Examined {
+		t.Fatalf("child output: examined=%t note=%q failures=%+v", r.Examined, r.Note, r.Failures)
+	}
+	// And the real next binary, after the summary, is still a new section.
+	next := "     Running tests/it.rs (target/debug/deps/it-1)\n\nrunning 1 test\ntest ok ... ok\n\ntest result: ok. 1 passed\n"
+	r = parseLibtest(strings.NewReader(hdrHead + hdrTail + next))
+	if len(r.Failures) != 1 || !r.Examined {
+		t.Fatalf("two binaries: examined=%t note=%q failures=%+v", r.Examined, r.Note, r.Failures)
+	}
+}
+
+func TestStructuralLinesInsideAStdoutBlockAreInert(t *testing.T) {
+	r := parseLibtest(strings.NewReader(hdrHead + "failures:\n    ghost\n\ntest result: ok. 5 passed; 0 failed\n" + hdrTail))
+	if len(r.Failures) != 1 || r.Failures[0].Name != "b" {
+		t.Fatalf("%+v", r.Failures)
+	}
+}
+
+func TestCRLFLineEndingsAndFourDashNamesParse(t *testing.T) {
+	log := strings.ReplaceAll(hdrHead+"x\n"+hdrTail, "\n", "\r\n")
+	r := parseLibtest(strings.NewReader(log))
+	if len(r.Failures) != 1 || r.Failures[0].Pkg != "zz" || !r.Examined {
+		t.Fatalf("CRLF: %+v examined=%t", r.Failures, r.Examined)
+	}
+	log = strings.ReplaceAll(hdrHead+hdrTail, "b", "x----y")
+	if r = parseLibtest(strings.NewReader(log)); len(r.Failures) != 1 {
+		t.Fatalf("name with ----: %+v", r.Failures)
+	}
+}
+
+func TestAnUnclosedStdoutBlockIsNotExamined(t *testing.T) {
+	if r := parseLibtest(strings.NewReader(hdrHead + "partial output")); r.Examined {
+		t.Fatal("unclosed block examined")
+	}
+}
+
+func TestAnErrorLineInTestOutputCannotHideACompileFailure(t *testing.T) {
+	if r := parseLibtest(strings.NewReader("error: could not compile `zz` (lib test) due to 1 previous error\n")); r.Examined {
+		t.Fatal("compile failure examined")
+	}
+}
+
+func TestEscapedValuesCarryNoLineBreak(t *testing.T) {
+	for _, s := range []string{"a ::error::x", "a\x00b", "a%0Ab", "a\r::warning::x", "a\u0085::error::x"} {
+		got := annotate("error", s)
+		if strings.ContainsAny(got[2:], "\r\n") {
+			t.Errorf("annotate(%q) = %q has a raw line break", s, got)
+		}
+	}
+}
+
+// Every e2e-tagged test must be reachable by the `-run '^TestE2E'` that CI and
+// ci:local pass: a tagged test without the prefix is compiled out of ./... and
+// filtered out of that run, so it runs nowhere.
+func TestEveryE2ETaggedTestIsNamedTestE2E(t *testing.T) {
+	files, err := filepath.Glob("*_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagged := 0
+	decl := regexp.MustCompile(`(?m)^func (Test\w*)\(`)
+	for _, f := range files {
+		body, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(string(body), "//go:build e2e\n") {
+			continue
+		}
+		tagged++
+		for _, m := range decl.FindAllStringSubmatch(string(body), -1) {
+			if !strings.HasPrefix(m[1], "TestE2E") {
+				t.Errorf("%s: %s is e2e-tagged and would be filtered out of -run '^TestE2E'", f, m[1])
+			}
+		}
+	}
+	if tagged == 0 {
+		t.Fatal("no file carries the e2e build tag; the guard would pass over nothing")
+	}
+}
+
+func TestOnlyCargosExactHeaderShapesStartABinary(t *testing.T) {
+	// Outside any failing test's block, with no stdout capture to hide behind: a
+	// passing test's printed line is still not a binary unless it is cargo's shape.
+	pass := "     Running tests/it.rs (target/debug/deps/it-1)\n\nrunning 1 test\n"
+	for _, line := range []string{"   Running migrations\n", "  Running tests/x.rs (t/x)\n", "     Running without parens\n", "   Doc-tests\n", "      Doc-tests x\n"} {
+		r := parseLibtest(strings.NewReader(pass + line + "test a ... ok\n\ntest result: ok. 1 passed\n"))
+		if !r.Examined || len(r.Failures) != 0 {
+			t.Errorf("%q split the section: examined=%t note=%q", line, r.Examined, r.Note)
+		}
+	}
+	two := "     Running unittests src/lib.rs (t/debug/deps/a-1)\n\nrunning 0 tests\n\ntest result: ok. 0 passed\n\n   Doc-tests a\n\nrunning 0 tests\n\ntest result: ok. 0 passed\n"
+	if r := parseLibtest(strings.NewReader(two)); !r.Examined {
+		t.Errorf("cargo's own headers did not parse: %s", r.Note)
 	}
 }
