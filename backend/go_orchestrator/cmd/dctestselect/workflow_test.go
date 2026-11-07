@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -130,45 +129,33 @@ func TestADevmapBuildOrIndexFailureIsAWarningNotAFailedJob(t *testing.T) {
 	}
 }
 
-func TestTheJobCanOnlyReadActionsAndTheTokenIsInOneStepOnly(t *testing.T) {
+func TestTheJobCanOnlyReadContentsAndHoldsNoToken(t *testing.T) {
 	f := loadWorkflow(t, "selected-tests.yml")
 	header := strings.Join(f.header, "\n")
-	if !regexp.MustCompile(`(?m)^    permissions:\n      contents: read\n      actions: read\n`).MatchString(header) {
-		t.Errorf("job permissions must be exactly contents: read and actions: read:\n%s", header)
+	if !regexp.MustCompile(`(?m)^    permissions:\n      contents: read\n    (?:\S|#)`).MatchString(header) {
+		t.Errorf("job permissions must be exactly contents: read:\n%s", header)
 	}
-	if strings.Contains(header, "actions: write") || strings.Contains(f.text, "actions: write\n") {
-		t.Error("actions: write is wider than gh run list/download need, and upload-artifact needs none")
+	if strings.Contains(f.text, "actions: read") || strings.Contains(f.text, "actions: write") {
+		t.Error("nothing in this job reads or writes Actions: upload-artifact uses the runner's own token")
 	}
-	if strings.Contains(header, "GH_TOKEN") {
-		t.Error("GH_TOKEN is in the job's environment, so cargo build and test run the changed code with it")
-	}
-	holders := 0
-	for _, s := range f.steps {
-		if s.has("GH_TOKEN") {
-			holders++
-			if !strings.HasPrefix(s.name, "Fetch the base") {
-				t.Errorf("step %q holds GH_TOKEN; only the base fetch may", s.name)
-			}
-		}
-	}
-	if holders != 1 {
-		t.Errorf("GH_TOKEN is in %d steps, want exactly the base fetch", holders)
+	if strings.Contains(f.text, "GH_TOKEN") || strings.Contains(f.text, "github.token") {
+		t.Error("no step needs GITHUB_TOKEN: cargo build and test run the changed code")
 	}
 }
 
-func TestTheBaseIsOnlyACompletedPushRunOfTheBaseBranchAndTheAuditIsToldWhoItIs(t *testing.T) {
+func TestTheAuditIsToldWhichRunItRecords(t *testing.T) {
 	f := loadWorkflow(t, "selected-tests.yml")
-	fetch := f.step(t, "Fetch the base")
-	for _, want := range []string{`--branch "$BASE_BRANCH"`, "--event push", "--status completed", "cancelled"} {
-		if !fetch.has(want) {
-			t.Errorf("the base fetch lacks %q", want)
-		}
-	}
 	audit := f.step(t, "Audit the selection")
-	for _, want := range []string{`--ref "$GITHUB_REF"`, `--event "$GITHUB_EVENT_NAME"`, `--run-id "$GITHUB_RUN_ID"`, `--base-branch "$BASE_BRANCH"`} {
+	for _, want := range []string{`--ref "$GITHUB_REF"`, `--event "$GITHUB_EVENT_NAME"`, `--run-id "$GITHUB_RUN_ID"`} {
 		if !audit.has(want) {
 			t.Errorf("the audit step does not pass %s", want)
 		}
+	}
+	if audit.has("--base-artifact") || audit.has("--base-branch") {
+		t.Error("the audit step passes a base artifact: the job records, it does not measure recall")
+	}
+	if !audit.has("continue-on-error: true") {
+		t.Error("the audit is not a gate: it must continue on error")
 	}
 }
 
@@ -190,39 +177,6 @@ func TestTheWorkflowRunsTheSelectorsEndToEndTestsUnderTheE2ETagAndOnlyThose(t *t
 	}
 }
 
-// The fetch step's esc() is the shell twin of escapeData: gh's error text goes
-// into a ::warning:: line, and a %, CR or LF in it must not end the annotation.
-func TestTheFetchStepsEscapeMatchesEscapeData(t *testing.T) {
-	f := loadWorkflow(t, "selected-tests.yml")
-	fetch := f.step(t, "Fetch the base")
-	def := ""
-	for _, l := range fetch.lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "esc() {") {
-			def = strings.TrimSpace(l)
-		}
-	}
-	if def == "" {
-		t.Fatal("the fetch step defines no esc() for gh's error text")
-	}
-	if strings.Contains(strings.Join(fetch.lines, "\n"), "tr '\\n' ' '") {
-		t.Error("a warning still flattens newlines with tr, which leaves % and CR unescaped")
-	}
-	for _, v := range []string{"plain", "a\nb", "100%\r\nx", "::error::injected", "%0A%"} {
-		out, err := exec.Command("bash", "-c", def+`; esc "$1"`, "bash", v).Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(out) != escapeData(v) {
-			t.Errorf("esc(%q) = %q, escapeData = %q", v, out, escapeData(v))
-		}
-	}
-	for _, want := range []string{`$(esc "$(head -c 300`, `$(esc "$(head -c 200`} {
-		if !fetch.has(want) {
-			t.Errorf("the fetch step does not pass its gh error text through esc: missing %q", want)
-		}
-	}
-}
-
 func TestOnlyTheBaseBranchSavesTheCache(t *testing.T) {
 	f := loadWorkflow(t, "selected-tests.yml")
 	if s := f.step(t, "Swatinem/rust-cache"); !s.has("save-if: ${{ github.ref == 'refs/heads/main' }}") {
@@ -234,6 +188,9 @@ func TestTheSelectedAndFullPhasesAreExplainedAsDifferingInFeatures(t *testing.T)
 	f := loadWorkflow(t, "selected-tests.yml")
 	if !strings.Contains(f.text, "feature-unification") || !strings.Contains(f.text, "selected_phase_failed_only") {
 		t.Error("the workflow must say why a selected-only red is possible and where it is recorded")
+	}
+	if !strings.Contains(f.text, "does not measure recall") {
+		t.Error("the workflow header must say the job orders and records and does not measure recall")
 	}
 }
 
@@ -284,19 +241,6 @@ func TestAFailedSelectorBuildSaysSoInsteadOfFailingWithExit127(t *testing.T) {
 	for _, name := range []string{"Plan the selection", "Selected tests", "Full suite", "Audit the selection"} {
 		if !f.step(t, name).has("steps.selector.outcome == 'success'") {
 			t.Errorf("step %q runs the selector binary without checking that it was built", name)
-		}
-	}
-}
-
-func TestTheBaseFetchDoesNotSwallowGhErrors(t *testing.T) {
-	f := loadWorkflow(t, "selected-tests.yml")
-	fetch := f.step(t, "Fetch the base")
-	if fetch.has("|| true") {
-		t.Error("`|| true` hides why gh failed")
-	}
-	for _, want := range []string{"::warning::gh run list failed", "gh.err", "base_failed is unknown"} {
-		if !fetch.has(want) {
-			t.Errorf("the fetch step lacks %q: a failure must be logged as a warning with its reason", want)
 		}
 	}
 }

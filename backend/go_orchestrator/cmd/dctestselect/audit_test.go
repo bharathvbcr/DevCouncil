@@ -112,7 +112,6 @@ var (
 	failCbIt  = Failure{Kind: "rust", Pkg: "cb", Target: "--test it", Name: "m::in_m"}
 	failCaFoo = Failure{Kind: "rust", Pkg: "ca", Target: "--test foo", Name: "integ_bad"}
 	failCdLib = Failure{Kind: "rust", Pkg: "cd", Target: "--lib", Name: "engine::t::bad"}
-	failGoBad = Failure{Kind: "go", Pkg: "toy/bad", Name: "TestBroken"}
 	// selectedCa selects crates ca and cd, whole, in one cargo command.
 	selectedCa = Plan{Schema: planSchema, Base: baseSHA,
 		Full: []Command{newCommand("rust", "cargo", "test", "--locked", "--workspace", "--no-fail-fast")},
@@ -121,185 +120,21 @@ var (
 		}}
 )
 
-// fastPhase is the audit input's view of a fast phase that ran and was
-// examined, with exactly these failures.
-func fastPhase(in AuditInput, fs ...Failure) AuditInput {
-	in.SelectedKnown = true
-	in.SelectedRust, in.SelectedGo = examined(fs...), examined()
-	return in
-}
-
-func TestAFailureTheSelectionDidNotRunAndTheBaseDidNotHaveIsAMiss(t *testing.T) {
-	r, notes := Audit(fastPhase(AuditInput{Plan: selectedCa, SHA: "s", Rust: examined(failCaFoo, failCbIt), Go: examined(), Base: []string{}}, failCaFoo))
-	if len(r.Missed) != 1 || r.Missed[0] != failCbIt.Key() {
-		t.Fatalf("missed = %v", r.Missed)
-	}
-	if !contains(notes, "::error::selection missed "+failCbIt.Key()) {
-		t.Errorf("notes = %q; want an error naming the test", notes)
-	}
-	if r.NFailed != 2 || r.Recall == nil || *r.Recall != 0.5 {
-		t.Errorf("n_failed=%d recall=%v; want 2 and 0.5", r.NFailed, r.Recall)
-	}
-	if !contains(r.Full.Failed, failCaFoo.Key()) || !contains(r.Full.Failed, failCbIt.Key()) {
-		t.Errorf("full.failed = %v", r.Full.Failed)
-	}
-}
-
-func TestAFailureTheBaseAlreadyHadIsNotAMissAndIsNotCounted(t *testing.T) {
-	r, notes := Audit(fastPhase(AuditInput{Plan: selectedCa, Rust: examined(failCbIt, failCaFoo), Go: examined(), Base: []string{failCbIt.Key()}}, failCaFoo))
-	if len(r.Missed) != 0 {
-		t.Fatalf("a failure the base had was reported as a miss: %v", r.Missed)
-	}
-	for _, n := range notes {
-		if strings.HasPrefix(n, "::error::") {
-			t.Errorf("unexpected error annotation %q", n)
-		}
-	}
-	if r.NFailed != 1 || r.Recall == nil || *r.Recall != 1 {
-		t.Errorf("n_failed=%d recall=%v; want only the new failure, found by the selection", r.NFailed, r.Recall)
-	}
-	if len(r.BaseFailed) != 1 {
-		t.Errorf("base_failed = %v", r.BaseFailed)
-	}
-}
-
-func TestRecallIsNullWhenNothingFailedNeverOne(t *testing.T) {
-	r, _ := Audit(AuditInput{Plan: selectedCa, Rust: examined(), Go: examined(), Base: []string{}})
-	if r.Recall != nil {
-		t.Fatalf("recall = %v with nothing failed; it must be null, not 1.0", *r.Recall)
-	}
-	body, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(body, []byte(`"recall":null`)) || !bytes.Contains(body, []byte(`"n_failed":0`)) {
-		t.Errorf("artifact = %s", body)
-	}
-	// And when only the base's failures failed, too.
-	r, _ = Audit(AuditInput{Plan: selectedCa, Rust: examined(failCbIt), Go: examined(), Base: []string{failCbIt.Key()}})
-	if r.Recall != nil || r.NFailed != 0 {
-		t.Errorf("recall=%v n_failed=%d when every failure was the base's", r.Recall, r.NFailed)
-	}
-}
-
-func TestWithTheBaseUnknownAFailureOutsideTheSelectionIsUnclassifiedNotAMiss(t *testing.T) {
-	r, notes := Audit(AuditInput{Plan: selectedCa, Rust: examined(failCbIt), Go: examined(), Base: nil, BaseWhy: "no base-branch artifact was given"})
-	if r.BaseFailed != nil {
-		t.Errorf("base_failed = %v; unknown must be null", r.BaseFailed)
-	}
-	if len(r.Missed) != 0 || len(r.Unclassified) != 1 {
-		t.Errorf("missed=%v unclassified=%v", r.Missed, r.Unclassified)
-	}
-	if r.Recall != nil {
-		t.Errorf("recall = %v; with the base unknown it cannot be asserted", *r.Recall)
-	}
-	var warned bool
-	for _, n := range notes {
-		if strings.HasPrefix(n, "::error::") {
-			t.Errorf("an unknown base must warn, not error: %q", n)
-		}
-		warned = warned || strings.HasPrefix(n, "::warning::base_failed is unknown")
-	}
-	if !warned {
-		t.Errorf("notes = %q; want a base_failed warning", notes)
-	}
-	body, _ := json.Marshal(r)
-	if !bytes.Contains(body, []byte(`"base_failed":null`)) {
-		t.Errorf("artifact = %s", body)
-	}
-}
-
 func TestASuiteThatWasNotExaminedNeverLooksLikeOneThatPassed(t *testing.T) {
-	r, notes := Audit(AuditInput{Plan: selectedCa, Rust: SuiteRun{Note: "no test ran"}, Go: examined(), Base: []string{}})
-	if r.Recall != nil || r.Full.Rust.Examined || r.RecallNote == "" {
-		t.Errorf("recall=%v rust=%+v note=%q", r.Recall, r.Full.Rust, r.RecallNote)
+	in := AuditInput{Plan: selectedCa, Rust: SuiteRun{Note: "no test ran"}, Go: examined()}
+	r, notes := Audit(in)
+	if r.Full.Rust.Examined || r.Full.Rust.Note != "no test ran" || !r.Full.Go.Examined {
+		t.Errorf("full = %+v", r.Full)
 	}
 	if !contains(notes, "::warning::the full Rust suite was not examined: no test ran") {
 		t.Errorf("notes = %q", notes)
 	}
-}
-
-func TestAnEverythingPlanCoversEveryFailureButSaysNothingAboutRecall(t *testing.T) {
-	r, _ := Audit(AuditInput{Plan: Plan{Everything: true}, Rust: examined(failCbIt), Go: examined(failGoBad), Base: []string{}})
-	if len(r.Missed) != 0 || r.NFailed != 2 {
-		t.Fatalf("missed=%v n_failed=%d", r.Missed, r.NFailed)
-	}
-	if r.Recall != nil || !strings.Contains(r.RecallNote, "everything") {
-		t.Fatalf("recall=%v note=%q; a widened run must not report a recall of 1.0", r.Recall, r.RecallNote)
-	}
-}
-
-func TestACoveredFailureMatchesTheCrateOrPackageWhole(t *testing.T) {
-	// A unit is a whole crate or package: any target of it is inside the selection.
-	for name, f := range map[string]Failure{
-		"a test target of a selected crate": failCaFoo,
-		"the lib of another selected crate": failCdLib,
-		"a doctest of a selected crate":     {Kind: "rust", Pkg: "ca", Target: "--doc", Name: "ca/src/lib.rs - d (line 3)"},
-		"whatever the module path":          {Kind: "rust", Pkg: "cd", Target: "--lib", Name: "db::payload_serialization_tests::roundtrip"},
-	} {
-		if !selectedCa.Covers(f) {
-			t.Errorf("%s was not reported as covered", name)
-		}
-	}
-	for name, f := range map[string]Failure{"another package": failCbIt, "go": failGoBad} {
-		if selectedCa.Covers(f) {
-			t.Errorf("%s was reported as covered", name)
-		}
-	}
-	both := Plan{Selected: []Selected{{Units: []Unit{{Kind: "rust", Pkg: "ca"}, {Kind: "go", Pkg: "toy/bad"}}}}}
-	if !both.Covers(failCaFoo) || !both.Covers(failGoBad) || both.Covers(failCdLib) {
-		t.Error("a Go package covers its tests, a crate covers its targets, and nothing else")
+	if code := Exit(in, r); code != 2 {
+		t.Errorf("exit = %d, want 2: a suite that was not examined is not one that passed", code)
 	}
 }
 
 const mainRef = "refs/heads/main"
-
-func baseDoc(mutate func(string) string) []byte {
-	return []byte(mutate(`{"schema":3,"sha":"abc","ref":"refs/heads/main","event":"push","run_id":"7","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["a","b"]}}`))
-}
-
-func TestBaseFailuresAcceptsOnlyAnExaminedSameSchemaPushRecordOfTheBaseBranch(t *testing.T) {
-	got, rec, why := BaseFailures(baseDoc(func(s string) string { return s }), mainRef)
-	if len(got) != 2 || why != "" || rec.SHA != "abc" || rec.RunID != "7" {
-		t.Fatalf("got=%v rec=%+v why=%q", got, rec, why)
-	}
-	empty := baseDoc(func(s string) string { return strings.Replace(s, `"failed":["a","b"]`, `"failed":[]`, 1) })
-	if got, _, why := BaseFailures(empty, mainRef); got == nil || why != "" {
-		t.Fatalf("an examined base with no failures is an empty list, not unknown: got=%v why=%q", got, why)
-	}
-	for name, mutate := range map[string]func(string) string{
-		"other schema":   func(s string) string { return strings.Replace(s, `"schema":3`, `"schema":2`, 1) },
-		"other ref":      func(s string) string { return strings.Replace(s, `refs/heads/main`, `refs/pull/9/merge`, 1) },
-		"no ref":         func(s string) string { return strings.Replace(s, `"ref":"refs/heads/main",`, ``, 1) },
-		"pull request":   func(s string) string { return strings.Replace(s, `"event":"push"`, `"event":"pull_request"`, 1) },
-		"no failed list": func(s string) string { return strings.Replace(s, `,"failed":["a","b"]`, ``, 1) },
-		"null failed":    func(s string) string { return strings.Replace(s, `["a","b"]`, `null`, 1) },
-		"base unexamined": func(s string) string {
-			return strings.Replace(s, `"rust":{"examined":true}`, `"rust":{"examined":false}`, 1)
-		},
-		"not json": func(string) string { return "nope" },
-	} {
-		if got, _, why := BaseFailures(baseDoc(mutate), mainRef); got != nil || why == "" {
-			t.Errorf("%s: got=%v why=%q; an untrustworthy base must be unknown", name, got, why)
-		}
-	}
-}
-
-func TestADifferentBaseCommitIsNotedAndRecorded(t *testing.T) {
-	plan := Plan{Base: "planbase"}
-	base := []string{}
-	r, notes := Audit(AuditInput{Plan: plan, Rust: examined(), Go: examined(), Base: base, BaseInfo: &BaseRecord{SHA: "other", RunID: "7", Ref: mainRef, Event: "push"}})
-	if r.BaseRecord == nil || r.BaseRecord.MatchesPlanBase || r.BaseRecord.SHA != "other" || r.BaseRecord.RunID != "7" {
-		t.Fatalf("base_record = %+v", r.BaseRecord)
-	}
-	if !contains(notes, annotate("notice", "the base record is from other (run 7) and the plan measured from planbase; a test fixed or broken between them is misattributed")) {
-		t.Errorf("notes = %q", notes)
-	}
-	r, notes = Audit(AuditInput{Plan: plan, Rust: examined(), Go: examined(), Base: base, BaseInfo: &BaseRecord{SHA: "planbase"}})
-	if !r.BaseRecord.MatchesPlanBase || len(notes) != 0 {
-		t.Errorf("matching base: %+v notes=%q", r.BaseRecord, notes)
-	}
-}
 
 func TestQualifyDemotesASuiteItsExitStatusContradicts(t *testing.T) {
 	ran := func(code int) *ExitInfo { return &ExitInfo{Code: code, Completed: true, Detail: "exit status"} }
@@ -326,7 +161,7 @@ func TestQualifyDemotesASuiteItsExitStatusContradicts(t *testing.T) {
 }
 
 func TestASelectedPhaseRedTheFullSuiteDidNotHaveIsNamed(t *testing.T) {
-	in := AuditInput{Plan: selectedCa, Rust: examined(failCaFoo), Go: examined(), Base: []string{}, SelectedKnown: true,
+	in := AuditInput{Plan: selectedCa, Rust: examined(failCaFoo), Go: examined(), SelectedKnown: true,
 		SelectedRust: examined(failCaFoo, failCdLib), SelectedGo: examined()}
 	r, notes := Audit(in)
 	if len(r.SelectedPhaseFailedOnly) != 1 || r.SelectedPhaseFailedOnly[0] != failCdLib.Key() {
@@ -434,39 +269,37 @@ const plantedMiss = "     Running tests/it.rs (t/it-1)\ntest m::in_m ... FAILED\
 
 const goPass = `{"Action":"pass","Package":"toy/ok"}` + "\n"
 
-func TestAuditCommandEndToEndReportsAPlantedMissAndExitsOne(t *testing.T) {
+func TestAuditCommandRecordsProvenanceAndTheFullSuitesFailuresAndExitsZero(t *testing.T) {
 	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
-	// The base had a different failure, so the planted one is new.
-	base := writeFile(t, dir, "base.json", `{"schema":3,"sha":"bb","ref":"refs/heads/main","event":"push","run_id":"1","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["rust:cb:--test it:old"]}}`)
-	code, stdout, r := auditIn(t, dir, "--base-artifact", base)
-	if code != 1 {
-		t.Fatalf("exit = %d, want 1; stdout:\n%s", code, stdout)
+	code, stdout, r := auditIn(t, dir)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0: both suites were examined; stdout:\n%s", code, stdout)
 	}
-	if !strings.Contains(stdout, "::error::selection missed rust:cb:--test it:m::in_m") {
-		t.Errorf("stdout = %q", stdout)
+	if strings.Contains(stdout, "selection missed") {
+		t.Errorf("a verdict about the selection:\n%s", stdout)
 	}
 	if r.SHA != "abc" || r.Ref != mainRef || r.Event != "push" || r.RunID != "9" || r.Schema != recallSchema {
 		t.Errorf("provenance = %s %s %s %s schema %d", r.SHA, r.Ref, r.Event, r.RunID, r.Schema)
 	}
-	if len(r.Missed) != 1 || r.Recall == nil || *r.Recall != 0 || r.NFailed != 1 || r.BaseRecord == nil || r.BaseRecord.RunID != "1" {
-		t.Errorf("artifact = %+v", r)
+	if len(r.Full.Failed) != 1 || r.Full.Failed[0] != "rust:cb:--test it:m::in_m" || !r.Full.Rust.Examined || !r.Full.Go.Examined {
+		t.Errorf("full = %+v", r.Full)
 	}
 }
 
 func TestAuditCommandWithMissingLogsWritesTheArtifactAndExitsTwo(t *testing.T) {
 	dir := phaseDir(t, selectedCa, "", "", nil)
 	code, stdout, r := auditIn(t, dir)
-	if code != 2 || r.Recall != nil || r.Full.Rust.Examined || r.Full.Go.Examined || r.BaseFailed != nil {
-		t.Fatalf("exit=%d recall=%v full=%+v base=%v stdout:\n%s", code, r.Recall, r.Full, r.BaseFailed, stdout)
+	if code != 2 || r.Full.Rust.Examined || r.Full.Go.Examined {
+		t.Fatalf("exit=%d full=%+v stdout:\n%s", code, r.Full, stdout)
 	}
 }
 
-func TestAuditOfATruncatedFullSuiteExitsTwoWithNullRecall(t *testing.T) {
+func TestAuditOfATruncatedFullSuiteExitsTwo(t *testing.T) {
 	// Passing logs, but no status file: nothing says the commands finished.
 	dir := phaseDir(t, selectedCa, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, nil)
 	code, _, r := auditIn(t, dir)
-	if code != 2 || r.Recall != nil || r.Full.Rust.Examined {
-		t.Fatalf("exit=%d recall=%v rust=%+v", code, r.Recall, r.Full.Rust)
+	if code != 2 || r.Full.Rust.Examined {
+		t.Fatalf("exit=%d rust=%+v", code, r.Full.Rust)
 	}
 	// A status file that says the command was killed.
 	killed := finished(0)
@@ -482,17 +315,8 @@ func TestAuditOfATruncatedFullSuiteExitsTwoWithNullRecall(t *testing.T) {
 	}
 	// A clean, finished run is examined and exits 0.
 	dir = phaseDir(t, selectedCa, "     Running tests/x.rs (t/x)\n\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed\n", goPass, finished(0))
-	base := writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
-	if code, _, r := auditIn(t, dir, "--base-artifact", base); code != 0 || !r.Full.Rust.Examined || r.Recall != nil {
-		t.Fatalf("clean: exit=%d rust=%+v recall=%v", code, r.Full.Rust, r.Recall)
-	}
-}
-
-func TestAnUnknownBaseWithUnclassifiedFailuresExitsTwo(t *testing.T) {
-	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
-	code, stdout, r := auditIn(t, dir)
-	if code != 2 || len(r.Unclassified) != 1 || len(r.Missed) != 0 || r.BaseFailed != nil {
-		t.Fatalf("exit=%d unclassified=%v missed=%v stdout:\n%s", code, r.Unclassified, r.Missed, stdout)
+	if code, _, r := auditIn(t, dir); code != 0 || !r.Full.Rust.Examined {
+		t.Fatalf("clean: exit=%d rust=%+v", code, r.Full.Rust)
 	}
 }
 
@@ -502,8 +326,8 @@ func TestAuditCommandWithAnUnusablePlanStillWritesTheArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, stdout, r := auditIn(t, dir)
-	if code != 2 || r.Recall != nil || !strings.Contains(r.RecallNote, "plan was unusable") || !strings.Contains(stdout, "::error::the plan was unusable") {
-		t.Fatalf("exit=%d note=%q stdout:\n%s", code, r.RecallNote, stdout)
+	if code != 2 || r.Full.Rust.Examined || !strings.Contains(stdout, "::error::the plan was unusable") {
+		t.Fatalf("exit=%d rust=%+v stdout:\n%s", code, r.Full.Rust, stdout)
 	}
 	// And with no plan at all.
 	if err := os.Remove(filepath.Join(dir, "plan.json")); err != nil {
@@ -525,22 +349,17 @@ func TestTheFastPhasesLogsNameASelectedOnlyFailure(t *testing.T) {
 	}
 }
 
-func TestAnUnusablePlanDoesNotBlameTheSelection(t *testing.T) {
+func TestAPlanWithNoFullCommandExitsTwoThroughTheCommand(t *testing.T) {
 	dir := phaseDir(t, selectedCa, plantedMiss, goPass, finished(101))
-	// The plan is replaced by one with no full-suite command: unusable.
 	if err := os.WriteFile(filepath.Join(dir, "plan.json"), []byte(`{"schema":1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	base := writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
-	code, stdout, r := auditIn(t, dir, "--base-artifact", base)
+	code, stdout, _ := auditIn(t, dir)
 	if code != 2 {
 		t.Fatalf("exit = %d, want 2; stdout:\n%s", code, stdout)
 	}
-	if len(r.Missed) != 0 || len(r.Unclassified) != 1 || r.Recall != nil {
-		t.Fatalf("missed=%v unclassified=%v recall=%v; with no usable plan every failure is unclassified", r.Missed, r.Unclassified, r.Recall)
-	}
-	if strings.Contains(stdout, "selection missed") || strings.Contains(stdout, "measured from") {
-		t.Errorf("a verdict or a base notice about a selection nobody knows:\n%s", stdout)
+	if strings.Contains(stdout, "selection missed") {
+		t.Errorf("a verdict about a selection nobody knows:\n%s", stdout)
 	}
 }
 
@@ -559,11 +378,8 @@ func TestAPlanWithNoFullCommandOrAnUnknownSchemaIsRefused(t *testing.T) {
 	}
 }
 
-func TestRecallIsNullWhenASelectedCommandDidNotComplete(t *testing.T) {
-	failCd := "     Running unittests src/lib.rs (t/l)\n\nrunning 1 test\ntest engine::t::bad ... FAILED\n\nfailures:\n\n---- engine::t::bad stdout ----\n\nfailures:\n    engine::t::bad\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `-p cd --lib`\n"
-	base := func(dir string) string {
-		return writeFile(t, dir, "base.json", string(baseDoc(func(s string) string { return strings.Replace(s, `["a","b"]`, `[]`, 1) })))
-	}
+func TestAFastPhaseThatDidNotRunExitsTwo(t *testing.T) {
+	failCd := cargoCdFailed
 	// The fast phase's cargo command was killed: nothing says it ran.
 	dir := phaseDir(t, selectedCa, failCd, goPass, finished(101))
 	killed := phaseStatus{Schema: statusSchema, PlanSHA256: planSHA(t, filepath.Join(dir, "plan.json")), Commands: []ExitInfo{
@@ -572,25 +388,25 @@ func TestRecallIsNullWhenASelectedCommandDidNotComplete(t *testing.T) {
 	if err := writeAtomic(filepath.Join(dir, "selected-status.json"), killed); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, r := auditIn(t, dir, "--base-artifact", base(dir))
-	if code != 2 || r.Recall != nil || len(r.Missed) != 0 || len(r.Unclassified) != 1 || !strings.Contains(r.RecallNote, "fast phase was not examined") {
-		t.Fatalf("killed: exit=%d recall=%v missed=%v unclassified=%v note=%q\n%s", code, r.Recall, r.Missed, r.Unclassified, r.RecallNote, stdout)
+	code, stdout, _ := auditIn(t, dir)
+	if code != 2 || !strings.Contains(stdout, "the selected phase was not examined") {
+		t.Fatalf("killed: exit=%d\n%s", code, stdout)
 	}
 	// And with no selected status at all.
 	dir = phaseDir(t, selectedCa, failCd, goPass, finished(101))
 	if err := os.Remove(filepath.Join(dir, "selected-status.json")); err != nil {
 		t.Fatal(err)
 	}
-	code, _, r = auditIn(t, dir, "--base-artifact", base(dir))
-	if code != 2 || r.Recall != nil || len(r.Missed) != 0 || !strings.Contains(r.RecallNote, "not examined") {
-		t.Fatalf("missing: exit=%d recall=%v missed=%v note=%q", code, r.Recall, r.Missed, r.RecallNote)
+	code, stdout, _ = auditIn(t, dir)
+	if code != 2 || !strings.Contains(stdout, "no usable fast-phase status") {
+		t.Fatalf("missing: exit=%d\n%s", code, stdout)
 	}
-	// A healthy fast phase that failed the same test is a recall of 1.
+	// A healthy fast phase that failed the same test as the full suite is examined: exit 0.
 	dir = phaseDir(t, selectedCa, failCd, goPass, finished(101))
 	selectedStatus(t, dir, selectedCa, ExitInfo{Code: 101, Detail: "exit status 101"})
 	writeFile(t, dir, "selected-rust.log", failCd)
-	if code, _, r := auditIn(t, dir, "--base-artifact", base(dir)); code != 0 || r.Recall == nil || *r.Recall != 1 {
-		t.Fatalf("healthy: exit=%d recall=%v", code, r.Recall)
+	if code, _, r := auditIn(t, dir); code != 0 || r.SelectedPhaseFailedOnly == nil || len(r.SelectedPhaseFailedOnly) != 0 {
+		t.Fatalf("healthy: exit=%d selected_only=%v", code, r.SelectedPhaseFailedOnly)
 	}
 }
 
@@ -609,39 +425,5 @@ func TestAStatusFromAnotherPlanIsRefused(t *testing.T) {
 	code, _, r := auditIn(t, dir)
 	if code != 2 || r.Full.Rust.Examined || !strings.Contains(r.Full.Rust.Note, "stale status") {
 		t.Fatalf("exit=%d rust=%+v", code, r.Full.Rust)
-	}
-}
-
-// Recall is measured on the fast phase's own failures: a failure in a crate the
-// selection ran that the fast phase did not fail is a phase difference (the
-// features it was built with), not a catch and not a miss.
-func TestAFailureInASelectedCrateTheFastPhaseDidNotFailIsNotReproducedNotAMissAndExitsZero(t *testing.T) {
-	in := fastPhase(AuditInput{Plan: selectedCa, Rust: examined(failCdLib), Go: examined(), Base: []string{}})
-	r, notes := Audit(in)
-	if len(r.SelectedNotReproduced) != 1 || r.SelectedNotReproduced[0] != failCdLib.Key() || len(r.Missed) != 0 {
-		t.Fatalf("selected_not_reproduced=%v missed=%v", r.SelectedNotReproduced, r.Missed)
-	}
-	if r.Recall == nil || *r.Recall != 0 || r.NFailed != 1 {
-		t.Errorf("recall=%v n_failed=%d, want 0 of 1", r.Recall, r.NFailed)
-	}
-	if !contains(notes, annotate("warning", "selection ran cd but the fast phase did not fail engine::t::bad")) {
-		t.Errorf("notes = %q", notes)
-	}
-	if code := Exit(in, r); code != 0 {
-		t.Errorf("exit = %d, want 0: a phase difference is priced in recall, not a gate", code)
-	}
-	body, _ := json.Marshal(r)
-	if !bytes.Contains(body, []byte(`"selected_not_reproduced":["rust:cd:--lib:engine::t::bad"]`)) {
-		t.Errorf("artifact = %s", body)
-	}
-	// The same failure, reproduced by the fast phase, is a recall of 1.
-	r, _ = Audit(fastPhase(AuditInput{Plan: selectedCa, Rust: examined(failCdLib), Go: examined(), Base: []string{}}, failCdLib))
-	if r.Recall == nil || *r.Recall != 1 || len(r.SelectedNotReproduced) != 0 {
-		t.Errorf("recall=%v not_reproduced=%v", r.Recall, r.SelectedNotReproduced)
-	}
-	// And with no examined fast phase to read, coverage is not claimed either way.
-	r, _ = Audit(AuditInput{Plan: selectedCa, Rust: examined(failCdLib), Go: examined(), Base: []string{}})
-	if len(r.SelectedNotReproduced) != 0 || len(r.Missed) != 0 {
-		t.Errorf("without a fast phase log: not_reproduced=%v missed=%v", r.SelectedNotReproduced, r.Missed)
 	}
 }

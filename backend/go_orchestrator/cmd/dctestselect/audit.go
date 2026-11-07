@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const recallSchema = 3
+const recallSchema = 4
 
 // Failure is one failed test, in the terms a unit is described in.
 type Failure struct {
@@ -26,10 +26,6 @@ type Failure struct {
 	// package that failed with no failing test (a build failure or a panic).
 	Name string
 }
-
-// unknownPkg is Failure.Pkg when cargo's footer never named the package. Such a
-// failure can match no unit, so it is never a verdict about the selection.
-const unknownPkg = "?"
 
 // Key is the stable identity compared across runs.
 func (f Failure) Key() string {
@@ -344,22 +340,6 @@ func sortFailures(fs []Failure) {
 	sort.Slice(fs, func(i, j int) bool { return fs[i].Key() < fs[j].Key() })
 }
 
-// Covers reports whether the plan's selection ran the failed test's crate or
-// package. Every unit is whole: a Go package, or every target of a crate.
-func (p Plan) Covers(f Failure) bool {
-	if p.Everything {
-		return true
-	}
-	for _, sel := range p.Selected {
-		for _, u := range sel.Units {
-			if u.Kind == f.Kind && u.Pkg == f.Pkg {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // RecallSelected is the artifact's record of one selected command.
 type RecallSelected struct {
 	Cmd   string   `json:"cmd"`
@@ -381,19 +361,10 @@ type FullReport struct {
 	Failed []string    `json:"failed"`
 }
 
-// BaseRecord is where the base's failures came from. A record of another
-// commit than the one the plan measured from can misattribute a failure that
-// was fixed or introduced between the two, so the difference is surfaced.
-type BaseRecord struct {
-	SHA   string `json:"sha"`
-	RunID string `json:"run_id"`
-	Ref   string `json:"ref"`
-	Event string `json:"event"`
-	// MatchesPlanBase is whether SHA is the commit the plan measured from.
-	MatchesPlanBase bool `json:"matches_plan_base"`
-}
-
-// Recall is selection-recall.json.
+// Recall is selection-recall.json: a record of what the job selected, what the
+// full suite failed, and whether each suite could be examined. It carries no
+// recall figure and no verdict about the selection (the file keeps its name so
+// the artifact's consumers keep finding it).
 type Recall struct {
 	Schema     int              `json:"schema"`
 	SHA        string           `json:"sha"`
@@ -407,64 +378,10 @@ type Recall struct {
 	Widened    []Widening       `json:"widened"`
 	Selected   []RecallSelected `json:"selected"`
 	Full       FullReport       `json:"full"`
-	// BaseFailed is null when the base run's failures are not known, which is
-	// not the same as an empty list.
-	BaseFailed []string    `json:"base_failed"`
-	BaseRecord *BaseRecord `json:"base_record"`
-	// Missed are failures the selection did not run and the base did not have.
-	Missed []string `json:"missed"`
-	// SelectedNotReproduced are new failures in a crate or package the
-	// selection ran, that the fast phase did not itself fail: a phase
-	// difference (features, ordering), not a miss. They count against recall.
-	SelectedNotReproduced []string `json:"selected_not_reproduced"`
-	// Unclassified are failures outside the selection while the base is
-	// unknown: they may be the base's own.
-	Unclassified []string `json:"unclassified"`
-	NFailed      int      `json:"n_failed"`
 	// SelectedPhaseFailedOnly are failures of the fast phase that the full
 	// suite did not have: a red only the selected commands' feature set or
 	// ordering produced. Null when either phase was not examined.
 	SelectedPhaseFailedOnly []string `json:"selected_phase_failed_only"`
-	// Recall is null when it cannot be asserted: nothing failed, the base is
-	// unknown, a suite was not examined, or the selection was everything.
-	Recall     *float64 `json:"recall"`
-	RecallNote string   `json:"recall_note"`
-}
-
-// BaseFailures reads the failures a base-branch run recorded. It returns nil,
-// with the reason, when they cannot be trusted: a different schema, a record
-// that is not of a push to wantRef, a run that did not examine both suites, or
-// a document that is not one.
-func BaseFailures(raw []byte, wantRef string) ([]string, BaseRecord, string) {
-	var b struct {
-		Schema int    `json:"schema"`
-		SHA    string `json:"sha"`
-		Ref    string `json:"ref"`
-		Event  string `json:"event"`
-		RunID  string `json:"run_id"`
-		Full   *struct {
-			Rust   SuiteReport `json:"rust"`
-			Go     SuiteReport `json:"go"`
-			Failed *[]string   `json:"failed"`
-		} `json:"full"`
-	}
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, BaseRecord{}, "the base artifact is not JSON: " + err.Error()
-	}
-	rec := BaseRecord{SHA: b.SHA, RunID: b.RunID, Ref: b.Ref, Event: b.Event}
-	switch {
-	case b.Schema != recallSchema:
-		return nil, rec, fmt.Sprintf("the base artifact has schema %d, this build reads %d", b.Schema, recallSchema)
-	case b.Ref != wantRef:
-		return nil, rec, fmt.Sprintf("the base artifact is from ref %q, not %q", b.Ref, wantRef)
-	case b.Event != "push":
-		return nil, rec, fmt.Sprintf("the base artifact is from a %q run, not a push", b.Event)
-	case b.Full == nil || b.Full.Failed == nil:
-		return nil, rec, "the base artifact carries no full.failed list"
-	case !b.Full.Rust.Examined || !b.Full.Go.Examined:
-		return nil, rec, "the base run did not examine both suites, so its failures are not its whole set"
-	}
-	return *b.Full.Failed, rec, ""
 }
 
 // ExitInfo is how one command of a phase ended, as run recorded it.
@@ -505,22 +422,15 @@ func Qualify(run SuiteRun, st *ExitInfo) SuiteRun {
 	return run
 }
 
-// AuditInput is everything Audit measures.
+// AuditInput is everything Audit records.
 type AuditInput struct {
 	Plan                Plan
 	SHA, Ref, Event, ID string
 	Rust                SuiteRun
 	Go                  SuiteRun
-	Base                []string // nil: unknown
-	BaseWhy             string
-	BaseInfo            *BaseRecord
 	// PlanUnusable is set when the plan could not be read: nothing is known
-	// about the selection, so no failure can be called a miss or a catch.
+	// about the selection.
 	PlanUnusable bool
-	// Ran is the selection as it ran: the plan less every selected command
-	// whose status does not say it completed. Covers works from it. Nil means
-	// the plan itself.
-	Ran *Plan
 	// SelectionNote is non-empty when the fast phase could not be examined (a
 	// selected command did not complete, or its status is missing or stale).
 	SelectionNote string
@@ -530,20 +440,14 @@ type AuditInput struct {
 	SelectedKnown            bool
 }
 
-// Audit computes selection-recall.json and the annotations that go with it.
-//
-// A miss is a failure of the full suite that the selection did not run and
-// that the base did not already have. Whether the base failed it is the
-// difference between "DevMap missed a test this change broke" and "this test
-// was broken before"; with the base unknown the first cannot be asserted, so
-// those failures are listed as unclassified and never as misses.
+// Audit computes selection-recall.json and the annotations that go with it. It
+// records; it does not measure the selection against the full suite.
 func Audit(in AuditInput) (Recall, []string) {
 	var notes []string
 	r := Recall{
 		Schema: recallSchema, SHA: in.SHA, Ref: in.Ref, Event: in.Event, RunID: in.ID,
 		Base: in.Plan.Base, Trigger: in.Plan.Trigger, Blast: in.Plan.Blast,
 		Everything: in.Plan.Everything, Widened: in.Plan.Widened, Selected: []RecallSelected{},
-		Missed: []string{}, SelectedNotReproduced: []string{}, Unclassified: []string{},
 	}
 	for _, s := range in.Plan.Selected {
 		r.Selected = append(r.Selected, RecallSelected{Cmd: s.Display, Files: s.Files, Seeds: s.Seeds, Why: s.Why})
@@ -562,14 +466,7 @@ func Audit(in AuditInput) (Recall, []string) {
 		r.Full.Failed = append(r.Full.Failed, f.Key())
 		fullFailed[f.Key()] = true
 	}
-	fullExamined := in.Rust.Examined && in.Go.Examined
-	selectedFailed := map[string]bool{}
-	for _, f := range append(append([]Failure{}, in.SelectedRust.Failures...), in.SelectedGo.Failures...) {
-		selectedFailed[f.Key()] = true
-	}
-	// The fast phase's own failures are evidence only when it was examined.
-	selectedUsable := in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && in.SelectionNote == ""
-	if in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && fullExamined {
+	if in.SelectedKnown && in.SelectedRust.Examined && in.SelectedGo.Examined && in.Rust.Examined && in.Go.Examined {
 		r.SelectedPhaseFailedOnly = []string{}
 		for _, f := range append(append([]Failure{}, in.SelectedRust.Failures...), in.SelectedGo.Failures...) {
 			if !fullFailed[f.Key()] {
@@ -581,61 +478,6 @@ func Audit(in AuditInput) (Recall, []string) {
 			notes = append(notes, annotate("warning", "failed in the selected phase only, not in the full suite: "+k))
 		}
 	}
-
-	baseKnown := in.Base != nil
-	baseSet := map[string]bool{}
-	if baseKnown {
-		r.BaseFailed = append([]string{}, in.Base...)
-		for _, k := range in.Base {
-			baseSet[k] = true
-		}
-		if in.BaseInfo != nil {
-			rec := *in.BaseInfo
-			rec.MatchesPlanBase = rec.SHA != "" && rec.SHA == in.Plan.Base
-			r.BaseRecord = &rec
-			if !rec.MatchesPlanBase && !in.PlanUnusable {
-				notes = append(notes, annotate("notice", fmt.Sprintf("the base record is from %s (run %s) and the plan measured from %s; a test fixed or broken between them is misattributed", rec.SHA, rec.RunID, in.Plan.Base)))
-			}
-		}
-	} else {
-		notes = append(notes, annotate("warning", "base_failed is unknown ("+in.BaseWhy+"); failures outside the selection are unclassified, not misses"))
-	}
-	var attributable []Failure
-	for _, f := range failures {
-		if !baseSet[f.Key()] {
-			attributable = append(attributable, f)
-		}
-	}
-	ran := &in.Plan
-	if in.Ran != nil {
-		ran = in.Ran
-	}
-	// A miss is a verdict about the whole suite and the whole selection, so it
-	// needs both examined. This is the one place that says so; Exit reads the
-	// same facts in the same order.
-	missable := baseKnown && fullExamined && !in.PlanUnusable && in.SelectionNote == ""
-	reproduced := 0
-	for _, f := range attributable {
-		switch {
-		case in.PlanUnusable:
-			r.Unclassified = append(r.Unclassified, f.Key())
-		case ran.Covers(f) && selectedFailed[f.Key()] && selectedUsable:
-			reproduced++
-		case ran.Covers(f) && selectedUsable && !in.Plan.Everything:
-			r.SelectedNotReproduced = append(r.SelectedNotReproduced, f.Key())
-			notes = append(notes, annotate("warning", "selection ran "+f.Pkg+" but the fast phase did not fail "+f.Name))
-		case ran.Covers(f):
-			// Inside the selection, with no examined fast phase to say more;
-			// recall is null in every such case.
-		case missable && f.Pkg != unknownPkg:
-			r.Missed = append(r.Missed, f.Key())
-			notes = append(notes, annotate("error", "selection missed "+f.Key()))
-		default:
-			r.Unclassified = append(r.Unclassified, f.Key())
-		}
-	}
-	r.NFailed = len(attributable)
-
 	for _, s := range []struct {
 		name string
 		run  SuiteRun
@@ -644,40 +486,17 @@ func Audit(in AuditInput) (Recall, []string) {
 			notes = append(notes, annotate("warning", "the full "+s.name+" suite was not examined: "+s.run.Note))
 		}
 	}
-	switch {
-	case in.PlanUnusable:
-		r.RecallNote = "the plan was unusable, so nothing is known about the selection"
-	case !fullExamined:
-		r.RecallNote = "a suite was not examined, so a failure may be absent from the record"
-	case in.SelectionNote != "":
-		r.RecallNote = "the fast phase was not examined (" + in.SelectionNote + "), so what the selection ran is unknown"
+	if in.SelectionNote != "" {
 		notes = append(notes, annotate("warning", "the selected phase was not examined: "+in.SelectionNote))
-	case in.Plan.Everything:
-		r.RecallNote = "the selection was everything, so every failure was inside it and the figure would say nothing about DevMap"
-	case !baseKnown:
-		r.RecallNote = "the base's failures are unknown, so which failures belong to this change is unknown"
-	case r.NFailed == 0:
-		r.RecallNote = "nothing failed that the base did not, so there was no test for the selection to find"
-	default:
-		v := float64(reproduced) / float64(r.NFailed)
-		r.Recall = &v
-		r.RecallNote = fmt.Sprintf("%d of %d new failure(s) were reproduced by the fast phase", reproduced, r.NFailed)
 	}
 	return r, notes
 }
 
-// Exit is the audit's exit code, decided in one place so the order is
-// structural: every way the suites or the selection were not examined (2) comes
-// before a miss (1), and before a clean 0. A suite that was not examined has
-// no verdict, so it never reaches the miss check.
+// Exit is the audit's exit code: 2 when the plan, a suite or the fast phase
+// could not be examined, otherwise 0. The job's gate is the full suite's own
+// step; this is a loud report, never a verdict on the selection.
 func Exit(in AuditInput, r Recall) int {
-	switch {
-	case in.PlanUnusable, !r.Full.Rust.Examined, !r.Full.Go.Examined, in.SelectionNote != "":
-		return 2
-	case len(r.Missed) > 0:
-		return 1
-	case len(r.Unclassified) > 0:
-		// Failures that cannot be called misses or not: not a pass.
+	if in.PlanUnusable || !r.Full.Rust.Examined || !r.Full.Go.Examined || in.SelectionNote != "" {
 		return 2
 	}
 	return 0

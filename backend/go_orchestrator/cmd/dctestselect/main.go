@@ -1,20 +1,18 @@
 // Command dctestselect runs the tests DevMap says a change reaches before the
-// full suite, and measures how much of what the full suite then fails the
-// selection had already run.
+// full suite, and records what it selected and what each suite showed. It
+// orders and records; it does not measure the selection's recall.
 //
 //	dctestselect plan  [--repo DIR] [--devmap BIN] [--event E --ref-name R --before SHA --base-ref B | --base REV] --out plan.json
 //	dctestselect run   --plan plan.json --phase selected|full [--log-dir DIR]
-//	dctestselect audit --plan plan.json [--log-dir DIR] [--base-artifact F] --sha SHA --out selection-recall.json
+//	dctestselect audit --plan plan.json [--log-dir DIR] --sha SHA --out selection-recall.json
 //
-// The selection orders the work and prices the graph; it never replaces the
-// full suite. So every doubt widens it, and the audit reports a failure that
-// the selection did not run and the base did not have as `selection missed`.
+// The selection orders the work; it never replaces the full suite. So every
+// doubt widens it.
 //
 // Exit codes: plan 0 a plan was written (possibly "everything") · 2 it could
 // not be written. run 0 every command passed · 1 a command failed · 2 a
-// command could not run. audit 0 no miss · 1 a miss · 2 a suite was not
-// examined, failures could not be classified, or the artifact could not be
-// written. The artifact is written on every path that can write it.
+// command could not run. audit 0 everything was examined · 2 a suite or the
+// fast phase was not examined, or the artifact could not be written. The artifact is written on every path that can write it.
 package main
 
 import (
@@ -166,8 +164,6 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
 	planPath := fs.String("plan", "plan.json", "the plan the run followed")
 	logDir := fs.String("log-dir", "", "where run kept its logs and status files (default: beside --plan)")
-	baseArtifact := fs.String("base-artifact", "", "the base branch's selection-recall.json (optional)")
-	baseBranch := fs.String("base-branch", "main", "the branch whose record is the base")
 	sha := fs.String("sha", "", "the commit under test")
 	ref := fs.String("ref", "", "GITHUB_REF")
 	event := fs.String("event", "", "GITHUB_EVENT_NAME")
@@ -206,19 +202,7 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	in.Go = suite("full-go.jsonl", "the go test -json log", parseGoJSON)
 	in.SelectedRust, in.SelectedGo, in.SelectedKnown = readSelected(*logDir, plan)
 	if planErr == nil {
-		in.Ran, in.SelectionNote = ranSelection(plan, filepath.Join(*logDir, "selected-status.json"), planSHA, in.SelectedRust, in.SelectedGo)
-	}
-	in.BaseWhy = "no base-branch artifact was given"
-	if *baseArtifact != "" {
-		if body, err := os.ReadFile(*baseArtifact); err != nil {
-			in.BaseWhy = "the base artifact could not be read: " + err.Error()
-		} else {
-			var rec BaseRecord
-			in.Base, rec, in.BaseWhy = BaseFailures(body, "refs/heads/"+*baseBranch)
-			if in.Base != nil {
-				in.BaseInfo = &rec
-			}
-		}
+		in.SelectionNote = selectionNote(plan, filepath.Join(*logDir, "selected-status.json"), planSHA, in.SelectedRust, in.SelectedGo)
 	}
 	recall, notes := Audit(in)
 	if planErr != nil {
@@ -233,26 +217,22 @@ func auditCmd(args []string, stdout io.Writer) (int, error) {
 	return Exit(in, recall), nil
 }
 
-// ranSelection is the selection as it ran, read from the fast phase's status
-// file: the plan less every selected command whose status does not say it
-// completed, whose log was not examined, or that ran nothing for a unit (a cargo
-// compile error exits 101 and leaves no `test result:`: it completed, and ran
-// nothing). A plan that selected
-// nothing, or everything, has no fast phase to read. Otherwise a status that is
-// missing, stale (another plan's) or lacks a selected command means what ran is
-// unknown, and the note says so.
-func ranSelection(plan Plan, statusPath, planSHA string, rust, golang SuiteRun) (*Plan, string) {
+// selectionNote says why the fast phase could not be examined, or "" when it
+// was (or when the plan selected nothing, or everything, so there is no fast
+// phase to read). Each selected command must have a status that says it
+// completed, a log that was examined, and a result for every unit: a cargo
+// compile error exits 101 and leaves no `test result:`, so it completed and ran
+// nothing. A status that is missing, stale (another plan's) or lacks a selected
+// command means what ran is unknown.
+func selectionNote(plan Plan, statusPath, planSHA string, rust, golang SuiteRun) string {
 	if plan.Everything || len(plan.Selected) == 0 {
-		return &plan, ""
+		return ""
 	}
 	status, err := loadStatus(statusPath, planSHA)
 	if err != nil {
-		return &Plan{Selected: []Selected{}}, "no usable fast-phase status: " + err.Error()
+		return "no usable fast-phase status: " + err.Error()
 	}
 	by := status.byCmd()
-	ran := plan
-	ran.Selected = nil
-	note := ""
 	for _, s := range plan.Selected {
 		st := by[s.Display]
 		log := rust
@@ -261,20 +241,17 @@ func ranSelection(plan Plan, statusPath, planSHA string, rust, golang SuiteRun) 
 		}
 		switch {
 		case st == nil:
-			note = "the status has no entry for " + s.Display
+			return "the status has no entry for " + s.Display
 		case !st.Completed:
-			note = s.Display + " did not run to completion (" + st.Detail + ")"
+			return s.Display + " did not run to completion (" + st.Detail + ")"
 		case !log.Examined:
-			note = s.Display + " left a log that was not examined (" + log.Note + ")"
-		default:
-			if why := unexaminedUnits(s, st, log); why != "" {
-				note = s.Display + " " + why
-				continue
-			}
-			ran.Selected = append(ran.Selected, s)
+			return s.Display + " left a log that was not examined (" + log.Note + ")"
+		}
+		if why := unexaminedUnits(s, st, log); why != "" {
+			return s.Display + " " + why
 		}
 	}
-	return &ran, note
+	return ""
 }
 
 // unexaminedUnits says why a selected command that completed ran nothing for

@@ -113,17 +113,25 @@ func a3cargo(t *testing.T, root string, logs map[string]string, argv []string) s
 
 var a3full = []string{"cargo", "test", "--workspace", "--no-fail-fast"}
 
-// a3audit audits a plan against the logs of the full suite and of the fast
-// phase, as the job does, with the base known and empty.
 func a3audit(t *testing.T, p Plan, fullLog, selLog string) (Recall, int) {
 	t.Helper()
-	in := AuditInput{Plan: p, Rust: parseLibtest(strings.NewReader(fullLog)), Go: examined(), Base: []string{},
+	in := AuditInput{Plan: p, Rust: parseLibtest(strings.NewReader(fullLog)), Go: examined(),
 		SelectedRust: parseLibtest(strings.NewReader(selLog)), SelectedGo: examined(), SelectedKnown: true}
 	if !in.Rust.Examined || !in.SelectedRust.Examined {
 		t.Fatalf("a log was not examined: full %q selected %q", in.Rust.Note, in.SelectedRust.Note)
 	}
 	r, _ := Audit(in)
 	return r, Exit(in, r)
+}
+
+// a3selectedFailed is whether the fast phase's own log fails the named test.
+func a3selectedFailed(selLog, name string) bool {
+	for _, f := range parseLibtest(strings.NewReader(selLog)).Failures {
+		if strings.HasSuffix(f.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func a3plan(ws *RustWorkspace, changed string) Plan {
@@ -186,15 +194,17 @@ func TestE2ECrateSelectionRunsEveryTargetTheFullSuiteRunsInTheCrate(t *testing.T
 		if !keyed(r, tc.test) {
 			t.Fatalf("fixture: the full suite did not fail %s: %v", tc.test, r.Full.Failed)
 		}
-		if len(r.Missed) != 0 || len(r.SelectedNotReproduced) != 0 || r.Recall == nil || *r.Recall != 1 || code != 0 {
-			t.Errorf("%s: missed=%v not_reproduced=%v recall=%v exit=%d; full failed %v", tc.file, r.Missed, r.SelectedNotReproduced, r.Recall, code, r.Full.Failed)
+		// The fast phase failed this test too, and nothing failed only there.
+		if len(r.SelectedPhaseFailedOnly) != 0 || !a3selectedFailed(a3cargo(t, root, logs, p.Selected[0].Argv), tc.test) || code != 0 {
+			t.Errorf("%s: selected_only=%v exit=%d; full failed %v", tc.file, r.SelectedPhaseFailedOnly, code, r.Full.Failed)
 		}
 	}
 }
 
 // Crate a's lib has a test behind `extra`, which only b's dependency on a turns
 // on. --workspace builds a with it. Selecting a with its dependent in one cargo
-// command builds it the same way, so the fast phase fails the same test.
+// command builds it the same way, so the fast phase fails the same test (`-p a`
+// alone would build a without `extra`).
 var a3pairFiles = map[string]string{
 	"rust/Cargo.toml":   "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"b\"]\n",
 	"rust/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nextra = []\n",
@@ -214,22 +224,8 @@ func TestE2EACrateAndItsDependentBuildInOneCommandWithTheFeaturesTheFullSuiteBui
 	if !keyed(r, "extra_bad") {
 		t.Fatalf("fixture: --workspace did not run extra_bad: %v", r.Full.Failed)
 	}
-	if r.Recall == nil || *r.Recall != 1 || len(r.SelectedNotReproduced) != 0 || code != 0 {
-		t.Fatalf("recall=%v not_reproduced=%v exit=%d: the fast phase did not run extra_bad", r.Recall, r.SelectedNotReproduced, code)
-	}
-}
-
-// If a phase difference remains (here, the old per-crate command `-p a`, which
-// builds a without `extra`), it is priced, not hidden: recall is 0, the failure
-// is listed in selected_not_reproduced, and the audit does not exit 1.
-func TestE2EAPhaseDifferenceIsPricedInRecallAndListedNotCountedCaughtOrMissed(t *testing.T) {
-	root, ws := a3fixture(t, a3pairFiles)
-	logs := map[string]string{}
-	p := a3plan(ws, "rust/a/src/lib.rs")
-	p.Selected[0].Units = p.Selected[0].Units[:1]
-	r, code := a3audit(t, p, a3cargo(t, root, logs, a3full), a3cargo(t, root, logs, []string{"cargo", "test", "--locked", "-p", "a", "--no-fail-fast"}))
-	if r.Recall == nil || *r.Recall != 0 || len(r.SelectedNotReproduced) != 1 || len(r.Missed) != 0 || code != 0 {
-		t.Fatalf("recall=%v not_reproduced=%v missed=%v exit=%d; full failed %v", r.Recall, r.SelectedNotReproduced, r.Missed, code, r.Full.Failed)
+	if !a3selectedFailed(a3cargo(t, root, logs, p.Selected[0].Argv), "extra_bad") || len(r.SelectedPhaseFailedOnly) != 0 || code != 0 {
+		t.Fatalf("selected_only=%v exit=%d: the fast phase did not run extra_bad", r.SelectedPhaseFailedOnly, code)
 	}
 }
 

@@ -253,30 +253,6 @@ func TestGoJSONEdgeCases(t *testing.T) {
 	}
 }
 
-// ATTACK 5: recall math.
-func TestAnEverythingPlanHasNullRecall(t *testing.T) {
-	in := AuditInput{
-		Plan: Plan{Schema: 1, Everything: true},
-		Rust: SuiteRun{Examined: true, Failures: []Failure{{Kind: "rust", Pkg: "ca", Target: "--lib", Name: "x"}}},
-		Go:   SuiteRun{Examined: true},
-		Base: []string{},
-	}
-	r, _ := Audit(in)
-	if r.Recall != nil {
-		t.Fatalf("recall = %v for a plan that selected EVERYTHING; a widened run says nothing about DevMap's recall", *r.Recall)
-	}
-}
-
-func TestABaseArtifactFromAnotherRefEventOrSchemaIsRefused(t *testing.T) {
-	// A feature branch's own artifact (trigger pull_request, other sha) that
-	// lists every test as failing would hide every miss if it were read as the base.
-	body := []byte(`{"schema":1,"sha":"feature","trigger":"pull_request","full":{"rust":{"examined":true},"go":{"examined":true},"failed":["rust:ca:--lib:x"]}}`)
-	got, _, why := BaseFailures(body, mainRef)
-	if got != nil {
-		t.Fatalf("accepted an artifact from trigger=pull_request sha=feature as the base's failures (why=%q); Recall has no ref field to check", why)
-	}
-}
-
 // ATTACK 6/7: injection into the runner's workflow-command channel, and the
 // process-group kill.
 func TestAFileNameCannotInjectAWorkflowCommand(t *testing.T) {
