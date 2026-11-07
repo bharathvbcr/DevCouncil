@@ -53,14 +53,18 @@ func (c *Client) EnableWarmMCP() {
 
 // EnableWarmMCPContext is EnableWarmMCP with an owner: the warm `devmap mcp`
 // process is a child of ctx, and cancelling ctx closes the session and kills
-// the process group. Only the first owner is kept; a client has one lifetime.
+// the process group. The first live owner is kept; an owner that has already
+// been cancelled is replaced, so enabling again after a cancel installs the new
+// context. After the owner is cancelled warm calls fall back to the CLI path
+// instead of failing; Close still only shuts the current session down and does
+// not mark the client unusable.
 func (c *Client) EnableWarmMCPContext(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	c.warmMu.Lock()
 	c.warmEnabled = true
-	register := c.ownerCtx == nil
+	register := c.ownerCtx == nil || c.ownerCtx.Err() != nil
 	if register {
 		c.ownerCtx = ctx
 	}
@@ -148,6 +152,9 @@ type mcpSession struct {
 	closeErr error
 	done     chan struct{}
 	waitDone chan struct{}
+	// reaped is set once cmd.Wait has returned: exec's stderr copier has then
+	// finished writing to stderr, so the buffer may be read without a race.
+	reaped atomic.Bool
 }
 
 func startMCPSession(ctx, owner context.Context, binary, root string, maxOut, maxErr int) (*mcpSession, error) {
@@ -229,6 +236,7 @@ func startMCPSession(ctx, owner context.Context, binary, root string, maxOut, ma
 			}
 		}
 		waitErr := cmd.Wait()
+		sess.reaped.Store(true)
 		sess.failAll(sess.deathError(waitErr))
 		close(sess.waitDone)
 	}()
@@ -407,7 +415,10 @@ const warmStderrTail = 2 << 10
 // stderrTail is the last bytes the child wrote to stderr, flattened to one
 // printable line, for inclusion in an error. Empty when it wrote nothing.
 func (s *mcpSession) stderrTail() string {
-	if s.stderr == nil {
+	// CappedBuffer has no lock and exec's copier writes to it until Wait
+	// returns, so it is read only after the process is reaped. A live session
+	// reports no tail rather than racing the writer.
+	if s.stderr == nil || !s.reaped.Load() {
 		return ""
 	}
 	raw := s.stderr.Bytes()
@@ -581,8 +592,14 @@ func (c *Client) decodeWarmMCP(ctx context.Context, into any, timeout time.Durat
 
 	c.warmMu.Lock()
 	enabled := c.warmEnabled && !c.warmDisabled
+	ownerGone := c.ownerCtx != nil && c.ownerCtx.Err() != nil
 	c.warmMu.Unlock()
 	if !enabled || len(args) == 0 {
+		return false, nil
+	}
+	if ownerGone {
+		// The owner's lifetime is over: its session was closed with it. Answer
+		// from the CLI rather than failing every call with "context canceled".
 		return false, nil
 	}
 
@@ -624,7 +641,10 @@ func (c *Client) decodeWarmMCP(ctx context.Context, into any, timeout time.Durat
 		// the server never answered: it is hung, not slow. Kill it, so the
 		// next call starts a fresh process instead of queueing behind it.
 		if ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
-			c.dropWarmSession(sess)
+			c.dropWarmSession(sess) // kills the group and waits for the reap
+			if tail := sess.stderrTail(); tail != "" {
+				callErr = fmt.Errorf("%w (stderr: %s)", callErr, tail)
+			}
 		}
 		return true, callErr
 	}
