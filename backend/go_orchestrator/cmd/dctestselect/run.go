@@ -369,6 +369,7 @@ func loadPlan(path string) (Plan, string, error) {
 			return Plan{}, "", fmt.Errorf("%s has a full-suite command with no argv", path)
 		}
 	}
+	p.normalize()
 	sum := sha256.Sum256(body)
 	return p, hex.EncodeToString(sum[:]), nil
 }

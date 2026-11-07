@@ -79,6 +79,38 @@ type Plan struct {
 	Notices    []string   `json:"notices"`
 }
 
+// normalize turns every list a plan decoded as JSON null into an empty one. The
+// strict decode accepts `"widened": null`, so a hand-edited or foreign plan
+// reaches the consumers with nil lists; the artifact would then carry null where
+// its schema says a list. Every plan is read through loadPlan, so this is the
+// one place that makes them all the same shape.
+func (p *Plan) normalize() {
+	if p.Widened == nil {
+		p.Widened = []Widening{}
+	}
+	if p.Selected == nil {
+		p.Selected = []Selected{}
+	}
+	if p.Dropped == nil {
+		p.Dropped = []Dropped{}
+	}
+	if p.Notices == nil {
+		p.Notices = []string{}
+	}
+	for i := range p.Selected {
+		s := &p.Selected[i]
+		if s.Units == nil {
+			s.Units = []Unit{}
+		}
+		if s.Files == nil {
+			s.Files = []string{}
+		}
+		if s.Seeds == nil {
+			s.Seeds = []string{}
+		}
+	}
+}
+
 // RustTarget is one cargo target, from `cargo metadata`.
 type RustTarget struct {
 	Name  string
