@@ -282,8 +282,30 @@ func unexaminedUnits(s Selected, st *ExitInfo, log SuiteRun) string {
 		}
 	case st.Code != 0 && log.FailedResults == 0:
 		return fmt.Sprintf("exited %d and its log records no `test result: FAILED`, so no test ran", st.Code)
+	default:
+		for _, u := range s.Units {
+			if !ranCargoUnit(u, log) {
+				return "ran nothing for " + u.Pkg + ": its log has no section for any of its test targets"
+			}
+		}
 	}
 	return ""
+}
+
+// ranCargoUnit is whether a finished cargo section belongs to the crate: its
+// `Running` header names one of the crate's test targets (source and binary
+// name), or a failed section's footer names the crate. A crate with no target to
+// look for is not checked: nothing says cargo would print a section for it.
+func ranCargoUnit(u Unit, log SuiteRun) bool {
+	if len(u.Runs) == 0 || log.Done[u.Pkg] {
+		return true
+	}
+	for _, run := range u.Runs {
+		if log.Sources[run] {
+			return true
+		}
+	}
+	return false
 }
 
 // readSelected reads the fast phase's logs. They are known only when every

@@ -30,6 +30,21 @@ type Unit struct {
 	Kind string `json:"kind"` // "rust" or "go"
 	// Pkg is a cargo package name or a Go import path.
 	Pkg string `json:"pkg"`
+	// Runs are the crate's test targets that cargo runs with no feature switched
+	// on. libtest prints a section for each, headed by its source and binary
+	// name, so a crate whose log shows none of them ran nothing. Empty for Go,
+	// and for a crate with no such target (every target `test = false` or gated
+	// by a feature), which cannot be asked for a section and is not checked.
+	Runs []UnitRun `json:"runs,omitempty"`
+}
+
+// UnitRun is a test target as cargo's `Running` header spells it: the source
+// path relative to the package (cargo prints it that way, so two crates both
+// print `src/lib.rs`) and the crate name its binary is named for, which tells
+// them apart.
+type UnitRun struct {
+	Src  string `json:"src"`
+	Name string `json:"name"`
 }
 
 // Selected is one command of the fast phase.
@@ -117,6 +132,8 @@ type RustTarget struct {
 	Kinds []string
 	Src   string // repository-relative
 	Test  bool
+	// Gated is true when the target has required-features, so cargo may skip it.
+	Gated bool
 }
 
 func (t RustTarget) is(kind string) bool {

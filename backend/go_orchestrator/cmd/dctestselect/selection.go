@@ -212,6 +212,7 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 		// to run; a command with no -p would run the whole workspace.
 		if len(chosen) > 0 {
 			out = append(out, assemble("rust", "dependents", s.rust, chosen, seeds, func(file, dir string) bool { return strings.HasPrefix(file, dir+"/") },
+				func(name string) Unit { return rustUnit(byName[name]) },
 				func(names []string) Command {
 					argv := []string{"cargo", "test", "--locked"}
 					for _, n := range names {
@@ -238,6 +239,7 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 		}
 		if len(chosen) > 0 {
 			out = append(out, assemble("go", "importers", s.gos, chosen, seeds, func(file, dir string) bool { return path.Dir(file) == dir },
+				func(name string) Unit { return Unit{Kind: "go", Pkg: name} },
 				func(names []string) Command {
 					return newCommand(s.in.GoDir, append([]string{"go", "test", "-count=1", "-json"}, names...)...)
 				}))
@@ -246,10 +248,22 @@ func (s *selection) commands(seeds []devmap.BlastSeed) []Selected {
 	return out
 }
 
+// rustUnit is a crate as a selected unit, with the test targets cargo runs
+// without any feature on: the headers the audit looks for in the log.
+func rustUnit(pkg RustPackage) Unit {
+	u := Unit{Kind: "rust", Pkg: pkg.Name}
+	for _, t := range pkg.Targets {
+		if t.Test && !t.Gated {
+			u.Runs = append(u.Runs, UnitRun{Src: strings.TrimPrefix(t.Src, pkg.Dir+"/"), Name: strings.ReplaceAll(t.Name, "-", "_")})
+		}
+	}
+	return u
+}
+
 // assemble builds the one command of a kind over the chosen units: the changed
 // ones (direct) and those that depend on them.
 func assemble(kind, label string, direct map[string]*unitSel, chosen map[string]bool, seeds []devmap.BlastSeed,
-	under func(file, dir string) bool, command func(names []string) Command) Selected {
+	under func(file, dir string) bool, unitOf func(name string) Unit, command func(names []string) Command) Selected {
 	var units []Unit
 	var whys, extra []string
 	files := map[string]bool{}
@@ -261,7 +275,7 @@ func assemble(kind, label string, direct map[string]*unitSel, chosen map[string]
 	}
 	names := sortedKeys(chosen)
 	for _, name := range names {
-		units = append(units, Unit{Kind: kind, Pkg: name})
+		units = append(units, unitOf(name))
 		if direct[name] == nil {
 			extra = append(extra, name)
 		}

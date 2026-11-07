@@ -148,7 +148,7 @@ func TestASourceFileSelectsEveryTargetOfItsCrate(t *testing.T) {
 		t.Fatalf("a source change inside the mapping must not widen: %v", p.Widened)
 	}
 	whole := wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
-	if whole.Dir != "rust" || len(whole.Units) != 1 || !reflect.DeepEqual(whole.Units[0], Unit{Kind: "rust", Pkg: "ca"}) {
+	if whole.Dir != "rust" || len(whole.Units) != 1 || !reflect.DeepEqual(whole.Units[0], Unit{Kind: "rust", Pkg: "ca", Runs: []UnitRun{{"src/lib.rs", "ca"}, {"src/main.rs", "ca"}, {"tests/foo.rs", "foo"}, {"tests/bar.rs", "bar"}}}) {
 		t.Errorf("unit = %+v dir=%q", whole.Units, whole.Dir)
 	}
 	if len(whole.Seeds) != 1 || whole.Seeds[0] != "rust/ca/src/engine.rs::run" || len(whole.Files) != 1 {

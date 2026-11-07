@@ -46,8 +46,12 @@ type SuiteRun struct {
 	// FailedResults counts the `test result: FAILED` lines of a cargo log: the
 	// proof that a non-zero exit came from tests that ran.
 	FailedResults int
-	// Done is the Go packages with a final pass, fail or skip action.
+	// Done is the Go packages with a final pass, fail or skip action, or the
+	// cargo packages a failed section's footer names.
 	Done map[string]bool
+	// Sources is the source path and binary crate name each finished cargo
+	// section's `Running` header names, as cargo printed them.
+	Sources map[UnitRun]bool
 }
 
 var (
@@ -61,6 +65,8 @@ var (
 	libtestResult       = regexp.MustCompile(`^test result: `)
 	libtestResultFailed = regexp.MustCompile(`^test result: FAILED`)
 	libtestCompile      = regexp.MustCompile(`^error: could not compile `)
+	libtestSource       = regexp.MustCompile(`^ {5}Running (?:unittests )?(\S.*) \(([^()\s]+)\)$`)
+	libtestBinary       = regexp.MustCompile(`^(.+)-[0-9a-f]{16}(?:\.exe)?$`)
 	ansiEscape          = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 )
 
@@ -85,6 +91,8 @@ func parseLibtest(r io.Reader) SuiteRun {
 	sc.Buffer(make([]byte, 64<<10), maxLogLine)
 	var run SuiteRun
 	var section []string
+	var header string
+	run.Done, run.Sources = map[string]bool{}, map[UnitRun]bool{}
 	var st blockState
 	compileErrors, results, incomplete := 0, 0, 0
 	seen := map[Failure]bool{}
@@ -94,6 +102,12 @@ func parseLibtest(r io.Reader) SuiteRun {
 		}
 		failed, pkg, target, done, resultFailed := readSection(section)
 		if done {
+			if m := libtestSource.FindStringSubmatch(header); m != nil {
+				run.Sources[UnitRun{Src: m[1], Name: binaryCrate(m[2])}] = true
+			}
+			if pkg != "?" {
+				run.Done[pkg] = true
+			}
 			results++
 			if resultFailed {
 				run.FailedResults++
@@ -121,6 +135,7 @@ func parseLibtest(r io.Reader) SuiteRun {
 		// is the test's own text: a migration log, a spawned cargo.
 		if libtestSection.MatchString(line) && (section == nil || st.closed()) {
 			finish()
+			header = line
 			section = []string{}
 			st = blockState{}
 			continue
@@ -145,6 +160,16 @@ func parseLibtest(r io.Reader) SuiteRun {
 	}
 	sortFailures(run.Failures)
 	return run
+}
+
+// binaryCrate is the crate name a test binary is named for: the file name
+// without cargo's `-<hash>` suffix, which is the target's name with `-` as `_`.
+func binaryCrate(binPath string) string {
+	base := binPath[strings.LastIndexAny(binPath, `/\`)+1:]
+	if m := libtestBinary.FindStringSubmatch(base); m != nil {
+		return m[1]
+	}
+	return base
 }
 
 // blockState follows one test binary's output far enough to know whether a

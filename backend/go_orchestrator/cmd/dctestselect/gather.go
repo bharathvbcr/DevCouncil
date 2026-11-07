@@ -249,6 +249,8 @@ type metadataWire struct {
 			Kind    []string `json:"kind"`
 			SrcPath string   `json:"src_path"`
 			Test    *bool    `json:"test"`
+			// RequiredFeatures gate a target: cargo skips it unless they are on.
+			RequiredFeatures []string `json:"required-features"`
 		} `json:"targets"`
 	} `json:"packages"`
 	WorkspaceMembers []string `json:"workspace_members"`
@@ -311,7 +313,7 @@ func decodeMetadata(raw []byte, repo string) (*RustWorkspace, error) {
 			if err != nil {
 				return nil, fmt.Errorf("target %s of %s: %w", t.Name, p.Name, err)
 			}
-			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, Test: *t.Test})
+			pkg.Targets = append(pkg.Targets, RustTarget{Name: t.Name, Kinds: t.Kind, Src: src, Test: *t.Test, Gated: len(t.RequiredFeatures) > 0})
 		}
 		ws.Packages = append(ws.Packages, pkg)
 	}
