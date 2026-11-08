@@ -146,12 +146,18 @@ impl DeltaStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // SQLite opens lazily: read now, so a refusal is reported here.
         conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
-            .with_context(|| {
-                format!(
-                    "delta store {} cannot be read read-only (a WAL-mode delta from an earlier \
-                     build in a read-only state directory is unreadable, not empty)",
-                    path.display()
-                )
+            .map_err(|err| {
+                let hot = matches!(&err, rusqlite::Error::SqliteFailure(e, _)
+                    if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK);
+                let why = if hot {
+                    "a writer was interrupted and left a hot rollback journal that a read-only \
+                     open cannot roll back; run `devmap seed --sync-delta` to recover"
+                } else {
+                    "a WAL-mode delta from an earlier build in a read-only state directory is \
+                     unreadable, not empty"
+                };
+                anyhow::Error::new(err)
+                    .context(format!("delta store {} cannot be read read-only ({why})", path.display()))
             })?;
         Ok(Some(Self {
             conn: Mutex::new(conn),
@@ -168,12 +174,19 @@ impl DeltaStore {
     }
 
     fn configure(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "PRAGMA trusted_schema = OFF;
-             PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = DELETE;",
-        )?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON;")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // The pragma answers with the mode in force: leaving WAL needs exclusive
+        // access, so a legacy WAL delta another connection holds stays WAL.
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))
+            .context("cannot switch the delta store to rollback-journal mode (another connection holds it)")?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            bail!(
+                "delta store stayed in {mode} journal mode (another connection holds it open); \
+                 close it and retry"
+            );
+        }
         Ok(())
     }
 
@@ -529,6 +542,71 @@ mod tests {
                 assert!(text.contains("read-only") && text.contains("not empty"), "{text}");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leave `dir/delta.sqlite` + a hot `-journal`, as a writer killed mid-commit
+    /// does: the copy is taken while a spilling transaction is open, then the
+    /// writer is dropped, so nothing in `dir` holds a lock.
+    pub(crate) fn hot_journal_delta(dir: &Path) -> PathBuf {
+        let src = temp_dir("hotsrc");
+        let path = dir.join("delta.sqlite");
+        std::fs::create_dir_all(dir).unwrap();
+        {
+            let w = DeltaStore::open(src.join("delta.sqlite")).unwrap();
+            w.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
+        }
+        let mut conn = Connection::open(src.join("delta.sqlite")).unwrap();
+        conn.execute_batch("PRAGMA cache_size = 1;").unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        for i in 0..400 {
+            tx.execute(
+                "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
+                 VALUES (?1, 'x', 1, ?2, 1)",
+                params![format!("src/spill_{i}.rs"), "y".repeat(2000)],
+            )
+            .unwrap();
+        }
+        assert!(src.join("delta.sqlite-journal").metadata().unwrap().len() > 0, "fixture: a live journal");
+        std::fs::copy(src.join("delta.sqlite"), &path).unwrap();
+        std::fs::copy(src.join("delta.sqlite-journal"), dir.join("delta.sqlite-journal")).unwrap();
+        drop(tx);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&src);
+        path
+    }
+
+    /// FIX-A: a read-only open cannot roll a hot journal back; it names the
+    /// cause and the recovery command, and a writable open recovers.
+    #[test]
+    fn a_hot_rollback_journal_is_refused_read_only_with_the_recovery_command_and_a_writer_recovers() {
+        let dir = temp_dir("hotjournal");
+        let path = hot_journal_delta(&dir);
+        let err = format!("{:#}", DeltaStore::open_read_only(&path).err().expect("a hot journal is refused"));
+        assert!(err.contains("hot rollback journal"), "{err}");
+        assert!(err.contains("devmap seed --sync-delta"), "{err}");
+        assert!(!err.contains("WAL-mode delta"), "wrong cause named: {err}");
+        drop(DeltaStore::open(&path).unwrap());
+        let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
+        assert_eq!(reader.dirty_file_count().unwrap(), 1, "the interrupted transaction rolled back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX-E: leaving WAL needs exclusive access; a legacy WAL delta another
+    /// connection holds open is refused, not silently kept in WAL.
+    #[test]
+    fn a_delta_that_cannot_leave_wal_is_refused() {
+        let dir = temp_dir("stayswal");
+        let path = dir.join("delta.sqlite");
+        let held = Connection::open(&path).unwrap();
+        let _: String = held.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+        held.execute_batch(DELTA_SCHEMA_DDL).unwrap();
+        held.execute_batch("BEGIN; SELECT COUNT(*) FROM delta_files;").unwrap();
+        let err = format!("{:#}", DeltaStore::open(&path).err().expect("must refuse"));
+        assert!(err.contains("rollback-journal mode"), "{err}");
+        held.execute_batch("COMMIT;").unwrap();
+        drop(held);
+        DeltaStore::open(&path).expect("once nothing holds it, it converts");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
