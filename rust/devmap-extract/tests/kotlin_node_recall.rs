@@ -378,3 +378,15 @@ class Holder {
         ]
     );
 }
+
+#[test]
+fn a_multi_line_twin_with_the_semicolon_before_an_accessor_is_repaired_too() {
+    for source in [
+        "class A {\nvar v = 0; set(x) { }; fun f() { g() }\n}\n",
+        "class A {\nvar v = 0; set(x) { }\n fun f() { g() }\n}\n",
+    ] {
+        let extraction = extract_file("A.kt", source);
+        assert!(is_clean(&extraction), "{source:?}: {:?}", extraction.parse_outcome);
+        assert!(names(&extraction).contains(&"A.kt::A.f".to_string()));
+    }
+}

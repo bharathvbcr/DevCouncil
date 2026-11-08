@@ -36,8 +36,8 @@ fn range_of(source: &str, text: &str) -> TextRange {
 }
 
 /// What each swallowed declaration kind becomes after recovery: the symbols it
-/// emits, by qualified name and kind, and nothing else. A property and a type
-/// alias are recovered declarations that emit no symbol.
+/// emits, by qualified name and kind, and nothing else. A private property is a
+/// recovered declaration that emits no symbol; a type alias is a `Struct`.
 #[test]
 fn every_swallowed_declaration_kind_is_recovered_as_the_declaration_it_is() {
     for (declaration, want) in [
@@ -49,7 +49,7 @@ fn every_swallowed_declaration_kind_is_recovered_as_the_declaration_it_is() {
         ("internal class Q", vec![("Q", SymbolKind::Class)]),
         ("private val y = 1", vec![]),
         ("private var y = 1", vec![]),
-        ("private typealias T = Int", vec![]),
+        ("private typealias T = Int", vec![("T", SymbolKind::Struct)]),
         ("open class O", vec![("O", SymbolKind::Class)]),
         ("sealed interface S", vec![("S", SymbolKind::Interface)]),
         ("abstract class AC {}", vec![("AC", SymbolKind::Class)]),

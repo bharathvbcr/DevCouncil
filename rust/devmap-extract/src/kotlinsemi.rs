@@ -391,6 +391,16 @@ fn candidates(
                 }
             }
         }
+        // Or the grammar kept it: an ERROR node, a property or a `;` token whose
+        // last byte is the `;`.
+        if (node.is_error() || kind == "property_declaration" || kind == ";")
+            && node.end_byte() > 0
+            && text.get(node.end_byte() - 1) == Some(&b';')
+            && accessor_after(text, node.end_byte() - 1)
+            && !done.contains(&(node.end_byte() - 1))
+        {
+            found.push(node.end_byte() - 1);
+        }
         if !node.is_named() && kind == "}" {
             let at = node.start_byte();
             let closes_a_body = bounded_parent(node).is_some_and(|parent| {
