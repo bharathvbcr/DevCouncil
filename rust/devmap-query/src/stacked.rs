@@ -3813,9 +3813,12 @@ mod tests {
         fs::create_dir_all(&imp_dir).unwrap();
         fs::copy(store_path(&other), imp_dir.join("base.sqlite")).unwrap();
         set_file_readonly(&imp_dir.join("base.sqlite")).unwrap();
+        // Same CSR as the donor's, so the impostor differs only in its graph and
+        // admission reaches the sha and key checks rather than a missing file.
+        fs::copy(entry.join(BASE_CSR), imp_dir.join(BASE_CSR)).unwrap();
+        set_file_readonly(&imp_dir.join(BASE_CSR)).unwrap();
         let mut forged = manifest.clone();
         forged.base_sqlite_sha256 = sha256_file_hex(&imp_dir.join("base.sqlite")).unwrap();
-        forged.csr_sha256 = None;
         fs::write(imp_dir.join("manifest.json"), serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
         set_dir_mode(&imp_dir, 0o555).unwrap();
         // The swap lands after publish returned `entry` and before admission.
@@ -3841,14 +3844,19 @@ mod tests {
 
         // A swap whose manifest still describes the honest bytes fails the sha check.
         assert!(a2_swap(&entry, &imp_dir));
-        let mut lying = manifest.clone();
-        lying.csr_sha256 = None;
         make_tree_writable(&imp_dir);
-        fs::write(imp_dir.join("manifest.json"), serde_json::to_vec_pretty(&lying).unwrap()).unwrap();
+        fs::write(imp_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        set_file_readonly(&imp_dir.join("base.sqlite")).unwrap();
+        set_file_readonly(&imp_dir.join(BASE_CSR)).unwrap();
+        set_dir_mode(&imp_dir, 0o555).unwrap();
         assert!(a2_swap(&entry, &imp_dir));
         let _ = fs::remove_dir_all(&stage);
         fs::create_dir_all(&stage).unwrap();
-        assert!(admit_published_base(&entry, &key, &manifest, &stage).is_err());
+        let err = match admit_published_base(&entry, &key, &manifest, &stage) {
+            Ok(_) => panic!("an entry whose manifest still describes the honest bytes was admitted"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("publish verified"), "unexpected refusal: {err}");
         let _ = remove_readonly_tree(&root);
     }
 
