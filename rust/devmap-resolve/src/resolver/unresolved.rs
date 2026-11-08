@@ -20,6 +20,34 @@ impl Resolver {
         caller: Option<&str>,
         name: &str,
     ) -> Option<String> {
+        self.lexical_scope_target(file, family, caller, name, false)
+    }
+
+    /// [`Self::lexical_target`] for a bare **call**: a Kotlin property of an
+    /// enclosing class is skipped and the walk goes on outward. `val log = "t"`
+    /// in a class does not hide a top-level `fun log()` from `log("x")`, because
+    /// a call can only reach the function (a property is reached through a
+    /// receiver, and the walk is otherwise stopped by it and refused by the
+    /// call filter). Accepted residual: a function-typed property whose type is
+    /// not indexed is called by Kotlin where this binds the outer function.
+    pub(super) fn lexical_call_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        self.lexical_scope_target(file, family, caller, name, true)
+    }
+
+    fn lexical_scope_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        name: &str,
+        for_a_call: bool,
+    ) -> Option<String> {
         // Absent everywhere: no scope can declare it.
         self.symbol_index.get(name)?;
         let mut scope = caller.unwrap_or(file);
@@ -32,6 +60,7 @@ impl Resolver {
                 .filter(|(kind, _)| {
                     !Self::family_needs_explicit_receiver(family) || *kind != SymbolKind::Method
                 })
+                .filter(|(kind, _)| !(for_a_call && Self::is_kotlin_member_property(family, *kind)))
                 .map(|(_, identity)| identity.as_ref());
             if let Some(first) = candidates.next() {
                 return candidates
