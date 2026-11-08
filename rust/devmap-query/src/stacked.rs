@@ -1606,30 +1606,12 @@ impl StackedStore {
             }
         }
 
+        // A delta row for a path git no longer reports as changed was reverted
+        // or removed after it was synced; it equals the base again.
         for prev in existing_delta {
-            if changed_paths.contains(&prev) {
-                continue;
-            }
-            let full = self.worktree_root.join(&prev);
-            if !full.is_file() {
-                continue;
-            }
-            let bytes = match fs::read(&full) {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| format!("cannot read {}", full.display()))
-                }
-            };
-            let src = std::str::from_utf8(&bytes)
-                .with_context(|| format!("{} is not valid UTF-8", full.display()))?;
-            if let Some(base_file) = self.base.latest_file(&prev)? {
-                let lang = devmap_extract::languages::detect_language(Path::new(&prev));
-                let key = devmap_extract::cache::CacheKey::for_source(lang, src);
-                if key.content_hash == base_file.content_hash {
-                    self.clear_reverted_file(&prev)?;
-                    cleaned_files += 1;
-                }
+            if !changed_paths.contains(&prev) {
+                self.clear_reverted_file(&prev)?;
+                cleaned_files += 1;
             }
         }
 
@@ -1659,16 +1641,46 @@ impl StackedStore {
     /// `deadline` (never more than the 10 s default), for callers with a budget.
     pub fn unsynced_paths_within(&self, deadline: std::time::Duration) -> Result<BTreeSet<String>> {
         let changed = git_changed_paths_within(&self.worktree_root, &self.base, deadline)?;
-        Ok(changed
-            .into_iter()
+        let mut pending: BTreeSet<String> = changed
+            .iter()
             .filter(|p| {
                 !devmap_extract::languages::is_ignored_path(p)
                     && !is_tool_state_path(p)
                     && devmap_extract::languages::is_indexable_source(p)
-                    && !self.overlay.modified_files.contains_key(Path::new(p))
-                    && !self.overlay.is_file_tombstoned(Path::new(p))
+                    && !self.delta_covers(p)
             })
-            .collect())
+            .cloned()
+            .collect();
+        // A delta row for a path git no longer reports as changed was reverted
+        // or removed after its sync: the delta still serves the old content.
+        let rows = self
+            .overlay
+            .modified_files
+            .keys()
+            .chain(self.overlay.tombstoned_files.iter());
+        for path in rows {
+            if let Some(p) = path.to_str().filter(|p| !changed.contains(*p)) {
+                pending.insert(p.to_string());
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Whether the delta row for `rel_path` is the file as it is now: a
+    /// tombstone for a path that is gone, or the hash of the bytes on disk.
+    /// Identity by content, not by path: a second edit of a synced path differs.
+    fn delta_covers(&self, rel_path: &str) -> bool {
+        let path = Path::new(rel_path);
+        let full = self.worktree_root.join(rel_path);
+        if self.overlay.is_file_tombstoned(path) {
+            return !full.is_file();
+        }
+        match self.overlay.modified_files.get(path) {
+            Some(recorded) => fs::read(&full)
+                .map(|bytes| blake3_hash(&bytes) == *recorded)
+                .unwrap_or(false),
+            None => false,
+        }
     }
 
     pub fn needs_rebase(&self) -> Result<bool> {
@@ -2076,7 +2088,7 @@ fn git_changed_paths_within(
     }
     let diff = run_git_within(
         worktree_root,
-        &["diff", "--name-only", "-z", &base_head, "HEAD"],
+        &["diff", "--name-only", "--no-renames", "-z", &base_head, "HEAD"],
         deadline,
     )?;
     if !diff.is_empty() && diff.last() != Some(&0) {
@@ -4723,6 +4735,24 @@ mod tests {
             !names.contains(&"EditedOne".to_string()) || unsynced.contains("src/svc.go"),
             "serves the reverted edit {names:?}; unsynced_paths={unsynced:?} is silent"
         );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A new untracked file that was synced and then removed: git no longer
+    /// reports it, so the delta row is stale until the next sync clears it.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_synced_file_removed_afterwards_is_unsynced_then_cleared() {
+        let (root, _anchor, lane) = a3_lane("a3-ghost");
+        fs::write(lane.join("src/ghost.go"), "package svc\n\nfunc Ghost() {}\n").unwrap();
+        a3_sync(&lane);
+        fs::remove_file(lane.join("src/ghost.go")).unwrap();
+        let mut s = StackedStore::open(&lane).unwrap();
+        assert!(s.unsynced_paths().unwrap().contains("src/ghost.go"), "the stale row is reported");
+        s.sync_worktree().unwrap();
+        let s = StackedStore::open(&lane).unwrap();
+        assert!(symbol_names(&s, "src/ghost.go").is_empty(), "the removed file's symbols are served");
+        assert!(s.unsynced_paths().unwrap().is_empty());
         let _ = remove_readonly_tree(&root);
     }
 
