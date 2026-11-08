@@ -1811,24 +1811,23 @@ impl StackedStore {
         for path in modified_paths {
             if let Some(ext) = self.overlay.added_extractions.get(path) {
                 for sym in &ext.symbols {
-                    if needle.is_empty()
+                    if (needle.is_empty()
                         || sym.name.to_ascii_lowercase().contains(&needle)
-                        || sym.qualified_name.to_ascii_lowercase().contains(&needle)
+                        || sym.qualified_name.to_ascii_lowercase().contains(&needle))
+                        && seen.insert((path.clone(), sym.qualified_name.clone()))
                     {
-                        if seen.insert((path.clone(), sym.qualified_name.clone())) {
-                            results.push(StoredSymbol {
-                                name: sym.name.clone(),
-                                qualified_name: sym.qualified_name.clone(),
-                                kind: sym.kind.as_str().to_string(),
-                                path: path.clone(),
-                                span_start: sym.span.start_byte,
-                                span_end: sym.span.end_byte,
-                                is_exported: sym.is_exported,
-                                content_hash: ext.content_hash,
-                            });
-                            if results.len() >= limit {
-                                return Ok(results);
-                            }
+                        results.push(StoredSymbol {
+                            name: sym.name.clone(),
+                            qualified_name: sym.qualified_name.clone(),
+                            kind: sym.kind.as_str().to_string(),
+                            path: path.clone(),
+                            span_start: sym.span.start_byte,
+                            span_end: sym.span.end_byte,
+                            is_exported: sym.is_exported,
+                            content_hash: ext.content_hash,
+                        });
+                        if results.len() >= limit {
+                            return Ok(results);
                         }
                     }
                 }
