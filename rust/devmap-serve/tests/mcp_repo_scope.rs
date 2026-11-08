@@ -1387,3 +1387,36 @@ async fn the_same_repo_cwd_refusal_holds_via_symlink_dotdot_and_case() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The slot caches a `Store` per path and re-checks only the file's identity,
+/// so an in-place `devmap build` (same inode) never evicts it. The cached
+/// connection must therefore follow the writer: an `?immutable=1` open of a
+/// quiescent WAL store answers from the generation it first read.
+#[test]
+fn a_cached_store_follows_a_build_that_writes_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let root = scratch("in-place-rebuild");
+    let db = plant_store(&root);
+    let inode = std::fs::metadata(&db).unwrap().ino();
+    let slot = StoreSlot::new(&db);
+    let first = slot.get().expect("open through the MCP slot");
+    assert!(first.get_pending_paths().unwrap().is_empty());
+
+    let writer = Store::open(&db).expect("writer attaches in place");
+    writer
+        .enqueue_pending_paths(&["src/written_after_the_slot_opened.rs".into()])
+        .unwrap();
+    drop(writer);
+    assert_eq!(std::fs::metadata(&db).unwrap().ino(), inode);
+
+    let again = slot.get().expect("cache hit on an unchanged inode");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "precondition: the same inode is a cache hit, not a reopen"
+    );
+    assert_eq!(
+        again.get_pending_paths().unwrap(),
+        vec!["src/written_after_the_slot_opened.rs".to_string()],
+        "the cached store must see what an in-place build committed"
+    );
+}

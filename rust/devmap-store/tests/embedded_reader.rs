@@ -413,3 +413,44 @@ fn a_queue_burst_can_wait_out_a_long_writer_without_losing_the_edit() {
 
 #[cfg(unix)]
 include!("../../testsupport/restriction.rs");
+
+/// A reader handed to a long-lived caller (the MCP cache keeps one per path)
+/// must follow a writer that commits in place. A quiescent WAL store has no
+/// `-wal`, and opening it `?immutable=1` would pin the reader to the bytes it
+/// first read: no locking, no change detection, no view of later frames.
+#[test]
+fn a_long_lived_reader_sees_a_commit_made_in_place_after_it_opened() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = Scratch::new();
+    drop(Store::open(temp.db()).unwrap());
+    let mut wal = temp.db().into_os_string();
+    wal.push("-wal");
+    assert!(
+        !std::path::Path::new(&wal).exists(),
+        "precondition: a quiescent WAL store has no -wal"
+    );
+    let inode = fs::metadata(temp.db()).unwrap().ino();
+    let reader = Store::open_read_only(temp.db()).unwrap();
+    assert!(reader.get_pending_paths().unwrap().is_empty());
+
+    let writer = Store::open(temp.db()).unwrap();
+    writer
+        .enqueue_pending_paths(&["src/after_the_reader_opened.rs".into()])
+        .unwrap();
+    assert_eq!(
+        fs::metadata(temp.db()).unwrap().ino(),
+        inode,
+        "the writer commits in place, so a cache keyed on the inode never evicts"
+    );
+    assert_eq!(
+        reader.get_pending_paths().unwrap(),
+        vec!["src/after_the_reader_opened.rs".to_string()],
+        "reader opened before the commit must see it while the writer is attached"
+    );
+    drop(writer);
+    assert_eq!(
+        reader.get_pending_paths().unwrap(),
+        vec!["src/after_the_reader_opened.rs".to_string()],
+        "and after the writer closed and checkpointed"
+    );
+}
