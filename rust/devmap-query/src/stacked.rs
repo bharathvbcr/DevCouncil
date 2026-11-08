@@ -5012,8 +5012,10 @@ mod tests {
     }
 
     /// The reuse path trusts a cache entry whose manifest and bytes agree with
-    /// each other: a donor rebuilt with different content at the same
-    /// generation id and HEAD is not re-published, so a new lane gets the old graph.
+    /// each other. A donor deleted and rebuilt at the same HEAD restarts at the
+    /// same generation id, so id, HEAD and root alone match the old entry: the
+    /// new lane must still be admitted from the rebuilt store, told apart by
+    /// the store's creation epoch.
     #[cfg(all(feature = "parse", unix))]
     #[test]
     fn a3_a_rebuilt_donor_with_other_content_at_the_same_key_is_not_served_from_the_old_entry() {
@@ -5022,21 +5024,39 @@ mod tests {
         seed_indexed_git_repo(&anchor);
         let lane1 = add_lane(&anchor, &root, "lane-1");
         let lane2 = add_lane(&anchor, &root, "lane-2");
-        provision_stacked_worktree(&anchor, &lane1).unwrap();
-        // The donor rebuilds: same HEAD, same generation id, a graph that omits svc.go.
+        let lease1 = provision_stacked_worktree(&anchor, &lane1).unwrap();
+        let old_epoch = donor_epoch(&anchor);
+        // The donor is deleted and rebuilt over the same files at the same HEAD.
         let db = store_path(&anchor);
         discard_staged(&db);
         let _ = fs::remove_file(csr_path_for_store(&db));
-        index_tree(&anchor, &["src/routes.ts", "src/limits.rs"]);
-        match provision_stacked_worktree(&anchor, &lane2) {
-            Err(e) => eprintln!("a3 rebuilt donor: provision refused: {e:#}"),
-            Ok(_) => {
-                let s = StackedStore::open(&lane2).unwrap();
-                let stale = symbol_names(&s, "src/svc.go");
-                assert!(stale.is_empty(), "lane-2 serves the previous build's graph for src/svc.go: {stale:?}");
-            }
-        }
+        index_tree(&anchor, &["src/svc.go", "src/routes.ts", "src/limits.rs"]);
+        let new_epoch = donor_epoch(&anchor);
+        assert_ne!(old_epoch, new_epoch, "precondition: a rebuilt store is a new store");
+        let lease2 = provision_stacked_worktree(&anchor, &lane2).unwrap();
+        assert_eq!(
+            (lease1.generation_id, &lease1.head_sha),
+            (lease2.generation_id, &lease2.head_sha),
+            "precondition: the rebuilt donor collides with the old entry's name"
+        );
+        let admitted = StackedStore::open(&lane2).unwrap();
+        assert_eq!(
+            admitted.base_store().pending_watermark().unwrap().epoch(),
+            new_epoch,
+            "lane-2 was admitted from the previous store's cache entry"
+        );
         let _ = remove_readonly_tree(&root);
+    }
+
+    /// `pending_state.epoch` of the donor's store at `anchor`.
+    #[cfg(all(feature = "parse", unix))]
+    fn donor_epoch(anchor: &Path) -> String {
+        Store::open_read_only(store_path(anchor))
+            .unwrap()
+            .pending_watermark()
+            .unwrap()
+            .epoch()
+            .to_string()
     }
 
     /// An exclusive writer on the delta makes the read-only open fail with
