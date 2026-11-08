@@ -1352,7 +1352,7 @@ impl Resolver {
                     {
                         if call.receiver_expr.is_none() {
                             if let Some(target_symbol) = self
-                                .lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
+                                .lexical_call_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
                                 .filter(|identity| {
                                     !self.file_declares_as(&ext.file_path, identity, |kind| {
                                         Self::never_a_call_target(family, kind)

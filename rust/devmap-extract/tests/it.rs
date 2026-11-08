@@ -88,6 +88,10 @@ mod js_object_facts;
 #[cfg(feature = "parse")]
 mod kotlin_followups;
 #[cfg(feature = "parse")]
+mod kotlin_node_recall;
+#[cfg(feature = "parse")]
+mod attack_kotlin_recall;
+#[cfg(feature = "parse")]
 mod kotlin_one_line_bodies;
 #[cfg(feature = "parse")]
 mod kotlin_recovery_twin;

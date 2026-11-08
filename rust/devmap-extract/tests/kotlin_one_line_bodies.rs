@@ -289,7 +289,7 @@ fn a_stacked_annotation_statement_and_a_one_line_body_in_one_file() {
     );
     assert_eq!(
         names(&extraction),
-        ["M.kt::K", "M.kt::f", "M.kt::helper", "M.kt::tail"]
+        ["M.kt::K", "M.kt::K.x", "M.kt::f", "M.kt::helper", "M.kt::tail"]
     );
     let ranges: Vec<&str> = extraction
         .recovered_decl_ranges

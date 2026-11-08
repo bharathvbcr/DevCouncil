@@ -33,3 +33,7 @@ live	app/src/main/java/com/fx/app/HabitFilter.kt::FilterTemplate.matchesFilterTe
 exported_unreferenced	app/src/main/java/com/fx/app/HabitFilter.kt::filterTemplates	nothing calls it
 exported_unreferenced	app/src/main/java/com/fx/app/SettingsScreen.kt::BaseScreen.show	nothing calls it and nothing overrides it
 exempt	app/src/main/java/com/fx/app/SettingsScreen.kt::SettingsScreen	K33: registered in AndroidManifest.xml (activity .SettingsScreen)
+# Kotlin node recall (card ft-4617a335): property Fields are nodes now, so these three are scored. Labelled from source.
+exported_unreferenced	app/build.gradle.kts::computed	nothing reads the build-script val (build.gradle.kts:13)
+live	app/src/main/java/com/fx/app/Dsl.kt::Page.sections	section() appends to it (Dsl.kt:6); reported at 0.4, a false positive of the tier
+live	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.state	HomeScreen reads vm.state (Screens.kt:16); reported at 0.4, a false positive of the tier
