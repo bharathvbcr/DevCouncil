@@ -242,13 +242,21 @@ impl Store {
             )));
         }
         let _sidecars = Self::checked_sidecars(path)?;
+        // Admit through a short-lived immutable peek that closes here, so a
+        // schema this reader cannot use is refused before any connection can
+        // create `-wal`/`-shm`.
+        Self::admit_store_for_read(path)?;
         let setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Immutable when no `-wal` exists. A plain read-only open of a WAL
-        // database creates `-wal` and `-shm`, which is a write from a command
-        // that was asked only to read.
-        let mut conn = Self::open_owner_peek(path)?;
+        // The `Store` returned here is held by long-lived readers (the MCP
+        // cache keeps one per path), so it is a plain read-only connection that
+        // takes locks and follows a writer committing in place. `?immutable=1`
+        // disables change detection and must never back such a reader.
+        let mut conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         Self::harden_connection(&conn)?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         let first_read = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
@@ -256,6 +264,14 @@ impl Store {
         let stamped: i32 = match first_read {
             Ok(version) => version,
             Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
+                // The one case that still hands out an immutable reader: the
+                // directory cannot hold `-wal`/`-shm`, so a live reader is
+                // impossible. It will not see a later write; say so.
+                eprintln!(
+                    "devmap-store: {} is in a directory that cannot hold WAL sidecars; \
+                     opened immutable, so this reader will not see later writes",
+                    path.display()
+                );
                 conn = Self::open_immutable(path)?;
                 conn.busy_timeout(Self::BUSY_TIMEOUT)?;
                 conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
