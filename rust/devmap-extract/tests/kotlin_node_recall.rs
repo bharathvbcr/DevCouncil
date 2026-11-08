@@ -390,3 +390,46 @@ fn a_multi_line_twin_with_the_semicolon_before_an_accessor_is_repaired_too() {
         assert!(names(&extraction).contains(&"A.kt::A.f".to_string()));
     }
 }
+
+// ---- the two remaining TrailBlazer triggers, isolated -----------------------
+//
+// Neither is repaired here: a repair would have to rename an identifier the
+// grammar reads as a modifier, which is a different rewrite from a separator.
+// These pin what the reduced shapes are, so a later repair (or a grammar bump)
+// turns them red on purpose and the lost declarations are named, not guessed.
+
+/// `LocationRepository.kt:124` (`locationSource`): a lambda parameter named with
+/// the soft keyword `external` (`{ external -> .. }`) is read as the modifier.
+/// Eight bytes (`external`) are the whole error, inside the surviving function.
+#[test]
+fn a_lambda_parameter_named_external_is_an_error_inside_a_surviving_function() {
+    let source = "fun f() {\n    val r = y.flatMapLatest { external ->\n        if (external) 1 else 2\n    }\n}\nfun g() = 2\n";
+    let extraction = extract_file("L.kt", source);
+    let ParseOutcome::Partial { error_ranges, .. } = &extraction.parse_outcome else {
+        panic!("{:?}", extraction.parse_outcome);
+    };
+    let texts: Vec<&str> = error_ranges
+        .iter()
+        .map(|range| &source[range.start_byte..range.end_byte])
+        .collect();
+    assert_eq!(texts, ["external"]);
+    let found = names(&extraction);
+    assert!(found.contains(&"L.kt::f".to_string()) && found.contains(&"L.kt::g".to_string()));
+}
+
+/// `NmeaParser.kt` (`accept`, the `open` property): a statement that starts with
+/// the soft keyword `open` as an assignment target (`open = it`) is read as a
+/// modifier, and the error swallows what follows it.
+#[test]
+fn a_statement_assigning_to_a_variable_named_open_is_an_error() {
+    let source = "fun f() {\n    open = 1\n}\nfun g() = 2\n";
+    let extraction = extract_file("N.kt", source);
+    assert!(
+        matches!(extraction.parse_outcome, ParseOutcome::Partial { .. }),
+        "{:?}",
+        extraction.parse_outcome
+    );
+    // `this.open = 1` is the same assignment spelled so the grammar reads it.
+    let spelled = extract_file("N.kt", "class C {\n    var open = 0\n    fun f() { this.open = 1 }\n}\nfun g() = 2\n");
+    assert!(is_clean(&spelled), "{:?}", spelled.parse_outcome);
+}
