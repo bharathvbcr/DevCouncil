@@ -500,17 +500,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("legacywal");
         let path = dir.join("delta.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
-            conn.execute_batch(DELTA_SCHEMA_DDL).unwrap();
-            conn.execute(
-                "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
-                 VALUES ('src/a.rs', 'x', 1, NULL, 1)",
-                [],
-            )
-            .unwrap();
-        }
+        // A live writer: its rows sit in the `-wal`, not in the main file, so an
+        // immutable read of the main file alone would answer 0.
+        let conn = Connection::open(&path).unwrap();
+        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
+        conn.execute_batch(DELTA_SCHEMA_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
+             VALUES ('src/a.rs', 'x', 1, NULL, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(dir.join("delta.sqlite-wal").is_file(), "the rows must be in the -wal");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let opened = DeltaStore::open_read_only(&path);
         let rows = match &opened {
@@ -518,6 +520,7 @@ mod tests {
             _ => None,
         };
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(conn);
         match opened {
             Ok(Some(_)) => assert_eq!(rows, Some(1), "an answer must be the committed rows"),
             Ok(None) => panic!("the delta exists"),
