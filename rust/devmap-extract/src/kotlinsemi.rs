@@ -39,8 +39,12 @@
 //! line by a declaration: `class A { .. } class B { .. }` wants one between the
 //! two classes, and the grammar reads the pair as an error until it has it.
 //!
-//! Both modes also repair a second shape: a `;` that sits between a property and
-//! its accessor on one line, `var m: Double? = null; private set`. The grammar
+//! A file both modes leave with an error is tried a last time with a **third
+//! mode**, which also repairs a second shape: a `;` that sits between a property
+//! and its accessor on one line, `var m: Double? = null; private set`. It runs
+//! only after the first two have failed, so by construction it cannot change a
+//! file they repair (`lock(); get()` in a function body is theirs, not this
+//! mode's, and is also refused by the `val`/`var` test below). The grammar
 //! reads the `;` as ending the property, finds a stray `set`, and makes the
 //! whole file an ERROR. The same text with a space for the `;` (or the accessor
 //! on the next line) parses cleanly, so the rewrite writes a **space over that
@@ -137,6 +141,17 @@ pub(crate) enum Repair {
     Unchanged { tree: Tree, why: String },
 }
 
+/// Which edits a rewrite may write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// A separator before each closing brace that follows code on its line.
+    Separators,
+    /// The above, and one between two declarations that share a line.
+    Boundaries,
+    /// The above, and a space over a `;` before a property accessor.
+    Accessors,
+}
+
 /// Why a rewrite stopped without a clean tree.
 enum Stop {
     /// No candidate was left, or the passes ran out: the other mode may still
@@ -157,18 +172,22 @@ enum Stop {
 /// second mode runs only where the first has already failed, so it cannot
 /// change a file the first repairs.
 pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: Instant) -> Repair {
-    let first = match rewrite(parser, &tree, source, deadline, false) {
-        Ok(done) => return done,
-        Err(stop) => stop,
-    };
-    let why = match first {
-        Stop::Final(why) => why,
-        Stop::Retry(why) => match rewrite(parser, &tree, source, deadline, true) {
+    let mut why = String::new();
+    for mode in [Mode::Separators, Mode::Boundaries, Mode::Accessors] {
+        match rewrite(parser, &tree, source, deadline, mode) {
             Ok(done) => return done,
-            Err(Stop::Final(later)) => later,
-            Err(Stop::Retry(_)) => why,
-        },
-    };
+            Err(Stop::Final(later)) => {
+                // A cap, a deadline or a bad rewrite: nothing else is tried.
+                why = later;
+                break;
+            }
+            Err(Stop::Retry(first)) => {
+                if why.is_empty() {
+                    why = first;
+                }
+            }
+        }
+    }
     Repair::Unchanged { tree, why }
 }
 
@@ -178,8 +197,9 @@ fn rewrite(
     tree: &Tree,
     source: &str,
     deadline: Instant,
-    boundaries: bool,
+    mode: Mode,
 ) -> Result<Repair, Stop> {
+    let boundaries = mode != Mode::Separators;
     let mut text = source.as_bytes().to_vec();
     let mut edited: Vec<usize> = Vec::new();
     let mut current = tree.clone();
@@ -200,8 +220,7 @@ fn rewrite(
         if pass == MAX_PASSES {
             break;
         }
-        let fresh =
-            candidates(current.root_node(), &text, &edited, boundaries).map_err(Stop::Final)?;
+        let fresh = candidates(current.root_node(), &text, &edited, mode).map_err(Stop::Final)?;
         if fresh.is_empty() {
             return Err(Stop::Retry(
                 "no space before a closing brace is left to write a separator over".into(),
@@ -305,10 +324,25 @@ fn semicolon_in_gap(text: &[u8], from: usize, to: usize) -> Option<usize> {
     alone.then_some(from + first)
 }
 
+/// Whether the line the `;` at `at` is on has `val` or `var` as a whole word
+/// before it: the `;` ends a property, not a statement of a function body.
+fn line_declares_a_property(text: &[u8], at: usize) -> bool {
+    let start = text[..at]
+        .iter()
+        .rposition(|b| matches!(b, b'\n' | b'\r'))
+        .map_or(0, |newline| newline + 1);
+    text[start..at]
+        .split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+        .any(|word| word == b"val" || word == b"var")
+}
+
 /// Whether the `;` at `at` ends a property on a line that goes on with its
 /// accessor: whitespace, an optional visibility word, then `get` or `set` as a
 /// whole word.
 fn accessor_after(text: &[u8], at: usize) -> bool {
+    if !line_declares_a_property(text, at) {
+        return false;
+    }
     let skip = |mut next: usize| {
         while matches!(text.get(next), Some(b' ' | b'\t')) {
             next += 1;
@@ -337,12 +371,9 @@ fn accessor_after(text: &[u8], at: usize) -> bool {
 /// The offsets of the spaces to write `;` over: one directly before each
 /// closing `}` that follows code on its line, in the top-level statements that
 /// hold an error, outside strings and comments.
-fn candidates(
-    root: Node,
-    text: &[u8],
-    done: &[usize],
-    boundaries: bool,
-) -> Result<Vec<usize>, String> {
+fn candidates(root: Node, text: &[u8], done: &[usize], mode: Mode) -> Result<Vec<usize>, String> {
+    let boundaries = mode != Mode::Separators;
+    let accessors = mode == Mode::Accessors;
     let mut found: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
     // Each node waits with the end of the last sibling before it that is not a
@@ -384,7 +415,7 @@ fn candidates(
         // The failed tree does not show the `;` itself (the grammar consumes it
         // as a hidden token), but it shows the gap: a `;` between two nodes with
         // only blanks around it, ending where an accessor starts.
-        if let Some(end) = code_end {
+        if let Some(end) = code_end.filter(|_| accessors) {
             if let Some(at) = semicolon_in_gap(text, end, node.start_byte()) {
                 if accessor_after(text, at) && !done.contains(&at) {
                     found.push(at);
@@ -393,7 +424,8 @@ fn candidates(
         }
         // Or the grammar kept it: an ERROR node, a property or a `;` token whose
         // last byte is the `;`.
-        if (node.is_error() || kind == "property_declaration" || kind == ";")
+        if accessors
+            && (node.is_error() || kind == "property_declaration" || kind == ";")
             && node.end_byte() > 0
             && text.get(node.end_byte() - 1) == Some(&b';')
             && accessor_after(text, node.end_byte() - 1)

@@ -563,20 +563,30 @@ pub(super) fn extract_treesitter_before_deadline(
                     } => (
                         ParseAttempt::Parsed(tree),
                         ranges,
-                        Some(format!(
-                            "kotlin one-line class body{}: {edits} separator(s) written over \
-                             spaces{} so the file parses; offsets are the file's own",
-                            if boundaries {
-                                " (declarations sharing a line)"
-                            } else {
-                                ""
-                            },
-                            if accessors > 0 {
-                                format!(" ({accessors} `;` before a property accessor replaced by a space)")
-                            } else {
-                                String::new()
-                            }
-                        )),
+                        Some(if accessors == 0 {
+                            format!(
+                                "kotlin one-line class body{}: {edits} separator(s) written over \
+                                 spaces so the file parses; offsets are the file's own",
+                                if boundaries {
+                                    " (declarations sharing a line)"
+                                } else {
+                                    ""
+                                }
+                            )
+                        } else if edits == accessors {
+                            format!(
+                                "kotlin property accessor: {accessors} `;` before a property \
+                                 accessor replaced by a space so the file parses; offsets are \
+                                 the file's own"
+                            )
+                        } else {
+                            format!(
+                                "kotlin one-line class body: {} separator(s) written over spaces \
+                                 and {accessors} `;` before a property accessor replaced by a \
+                                 space so the file parses; offsets are the file's own",
+                                edits - accessors
+                            )
+                        }),
                     ),
                     crate::kotlinsemi::Repair::Unchanged { tree, why } => (
                         ParseAttempt::Parsed(tree),
@@ -699,20 +709,6 @@ pub(super) fn extract_treesitter_before_deadline(
                         over_budget("walking the syntax tree"),
                     );
                 }
-                // Kotlin only: one qualified name is one node, so a property
-                // whose id a function, a class or an earlier property holds
-                // is withheld, and the withholding is recorded.
-                let property_note = (lang == "kotlin")
-                    .then(|| {
-                        crate::langdecl::kotlin::settle_property_ids(root, source, &mut symbols)
-                    })
-                    .filter(|(callable, property)| callable + property > 0)
-                    .map(|(callable, property)| {
-                        format!(
-                            "kotlin property id withheld: {callable} shared the id of a function \
-                             or type of the same owner, {property} of an earlier property"
-                        )
-                    });
                 // After the walk, because a stamped function is a declaration
                 // the walk could not see: it exists only in a macro's
                 // expansion. Its overrun is caught by the check below, the one
@@ -925,7 +921,6 @@ pub(super) fn extract_treesitter_before_deadline(
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
                 diagnostics.extend(semi_note);
-                diagnostics.extend(property_note);
                 if lang == "hcl" && calls.len() > crate::model::MAX_CALL_BLIND_SITES {
                     let dropped = calls.len() - crate::model::MAX_CALL_BLIND_SITES;
                     calls.truncate(crate::model::MAX_CALL_BLIND_SITES);
@@ -1087,6 +1082,21 @@ pub(super) fn extract_treesitter_before_deadline(
                 // everything below, which reads `extraction.symbols`.
                 if lang == "kotlin" {
                     crate::kotlinloss::recover(&mut extraction, source, &lost, deadline);
+                    // One qualified name is one node, so a property whose id a
+                    // function, a type, an enum entry or an earlier property
+                    // holds is withheld, and the withholding is recorded. After
+                    // the recovery, so a re-derived property is settled too.
+                    let (callable, property) = crate::langdecl::kotlin::settle_property_ids(
+                        source,
+                        &mut extraction.symbols,
+                    );
+                    if callable + property > 0 {
+                        extraction.diagnostics.push(format!(
+                            "kotlin property id withheld: {callable} shared the id of another \
+                             declaration of the same owner (a function, type or enum entry), \
+                             {property} of an earlier property"
+                        ));
+                    }
                 }
 
                 // The code inside a template language's `<script>` blocks, in

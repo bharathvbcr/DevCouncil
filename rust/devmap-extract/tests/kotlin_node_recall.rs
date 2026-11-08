@@ -129,6 +129,16 @@ fn a_semicolon_in_a_string_or_comment_is_never_rewritten() {
     let extraction = extract_file("C.kt", source);
     assert!(is_clean(&extraction), "{:?}", extraction.parse_outcome);
     assert!(names(&extraction).contains(&"C.kt::C.f".to_string()));
+    // Exactly one `;` is rewritten: the real one. A rewrite inside the string
+    // or the comment would also leave the file clean, so the count is the check.
+    assert!(
+        extraction
+            .diagnostics
+            .iter()
+            .any(|note| note.contains("1 `;` before a property accessor")),
+        "{:?}",
+        extraction.diagnostics
+    );
 }
 
 #[test]
@@ -458,4 +468,90 @@ fn a_statement_assigning_to_a_variable_named_open_is_an_error() {
         "class C {\n    var open = 0\n    fun f() { this.open = 1 }\n}\nfun g() = 2\n",
     );
     assert!(is_clean(&spelled), "{:?}", spelled.parse_outcome);
+}
+
+// ---- the accessor repair is a third mode, never a change to a repaired file --
+
+/// A file the one-line-body repair already makes clean keeps exactly that
+/// extraction when a function body in it holds `lock(); get()`: the accessor
+/// rewrite runs only after the other two modes fail, and only on a line that
+/// declares a property.
+#[test]
+fn a_statement_semicolon_before_get_or_set_is_not_an_accessor_separator() {
+    for source in [
+        "class A { val x = 1; fun f() { lock(); get() } }\nfun top() {}\n",
+        "class A { val x = 1 }\nfun f() { lock(); set(2) }\nfun top() {}\n",
+        "class A { val x = 1 }\nfun f() { x = 1; set(2) }\nfun top() {}\n",
+    ] {
+        let extraction = extract_file("A.kt", source);
+        assert!(
+            is_clean(&extraction),
+            "{source:?}: {:?}",
+            extraction.parse_outcome
+        );
+        assert!(
+            extraction
+                .diagnostics
+                .iter()
+                .all(|note| !note.contains("accessor")),
+            "{source:?}: {:?}",
+            extraction.diagnostics
+        );
+        let callee = if source.contains("get()") {
+            "get"
+        } else {
+            "set"
+        };
+        let call = extraction
+            .calls
+            .iter()
+            .find(|call| call.callee_name == callee)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{source:?}: the `{callee}` call is a call: {:?}",
+                    extraction.calls
+                )
+            });
+        assert!(call.receiver_expr.is_none(), "{call:?}");
+        assert!(
+            extraction
+                .calls
+                .iter()
+                .any(|call| call.callee_name == "lock")
+                || source.contains("x = 1; set"),
+            "{source:?}"
+        );
+    }
+}
+
+// ---- recovered properties are settled too ------------------------------------
+
+/// A property the loss recovery re-derives (a swallowed `val` behind two
+/// annotations) next to a function of the same name the walk read directly
+/// is one node, the function.
+#[test]
+fn a_recovered_property_does_not_duplicate_the_id_of_a_surviving_function() {
+    let source = "fun size() = 2\n@Preview\n@Composable\nval size = 1\nfun after() {}\n";
+    let extraction = extract_file("A.kt", source);
+    let ids: Vec<_> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.qualified_name == "A.kt::size")
+        .map(|symbol| symbol.kind)
+        .collect();
+    assert_eq!(ids, [SymbolKind::Function], "{:?}", names(&extraction));
+    assert!(extraction
+        .diagnostics
+        .iter()
+        .any(|note| note.contains("kotlin property id withheld")));
+    // The same recovered property with nothing in its way is still a node.
+    let alone = extract_file(
+        "A.kt",
+        "@Preview\n@Composable\nval size = 1\nfun after() {}\n",
+    );
+    assert!(
+        names(&alone).contains(&"A.kt::size".to_string()),
+        "{:?}",
+        names(&alone)
+    );
 }

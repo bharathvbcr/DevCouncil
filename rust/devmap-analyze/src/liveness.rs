@@ -777,10 +777,14 @@ impl ExtractionCoverage {
             reason.push_str(&format!(
                 "; {} of the {listed} file(s) listed under `partial_parse` parsed with \
                  ERROR/MISSING regions that can hide a declaration or call, so those inside \
-                 the charged regions are absent (the other {} hold only regions the \
-                 extraction accounts for)",
+                 the charged regions are absent{}",
                 self.partial_parse_files,
-                listed - self.partial_parse_files
+                match listed - self.partial_parse_files {
+                    0 => String::new(),
+                    rest => format!(
+                        " (the other {rest} hold only regions the extraction accounts for)"
+                    ),
+                }
             ));
         }
         if self.over_limit_files > 0 {
@@ -4179,11 +4183,6 @@ mod tests {
         assert!(!coverage.is_complete());
     }
 
-    /// The listing says which regions were charged and which were not, and
-    /// why — the same verdict the charge was decided by. Before, every
-    /// partial file read "declarations and calls inside them are absent from
-    /// the graph", including the `&raw` shape whose declaration survived and
-    /// which was never charged: an exemption the reader could not see.
     /// `degraded_reason` and the `partial_parse` inventory state one count
     /// (card ft-4617a335 AC5): the sentence said "N file(s)" for the charged
     /// subset, which read as a second, smaller count of the same list.
@@ -4224,8 +4223,26 @@ mod tests {
             reason.contains("1 of the 3 file(s) listed under `partial_parse`"),
             "{reason}"
         );
+        assert!(
+            reason.contains("(the other 2 hold only regions"),
+            "{reason}"
+        );
+        // When every listed file is charged there is no remainder to name.
+        let all_charged = extraction_coverage(&[partial("src/app.py", &[(10, 50)])])
+            .degraded_reason()
+            .expect("degraded");
+        assert!(
+            all_charged.contains("1 of the 1 file(s) listed"),
+            "{all_charged}"
+        );
+        assert!(!all_charged.contains("the other"), "{all_charged}");
     }
 
+    /// The listing says which regions were charged and which were not, and
+    /// why — the same verdict the charge was decided by. Before, every
+    /// partial file read "declarations and calls inside them are absent from
+    /// the graph", including the `&raw` shape whose declaration survived and
+    /// which was never charged: an exemption the reader could not see.
     #[test]
     fn a_partial_parse_reason_names_each_exempt_region_and_why() {
         let region = |start_byte: usize, end_byte: usize| TextRange {

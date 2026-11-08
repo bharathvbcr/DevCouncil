@@ -209,7 +209,6 @@ fn is_named_owner(node: Node<'_>, source: &str) -> bool {
 /// group with a duplicate id is looked at, so a file with none pays one hash
 /// pass.
 pub(crate) fn settle_property_ids(
-    root: Node<'_>,
     source: &str,
     symbols: &mut Vec<ExtractedSymbol>,
 ) -> (usize, usize) {
@@ -220,27 +219,23 @@ pub(crate) fn settle_property_ids(
             .or_default()
             .push(at);
     }
-    let is_property = |symbol: &ExtractedSymbol| {
-        symbol.kind == SymbolKind::Field
-            && root
-                .descendant_for_byte_range(symbol.span.start_byte, symbol.span.end_byte)
-                .and_then(|name| property_declaring_node(name, source))
-                .is_some()
-    };
     let mut drop = vec![false; symbols.len()];
     let (mut by_callable, mut by_property) = (0, 0);
     for group in by_id.values().filter(|group| group.len() > 1) {
-        let properties: Vec<usize> = group
+        let mut properties: Vec<usize> = group
             .iter()
             .copied()
-            .filter(|&at| is_property(&symbols[at]))
+            .filter(|&at| is_property_symbol(source, &symbols[at]))
             .collect();
         if properties.is_empty() {
             continue;
         }
+        // Source order, not vector order: a recovered declaration is appended
+        // after the walk's own symbols.
+        properties.sort_by_key(|&at| symbols[at].span.start_byte);
         let others = group.len() - properties.len();
         let keep = usize::from(others == 0);
-        for &at in &properties[keep.min(properties.len())..] {
+        for &at in &properties[keep..] {
             drop[at] = true;
             if others > 0 {
                 by_callable += 1;
@@ -257,6 +252,30 @@ pub(crate) fn settle_property_ids(
         });
     }
     (by_callable, by_property)
+}
+
+/// Whether `symbol` is a property: a `Field` whose name is written directly
+/// after `val` or `var` (a constructor parameter and a body property both are;
+/// an enum entry follows a `,`, `{` or `;`). Read from the symbol and the file
+/// text rather than from a tree, so a declaration the loss recovery re-derived
+/// from a wrapper, whose outer tree holds an ERROR there, is judged like any
+/// other, and no flag has to be added to every symbol.
+fn is_property_symbol(source: &str, symbol: &ExtractedSymbol) -> bool {
+    if symbol.kind != SymbolKind::Field {
+        return false;
+    }
+    let Some(before) = source.get(..symbol.span.start_byte) else {
+        return false;
+    };
+    let before = before.trim_end();
+    ["val", "var"].iter().any(|word| {
+        before.strip_suffix(word).is_some_and(|rest| {
+            !rest
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    })
 }
 
 /// `class`, `interface` or `enum class`, read from the tokens the grammar keeps
