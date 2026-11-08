@@ -522,6 +522,11 @@ pub struct ExtractionCoverage {
     /// cannot hold a caller; both are still *listed* in the `partial_parse`
     /// inventory, which `extraction_gaps` derives without this filter.
     pub partial_parse_files: usize,
+    /// Every file the `partial_parse` inventory lists: the charged ones above
+    /// and those whose regions are exempt (inside a surviving declaration,
+    /// zero-width, nameless or vendored). The sentence in `degraded_reason`
+    /// states both numbers, so it and the inventory agree on the count.
+    pub partial_parse_listed_files: usize,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -763,10 +768,17 @@ impl ExtractionCoverage {
         // Its own clause for the same reason: the fix is to split or shrink
         // the file (or accept the hole), not to re-run anything.
         if self.partial_parse_files > 0 {
+            // The inventory lists every partial file; only the charged ones are
+            // counted as blind. Saying "N file(s)" for the charged ones alone
+            // read as a second, smaller count of the same list (8 against 14).
+            let listed = self.partial_parse_listed_files.max(self.partial_parse_files);
             reason.push_str(&format!(
-                "; {} file(s) parsed with ERROR/MISSING regions, so declarations and calls \
-                 inside those regions are absent",
-                self.partial_parse_files
+                "; {} of the {listed} file(s) listed under `partial_parse` parsed with \
+                 ERROR/MISSING regions that can hide a declaration or call, so those inside \
+                 the charged regions are absent (the other {} hold only regions the \
+                 extraction accounts for)",
+                self.partial_parse_files,
+                listed - self.partial_parse_files
             ));
         }
         if self.over_limit_files > 0 {
@@ -2968,6 +2980,7 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
             ExtractionGap::NotParsed => coverage.not_parsed_files += 1,
             ExtractionGap::PartialParse => {
+                coverage.partial_parse_listed_files += 1;
                 if partial_with_calls.contains(entry.path.as_str()) {
                     coverage.partial_parse_files += 1;
                 }
@@ -4169,6 +4182,46 @@ mod tests {
     /// partial file read "declarations and calls inside them are absent from
     /// the graph", including the `&raw` shape whose declaration survived and
     /// which was never charged: an exemption the reader could not see.
+    /// `degraded_reason` and the `partial_parse` inventory state one count
+    /// (card ft-4617a335 AC5): the sentence said "N file(s)" for the charged
+    /// subset, which read as a second, smaller count of the same list.
+    #[test]
+    fn degraded_reason_and_the_partial_parse_inventory_agree_on_the_count() {
+        let partial = |path: &str, errors: &[(usize, usize)]| {
+            let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
+            ext.file_path = path.to_string();
+            ext.parse_outcome = ParseOutcome::Partial {
+                error_ranges: errors
+                    .iter()
+                    .map(|(start_byte, end_byte)| TextRange {
+                        start_byte: *start_byte,
+                        end_byte: *end_byte,
+                    })
+                    .collect(),
+                nameless_ranges: Vec::new(),
+            };
+            ext
+        };
+        let corpus = vec![
+            partial("src/app.py", &[(10, 50)]),
+            partial("src/inner.py", &[(4, 8)]),
+            partial("vendor/lib/x.py", &[(20, 40)]),
+        ];
+        let listed = extraction_gaps(&corpus)
+            .into_iter()
+            .filter(|entry| entry.gap == ExtractionGap::PartialParse)
+            .count();
+        let coverage = extraction_coverage(&corpus);
+        assert_eq!(listed, 3);
+        assert_eq!(coverage.partial_parse_listed_files, listed);
+        assert_eq!(coverage.partial_parse_files, 1);
+        let reason = coverage.degraded_reason().expect("a charged partial parse degrades");
+        assert!(
+            reason.contains("1 of the 3 file(s) listed under `partial_parse`"),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn a_partial_parse_reason_names_each_exempt_region_and_why() {
         let region = |start_byte: usize, end_byte: usize| TextRange {
