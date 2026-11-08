@@ -22,9 +22,10 @@
 //!
 //! A `devmap.sqlite` beside a lease means the lease is stale: materialize
 //! places the store first and retires the lease after, so a crash between the
-//! two leaves a store and a lease. `open_if_leased` retires such a lease under
-//! the writer lock and answers `None`; provision refuses a lane that has a
-//! store.
+//! two leaves a store and a lease. A read (`open_if_leased`) refuses it and
+//! deletes nothing; `open_if_leased_for_sync` (`seed --sync-delta`) retires it
+//! under the writer lock and answers `None`; provision refuses a lane that has
+//! a store.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -315,6 +316,12 @@ pub fn base_generation_dir(common_git_dir: &Path, key: &BaseKey) -> PathBuf {
 /// The entry is a cache line. Nothing reads it after provision, so one that
 /// fails verification is replaced; callers hold the bases lock.
 pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifest)> {
+    publish_base_snapshot_with(source_root, true)
+}
+
+/// [`publish_base_snapshot`]; with `reuse` false an existing entry is replaced
+/// without being looked at: the one place a cache entry is removed.
+fn publish_base_snapshot_with(source_root: &Path, reuse: bool) -> Result<(PathBuf, BaseManifest)> {
     let source_canon = source_root
         .canonicalize()
         .with_context(|| format!("cannot canonicalize {}", source_root.display()))?;
@@ -352,15 +359,15 @@ pub fn publish_base_snapshot(source_root: &Path) -> Result<(PathBuf, BaseManifes
         .with_context(|| format!("cannot create {}", bases_dir.display()))?;
     let final_dir = base_generation_dir(&common_git_dir, &key);
     if fs::symlink_metadata(&final_dir).is_ok() {
-        match verify_base_dir(&final_dir, &key) {
-            Ok(existing) => return Ok((final_dir, existing)),
-            // A rebuilt donor restarts its generation ids, so its new base can
-            // meet an old one of the same name whose bytes differ; an entry can
-            // also be of another format or damaged. No lane reads the entry, so
-            // none of those is a conflict: replace it.
-            Err(_) => remove_readonly_tree(&final_dir)
-                .with_context(|| format!("cannot replace base {}", final_dir.display()))?,
+        // A rebuilt donor restarts its generation ids, so its new base can meet
+        // an old one of the same name whose bytes differ; an entry can also be
+        // of another format or damaged. No lane reads the entry, so none of
+        // those is a conflict: replace it.
+        if let Some(existing) = reuse.then(|| verify_base_dir(&final_dir, &key).ok()).flatten() {
+            return Ok((final_dir, existing));
         }
+        remove_readonly_tree(&final_dir)
+            .with_context(|| format!("cannot replace base {}", final_dir.display()))?;
     }
 
     let stage_dir = bases_dir.join(format!(
@@ -524,6 +531,28 @@ fn check_identity(file: &File, record: &FileRecord, what: &str, lease_path: &Pat
         );
     }
     Ok(())
+}
+
+/// Open `name` in `dir` by descriptor and refuse it unless it is sealed. With
+/// `lease` (the lease path and the identity it recorded) the file must also be
+/// the one the lease admitted; a cache entry has no lease and no hint.
+fn open_sealed_child(
+    dir: &PinnedDir,
+    name: &str,
+    what: &str,
+    lease: Option<(&Path, &FileRecord)>,
+) -> Result<File> {
+    let hint = lease.map_or_else(String::new, |(path, _)| format!("; {}", restack_hint(path)));
+    let file = dir
+        .open_file(std::ffi::OsStr::new(name), Access::Read, Creation::Never)
+        .with_context(|| format!("cannot open {name} ({what}){hint}"))?
+        .try_clone()?;
+    let sealed = if lease.is_some() { format!("the lane's {what}") } else { what.to_string() };
+    require_sealed(&file, &sealed, lease.map(|(path, _)| path))?;
+    if let Some((path, record)) = lease {
+        check_identity(&file, record, what, path)?;
+    }
+    Ok(file)
 }
 
 /// Refuse a file anyone can write to: an immutable snapshot is `0444`. A lane's
@@ -708,14 +737,7 @@ fn admit_published_base(
     for suffix in ["-wal", "-shm", "-journal"] {
         require_child_absent(&dir, &format!("{BASE_SQLITE}{suffix}"), &what)?;
     }
-    let open_entry = |name: &str| -> Result<File> {
-        let file = dir
-            .open_file(std::ffi::OsStr::new(name), Access::Read, Creation::Never)
-            .with_context(|| format!("cannot open {name} of {what}"))?
-            .try_clone()?;
-        require_sealed(&file, &format!("published {name}"), None)?;
-        Ok(file)
-    };
+    let open_entry = |name: &str| open_sealed_child(&dir, name, &format!("published {name}"), None);
     let sqlite_src = open_entry(BASE_SQLITE)?;
     let csr_src = match published.csr_sha256 {
         Some(_) => Some(open_entry(BASE_CSR)?),
@@ -1012,11 +1034,9 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
     let admitted = admit_once(&published, &manifest)
         .or_else(|first| {
             // The entry held what its manifest said but not what the donor
-            // built (an impostor, or a rebuilt donor that reused the name). No
-            // lane reads the entry, so replace it once and admit the fresh one.
-            remove_readonly_tree(&published)
-                .with_context(|| format!("cannot replace base {}", published.display()))?;
-            let (entry, verified) = publish_base_snapshot(&source_canon)?;
+            // built (an impostor, or a rebuilt donor that reused the name):
+            // publish replaces it, and the fresh one is admitted once more.
+            let (entry, verified) = publish_base_snapshot_with(&source_canon, false)?;
             admit_once(&entry, &verified).with_context(|| {
                 format!("the replacement cache entry was refused too (first refusal: {first:#})")
             })
@@ -1048,24 +1068,7 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
     let placed = (|| -> Result<()> {
         // The previous lease goes first: between here and the new lease the
         // lane is plainly unstacked, never leased to a base that is not there.
-        match fs::remove_file(&lease_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("cannot retire the previous lease {}", lease_path.display())
-                })
-            }
-        }
-        match fs::remove_dir_all(&final_stack) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("cannot replace the lane's base {}", final_stack.display())
-                })
-            }
-        }
+        remove_lease_and_base(&lease_path, &final_stack)?;
         fs::rename(&stage, &final_stack)
             .with_context(|| format!("cannot place {}", final_stack.display()))?;
         write_atomic(&lease_path, &serde_json::to_vec_pretty(&lease)?)
@@ -1252,12 +1255,12 @@ fn open_lane_base(wt_canon: &Path, repo_root_override: Option<String>) -> Result
         format!("cannot open the lane's base directory {}; {hint}", stack.display())
     })?;
     let base_sqlite_path = stack.join(BASE_SQLITE);
-    let base_file = pinned
-        .open_file(std::ffi::OsStr::new(BASE_SQLITE), Access::Read, Creation::Never)
-        .with_context(|| format!("cannot open {BASE_SQLITE} in {}; {hint}", stack.display()))?
-        .try_clone()?;
-    require_sealed(&base_file, "the lane's base snapshot", Some(&lease_path))?;
-    check_identity(&base_file, &lease.base, "base snapshot", &lease_path)?;
+    let base_file = open_sealed_child(
+        &pinned,
+        BASE_SQLITE,
+        "base snapshot",
+        Some((&lease_path, &lease.base)),
+    )?;
     let base = Store::open_immutable_snapshot_file(&base_file, &base_sqlite_path, repo_root_override)
         .with_context(|| {
             format!(
@@ -1331,7 +1334,7 @@ impl StackedStore {
     ///
     /// Names nothing under the shared `bases/` cache: it opens the lane's own
     /// `stack/` directory by descriptor, checks the base against the identity
-    /// the lease recorded at provision (one directory open, two `fstat`s) and
+    /// the lease recorded at provision (one directory open, then one `fstat` per file) and
     /// binds the SQLite connection to that descriptor.
     pub fn open(worktree_root: &Path) -> Result<Self> {
         let wt_canon = worktree_root
@@ -1350,12 +1353,12 @@ impl StackedStore {
 
         let (csr_file, base_csr_path) = match &lease.csr {
             Some(record) => {
-                let file = pinned
-                    .open_file(std::ffi::OsStr::new(BASE_CSR), Access::Read, Creation::Never)
-                    .with_context(|| format!("cannot open {BASE_CSR} in {}; {hint}", stack.display()))?
-                    .try_clone()?;
-                require_sealed(&file, "the lane's CSR sidecar", Some(&lease_path))?;
-                check_identity(&file, record, "CSR sidecar", &lease_path)?;
+                let file = open_sealed_child(
+                    &pinned,
+                    BASE_CSR,
+                    "CSR sidecar",
+                    Some((&lease_path, record)),
+                )?;
                 (Some(file), Some(stack.join(BASE_CSR)))
             }
             None => {
@@ -1383,20 +1386,37 @@ impl StackedStore {
         })
     }
 
-    /// `None` when the lane has no lease, or its lease is stale: a store beside
-    /// a lease means a materialize placed the store and was interrupted before
-    /// it retired the lease. The stale lease is retired here under the writer
-    /// lock (housekeeping; the answer is `None` either way).
+    /// `None` when the lane has no lease. A read path: it deletes nothing, so a
+    /// store beside a lease (an interrupted materialize) is refused with the
+    /// recovery command.
     pub fn open_if_leased(worktree_root: &Path) -> Result<Option<Self>> {
         if !stack_lease_path(worktree_root).is_file() {
             return Ok(None);
         }
         if store_path(worktree_root).is_file() {
-            retire_stale_lease(worktree_root);
-            return Ok(None);
+            bail!(
+                "{} has its own store beside a stale stack lease (an interrupted materialize); \
+                 run `devmap seed --sync-delta` there to retire the lease",
+                worktree_root.display()
+            );
         }
         Self::open(worktree_root).map(Some)
     }
+
+    /// [`open_if_leased`](Self::open_if_leased) for `seed --sync-delta`, a write
+    /// command: retires a stale lease (reads as `None`) and rolls back a hot
+    /// delta journal with a writable open before the read-only one.
+    pub fn open_if_leased_for_sync(worktree_root: &Path) -> Result<Option<Self>> {
+        if stack_lease_path(worktree_root).is_file() {
+            if store_path(worktree_root).is_file() {
+                retire_stale_lease(worktree_root);
+                return Ok(None);
+            }
+            DeltaStore::open_existing(stack_delta_path(worktree_root))?;
+        }
+        Self::open_if_leased(worktree_root)
+    }
+
     pub fn worktree_root(&self) -> &Path {
         &self.worktree_root
     }
@@ -1686,7 +1706,7 @@ impl StackedStore {
         if fs::symlink_metadata(&target_db).is_ok() {
             bail!(
                 "refusing to materialize over an existing store {}; its stack lease is stale \
-                 and the next open retires it",
+                 and `devmap seed --sync-delta` retires it",
                 target_db.display()
             );
         }
@@ -1716,7 +1736,7 @@ impl StackedStore {
         }
         if let Err(err) = retire_stack(&self.worktree_root) {
             // The lane is consistent: a store beside a stale lease, which the
-            // next `open_if_leased` retires.
+            // next `open_if_leased_for_sync` retires.
             eprintln!(
                 "devmap: materialized {} but could not retire the stack lease: {err:#}",
                 target_db.display()
@@ -2074,7 +2094,7 @@ fn git_changed_paths_within(
     Ok(paths)
 }
 
-/// Longest `open_if_leased` waits for the writer lock to retire a stale lease.
+/// Longest `open_if_leased_for_sync` waits for the writer lock to retire a stale lease.
 /// A build that holds it for minutes must not stall a hook, and the answer
 /// does not depend on it.
 const STALE_LEASE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
@@ -2101,26 +2121,22 @@ fn retire_stale_lease(worktree_root: &Path) {
 /// Remove a lane's lease, private base and delta. The lease goes first, so an
 /// interruption never leaves a lease naming a base that is gone.
 fn retire_stack(worktree_root: &Path) -> Result<()> {
-    let lease_path = stack_lease_path(worktree_root);
-    match fs::remove_file(&lease_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("cannot remove the stack lease {}", lease_path.display()))
-        }
-    }
-    let stack = stack_dir(worktree_root);
-    match fs::remove_dir_all(&stack) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("cannot remove the lane's base {}", stack.display()))
-        }
-    }
+    remove_lease_and_base(&stack_lease_path(worktree_root), &stack_dir(worktree_root))?;
     discard_staged(&stack_delta_path(worktree_root));
     Ok(())
+}
+
+/// Remove a lane's lease, then its private base; already gone is fine. The lease
+/// goes first, so an interruption never leaves a lease naming a base that is gone.
+fn remove_lease_and_base(lease_path: &Path, stack: &Path) -> Result<()> {
+    let tolerate = |removed: std::io::Result<()>, path: &Path| match removed {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("cannot remove {}", path.display()))
+        }
+        _ => Ok(()),
+    };
+    tolerate(fs::remove_file(lease_path), lease_path)?;
+    tolerate(fs::remove_dir_all(stack), stack)
 }
 
 /// Streaming sha256 of an open file, 64 KiB at a time, from offset 0.
@@ -3465,10 +3481,10 @@ mod tests {
 
     /// 9: a store is placed before the lease is retired, so a lease that cannot
     /// be removed leaves a store beside a STALE lease: the lane is plain, and the
-    /// next `open_if_leased` retires the lease under the writer lock.
+    /// next `open_if_leased_for_sync` retires the lease under the writer lock.
     #[cfg(all(feature = "parse", target_os = "macos"))]
     #[test]
-    fn materialize_with_an_unremovable_lease_leaves_a_stale_lease_the_next_open_retires() {
+    fn materialize_with_an_unremovable_lease_leaves_a_stale_lease_the_next_sync_retires() {
         let root = temp_repo_dir("atk9");
         let anchor = root.join("anchor");
         seed_indexed_git_repo(&anchor);
@@ -3490,13 +3506,14 @@ mod tests {
         let store_exists = store_path(&canon).exists();
         let lease_exists = lease.exists();
         // Not leased any more: the store beside the lease wins.
-        let during = StackedStore::open_if_leased(&lane).map(|o| o.is_some());
+        let during = format!("{:#}", StackedStore::open_if_leased(&lane).err().expect("a read refuses"));
         let _ = Command::new("chflags").arg("nouchg").arg(&lease).status();
         drop(stacked);
         assert!(res.is_ok(), "the store was placed: {res:?}");
         assert!(store_exists && lease_exists, "fixture: a store and a stale lease");
-        assert!(matches!(during, Ok(false)), "stale lease must read as unstacked: {during:?}");
-        assert!(matches!(StackedStore::open_if_leased(&lane), Ok(None)));
+        assert!(during.contains("devmap seed --sync-delta"), "a read names the recovery: {during}");
+        assert!(lease.exists(), "a read deletes nothing");
+        assert!(matches!(StackedStore::open_if_leased_for_sync(&lane), Ok(None)));
         assert!(!lease.exists(), "the stale lease is retired");
         assert!(!stack_dir(&canon).exists(), "and so is the private base");
         assert!(!stack_delta_path(&canon).exists(), "and the delta");
@@ -3899,7 +3916,11 @@ mod tests {
         fs::rename(&base_dir, &away).unwrap();
         std::os::unix::fs::symlink(&away, &base_dir).unwrap();
         match StackedStore::open(&lane) {
-            Err(e) => eprintln!("a2_1c stack-dir symlink refused: {e:#}"),
+            Err(e) => {
+                let text = format!("{e:#}");
+                assert!(text.contains("cannot open the lane's base directory"), "{text}");
+                assert!(text.contains("devmap seed --stacked"), "{text}");
+            }
             Ok(_) => panic!("a stack dir that is a symlink to a dir outside the lane was opened"),
         }
         let _ = remove_readonly_tree(&root);
@@ -4033,12 +4054,12 @@ mod tests {
     }
 
     /// 4b: a store beside a lease means the lease is stale (a materialize was
-    /// interrupted after placing the store). `open_if_leased` says "unstacked",
-    /// retires the lease, the private base and the delta under the writer lock,
-    /// and provision refuses a lane that has a store.
+    /// interrupted after placing the store). `open_if_leased` (a read) refuses
+    /// and deletes nothing; `open_if_leased_for_sync` says "unstacked", retires the lease, the private
+    /// base and the delta under the writer lock, and provision refuses a lane that has a store.
     #[cfg(all(feature = "parse", unix))]
     #[test]
-    fn a2_4b_a_store_beside_a_stale_lease_reads_as_unstacked_and_the_lease_is_retired() {
+    fn a2_4b_a_store_beside_a_stale_lease_is_refused_on_read_and_retired_by_sync() {
         let root = temp_repo_dir("a2-4b");
         let anchor = root.join("anchor");
         seed_indexed_git_repo(&anchor);
@@ -4065,7 +4086,10 @@ mod tests {
         assert!(err.contains("already has its own store"), "{err}");
         assert!(stack_lease_path(&wt).is_file(), "a refused provision changes nothing");
 
-        assert!(matches!(StackedStore::open_if_leased(&lane), Ok(None)));
+        let read = format!("{:#}", StackedStore::open_if_leased(&lane).err().expect("a read refuses"));
+        assert!(read.contains("devmap seed --sync-delta"), "{read}");
+        assert!(stack_lease_path(&wt).is_file(), "a read retires nothing");
+        assert!(matches!(StackedStore::open_if_leased_for_sync(&lane), Ok(None)));
         assert!(!stack_lease_path(&wt).exists(), "the stale lease is retired");
         assert!(!lease.base_dir().exists(), "and the private base");
         assert!(!stack_delta_path(&wt).exists(), "and the delta");
@@ -4487,10 +4511,13 @@ mod tests {
         let _ = remove_readonly_tree(&root);
     }
 
-    /// 5b: a normal (default-mode) writer mid-transaction must not block the hook.
+    /// FIX-C: the production writer (`DeltaStore`, rollback-journal mode) commits
+    /// in a loop while a reader opens and asks status, as the hook does. A reader
+    /// is blocked only while a commit holds PENDING/EXCLUSIVE, so the worst case
+    /// over many opens is measured against the hook's 400 ms read budget.
     #[cfg(all(feature = "parse", unix))]
     #[test]
-    fn a2_5b_default_writer_does_not_block_open_and_status() {
+    fn a2_5b_a_committing_writer_in_rollback_mode_stays_inside_the_hook_read_budget() {
         let root = temp_repo_dir("a2-5b");
         let anchor = root.join("anchor");
         seed_indexed_git_repo(&anchor);
@@ -4502,17 +4529,87 @@ mod tests {
             s.sync_worktree().unwrap();
         }
         let wt = lane.canonicalize().unwrap();
-        let conn = DeltaStore::open(stack_delta_path(&wt)).unwrap();
-        let raw = rusqlite::Connection::open(stack_delta_path(&wt)).unwrap();
-        raw.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;").unwrap();
-        let t = std::time::Instant::now();
-        let r = StackedStore::open(&lane);
-        let st = r.as_ref().ok().map(|s| s.status().map(|x| x.dirty_files).map_err(|e| format!("{e:#}")));
-        let took = t.elapsed();
-        eprintln!("a2_5b: open={:?} status={:?} took={took:?}", r.as_ref().map(|_| "ok").map_err(|e| format!("{e:#}")), st);
-        raw.execute_batch("ROLLBACK;").unwrap();
+        let delta_path = stack_delta_path(&wt);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let delta = DeltaStore::open(&delta_path).unwrap();
+                let mut commits = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    delta.tombstone_file(&format!("src/w_{}.rs", commits % 64), "CAS_TOMBSTONE", commits).unwrap();
+                    commits += 1;
+                }
+                commits
+            })
+        };
+        let mut worst = std::time::Duration::ZERO;
+        let began = std::time::Instant::now();
+        let mut opens = 0u32;
+        while began.elapsed() < std::time::Duration::from_secs(3) {
+            let t = std::time::Instant::now();
+            let s = StackedStore::open(&lane).expect("a reader opens beside a committing writer");
+            s.status().expect("status beside a committing writer");
+            worst = worst.max(t.elapsed());
+            opens += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let commits = writer.join().unwrap();
+        eprintln!("a2_5b: {opens} opens against {commits} commits, worst open+status {worst:?}");
+        assert!(commits > 10, "fixture: the writer committed ({commits})");
+        assert!(
+            worst < std::time::Duration::from_millis(400),
+            "open+status took {worst:?} beside a committing writer (hook read budget 400 ms)"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// FIX-A at the lane: an interrupted delta writer's hot journal makes every
+    /// read refuse with the cause and `devmap seed --sync-delta`, and that
+    /// command (a writable open first) recovers the lane.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_hot_delta_journal_refuses_reads_and_sync_delta_recovers_the_lane() {
+        let root = temp_repo_dir("hotjournal");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        {
+            let mut s = StackedStore::open(&lane).unwrap();
+            s.sync_worktree().unwrap();
+        }
+        let wt = lane.canonicalize().unwrap();
+        let delta = stack_delta_path(&wt);
+        // A writer killed mid-commit: copy the db and its journal while a
+        // spilling transaction is open, then put the copies in place.
+        let live = root.join("live.sqlite");
+        fs::copy(&delta, &live).unwrap();
+        let mut conn = rusqlite::Connection::open(&live).unwrap();
+        conn.execute_batch("PRAGMA cache_size = 1;").unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        for i in 0..400 {
+            tx.execute(
+                "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
+                 VALUES (?1, 'x', 1, ?2, 1)",
+                rusqlite::params![format!("src/spill_{i}.rs"), "y".repeat(2000)],
+            )
+            .unwrap();
+        }
+        fs::copy(&live, &delta).unwrap();
+        fs::copy(root.join("live.sqlite-journal"), delta.with_file_name("delta.sqlite-journal")).unwrap();
+        drop(tx);
         drop(conn);
-        assert!(r.is_ok() && took < std::time::Duration::from_millis(400));
+
+        let err = format!("{:#}", StackedStore::open(&lane).err().expect("a hot journal refuses reads"));
+        assert!(err.contains("hot rollback journal") && err.contains("devmap seed --sync-delta"), "{err}");
+        let mut s = StackedStore::open_if_leased_for_sync(&lane)
+            .expect("sync --sync-delta opens the lane")
+            .expect("leased");
+        s.sync_worktree().unwrap();
+        drop(s);
+        StackedStore::open(&lane).expect("the lane reads again after the sync");
         let _ = remove_readonly_tree(&root);
     }
 }

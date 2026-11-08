@@ -150,14 +150,13 @@ impl DeltaStore {
                 let hot = matches!(&err, rusqlite::Error::SqliteFailure(e, _)
                     if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK);
                 let why = if hot {
-                    "a writer was interrupted and left a hot rollback journal that a read-only \
-                     open cannot roll back; run `devmap seed --sync-delta` to recover"
+                    "an interrupted writer left a hot rollback journal that a read-only open \
+                     cannot roll back; run `devmap seed --sync-delta`"
                 } else {
                     "a WAL-mode delta from an earlier build in a read-only state directory is \
                      unreadable, not empty"
                 };
-                anyhow::Error::new(err)
-                    .context(format!("delta store {} cannot be read read-only ({why})", path.display()))
+                anyhow::Error::new(err).context(format!("delta store {} cannot be read ({why})", path.display()))
             })?;
         Ok(Some(Self {
             conn: Mutex::new(conn),
@@ -176,16 +175,12 @@ impl DeltaStore {
     fn configure(conn: &Connection) -> Result<()> {
         conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON;")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        // The pragma answers with the mode in force: leaving WAL needs exclusive
-        // access, so a legacy WAL delta another connection holds stays WAL.
+        // Leaving WAL needs exclusive access: read the mode back, never assume it.
         let mode: String = conn
             .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))
             .context("cannot switch the delta store to rollback-journal mode (another connection holds it)")?;
         if !mode.eq_ignore_ascii_case("delete") {
-            bail!(
-                "delta store stayed in {mode} journal mode (another connection holds it open); \
-                 close it and retry"
-            );
+            bail!("delta store stayed in {mode} journal mode: another connection holds it open");
         }
         Ok(())
     }
@@ -461,7 +456,7 @@ mod tests {
     /// While a writer holds the database open its `-wal` exists, and a read
     /// must see that writer's committed rows (an immutable open would not).
     #[test]
-    fn open_read_only_sees_rows_a_live_writer_has_not_checkpointed() {
+    fn open_read_only_sees_rows_a_live_writer_has_committed() {
         let dir = temp_dir("livewriter");
         let path = dir.join("delta.sqlite");
         let writer = DeltaStore::open(&path).unwrap();

@@ -1250,11 +1250,9 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
     );
 
     // Corrupting stack_lease.json must fail closed instead of falling back!
-    std::fs::write(
-        devmap_extract::paths::stack_lease_path(&stacked_wt),
-        b"{not valid json",
-    )
-    .unwrap();
+    let lease_path = devmap_extract::paths::stack_lease_path(&stacked_wt);
+    let lease_bytes = std::fs::read(&lease_path).unwrap();
+    std::fs::write(&lease_path, b"{not valid json").unwrap();
     let corrupt_err = tool_error_text(
         &call(
             &slot,
@@ -1267,6 +1265,21 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
         corrupt_err.contains("corrupt") || corrupt_err.contains("stack_lease.json"),
         "corrupt stack_lease.json must fail closed: {corrupt_err}"
     );
+
+    // A store beside a valid lease (an interrupted materialize): a read refuses
+    // with the recovery command and deletes nothing.
+    std::fs::write(&lease_path, &lease_bytes).unwrap();
+    std::fs::copy(&anchor_db, devmap_extract::paths::store_path(&stacked_wt)).unwrap();
+    let stale_err = tool_error_text(
+        &call(
+            &slot,
+            "devmap_status",
+            json!({"repo_path": stacked_wt.display().to_string()}),
+        )
+        .await,
+    );
+    assert!(stale_err.contains("devmap seed --sync-delta"), "{stale_err}");
+    assert!(lease_path.is_file(), "an MCP read must not delete lane state");
 
     let _ = std::fs::remove_dir_all(&base);
 }

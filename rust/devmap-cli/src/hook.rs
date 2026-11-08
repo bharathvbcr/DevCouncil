@@ -4645,30 +4645,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// One entry point: the hook's open retires a stale lease (a lease beside
-    /// the store that a materialize placed) instead of reading the stale stack.
+    /// The hook only reads: with the store a materialize placed and a lease
+    /// that outlived it, its open answers from the store and deletes nothing.
     #[test]
-    fn the_hooks_open_retires_a_stale_lease_beside_a_store() {
+    fn the_hooks_open_never_deletes_a_stale_lease_beside_a_store() {
         let (base, _main, lane) = stacked_lane_fixture("stacked-stale");
         let canon = lane.canonicalize().unwrap();
         let lease_path = devmap_extract::paths::stack_lease_path(&canon);
         let lease_bytes = std::fs::read(&lease_path).unwrap();
-        let store = devmap_query::StackedStore::open(&lane)
+        devmap_query::StackedStore::open(&lane)
             .unwrap()
             .materialize_seeded_store()
             .unwrap();
-        assert!(store.is_file());
         // The interrupted state: the store is placed, the lease is back.
         std::fs::write(&lease_path, &lease_bytes).unwrap();
-        // Plain store first, as before; the lease is not read at all.
         assert!(matches!(HookStore::open(&lane), Ok(Some(HookStore::Plain(_)))));
-        // Without the plain store the hook would reach the lease; the single
-        // entry point retires it and says "not stacked".
-        assert!(matches!(
-            devmap_query::StackedStore::open_if_leased(&lane),
-            Ok(None)
-        ));
-        assert!(!lease_path.exists(), "the stale lease is retired");
+        assert!(lease_path.is_file(), "the hook's read left the lease alone");
         let _ = std::fs::remove_dir_all(&base);
     }
 
