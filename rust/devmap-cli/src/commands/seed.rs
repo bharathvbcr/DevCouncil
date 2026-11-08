@@ -18,7 +18,7 @@ use devmap_extract::paths::{
 };
 use devmap_query::{
     gc_unused_bases, provision_stacked_worktree, seed_derived_artifacts_and_reuse_caches,
-    StackedStore,
+    StackedStore, SyncTarget,
 };
 use devmap_store::seed::{self, SeedMethod};
 use devmap_store::Store;
@@ -81,13 +81,23 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     }
 
     if args.sync_delta {
-        let mut stacked = StackedStore::open_if_leased_for_sync(&root)?.with_context(|| {
-            format!(
-                "{} has no stack lease (or has its own store, which makes a lease stale); \
-                 nothing to sync",
-                root.display()
-            )
-        })?;
+        let mut stacked = match StackedStore::open_if_leased_for_sync(&root)? {
+            SyncTarget::Lane(lane) => lane,
+            SyncTarget::RetiredStaleLease => {
+                if cli.json {
+                    emit_json(cli, &serde_json::json!({ "retired_stale_lease": true }))?;
+                } else {
+                    outln!(
+                        "retired the stale stack lease of {} (it has its own store); nothing to sync",
+                        root.display()
+                    );
+                }
+                return Ok(());
+            }
+            SyncTarget::NoLease => {
+                bail!("{} has no stack lease; nothing to sync", root.display())
+            }
+        };
         let report = stacked.sync_worktree()?;
         if cli.json {
             emit_json(cli, &serde_json::to_value(&report)?)?;

@@ -103,6 +103,15 @@ impl std::fmt::Debug for DeltaStore {
     }
 }
 
+/// The `-journal`, `-wal` and `-shm` beside `db` that are symlinks.
+fn symlinked_sidecars(db: &Path) -> Vec<PathBuf> {
+    ["-journal", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| sidecar(db, suffix))
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
+        .collect()
+}
+
 impl DeltaStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -137,6 +146,14 @@ impl DeltaStore {
         if !path.is_file() {
             return Ok(None);
         }
+        if let Some(link) = symlinked_sidecars(&path).into_iter().next() {
+            bail!(
+                "delta store {} cannot be read: {} is a symlink, which SQLite will not follow; \
+                 run `devmap seed --sync-delta`, which unlinks it",
+                path.display(),
+                link.display()
+            );
+        }
         let conn = Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -147,14 +164,29 @@ impl DeltaStore {
         // SQLite opens lazily: read now, so a refusal is reported here.
         conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
             .map_err(|err| {
-                let hot = matches!(&err, rusqlite::Error::SqliteFailure(e, _)
-                    if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK);
-                let why = if hot {
-                    "an interrupted writer left a hot rollback journal that a read-only open \
-                     cannot roll back; run `devmap seed --sync-delta`"
-                } else {
-                    "a WAL-mode delta from an earlier build in a read-only state directory is \
-                     unreadable, not empty"
+                let code = match &err {
+                    rusqlite::Error::SqliteFailure(e, _) => Some(*e),
+                    _ => None,
+                };
+                let why = match code {
+                    Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
+                        "an interrupted writer left a hot rollback journal that a read-only open \
+                         cannot roll back; run `devmap seed --sync-delta`"
+                    }
+                    Some(e)
+                        if matches!(
+                            e.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) =>
+                    {
+                        "another process holds a write lock on it; wait for that writer (often a \
+                         running `devmap seed --sync-delta`) to finish and retry"
+                    }
+                    Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
+                        "a WAL-mode delta from an earlier build in a read-only state directory is \
+                         unreadable, not empty"
+                    }
+                    _ => "the database could not be read",
                 };
                 anyhow::Error::new(err).context(format!("delta store {} cannot be read ({why})", path.display()))
             })?;
@@ -168,6 +200,17 @@ impl DeltaStore {
         let path = path.as_ref();
         if !path.is_file() {
             return Ok(None);
+        }
+        // SQLite refuses a journal or WAL sidecar that is a symlink, which
+        // strands the delta. A real sidecar is never a link: unlink it (the link
+        // only, never its target) and say so.
+        for link in symlinked_sidecars(path) {
+            std::fs::remove_file(&link)
+                .with_context(|| format!("cannot unlink the symlinked {}", link.display()))?;
+            eprintln!(
+                "devmap: unlinked {}, a symlink where SQLite keeps a delta sidecar (its target was not touched)",
+                link.display()
+            );
         }
         Self::open(path).map(Some)
     }
@@ -577,7 +620,7 @@ mod tests {
     fn a_hot_rollback_journal_is_refused_read_only_with_the_recovery_command_and_a_writer_recovers() {
         let dir = temp_dir("hotjournal");
         let path = hot_journal_delta(&dir);
-        let err = format!("{:#}", DeltaStore::open_read_only(&path).err().expect("a hot journal is refused"));
+        let err = format!("{:#}", DeltaStore::open_read_only(&path).expect_err("a hot journal is refused"));
         assert!(err.contains("hot rollback journal"), "{err}");
         assert!(err.contains("devmap seed --sync-delta"), "{err}");
         assert!(!err.contains("WAL-mode delta"), "wrong cause named: {err}");
@@ -597,7 +640,7 @@ mod tests {
         let _: String = held.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
         held.execute_batch(DELTA_SCHEMA_DDL).unwrap();
         held.execute_batch("BEGIN; SELECT COUNT(*) FROM delta_files;").unwrap();
-        let err = format!("{:#}", DeltaStore::open(&path).err().expect("must refuse"));
+        let err = format!("{:#}", DeltaStore::open(&path).expect_err("must refuse"));
         assert!(err.contains("rollback-journal mode"), "{err}");
         held.execute_batch("COMMIT;").unwrap();
         drop(held);

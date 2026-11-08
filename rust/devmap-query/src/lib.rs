@@ -87,7 +87,7 @@ pub use stacked::{
     base_generation_dir, bases_root_dir, gc_unused_bases, gc_unused_bases_waiting,
     provision_stacked_worktree, publish_base_snapshot, seed_derived_artifacts_and_reuse_caches,
     BaseKey, BaseManifest, FileRecord, GcBasesReport, StackLease, StackedStatus, StackedStore,
-    StackedSyncReport, DEFAULT_REBASE_DELTA_BYTES, DEFAULT_REBASE_DIRTY_FILES,
+    StackedSyncReport, SyncTarget, DEFAULT_REBASE_DELTA_BYTES, DEFAULT_REBASE_DIRTY_FILES,
     STACK_FORMAT_VERSION,
 };
 

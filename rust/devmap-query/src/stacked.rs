@@ -31,7 +31,6 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -41,7 +40,6 @@ use devmap_extract::paths::{
     repo_map_path, same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
 };
 use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
-use devmap_store::csr::CsrGraphReader;
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
@@ -1222,7 +1220,6 @@ fn make_tree_writable_best_effort(path: &Path) {
 struct LaneBase {
     lease: StackLease,
     lease_path: PathBuf,
-    stack: PathBuf,
     pinned: PinnedDir,
     base_file: File,
     base: Store,
@@ -1271,7 +1268,6 @@ fn open_lane_base(wt_canon: &Path, repo_root_override: Option<String>) -> Result
     Ok(LaneBase {
         lease,
         lease_path,
-        stack,
         pinned,
         base_file,
         base,
@@ -1302,6 +1298,16 @@ pub fn open_lane_base_store(base_sqlite: &Path) -> Result<Store> {
     open_lane_base(&wt_canon, None).map(|lane| lane.base)
 }
 
+/// What `seed --sync-delta` found in a lane.
+pub enum SyncTarget {
+    /// A live stacked lane to sync.
+    Lane(Box<StackedStore>),
+    /// The lane has its own store, so its stack lease was stale; it was removed.
+    RetiredStaleLease,
+    /// No stack lease at all.
+    NoLease,
+}
+
 pub struct StackedStore {
     worktree_root: PathBuf,
     lease: StackLease,
@@ -1309,9 +1315,7 @@ pub struct StackedStore {
     /// and any re-check all go through this descriptor, never a name.
     base_file: File,
     csr_file: Option<File>,
-    base_csr_path: Option<PathBuf>,
     base: Store,
-    csr: Mutex<Option<Arc<CsrGraphReader>>>,
     /// `None` until `delta.sqlite` exists. A read path (hook, MCP, status) never
     /// creates or migrates it: a missing delta reads as an empty one.
     delta: Option<DeltaStore>,
@@ -1344,14 +1348,13 @@ impl StackedStore {
         let LaneBase {
             lease,
             lease_path,
-            stack,
             pinned,
             base_file,
             base,
         } = open_lane_base(&wt_canon, Some(wt_root_str.clone()))?;
         let hint = restack_hint(&lease_path);
 
-        let (csr_file, base_csr_path) = match &lease.csr {
+        let csr_file = match &lease.csr {
             Some(record) => {
                 let file = open_sealed_child(
                     &pinned,
@@ -1359,12 +1362,12 @@ impl StackedStore {
                     "CSR sidecar",
                     Some((&lease_path, record)),
                 )?;
-                (Some(file), Some(stack.join(BASE_CSR)))
+                Some(file)
             }
             None => {
                 require_child_absent(&pinned, BASE_CSR, "the lane's base directory")
                     .with_context(|| hint.clone())?;
-                (None, None)
+                None
             }
         };
 
@@ -1377,9 +1380,7 @@ impl StackedStore {
             lease,
             base_file,
             csr_file,
-            base_csr_path,
             base,
-            csr: Mutex::new(None),
             delta,
             delta_writable: false,
             overlay,
@@ -1404,17 +1405,19 @@ impl StackedStore {
     }
 
     /// [`open_if_leased`](Self::open_if_leased) for `seed --sync-delta`, a write
-    /// command: retires a stale lease (reads as `None`) and rolls back a hot
-    /// delta journal with a writable open before the read-only one.
-    pub fn open_if_leased_for_sync(worktree_root: &Path) -> Result<Option<Self>> {
+    /// command: retires a stale lease (a store beside it) and says so, and rolls
+    /// back a hot delta journal with a writable open before the read-only one.
+    pub fn open_if_leased_for_sync(worktree_root: &Path) -> Result<SyncTarget> {
         if stack_lease_path(worktree_root).is_file() {
-            if store_path(worktree_root).is_file() {
-                retire_stale_lease(worktree_root);
-                return Ok(None);
+            if store_path(worktree_root).is_file() && retire_stale_lease(worktree_root)? {
+                return Ok(SyncTarget::RetiredStaleLease);
             }
             DeltaStore::open_existing(stack_delta_path(worktree_root))?;
         }
-        Self::open_if_leased(worktree_root)
+        Ok(match Self::open_if_leased(worktree_root)? {
+            Some(lane) => SyncTarget::Lane(Box::new(lane)),
+            None => SyncTarget::NoLease,
+        })
     }
 
     pub fn worktree_root(&self) -> &Path {
@@ -1452,43 +1455,6 @@ impl StackedStore {
 
     pub fn overlay(&self) -> &WorktreeOverlay {
         &self.overlay
-    }
-
-    /// Lazily map `base.sqlite.csr` on first traversal (`F6` — zero eager edge scan at open).
-    pub fn csr_reader(&self) -> Result<Option<Arc<CsrGraphReader>>> {
-        let mut guard = self
-            .csr
-            .lock()
-            .map_err(|_| anyhow::anyhow!("StackedStore CSR mutex poisoned"))?;
-        if let Some(ref reader) = *guard {
-            return Ok(Some(Arc::clone(reader)));
-        }
-        let (Some(csr_path), Some(csr_file), Some(record)) =
-            (&self.base_csr_path, &self.csr_file, &self.lease.csr)
-        else {
-            return Ok(None);
-        };
-        // Content and identity, once, before the first mapping, through the
-        // descriptor the lane admitted.
-        let lease_path = stack_lease_path(&self.worktree_root);
-        check_identity(csr_file, record, "CSR sidecar", &lease_path)?;
-        verify_csr_content(csr_file, record)?;
-        let reader = Arc::new(
-            CsrGraphReader::open_mmap(csr_path)
-                .map_err(|e| anyhow::anyhow!("cannot mmap {}: {e}", csr_path.display()))?,
-        );
-        // The mapping opened a name: it must be the file that was verified.
-        let mapped = fs::metadata(csr_path)
-            .with_context(|| format!("cannot stat {}", csr_path.display()))?;
-        if !same_file(&mapped, csr_file)? {
-            bail!(
-                "the lane's CSR sidecar {} was replaced while it was being mapped; {}",
-                csr_path.display(),
-                restack_hint(&lease_path)
-            );
-        }
-        *guard = Some(Arc::clone(&reader));
-        Ok(Some(reader))
     }
 
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
@@ -2113,21 +2079,28 @@ const STALE_LEASE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mil
 
 /// Retire a lease that a store has outlived. Under the writer lock, because a
 /// materialize that is still placing the store holds it and owns the lease
-/// until it finishes; the store is re-checked once the lock is held.
-fn retire_stale_lease(worktree_root: &Path) {
+/// until it finishes; the store is re-checked once the lock is held. `false`
+/// when the store is gone by then (the lease is live again, nothing retired).
+fn retire_stale_lease(worktree_root: &Path) -> Result<bool> {
     let target_db = store_path(worktree_root);
-    let Ok(_writer) = Store::lock_writer_at(&target_db, STALE_LEASE_LOCK_WAIT) else {
-        return;
-    };
+    let _writer = Store::lock_writer_at(&target_db, STALE_LEASE_LOCK_WAIT).with_context(|| {
+        format!(
+            "{} has a store and a stale stack lease, but the writer lock on {} is held; \
+             wait for that process to finish and run `devmap seed --sync-delta` again",
+            worktree_root.display(),
+            target_db.display()
+        )
+    })?;
     if !target_db.is_file() {
-        return;
+        return Ok(false);
     }
-    if let Err(err) = retire_stack(worktree_root) {
-        eprintln!(
-            "devmap: {} has a store and a stale stack lease that could not be retired: {err:#}",
+    retire_stack(worktree_root).with_context(|| {
+        format!(
+            "{} has a store and a stale stack lease that could not be retired",
             worktree_root.display()
-        );
-    }
+        )
+    })?;
+    Ok(true)
 }
 
 /// Remove a lane's lease, private base and delta. The lease goes first, so an
@@ -2168,20 +2141,6 @@ fn sha256_of_open_file(file: &File) -> Result<String> {
     Ok(crate::digest::hex(&hasher.finalize()))
 }
 
-/// Whether the file a name resolved to (`named`) is the open `file`.
-fn same_file(named: &fs::Metadata, file: &File) -> Result<bool> {
-    let held = file.metadata().context("cannot stat an admitted file")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok((named.dev(), named.ino()) == (held.dev(), held.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(named.len() == held.len() && named.modified().ok() == held.modified().ok())
-    }
-}
-
 /// The CSR sidecar's content against what the lease admitted, read through the
 /// descriptor the store holds.
 fn verify_csr_content(file: &File, record: &FileRecord) -> Result<()> {
@@ -2210,6 +2169,7 @@ fn sha256_str_hex(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     #[cfg(feature = "parse")]
     use std::process::Command;
     #[cfg(feature = "parse")]
@@ -2448,8 +2408,6 @@ mod tests {
             "Rust macro_rules! lost: {rs_names:?}"
         );
 
-        // Lazy CSR mmap works without scanning SQLite edges!
-        assert!(stacked.csr_reader().unwrap().is_some());
         drop(stacked);
 
         // Adversarial 2: flipping `base.sqlite` to `0644` MUST cause `StackedStore::open` to fail closed!
@@ -2969,7 +2927,7 @@ mod tests {
     /// 15: a replaced `base.sqlite.csr` must not be served.
     #[cfg(feature = "parse")]
     #[test]
-    fn csr_reader_refuses_a_tampered_sidecar() {
+    fn materialize_refuses_a_tampered_csr_sidecar() {
         let root = temp_repo_dir("atk15");
         let anchor = root.join("anchor");
         seed_indexed_git_repo(&anchor);
@@ -2992,7 +2950,7 @@ mod tests {
         let tampered_len = fs::metadata(&csr).unwrap().len();
         set_file_readonly(&csr).unwrap();
         assert_ne!(honest_len, tampered_len, "fixture: CSRs must differ");
-        let served = StackedStore::open(&lane).and_then(|s| s.csr_reader().map(|r| r.is_some()));
+        let served = StackedStore::open(&lane).and_then(|s| s.materialize_seeded_store());
         eprintln!(
             "attack_15 outcome: {:?}",
             served.as_ref().map_err(|e| format!("{e:#}"))
@@ -3518,14 +3476,14 @@ mod tests {
         let store_exists = store_path(&canon).exists();
         let lease_exists = lease.exists();
         // Not leased any more: the store beside the lease wins.
-        let during = format!("{:#}", StackedStore::open_if_leased(&lane).err().expect("a read refuses"));
+        let during = format!("{:#}", StackedStore::open_if_leased(&lane).expect_err("a read refuses"));
         let _ = Command::new("chflags").arg("nouchg").arg(&lease).status();
         drop(stacked);
         assert!(res.is_ok(), "the store was placed: {res:?}");
         assert!(store_exists && lease_exists, "fixture: a store and a stale lease");
         assert!(during.contains("devmap seed --sync-delta"), "a read names the recovery: {during}");
         assert!(lease.exists(), "a read deletes nothing");
-        assert!(matches!(StackedStore::open_if_leased_for_sync(&lane), Ok(None)));
+        assert!(matches!(StackedStore::open_if_leased_for_sync(&lane), Ok(SyncTarget::RetiredStaleLease)));
         assert!(!lease.exists(), "the stale lease is retired");
         assert!(!stack_dir(&canon).exists(), "and so is the private base");
         assert!(!stack_delta_path(&canon).exists(), "and the delta");
@@ -4098,10 +4056,10 @@ mod tests {
         assert!(err.contains("already has its own store"), "{err}");
         assert!(stack_lease_path(&wt).is_file(), "a refused provision changes nothing");
 
-        let read = format!("{:#}", StackedStore::open_if_leased(&lane).err().expect("a read refuses"));
+        let read = format!("{:#}", StackedStore::open_if_leased(&lane).expect_err("a read refuses"));
         assert!(read.contains("devmap seed --sync-delta"), "{read}");
         assert!(stack_lease_path(&wt).is_file(), "a read retires nothing");
-        assert!(matches!(StackedStore::open_if_leased_for_sync(&lane), Ok(None)));
+        assert!(matches!(StackedStore::open_if_leased_for_sync(&lane), Ok(SyncTarget::RetiredStaleLease)));
         assert!(!stack_lease_path(&wt).exists(), "the stale lease is retired");
         assert!(!lease.base_dir().exists(), "and the private base");
         assert!(!stack_delta_path(&wt).exists(), "and the delta");
@@ -4344,7 +4302,6 @@ mod tests {
         let c = StackedStore::open(&lanes[2]).expect("no cache at all changes nothing");
         assert_eq!(c.base_store().latest_generation_head_sha().unwrap(), admitted_head);
         assert!(!symbol_names(&c, "src/svc.go").is_empty());
-        assert!(c.csr_reader().unwrap().is_some(), "the CSR is the lane's own clone too");
         let path = c.materialize_seeded_store().unwrap();
         assert_eq!(
             Store::open_read_only(&path).unwrap().latest_generation_head_sha().unwrap(),
@@ -4492,7 +4449,8 @@ mod tests {
         fs::copy(&base, &impostor).unwrap();
         set_file_readonly(&impostor).unwrap();
         fs::rename(&impostor, &base).unwrap();
-        let err = format!("{:#}", open_lane_base_store(&base).err().expect("a swapped base is refused"));
+        let Err(err) = open_lane_base_store(&base) else { panic!("a swapped base is refused") };
+        let err = format!("{err:#}");
         assert!(err.contains("replaced or modified"), "{err}");
         // A path that is not a lane's stack/base.sqlite has no lease to check.
         assert!(open_lane_base_store(&root.join("nowhere/base.sqlite")).is_err());
@@ -4614,11 +4572,13 @@ mod tests {
         drop(tx);
         drop(conn);
 
-        let err = format!("{:#}", StackedStore::open(&lane).err().expect("a hot journal refuses reads"));
+        let err = format!("{:#}", StackedStore::open(&lane).expect_err("a hot journal refuses reads"));
         assert!(err.contains("hot rollback journal") && err.contains("devmap seed --sync-delta"), "{err}");
-        let mut s = StackedStore::open_if_leased_for_sync(&lane)
+        let SyncTarget::Lane(mut s) = StackedStore::open_if_leased_for_sync(&lane)
             .expect("sync --sync-delta opens the lane")
-            .expect("leased");
+        else {
+            panic!("the lane is leased");
+        };
         s.sync_worktree().unwrap();
         drop(s);
         StackedStore::open(&lane).expect("the lane reads again after the sync");
@@ -4760,6 +4720,7 @@ mod tests {
     /// refusal prints replays foreign pages into this lane's delta.
     #[cfg(all(feature = "parse", unix))]
     #[test]
+    #[ignore = "carded ft-983bd7bc: a foreign hot journal planted in the lane's own state dir is outside the stated threat model (lead ruling, fix round 5)"]
     fn a3_a_journal_for_a_different_db_is_not_replayed_into_the_lanes_delta() {
         let (root, _anchor, lane) = a3_lane("a3-foreign-journal");
         fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
@@ -4770,7 +4731,7 @@ mod tests {
         fs::copy(&foreign_journal, stack_delta_path(&wt).with_file_name("delta.sqlite-journal")).unwrap();
         let read = a3_dirty(&lane);
         eprintln!("a3 foreign journal: read before recovery -> {read:?}");
-        let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| o.is_some()).map_err(|e| format!("{e:#}"));
+        let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| matches!(o, SyncTarget::Lane(_))).map_err(|e| format!("{e:#}"));
         eprintln!("a3 foreign journal: recovery -> {recovered:?}");
         let after = a3_dirty(&lane);
         eprintln!("a3 foreign journal: before={before} after={after:?}");
@@ -4795,7 +4756,7 @@ mod tests {
             let bytes = fs::read(&jr).unwrap();
             fs::write(delta.with_file_name("delta.sqlite-journal"), &bytes[..keep as usize]).unwrap();
             let read = a3_dirty(&lane);
-            let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| o.is_some()).map_err(|e| format!("{e:#}"));
+            let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| matches!(o, SyncTarget::Lane(_))).map_err(|e| format!("{e:#}"));
             let after = a3_dirty(&lane);
             eprintln!("a3 truncated cut={cut} keep={keep}/{len}: read={read:?} recovery={recovered:?} after={after:?}");
             // the committed delta had exactly the rows a3_hot_delta wrote (1)
@@ -4821,7 +4782,7 @@ mod tests {
         let link = stack_delta_path(&wt).with_file_name("delta.sqlite-journal");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let read = a3_dirty(&lane);
-        let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| o.is_some()).map_err(|e| format!("{e:#}"));
+        let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| matches!(o, SyncTarget::Lane(_))).map_err(|e| format!("{e:#}"));
         let after = a3_dirty(&lane);
         eprintln!("a3 symlink journal: read={read:?} recovery={recovered:?} after={after:?} before={before}");
         assert_eq!(fs::read(&outside).ok(), Some(outside_bytes), "the file outside the lane was modified or removed");
@@ -4878,7 +4839,7 @@ mod tests {
     #[test]
     fn a3_the_printed_recovery_for_a_store_beside_a_lease_recovers() {
         let (root, wt, lane, _store) = a3_store_beside_lease();
-        let read_err = format!("{:#}", StackedStore::open_if_leased(&lane).err().expect("a read refuses"));
+        let read_err = format!("{:#}", StackedStore::open_if_leased(&lane).expect_err("a read refuses"));
         assert!(read_err.contains("devmap seed --sync-delta"));
         let (code, msg) = a3_run_sync_delta(&wt);
         eprintln!("a3 sync-delta unlocked: status={code:?} lease_gone={} msg={msg}", !stack_lease_path(&wt).exists());
@@ -5097,63 +5058,12 @@ mod tests {
         let _ = remove_readonly_tree(&root);
     }
 
-    /// Index `rels` as a new generation exactly as `index_tree` does, but leave
-    /// the CSR sidecar on disk as it was (a build that does not rewrite it).
-    #[cfg(all(feature = "parse", unix))]
-    fn a3_index_tree_keeping_old_csr(anchor: &Path, rels: &[&str]) {
-        let store = Store::open(&store_path(anchor)).unwrap();
-        let exts: Vec<_> = rels
-            .iter()
-            .map(|rel| devmap_extract::extract_file(rel, &fs::read_to_string(anchor.join(rel)).unwrap()))
-            .collect();
-        let mut resolver = devmap_resolve::Resolver::new();
-        resolver.index_extractions(&exts);
-        let res = resolver.resolve_all(&exts).unwrap();
-        let analysis = devmap_analyze::analyze(&exts, &res);
-        store
-            .save_generation_with_metadata(&exts, &res, &analysis, devmap_store::GenerationWriteOpts::default(), &git_head(anchor))
-            .unwrap();
-    }
-
-    /// The lane's CSR sidecar must be the graph of the generation the lease
-    /// records. A donor whose sidecar is left over from an older generation is
-    /// admitted with it, and the lease records the sidecar's own sha.
-    #[cfg(all(feature = "parse", unix))]
-    #[test]
-    fn a3_a_csr_sidecar_from_another_generation_is_not_served_with_the_base() {
-        let root = temp_repo_dir("a3-csr-gen");
-        let anchor = root.join("anchor");
-        seed_indexed_git_repo(&anchor);
-        fs::write(anchor.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
-        run_git_ok(&anchor, &["add", "src"]);
-        run_git_ok(&anchor, &["commit", "-m", "second"]);
-        a3_index_tree_keeping_old_csr(&anchor, &["src/svc.go", "src/routes.ts", "src/limits.rs", "src/extra.rs"]);
-        let lane = add_lane(&anchor, &root, "lane");
-        let lease = match provision_stacked_worktree(&anchor, &lane) {
-            Ok(lease) => lease,
-            Err(e) => {
-                eprintln!("a3 csr gen: provision refused: {e:#}");
-                let _ = remove_readonly_tree(&root);
-                return;
-            }
-        };
-        let s = StackedStore::open(&lane).unwrap();
-        let csr_gen = s.csr_reader().map(|r| r.map(|r| r.generation()));
-        eprintln!("a3 csr gen: lease generation {} csr {csr_gen:?}", lease.generation_id);
-        match csr_gen {
-            Ok(Some(g)) => assert_eq!(g, u64::from(lease.generation_id), "the CSR sidecar is generation {g}, the base and lease are generation {}", lease.generation_id),
-            Ok(None) => panic!("fixture: the donor had a CSR sidecar, the lane has none"),
-            Err(e) => panic!("csr_reader refused: {e:#}"),
-        }
-        let _ = remove_readonly_tree(&root);
-    }
-
     /// The other printed recovery, `devmap seed --stacked --from <donor>`,
     /// replaces only the lease and `stack/`; a symlinked journal beside the
     /// delta survives it.
     #[cfg(all(feature = "parse", unix))]
     #[test]
-    fn a3_a_symlinked_journal_is_recoverable_by_reprovisioning() {
+    fn a3_a_symlinked_journal_after_reprovisioning_names_the_link_and_recovers() {
         let (root, anchor, lane) = a3_lane("a3-symlink-reprov");
         fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
         a3_sync(&lane);
@@ -5163,9 +5073,20 @@ mod tests {
         fs::copy(&foreign, &outside).unwrap();
         std::os::unix::fs::symlink(&outside, stack_delta_path(&wt).with_file_name("delta.sqlite-journal")).unwrap();
         provision_stacked_worktree(&anchor, &lane).expect("re-provision succeeds");
-        let after = a3_dirty(&lane);
-        eprintln!("a3 symlink reprovision: after={after:?}");
-        assert!(after.is_ok(), "re-provisioning (the second printed recovery) does not recover the lane: {after:?}");
+        // Re-provisioning leaves the delta and its sidecars alone, so the only
+        // recovery a refusal names for this cause is `seed --sync-delta`: it
+        // must name the link, and running it must recover the lane.
+        let refused = a3_dirty(&lane).expect_err("a symlinked journal refuses reads");
+        assert!(refused.contains("delta.sqlite-journal is a symlink"), "{refused}");
+        assert!(refused.contains("devmap seed --sync-delta"), "{refused}");
+        let (code, msg) = a3_run_sync_delta(&wt);
+        assert_eq!(code, Some(0), "the printed recovery failed: {msg}");
+        assert!(a3_dirty(&lane).is_ok(), "the lane is still stranded: {msg}");
+        assert!(
+            fs::symlink_metadata(stack_delta_path(&wt).with_file_name("delta.sqlite-journal")).is_err(),
+            "the link was not unlinked"
+        );
+        assert!(outside.is_file(), "the link's target was removed");
         let _ = remove_readonly_tree(&root);
     }
 

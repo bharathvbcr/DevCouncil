@@ -89,12 +89,14 @@ impl Fingerprint {
     }
 }
 
-/// Remove `path` and its `-wal` / `-shm`. For files this process staged.
+/// Remove `path` and its `-wal` / `-shm` / `-journal`. For files this process
+/// staged. A sidecar that is a symlink is unlinked, never followed.
 pub fn discard_staged(path: &Path) {
     for file in [
         path.to_path_buf(),
         sidecar(path, "-wal"),
         sidecar(path, "-shm"),
+        sidecar(path, "-journal"),
     ] {
         let _ = std::fs::remove_file(file);
     }
