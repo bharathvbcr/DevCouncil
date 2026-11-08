@@ -18,6 +18,8 @@ use devmap_resolve::Resolver;
 struct Resolved {
     extractions: Vec<Extraction>,
     calls: Vec<(String, String)>,
+    /// `(source, target, how it was resolved)`, for the calls above.
+    how: Vec<(String, String, String)>,
 }
 
 fn resolve(files: &[(&str, &str)]) -> Resolved {
@@ -35,7 +37,23 @@ fn resolve(files: &[(&str, &str)]) -> Resolved {
         .map(|edge| (edge.source_symbol.clone(), edge.target_symbol.clone()))
         .collect();
     calls.sort();
-    Resolved { extractions, calls }
+    let how = result
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_kind == EdgeKind::Calls)
+        .map(|edge| {
+            (
+                edge.source_symbol.clone(),
+                edge.target_symbol.clone(),
+                format!("{:?}", edge.resolution),
+            )
+        })
+        .collect();
+    Resolved {
+        extractions,
+        calls,
+        how,
+    }
 }
 
 impl Resolved {
@@ -112,6 +130,15 @@ fn a_property_of_the_class_does_not_hide_the_top_level_function_a_call_names() {
         "{:?}",
         resolved.calls
     );
+    // Deterministic, from the lexical walk: not a UniqueGlobal guess that only
+    // holds while no other Kotlin `log` exists.
+    let how = resolved
+        .how
+        .iter()
+        .find(|(source, target, _)| source == "A.kt::Svc.run" && target == "A.kt::log")
+        .map(|(_, _, how)| how.as_str())
+        .unwrap_or_default();
+    assert!(how.contains("SameFile"), "{how}");
 }
 
 /// The dead-code consequence: a `private` helper that another Kotlin `log`
