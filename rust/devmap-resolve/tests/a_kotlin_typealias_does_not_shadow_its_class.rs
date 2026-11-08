@@ -102,3 +102,31 @@ fn an_alias_alone_under_its_name_keeps_its_references() {
         "{found:?}"
     );
 }
+
+/// The alias and its user in one file: the lexical walk finds the alias first
+/// and must not stop there.
+#[test]
+fn a_same_file_alias_does_not_hide_the_class_from_its_user() {
+    let found = edges(&[
+        ("a/model/T.kt", CLASS),
+        (
+            "a/user.kt",
+            "package a\n\ntypealias T = a.model.T\n\nfun g(t: T) = t\n",
+        ),
+    ]);
+    assert!(
+        has(
+            &found,
+            "a/user.kt::g",
+            "a/model/T.kt::T",
+            EdgeKind::References
+        ),
+        "{found:?}"
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|(s, t, _)| s == "a/user.kt::g" && t == "a/user.kt::T"),
+        "{found:?}"
+    );
+}

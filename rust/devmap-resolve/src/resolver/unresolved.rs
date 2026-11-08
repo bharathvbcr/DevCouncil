@@ -49,7 +49,19 @@ impl Resolver {
         for_a_call: bool,
     ) -> Option<String> {
         // Absent everywhere: no scope can declare it.
-        self.symbol_index.get(name)?;
+        let declared = self.symbol_index.get(name)?;
+        // A Kotlin `typealias` spells a type declared elsewhere: a use of its
+        // name reaches that declaration, as it did before the alias was a node
+        // (see `drop_kotlin_aliases_shadowing_a_declaration`), so a same-file
+        // alias must not hide it from the walk.
+        let alias_spells_a_class = family == LangFamily::Kotlin
+            && declared.iter().any(|(_, kind, declared_family, _)| {
+                *declared_family == LangFamily::Kotlin
+                    && matches!(
+                        kind,
+                        SymbolKind::Class | SymbolKind::Enum | SymbolKind::Interface
+                    )
+            });
         let mut scope = caller.unwrap_or(file);
         for _ in 0..1024 {
             let mut candidates = self
@@ -66,7 +78,7 @@ impl Resolver {
                 .filter(|(kind, identity)| {
                     !(family == LangFamily::Kotlin
                         && *kind == SymbolKind::Struct
-                        && Some(identity.as_ref()) == caller)
+                        && (alias_spells_a_class || Some(identity.as_ref()) == caller))
                 })
                 .map(|(_, identity)| identity.as_ref());
             if let Some(first) = candidates.next() {
