@@ -29,10 +29,7 @@ fn call_targets(files: &[(&str, &str)]) -> Vec<String> {
 
 #[test]
 fn a_bare_call_in_the_same_file_does_not_bind_to_a_member_property() {
-    let targets = call_targets(&[(
-        "A.kt",
-        "class Box { val size = 1 }\nfun use() { size() }\n",
-    )]);
+    let targets = call_targets(&[("A.kt", "class Box { val size = 1 }\nfun use() { size() }\n")]);
     assert!(
         !targets.iter().any(|target| target.ends_with("Box.size")),
         "{targets:?}"

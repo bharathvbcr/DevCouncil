@@ -190,7 +190,10 @@ fn rewrite(
                 tree: current,
                 ranges,
                 edits: edited.len(),
-                accessors: edited.iter().filter(|&&at| source.as_bytes()[at] == b';').count(),
+                accessors: edited
+                    .iter()
+                    .filter(|&&at| source.as_bytes()[at] == b';')
+                    .count(),
                 boundaries,
             });
         }
@@ -298,10 +301,7 @@ fn semicolon_in_gap(text: &[u8], from: usize, to: usize) -> Option<usize> {
     }
     let mut semicolons = gap.iter().enumerate().filter(|(_, b)| **b == b';');
     let (first, _) = semicolons.next()?;
-    let alone = semicolons.next().is_none()
-        && gap
-            .iter()
-            .all(|b| matches!(b, b' ' | b'\t' | b';'));
+    let alone = semicolons.next().is_none() && gap.iter().all(|b| matches!(b, b' ' | b'\t' | b';'));
     alone.then_some(from + first)
 }
 

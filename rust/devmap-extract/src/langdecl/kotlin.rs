@@ -175,7 +175,9 @@ fn is_member_or_top_level(declaration: Node<'_>, source: &str) -> bool {
     };
     match container.kind() {
         "source_file" => true,
-        "class_body" | "enum_class_body" => bounded_parent(container).is_some_and(|owner| is_named_owner(owner, source)),
+        "class_body" | "enum_class_body" => {
+            bounded_parent(container).is_some_and(|owner| is_named_owner(owner, source))
+        }
         _ => false,
     }
 }
@@ -213,7 +215,10 @@ pub(crate) fn settle_property_ids(
 ) -> (usize, usize) {
     let mut by_id: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (at, symbol) in symbols.iter().enumerate() {
-        by_id.entry(symbol.qualified_name.as_str()).or_default().push(at);
+        by_id
+            .entry(symbol.qualified_name.as_str())
+            .or_default()
+            .push(at);
     }
     let is_property = |symbol: &ExtractedSymbol| {
         symbol.kind == SymbolKind::Field

@@ -25,7 +25,10 @@ fn symbols(extraction: &Extraction) -> Vec<(String, SymbolKind)> {
 }
 
 fn names(extraction: &Extraction) -> Vec<String> {
-    symbols(extraction).into_iter().map(|(name, _)| name).collect()
+    symbols(extraction)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn is_clean(extraction: &Extraction) -> bool {
@@ -34,8 +37,10 @@ fn is_clean(extraction: &Extraction) -> bool {
 
 // ---- `; private set` -------------------------------------------------------
 
-const ERR_KT: &str = "class Track {\n    var maxM: Double? = null; private set\n    fun f() = 1\n}\nfun g() = 2\n";
-const SC3_KT: &str = "class T3 {\n    var m: Double? = null; private set\n    fun f() = 1\n}\nfun g3() = 2\n";
+const ERR_KT: &str =
+    "class Track {\n    var maxM: Double? = null; private set\n    fun f() = 1\n}\nfun g() = 2\n";
+const SC3_KT: &str =
+    "class T3 {\n    var m: Double? = null; private set\n    fun f() = 1\n}\nfun g3() = 2\n";
 
 #[test]
 fn a_semicolon_before_a_private_setter_does_not_lose_the_file() {
@@ -101,9 +106,15 @@ fn the_accessor_repair_covers_each_visibility_and_both_accessors() {
         "set(value) { field = value }",
         "private   set",
     ] {
-        let source = format!("class C {{\n    var m: Int = 0; {accessor}\n    fun f() = 1\n}}\nfun g() = 2\n");
+        let source = format!(
+            "class C {{\n    var m: Int = 0; {accessor}\n    fun f() = 1\n}}\nfun g() = 2\n"
+        );
         let extraction = extract_file("C.kt", &source);
-        assert!(is_clean(&extraction), "{accessor}: {:?}", extraction.parse_outcome);
+        assert!(
+            is_clean(&extraction),
+            "{accessor}: {:?}",
+            extraction.parse_outcome
+        );
         assert!(
             names(&extraction).contains(&"C.kt::g".to_string()),
             "{accessor}: {:?}",
@@ -143,7 +154,8 @@ fn a_one_line_class_with_a_private_setter_takes_both_repairs() {
 
 #[test]
 fn a_typealias_is_a_struct_named_from_the_type_field() {
-    let source = "typealias Id = Long\nactual typealias P = Path\nprivate typealias T = Int\nclass K\n";
+    let source =
+        "typealias Id = Long\nactual typealias P = Path\nprivate typealias T = Int\nclass K\n";
     let extraction = extract_file("A.kt", source);
     let alias = |name: &str| {
         extraction
@@ -298,7 +310,11 @@ fn a_property_never_takes_the_id_of_a_function_of_the_same_owner() {
         .filter(|symbol| symbol.qualified_name == "T.kt::Trip.size")
         .collect();
     assert_eq!(size.len(), 1, "one id, one node: {size:?}");
-    assert_eq!(size[0].kind, SymbolKind::Method, "the callable keeps the id");
+    assert_eq!(
+        size[0].kind,
+        SymbolKind::Method,
+        "the callable keeps the id"
+    );
     assert!(
         extraction
             .diagnostics
@@ -311,7 +327,10 @@ fn a_property_never_takes_the_id_of_a_function_of_the_same_owner() {
 
 #[test]
 fn a_top_level_property_yields_the_id_to_a_class_or_function() {
-    let extraction = extract_file("T.kt", "val Foo = 1\nclass Foo\nval bar = 1\nfun bar() = 2\n");
+    let extraction = extract_file(
+        "T.kt",
+        "val Foo = 1\nclass Foo\nval bar = 1\nfun bar() = 2\n",
+    );
     let found = symbols(&extraction);
     assert_eq!(
         found,
@@ -386,7 +405,11 @@ fn a_multi_line_twin_with_the_semicolon_before_an_accessor_is_repaired_too() {
         "class A {\nvar v = 0; set(x) { }\n fun f() { g() }\n}\n",
     ] {
         let extraction = extract_file("A.kt", source);
-        assert!(is_clean(&extraction), "{source:?}: {:?}", extraction.parse_outcome);
+        assert!(
+            is_clean(&extraction),
+            "{source:?}: {:?}",
+            extraction.parse_outcome
+        );
         assert!(names(&extraction).contains(&"A.kt::A.f".to_string()));
     }
 }
@@ -430,6 +453,9 @@ fn a_statement_assigning_to_a_variable_named_open_is_an_error() {
         extraction.parse_outcome
     );
     // `this.open = 1` is the same assignment spelled so the grammar reads it.
-    let spelled = extract_file("N.kt", "class C {\n    var open = 0\n    fun f() { this.open = 1 }\n}\nfun g() = 2\n");
+    let spelled = extract_file(
+        "N.kt",
+        "class C {\n    var open = 0\n    fun f() { this.open = 1 }\n}\nfun g() = 2\n",
+    );
     assert!(is_clean(&spelled), "{:?}", spelled.parse_outcome);
 }

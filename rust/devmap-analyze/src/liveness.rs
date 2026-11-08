@@ -771,7 +771,9 @@ impl ExtractionCoverage {
             // The inventory lists every partial file; only the charged ones are
             // counted as blind. Saying "N file(s)" for the charged ones alone
             // read as a second, smaller count of the same list (8 against 14).
-            let listed = self.partial_parse_listed_files.max(self.partial_parse_files);
+            let listed = self
+                .partial_parse_listed_files
+                .max(self.partial_parse_files);
             reason.push_str(&format!(
                 "; {} of the {listed} file(s) listed under `partial_parse` parsed with \
                  ERROR/MISSING regions that can hide a declaration or call, so those inside \
@@ -4215,7 +4217,9 @@ mod tests {
         assert_eq!(listed, 3);
         assert_eq!(coverage.partial_parse_listed_files, listed);
         assert_eq!(coverage.partial_parse_files, 1);
-        let reason = coverage.degraded_reason().expect("a charged partial parse degrades");
+        let reason = coverage
+            .degraded_reason()
+            .expect("a charged partial parse degrades");
         assert!(
             reason.contains("1 of the 3 file(s) listed under `partial_parse`"),
             "{reason}"
