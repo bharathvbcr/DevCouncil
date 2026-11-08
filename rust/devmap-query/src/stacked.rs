@@ -76,6 +76,10 @@ pub struct BaseManifest {
     /// The donor's git `HEAD` the snapshot was taken at. Part of the base's
     /// identity: two donors (or one donor rebuilt) can reuse a generation id.
     pub head_sha: String,
+    /// The donor store's creation epoch (`pending_state.epoch`). A donor
+    /// deleted and rebuilt restarts its generation ids, so id and `HEAD` alone
+    /// cannot tell its new base from the old one.
+    pub epoch: String,
     pub created_at_unix_ms: u64,
     pub base_sqlite_sha256: String,
     /// The CSR sidecar's sha256, when one was published.
@@ -95,30 +99,44 @@ pub struct FileRecord {
     pub dev: u64,
 }
 
-/// What names a published base: generation id, donor `HEAD`, donor root.
+/// What identifies a published base: generation id, donor `HEAD`, donor root,
+/// and the donor store's creation epoch.
+///
+/// The epoch is not part of [`BaseKey::dir_name`] (garbage collection parses
+/// that name). It is part of the identity every reuse and admission check
+/// compares, so a donor deleted and rebuilt at the same `HEAD`, which restarts
+/// at the same generation id, never matches an entry published from the old store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseKey {
     pub generation_id: u32,
     pub head_sha: String,
     pub source_repo_root: String,
+    /// `pending_state.epoch` of the donor store.
+    pub epoch: String,
 }
 
 impl BaseKey {
-    pub fn new(generation_id: u32, head_sha: &str, source_root: &Path) -> Result<Self> {
+    pub fn new(generation_id: u32, head_sha: &str, source_root: &Path, epoch: &str) -> Result<Self> {
         if !is_commit_sha(head_sha) {
             bail!(
                 "donor generation {generation_id} carries head_sha {head_sha:?}, not a git commit; \
                  a stacked base must be taken from a built, committed checkout"
             );
         }
+        if epoch.len() != 32 || !epoch.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            bail!("donor store epoch {epoch:?} is not 32 lowercase hex characters");
+        }
         Ok(Self {
             generation_id,
             head_sha: head_sha.to_string(),
             source_repo_root: source_root.to_string_lossy().into_owned(),
+            epoch: epoch.to_string(),
         })
     }
 
-    /// `gen-<G>-<head12>-<src8>`.
+    /// `gen-<G>-<head12>-<src8>`. Names the cache entry; it does not carry the
+    /// epoch, so a rebuilt donor's publish finds the old entry, fails its
+    /// manifest check, and replaces it.
     pub fn dir_name(&self) -> String {
         format!(
             "gen-{}-{}-{}",
@@ -133,6 +151,7 @@ impl BaseKey {
             manifest.generation_id,
             &manifest.head_sha,
             Path::new(&manifest.source_repo_root),
+            &manifest.epoch,
         )
     }
 }
@@ -347,7 +366,8 @@ fn publish_base_snapshot_with(source_root: &Path, reuse: bool) -> Result<(PathBu
             )
         })?;
         let head = store.latest_generation_head_sha()?.unwrap_or_default();
-        let key = BaseKey::new(generation_id, &head, &source_canon)?;
+        let epoch = store.pending_watermark()?;
+        let key = BaseKey::new(generation_id, &head, &source_canon, epoch.epoch())?;
         assert_donor_is_head_tree(&source_canon, &store, &key.head_sha)?;
         key
     };
@@ -391,6 +411,7 @@ fn publish_base_snapshot_with(source_root: &Path, reuse: bool) -> Result<(PathBu
             let staged_head = staged.latest_generation_head_sha()?;
             if staged_gen != Some(key.generation_id)
                 || staged_head.as_deref() != Some(key.head_sha.as_str())
+                || staged.pending_watermark()?.epoch() != key.epoch
             {
                 bail!(
                     "donor {} changed while its base was being staged (expected generation {} at {}, staged copy holds {:?} at {:?}); retry",
@@ -420,6 +441,7 @@ fn publish_base_snapshot_with(source_root: &Path, reuse: bool) -> Result<(PathBu
             schema_version: CURRENT_SCHEMA_VERSION,
             source_repo_root: key.source_repo_root.clone(),
             head_sha: key.head_sha.clone(),
+            epoch: key.epoch.clone(),
             created_at_unix_ms: now_unix_ms(),
             base_sqlite_sha256: sha256,
             csr_sha256,
@@ -647,6 +669,13 @@ fn check_manifest_matches(manifest: &BaseManifest, expected: &BaseKey, dir: &Pat
             expected.source_repo_root.clone(),
         ));
     }
+    if manifest.epoch != expected.epoch {
+        return Err(mismatch(
+            "epoch",
+            manifest.epoch.clone(),
+            expected.epoch.clone(),
+        ));
+    }
     Ok(())
 }
 
@@ -674,7 +703,7 @@ fn verify_base_dir(base_dir: &Path, expected: &BaseKey) -> Result<BaseManifest> 
     Ok(manifest)
 }
 
-/// Refuse a store whose latest generation, `HEAD` or root is not `key`'s.
+/// Refuse a store whose latest generation, `HEAD`, root or creation epoch is not `key`'s.
 fn check_store_holds_key(store: &Store, key: &BaseKey, what: &str) -> Result<()> {
     let root = store.latest_generation_repo_root()?;
     let root_matches = root.as_deref().is_some_and(|r| {
@@ -684,15 +713,20 @@ fn check_store_holds_key(store: &Store, key: &BaseKey, what: &str) -> Result<()>
         store.latest_generation_id()?,
         store.latest_generation_head_sha()?,
     );
+    let epoch = store.pending_watermark()?;
     if generation != Some(key.generation_id)
         || head.as_deref() != Some(key.head_sha.as_str())
         || !root_matches
+        || epoch.epoch() != key.epoch
     {
         bail!(
-            "{what} holds generation {generation:?} at {head:?} for {root:?}, not generation {} at {} for {}",
+            "{what} holds generation {generation:?} at {head:?} for {root:?} (store epoch {}), \
+             not generation {} at {} for {} (store epoch {})",
+            epoch.epoch(),
             key.generation_id,
             key.head_sha,
-            key.source_repo_root
+            key.source_repo_root,
+            key.epoch
         );
     }
     Ok(())
@@ -2532,12 +2566,14 @@ mod tests {
         let common = registered_common_git_dir(&anchor.canonicalize().unwrap()).unwrap();
         base_generation_dir(
             &common,
-            &BaseKey::new(
-                lease.generation_id,
-                &lease.head_sha,
-                Path::new(&lease.source_repo_root),
-            )
-            .unwrap(),
+            // The entry's name does not depend on the epoch, which a lease
+            // does not record.
+            &BaseKey {
+                generation_id: lease.generation_id,
+                head_sha: lease.head_sha.clone(),
+                source_repo_root: lease.source_repo_root.clone(),
+                epoch: String::new(),
+            },
         )
     }
 
