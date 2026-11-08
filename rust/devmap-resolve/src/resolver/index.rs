@@ -501,6 +501,7 @@ impl Resolver {
                 }
             }
         }
+        self.drop_kotlin_aliases_shadowing_a_declaration();
 
         // Group the indexed files by directory once, now that `file_symbols`
         // holds the complete set and before pass two asks the first "what is in
@@ -1621,6 +1622,35 @@ impl Resolver {
     /// precision, never a wrong edge. A lost chain is still a loss, so the stop
     /// is recorded: [`Self::reexport_glob_cutoff`] reports it.
     pub(super) const REEXPORT_GLOB_MAX_HOPS: usize = 200_000;
+
+    /// A Kotlin `typealias` is a `Struct` node, and the bare name it spells is
+    /// the name of the type it expands to: `typealias T = pkg.model.T` beside
+    /// `class T` is one type to every use of `T`, not two candidates. Left in
+    /// the bare-name index it makes `T(..)` an ambiguous global, a `T`-typed
+    /// binding unresolved, and the alias's own right-hand `T` a reference to
+    /// itself, so each use loses the edge it had before the alias was a node
+    /// (ChronosFlow: 55 true edges). The alias stays a node under its own full
+    /// identity; only the bare name stops offering it where a Kotlin class,
+    /// enum or interface of that name exists. An alias alone under its name
+    /// (`typealias Handler = (Int) -> Unit`) keeps the candidate.
+    fn drop_kotlin_aliases_shadowing_a_declaration(&mut self) {
+        let is_type = |kind: SymbolKind| {
+            matches!(
+                kind,
+                SymbolKind::Class | SymbolKind::Enum | SymbolKind::Interface
+            )
+        };
+        for hits in self.symbol_index.values_mut() {
+            let kotlin_type = hits
+                .iter()
+                .any(|(_, kind, family, _)| *family == LangFamily::Kotlin && is_type(*kind));
+            if kotlin_type {
+                hits.retain(|(_, kind, family, _)| {
+                    !(*family == LangFamily::Kotlin && *kind == SymbolKind::Struct)
+                });
+            }
+        }
+    }
 
     /// Turn each glob re-export into one hop per name the target publishes.
     ///

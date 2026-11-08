@@ -61,6 +61,13 @@ impl Resolver {
                     !Self::family_needs_explicit_receiver(family) || *kind != SymbolKind::Method
                 })
                 .filter(|(kind, _)| !(for_a_call && Self::is_kotlin_member_property(family, *kind)))
+                // The right-hand side of `typealias T = pkg.T` names another
+                // declaration, never the alias it sits in.
+                .filter(|(kind, identity)| {
+                    !(family == LangFamily::Kotlin
+                        && *kind == SymbolKind::Struct
+                        && Some(identity.as_ref()) == caller)
+                })
                 .map(|(_, identity)| identity.as_ref());
             if let Some(first) = candidates.next() {
                 return candidates
