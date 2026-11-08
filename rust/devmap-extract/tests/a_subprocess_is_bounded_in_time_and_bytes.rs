@@ -189,6 +189,67 @@ fn cfg_test_module(path: &std::path::Path) -> bool {
     false
 }
 
+#[test]
+fn an_inline_cfg_test_module_is_exempt_and_production_spawns_are_not() {
+    let source = r##"use std::process::Command;
+
+pub fn production() {
+    Command::new("git"); // line 4: flagged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() {
+        Command::new("git");
+        let _ = "}"; // a brace in a literal must not close the block
+        let _ = '{'; // nor open one
+        let _ = r#"} } }"#;
+        /* } */
+        if true {
+            Command::new("chflags");
+        }
+    }
+
+    mod nested {
+        fn deeper() {
+            Command::new("devmap");
+        }
+    }
+}
+
+pub fn after() {
+    Command::new("git"); // line 31: flagged again, the block has closed
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod odd { fn f() { Command::new("x"); } }
+
+#[cfg(test)]
+mod declared_elsewhere;
+
+pub fn last<'a>(_: &'a str) {
+    Command::new("git"); // line 41: a lifetime must not read as a char literal
+}
+"##;
+    let hits: Vec<usize> = production_spawn_lines(source)
+        .into_iter()
+        .map(|index| index + 1)
+        .collect();
+    assert_eq!(
+        hits,
+        [4, 31, 41],
+        "only production spawns are flagged; scrubbed text was:\n{}",
+        blank_comments_and_literals(source)
+    );
+    assert_eq!(
+        production_spawn_lines("mod tests {\n    fn f() { Command::new(\"x\"); }\n}\n"),
+        [1],
+        "a module without `#[cfg(test)]` is production code"
+    );
+}
+
 /// Structural: no library crate's production code spawns a child on its own.
 /// The three runners this module replaced each began as one reasonable
 /// `Command::new`, and the way a fourth arrives is the same — so a new one
