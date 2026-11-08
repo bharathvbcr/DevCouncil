@@ -974,18 +974,17 @@ mod tests {
     /// The non-reflink fallback: on a filesystem without `clonefile`/`FICLONE`
     /// the same call copies, reports `Copy`, and the result is byte-identical.
     /// Needs a directory on such a volume (an HFS+ disk image on macOS):
-    /// `DEVMAP_NON_REFLINK_DIR=/Volumes/X cargo test -p devmap-store --lib clone_or_copy_file_falls_back`.
-    /// Without the variable the test logs why it did not exercise the fallback
-    /// (the cargo summary cannot report a skip, so the line below is the record).
+    /// `DEVMAP_NON_REFLINK_DIR=/Volumes/X cargo test -p devmap-store --lib clone_or_copy_file_falls_back -- --ignored`.
+    /// Ignored by default (card ft-983bd7bc) so a run that could not exercise the
+    /// fallback reports `ignored`, never `ok`; run it with `--ignored`. With the
+    /// variable unset it fails rather than pass without testing anything.
     #[test]
+    #[ignore = "needs DEVMAP_NON_REFLINK_DIR on a volume without reflink (an HFS+ image); card ft-983bd7bc"]
     fn clone_or_copy_file_falls_back_to_a_copy_without_reflink() {
-        let Some(base) = std::env::var_os("DEVMAP_NON_REFLINK_DIR").map(PathBuf::from) else {
-            eprintln!(
-                "SKIPPED clone_or_copy_file_falls_back_to_a_copy_without_reflink: \
-                 DEVMAP_NON_REFLINK_DIR is not set; the copy fallback was NOT exercised"
-            );
-            return;
-        };
+        let base = PathBuf::from(
+            std::env::var_os("DEVMAP_NON_REFLINK_DIR")
+                .expect("DEVMAP_NON_REFLINK_DIR must name a directory on a volume without reflink"),
+        );
         let dir = base.join(format!("devmap-nonreflink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
