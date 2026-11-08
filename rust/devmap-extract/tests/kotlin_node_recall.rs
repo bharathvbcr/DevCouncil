@@ -526,13 +526,18 @@ fn a_statement_semicolon_before_get_or_set_is_not_an_accessor_separator() {
 
 // ---- recovered properties are settled too ------------------------------------
 
-/// A property the loss recovery re-derives (a swallowed `val` behind two
-/// annotations) next to a function of the same name the walk read directly
+/// A property the loss recovery re-derives (a swallowed `internal val`
+/// behind two annotations) next to a function of the same name the walk read directly
 /// is one node, the function.
 #[test]
 fn a_recovered_property_does_not_duplicate_the_id_of_a_surviving_function() {
-    let source = "fun size() = 2\n@Preview\n@Composable\nval size = 1\nfun after() {}\n";
+    let source = "fun size() {}\n@A\n@B\ninternal val size = 1\nfun after() {}\n";
     let extraction = extract_file("A.kt", source);
+    assert!(
+        !extraction.recovered_decl_ranges.is_empty(),
+        "the property is one the loss recovery re-derived: {:?}",
+        extraction.parse_outcome
+    );
     let ids: Vec<_> = extraction
         .symbols
         .iter()
