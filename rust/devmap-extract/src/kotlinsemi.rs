@@ -66,7 +66,7 @@ use std::time::Instant;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::model::TextRange;
-use crate::treesitter::{bounded_parent, parse_until, walk_deadline_passed, DEADLINE_CHECK_STRIDE};
+use crate::treesitter::{DEADLINE_CHECK_STRIDE, bounded_parent, parse_until, walk_deadline_passed};
 
 /// Separators written per file. A file that wants more is not rewritten.
 pub(crate) const MAX_EDITS: usize = 512;
@@ -246,7 +246,7 @@ fn rewrite(
             _ => {
                 return Err(Stop::Final(
                     "the re-parse did not finish within the budget".into(),
-                ))
+                ));
             }
         }
     }
@@ -324,16 +324,27 @@ fn semicolon_in_gap(text: &[u8], from: usize, to: usize) -> Option<usize> {
     alone.then_some(from + first)
 }
 
-/// Whether the line the `;` at `at` is on has `val` or `var` as a whole word
-/// before it: the `;` ends a property, not a statement of a function body.
+/// Whether the `;` at `at` ends a property statement: the last `val` or `var`
+/// (a whole word) earlier on its line is followed by no `{`, `(` or `;` before
+/// it, so the `;` is the property's own and not that of a statement in a
+/// function body further along the line.
 fn line_declares_a_property(text: &[u8], at: usize) -> bool {
     let start = text[..at]
         .iter()
         .rposition(|b| matches!(b, b'\n' | b'\r'))
         .map_or(0, |newline| newline + 1);
-    text[start..at]
-        .split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
-        .any(|word| word == b"val" || word == b"var")
+    let line = &text[start..at];
+    let is_word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let mut keyword_end = None;
+    let mut from = 0;
+    for word in line.split(|b| !is_word(b)) {
+        let end = from + word.len();
+        if word == b"val" || word == b"var" {
+            keyword_end = Some(end);
+        }
+        from = end + 1;
+    }
+    keyword_end.is_some_and(|end| !line[end..].iter().any(|b| matches!(b, b'{' | b'(' | b';')))
 }
 
 /// Whether the `;` at `at` ends a property on a line that goes on with its
@@ -538,6 +549,29 @@ fn touched(tree: &Tree, edits: &[usize]) -> Vec<TextRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `;` of `lock();` after a `val` on the same line ends a statement of a
+    /// function body, not a property: `{`, `(` and `;` lie between the two.
+    #[test]
+    fn a_semicolon_ends_a_property_only_when_no_brace_paren_or_semicolon_lies_between() {
+        let semicolon_after =
+            |text: &str, needle: &str| text.find(needle).map(|at| at + needle.len() - 1).unwrap();
+        let body = b"class A { val x = 1; fun f() { lock(); get() } }";
+        assert!(!accessor_after(
+            body,
+            semicolon_after(std::str::from_utf8(body).unwrap(), "lock();")
+        ));
+        assert!(!line_declares_a_property(
+            body,
+            semicolon_after(std::str::from_utf8(body).unwrap(), "lock();")
+        ));
+        // The property's own `;` still counts.
+        let own = b"class A { var x = 1; private set }";
+        assert!(accessor_after(own, 19));
+        // A `val` after an earlier statement's `;` is the one that is read.
+        let later = b"fun f() { g(); val y = 2; private set }";
+        assert!(line_declares_a_property(later, 24));
+    }
 
     #[test]
     fn the_last_character_is_decoded_not_taken_as_a_byte() {

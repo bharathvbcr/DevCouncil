@@ -22,7 +22,7 @@ use tree_sitter::Node;
 use crate::model::{ExtractedSymbol, SymbolKind, WiringKind};
 use crate::treesitter::{bounded_parent, get_child_text, get_node_text};
 
-use super::{enclosing_owner, Declaration};
+use super::{Declaration, enclosing_owner};
 
 /// A Kotlin declaration, or `None` when `node` declares nothing this graph
 /// records.
@@ -260,6 +260,10 @@ pub(crate) fn settle_property_ids(
 /// text rather than from a tree, so a declaration the loss recovery re-derived
 /// from a wrapper, whose outer tree holds an ERROR there, is judged like any
 /// other, and no flag has to be added to every symbol.
+///
+/// Known residual (not fixed): a comment between `val`/`var` and the name
+/// (`val /*x*/ n`) hides the keyword from the `trim_end` read, so such a field
+/// is not seen as a property and is not settled against a function of its id.
 fn is_property_symbol(source: &str, symbol: &ExtractedSymbol) -> bool {
     if symbol.kind != SymbolKind::Field {
         return false;
