@@ -57,10 +57,7 @@ impl Resolver {
         let alias_spells_a_class = family == LangFamily::Kotlin
             && declared.iter().any(|(_, kind, declared_family, _)| {
                 *declared_family == LangFamily::Kotlin
-                    && matches!(
-                        kind,
-                        SymbolKind::Class | SymbolKind::Enum | SymbolKind::Interface
-                    )
+                    && Self::kotlin_declaration_an_alias_yields_to(*kind)
             });
         let mut scope = caller.unwrap_or(file);
         for _ in 0..1024 {

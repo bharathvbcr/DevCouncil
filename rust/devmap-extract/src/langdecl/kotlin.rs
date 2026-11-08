@@ -204,14 +204,20 @@ fn is_named_owner(node: Node<'_>, source: &str) -> bool {
 /// `val z` and a companion's `val z`, both `Holder.z`) the first in source order
 /// keeps it.
 ///
-/// Returns `(withheld for a non-property, withheld for an earlier property)`.
+/// A `typealias` (the one Kotlin `Struct`) is withheld the same way when a
+/// callable or type holds its id: `typealias Pt = Pair<Int, Int>` beside
+/// `fun Pt(x: Int): Pt`, the fake-constructor idiom, is one id and the
+/// declaration that is not an alias keeps it.
+///
+/// Returns `(withheld for a non-property, withheld for an earlier property,
+/// aliases withheld)`.
 /// Runs on the symbols the walk emitted, which are in source order; only a
 /// group with a duplicate id is looked at, so a file with none pays one hash
 /// pass.
 pub(crate) fn settle_property_ids(
     source: &str,
     symbols: &mut Vec<ExtractedSymbol>,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     let mut by_id: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (at, symbol) in symbols.iter().enumerate() {
         by_id
@@ -220,8 +226,17 @@ pub(crate) fn settle_property_ids(
             .push(at);
     }
     let mut drop = vec![false; symbols.len()];
-    let (mut by_callable, mut by_property) = (0, 0);
+    let (mut by_callable, mut by_property, mut by_declaration) = (0, 0, 0);
     for group in by_id.values().filter(|group| group.len() > 1) {
+        let is_alias = |at: usize| symbols[at].kind == SymbolKind::Struct;
+        let mut group = group.clone();
+        if group.iter().any(|&at| !is_alias(at)) {
+            for &at in group.iter().filter(|&&at| is_alias(at)) {
+                drop[at] = true;
+                by_declaration += 1;
+            }
+            group.retain(|&at| !is_alias(at));
+        }
         let mut properties: Vec<usize> = group
             .iter()
             .copied()
@@ -244,14 +259,14 @@ pub(crate) fn settle_property_ids(
             }
         }
     }
-    if by_callable + by_property > 0 {
+    if by_callable + by_property + by_declaration > 0 {
         let mut at = 0;
         symbols.retain(|_| {
             at += 1;
             !drop[at - 1]
         });
     }
-    (by_callable, by_property)
+    (by_callable, by_property, by_declaration)
 }
 
 /// Whether `symbol` is a property: a `Field` whose name is written directly

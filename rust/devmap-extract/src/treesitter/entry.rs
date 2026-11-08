@@ -1086,7 +1086,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     // function, a type, an enum entry or an earlier property
                     // holds is withheld, and the withholding is recorded. After
                     // the recovery, so a re-derived property is settled too.
-                    let (callable, property) = crate::langdecl::kotlin::settle_property_ids(
+                    let (callable, property, alias) = crate::langdecl::kotlin::settle_property_ids(
                         source,
                         &mut extraction.symbols,
                     );
@@ -1095,6 +1095,12 @@ pub(super) fn extract_treesitter_before_deadline(
                             "kotlin property id withheld: {callable} shared the id of another \
                              declaration of the same owner (a function, type or enum entry), \
                              {property} of an earlier property"
+                        ));
+                    }
+                    if alias > 0 {
+                        extraction.diagnostics.push(format!(
+                            "kotlin typealias id withheld: {alias} shared the id of a function \
+                             or type declared in the same file"
                         ));
                     }
                 }

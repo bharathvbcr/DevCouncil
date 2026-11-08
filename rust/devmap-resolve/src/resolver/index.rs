@@ -1633,23 +1633,30 @@ impl Resolver {
     /// identity; only the bare name stops offering it where a Kotlin class,
     /// enum or interface of that name exists. An alias alone under its name
     /// (`typealias Handler = (Int) -> Unit`) keeps the candidate.
+    ///
+    /// A same-name **function** claims the name too: `typealias Pt =
+    /// Pair<Int, Int>` beside `fun Pt(x: Int): Pt` is the fake-constructor
+    /// idiom, and `Pt(3)` is a call of the function.
     fn drop_kotlin_aliases_shadowing_a_declaration(&mut self) {
-        let is_type = |kind: SymbolKind| {
-            matches!(
-                kind,
-                SymbolKind::Class | SymbolKind::Enum | SymbolKind::Interface
-            )
-        };
         for hits in self.symbol_index.values_mut() {
-            let kotlin_type = hits
-                .iter()
-                .any(|(_, kind, family, _)| *family == LangFamily::Kotlin && is_type(*kind));
+            let kotlin_type = hits.iter().any(|(_, kind, family, _)| {
+                *family == LangFamily::Kotlin && Self::kotlin_declaration_an_alias_yields_to(*kind)
+            });
             if kotlin_type {
                 hits.retain(|(_, kind, family, _)| {
                     !(*family == LangFamily::Kotlin && *kind == SymbolKind::Struct)
                 });
             }
         }
+    }
+
+    /// The Kotlin declarations a same-name `typealias` yields its bare name
+    /// to: the types it can spell and the function of the fake-constructor idiom.
+    pub(super) fn kotlin_declaration_an_alias_yields_to(kind: SymbolKind) -> bool {
+        matches!(
+            kind,
+            SymbolKind::Class | SymbolKind::Enum | SymbolKind::Interface | SymbolKind::Function
+        )
     }
 
     /// Turn each glob re-export into one hop per name the target publishes.
