@@ -242,9 +242,17 @@ impl Store {
             )));
         }
         let _sidecars = Self::checked_sidecars(path)?;
+        // Admit through a short-lived immutable peek that closes here, so a
+        // schema this reader cannot use is refused before any connection can
+        // create `-wal`/`-shm`.
+        Self::admit_store_for_read(path)?;
         let setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // The `Store` returned here is held by long-lived readers (the MCP
+        // cache keeps one per path), so it is a plain read-only connection that
+        // takes locks and follows a writer committing in place. `?immutable=1`
+        // disables change detection and must never back such a reader.
         let mut conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -256,6 +264,14 @@ impl Store {
         let stamped: i32 = match first_read {
             Ok(version) => version,
             Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
+                // The one case that still hands out an immutable reader: the
+                // directory cannot hold `-wal`/`-shm`, so a live reader is
+                // impossible. It will not see a later write; say so.
+                eprintln!(
+                    "devmap-store: {} is in a directory that cannot hold WAL sidecars; \
+                     opened immutable, so this reader will not see later writes",
+                    path.display()
+                );
                 conn = Self::open_immutable(path)?;
                 conn.busy_timeout(Self::BUSY_TIMEOUT)?;
                 conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
@@ -275,6 +291,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
+            repo_root_override: None,
         })
     }
 
@@ -361,6 +378,9 @@ impl Store {
             .map_err(|error| refusal(error.to_string()))?;
         let path = resolved.as_path();
         Self::validate_database_file(path)?;
+        // Before any sidecar repair, WAL switch, or migration. An unreadable
+        // owner is not ours, and same-version heals are writes.
+        Self::refuse_writes_when_owner_unreadable(path)?;
         // Before the connection exists: SQLite maps the `-shm` sidecar as it
         // opens a WAL database, with whatever mode the sidecar has, so a
         // repair after `Connection::open` is a repair the connection never
@@ -437,6 +457,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only,
+            repo_root_override: None,
         })
     }
 
@@ -456,18 +477,32 @@ impl Store {
     }
 
     /// Open `path` read-only and immutable, for a store in a directory this
-    /// process cannot write. See the fallback in [`Store::open`].
+    /// process cannot write, and for a peek that must not create `-wal` or
+    /// `-shm`. See the fallback in [`Store::open`].
     pub(super) fn open_immutable(path: &Path) -> Result<Connection> {
-        // A URI filename: `%`, `?` and `#` in the path would be read as URI
-        // syntax, so they are percent-encoded — the only three characters the
-        // SQLite URI grammar reserves inside the path component.
-        let mut encoded = String::with_capacity(path.as_os_str().len() + 8);
+        // A URI filename. Every byte that is not an unreserved character or a
+        // path separator is percent-encoded, including the UTF-8 bytes of a
+        // non-ASCII path. Encoding only `%`, `?` and `#` leaves those bytes as
+        // the wrong characters, and the peek then opens a path that is not the
+        // store.
+        let mut encoded = String::with_capacity(path.as_os_str().len() * 3 + 8);
         for byte in path.to_string_lossy().bytes() {
             match byte {
-                b'%' => encoded.push_str("%25"),
-                b'?' => encoded.push_str("%3F"),
-                b'#' => encoded.push_str("%23"),
-                other => encoded.push(other as char),
+                b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b'/'
+                | b'\\' => encoded.push(byte as char),
+                other => {
+                    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                    encoded.push('%');
+                    encoded.push(char::from(HEX[(other >> 4) as usize]));
+                    encoded.push(char::from(HEX[(other & 0x0F) as usize]));
+                }
             }
         }
         let conn = Connection::open_with_flags(
@@ -478,6 +513,107 @@ impl Store {
         )?;
         Self::harden_connection(&conn)?;
         Ok(conn)
+    }
+
+    /// A connection that can read the owner and the schema stamp.
+    ///
+    /// A WAL database (header byte 18 is 2) with no `-wal` yet is opened
+    /// immutable: a read-only open of that file creates `-wal` and `-shm`.
+    /// A rollback-journal database, and a WAL database whose sidecar is
+    /// already there, is opened read-only. That open takes the shared lock
+    /// and waits out `busy_timeout`. An immutable open does not, so a
+    /// momentary exclusive lock would look like an uncontended read.
+    pub(super) fn open_owner_peek(path: &Path) -> Result<Connection> {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal_present = std::path::Path::new(&wal).is_file();
+        if wal_present || !Self::file_header_is_wal(path)? {
+            match Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(conn) => Ok(conn),
+                Err(error) if Self::directory_refused_the_wal(&error) => Self::open_immutable(path),
+                Err(error) => Err(error),
+            }
+        } else {
+            Self::open_immutable(path)
+        }
+    }
+
+    /// Whether `path` is a WAL database, from the write-version byte.
+    ///
+    /// A short header is not WAL. The open that follows reports a file that
+    /// is not a database. A header that cannot be read is an error: guessing
+    /// either creates a sidecar or skips the lock wait.
+    fn file_header_is_wal(path: &Path) -> Result<bool> {
+        let mut header = [0u8; 20];
+        let mut file = std::fs::File::open(path).map_err(|error| {
+            refusal(format!(
+                "cannot inspect devmap store {}: {error}",
+                path.display()
+            ))
+        })?;
+        match std::io::Read::read(&mut file, &mut header) {
+            Ok(20) => Ok(header[18] == 2),
+            Ok(_) => Ok(false),
+            Err(error) => Err(refusal(format!(
+                "cannot read devmap store header {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Refuse to write when an existing store's owner record cannot be read.
+    ///
+    /// Same-version heals and migration are writes. An owner that cannot be
+    /// read is not proof that the store is ours, at the current schema as well
+    /// as an older one. A missing file is not a store yet, and a peek that
+    /// fails for a reason other than a proven unreadable owner lets
+    /// [`Store::open`] report that file in its own words. A corrupt page is
+    /// that proof, and it is returned as SQLite's corruption error so the
+    /// caller can say the store was left where it is.
+    fn refuse_writes_when_owner_unreadable(path: &Path) -> Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let conn = match Self::open_owner_peek(path) {
+            Ok(conn) => conn,
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
+            Err(_) => return Ok(()),
+        };
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        let stamped: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+            Ok(stamped) => stamped,
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
+            Err(_) => return Ok(()),
+        };
+        // Schema 7 is the first that records an owner. Older than that, and a
+        // version this kernel cannot migrate, are reported by the open itself.
+        if stamped < 7 || !Self::schema_is_migratable(stamped) {
+            return Ok(());
+        }
+        match Self::stored_repo_root(&conn, stamped) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Admit `path` for a reader without creating a sidecar.
+    ///
+    /// [`Store::open_read_only`] opens before it checks the stamp, and that
+    /// open creates `-wal`/`-shm` for a WAL store whose sidecars were removed.
+    /// A schema this reader cannot use must fail here, where the connection
+    /// cannot create them.
+    fn admit_store_for_read(path: &Path) -> Result<()> {
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(path)
+            .map_err(|error| refusal(error.to_string()))?;
+        let path = resolved.as_path();
+        let conn = Self::open_owner_peek(path)?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Self::admit_reader_schema(&conn, &path.display().to_string(), stamped)
     }
 
     /// Whether this store can only be read. See the `read_only` field.
@@ -784,10 +920,20 @@ impl Store {
     ///
     /// The holder writes its pid into the file, so the timeout can say who.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
-        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
         let db_path = devmap_extract::safe_fs::resolve_file_alias(db_path)?;
         Self::validate_database_file(&db_path)?;
         let lock_path = Self::writer_lock_path(&db_path);
+        Self::lock_file_at(&lock_path, wait)
+    }
+
+    /// The bounded, pid-recording exclusive `flock` behind
+    /// [`Store::lock_writer_at`], for a lock file that is not a database's
+    /// (the shared bases directory's `.lock`). One owner for the poll policy:
+    /// contention waits, a failed check is reported as such, and the timeout
+    /// names the holder's pid.
+    pub fn lock_file_at(lock_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        let lock_path = lock_path.to_path_buf();
         let mut file = SafeFile::open(&lock_path, Access::ReadWrite, Creation::IfMissing).map_err(
             |error| {
                 anyhow::anyhow!(
@@ -916,13 +1062,146 @@ impl Store {
     /// was a race, not a state.
     ///
     /// A read answers from what exists, or reports that nothing is there. It
-    /// does not create the thing it is reading.
+    /// does not create the thing it is reading, and it does not migrate, heal,
+    /// or switch the journal mode of a store some other repository owns.
+    /// An older schema is an error from [`Store::admit_reader_schema`], not a
+    /// migration: the caller records the store as unreadable.
     pub fn open_existing<P: AsRef<Path>>(db_path: P) -> Result<Option<Self>> {
         let path = db_path.as_ref();
         if !path.is_file() {
             return Ok(None);
         }
-        Ok(Some(Self::open(path)?))
+        Self::admit_store_for_read(path)?;
+        Ok(Some(Self::open_read_only(path)?))
+    }
+
+    /// Open a sealed immutable base snapshot (`chmod 0444`, rollback journal,
+    /// zero `-wal`/`-shm` sidecars) with `?immutable=1` and an optional worktree
+    /// `repo_root_override`.
+    ///
+    /// Fails closed if `db_path` has any write permission bit set or has
+    /// `-wal`/`-shm` sidecars so live mutable `devmap.sqlite` files can never
+    /// be opened with `?immutable=1` (`SQLITE_CORRUPT` hazard under concurrent
+    /// writers).
+    pub fn open_immutable_snapshot<P: AsRef<Path>>(
+        db_path: P,
+        repo_root_override: Option<String>,
+    ) -> Result<Self> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+            .map_err(|error| refusal(error.to_string()))?;
+        let file = SafeFile::open(&resolved, Access::Read, Creation::Never).map_err(|error| {
+            refusal(format!(
+                "cannot open immutable snapshot {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        Self::open_immutable_snapshot_file(&file, &resolved, repo_root_override)
+    }
+
+    /// [`Self::open_immutable_snapshot`] for a file the caller already holds.
+    ///
+    /// On macOS the connection is bound to `file`'s descriptor (`/dev/fd/N`,
+    /// which is not a symlink there), so renaming, replacing or deleting the name
+    /// `label` before or after the open cannot change what the store reads. On
+    /// Linux `/dev/fd/N` is a symlink into `/proc/self/fd`, which SQLite resolves
+    /// to a name, so the open is path-bound there: callers rely on that name
+    /// being inside a directory only the owner writes (the lane's own `stack/`).
+    /// `label` is the name the store reports and where its sidecars would sit.
+    /// Elsewhere the connection opens `label`.
+    pub fn open_immutable_snapshot_file(
+        file: &std::fs::File,
+        label: &Path,
+        repo_root_override: Option<String>,
+    ) -> Result<Self> {
+        let path = label;
+        let metadata = file.metadata().map_err(|error| {
+            refusal(format!(
+                "cannot inspect immutable snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(refusal(format!(
+                "immutable snapshot {} is not a regular file",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = metadata.mode();
+            if mode & 0o222 != 0 {
+                return Err(refusal(format!(
+                    "immutable snapshot {} is writable (mode {:04o}); refusing ?immutable=1 open on mutable database",
+                    path.display(),
+                    mode & 0o7777
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !metadata.permissions().readonly() {
+                return Err(refusal(format!(
+                    "immutable snapshot {} is writable; refusing ?immutable=1 open on mutable database",
+                    path.display()
+                )));
+            }
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar_path = std::path::Path::new(&sidecar);
+            match std::fs::symlink_metadata(sidecar_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(refusal(format!(
+                        "immutable snapshot {} has active sidecar {}; refusing ?immutable=1 open",
+                        path.display(),
+                        sidecar_path.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(refusal(format!(
+                        "cannot inspect sidecar {} for immutable snapshot {}: {error}",
+                        sidecar_path.display(),
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        let setup = CONNECTION_SETUP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        #[cfg(unix)]
+        let conn = {
+            use std::os::fd::AsRawFd;
+            Self::open_immutable(Path::new(&format!("/dev/fd/{}", file.as_raw_fd())))?
+        };
+        #[cfg(not(unix))]
+        let conn = Self::open_immutable(path)?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        drop(setup);
+
+        let store_label = path.display().to_string();
+        Self::admit_reader_schema(&conn, &store_label, stamped)?;
+        Self::reject_triggers(&conn)?;
+        Self::configure_connection(&conn)?;
+        Self::validate_schema(&conn)?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            edge_index: Mutex::new(None),
+            generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
+            generation_analysis_status: Mutex::new(None),
+            source_freshness_cache: Mutex::new(None),
+            db_path: Some(path.to_path_buf()),
+            read_only: true,
+            repo_root_override,
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -939,6 +1218,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: None,
             read_only: false,
+            repo_root_override: None,
         })
     }
 }

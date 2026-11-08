@@ -462,6 +462,22 @@ impl Store {
     /// built outside a repository. Never an empty string dressed as a path.
     pub fn latest_generation_repo_root(&self) -> Result<Option<String>> {
         let conn = lock_conn(&self.conn)?;
+        if let Some(ref override_root) = self.repo_root_override {
+            let has_gen: Option<i64> = conn
+                .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
+                .optional()?;
+            return Ok(
+                has_gen.and_then(|_| (!override_root.is_empty()).then(|| override_root.clone())),
+            );
+        }
+        if let Some(seeded) = Self::seeded_repo_root_in(&conn)? {
+            let has_gen: Option<i64> = conn
+                .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
+                .optional()?;
+            if has_gen.is_some() {
+                return Ok(Some(seeded));
+            }
+        }
         let root: Option<Option<String>> = conn
             .query_row(
                 "SELECT repo_root FROM generations WHERE id = (SELECT max(id) FROM generations)",
@@ -496,6 +512,15 @@ impl Store {
                 "no generation to restamp: nothing has been indexed yet — run `devmap build`",
             ));
         }
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Self::clear_seed_rebind_and_normalize_generations(&tx, owner.as_deref())?;
         tx.commit()?;
         Ok(())
     }
@@ -695,15 +720,7 @@ impl Store {
     }
 
     pub fn latest_repo_root(&self) -> Result<Option<String>> {
-        let conn = lock_conn(&self.conn)?;
-        let root: Option<Option<String>> = conn
-            .query_row(
-                "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(root.flatten().filter(|root| !root.is_empty()))
+        self.latest_generation_repo_root()
     }
 
     /// The latest generation's analysis summary.

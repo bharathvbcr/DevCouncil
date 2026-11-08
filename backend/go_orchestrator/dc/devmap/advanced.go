@@ -127,7 +127,8 @@ func (c *Client) Advanced(ctx context.Context, q AdvancedQuery) (AdvancedResult,
 		args = append(args, q.Targets...)
 	}
 
-	before, err := c.Status(ctx)
+	statusCtx := withCLIStatus(ctx)
+	before, err := c.Status(statusCtx)
 	if err != nil {
 		return AdvancedResult{}, fmt.Errorf("check %s readiness: %w", q.Kind, err)
 	}
@@ -142,7 +143,7 @@ func (c *Client) Advanced(ctx context.Context, q AdvancedQuery) (AdvancedResult,
 	if err := validateAdvancedEnvelope(q.Kind, data); err != nil {
 		return AdvancedResult{}, err
 	}
-	status, err := c.Status(ctx)
+	status, err := c.Status(statusCtx)
 	if err != nil {
 		return AdvancedResult{}, fmt.Errorf("qualify %s result with index status: %w", q.Kind, err)
 	}

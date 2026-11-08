@@ -39,6 +39,7 @@ pub(crate) mod repair;
 pub(crate) mod routes;
 pub(crate) mod savings;
 pub(crate) mod search;
+pub(crate) mod seed;
 pub(crate) mod serve;
 pub(crate) mod session_report;
 pub(crate) mod shape_check;
@@ -54,6 +55,7 @@ pub(crate) mod workspace;
 pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build(args) => build::run(cli, progress, args),
+        Commands::Seed(args) => seed::run(cli, args),
         Commands::Search(args) => search::run(cli, args),
         Commands::Ask(args) => ask::run(cli, args),
         Commands::Deps(args) => deps::run(cli, args),

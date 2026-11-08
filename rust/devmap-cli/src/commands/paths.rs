@@ -42,6 +42,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     // Both explicit --db and relative roots are invocation-relative.
     // Joining this to root again duplicates the repository directory.
     let db_path = std::path::absolute(cli.db())?;
+    let stack_lease = devmap_extract::paths::stack_lease_path(&root);
+    let sqlite_store_exists = db_path.is_file();
+    let stacked_exists = cli.db.is_none() && stack_lease.is_file();
     let mut digests = crate::digest_cache::BinaryDigests::open(Some(&state_dir));
     let binaries = inventory_devmap_binaries(&mut digests)?;
     let skew = binaries_skew_warning(&binaries);
@@ -50,7 +53,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         "state_dir": state_dir,
         "state_dir_exists": state_dir.is_dir(),
         "db_path": db_path,
-        "store_exists": db_path.is_file(),
+        "store_exists": sqlite_store_exists || stacked_exists,
+        "sqlite_store_exists": sqlite_store_exists,
+        "stack_lease_path": stack_lease,
+        "stacked_exists": stacked_exists,
         "repo_map": devmap_extract::paths::repo_map_path(&root),
         "code_graph": devmap_extract::paths::code_graph_path(&root),
         "workspace": devmap_extract::paths::workspace_path(&root),

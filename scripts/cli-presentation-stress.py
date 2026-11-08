@@ -244,6 +244,14 @@ def main():
         for query in queries:
             receipt(run([*base, *query, "--json", "--progress", "always"], root))
             counts["json_commands"] += 1
+        # `seed` needs a registered linked worktree of the fixture repository and
+        # a built donor: the fixture is both, so the lane is a real `git worktree`.
+        with tempfile.TemporaryDirectory(prefix="devcouncil-ui-stress-lane-") as lane_scratch:
+            lane = Path(lane_scratch) / "lane"
+            subprocess.run(["git", "worktree", "add", "-q", "--detach", str(lane)],
+                           cwd=root, check=True, capture_output=True)
+            receipt(run([devmap, "--root", str(lane), "seed", "--json", "--progress", "always"], lane))
+            counts["json_commands"] += 1
         host_queries = [["skills", "list"], ["install", "devmap", "--dry-run"], ["install", "--list"],
                         ["gate", "status", "--project-root", str(root)]]
         for query in host_queries:

@@ -381,8 +381,21 @@ fn run_hook_inner(
         }
         HookEvent::PostToolUse => {
             let started = Instant::now();
-            let budget_note =
-                detach_roots(executable, &selection.roots, DETACH_BUDGET, detach_build)?;
+            let budget_note = if !selection.roots.is_empty() {
+                detach_roots(
+                    executable,
+                    &selection.roots,
+                    DETACH_BUDGET,
+                    detach_post_tool_root,
+                )?
+            } else if pinned_root.is_none() {
+                if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
+                    let _ = detach_seeded_build(executable, &wt, &main);
+                }
+                None
+            } else {
+                None
+            };
             // After the detach is scheduled: short blast from the generation
             // already on disk. Never waits for the rebuild. Budget miss says
             // so and still exits 0.
@@ -706,11 +719,12 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
     let name = unindexed_context_name(&root);
     let opted_in =
         main_checkout_of(&root).filter(|main| !is_unsafe_root(main) && store_exists(main));
-    let text = match opted_in.map(|main| (detach_build(executable, &root), main)) {
+    let text = match opted_in.map(|main| (detach_seeded_build(executable, &root, &main), main)) {
         Some((Ok(()), main)) => format!(
-            "{name}: no DevMap index in this working tree yet, so `devmap build` was started \
-             here in the background — this repository's main checkout ({}) is indexed. Until \
-             it lands (`devmap status` reports it), devmap_* queries here cannot answer, and an \
+            "{name}: no DevMap index in this working tree yet, so `devmap build --seed-from` \
+             was started here in the background, copying this repository's main checkout ({}) \
+             index and then updating it for this tree. Until it lands (`devmap status` reports \
+             it), devmap_* queries here cannot be trusted: they may answer nothing, and an \
              empty result is not evidence that a symbol is absent. Do not query the main \
              checkout's index for this tree: it describes a different working state.",
             context_line(&main.display().to_string())
@@ -736,64 +750,10 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
     }))
 }
 
-/// Largest gitlink or `commondir` file read. Both hold one path.
-const MAX_GITLINK_BYTES: u64 = 4096;
-
 /// The main checkout of the linked worktree at `root`, when git has registered
-/// that worktree.
-///
-/// Three paths have to agree. The gitdir is `<main>/.git/worktrees/<name>`.
-/// Its `commondir` canonicalizes to that same `<main>/.git`. Its `gitdir` file
-/// names this root's `.git`, and this root's `.git` is a regular file. A
-/// `commondir` whose final component is `.git` is not enough: the directory a
-/// gitlink names is writable by whoever planted the gitlink.
-///
-/// `None` when `root` is itself a main checkout (its `.git` is a directory),
-/// when the common directory is bare, when this root is not the registered
-/// worktree, or when any of it cannot be read.
-fn main_checkout_of(root: &Path) -> Option<PathBuf> {
-    let gitlink = root.join(".git");
-    // A symlink is not this checkout's gitlink. Following it would adopt
-    // whatever worktree the link points at.
-    if !gitlink.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
-        return None;
-    }
-    let text = devmap_query::stat_memo::read_bounded(&gitlink, MAX_GITLINK_BYTES)?;
-    let gitdir_spec = text
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:"))
-        .map(str::trim)
-        .filter(|path| !path.is_empty() && !path.contains('\0'))?;
-    let gitdir = root.join(gitdir_spec);
-    let common_text =
-        devmap_query::stat_memo::read_bounded(&gitdir.join("commondir"), MAX_GITLINK_BYTES)?;
-    let common_text = common_text.trim();
-    if common_text.is_empty() || common_text.contains('\0') {
-        return None;
-    }
-    let common = gitdir.join(common_text).canonicalize().ok()?;
-    if common.file_name()? != ".git" {
-        return None;
-    }
-    let gitdir = gitdir.canonicalize().ok()?;
-    let worktrees = gitdir.parent()?;
-    if worktrees.file_name()? != "worktrees" || worktrees.parent()? != common {
-        return None;
-    }
-    let registered =
-        devmap_query::stat_memo::read_bounded(&gitdir.join("gitdir"), MAX_GITLINK_BYTES)?;
-    let registered = registered.trim();
-    if registered.is_empty() || registered.contains('\0') {
-        return None;
-    }
-    let registered = gitdir.join(registered).canonicalize().ok()?;
-    let gitlink = gitlink.canonicalize().ok()?;
-    let root = root.canonicalize().ok()?;
-    if registered != gitlink || registered.parent()? != root {
-        return None;
-    }
-    let main = common.parent()?.to_path_buf();
-    (main != root).then_some(main)
+/// that worktree. Delegates to the canonical validator in `devmap_extract::paths`.
+pub(crate) fn main_checkout_of(root: &Path) -> Option<PathBuf> {
+    devmap_extract::paths::main_checkout_of(root)
 }
 
 fn push_unique(out: &mut Vec<PathBuf>, path: Option<PathBuf>) {
@@ -819,14 +779,6 @@ fn resolve_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
     // ...but never out of this working tree. A linked worktree nested inside
     // its parent checkout (`.claude/worktrees/<lane>`) has no store until it
     // is built locally, and the parent's store describes a different commit.
-    // Without this bound the walk reaches the parent and the session brief
-    // reports that index as this session's: `status` says `query_ready:false`
-    // while the hook says "ready, 11789 symbols", which is the one thing a
-    // check that could not run must never do. `state_discovery_contract`
-    // already holds the CLI to the same rule
-    // (`a_new_linked_worktree_is_truthfully_missing_until_bootstrapped_locally`);
-    // this is the hook honouring it. Outside git there is no repository
-    // identity to cross, so discovery there is left unbounded.
     let boundary = devmap_extract::git_worktree_root(&cursor);
     loop {
         if store_exists(&cursor) {
@@ -848,10 +800,7 @@ fn canonicalize_existing(path: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("cannot resolve {}", path.display()))
 }
 
-fn store_exists(root: &Path) -> bool {
-    // Clear DEVMAP_HOME influence for hook discovery: the store must live under
-    // the repository itself. Using the path helpers with an empty home override
-    // would require plumbing; check both layout names directly.
+fn has_sqlite_store(root: &Path) -> bool {
     root.join(".devmap")
         .join("codeintel")
         .join("devmap.sqlite")
@@ -861,6 +810,25 @@ fn store_exists(root: &Path) -> bool {
             .join("codeintel")
             .join("devmap.sqlite")
             .is_file()
+}
+
+fn has_stack_lease(root: &Path) -> bool {
+    root.join(".devmap")
+        .join("codeintel")
+        .join("stack_lease.json")
+        .is_file()
+        || root
+            .join(".devcouncil")
+            .join("codeintel")
+            .join("stack_lease.json")
+            .is_file()
+}
+
+fn store_exists(root: &Path) -> bool {
+    // Clear DEVMAP_HOME influence for hook discovery: the store must live under
+    // the repository itself. Check both layout names directly for either a
+    // standalone SQLite store or a zero-copy stacked worktree lease.
+    has_sqlite_store(root) || has_stack_lease(root)
 }
 
 fn is_unsafe_root(root: &Path) -> bool {
@@ -1322,13 +1290,19 @@ fn render_skeleton_context(root: &Path, absolute: &Path, budget: Duration) -> Op
     if budget.is_zero() {
         return None;
     }
-    let db = store_db_path(root)?;
-    let store = devmap_store::Store::open_read_only(&db).ok()?;
+    let hook_store = HookStore::open(root).ok().flatten()?;
     if started.elapsed() >= budget {
         return None;
     }
     let relative = repo_relative_path(root, absolute)?;
-    let report = devmap_query::StoreQueryEngine::new(&store)
+    if let HookStore::Stacked(stacked) = &hook_store {
+        if stacked_file_has_unindexed_edits(stacked, root, &relative) {
+            return Some(format!(
+                "DevMap skeleton: {relative} has edits not in the stacked base index; run devmap build --manifest for an exact skeleton"
+            ));
+        }
+    }
+    let report = devmap_query::StoreQueryEngine::new(hook_store.store())
         .skeleton(&relative, 4000)
         .ok()?;
     if started.elapsed() >= budget {
@@ -1398,20 +1372,38 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
             "DevMap blast: no edited file/range in the payload, so nothing to walk from.".into(),
         );
     }
-    let db = store_db_path(root)?;
-    let store = match devmap_store::Store::open_read_only(&db) {
-        Ok(store) => store,
-        Err(_) => {
+    // No store and no stacked lease: nothing to say, as before.
+    let has_store = [
+        root.join(".devcouncil/codeintel/devmap.sqlite"),
+        root.join(".devmap/codeintel/devmap.sqlite"),
+        root.join(".devcouncil/codeintel/stack_lease.json"),
+        root.join(".devmap/codeintel/stack_lease.json"),
+    ]
+    .iter()
+    .any(|path| path.is_file());
+    if !has_store {
+        return None;
+    }
+    let hook_store = match HookStore::open(root) {
+        Ok(Some(hook_store)) => hook_store,
+        Ok(None) => {
             return Some(
                 "DevMap blast: the on-disk index could not be opened; list is empty because the store was unavailable."
                     .into(),
             );
         }
+        Err(reason) => {
+            return Some(format!(
+                "DevMap blast: the stacked index could not be opened ({reason}); \
+                 list is empty because the store was unavailable."
+            ));
+        }
     };
+    let store = hook_store.store();
     if started.elapsed() >= budget {
         return Some("DevMap blast skipped: opening the store spent the leftover budget.".into());
     }
-    let graph = match dc_regress_store::StoreGraph::new(&store, root) {
+    let graph = match dc_regress_store::StoreGraph::new(store, root) {
         Ok(graph) => graph,
         Err(err) => {
             return Some(format!(
@@ -1448,6 +1440,9 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
     const MAX_LOCATIONS: usize = 4;
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("DevMap blast from {label}:"));
+    if let HookStore::Stacked(stacked) = &hook_store {
+        parts.push(stacked_blast_note(stacked));
+    }
     for (examined, (path, start, end)) in locations.iter().take(MAX_LOCATIONS).enumerate() {
         if started.elapsed() >= budget {
             parts.push(format!(
@@ -1479,6 +1474,28 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
         ));
     }
     Some(truncate(&parts.join("\n"), POST_TOOL_BLAST_CONTEXT_CAP))
+}
+
+/// The stacked-lane line of a hook blast report. It reads only what is already
+/// open (the delta's counts): `unsynced_paths` runs two git processes bounded at
+/// 10 s each, which does not fit in the hook's 400 ms budget, so the unsynced
+/// count is named as not computed rather than computed late.
+fn stacked_blast_note(stacked: &devmap_query::StackedStore) -> String {
+    let in_delta = stacked
+        .status()
+        .ok()
+        .map(|st| st.dirty_files.saturating_add(st.tombstoned_files));
+    let missing = if stacked.delta_present() {
+        ""
+    } else {
+        " (no delta.sqlite yet: the delta reads as empty)"
+    };
+    match in_delta {
+        Some(delta) => format!(
+            "stacked lane: {delta} file(s) are dirty or deleted in the delta{missing}; unsynced count not computed within the hook budget; the walk reads the immutable base, so this list is a lower bound."
+        ),
+        None => "stacked lane: the delta counts could not be read and the unsynced count was not computed within the hook budget; the walk reads the immutable base, so this list is a lower bound.".into(),
+    }
 }
 
 fn format_blast_for_hook(report: &dc_regress::BlastReport) -> String {
@@ -1668,12 +1685,67 @@ fn lines_covering(content: &str, needle: &str) -> Option<(u32, u32)> {
     Some((start, end.max(start)))
 }
 
-fn store_db_path(root: &Path) -> Option<PathBuf> {
-    let candidates = [
-        root.join(".devcouncil/codeintel/devmap.sqlite"),
-        root.join(".devmap/codeintel/devmap.sqlite"),
-    ];
-    candidates.into_iter().find(|path| path.is_file())
+/// The store a hook answers from: the lane's own, or, for a stacked lane, the
+/// `StackedStore` whose base carries the worktree root override. Opening the
+/// base file directly would answer with the donor's root and no delta.
+enum HookStore {
+    Plain(Box<devmap_store::Store>),
+    Stacked(Box<devmap_query::StackedStore>),
+}
+
+impl HookStore {
+    /// `Ok(None)`: nothing is stored here. `Err`: a lane's lease exists but its
+    /// store cannot be opened; the text names the recovery command, so the hook
+    /// can say why instead of "could not be opened".
+    fn open(root: &Path) -> Result<Option<Self>, String> {
+        let plain = [
+            root.join(".devcouncil/codeintel/devmap.sqlite"),
+            root.join(".devmap/codeintel/devmap.sqlite"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(db) = plain {
+            return Ok(devmap_store::Store::open_read_only(&db)
+                .ok()
+                .map(|store| Self::Plain(Box::new(store))));
+        }
+        devmap_query::StackedStore::open_if_leased(root)
+            .map(|opened| opened.map(|stacked| Self::Stacked(Box::new(stacked))))
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    fn store(&self) -> &devmap_store::Store {
+        match self {
+            Self::Plain(store) => store.as_ref(),
+            Self::Stacked(stacked) => stacked.base_store(),
+        }
+    }
+}
+
+/// Whether `relative` has edits the stacked base index does not hold: the delta
+/// lists it, the base never indexed it, or the file on disk no longer hashes to
+/// what the base recorded. The PostToolUse sync is detached, so the delta lags.
+fn stacked_file_has_unindexed_edits(
+    stacked: &devmap_query::StackedStore,
+    root: &Path,
+    relative: &str,
+) -> bool {
+    let path = Path::new(relative);
+    let overlay = stacked.overlay();
+    if overlay.modified_files.contains_key(path) || overlay.is_file_tombstoned(path) {
+        return true;
+    }
+    let Ok(Some(base_file)) = stacked.base_store().latest_file(relative) else {
+        return true;
+    };
+    let Ok(bytes) = std::fs::read(root.join(relative)) else {
+        return true;
+    };
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return true;
+    };
+    let lang = devmap_extract::languages::detect_language(path);
+    devmap_extract::cache::CacheKey::for_source(lang, source).content_hash != base_file.content_hash
 }
 
 fn repo_relative_path(root: &Path, absolute: &Path) -> Option<String> {
@@ -2008,16 +2080,96 @@ fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
     }
 }
 
+fn detach_post_tool_root(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    if has_stack_lease(root) && !has_sqlite_store(root) {
+        return detach_stack_sync(executable, root);
+    }
+    detach_build(executable, root)
+}
+
+fn detach_stack_sync(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    let lock_dir = coalesce_lock_dir(root, "stack-sync");
+    if !try_acquire_lock_dir(&lock_dir)? {
+        return Ok(());
+    }
+    let args: Vec<std::ffi::OsString> = vec![
+        "--root".into(),
+        root.as_os_str().to_owned(),
+        "seed".into(),
+        "--sync-delta".into(),
+    ];
+    let args_ref: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+    spawn_detached_with_cleanup(executable, &args_ref, &lock_dir)
+}
+
+fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Some(fp) = file_path_from_payload(payload) {
+        candidates.push(fp);
+    }
+    candidates.extend(apply_patch_paths(payload));
+    if let Some(cwd) = string_path(payload, "cwd") {
+        candidates.push(cwd);
+    }
+    for candidate in candidates.into_iter().take(MAX_HOOK_ROOT_CANDIDATES) {
+        let probe = if candidate.exists() {
+            candidate
+        } else if let Some(parent) = candidate.parent().filter(|p| p.exists()) {
+            parent.to_path_buf()
+        } else {
+            continue;
+        };
+        let Ok(canon) = canonicalize_existing(&probe) else {
+            continue;
+        };
+        let Some(wt) = devmap_extract::git_worktree_root(&canon) else {
+            continue;
+        };
+        if is_unsafe_root(&wt) || store_exists(&wt) {
+            return None;
+        }
+        if let Some(main) =
+            main_checkout_of(&wt).filter(|main| !is_unsafe_root(main) && store_exists(main))
+        {
+            return Some((wt, main));
+        }
+        return None;
+    }
+    None
+}
+
 fn detach_build(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    detach_build_with(executable, root, None)
+}
+
+/// A build of a linked worktree that starts from its main checkout's store.
+fn detach_seeded_build(executable: &Path, root: &Path, main: &Path) -> anyhow::Result<()> {
+    detach_build_with(executable, root, Some(main))
+}
+
+fn detach_build_with(
+    executable: &Path,
+    root: &Path,
+    seed_from: Option<&Path>,
+) -> anyhow::Result<()> {
     let lock_dir = coalesce_lock_dir(root, "build");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
     }
-    spawn_detached_with_cleanup(
-        executable,
-        &[OsStr::new("--root"), root.as_os_str(), OsStr::new("build")],
-        &lock_dir,
-    )
+    let args = build_args(root, seed_from);
+    let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+    spawn_detached_with_cleanup(executable, &args, &lock_dir)
+}
+
+/// `build`'s argument vector; `--seed-from` is present exactly when a main
+/// checkout was named.
+fn build_args(root: &Path, seed_from: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["--root".into(), root.as_os_str().to_owned(), "build".into()];
+    if let Some(main) = seed_from {
+        args.push("--seed-from".into());
+        args.push(main.as_os_str().to_owned());
+    }
+    args
 }
 
 fn detach_session_report(
@@ -4359,6 +4511,159 @@ mod tests {
         );
     }
 
+    /// A committed, indexed donor `main` and a provisioned stacked `lane`.
+    fn stacked_lane_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = scratch(tag);
+        let run = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let main = base.join("main");
+        let lane = base.join("lane");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(main.join("lib.rs"), "pub fn base_only() -> i32 { 1 }\n").unwrap();
+        run(&main, &["init", "-q", "-b", "main"]);
+        run(&main, &["add", "."]);
+        run(&main, &["commit", "-qm", "base"]);
+        run(
+            &main,
+            &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()],
+        );
+        let head = run(&main, &["rev-parse", "HEAD"]);
+        {
+            let db = devmap_extract::paths::store_path(&main);
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let store = devmap_store::Store::open(&db).unwrap();
+            store.bind_repo_root(&main.canonicalize().unwrap()).unwrap();
+            let exts = vec![devmap_extract::extract_file(
+                "lib.rs",
+                "pub fn base_only() -> i32 { 1 }\n",
+            )];
+            let mut resolver = devmap_resolve::Resolver::new();
+            resolver.index_extractions(&exts);
+            let res = resolver.resolve_all(&exts).unwrap();
+            let analysis = devmap_analyze::analyze(&exts, &res);
+            store
+                .save_generation_with_metadata(
+                    &exts,
+                    &res,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts::default(),
+                    &head,
+                )
+                .unwrap();
+        }
+        devmap_query::provision_stacked_worktree(&main, &lane).unwrap();
+        (base, main, lane)
+    }
+
+    /// A stacked lane's hook must not answer from the donor's base as if the
+    /// file just edited were unchanged, nor name the donor's root.
+    #[test]
+    fn stacked_lane_skeleton_names_edits_not_in_the_base_index() {
+        let (base, main, lane) = stacked_lane_fixture("stacked-skeleton");
+        // Untouched: the base answer, naming the lane and never the donor.
+        let clean = render_skeleton_context(&lane, &lane.join("lib.rs"), Duration::from_secs(10))
+            .expect("a clean stacked file answers from the base");
+        assert!(clean.contains("base_only"), "{clean}");
+        assert!(!clean.contains(main.to_str().unwrap()), "{clean}");
+
+        // Edited, not yet synced (the PostToolUse sync is detached): say so.
+        std::fs::write(
+            lane.join("lib.rs"),
+            "pub fn edited_in_lane() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        let dirty = render_skeleton_context(&lane, &lane.join("lib.rs"), Duration::from_secs(10))
+            .expect("an edited stacked file must still speak");
+        assert!(
+            dirty.contains("edits not in the stacked base index"),
+            "{dirty}"
+        );
+        assert!(!dirty.contains("base_only"), "{dirty}");
+        assert!(!dirty.contains(main.to_str().unwrap()), "{dirty}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The blast note must come from what is already open: it may not spend git
+    /// time inside the hook's 400 ms budget. With the lane's `.git` broken any git
+    /// call would fail, so a note that still reports the delta count and says the
+    /// unsynced count was not computed proves no git ran.
+    #[test]
+    fn stacked_blast_note_names_the_budget_and_runs_no_git() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-blast-note");
+        let stacked = devmap_query::StackedStore::open(&lane).expect("open lane");
+        std::fs::write(lane.join(".git"), "gitdir: /nonexistent/devmap-hook-test\n").unwrap();
+        let started = Instant::now();
+        let note = stacked_blast_note(&stacked);
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            note.contains("unsynced count not computed within the hook budget"),
+            "{note}"
+        );
+        assert!(note.contains("0 file(s) are dirty or deleted"), "{note}");
+        assert!(note.contains("no delta.sqlite yet"), "{note}");
+        assert!(note.contains("lower bound"), "{note}");
+        drop(stacked);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hook surfaces why a stacked lane cannot be read, with the recovery
+    /// command, instead of the bare "could not be opened": here a lease left by
+    /// an earlier format (v1).
+    #[test]
+    fn a_stranded_stacked_lane_names_its_recovery_command_in_the_blast_note() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-stranded");
+        let lease_path = devmap_extract::paths::stack_lease_path(lane.canonicalize().unwrap());
+        let mut lease: Value =
+            serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+        lease["format_version"] = json!(1);
+        std::fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+        let payload = json!({"file_path": lane.join("lib.rs").to_str().unwrap()});
+        let note = compose_write_blast(&lane, &payload, Duration::from_secs(10))
+            .expect("a stranded lane must still speak");
+        assert!(
+            note.contains("devmap seed --stacked --from <donor checkout>"),
+            "the note must name the recovery command: {note}"
+        );
+        assert!(!note.contains("could not be opened; list is empty"), "{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hook only reads: with the store a materialize placed and a lease
+    /// that outlived it, its open answers from the store and deletes nothing.
+    #[test]
+    fn the_hooks_open_never_deletes_a_stale_lease_beside_a_store() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-stale");
+        let canon = lane.canonicalize().unwrap();
+        let lease_path = devmap_extract::paths::stack_lease_path(&canon);
+        let lease_bytes = std::fs::read(&lease_path).unwrap();
+        devmap_query::StackedStore::open(&lane)
+            .unwrap()
+            .materialize_seeded_store()
+            .unwrap();
+        // The interrupted state: the store is placed, the lease is back.
+        std::fs::write(&lease_path, &lease_bytes).unwrap();
+        assert!(matches!(HookStore::open(&lane), Ok(Some(HookStore::Plain(_)))));
+        assert!(lease_path.is_file(), "the hook's read left the lease alone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn write_blast_budget_zero_names_the_skip() {
         let text = compose_write_blast(
@@ -5318,5 +5623,139 @@ mod lock_tests {
         assert!(unremovable_lock_verdict(true, Err(anyhow::anyhow!("denied"))).is_ok());
         let claimed = unremovable_lock_verdict(true, Ok(true)).expect_err("a claim is not success");
         assert!(claimed.contains("claimed a lock"), "{claimed}");
+    }
+
+    /// A linked worktree plus the fake `devmap` that records its argument vector
+    /// one per line, so a test reads what the detached build was really given.
+    #[cfg(unix)]
+    struct Detached {
+        parent: PathBuf,
+        main: PathBuf,
+        lane: PathBuf,
+        fake: PathBuf,
+        record: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Detached {
+        fn new(tag: &str, main_has_store: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = scratch(tag);
+            fs::create_dir_all(&parent).unwrap();
+            let parent = parent.canonicalize().unwrap();
+            let main = parent.join("main");
+            let gitdir = main.join(".git/worktrees/lane");
+            fs::create_dir_all(&gitdir).unwrap();
+            if main_has_store {
+                fs::create_dir_all(main.join(".devcouncil/codeintel")).unwrap();
+                fs::write(main.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+            }
+            fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            let lane = parent.join("lane");
+            fs::create_dir_all(lane.join(".devcouncil/codeintel")).unwrap();
+            fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", lane.join(".git").display()),
+            )
+            .unwrap();
+            fs::write(lane.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+            let record = parent.join("argv");
+            let fake = parent.join("fake-devmap");
+            fs::write(
+                &fake,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{r}.tmp' && mv '{r}.tmp' '{r}'\n",
+                    r = record.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                parent,
+                main: main.canonicalize().unwrap(),
+                lane: lane.canonicalize().unwrap(),
+                fake,
+                record,
+            }
+        }
+
+        fn argv(&self) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if let Ok(text) = fs::read_to_string(&self.record) {
+                    return text.lines().map(str::to_owned).collect();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the detached devmap never recorded its arguments");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Detached {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    /// The seeded start is the whole point of the opt-in: a worktree whose main
+    /// checkout is indexed is built with `--seed-from <main>`, and the notice
+    /// says so.
+    #[cfg(unix)]
+    #[test]
+    fn an_opted_in_worktree_build_is_seeded_from_its_main_checkout() {
+        let fx = Detached::new("seeded-argv", true);
+        let notice = unindexed_worktree_notice(&json!({ "cwd": &fx.lane }), &fx.fake)
+            .expect("an unindexed linked worktree is named");
+        let text = notice
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext");
+        assert!(text.contains("--seed-from"), "{text:?}");
+        assert!(text.contains("cannot be trusted"), "{text:?}");
+        assert_eq!(
+            fx.argv(),
+            vec![
+                "--root".to_string(),
+                fx.lane.display().to_string(),
+                "build".to_string(),
+                "--seed-from".to_string(),
+                fx.main.display().to_string(),
+            ]
+        );
+    }
+
+    /// Every other detached build (the PostToolUse rebuild of an indexed tree)
+    /// stays a plain `build`.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_detached_build_is_not_seeded() {
+        let fx = Detached::new("plain-argv", true);
+        detach_build(&fx.fake, &fx.lane).expect("detach");
+        assert_eq!(
+            fx.argv(),
+            vec![
+                "--root".to_string(),
+                fx.lane.display().to_string(),
+                "build".to_string()
+            ]
+        );
+        assert_eq!(build_args(&fx.lane, None).len(), 3);
+    }
+
+    /// Not opted in (the main checkout has no store): nothing is started.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_of_an_unindexed_main_starts_no_build() {
+        let fx = Detached::new("unindexed-main", false);
+        let notice = unindexed_worktree_notice(&json!({ "cwd": &fx.lane }), &fx.fake)
+            .expect("an unindexed linked worktree is named");
+        let text = notice
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext");
+        assert!(!text.contains("--seed-from"), "{text:?}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!fx.record.exists(), "a build was started without an opt-in");
     }
 }

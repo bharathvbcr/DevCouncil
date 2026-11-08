@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devcouncil.local/schemas/stacked_store.schema.json",
+  "title": "DevMap StackedStore Base Manifest & Worktree Lease",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/BaseManifest" },
+    { "$ref": "#/$defs/StackLease" }
+  ],
+  "$defs": {
+    "BaseManifest": {
+      "type": "object",
+      "required": ["format_version", "generation_id", "schema_version", "source_repo_root", "created_at_unix_ms", "base_sqlite_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "format_version": { "const": 1 },
+        "generation_id": { "type": "integer", "minimum": 1 },
+        "schema_version": { "type": "integer", "const": 29 },
+        "source_repo_root": { "type": "string", "minLength": 1 },
+        "created_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "base_sqlite_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "has_csr": { "type": "boolean" }
+      }
+    },
+    "StackLease": {
+      "type": "object",
+      "required": ["format_version", "generation_id", "base_dir", "worktree_root", "leased_at_unix_ms", "rebases_after_dirty_files", "rebases_after_delta_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "format_version": { "const": 1 },
+        "generation_id": { "type": "integer", "minimum": 1 },
+        "base_dir": { "type": "string", "minLength": 1 },
+        "worktree_root": { "type": "string", "minLength": 1 },
+        "leased_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "rebases_after_dirty_files": { "type": "integer", "const": 250 },
+        "rebases_after_delta_bytes": { "type": "integer", "const": 16777216 }
+      }
+    }
+  }
+}

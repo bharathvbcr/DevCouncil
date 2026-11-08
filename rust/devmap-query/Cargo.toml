@@ -40,6 +40,9 @@ devmap-analyze = { path = "../devmap-analyze", default-features = false }
 devmap-store = { path = "../devmap-store", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+# Streaming sha256 of the base snapshot. Already a workspace dependency
+# (`rust/Cargo.toml`); replaces the hand-rolled implementation that lived here.
+sha2.workspace = true
 anyhow.workspace = true
 regex.workspace = true
 # For `O_NONBLOCK` on the memo read: opening a fifo without it blocks in

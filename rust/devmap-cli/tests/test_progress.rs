@@ -1660,7 +1660,14 @@ fn repair_combinations_and_fts_each_emit_one_complete_json_receipt() {
         vec!["--schema"],
         vec!["--fts", "--pending", "--page-size"],
     ] {
+        // Repair proves the store belongs to this invocation's repository
+        // before it writes, including when `--db` names the file. The build
+        // above bound the store to `root`, so the repair has to name that
+        // same tree. The process cwd is this checkout, which is a different
+        // live worktree.
         let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .args(["--root"])
+            .arg(&root)
             .args(["repair", "--json", "--db"])
             .arg(&db)
             .args(&flags)

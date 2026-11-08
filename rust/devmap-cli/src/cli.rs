@@ -97,7 +97,11 @@ pub(crate) struct Cli {
     /// parses as `devmap --db X status` and fails as `devmap status --db X` is a
     /// papercut every caller hits once, and the generated agent guide hit it in
     /// writing: it told agents to run `devmap dead --json`, which did not parse.
-    #[arg(short, long, global = true)]
+    /// Anchored at parse, the same way `--root` is. A relative store then names
+    /// one absolute file for every command and for every tool that command
+    /// starts in another directory. An absolute path is only cleaned of `.`
+    /// and `..`; symlinks stay as spelled.
+    #[arg(short, long, global = true, value_parser = root_parser())]
     pub(crate) db: Option<PathBuf>,
 
     /// The repository this invocation is about, when the working directory is
@@ -148,6 +152,7 @@ impl Cli {
         }
         match &self.command {
             Commands::Build(commands::build::Args { path, .. })
+            | Commands::Seed(commands::seed::Args { path, .. })
             | Commands::Manifest(commands::manifest::Args { path, .. })
             | Commands::MapHtml(commands::map_html::Args { path, .. })
             | Commands::Freshness(commands::freshness::Args { path, .. })
@@ -180,12 +185,13 @@ impl Cli {
 
     /// The store this invocation reads and writes.
     ///
-    /// An explicit `--db` is used as given — the Python seam passes one on
-    /// every call, so DevCouncil's behaviour cannot change here. Otherwise the
-    /// store is resolved against [`Self::root_hint`], which is what makes
-    /// `devmap build /other/repo` index into *that* repository instead of
-    /// creating a state directory under whatever the shell's working directory
-    /// happened to be.
+    /// An explicit `--db` was anchored when the flag was parsed. An absolute
+    /// path the caller passed, which is what the Python seam passes, stays
+    /// that path apart from a lexical clean. When the flag is omitted the
+    /// store is resolved against [`Self::root_hint`] and keeps that root's
+    /// spelling, which is what makes `devmap build /other/repo` index into
+    /// *that* repository instead of creating a state directory under whatever
+    /// the shell's working directory happened to be.
     pub(crate) fn db(&self) -> PathBuf {
         match &self.db {
             Some(explicit) => explicit.clone(),
@@ -379,6 +385,8 @@ impl From<ResolveLimitFlags> for devmap_resolve::ResolutionLimits {
 pub(crate) enum Commands {
     /// Cold or incremental build of the code-intelligence graph
     Build(commands::build::Args),
+    /// Seed or stack a linked worktree's index from a registered checkout
+    Seed(commands::seed::Args),
     Search(commands::search::Args),
     /// Plain-language find over names, docstrings, and the call graph.
     ///
@@ -954,6 +962,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         }
         // No numeric query arguments reach the engine from these.
         Commands::Build(_)
+        | Commands::Seed(_)
         | Commands::Status(_)
         | Commands::Doctor
         | Commands::SessionReport(_)
