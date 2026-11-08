@@ -6,7 +6,7 @@
 //! - `devmap seed [--from <checkout>] [--stacked] [--sync-delta] [--gc-bases] [path]`:
 //!   sub-15ms CoW/WAL-healing standalone seeding from any registered checkout of
 //!   the same repository, or zero-copy stacked delta provisioning (`stack_lease.json`
-//!   + `delta.sqlite` over the lane's own clone of a base published to
+//!   and `delta.sqlite` over the lane's own clone of a base published to
 //!   `.git/devmap/bases/<gen>-<head12>-<src8>/`).
 
 use std::path::{Path, PathBuf};

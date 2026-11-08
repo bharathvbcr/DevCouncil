@@ -4125,7 +4125,7 @@ mod tests {
         seed_indexed_git_repo(&anchor);
         let lane = add_lane(&anchor, &root, "lane");
         let other = other_repo_with(&root, "other", "src/other_only.rs", "pub fn only_in_other() {}\n");
-        let _ = fs::remove_file(csr_path_for_store(&store_path(&anchor)));
+        let _ = fs::remove_file(csr_path_for_store(store_path(&anchor)));
         let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
         assert!(lease.csr.is_none(), "fixture: a donor without a CSR sidecar");
         let entry = published_dir(&anchor, &lease);
