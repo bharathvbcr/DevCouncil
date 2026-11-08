@@ -4612,4 +4612,550 @@ mod tests {
         StackedStore::open(&lane).expect("the lane reads again after the sync");
         let _ = remove_readonly_tree(&root);
     }
+
+    // ===================== attack round 3 =====================
+
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_lane(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_repo_dir(tag);
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        (root, anchor, lane)
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_sync(lane: &Path) {
+        let mut s = StackedStore::open(lane).unwrap();
+        s.sync_worktree().unwrap();
+    }
+
+    /// A delta db plus a hot journal copied while a spilling transaction was
+    /// open (a writer killed mid-commit), written to `dir/{delta.sqlite,delta.sqlite-journal}`.
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_hot_delta(dir: &Path, tag: &str, committed_rows: usize) -> (PathBuf, PathBuf) {
+        let src = dir.join(format!("src-{tag}"));
+        fs::create_dir_all(&src).unwrap();
+        {
+            let w = DeltaStore::open(src.join("delta.sqlite")).unwrap();
+            for i in 0..committed_rows {
+                w.tombstone_file(&format!("src/{tag}_{i}.rs"), "CAS_TOMBSTONE", 1).unwrap();
+            }
+        }
+        let mut conn = rusqlite::Connection::open(src.join("delta.sqlite")).unwrap();
+        conn.execute_batch("PRAGMA cache_size = 1;").unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        for i in 0..400 {
+            tx.execute(
+                "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
+                 VALUES (?1, 'x', 1, ?2, 1)",
+                rusqlite::params![format!("src/spill_{tag}_{i}.rs"), "y".repeat(2000)],
+            )
+            .unwrap();
+        }
+        let db = dir.join(format!("{tag}.sqlite"));
+        let jr = dir.join(format!("{tag}.sqlite-journal"));
+        fs::copy(src.join("delta.sqlite"), &db).unwrap();
+        fs::copy(src.join("delta.sqlite-journal"), &jr).unwrap();
+        drop(tx);
+        drop(conn);
+        (db, jr)
+    }
+
+    /// Dirty-file count a lane reports, or the refusal.
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_dirty(lane: &Path) -> Result<usize, String> {
+        StackedStore::open(lane)
+            .and_then(|s| s.status())
+            .map(|st| st.dirty_files)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// A committed rename: `git diff --name-only` (rename detection on) lists
+    /// only the new path, so the old path never reaches the delta and the base
+    /// keeps serving the deleted file's symbols.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_committed_rename_does_not_leave_the_old_path_in_the_answer() {
+        let (root, _anchor, lane) = a3_lane("a3-rename");
+        run_git_ok(&lane, &["mv", "src/svc.go", "src/svc2.go"]);
+        run_git_ok(&lane, &["commit", "-m", "rename"]);
+        a3_sync(&lane);
+        let s = StackedStore::open(&lane).unwrap();
+        assert!(!symbol_names(&s, "src/svc2.go").is_empty(), "the new path is indexed");
+        let old = symbol_names(&s, "src/svc.go");
+        assert!(old.is_empty(), "src/svc.go no longer exists but the answer still lists {old:?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A second edit of a path the delta already holds is not reported as
+    /// unsynced, and the delta serves the first edit's symbols.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_second_edit_of_a_synced_path_is_reported_as_unsynced() {
+        let (root, _anchor, lane) = a3_lane("a3-second-edit");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc EditedOne() {}\n").unwrap();
+        a3_sync(&lane);
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc EditedTwo() {}\n").unwrap();
+        let s = StackedStore::open(&lane).unwrap();
+        let names = symbol_names(&s, "src/svc.go");
+        let unsynced = s.unsynced_paths().unwrap();
+        assert!(
+            names.contains(&"EditedTwo".to_string()) || unsynced.contains("src/svc.go"),
+            "serves {names:?} for a file whose content is EditedTwo, and unsynced_paths={unsynced:?} is silent"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A revert after a sync (git checkout) leaves the delta serving the edit.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_revert_after_a_sync_is_reported_or_answered() {
+        let (root, _anchor, lane) = a3_lane("a3-revert");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc EditedOne() {}\n").unwrap();
+        a3_sync(&lane);
+        run_git_ok(&lane, &["checkout", "--", "src/svc.go"]);
+        let s = StackedStore::open(&lane).unwrap();
+        let names = symbol_names(&s, "src/svc.go");
+        let unsynced = s.unsynced_paths().unwrap();
+        assert!(
+            !names.contains(&"EditedOne".to_string()) || unsynced.contains("src/svc.go"),
+            "serves the reverted edit {names:?}; unsynced_paths={unsynced:?} is silent"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A hot journal that belongs to a different database: the recovery the
+    /// refusal prints replays foreign pages into this lane's delta.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_journal_for_a_different_db_is_not_replayed_into_the_lanes_delta() {
+        let (root, _anchor, lane) = a3_lane("a3-foreign-journal");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        a3_sync(&lane);
+        let wt = lane.canonicalize().unwrap();
+        let before = a3_dirty(&lane).unwrap();
+        let (_foreign_db, foreign_journal) = a3_hot_delta(&root, "foreign", 7);
+        fs::copy(&foreign_journal, stack_delta_path(&wt).with_file_name("delta.sqlite-journal")).unwrap();
+        let read = a3_dirty(&lane);
+        eprintln!("a3 foreign journal: read before recovery -> {read:?}");
+        let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| o.is_some()).map_err(|e| format!("{e:#}"));
+        eprintln!("a3 foreign journal: recovery -> {recovered:?}");
+        let after = a3_dirty(&lane);
+        eprintln!("a3 foreign journal: before={before} after={after:?}");
+        assert!(after == Ok(before) || after.is_err(), "the lane's delta was replaced by a foreign db's rows: {after:?} (was {before})");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A truncated hot journal, at several cut points.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_truncated_hot_journal_is_refused_or_recovers_to_the_committed_state() {
+        for cut in [1u64, 12, 28, 512, 4096, u64::MAX] {
+            let (root, _anchor, lane) = a3_lane(&format!("a3-trunc-{}", cut.min(99999)));
+            fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+            a3_sync(&lane);
+            let wt = lane.canonicalize().unwrap();
+            let delta = stack_delta_path(&wt);
+            let (db, jr) = a3_hot_delta(&root, "hot", 1);
+            fs::copy(&db, &delta).unwrap();
+            let len = fs::metadata(&jr).unwrap().len();
+            let keep = if cut == u64::MAX { len / 2 } else { cut.min(len) };
+            let bytes = fs::read(&jr).unwrap();
+            fs::write(delta.with_file_name("delta.sqlite-journal"), &bytes[..keep as usize]).unwrap();
+            let read = a3_dirty(&lane);
+            let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| o.is_some()).map_err(|e| format!("{e:#}"));
+            let after = a3_dirty(&lane);
+            eprintln!("a3 truncated cut={cut} keep={keep}/{len}: read={read:?} recovery={recovered:?} after={after:?}");
+            // the committed delta had exactly the rows a3_hot_delta wrote (1)
+            assert!(read.is_err() || read == Ok(1), "cut {cut}: read answered {read:?}");
+            assert!(after == Ok(1), "cut {cut}: after recovery the lane reports {after:?}, not the committed 1");
+            let _ = remove_readonly_tree(&root);
+        }
+    }
+
+    /// A journal that is a symlink to a hot journal elsewhere.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_symlinked_journal_is_neither_followed_nor_modified() {
+        let (root, _anchor, lane) = a3_lane("a3-symlink-journal");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        a3_sync(&lane);
+        let wt = lane.canonicalize().unwrap();
+        let before = a3_dirty(&lane).unwrap();
+        let (_db, foreign) = a3_hot_delta(&root, "outside", 5);
+        let outside = root.join("outside-journal");
+        fs::copy(&foreign, &outside).unwrap();
+        let outside_bytes = fs::read(&outside).unwrap();
+        let link = stack_delta_path(&wt).with_file_name("delta.sqlite-journal");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let read = a3_dirty(&lane);
+        let recovered = StackedStore::open_if_leased_for_sync(&lane).map(|o| o.is_some()).map_err(|e| format!("{e:#}"));
+        let after = a3_dirty(&lane);
+        eprintln!("a3 symlink journal: read={read:?} recovery={recovered:?} after={after:?} before={before}");
+        assert_eq!(fs::read(&outside).ok(), Some(outside_bytes), "the file outside the lane was modified or removed");
+        assert!(after == Ok(before) || after.is_err(), "foreign journal replayed through a symlink: {after:?} (was {before})");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `retire_stack` (the sync's stale-lease retirement and a materialize)
+    /// discards the delta but leaves its `-journal`.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_retiring_a_lane_leaves_no_journal_behind() {
+        let (root, _anchor, lane) = a3_lane("a3-orphan-journal");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        a3_sync(&lane);
+        let wt = lane.canonicalize().unwrap();
+        let delta = stack_delta_path(&wt);
+        let journal = delta.with_file_name("delta.sqlite-journal");
+        fs::write(&journal, b"\x01").unwrap();
+        retire_stack(&wt).unwrap();
+        assert!(!delta.exists());
+        assert!(!journal.exists(), "an orphan delta.sqlite-journal survives retire_stack (hygiene only: a3_an_orphan_journal_is_not_replayed_into_a_recreated_delta shows SQLite discards it)");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_store_beside_lease() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (root, _anchor, lane) = a3_lane("a3-recover-store");
+        let wt = lane.canonicalize().unwrap();
+        let lease_bytes = fs::read(stack_lease_path(&wt)).unwrap();
+        let base_dir = StackLease::read_from(&stack_lease_path(&wt)).unwrap().base_dir();
+        let stacked = StackedStore::open(&lane).unwrap();
+        let store = stacked.materialize_seeded_store().unwrap();
+        drop(stacked);
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::write(stack_lease_path(&wt), &lease_bytes).unwrap();
+        (root, wt, lane, store)
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_run_sync_delta(wt: &Path) -> (Option<i32>, String) {
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/devmap");
+        assert!(bin.is_file(), "build the devmap binary first: {}", bin.display());
+        let out = Command::new(&bin).arg("--root").arg(wt).args(["seed", "--sync-delta"]).output().unwrap();
+        (
+            out.status.code(),
+            format!("{} / {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+        )
+    }
+
+    /// The recovery a read prints for "a store beside a stale lease" must
+    /// retire the lease and exit 0.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_the_printed_recovery_for_a_store_beside_a_lease_recovers() {
+        let (root, wt, lane, _store) = a3_store_beside_lease();
+        let read_err = format!("{:#}", StackedStore::open_if_leased(&lane).err().expect("a read refuses"));
+        assert!(read_err.contains("devmap seed --sync-delta"));
+        let (code, msg) = a3_run_sync_delta(&wt);
+        eprintln!("a3 sync-delta unlocked: status={code:?} lease_gone={} msg={msg}", !stack_lease_path(&wt).exists());
+        assert!(!stack_lease_path(&wt).exists(), "the lease was not retired: {msg}");
+        assert_eq!(code, Some(0), "the recovery the refusal names exits {code:?}: {msg}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// While another writer holds the lane's writer lock the lease cannot be
+    /// retired; the command must say so, not claim there is no lease.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_the_recovery_does_not_claim_there_is_no_lease_while_it_is_locked_out() {
+        let (root, wt, _lane, store) = a3_store_beside_lease();
+        let held = Store::lock_writer_at(&store, std::time::Duration::from_secs(1)).unwrap();
+        let (code, msg) = a3_run_sync_delta(&wt);
+        let lease_still = stack_lease_path(&wt).is_file();
+        drop(held);
+        eprintln!("a3 sync-delta while locked: status={code:?} lease_still={lease_still} msg={msg}");
+        assert!(
+            !(lease_still && msg.contains("no stack lease")),
+            "told 'no stack lease ... nothing to sync' while the lease is still there: {msg}"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A journal that is a symlink: the read refuses naming `devmap seed
+    /// --sync-delta`; that command must then recover the lane.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_symlinked_journal_is_recoverable_by_the_printed_command() {
+        let (root, _anchor, lane) = a3_lane("a3-symlink-recover");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        a3_sync(&lane);
+        let wt = lane.canonicalize().unwrap();
+        let (_db, foreign) = a3_hot_delta(&root, "outside", 5);
+        let outside = root.join("outside-journal");
+        fs::copy(&foreign, &outside).unwrap();
+        let link = stack_delta_path(&wt).with_file_name("delta.sqlite-journal");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let read = a3_dirty(&lane).expect_err("a hot journal refuses reads");
+        assert!(read.contains("devmap seed --sync-delta"), "{read}");
+        let (code, msg) = a3_run_sync_delta(&wt);
+        let after = a3_dirty(&lane);
+        eprintln!("a3 symlink recovery: status={code:?} after={after:?} msg={msg}");
+        assert_eq!(code, Some(0), "the printed recovery failed: {msg}");
+        assert!(after.is_ok(), "the lane is still stranded after the printed recovery: {after:?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `seed --sync-delta` in a child process (rollback-journal commits) while
+    /// this process opens the lane in a loop, as the hook and MCP do.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_sync_delta_racing_a_reader_never_refuses_or_serves_a_torn_delta() {
+        let (root, _anchor, lane) = a3_lane("a3-race");
+        let wt = lane.canonicalize().unwrap();
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/devmap");
+        assert!(bin.is_file(), "build the devmap binary first");
+        for i in 0..4 {
+            fs::write(wt.join(format!("src/extra{i}.go")), format!("package svc\n\nfunc Extra{i}() {{}}\n")).unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (stop, wt, bin) = (Arc::clone(&stop), wt.clone(), bin.clone());
+            std::thread::spawn(move || {
+                let mut fails = Vec::new();
+                for round in 0..12 {
+                    fs::write(wt.join("src/svc.go"), format!("package svc\n\nfunc Round{round}() {{}}\n")).unwrap();
+                    let out = Command::new(&bin).arg("--root").arg(&wt).args(["seed", "--sync-delta"]).output().unwrap();
+                    if !out.status.success() {
+                        fails.push(String::from_utf8_lossy(&out.stderr).into_owned());
+                    }
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                fails
+            })
+        };
+        let mut errs: Vec<String> = Vec::new();
+        let mut reads = 0u32;
+        let mut worst = std::time::Duration::ZERO;
+        let mut last_dirty = 0usize;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let t = std::time::Instant::now();
+            match StackedStore::open(&lane) {
+                Ok(s) => {
+                    last_dirty = s.status().map(|x| x.dirty_files).unwrap_or(usize::MAX);
+                }
+                Err(e) => errs.push(format!("{e:#}")),
+            }
+            worst = worst.max(t.elapsed());
+            reads += 1;
+        }
+        let fails = writer.join().unwrap();
+        eprintln!("a3 race: reads={reads} errors={} writer_failures={} worst={worst:?} last_dirty={last_dirty}", errs.len(), fails.len());
+        assert!(fails.is_empty(), "sync-delta failed: {fails:?}");
+        assert!(errs.is_empty(), "a reader beside a live sync-delta was refused: {:?}", errs.first());
+        assert_eq!(a3_dirty(&lane), Ok(5));
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// FIX-3 area: a WAL-mode delta from an older build, with `-wal`/`-shm`
+    /// leftovers, in a writable and a read-only state directory. A read may
+    /// refuse; it may never answer with fewer rows than were committed.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_wal_leftovers_never_read_as_fewer_rows_than_were_committed() {
+        for (keep_shm, keep_wal, ro) in [
+            (true, true, true), (false, true, true), (true, true, false), (false, true, false),
+            (true, false, true), (true, false, false),
+        ] {
+            let (root, _anchor, lane) = a3_lane(&format!("a3-wal-{keep_shm}-{keep_wal}-{ro}"));
+            let wt = lane.canonicalize().unwrap();
+            let delta = stack_delta_path(&wt);
+            // an older build's WAL delta: 3 committed rows, all still in the -wal
+            let src = root.join("walsrc");
+            fs::create_dir_all(&src).unwrap();
+            {
+                drop(DeltaStore::open(src.join("delta.sqlite")).unwrap());
+            }
+            let conn = rusqlite::Connection::open(src.join("delta.sqlite")).unwrap();
+            let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+            conn.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms) VALUES (?1, 'x', 1, NULL, 1)",
+                    rusqlite::params![format!("src/w{i}.rs")],
+                ).unwrap();
+            }
+            let _ = fs::remove_file(&delta);
+            fs::copy(src.join("delta.sqlite"), &delta).unwrap();
+            if keep_wal { fs::copy(src.join("delta.sqlite-wal"), sidecar_for_test(&delta, "-wal")).unwrap(); }
+            if keep_shm { fs::copy(src.join("delta.sqlite-shm"), sidecar_for_test(&delta, "-shm")).unwrap(); }
+            drop(conn);
+            let cdir = delta.parent().unwrap().to_path_buf();
+            if ro { set_dir_mode(&cdir, 0o555).unwrap(); }
+            let got = a3_dirty(&lane);
+            if ro { set_dir_mode(&cdir, 0o755).unwrap(); }
+            eprintln!("a3 wal leftovers shm={keep_shm} wal={keep_wal} ro={ro}: {got:?}");
+            if let Ok(n) = got {
+                assert!(keep_wal || n == 0 || n == 3, "unexpected");
+                assert!(!keep_wal || n == 3, "shm={keep_shm} wal={keep_wal} ro={ro}: answered {n} dirty files; 3 were committed");
+            }
+            let _ = remove_readonly_tree(&root);
+        }
+    }
+
+    /// The fd a store is bound to is recycled by other opens: the store still
+    /// reads the lane's own base.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_fd_reuse_after_open_lane_base_store_does_not_redirect_the_store() {
+        let (root, _anchor, lane) = a3_lane("a3-fd");
+        let wt = lane.canonicalize().unwrap();
+        let lease = StackLease::read_from(&stack_lease_path(&wt)).unwrap();
+        let store = open_lane_base_store(&lease.base_sqlite_path()).unwrap();
+        let head = store.latest_generation_head_sha().unwrap();
+        let other = other_repo_with(&root, "other", "src/other_only.rs", "pub fn only_in_other() {}\n");
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            held.push(fs::File::open(store_path(&other)).unwrap());
+            held.push(fs::File::open(store_path(&other)).unwrap());
+            drop(held.pop());
+        }
+        assert_eq!(store.latest_generation_head_sha().unwrap(), head);
+        assert!(store.latest_path_is_indexed("src/svc.go").unwrap());
+        assert!(!store.latest_path_is_indexed("src/other_only.rs").unwrap());
+        drop(held);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// The reuse path trusts a cache entry whose manifest and bytes agree with
+    /// each other: a donor rebuilt with different content at the same
+    /// generation id and HEAD is not re-published, so a new lane gets the old graph.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_rebuilt_donor_with_other_content_at_the_same_key_is_not_served_from_the_old_entry() {
+        let root = temp_repo_dir("a3-rebuilt");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane1 = add_lane(&anchor, &root, "lane-1");
+        let lane2 = add_lane(&anchor, &root, "lane-2");
+        provision_stacked_worktree(&anchor, &lane1).unwrap();
+        // The donor rebuilds: same HEAD, same generation id, a graph that omits svc.go.
+        let db = store_path(&anchor);
+        discard_staged(&db);
+        let _ = fs::remove_file(csr_path_for_store(&db));
+        index_tree(&anchor, &["src/routes.ts", "src/limits.rs"]);
+        match provision_stacked_worktree(&anchor, &lane2) {
+            Err(e) => eprintln!("a3 rebuilt donor: provision refused: {e:#}"),
+            Ok(_) => {
+                let s = StackedStore::open(&lane2).unwrap();
+                let stale = symbol_names(&s, "src/svc.go");
+                assert!(stale.is_empty(), "lane-2 serves the previous build's graph for src/svc.go: {stale:?}");
+            }
+        }
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// An exclusive writer on the delta makes the read-only open fail with
+    /// "database is locked"; the refusal must say that, not blame a WAL delta.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_locked_delta_is_not_blamed_on_a_wal_mode_delta() {
+        let (root, _anchor, lane) = a3_lane("a3-busy");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        a3_sync(&lane);
+        let wt = lane.canonicalize().unwrap();
+        let conn = rusqlite::Connection::open(stack_delta_path(&wt)).unwrap();
+        let _: String = conn.query_row("PRAGMA locking_mode=EXCLUSIVE", [], |r| r.get(0)).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let err = a3_dirty(&lane).expect_err("an exclusive writer blocks the read");
+        conn.execute_batch("ROLLBACK;").unwrap();
+        eprintln!("a3 busy: {err}");
+        assert!(!err.contains("WAL-mode delta"), "wrong cause named for a locked delta: {err}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Index `rels` as a new generation exactly as `index_tree` does, but leave
+    /// the CSR sidecar on disk as it was (a build that does not rewrite it).
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_index_tree_keeping_old_csr(anchor: &Path, rels: &[&str]) {
+        let store = Store::open(&store_path(anchor)).unwrap();
+        let exts: Vec<_> = rels
+            .iter()
+            .map(|rel| devmap_extract::extract_file(rel, &fs::read_to_string(anchor.join(rel)).unwrap()))
+            .collect();
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&exts);
+        let res = resolver.resolve_all(&exts).unwrap();
+        let analysis = devmap_analyze::analyze(&exts, &res);
+        store
+            .save_generation_with_metadata(&exts, &res, &analysis, devmap_store::GenerationWriteOpts::default(), &git_head(anchor))
+            .unwrap();
+    }
+
+    /// The lane's CSR sidecar must be the graph of the generation the lease
+    /// records. A donor whose sidecar is left over from an older generation is
+    /// admitted with it, and the lease records the sidecar's own sha.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_csr_sidecar_from_another_generation_is_not_served_with_the_base() {
+        let root = temp_repo_dir("a3-csr-gen");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        fs::write(anchor.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+        run_git_ok(&anchor, &["add", "src"]);
+        run_git_ok(&anchor, &["commit", "-m", "second"]);
+        a3_index_tree_keeping_old_csr(&anchor, &["src/svc.go", "src/routes.ts", "src/limits.rs", "src/extra.rs"]);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = match provision_stacked_worktree(&anchor, &lane) {
+            Ok(lease) => lease,
+            Err(e) => {
+                eprintln!("a3 csr gen: provision refused: {e:#}");
+                let _ = remove_readonly_tree(&root);
+                return;
+            }
+        };
+        let s = StackedStore::open(&lane).unwrap();
+        let csr_gen = s.csr_reader().map(|r| r.map(|r| r.generation()));
+        eprintln!("a3 csr gen: lease generation {} csr {csr_gen:?}", lease.generation_id);
+        match csr_gen {
+            Ok(Some(g)) => assert_eq!(g, u64::from(lease.generation_id), "the CSR sidecar is generation {g}, the base and lease are generation {}", lease.generation_id),
+            Ok(None) => panic!("fixture: the donor had a CSR sidecar, the lane has none"),
+            Err(e) => panic!("csr_reader refused: {e:#}"),
+        }
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// The other printed recovery, `devmap seed --stacked --from <donor>`,
+    /// replaces only the lease and `stack/`; a symlinked journal beside the
+    /// delta survives it.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_a_symlinked_journal_is_recoverable_by_reprovisioning() {
+        let (root, anchor, lane) = a3_lane("a3-symlink-reprov");
+        fs::write(lane.join("src/svc.go"), "package svc\n\nfunc Edited() {}\n").unwrap();
+        a3_sync(&lane);
+        let wt = lane.canonicalize().unwrap();
+        let (_db, foreign) = a3_hot_delta(&root, "outside", 5);
+        let outside = root.join("outside-journal");
+        fs::copy(&foreign, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, stack_delta_path(&wt).with_file_name("delta.sqlite-journal")).unwrap();
+        provision_stacked_worktree(&anchor, &lane).expect("re-provision succeeds");
+        let after = a3_dirty(&lane);
+        eprintln!("a3 symlink reprovision: after={after:?}");
+        assert!(after.is_ok(), "re-provisioning (the second printed recovery) does not recover the lane: {after:?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// An orphan `-journal` (left by `retire_stack`) beside a delta that is
+    /// then recreated: is it replayed into the new delta?
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_an_orphan_journal_is_not_replayed_into_a_recreated_delta() {
+        let root = temp_repo_dir("a3-orphan-replay");
+        let (_db, foreign) = a3_hot_delta(&root, "old", 3);
+        let dir = root.join("lane-state");
+        fs::create_dir_all(&dir).unwrap();
+        fs::copy(&foreign, dir.join("delta.sqlite-journal")).unwrap();
+        let d = DeltaStore::open(dir.join("delta.sqlite")).unwrap();
+        d.tombstone_file("src/new_a.rs", "CAS_TOMBSTONE", 1).unwrap();
+        d.tombstone_file("src/new_b.rs", "CAS_TOMBSTONE", 1).unwrap();
+        assert_eq!(d.dirty_file_count().unwrap(), 2);
+        drop(d);
+        let r = DeltaStore::open_read_only(dir.join("delta.sqlite")).unwrap().expect("exists");
+        assert_eq!(r.dirty_file_count().unwrap(), 2, "an orphan journal altered the recreated delta");
+        let _ = remove_readonly_tree(&root);
+    }
 }
