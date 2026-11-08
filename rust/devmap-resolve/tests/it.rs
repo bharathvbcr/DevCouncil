@@ -18,6 +18,8 @@
 #[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
+mod a_kotlin_property_is_not_a_call_target;
+#[cfg(feature = "parse")]
 mod a_literal_constant_is_not_a_call_target;
 #[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;

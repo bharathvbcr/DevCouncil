@@ -39,6 +39,15 @@
 //! line by a declaration: `class A { .. } class B { .. }` wants one between the
 //! two classes, and the grammar reads the pair as an error until it has it.
 //!
+//! Both modes also repair a second shape: a `;` that sits between a property and
+//! its accessor on one line, `var m: Double? = null; private set`. The grammar
+//! reads the `;` as ending the property, finds a stray `set`, and makes the
+//! whole file an ERROR. The same text with a space for the `;` (or the accessor
+//! on the next line) parses cleanly, so the rewrite writes a **space over that
+//! `;`**: same length, same offsets. The `;` is found as a token of the failed
+//! tree (outside strings and comments) that is followed on its line by an
+//! optional visibility word and `get` or `set`.
+//!
 //! The result is accepted **only if the re-parse is fully clean**. Anything
 //! else, including a deadline, leaves the file exactly as it was: `Partial`.
 //!
@@ -117,6 +126,9 @@ pub(crate) enum Repair {
         tree: Tree,
         ranges: Vec<TextRange>,
         edits: usize,
+        /// How many of `edits` are a `;` before a property accessor, written
+        /// over with a space rather than the other way round.
+        accessors: usize,
         /// The second mode was needed: a separator was written between two
         /// declarations that share a line.
         boundaries: bool,
@@ -178,6 +190,7 @@ fn rewrite(
                 tree: current,
                 ranges,
                 edits: edited.len(),
+                accessors: edited.iter().filter(|&&at| source.as_bytes()[at] == b';').count(),
                 boundaries,
             });
         }
@@ -197,10 +210,12 @@ fn rewrite(
             )));
         }
         for at in fresh {
-            text[at] = b';';
+            // A `;` before an accessor becomes a space; any other site is a
+            // space or tab that becomes a `;`.
+            text[at] = if text[at] == b';' { b' ' } else { b';' };
             edited.push(at);
         }
-        // Only an ASCII space or tab was replaced by an ASCII byte.
+        // Only an ASCII space, tab or `;` was replaced by an ASCII byte.
         let Ok(rewritten) = std::str::from_utf8(&text) else {
             return Err(Stop::Final("the rewritten text is not UTF-8".into()));
         };
@@ -274,6 +289,51 @@ fn boundary_after(text: &[u8], at: usize) -> Option<usize> {
     starts_a_declaration.then_some(at + 1)
 }
 
+/// The offset of the one `;` that lies alone, with blanks, between the end of
+/// the node before and the start of the node at `to`.
+fn semicolon_in_gap(text: &[u8], from: usize, to: usize) -> Option<usize> {
+    let gap = text.get(from..to)?;
+    if gap.len() > 64 || !gap.contains(&b';') {
+        return None;
+    }
+    let mut semicolons = gap.iter().enumerate().filter(|(_, b)| **b == b';');
+    let (first, _) = semicolons.next()?;
+    let alone = semicolons.next().is_none()
+        && gap
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b';'));
+    alone.then_some(from + first)
+}
+
+/// Whether the `;` at `at` ends a property on a line that goes on with its
+/// accessor: whitespace, an optional visibility word, then `get` or `set` as a
+/// whole word.
+fn accessor_after(text: &[u8], at: usize) -> bool {
+    let skip = |mut next: usize| {
+        while matches!(text.get(next), Some(b' ' | b'\t')) {
+            next += 1;
+        }
+        next
+    };
+    let word_at = |from: usize| {
+        let rest = text.get(from..).unwrap_or_default();
+        let len = rest
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        (&rest[..len], from + len)
+    };
+    let (mut word, end) = word_at(skip(at + 1));
+    if matches!(word, b"private" | b"internal" | b"protected" | b"public") {
+        let after = skip(end);
+        if after == end {
+            return false;
+        }
+        word = word_at(after).0;
+    }
+    matches!(word, b"get" | b"set")
+}
+
 /// The offsets of the spaces to write `;` over: one directly before each
 /// closing `}` that follows code on its line, in the top-level statements that
 /// hold an error, outside strings and comments.
@@ -320,6 +380,16 @@ fn candidates(
         let kind = node.kind();
         if kind.contains("string") || kind.contains("template") || kind.ends_with("comment") {
             continue;
+        }
+        // The failed tree does not show the `;` itself (the grammar consumes it
+        // as a hidden token), but it shows the gap: a `;` between two nodes with
+        // only blanks around it, ending where an accessor starts.
+        if let Some(end) = code_end {
+            if let Some(at) = semicolon_in_gap(text, end, node.start_byte()) {
+                if accessor_after(text, at) && !done.contains(&at) {
+                    found.push(at);
+                }
+            }
         }
         if !node.is_named() && kind == "}" {
             let at = node.start_byte();
