@@ -189,12 +189,165 @@ fn cfg_test_module(path: &std::path::Path) -> bool {
     false
 }
 
+/// `text` with comments and the insides of string and char literals blanked to
+/// spaces, newlines and length kept, so a brace or a `Command::new(` that only
+/// appears in prose or a literal neither opens a block nor counts as a spawn.
+fn blank_comments_and_literals(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(chars[i]));
+                    i += 1;
+                }
+            }
+        } else if c == 'r' && matches!(next, Some('"' | '#')) && {
+            let mut j = i + 1;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            chars.get(j) == Some(&'"')
+        } {
+            let mut hashes = 0usize;
+            let mut j = i + 1;
+            while chars[j] == '#' {
+                hashes += 1;
+                j += 1;
+            }
+            // Keep the opener, blank the body, keep the closer.
+            out.extend(std::iter::repeat_n(' ', j + 1 - i));
+            i = j + 1;
+            while i < chars.len() {
+                if chars[i] == '"' && (0..hashes).all(|k| chars.get(i + 1 + k) == Some(&'#')) {
+                    out.extend(std::iter::repeat_n(' ', 1 + hashes));
+                    i += 1 + hashes;
+                    break;
+                }
+                out.push(blank(chars[i]));
+                i += 1;
+            }
+        } else if c == '"' {
+            out.push(' ');
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(' ');
+                    i += 1;
+                }
+                out.push(blank(chars[i]));
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '\'' {
+            // A char literal closes within a few chars; a lifetime does not.
+            let close = if next == Some('\\') {
+                (i + 2..(i + 12).min(chars.len())).find(|&j| chars[j] == '\'')
+            } else if chars.get(i + 2) == Some(&'\'') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            match close {
+                Some(end) => {
+                    out.extend(std::iter::repeat_n(' ', end + 1 - i));
+                    i = end + 1;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Zero-based indexes of the lines of `text` that spawn a child in production
+/// code. An inline `#[cfg(test)] mod name { … }` block is test code however
+/// large it is, so its lines are skipped, tracked by brace depth to the close
+/// that matches its opener. Code before and after the block is still scanned.
+fn production_spawn_lines(text: &str) -> Vec<usize> {
+    let scrubbed = blank_comments_and_literals(text);
+    let mut hits = Vec::new();
+    let mut armed = false;
+    let mut depth = 0usize;
+    for (index, line) in scrubbed.lines().enumerate() {
+        let trim = line.trim();
+        if depth > 0 {
+            depth += line.matches('{').count();
+            depth -= line.matches('}').count().min(depth);
+            continue;
+        }
+        let rest = trim.strip_prefix("#[cfg(test)]").map(str::trim);
+        let candidate = match rest {
+            Some("") => {
+                armed = true;
+                continue;
+            }
+            Some(rest) => rest,
+            None if armed && trim.starts_with("#[") => continue,
+            None if armed => trim,
+            None => "",
+        };
+        armed = false;
+        let item = candidate
+            .strip_prefix("pub ")
+            .or_else(|| {
+                candidate
+                    .strip_prefix("pub(")
+                    .and_then(|r| r.split_once(") ").map(|(_, r)| r))
+            })
+            .unwrap_or(candidate);
+        // `mod name;` has a `;` before any `{`; `mod name { … ; … }` does not.
+        let opens_a_body = item
+            .find('{')
+            .is_some_and(|brace| !item[..brace].contains(';'));
+        if item.starts_with("mod ") && opens_a_body {
+            depth = line.matches('{').count().saturating_sub(line.matches('}').count());
+            continue;
+        }
+        if line.contains("Command::new(") {
+            hits.push(index);
+        }
+    }
+    hits
+}
+
 #[test]
 fn an_inline_cfg_test_module_is_exempt_and_production_spawns_are_not() {
     let source = r##"use std::process::Command;
 
 pub fn production() {
-    Command::new("git"); // line 4: flagged
+    Command::new("git"); // flagged
 }
 
 #[cfg(test)]
@@ -219,7 +372,7 @@ mod tests {
 }
 
 pub fn after() {
-    Command::new("git"); // line 31: flagged again, the block has closed
+    Command::new("git"); // flagged again, the block has closed
 }
 
 #[cfg(test)]
@@ -230,7 +383,7 @@ pub(crate) mod odd { fn f() { Command::new("x"); } }
 mod declared_elsewhere;
 
 pub fn last<'a>(_: &'a str) {
-    Command::new("git"); // line 41: a lifetime must not read as a char literal
+    Command::new("git"); // flagged: a lifetime must not read as a char literal
 }
 "##;
     let hits: Vec<usize> = production_spawn_lines(source)
@@ -239,7 +392,7 @@ pub fn last<'a>(_: &'a str) {
         .collect();
     assert_eq!(
         hits,
-        [4, 31, 41],
+        [4, 29, 40],
         "only production spawns are flagged; scrubbed text was:\n{}",
         blank_comments_and_literals(source)
     );
@@ -299,10 +452,14 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
             }
             scanned += 1;
             let text = std::fs::read_to_string(&path).expect("read source");
-            for (index, line) in text.lines().enumerate() {
-                if line.contains("Command::new(") {
-                    offenders.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
-                }
+            let lines: Vec<&str> = text.lines().collect();
+            for index in production_spawn_lines(&text) {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    path.display(),
+                    index + 1,
+                    lines[index].trim()
+                ));
             }
         }
     }
