@@ -1674,6 +1674,51 @@ impl StackedStore {
         ))
     }
 
+    /// Why `dead` over this lane may be missing symbols, or `None` when the
+    /// delta changes nothing (the answer is then the base's own).
+    ///
+    /// `dead_page` filters the base's dead rows against the merged edges, so it
+    /// can only ever drop rows the delta resurrected. It cannot add the two
+    /// kinds the delta creates: a base symbol whose only caller the delta edited
+    /// away or deleted, and a symbol the delta adds with no caller. Listing
+    /// them would take the base's exemption rules (entry points, tests,
+    /// visibility) re-applied over the merged graph, so the answer says it is a
+    /// lower bound instead, naming the delta files that can cause it.
+    pub fn dead_lower_bound_reason(&self) -> Option<String> {
+        if !self.has_delta_changes() {
+            return None;
+        }
+        let mut edited: Vec<String> = self
+            .overlay
+            .modified_files
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let mut deleted: Vec<String> = self
+            .overlay
+            .tombstoned_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        edited.sort();
+        deleted.sort();
+        let name = |files: &[String]| {
+            let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+            format!(
+                "{}{}",
+                shown.join(", "),
+                if files.len() > shown.len() { ", ..." } else { "" }
+            )
+        };
+        Some(format!(
+            "dead symbols over this lane are a lower bound: the stacked delta edits or adds {} file(s) ({}) and deletes {} ({}), so a base symbol whose only caller the delta removed, and a symbol the delta adds with no caller, may be missing from the list; run `devmap build` for a complete answer",
+            edited.len(),
+            name(&edited),
+            deleted.len(),
+            name(&deleted)
+        ))
+    }
+
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
     /// `delta.sqlite` and refresh the `WorktreeOverlay` (`F4`).
     ///
@@ -7062,6 +7107,53 @@ mod tests {
                 .any(|edge| edge.source_symbol.contains("caller_5")),
             "the call after a cancelled merge must hold the full delta: {:?}",
             answer.items
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn dead_over_a_lane_is_a_named_lower_bound_exactly_when_the_delta_changes_something() {
+        let (root, _anchor, lane) = lane_over(
+            "dead-lower-bound",
+            &[
+                ("src/helper.rs", "pub fn helper() -> i32 { 1 }\n"),
+                ("src/user.rs", "pub fn user() -> i32 { helper() }\n"),
+            ],
+        );
+        let clean = StackedStore::open(&lane).unwrap();
+        assert_eq!(clean.dead_lower_bound_reason(), None);
+        let engine = crate::StoreQueryEngine::new(clean.base_store()).with_stacked(Some(&clean));
+        let answer = engine.dead_symbols(4000).unwrap();
+        assert!(
+            answer
+                .walk_incomplete
+                .as_deref()
+                .is_none_or(|r| !r.contains("lower bound")),
+            "a lane with no delta answers as its base: {:?}",
+            answer.walk_incomplete
+        );
+
+        fs::remove_file(lane.join("src/user.rs")).unwrap();
+        fs::write(lane.join("src/fresh.rs"), "pub fn fresh() -> i32 { 3 }\n").unwrap();
+        a3_sync(&lane);
+        let dirty = StackedStore::open(&lane).unwrap();
+        let reason = dirty
+            .dead_lower_bound_reason()
+            .expect("a delta that edits and deletes files is a lower bound");
+        assert!(
+            reason.contains("src/fresh.rs") && reason.contains("src/user.rs"),
+            "the reason names the delta's files: {reason}"
+        );
+        let engine = crate::StoreQueryEngine::new(dirty.base_store()).with_stacked(Some(&dirty));
+        let answer = engine.dead_symbols(4000).unwrap();
+        assert!(
+            answer
+                .walk_incomplete
+                .as_deref()
+                .is_some_and(|r| r.contains("lower bound") && r.contains("src/user.rs")),
+            "{:?}",
+            answer.walk_incomplete
         );
         let _ = remove_readonly_tree(&root);
     }

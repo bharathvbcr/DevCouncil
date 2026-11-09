@@ -2408,6 +2408,12 @@ impl<'a> StoreQueryEngine<'a> {
             response.hidden = response.total.saturating_sub(response.shown);
             response.truncated = response.hidden > 0;
             response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+            // A lane's list is the base's with the delta's resurrections
+            // removed; what the delta killed is not in it, so say so.
+            if let Some(reason) = self.stacked.and_then(|s| s.dead_lower_bound_reason()) {
+                response.walk_incomplete =
+                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(reason));
+            }
             self.note_failed_parses(&mut response)?;
             // The other half of the answer, and until now the half nothing could
             // see. A one-hop inbound-edge join structurally cannot report a
