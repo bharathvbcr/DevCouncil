@@ -25,6 +25,7 @@ mod a_build_names_its_parse_budget_outcome;
 mod a_call_blind_file_names_its_hole;
 mod a_damaged_store_is_reported_and_refused;
 mod a_dead_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
+mod a_legacy_base_store_pointer_is_refused_by_name;
 mod a_manifest_rewrite_keeps_unchanged_blocks;
 mod a_message_literal_has_no_run_of_spaces;
 mod a_named_root_must_be_a_directory;
