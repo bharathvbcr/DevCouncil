@@ -1024,3 +1024,66 @@ fn a_staged_build_that_fails_after_taking_its_lock_leaves_no_staged_file_or_lock
         "staged files left behind after a failed staged build: {leftovers:?}"
     );
 }
+
+fn seed_leftovers(lane: &Path) -> Vec<String> {
+    fs::read_dir(lane.join(".devmap/codeintel"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".seed-"))
+        .collect()
+}
+
+/// A diverged standalone seed writes its manifest while the store is still at
+/// the staged path, and the artifact stamp (`<db>.artifacts.json`) follows the
+/// store it was written beside. It must end up beside the placed store, and
+/// nothing may remain at the staged path.
+#[test]
+fn a_diverged_standalone_seed_places_its_artifact_stamp_beside_the_store() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit(&lane);
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    assert_eq!(
+        seed_leftovers(&lane),
+        Vec::<String>::new(),
+        "a successful seed left staged files behind"
+    );
+    assert!(
+        lane.join(".devmap/codeintel/devmap.sqlite.artifacts.json")
+            .is_file(),
+        "the placed store has no artifact stamp, so the next manifest regenerates"
+    );
+}
+
+/// The failure that follows the stamp: the build and its manifest succeed, then
+/// placement fails (a directory at the lane's `.csr`). The staged stamp has to be
+/// discarded with the rest of the staged set.
+#[test]
+fn a_seed_that_fails_at_placement_discards_the_staged_artifact_stamp() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit(&lane);
+    let ci = lane.join(".devmap/codeintel");
+    fs::create_dir_all(ci.join("devmap.sqlite.csr")).unwrap();
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(
+        !out.status.success(),
+        "placement over a directory must fail the seed"
+    );
+    assert!(
+        !store(&lane).exists(),
+        "a failed seed must not place a store"
+    );
+    assert_eq!(
+        seed_leftovers(&lane),
+        Vec::<String>::new(),
+        "staged files left behind after a failed placement"
+    );
+}
