@@ -1,9 +1,7 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{
-    emit_blast_radius, emit_truncation, emit_unavailable, open_for_read,
-};
+use crate::output::{emit_blast_radius, emit_truncation, emit_unavailable, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Affected")]
