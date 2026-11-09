@@ -97,7 +97,7 @@ pub(super) const AFFECTED_SYMBOL_SAMPLE: usize = 8;
 pub(super) const EXPLORE_DEFINITION_OVERHEAD_TOKENS: u32 = 40;
 
 /// The `file::symbol` identity every traversal surface resolves.
-pub(super) fn node_id_of(file_path: &str, symbol_name: &str) -> String {
+pub(crate) fn node_id_of(file_path: &str, symbol_name: &str) -> String {
     if file_path.is_empty() {
         return symbol_name.to_string();
     }

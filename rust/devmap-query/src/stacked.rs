@@ -27,14 +27,15 @@
 //! under the writer lock and answers `None`; provision refuses a lane that has
 //! a store.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use devmap_extract::model::Extraction;
+use devmap_extract::model::{Extraction, WiringKind};
 use devmap_extract::paths::{
     code_graph_path, compact_code_graph_path, csr_path_for_store, find_legacy_base_store_ref,
     main_checkout_of, registered_common_git_dir, repo_map_path, repo_root_from_store,
@@ -48,12 +49,20 @@ use devmap_store::seed::{
     promote_immutable_base_to_store, read_file_at, seed_artifact, seed_directory_cow,
     set_file_readonly, set_file_writable, stage_seed_healing_wal,
 };
-use devmap_store::{Store, StoredSymbol};
+use devmap_resolve::model::LangFamily;
+use devmap_store::{
+    CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
+    StoredEdge, StoredFile, StoredSymbol,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::write_atomic;
 use crate::cas::{blake3_hash, CAS_TOMBSTONE};
+use crate::engine::traversal::node_id_of;
 use crate::overlay::{OverlayEdge, RoaringBitmap, WorktreeOverlay};
+
+/// `(generation, repository root, [(path, language)])`: the file list a scope resolves against.
+pub type ScopeInputs = (u32, Option<String>, Vec<(String, String)>);
 
 /// Format of both the lease and the published manifest. 2 moved the base into
 /// the lane (`stack/`); a v1 lease named a shared cache entry.
@@ -1506,6 +1515,9 @@ pub struct StackedStore {
     delta: Option<DeltaStore>,
     delta_writable: bool,
     overlay: WorktreeOverlay,
+    /// The base edge index merged with the delta's edges, built on first use and
+    /// dropped whenever the overlay is rebuilt. Unused while the delta is empty.
+    merged_edges: Mutex<Option<(u32, Arc<GenerationEdges>)>>,
 }
 
 impl std::fmt::Debug for StackedStore {
@@ -1569,6 +1581,7 @@ impl StackedStore {
             delta,
             delta_writable: false,
             overlay,
+            merged_edges: Mutex::new(None),
         })
     }
 
@@ -1641,6 +1654,24 @@ impl StackedStore {
 
     pub fn overlay(&self) -> &WorktreeOverlay {
         &self.overlay
+    }
+
+    /// Whether the delta holds any edit or deletion. With none, every engine
+    /// surface is the base's own answer.
+    pub fn has_delta_changes(&self) -> bool {
+        !self.overlay.modified_files.is_empty() || !self.overlay.tombstoned_files.is_empty()
+    }
+
+    /// The freshness stamp of an answer merged over the delta. It is never
+    /// `verified`: the base is a generation behind the tree and the delta covers
+    /// only the files that were synced.
+    pub fn delta_source_freshness(&self) -> crate::model::SourceFreshness {
+        crate::model::SourceFreshness::unverified(format!(
+            "answered over immutable base generation {} merged with {} uncommitted stacked delta file(s) ({} deleted)",
+            self.lease.generation_id,
+            self.overlay.modified_files.len(),
+            self.overlay.tombstoned_files.len()
+        ))
     }
 
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
@@ -2108,6 +2139,536 @@ impl StackedStore {
         Ok(out)
     }
 
+    pub fn latest_file(&self, rel_path: &str) -> Result<Option<StoredFile>> {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return Ok(None);
+        };
+        let p = Path::new(&normalized);
+        if self.overlay.is_file_tombstoned(p) {
+            return Ok(None);
+        }
+        if let Some(ext) = self.overlay.added_extractions.get(&normalized) {
+            return Ok(Some(StoredFile {
+                path: normalized,
+                language: ext.language.clone(),
+                content_hash: ext.content_hash,
+                parse_outcome: ext.parse_outcome.clone(),
+                engine: ext.engine.clone(),
+            }));
+        }
+        Ok(self.base.latest_file(&normalized)?)
+    }
+
+    pub fn latest_extraction_for_path(&self, rel_path: &str) -> Result<Option<Extraction>> {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return Ok(None);
+        };
+        let p = Path::new(&normalized);
+        if self.overlay.is_file_tombstoned(p) {
+            return Ok(None);
+        }
+        if let Some(ext) = self.overlay.added_extractions.get(&normalized) {
+            return Ok(Some(ext.clone()));
+        }
+        Ok(self.base.latest_extraction_for_path(&normalized)?)
+    }
+
+    /// A unified `GenerationEdges` adjacency: the base's edges that the delta did
+    /// not mask, plus the delta files' own `Contains`, `Calls` and `Imports` edges,
+    /// so every `StoreQueryEngine` traversal (`impact`, `trace`, `neighbors`,
+    /// `explore`, `affected_tests`, `dependencies`, `ask`) sees worktree edits and
+    /// deletions. The merged index is cached until the overlay is rebuilt.
+    pub fn generation_edges_with_id(&self) -> Result<Option<(u32, Arc<GenerationEdges>)>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.generation_edges_with_id()?);
+        }
+        let mut guard = self
+            .merged_edges
+            .lock()
+            .map_err(|_| anyhow::anyhow!("StackedStore merged_edges mutex poisoned"))?;
+        if let Some((generation, cached)) = guard.as_ref() {
+            return Ok(Some((*generation, Arc::clone(cached))));
+        }
+        let Some((generation, base_index)) = self.base.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let built = Arc::new(merge_generation_edges(
+            &base_index,
+            &self.overlay,
+            &self.base,
+            generation,
+        )?);
+        *guard = Some((generation, Arc::clone(&built)));
+        Ok(Some((generation, built)))
+    }
+
+    pub fn file_edges(&self, path: &str, min_confidence: f32) -> Result<Option<FileEdges>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.file_edges(path, min_confidence)?);
+        }
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some(file) = self.latest_file(path)? else {
+            return Ok(None);
+        };
+        let Some((generation, index)) = self.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let mut edges = Vec::new();
+        let mut inbound_edges = 0usize;
+        for id in 0..index.len() as u32 {
+            if !index.admits(id, min_confidence) {
+                continue;
+            }
+            if index.source_file(id) == file.path {
+                edges.push(index.stored_edge(id));
+            } else if index.target_file(id) == file.path {
+                inbound_edges += 1;
+            }
+        }
+        edges.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.source_file.cmp(&b.source_file))
+                .then_with(|| a.target_file.cmp(&b.target_file))
+                .then_with(|| a.source_symbol.cmp(&b.source_symbol))
+                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+                .then_with(|| a.edge_kind.cmp(&b.edge_kind))
+        });
+        Ok(Some(FileEdges {
+            generation,
+            file,
+            edges,
+            inbound_edges,
+            analysis: index.analysis().cloned(),
+        }))
+    }
+
+    pub fn all_indexed_files(&self) -> Result<Option<ScopeInputs>> {
+        let Some((gen_id, _root, base_files)) = self.base.latest_scope_inputs()? else {
+            return Ok(None);
+        };
+        let mut by_path: std::collections::BTreeMap<String, String> = base_files
+            .into_iter()
+            .filter(|(p, _)| {
+                let path_ref = Path::new(p);
+                !self.overlay.is_file_tombstoned(path_ref)
+                    && !self.overlay.modified_files.contains_key(path_ref)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            by_path.insert(path.clone(), ext.language.clone());
+        }
+        let wt_root = Some(self.worktree_root.to_string_lossy().into_owned());
+        Ok(Some((gen_id, wt_root, by_path.into_iter().collect())))
+    }
+
+    pub fn all_merged_symbols(&self) -> Result<Option<SearchPage>> {
+        let Some(mut page) = self.base.all_symbols_page()? else {
+            return Ok(None);
+        };
+        page.rows.retain(|sym| {
+            let p = Path::new(&sym.path);
+            !self.overlay.is_file_tombstoned(p)
+                && !self.overlay.modified_files.contains_key(p)
+                && !self.overlay.is_symbol_tombstoned(&sym.qualified_name)
+        });
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(path) {
+                for sym in &ext.symbols {
+                    page.rows.push(StoredSymbol {
+                        name: sym.name.clone(),
+                        qualified_name: sym.qualified_name.clone(),
+                        kind: sym.kind.as_str().to_string(),
+                        path: path.clone(),
+                        span_start: sym.span.start_byte,
+                        span_end: sym.span.end_byte,
+                        is_exported: sym.is_exported,
+                        content_hash: ext.content_hash,
+                    });
+                }
+            }
+        }
+        page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        page.repo_root = Some(self.worktree_root.to_string_lossy().into_owned());
+        Ok(Some(page))
+    }
+
+    pub fn keyword_page(
+        &self,
+        query: &str,
+        pool: usize,
+        filter: Option<&crate::scope::NameQueryFilter>,
+    ) -> Result<Option<SearchPage>> {
+        let Some(mut page) = self.all_merged_symbols()? else {
+            return Ok(None);
+        };
+        let Some((_, root, all_files)) = self.all_indexed_files()? else {
+            return Ok(None);
+        };
+        let corpus_files = u32::try_from(all_files.len()).unwrap_or(u32::MAX);
+        let corpus_symbols = page.total;
+
+        if let Some(filter) = filter {
+            let mut scope_paths = Vec::new();
+            let mut scope_langs = Vec::new();
+            if let Some(scope) = filter.symbol_scope().map_err(anyhow::Error::msg)? {
+                let resolved = scope.resolve(&all_files, root.as_deref())?;
+                scope_paths = resolved.report.paths.clone();
+                scope_langs = resolved.report.languages.clone();
+                page.rows.retain(|row| resolved.contains(&row.path));
+            }
+            let kinds = filter.kinds();
+            if !kinds.is_empty() {
+                let present: BTreeSet<String> =
+                    page.rows.iter().map(|row| row.kind.clone()).collect();
+                let missing: Vec<String> = kinds
+                    .iter()
+                    .filter(|k| !present.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    bail!(crate::scope::missing_kind_message(
+                        &missing,
+                        &present,
+                        !scope_paths.is_empty() || !scope_langs.is_empty()
+                    ));
+                }
+                page.rows.retain(|row| kinds.iter().any(|k| k == &row.kind));
+            }
+            let scoped_files = page
+                .rows
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let scoped_symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+            page.narrowing = Some(SearchNarrowing {
+                paths: scope_paths,
+                languages: scope_langs,
+                kinds: kinds.to_vec(),
+                files: u32::try_from(scoped_files).unwrap_or(u32::MAX),
+                symbols: scoped_symbols,
+                corpus_files,
+                corpus_symbols,
+            });
+        }
+
+        let trimmed = query.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            let terms: Vec<&str> = trimmed
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+                .collect();
+            page.rows.retain(|sym| {
+                let name_l = sym.name.to_ascii_lowercase();
+                let qual_l = sym.qualified_name.to_ascii_lowercase();
+                if terms.is_empty() {
+                    name_l.contains(&trimmed) || qual_l.contains(&trimmed)
+                } else {
+                    terms
+                        .iter()
+                        .all(|term| name_l.contains(term) || qual_l.contains(term))
+                }
+            });
+        }
+
+        page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        page.rows.sort_by(|a, b| {
+            let exact_a = a.name.eq_ignore_ascii_case(&trimmed);
+            let exact_b = b.name.eq_ignore_ascii_case(&trimmed);
+            exact_b
+                .cmp(&exact_a)
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        if page.rows.len() > pool {
+            page.rows.truncate(pool);
+        }
+        Ok(Some(page))
+    }
+
+    pub fn ranking_corpus(
+        &self,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> Result<Option<(SearchPage, Option<crate::scope::ResolvedScope>)>> {
+        let Some(mut page) = self.all_merged_symbols()? else {
+            return Ok(None);
+        };
+        let Some(scope) = scope else {
+            return Ok(Some((page, None)));
+        };
+        let Some((_, root, files)) = self.all_indexed_files()? else {
+            return Ok(None);
+        };
+        let mut resolved = scope.resolve(&files, root.as_deref())?;
+        let corpus_symbols = page.rows.len();
+        page.rows.retain(|row| resolved.contains(&row.path));
+        resolved.report.symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        resolved.report.corpus_symbols = u32::try_from(corpus_symbols).unwrap_or(u32::MAX);
+        page.total = resolved.report.symbols;
+        Ok(Some((page, Some(resolved))))
+    }
+
+    pub fn latest_test_entry_symbols(&self) -> Result<HashSet<String>> {
+        let mut symbols = self.base.latest_test_entry_symbols()?;
+        if !self.has_delta_changes() {
+            return Ok(symbols);
+        }
+        symbols.retain(|sym| {
+            if self.overlay.is_symbol_tombstoned(sym) {
+                return false;
+            }
+            if let Some((file_part, _)) = sym.split_once("::") {
+                let p = Path::new(file_part);
+                if self.overlay.is_file_tombstoned(p) || self.overlay.modified_files.contains_key(p)
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        for ext in self.overlay.added_extractions.values() {
+            for annotation in &ext.wiring {
+                if annotation.kind == WiringKind::RuntimeEntryPoint
+                    && devmap_extract::wiring::is_test_harness_reason(&annotation.details)
+                {
+                    symbols.insert(annotation.target_symbol.clone());
+                }
+            }
+        }
+        Ok(symbols)
+    }
+
+    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.dead_page(limit)?);
+        }
+        let fetch = limit.saturating_add(self.overlay.modified_files.len() * 8 + 64);
+        let Some(mut page) = self.base.dead_page(fetch)? else {
+            return Ok(None);
+        };
+        let edges_opt = self.generation_edges_with_id()?.map(|(_, idx)| idx);
+        let before_filter = page.rows.len();
+        page.rows.retain(|row| {
+            let p = Path::new(&row.file_path);
+            let qn = node_id_of(&row.file_path, &row.symbol_name);
+            if self.overlay.is_file_tombstoned(p)
+                || self.overlay.modified_files.contains_key(p)
+                || self.overlay.is_symbol_tombstoned(&qn)
+                || self.overlay.is_symbol_tombstoned(&row.symbol_name)
+            {
+                return false;
+            }
+            if let Some(ref idx) = edges_opt {
+                let has_inbound_call = idx
+                    .into_target_symbol(&qn)
+                    .iter()
+                    .chain(idx.into_target_symbol(&row.symbol_name).iter())
+                    .any(|id| {
+                        idx.kind(*id) != devmap_extract::model::EdgeKind::Contains
+                            && idx.source_symbol(*id) != qn
+                            && idx.source_symbol(*id) != row.symbol_name
+                    });
+                if has_inbound_call {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed_count = before_filter.saturating_sub(page.rows.len());
+        page.total_non_exempt = page.total_non_exempt.saturating_sub(removed_count);
+        if page.rows.len() > limit {
+            page.rows.truncate(limit);
+        }
+        Ok(Some(page))
+    }
+
+    pub fn callers_page(
+        &self,
+        targets: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Option<CallersPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self
+                .base
+                .callers_page(targets, exclude_file, min_confidence)?);
+        }
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some((generation, index)) = self.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let mut callers = Vec::new();
+        let mut total_unfiltered = 0usize;
+        let target_set: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+        for target in target_set {
+            for id in index.into_target_symbol(target) {
+                if index.kind(*id) != devmap_extract::model::EdgeKind::Calls
+                    || index.source_file(*id) == exclude_file
+                {
+                    continue;
+                }
+                total_unfiltered += 1;
+                if index.admits(*id, min_confidence) {
+                    callers.push(index.stored_edge(*id));
+                }
+            }
+        }
+        callers.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+                .then_with(|| left.source_file.cmp(&right.source_file))
+                .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        });
+        Ok(Some(CallersPage {
+            generation,
+            callers,
+            total_unfiltered,
+        }))
+    }
+
+    pub fn latest_parse_failures(&self) -> Result<(usize, Vec<String>)> {
+        let (base_total, base_paths) = self.base.latest_parse_failures()?;
+        if !self.has_delta_changes() {
+            return Ok((base_total, base_paths));
+        }
+        let mut paths: Vec<String> = base_paths
+            .into_iter()
+            .filter(|p| {
+                let pr = Path::new(p);
+                !self.overlay.is_file_tombstoned(pr)
+                    && !self.overlay.modified_files.contains_key(pr)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            if matches!(
+                ext.parse_outcome,
+                devmap_extract::model::ParseOutcome::Failed { .. }
+            ) {
+                paths.push(path.clone());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let total = paths.len();
+        Ok((total, paths))
+    }
+
+    pub fn merged_extractions_cancellable(
+        &self,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Vec<Extraction>> {
+        let mut exts = self
+            .base
+            .latest_extractions_until(&mut || cancel.check().is_err())?
+            .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))?;
+        if !self.has_delta_changes() {
+            return Ok(exts);
+        }
+        exts.retain(|ext| {
+            let p = Path::new(&ext.file_path);
+            !self.overlay.is_file_tombstoned(p) && !self.overlay.modified_files.contains_key(p)
+        });
+        for ext in self.overlay.added_extractions.values() {
+            exts.push(ext.clone());
+        }
+        Ok(exts)
+    }
+
+    pub fn latest_clone_candidates(&self) -> Result<(Vec<devmap_analyze::CloneCandidate>, usize)> {
+        let (mut candidates, mut unsigned) = self.base.latest_clone_candidates()?;
+        if !self.has_delta_changes() {
+            return Ok((candidates, unsigned));
+        }
+        candidates.retain(|cand| {
+            let p = Path::new(&cand.file_path);
+            !self.overlay.is_file_tombstoned(p)
+                && !self.overlay.modified_files.contains_key(p)
+                && !self.overlay.is_symbol_tombstoned(&cand.qualified_name)
+        });
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(path) {
+                for sym in &ext.symbols {
+                    if let Some(sig) = sym.body_signature {
+                        candidates.push(devmap_analyze::CloneCandidate {
+                            file_path: path.clone(),
+                            symbol_name: sym.name.clone(),
+                            qualified_name: sym.qualified_name.clone(),
+                            span_start: sym.span.start_byte,
+                            span_end: sym.span.end_byte,
+                            kind: sym.kind,
+                            exact: sig.exact,
+                            structural: sig.structural,
+                            nodes: sig.nodes,
+                        });
+                    } else {
+                        unsigned += 1;
+                    }
+                }
+            }
+        }
+        Ok((candidates, unsigned))
+    }
+
+    pub fn search_literals(
+        &self,
+        query: &str,
+        exact: bool,
+        page_cap: usize,
+    ) -> Result<Option<devmap_store::LiteralPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.search_literals(query, exact, page_cap)?);
+        }
+        let fetch = page_cap.saturating_add(self.overlay.modified_files.len() * 16 + 64);
+        let Some(base_page) = self.base.search_literals(query, exact, fetch)? else {
+            return Ok(None);
+        };
+        let mut rows: Vec<devmap_store::StoredLiteral> = base_page
+            .rows
+            .into_iter()
+            .filter(|lit| {
+                let p = Path::new(&lit.file_path);
+                !self.overlay.is_file_tombstoned(p) && !self.overlay.modified_files.contains_key(p)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            for lit in &ext.literals {
+                let matched = if exact {
+                    lit.value == query
+                } else {
+                    lit.value.contains(query)
+                };
+                if matched {
+                    rows.push(devmap_store::StoredLiteral {
+                        file_path: path.clone(),
+                        line: lit.line,
+                        span_start: u32::try_from(lit.start_byte).unwrap_or(u32::MAX),
+                        value: lit.value.clone(),
+                        qualified_name: lit.enclosing_qualified_name.clone(),
+                        symbol_name: lit.enclosing_name.clone(),
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.span_start.cmp(&b.span_start))
+        });
+        let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        if rows.len() > page_cap.max(1) {
+            rows.truncate(page_cap.max(1));
+        }
+        Ok(Some(devmap_store::LiteralPage { total, rows }))
+    }
     pub fn status(&self) -> Result<StackedStatus> {
         let delta_bytes = self.delta.as_ref().map_or(0, DeltaStore::bytes_on_disk);
         let dirty_files = self.overlay.modified_files.len();
@@ -2139,8 +2700,461 @@ impl StackedStore {
             &self.base,
             self.delta.as_ref(),
         )?;
+        // The merged edge index was built from the overlay just replaced.
+        *self
+            .merged_edges
+            .get_mut()
+            .map_err(|_| anyhow::anyhow!("StackedStore merged_edges mutex poisoned"))? = None;
         Ok(())
     }
+}
+
+fn bare_tail(symbol: &str) -> Option<&str> {
+    let tail = symbol.rsplit("::").next().unwrap_or(symbol);
+    let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
+struct ImportAliasMaps {
+    /// `local_name -> (module_specifier, imported_name)` from `ExtractedImport::binding_pairs()`.
+    symbol_aliases: BTreeMap<String, (String, String)>,
+    /// `module_alias -> module_specifier` when `imported_names` is empty (excluding `.`).
+    module_aliases: BTreeMap<String, String>,
+}
+
+fn import_alias_maps(ext: &Extraction) -> ImportAliasMaps {
+    let mut symbol_aliases = BTreeMap::new();
+    let mut module_aliases = BTreeMap::new();
+    for imp in &ext.imports {
+        let spec = imp.module_specifier.trim();
+        for (local, imported) in imp.binding_pairs() {
+            let local = local.trim();
+            let imported = imported.trim();
+            if !local.is_empty() && !imported.is_empty() {
+                symbol_aliases.insert(local.to_string(), (spec.to_string(), imported.to_string()));
+            }
+        }
+        if imp.imported_names.is_empty() {
+            if let Some(alias) = imp.alias.as_deref().map(str::trim) {
+                if !alias.is_empty() && alias != "." && !spec.is_empty() {
+                    module_aliases.insert(alias.to_string(), spec.to_string());
+                }
+            }
+        }
+    }
+    ImportAliasMaps {
+        symbol_aliases,
+        module_aliases,
+    }
+}
+
+fn specifier_matches_path(specifier: &str, candidate_path: &str) -> bool {
+    let mut s = specifier.trim();
+    while let Some(rest) = s
+        .strip_prefix("./")
+        .or_else(|| s.strip_prefix("../"))
+        .or_else(|| s.strip_prefix("crate::"))
+        .or_else(|| s.strip_prefix("self::"))
+        .or_else(|| s.strip_prefix("super::"))
+    {
+        s = rest;
+    }
+    if matches!(s, "" | "crate" | "self" | "super" | ".") {
+        return false;
+    }
+    let cand_no_ext = candidate_path
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(candidate_path);
+    let mut norm_variants = Vec::with_capacity(2);
+    let slash_spec = s.replace("::", "/").trim_matches('/').to_string();
+    if !slash_spec.is_empty() {
+        norm_variants.push(slash_spec);
+    }
+    if s.contains('.') && !s.contains('/') && !s.contains("::") {
+        let dot_spec = s.trim_start_matches('.').replace('.', "/");
+        if !dot_spec.is_empty() && !norm_variants.contains(&dot_spec) {
+            norm_variants.push(dot_spec);
+        }
+    }
+    norm_variants.iter().any(|norm_spec| {
+        cand_no_ext == norm_spec
+            || cand_no_ext.ends_with(&format!("/{norm_spec}"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/mod"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/index"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/__init__"))
+    })
+}
+
+/// The most base rows one callee lookup will read. A name matching more than this
+/// is too common to resolve by uniqueness.
+const CALLEE_LOOKUP_CEILING: usize = 4096;
+
+/// Every base symbol the index matches for `callee`, with whether that is the
+/// *whole* match set. `search_page` counts and reads in one snapshot, so
+/// `exhaustive` is `rows.len() >= total`: a capped read is never mistaken for a
+/// complete one.
+fn base_symbols_for_callee(base: &Store, callee: &str) -> Result<(Vec<StoredSymbol>, bool)> {
+    base_symbols_for_callee_within(base, callee, CALLEE_LOOKUP_CEILING)
+}
+
+fn base_symbols_for_callee_within(
+    base: &Store,
+    callee: &str,
+    ceiling: usize,
+) -> Result<(Vec<StoredSymbol>, bool)> {
+    let Some(page) = base.search_page(callee, ceiling)? else {
+        return Ok((Vec::new(), true));
+    };
+    let exhaustive = page.rows.len() >= usize::try_from(page.total).unwrap_or(usize::MAX);
+    Ok((page.rows, exhaustive))
+}
+
+/// The edges one dirty file contributes to the merged index.
+///
+/// `base_scope_paths` is every path the base indexes, read once per merge by the
+/// caller. `lookups` memoises [`base_symbols_for_callee`] across the merge.
+fn resolve_delta_stored_edges(
+    rel_path: &str,
+    ext: &Extraction,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+    base_scope_paths: &[String],
+    lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>,
+) -> Result<Vec<StoredEdge>> {
+    let mut out = Vec::new();
+    let caller_family = LangFamily::from_lang(devmap_extract::languages::detect_language(
+        Path::new(rel_path),
+    ));
+    let aliases = import_alias_maps(ext);
+
+    for sym in &ext.symbols {
+        out.push(StoredEdge {
+            source_file: rel_path.to_string(),
+            target_file: rel_path.to_string(),
+            source_symbol: rel_path.to_string(),
+            target_symbol: sym.qualified_name.clone(),
+            edge_kind: "Contains".to_string(),
+            confidence: 1.0,
+            resolution: Some("Structural".to_string()),
+        });
+    }
+
+    for call in &ext.calls {
+        let raw_callee = call.callee_name.trim();
+        if raw_callee.is_empty() {
+            continue;
+        }
+        let source_symbol = call
+            .caller_symbol
+            .as_deref()
+            .map(|caller| {
+                let want_qual = node_id_of(rel_path, caller);
+                ext.symbols
+                    .iter()
+                    .find(|s| {
+                        s.qualified_name == caller
+                            || s.name == caller
+                            || node_id_of(rel_path, &s.qualified_name) == want_qual
+                    })
+                    .map(|s| s.qualified_name.clone())
+                    .unwrap_or(want_qual)
+            })
+            .unwrap_or_else(|| rel_path.to_string());
+        let raw_recv =
+            call.receiver_expr.as_deref().map(str::trim).filter(|r| {
+                !r.is_empty() && !matches!(*r, "self" | "this" | "Self" | "super" | "cls")
+            });
+
+        // 1. SameFile resolution (deterministic 1.0) checks raw local callee/receiver first.
+        let same_file: Vec<&devmap_extract::model::ExtractedSymbol> = ext
+            .symbols
+            .iter()
+            .filter(|s| {
+                let tail_ok =
+                    s.name == raw_callee || bare_tail(&s.qualified_name) == Some(raw_callee);
+                if !tail_ok {
+                    return false;
+                }
+                match raw_recv {
+                    Some(r) => {
+                        s.qualified_name.contains(&format!("{r}.{raw_callee}"))
+                            || s.qualified_name.contains(&format!("{r}::{raw_callee}"))
+                    }
+                    None => true,
+                }
+            })
+            .collect();
+        if same_file.len() == 1 {
+            out.push(StoredEdge {
+                source_file: rel_path.to_string(),
+                target_file: rel_path.to_string(),
+                source_symbol,
+                target_symbol: same_file[0].qualified_name.clone(),
+                edge_kind: "Calls".to_string(),
+                confidence: 1.0,
+                resolution: Some("SameFile".to_string()),
+            });
+            continue;
+        }
+        if !same_file.is_empty() {
+            continue;
+        }
+
+        // Resolve symbol and module import aliases (`use a::b as c`, `import { b as c }`,
+        // `use crate::mod_a as m`, `import * as m`).
+        let mut explicit_specs: Vec<String> = Vec::new();
+        let (callee, recv): (&str, Option<&str>) = match raw_recv {
+            None => {
+                if let Some((spec, imported)) = aliases.symbol_aliases.get(raw_callee) {
+                    if !spec.is_empty() {
+                        explicit_specs.push(spec.clone());
+                    }
+                    (imported.as_str(), None)
+                } else {
+                    (raw_callee, None)
+                }
+            }
+            Some(r) => {
+                if let Some(mod_spec) = aliases.module_aliases.get(r) {
+                    explicit_specs.push(mod_spec.clone());
+                    (raw_callee, None)
+                } else if let Some((spec, imported)) = aliases.symbol_aliases.get(r) {
+                    if !spec.is_empty() {
+                        explicit_specs.push(spec.clone());
+                        explicit_specs.push(format!("{spec}::{imported}"));
+                        explicit_specs.push(format!("{spec}/{imported}"));
+                    } else {
+                        explicit_specs.push(imported.clone());
+                    }
+                    (raw_callee, Some(imported.as_str()))
+                } else {
+                    (raw_callee, Some(r))
+                }
+            }
+        };
+
+        // 2. Cross-file resolution across other delta extractions + non-masked base symbols.
+        let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+        for (other_path, other_ext) in &overlay.added_extractions {
+            if other_path == rel_path {
+                continue;
+            }
+            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(
+                other_path,
+            )));
+            if fam != caller_family {
+                continue;
+            }
+            for s in &other_ext.symbols {
+                if s.name == callee || bare_tail(&s.qualified_name) == Some(callee) {
+                    candidates.insert((other_path.clone(), s.qualified_name.clone()));
+                }
+            }
+        }
+        if !lookups.contains_key(callee) {
+            lookups.insert(callee.to_string(), base_symbols_for_callee(base, callee)?);
+        }
+        let (base_rows, base_exhaustive) = &lookups[callee];
+        for sym in base_rows {
+            if sym.path == rel_path {
+                continue;
+            }
+            let p = Path::new(&sym.path);
+            if overlay.is_file_tombstoned(p)
+                || overlay.modified_files.contains_key(p)
+                || overlay.is_symbol_tombstoned(&sym.qualified_name)
+            {
+                continue;
+            }
+            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
+            if fam != caller_family {
+                continue;
+            }
+            if sym.name == callee || bare_tail(&sym.qualified_name) == Some(callee) {
+                candidates.insert((sym.path.clone(), sym.qualified_name.clone()));
+            }
+        }
+
+        if let Some(r) = recv {
+            let narrowed: BTreeSet<(String, String)> = candidates
+                .iter()
+                .filter(|(cand_file, cand_qual)| {
+                    cand_qual.contains(&format!("{r}.{callee}"))
+                        || cand_qual.contains(&format!("{r}::{callee}"))
+                        || Path::new(cand_file).file_stem().and_then(|s| s.to_str()) == Some(r)
+                })
+                .cloned()
+                .collect();
+            if !narrowed.is_empty() {
+                candidates = narrowed;
+            }
+        }
+
+        let imported: Vec<&(String, String)> = candidates
+            .iter()
+            .filter(|(cand_file, _)| {
+                Path::new(cand_file).parent() == Path::new(rel_path).parent()
+                    || explicit_specs
+                        .iter()
+                        .any(|spec| specifier_matches_path(spec, cand_file))
+                    || ext
+                        .imports
+                        .iter()
+                        .any(|imp| specifier_matches_path(&imp.module_specifier, cand_file))
+            })
+            .collect();
+
+        if imported.len() == 1 {
+            let (target_file, target_symbol) = imported[0];
+            out.push(StoredEdge {
+                source_file: rel_path.to_string(),
+                target_file: target_file.clone(),
+                source_symbol,
+                target_symbol: target_symbol.clone(),
+                edge_kind: "Calls".to_string(),
+                confidence: 0.9,
+                resolution: Some("ImportScoped".to_string()),
+            });
+        } else if candidates.len() == 1 && *base_exhaustive {
+            // `UniqueGlobal` claims no other symbol in the corpus carries the
+            // name. That holds only when the base lookup saw every match; a read
+            // that hit the ceiling proves nothing, so it adds no edge.
+            if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
+                out.push(StoredEdge {
+                    source_file: rel_path.to_string(),
+                    target_file,
+                    source_symbol,
+                    target_symbol,
+                    edge_kind: "Calls".to_string(),
+                    confidence: 0.9,
+                    resolution: Some("UniqueGlobal".to_string()),
+                });
+            }
+        }
+    }
+
+    for imp in &ext.imports {
+        let spec = imp.module_specifier.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let mut candidate_specs = vec![spec.to_string()];
+        for (_, imported) in imp.binding_pairs() {
+            let imported = imported.trim();
+            if !imported.is_empty() {
+                candidate_specs.push(format!("{spec}::{imported}"));
+                candidate_specs.push(format!("{spec}/{imported}"));
+            }
+        }
+        for cand_spec in candidate_specs {
+            let mut matched_files: BTreeSet<String> = BTreeSet::new();
+            for other_path in overlay.added_extractions.keys() {
+                if other_path != rel_path && specifier_matches_path(&cand_spec, other_path) {
+                    matched_files.insert(other_path.clone());
+                }
+            }
+            if matched_files.is_empty() {
+                for bp in base_scope_paths {
+                    let p = Path::new(bp);
+                    if bp != rel_path
+                        && !overlay.is_file_tombstoned(p)
+                        && specifier_matches_path(&cand_spec, bp)
+                    {
+                        matched_files.insert(bp.clone());
+                    }
+                }
+            }
+            if matched_files.len() == 1 {
+                if let Some(target_file) = matched_files.into_iter().next() {
+                    out.push(StoredEdge {
+                        source_file: rel_path.to_string(),
+                        target_file: target_file.clone(),
+                        source_symbol: rel_path.to_string(),
+                        target_symbol: target_file,
+                        edge_kind: "Imports".to_string(),
+                        confidence: 1.0,
+                        resolution: Some("ImportScoped".to_string()),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// The base edge index with the delta applied: base edges whose file or symbol
+/// the delta masked are dropped, and each dirty file's own edges are added.
+/// Edges are de-duplicated on `(source file, target file, source symbol, target
+/// symbol, kind)`.
+///
+/// This walks every base edge and materialises the survivors, so its cost grows
+/// with the base. `StackedStore::generation_edges_with_id` caches the result.
+fn merge_generation_edges(
+    base_index: &GenerationEdges,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+    generation: u32,
+) -> Result<GenerationEdges> {
+    let mut merged: Vec<StoredEdge> = Vec::with_capacity(base_index.len() + 64);
+    let mut seen: HashSet<(String, String, String, String, String)> = HashSet::new();
+    let key_of = |edge: &StoredEdge| {
+        (
+            edge.source_file.clone(),
+            edge.target_file.clone(),
+            edge.source_symbol.clone(),
+            edge.target_symbol.clone(),
+            edge.edge_kind.clone(),
+        )
+    };
+
+    for id in 0..base_index.len() as u32 {
+        let src_p = Path::new(base_index.source_file(id));
+        let dst_p = Path::new(base_index.target_file(id));
+        if overlay.is_file_tombstoned(src_p)
+            || overlay.modified_files.contains_key(src_p)
+            || overlay.is_file_tombstoned(dst_p)
+            || overlay.is_symbol_tombstoned(base_index.source_symbol(id))
+            || overlay.is_symbol_tombstoned(base_index.target_symbol(id))
+        {
+            continue;
+        }
+        let edge = base_index.stored_edge(id);
+        seen.insert(key_of(&edge));
+        merged.push(edge);
+    }
+
+    let base_scope_paths: Vec<String> = base
+        .latest_scope_inputs()?
+        .map(|(_, _, base_files)| base_files.into_iter().map(|(bp, _)| bp).collect())
+        .unwrap_or_default();
+    let mut lookups = BTreeMap::new();
+    let mut dirty_paths: Vec<&String> = overlay.added_extractions.keys().collect();
+    dirty_paths.sort();
+    for rel_path in dirty_paths {
+        let Some(ext) = overlay.added_extractions.get(rel_path) else {
+            continue;
+        };
+        for edge in resolve_delta_stored_edges(
+            rel_path,
+            ext,
+            overlay,
+            base,
+            &base_scope_paths,
+            &mut lookups,
+        )? {
+            if seen.insert(key_of(&edge)) {
+                merged.push(edge);
+            }
+        }
+    }
+
+    Ok(
+        GenerationEdges::build(Arc::new(merged), base_index.analysis().cloned())?
+            .with_generation(generation),
+    )
 }
 
 fn build_overlay_from_delta(
@@ -5527,5 +6541,453 @@ mod tests {
     fn taking_the_delta_lock_while_holding_the_store_lock_is_refused() {
         let _store = RankGuard::enter(LockRank::Store);
         let _delta = RankGuard::enter(LockRank::Delta);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn commit_all(anchor: &Path) {
+        fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
+        run_git_ok(anchor, &["init", "-b", "main"]);
+        run_git_ok(anchor, &["add", "."]);
+        run_git_ok(anchor, &["commit", "-m", "initial"]);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn lane_over(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_repo_dir(tag);
+        let anchor = root.join("anchor");
+        for (rel, text) in files {
+            let path = anchor.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        commit_all(&anchor);
+        let rels: Vec<&str> = files.iter().map(|(rel, _)| *rel).collect();
+        index_tree(&anchor, &rels);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        (root, anchor, lane)
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn store_query_engine_with_stacked_answers_all_graph_and_search_surfaces_over_delta_edits_and_deletions(
+    ) {
+        let (root, _anchor, lane) = lane_over(
+            "full-engine-surfaces",
+            &[
+                (
+                    "src/db.rs",
+                    "pub fn run_query() -> i32 { 42 }\npub fn legacy_literal_holder() -> &'static str { \"OLD_SECRET_TAG\" }\n",
+                ),
+                (
+                    "src/dead_mod.rs",
+                    "pub(crate) fn orphan_fn() -> i32 { 0 }\npub(crate) fn soon_called() -> i32 { 7 }\n",
+                ),
+                (
+                    "src/obsolete.rs",
+                    "pub(crate) fn vanished_api() -> &'static str { \"VANISHED_LITERAL\" }\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub mod db;\npub mod dead_mod;\npub mod obsolete;\npub fn handle_req() -> i32 { db::run_query() }\n",
+                ),
+                (
+                    "tests/smoke.rs",
+                    "#[test]\nfn test_handle_req() {\n    let _ = handle_req();\n}\n",
+                ),
+            ],
+        );
+
+        fs::write(
+            lane.join("src/db.rs"),
+            "// header comment shifting spans\npub fn run_query() -> i32 { 99 }\npub fn stream_rows() -> i32 {\n    let _tag = \"LIVE_DELTA_LITERAL\";\n    run_query() + soon_called()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lane.join("src/api.rs"),
+            "use crate::db;\npub fn serve_stream() -> i32 {\n    stream_rows()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lane.join("tests/smoke.rs"),
+            "#[test]\nfn test_handle_req() {\n    let _ = handle_req();\n}\n\n#[test]\nfn test_stream_pipeline() {\n    let _ = serve_stream();\n}\n",
+        )
+        .unwrap();
+        fs::remove_file(lane.join("src/obsolete.rs")).unwrap();
+        a3_sync(&lane);
+
+        let lane_canon = lane.canonicalize().unwrap();
+        let delta_file = stack_delta_path(&lane_canon);
+        let lease_file = stack_lease_path(&lane_canon);
+        let delta_before = fs::read(&delta_file).unwrap();
+        let lease_before = fs::read(&lease_file).unwrap();
+
+        // An edit that is on disk only: a read-only open must not ingest it.
+        fs::write(
+            lane.join("src/unsynced_scratch.rs"),
+            "pub fn unsynced_only_on_disk() {}\n",
+        )
+        .unwrap();
+
+        let stacked = StackedStore::open(&lane).unwrap();
+        let engine =
+            crate::StoreQueryEngine::new(stacked.base_store()).with_stacked(Some(&stacked));
+        let request = |query: &str, depth: usize| crate::Request {
+            query: query.to_string(),
+            token_budget: 4000,
+            min_confidence: 0.0,
+            max_depth: depth,
+        };
+
+        let search_new = engine.search(request("stream_rows", 1)).unwrap();
+        assert_eq!(search_new.items.len(), 1);
+        assert!(search_new.items[0]
+            .source_span
+            .contains("LIVE_DELTA_LITERAL"));
+        assert!(engine
+            .search(request("unsynced_only_on_disk", 1))
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(engine
+            .search(request("vanished_api", 1))
+            .unwrap()
+            .items
+            .is_empty());
+
+        let sem = engine.search_semantic("stream rows", 4000).unwrap();
+        assert!(sem.items.iter().any(|h| h.symbol_name == "stream_rows"));
+        let ask_res = engine.ask("stream rows", 4000, 0.0).unwrap();
+        assert!(ask_res.items.iter().any(|h| h.symbol_name == "stream_rows"));
+
+        let exp = engine.explore("stream_rows", 10, 4000, 0.0, 2).unwrap();
+        assert_eq!(exp.definitions.items.len(), 1);
+        let entry = &exp.definitions.items[0];
+        assert!(entry
+            .callers
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("serve_stream")));
+        assert!(entry
+            .callees
+            .items
+            .iter()
+            .any(|e| e.target_symbol.contains("run_query")));
+
+        let imp = engine.impact(request("run_query", 5)).unwrap();
+        assert!(imp
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("stream_rows")));
+        assert!(imp
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("test_stream_pipeline")));
+        let layered = engine.impact_layered(request("run_query", 5)).unwrap();
+        assert!(!layered.edges.items.is_empty());
+
+        let neigh = engine
+            .neighbors(&["stream_rows".to_string()], 4000, 0.0, 1)
+            .unwrap();
+        assert_eq!(neigh.len(), 1);
+        assert!(!neigh[0].callers.items.is_empty());
+        assert!(!neigh[0].callees.items.is_empty());
+
+        let tr = engine
+            .trace_between(crate::Request {
+                query: ("test_stream_pipeline".to_string(), "run_query".to_string()),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 5,
+            })
+            .unwrap();
+        assert!(!tr.items.is_empty());
+
+        let deps_api = engine.dependencies(request("src/api.rs", 1)).unwrap();
+        assert!(deps_api.items.iter().any(|e| e.target_file == "src/db.rs"));
+
+        let aff = engine
+            .affected_tests(&["src/db.rs".to_string()], 4000, 0.0, 5)
+            .unwrap();
+        assert!(aff
+            .tests
+            .items
+            .iter()
+            .any(|t| t.symbols.iter().any(|s| s.contains("test_stream_pipeline"))));
+
+        // A repository-relative and a worktree-absolute path reach the same row.
+        let abs_db = lane_canon.join("src/db.rs");
+        let skel_db = engine.skeleton(abs_db.to_str().unwrap(), 4000).unwrap();
+        assert_eq!(skel_db.presence, crate::SkeletonPresence::Indexed);
+        assert!(skel_db
+            .items
+            .iter()
+            .any(|i| i.qualified_name.contains("stream_rows")));
+        let skel_del = engine.skeleton("src/obsolete.rs", 4000).unwrap();
+        assert_eq!(skel_del.presence, crate::SkeletonPresence::NotInIndex);
+
+        let dead = engine.dead_symbols(4000).unwrap();
+        let dead_names: Vec<&str> = dead.items.iter().map(|d| d.symbol_name.as_str()).collect();
+        assert!(dead_names.contains(&"orphan_fn"), "{dead_names:?}");
+        assert!(!dead_names.contains(&"soon_called"), "{dead_names:?}");
+        assert!(!dead_names.contains(&"vanished_api"), "{dead_names:?}");
+
+        assert_eq!(
+            engine
+                .literals("LIVE_DELTA_LITERAL", false, 4000)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert!(engine
+            .literals("OLD_SECRET_TAG", false, 4000)
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(engine
+            .literals("VANISHED_LITERAL", false, 4000)
+            .unwrap()
+            .items
+            .is_empty());
+
+        let prev = engine
+            .preview(
+                "src/db.rs",
+                "pub fn run_query() -> i32 { 99 }\npub fn stream_rows(limit: usize) -> i32 { limit as i32 }\n",
+                4000,
+                0.0,
+            )
+            .unwrap();
+        assert!(prev.delta_available);
+        assert!(prev
+            .broken_callers
+            .items
+            .iter()
+            .any(|e| e.caller_symbol.contains("serve_stream")));
+
+        drop(engine);
+        drop(stacked);
+        assert_eq!(
+            fs::read(&delta_file).unwrap(),
+            delta_before,
+            "queries must not mutate a byte of delta.sqlite"
+        );
+        assert_eq!(
+            fs::read(&lease_file).unwrap(),
+            lease_before,
+            "queries must not mutate stack_lease.json"
+        );
+        assert!(!delta_file.with_extension("sqlite-wal").exists());
+        assert!(!delta_file.with_extension("sqlite-shm").exists());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn test_stacked_aliased_imports_resolve_calls_and_affected_tests() {
+        let (root, _anchor, lane) = lane_over(
+            "aliased-imports",
+            &[
+                (
+                    "src/callee.rs",
+                    "pub fn probe_callee() -> i32 {\n    7\n}\n",
+                ),
+                (
+                    "src/mod_callee.rs",
+                    "pub fn mod_target() -> i32 {\n    11\n}\n",
+                ),
+                ("src/lib.rs", "pub mod callee;\npub mod mod_callee;\n"),
+                (
+                    "tests/alias_test.rs",
+                    "#[test]\nfn test_initial() {\n    assert_eq!(1, 1);\n}\n",
+                ),
+            ],
+        );
+        fs::write(
+            lane.join("tests/alias_test.rs"),
+            "use crate::callee::probe_callee as aliased_callee;\nuse crate::mod_callee as mc;\n\n#[test]\nfn test_via_symbol_alias() {\n    let _ = aliased_callee();\n}\n\n#[test]\nfn test_via_module_alias() {\n    let _ = mc::mod_target();\n}\n",
+        )
+        .unwrap();
+        a3_sync(&lane);
+
+        let stacked = StackedStore::open(&lane).unwrap();
+        let engine =
+            crate::StoreQueryEngine::new(stacked.base_store()).with_stacked(Some(&stacked));
+        for (target, test) in [
+            ("probe_callee", "test_via_symbol_alias"),
+            ("mod_target", "test_via_module_alias"),
+        ] {
+            let affected = engine
+                .affected_tests(&[target.to_string()], 4000, 0.0, 5)
+                .unwrap();
+            assert!(
+                affected
+                    .tests
+                    .items
+                    .iter()
+                    .any(|t| t.symbols.iter().any(|s| s.contains(test))),
+                "an aliased import must reach {target} from {test}: {:?}",
+                affected.tests.items
+            );
+        }
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A delta call whose callee name the base does not hold uniquely is not a
+    /// `UniqueGlobal` edge. The label asserts "no other symbol carries this name",
+    /// which a lookup that stopped at a cap cannot know.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_delta_call_is_unique_global_only_when_the_base_lookup_saw_every_match() {
+        let (root, _anchor, lane) = lane_over(
+            "unique-global-label",
+            &[
+                ("core/db.rs", "pub fn run_query() -> i32 { 42 }\n"),
+                ("src/other.rs", "pub fn other_fn() -> i32 { 1 }\n"),
+            ],
+        );
+        fs::write(
+            lane.join("src/api.rs"),
+            "pub fn serve() -> i32 {\n    run_query()\n}\n",
+        )
+        .unwrap();
+        a3_sync(&lane);
+        let stacked = StackedStore::open(&lane).unwrap();
+        let ext = stacked
+            .overlay()
+            .added_extractions
+            .get("src/api.rs")
+            .expect("the synced file is in the overlay")
+            .clone();
+        let scope: Vec<String> = vec!["core/db.rs".to_string(), "src/other.rs".to_string()];
+        let calls_to_run_query = |lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>| {
+            resolve_delta_stored_edges(
+                "src/api.rs",
+                &ext,
+                stacked.overlay(),
+                stacked.base_store(),
+                &scope,
+                lookups,
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.edge_kind == "Calls" && e.target_symbol.contains("run_query"))
+            .collect::<Vec<_>>()
+        };
+
+        // The real lookup sees the one match: a unique-global edge.
+        let found = calls_to_run_query(&mut BTreeMap::new());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].resolution.as_deref(), Some("UniqueGlobal"));
+
+        // The same rows, but a lookup that reports it stopped short: no such claim.
+        let (rows, _) = base_symbols_for_callee(stacked.base_store(), "run_query").unwrap();
+        assert!(!rows.is_empty());
+        let mut capped = BTreeMap::new();
+        capped.insert("run_query".to_string(), (rows, false));
+        assert!(
+            calls_to_run_query(&mut capped).is_empty(),
+            "a capped lookup must not mint a unique-global edge"
+        );
+
+        // A ceiling below the match count is reported as not exhaustive.
+        let (_, exhaustive) =
+            base_symbols_for_callee_within(stacked.base_store(), "run_query", 0).unwrap();
+        assert!(
+            !exhaustive,
+            "a zero-row read of a matching name is not exhaustive"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Cost of the merged-`GenerationEdges` rebuild against the MCP per-call
+    /// ceiling (`devmap-serve/src/mcp.rs` `CALL_TIMEOUT`, 30 s). Every MCP call
+    /// opens a fresh `StackedStore`, so this runs per call while the delta is
+    /// non-empty. Ignored by default; run it with
+    /// `cargo test -p devmap-query --lib --release merged_generation_edges -- --ignored --nocapture`.
+    ///
+    /// The base index is synthetic at 100k edges. When `DEVMAP_BENCH_STORE` names
+    /// a real store (read only), that store's own edge index and symbol lookups
+    /// are used instead, with a delta of two real source files and one deletion.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+    fn merged_generation_edges_rebuild_is_bounded_against_the_mcp_call_timeout() {
+        const MCP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const RUNS: usize = 7;
+
+        let (root, base, base_index) = match std::env::var_os("DEVMAP_BENCH_STORE") {
+            Some(path) => {
+                let store = Store::open_read_only(Path::new(&path)).unwrap();
+                let (_, index) = store.generation_edges_with_id().unwrap().unwrap();
+                (None, store, index)
+            }
+            None => {
+                let (root, _anchor, lane) =
+                    lane_over("merge-bench", &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")]);
+                let stacked = StackedStore::open(&lane).unwrap();
+                let base = open_lane_base_store(&stacked.lease().base_sqlite_path()).unwrap();
+                let edges: Vec<StoredEdge> = (0..100_000u32)
+                    .map(|i| StoredEdge {
+                        source_file: format!("src/m{}.rs", i % 2000),
+                        target_file: format!("src/m{}.rs", (i / 50) % 2000),
+                        source_symbol: format!("src/m{}.rs::f{}", i % 2000, i / 2000),
+                        target_symbol: format!("src/m{}.rs::f{}", (i / 50) % 2000, i % 50),
+                        edge_kind: "Calls".to_string(),
+                        confidence: 1.0,
+                        resolution: Some("SameFile".to_string()),
+                    })
+                    .collect();
+                let index = Arc::new(GenerationEdges::build(Arc::new(edges), None).unwrap());
+                (Some(root), base, index)
+            }
+        };
+
+        let mut overlay = WorktreeOverlay::new("bench", 1);
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (id, rel) in ["stacked.rs", "engine.rs"].iter().enumerate() {
+            let src = fs::read_to_string(manifest.join("src").join(rel)).unwrap();
+            let repo_rel = format!("rust/devmap-query/src/{rel}");
+            let ext = devmap_extract::extract_file(&repo_rel, &src);
+            let id = u32::try_from(id).unwrap();
+            overlay.record_modified_file(&repo_rel, "bench", Some(id));
+            overlay.record_extraction(repo_rel, ext, id);
+        }
+        overlay.mark_file_tombstone("src/m1.rs", Some(9));
+        assert!(!overlay.modified_files.is_empty());
+
+        let mut timings = Vec::new();
+        let mut merged_len = 0;
+        for _ in 0..RUNS {
+            let started = std::time::Instant::now();
+            let merged = merge_generation_edges(&base_index, &overlay, &base, 1).unwrap();
+            timings.push(started.elapsed());
+            merged_len = merged.len();
+        }
+        timings.sort();
+        let min = timings[0];
+        eprintln!(
+            "merge_generation_edges: base edges {}, merged edges {}, runs {RUNS}, min {:?}, median {:?}, max {:?}, MCP CALL_TIMEOUT {:?}",
+            base_index.len(),
+            merged_len,
+            min,
+            timings[RUNS / 2],
+            timings[RUNS - 1],
+            MCP_CALL_TIMEOUT
+        );
+        assert!(
+            base_index.len() >= 90_000,
+            "the benchmark must run at about 100k base edges, got {}",
+            base_index.len()
+        );
+        assert!(
+            min < MCP_CALL_TIMEOUT / 3,
+            "the merged-edge rebuild must leave the call most of its {MCP_CALL_TIMEOUT:?}: min {min:?}"
+        );
+        if let Some(root) = root {
+            let _ = remove_readonly_tree(&root);
+        }
     }
 }
