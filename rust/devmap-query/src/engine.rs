@@ -2422,7 +2422,11 @@ impl<'a> StoreQueryEngine<'a> {
             // entire class of finding. `DeadClusterScan::clusters` is capped at
             // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
             // own; what the cap dropped travels beside it.
-            if let Some(scan) = page.dead_clusters {
+            let dropped = self.stacked.and_then(|s| s.dead_clusters_dropped_reason());
+            if let Some(reason) = dropped {
+                // The base's scan describes the base, not this lane.
+                response.dead_clusters_incomplete = Some(reason);
+            } else if let Some(scan) = page.dead_clusters {
                 if scan.refused_oversized_graph {
                     // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
                     // empty list here would say the walk ran and found nothing.

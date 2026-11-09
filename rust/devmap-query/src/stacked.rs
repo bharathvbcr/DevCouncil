@@ -1685,6 +1685,27 @@ impl StackedStore {
     /// visibility) re-applied over the merged graph, so the answer says it is a
     /// lower bound instead, naming the delta files that can cause it.
     pub fn dead_lower_bound_reason(&self) -> Option<String> {
+        let delta = self.delta_files_summary()?;
+        Some(format!(
+            "dead symbols over this lane are a lower bound: the stacked delta {delta}, so a base symbol whose only caller the delta removed, and a symbol the delta adds with no caller, may be missing from the list; run `devmap build` for a complete answer"
+        ))
+    }
+
+    /// Why the base's abandoned-cycle scan is not reported over this lane, or
+    /// `None` when the delta changes nothing. The scan is a whole-graph pass
+    /// over the base; a delta that deletes a cycle's file, or adds a caller
+    /// into one, makes its clusters false, and the engine does not re-run it
+    /// over the merged edges, so it is dropped rather than passed through.
+    pub fn dead_clusters_dropped_reason(&self) -> Option<String> {
+        let delta = self.delta_files_summary()?;
+        Some(format!(
+            "abandoned-cycle clusters are not reported over this lane: the base's cluster scan cannot see the stacked delta, which {delta}; run `devmap build` for the cluster list"
+        ))
+    }
+
+    /// "edits or adds N file(s) (..) and deletes M (..)" for the delta, or
+    /// `None` when it changes nothing.
+    fn delta_files_summary(&self) -> Option<String> {
         if !self.has_delta_changes() {
             return None;
         }
@@ -1711,7 +1732,7 @@ impl StackedStore {
             )
         };
         Some(format!(
-            "dead symbols over this lane are a lower bound: the stacked delta edits or adds {} file(s) ({}) and deletes {} ({}), so a base symbol whose only caller the delta removed, and a symbol the delta adds with no caller, may be missing from the list; run `devmap build` for a complete answer",
+            "edits or adds {} file(s) ({}) and deletes {} ({})",
             edited.len(),
             name(&edited),
             deleted.len(),
