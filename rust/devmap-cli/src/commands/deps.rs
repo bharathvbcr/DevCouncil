@@ -1,7 +1,7 @@
 use devmap_query::Request;
 
 use crate::cli::Cli;
-use crate::output::{emit_edges, emit_json, open_for_read};
+use crate::output::{emit_edges, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Deps")]
@@ -46,9 +46,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         min_rung.as_deref().and_then(devmap_query::Rung::parse),
     )?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&resp)?)?;
+        store.emit_answer(cli, serde_json::to_value(&resp)?)?;
     } else {
         emit_edges(&resp);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_json, emit_truncation, open_for_read};
+use crate::output::{emit_truncation, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Preview")]
@@ -47,9 +47,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         .engine()
         .preview(file, &source, *budget, *min_confidence)?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_preview(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

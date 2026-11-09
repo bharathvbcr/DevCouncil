@@ -2,7 +2,7 @@ use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
 use crate::output::{
-    emit_json, emit_scope, emit_search, emit_truncation, emit_unavailable, open_for_read,
+    emit_scope, emit_search, emit_truncation, emit_unavailable, open_for_read,
 };
 
 #[derive(clap::Args)]
@@ -50,9 +50,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             let pack =
                 engine.ask_evidence_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
-                emit_json(cli, &serde_json::to_value(&pack)?)?;
+                store.emit_answer(cli, serde_json::to_value(&pack)?)?;
             } else {
                 emit_evidence_pack(&pack);
+                store.warn_incomplete()?;
             }
         }
         Args {
@@ -68,9 +69,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             let engine = store.engine();
             let resp = engine.ask_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
-                emit_json(cli, &serde_json::to_value(&resp)?)?;
+                store.emit_answer(cli, serde_json::to_value(&resp)?)?;
             } else {
                 emit_search(&resp);
+                store.warn_incomplete()?;
             }
         }
     }

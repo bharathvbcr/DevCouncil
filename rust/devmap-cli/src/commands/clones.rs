@@ -1,7 +1,7 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_json, emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{emit_truncation, emit_unavailable, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Clones")]
@@ -30,9 +30,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
     let report = store.engine().clones(*budget, wanted, *min_nodes)?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_clones(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

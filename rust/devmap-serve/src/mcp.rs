@@ -3053,59 +3053,6 @@ being reported because a partial traversal cannot be distinguished from a comple
     }
 }
 
-/// A stacked lane answers from an immutable base plus a delta that a detached
-/// hook syncs, so every answer except `status` (which reports the delta itself)
-/// can be missing the lane's own edits. Say so on the answer, appended to any
-/// reason the producer already gave rather than skipped when one exists.
-fn attach_stacked_incompleteness(
-    value: &mut Value,
-    stacked: &devmap_query::stacked::StackedStore,
-    st: &devmap_query::stacked::StackedStatus,
-) {
-    let mut reasons = Vec::new();
-    if st.dirty_files > 0 || st.tombstoned_files > 0 {
-        reasons.push(format!(
-            "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges): this answer comes from the immutable base plus whatever the delta covers; run `devmap build --manifest` for full cross-file resolution",
-            st.dirty_files, st.tombstoned_files, st.delta_edges
-        ));
-    }
-    if !stacked.delta_present() {
-        reasons.push(
-            "this lane has no delta.sqlite yet (no sync has run): its delta is read as empty"
-                .to_string(),
-        );
-    }
-    match stacked.unsynced_paths() {
-        Ok(paths) if !paths.is_empty() => {
-            let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
-            reasons.push(format!(
-                "{} edited file(s) are not in the stacked delta yet ({}{}); run `devmap seed --sync-delta` or `devmap build --manifest`",
-                paths.len(),
-                shown.join(", "),
-                if paths.len() > shown.len() { ", ..." } else { "" }
-            ));
-        }
-        Ok(_) => {}
-        Err(err) => reasons.push(format!(
-            "cannot tell whether the stacked delta is current ({err}); run `devmap build --manifest`"
-        )),
-    }
-    if reasons.is_empty() {
-        return;
-    }
-    if let Some(obj) = value.as_object_mut() {
-        let existing = obj
-            .get("walk_incomplete")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        if let Some(combined) = devmap_analyze::combine_reasons(existing, Some(reasons.join("; ")))
-        {
-            obj.insert("walk_incomplete".into(), json!(combined));
-        }
-    }
-}
-
 fn dispatch_with_stacked_overlay(
     engine: &Store,
     attr_root: &Path,
@@ -3145,7 +3092,8 @@ fn dispatch_with_stacked_overlay(
         return Ok(value);
     }
 
-    attach_stacked_incompleteness(&mut value, &stacked, &st);
+    // One owner for what a lane answer may be missing, shared with the CLI.
+    stacked.attach_incompleteness(&mut value)?;
     Ok(value)
 }
 

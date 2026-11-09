@@ -1719,6 +1719,75 @@ impl StackedStore {
         ))
     }
 
+    /// What a lane answer may be missing, or `None` when it is complete.
+    ///
+    /// A lane answers from an immutable base plus a delta that a detached hook
+    /// syncs, so every answer except `status` (which reports the delta itself)
+    /// can be missing the lane's own edits. This is the one place that says so,
+    /// for the MCP server and the CLI alike: the delta's size, a delta that does
+    /// not exist yet, and the edited files it has not ingested.
+    pub fn incompleteness_reason(&self) -> Result<Option<String>> {
+        let st = self.status()?;
+        let mut reasons = Vec::new();
+        if st.dirty_files > 0 || st.tombstoned_files > 0 {
+            reasons.push(format!(
+                "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges): this answer comes from the immutable base plus whatever the delta covers; run `devmap build --manifest` for full cross-file resolution",
+                st.dirty_files, st.tombstoned_files, st.delta_edges
+            ));
+        }
+        if !self.delta_present() {
+            reasons.push(
+                "this lane has no delta.sqlite yet (no sync has run): its delta is read as empty"
+                    .to_string(),
+            );
+        }
+        match self.unsynced_paths() {
+            Ok(paths) if !paths.is_empty() => {
+                let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+                reasons.push(format!(
+                    "{} edited file(s) are not in the stacked delta yet ({}{}); run `devmap seed --sync-delta` or `devmap build --manifest`",
+                    paths.len(),
+                    shown.join(", "),
+                    if paths.len() > shown.len() { ", ..." } else { "" }
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => reasons.push(format!(
+                "cannot tell whether the stacked delta is current ({err}); run `devmap build --manifest`"
+            )),
+        }
+        Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
+    /// Put [`Self::incompleteness_reason`] on a lane answer's JSON, appended to
+    /// any `walk_incomplete` the producer already gave, and stamp the
+    /// delta's freshness on an answer type that carries none of its own
+    /// (`literals`, `doc_drift`, `savings` do not go through the engine's
+    /// freshness exit). A value that is not an object is left alone.
+    pub fn attach_incompleteness(&self, value: &mut serde_json::Value) -> Result<()> {
+        let reason = self.incompleteness_reason()?;
+        let Some(object) = value.as_object_mut() else {
+            return Ok(());
+        };
+        if let Some(reason) = reason {
+            let existing = object
+                .get("walk_incomplete")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            if let Some(combined) = devmap_analyze::combine_reasons(existing, Some(reason)) {
+                object.insert("walk_incomplete".into(), serde_json::Value::String(combined));
+            }
+        }
+        if self.has_delta_changes() && !object.contains_key("source_freshness") {
+            object.insert(
+                "source_freshness".into(),
+                serde_json::to_value(self.delta_source_freshness())?,
+            );
+        }
+        Ok(())
+    }
+
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
     /// `delta.sqlite` and refresh the `WorktreeOverlay` (`F4`).
     ///
@@ -7155,6 +7224,53 @@ mod tests {
             "{:?}",
             answer.walk_incomplete
         );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attach_incompleteness_appends_to_a_producer_reason_and_stamps_a_bare_answer() {
+        let (root, _anchor, lane) = lane_over(
+            "attach-incompleteness",
+            &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")],
+        );
+        // Nothing synced, one edit on disk.
+        fs::write(lane.join("src/b.rs"), "pub fn b() -> i32 { 2 }\n").unwrap();
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        let mut answer = serde_json::json!({"walk_incomplete": "producer reason", "items": []});
+        stacked.attach_incompleteness(&mut answer).unwrap();
+        let walk = answer["walk_incomplete"].as_str().unwrap();
+        assert!(walk.starts_with("producer reason; "), "{walk}");
+        assert!(
+            walk.contains("no delta.sqlite yet") && walk.contains("src/b.rs"),
+            "{walk}"
+        );
+        assert!(
+            answer.get("source_freshness").is_none(),
+            "a lane with no delta changes is the base's own answer: {answer}"
+        );
+
+        a3_sync(&lane);
+        let synced = StackedStore::open(&lane).unwrap();
+        let mut bare = serde_json::json!({"items": []});
+        synced.attach_incompleteness(&mut bare).unwrap();
+        assert!(
+            bare["source_freshness"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("stacked delta file(s)")),
+            "{bare}"
+        );
+        let mut stamped = serde_json::json!({"source_freshness": {"fresh": true}});
+        synced.attach_incompleteness(&mut stamped).unwrap();
+        assert_eq!(
+            stamped["source_freshness"],
+            serde_json::json!({"fresh": true}),
+            "an answer that already carries a stamp keeps it"
+        );
+        let mut not_an_object = serde_json::json!([1, 2]);
+        synced.attach_incompleteness(&mut not_an_object).unwrap();
+        assert_eq!(not_an_object, serde_json::json!([1, 2]));
         let _ = remove_readonly_tree(&root);
     }
 

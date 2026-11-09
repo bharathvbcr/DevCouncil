@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_edges, emit_json, open_for_read};
+use crate::output::{emit_edges, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Neighbors")]
@@ -43,7 +43,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         min_rung.as_deref().and_then(devmap_query::Rung::parse),
     )?;
     if cli.json {
-        emit_json(cli, &serde_json::json!({ "neighbors": answers }))?;
+        store.emit_answer(cli, serde_json::json!({ "neighbors": answers }))?;
     } else {
         for entry in &answers {
             outln!("{}", entry.target);
@@ -52,6 +52,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             outln!("  callees:");
             emit_edges(&entry.callees);
         }
+        store.warn_incomplete()?;
     }
     Ok(())
 }

@@ -1572,6 +1572,17 @@ async fn mcp_stacked_graph_tools_merge_delta_with_zero_writes_and_refuse_legacy_
         "impact must mask the caller the delta removed: {impact}"
     );
 
+    // The lane's incompleteness warning has one owner (`StackedStore::attach_incompleteness`),
+    // so MCP says what the CLI says: the same sentence, naming the unsynced edit.
+    let walk = structured(&impact)["walk_incomplete"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        walk.contains("edited file(s) are not in the stacked delta yet")
+            && walk.contains("unsynced.rs"),
+        "impact over a lagging lane must name the edit it does not cover: {impact}"
+    );
+
     let search = call(
         &slot,
         "devmap_search",

@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_json, emit_truncation, open_for_read};
+use crate::output::{emit_truncation, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Literals")]
@@ -24,9 +24,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let store = open_for_read(cli)?;
     let report = store.engine().literals(query, *exact, *budget)?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_literals(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

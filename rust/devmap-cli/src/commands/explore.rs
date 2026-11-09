@@ -2,7 +2,7 @@ use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
 use crate::output::{
-    emit_blast_radius, emit_json, emit_scope, emit_truncation, emit_unavailable, open_for_read,
+    emit_blast_radius, emit_scope, emit_truncation, emit_unavailable, open_for_read,
 };
 
 #[derive(clap::Args)]
@@ -53,9 +53,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         filter.as_ref(),
     )?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_explore(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

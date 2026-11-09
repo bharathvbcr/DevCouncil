@@ -24,6 +24,30 @@ impl ReadStore {
         }
     }
 
+    /// Print a JSON answer. A lane's answer also carries what it may be missing
+    /// (see [`devmap_query::StackedStore::attach_incompleteness`]), the same
+    /// statement the MCP server makes, so the two transports cannot disagree.
+    pub(crate) fn emit_answer(
+        &self,
+        cli: &Cli,
+        mut answer: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        if let Self::Stacked(stacked) = self {
+            stacked.attach_incompleteness(&mut answer)?;
+        }
+        emit_json(cli, &answer)
+    }
+
+    /// After a human-readable answer: the lane's incompleteness warning, if any.
+    pub(crate) fn warn_incomplete(&self) -> anyhow::Result<()> {
+        if let Self::Stacked(stacked) = self {
+            if let Some(reason) = stacked.incompleteness_reason()? {
+                outln!("warning: {reason}");
+            }
+        }
+        Ok(())
+    }
+
     /// The store, for a command that reads the whole of it. A lane has none to
     /// give, and answering such a command from its base alone would be silent.
     pub(crate) fn require_plain(self) -> anyhow::Result<Store> {
