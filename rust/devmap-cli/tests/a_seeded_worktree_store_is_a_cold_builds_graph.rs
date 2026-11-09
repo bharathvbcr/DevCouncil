@@ -768,3 +768,62 @@ fn a_lane_refuses_the_commands_that_read_the_whole_store_instead_of_answering_fr
         );
     }
 }
+
+/// The `dead` rows' symbol names.
+fn dead_names(dead: &Value) -> Vec<String> {
+    dead["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a dead answer has an items list: {dead}"))
+        .iter()
+        .filter_map(|row| row["symbol_name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Over a lane, `dead` is the base's list with the delta's edits applied. It
+/// cannot see two things the delta does: a base symbol whose only caller the
+/// delta deleted is dead and is not listed, and a symbol the delta adds with no
+/// caller is dead and is not listed. Either the answer lists them or it says,
+/// in the field the engine already uses for "the producer did not see
+/// everything", that the delta may have made more symbols dead. A silent,
+/// complete-looking list is the failure.
+#[test]
+fn dead_over_a_lane_never_silently_omits_what_the_delta_made_dead() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+
+    let base_dead = json_of(&fx.devmap(&fx.main(), &["--json", "dead"]));
+    assert!(
+        !dead_names(&base_dead).iter().any(|n| n.contains("alpha")),
+        "the fixture's alpha has a caller in the base: {base_dead}"
+    );
+
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    // (a) b.py held the only caller of alpha; the lane deletes it.
+    fs::remove_file(lane.join("src/b.py")).unwrap();
+    // (b) a symbol the delta adds, with no caller.
+    fs::write(
+        lane.join("src/c.py"),
+        "def orphan_added_by_the_delta():\n    return 3\n",
+    )
+    .unwrap();
+    let sync_out = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(sync_out.status.success(), "{}", stderr(&sync_out));
+
+    let dead = json_of(&fx.devmap(&lane, &["--json", "dead"]));
+    let names = dead_names(&dead);
+    let marked = dead["walk_incomplete"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("delta"));
+    for (case, name) in [
+        ("the delta deleted the only caller", "alpha"),
+        ("the delta added a symbol with no caller", "orphan_added_by_the_delta"),
+    ] {
+        assert!(
+            names.iter().any(|n| n.contains(name)) || marked,
+            "{case}: `dead` over the lane neither lists {name} nor says the delta may have made \
+             more symbols dead: {dead}"
+        );
+    }
+}
