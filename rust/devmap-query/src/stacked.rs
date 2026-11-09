@@ -3458,6 +3458,16 @@ const STALE_LEASE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mil
 /// when the store is gone by then (the lease is live again, nothing retired).
 fn retire_stale_lease(worktree_root: &Path) -> Result<bool> {
     let target_db = store_path(worktree_root);
+    // Retirement deletes the delta, and every write to the delta holds this
+    // lock. The order is delta, then store, then bases.
+    let _delta = lock_delta_writer_at(worktree_root, STALE_LEASE_LOCK_WAIT).with_context(|| {
+        format!(
+            "{} has a store and a stale stack lease, but the delta writer lock on {} is held; \
+             wait for that sync to finish and run `devmap seed --sync-delta` again",
+            worktree_root.display(),
+            stack_delta_path(worktree_root).display()
+        )
+    })?;
     let _writer = lock_store_writer_at(&target_db, STALE_LEASE_LOCK_WAIT).with_context(|| {
         format!(
             "{} has a store and a stale stack lease, but the writer lock on {} is held; \
