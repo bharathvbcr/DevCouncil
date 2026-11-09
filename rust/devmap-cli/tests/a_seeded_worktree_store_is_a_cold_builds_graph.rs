@@ -827,3 +827,89 @@ fn dead_over_a_lane_never_silently_omits_what_the_delta_made_dead() {
         );
     }
 }
+
+/// The sentence `walk_incomplete` carries for an edit the delta has not
+/// ingested. The MCP server says the same thing; both are one function.
+const UNSYNCED: &str = "edited file(s) are not in the stacked delta yet";
+
+/// A lane answers from a base plus a delta that a detached hook syncs. When the
+/// hook lags, every rerouted CLI command must say which edited files its answer
+/// does not cover, in `--json` and in the human output, and the commands that
+/// do not go through the engine's freshness exit (`literals`, `doc-drift`,
+/// `savings`) must also carry the delta's freshness stamp.
+#[test]
+fn every_rerouted_cli_command_names_the_edits_a_lane_answer_does_not_cover() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+
+    // One synced edit, so the lane has a delta, then one the hook has not synced.
+    fs::write(
+        lane.join("src/a.py"),
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n\n\ndef synced_delta_fn():\n    return beta()\n",
+    )
+    .unwrap();
+    let sync_out = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(sync_out.status.success(), "{}", stderr(&sync_out));
+    fs::write(
+        lane.join("src/c.py"),
+        "def unsynced_after_delta():\n    return 'UNSYNCED_LITERAL'\n",
+    )
+    .unwrap();
+
+    let commands: [&[&str]; 12] = [
+        &["impact", "--", "beta"],
+        &["literals", "--", "UNSYNCED_LITERAL"],
+        &["doc-drift"],
+        &["savings"],
+        &["search", "--", "alpha"],
+        &["explore", "--", "alpha"],
+        &["deps", "--", "src/a.py"],
+        &["dead"],
+        &["clones"],
+        &["neighbors", "--", "beta"],
+        &["skeleton", "--", "src/a.py"],
+        &["affected", "--", "beta"],
+    ];
+    for args in commands {
+        let mut json_args = vec!["--json"];
+        json_args.extend_from_slice(args);
+        let answer = json_of(&fx.devmap(&lane, &json_args));
+        let walk = answer["walk_incomplete"].as_str().unwrap_or_default();
+        assert!(
+            walk.contains(UNSYNCED) && walk.contains("src/c.py"),
+            "`devmap {args:?}` over a lagging lane must say which edit it does not cover: {answer}"
+        );
+
+        let human = fx.devmap(&lane, args);
+        assert!(human.status.success(), "{}", stderr(&human));
+        let text = String::from_utf8_lossy(&human.stdout);
+        assert!(
+            text.contains(UNSYNCED) && text.contains("src/c.py"),
+            "`devmap {args:?}` human output must print the same warning: {text}"
+        );
+    }
+
+    for args in [&["literals", "--", "UNSYNCED_LITERAL"][..], &["doc-drift"], &["savings"]] {
+        let mut json_args = vec!["--json"];
+        json_args.extend_from_slice(args);
+        let answer = json_of(&fx.devmap(&lane, &json_args));
+        assert!(
+            answer["source_freshness"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("stacked delta")),
+            "`devmap {args:?}` must carry the delta's freshness stamp: {answer}"
+        );
+    }
+
+    // A plain (non-lane) store's answers are untouched.
+    let plain = json_of(&fx.devmap(&fx.main(), &["--json", "impact", "--", "beta"]));
+    assert!(
+        plain["walk_incomplete"]
+            .as_str()
+            .is_none_or(|reason| !reason.contains("stacked")),
+        "{plain}"
+    );
+}
