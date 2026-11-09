@@ -768,4 +768,27 @@ mod tests {
         assert!(json.get("direct").is_none());
         assert!(json.get("dispatch").is_none());
     }
+
+    #[test]
+    fn refuse_ambiguous_dedups_by_node_id_not_by_raw_pair() {
+        use super::refuse_ambiguous;
+        // The same definition reached once bare and once already qualified is
+        // one node, not an ambiguity.
+        let same_node = vec![
+            ("foo".to_string(), "a.rs".to_string()),
+            ("a.rs::foo".to_string(), "a.rs".to_string()),
+        ];
+        assert!(refuse_ambiguous("foo", &same_node).is_ok());
+
+        // Two genuinely distinct ids are still refused, and the candidates
+        // name each id once.
+        let distinct = vec![
+            ("foo".to_string(), "a.rs".to_string()),
+            ("foo".to_string(), "b.rs".to_string()),
+        ];
+        let error = refuse_ambiguous("foo", &distinct)
+            .expect_err("two distinct ids must be refused")
+            .to_string();
+        assert!(error.contains("a.rs::foo, b.rs::foo"), "{error}");
+    }
 }
