@@ -36,8 +36,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use devmap_extract::model::Extraction;
 use devmap_extract::paths::{
-    code_graph_path, compact_code_graph_path, csr_path_for_store, registered_common_git_dir,
-    repo_map_path, same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
+    code_graph_path, compact_code_graph_path, csr_path_for_store, find_legacy_base_store_ref,
+    main_checkout_of, registered_common_git_dir, repo_map_path, repo_root_from_store,
+    same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
 };
 use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
@@ -940,6 +941,69 @@ fn is_tool_state_path(path: &str) -> bool {
         || path.starts_with(".devcouncil/")
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LegacyBaseStoreRef {
+    #[serde(default)]
+    anchor_repo_root: Option<String>,
+    #[serde(default, alias = "base_store_path", alias = "base_sqlite_path")]
+    anchor_db_path: Option<String>,
+}
+
+/// Inspect `<worktree_root>/<state>/codeintel/base_store_ref.json` (if present)
+/// and return the registered anchor checkout root it names when that checkout
+/// is a different registered worktree of the same repository and has a store.
+/// A hint for the refusal's upgrade command: it only reads, and every failure
+/// is "no hint", never a reason to trust the pointer.
+pub fn legacy_base_store_anchor_root(worktree_root: &Path) -> Option<PathBuf> {
+    let ref_path = find_legacy_base_store_ref(worktree_root)?;
+    let meta = fs::symlink_metadata(&ref_path).ok()?;
+    if !meta.is_file() || meta.len() > 64 * 1024 {
+        return None;
+    }
+    let raw = fs::read_to_string(&ref_path).ok()?;
+    let parsed: LegacyBaseStoreRef = serde_json::from_str(&raw).ok()?;
+    let anchor_raw = parsed
+        .anchor_repo_root
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            parsed
+                .anchor_db_path
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|p| repo_root_from_store(Path::new(&p)))
+        })?;
+    let anchor_canon = anchor_raw.canonicalize().ok()?;
+    let wt_canon = worktree_root.canonicalize().ok()?;
+    if anchor_canon == wt_canon || !same_registered_repo(&anchor_canon, &wt_canon) {
+        return None;
+    }
+    store_path(&anchor_canon).is_file().then_some(anchor_canon)
+}
+
+/// Fail closed on a retired `base_store_ref.json` pointer without writing or
+/// upgrading anything on a read. A lane that has a store or a lease is served
+/// by those, so the pointer is moot and this answers `Ok`.
+pub fn refuse_legacy_base_store_ref(worktree_root: &Path) -> Result<()> {
+    let wt_canon = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    if store_path(&wt_canon).is_file() || stack_lease_path(&wt_canon).is_file() {
+        return Ok(());
+    }
+    let Some(ref_path) = find_legacy_base_store_ref(&wt_canon) else {
+        return Ok(());
+    };
+    let donor_hint = legacy_base_store_anchor_root(&wt_canon)
+        .or_else(|| main_checkout_of(&wt_canon))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<main>".to_string());
+    bail!(
+        "retired legacy worktree pointer {} is no longer accepted on read; \
+         run `devmap seed --stacked --from {donor_hint}` (or `devmap build --manifest`) to upgrade",
+        ref_path.display()
+    )
+}
+
 /// Refuse unless `source`'s `HEAD` is `expected_head` and its tracked and
 /// untracked files are clean against it (tool-owned state excepted).
 fn assert_donor_is_clean_head(source: &Path, expected_head: &str) -> Result<()> {
@@ -1426,6 +1490,7 @@ impl StackedStore {
     /// recovery command.
     pub fn open_if_leased(worktree_root: &Path) -> Result<Option<Self>> {
         if !stack_lease_path(worktree_root).is_file() {
+            refuse_legacy_base_store_ref(worktree_root)?;
             return Ok(None);
         }
         if store_path(worktree_root).is_file() {
@@ -5162,6 +5227,106 @@ mod tests {
         drop(d);
         let r = DeltaStore::open_read_only(dir.join("delta.sqlite")).unwrap().expect("exists");
         assert_eq!(r.dirty_file_count().unwrap(), 2, "an orphan journal altered the recreated delta");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Every file under `dir` with its bytes, for "nothing was written" checks.
+    #[cfg(feature = "parse")]
+    fn state_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(d) = pending.pop() {
+            for entry in fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    out.push((path.clone(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn legacy_base_store_ref_is_cleanly_refused_without_silent_upgrade() {
+        let root = temp_repo_dir("legacy-ref-refused");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        // Two plain lanes: no lease, no store, so the pointer is all there is.
+        let lane_a = add_lane(&anchor, &root, "lane-a");
+        let lane_b = add_lane(&anchor, &root, "lane-b");
+        let anchor_canon = anchor.canonicalize().unwrap();
+
+        // A pointer at an unrelated repository resolves to no hint, and the
+        // refusal still names the upgrade command.
+        let unrelated = root.join("unrelated");
+        seed_indexed_git_repo(&unrelated);
+        let ref_a = lane_a.join(".devcouncil/codeintel/base_store_ref.json");
+        fs::create_dir_all(ref_a.parent().unwrap()).unwrap();
+        fs::write(
+            &ref_a,
+            serde_json::to_vec(&serde_json::json!({
+                "anchor_repo_root": unrelated.canonicalize().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(legacy_base_store_anchor_root(&lane_a).is_none());
+        let before = state_snapshot(&lane_a.join(".devcouncil"));
+        let err = StackedStore::open_if_leased(&lane_a)
+            .expect_err("a legacy pointer must be refused")
+            .to_string();
+        assert!(err.contains("retired legacy worktree pointer"), "{err}");
+        assert!(err.contains("devmap seed --stacked --from"), "{err}");
+        assert_eq!(state_snapshot(&lane_a.join(".devcouncil")), before);
+        assert!(!stack_lease_path(lane_a.canonicalize().unwrap()).exists());
+        assert!(!stack_delta_path(lane_a.canonicalize().unwrap()).exists());
+        assert!(!store_path(lane_a.canonicalize().unwrap()).exists());
+
+        // A pointer at the sibling anchor puts that exact path in the command.
+        fs::write(
+            &ref_a,
+            serde_json::to_vec(&serde_json::json!({ "anchor_repo_root": &anchor_canon })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_base_store_anchor_root(&lane_a),
+            Some(anchor_canon.clone())
+        );
+        let err = StackedStore::open_if_leased(&lane_a)
+            .expect_err("a sibling pointer must still be refused")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "devmap seed --stacked --from {}",
+                anchor_canon.display()
+            )),
+            "{err}"
+        );
+
+        // The `.devmap` spelling and the `base_store_path` field are refused too.
+        let ref_b = lane_b.join(".devmap/codeintel/base_store_ref.json");
+        fs::create_dir_all(ref_b.parent().unwrap()).unwrap();
+        fs::write(
+            &ref_b,
+            serde_json::to_vec(&serde_json::json!({
+                "base_store_path": store_path(&anchor_canon),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = StackedStore::open_if_leased(&lane_b)
+            .expect_err("the .devmap pointer must be refused")
+            .to_string();
+        assert!(err.contains("devmap seed --stacked --from"), "{err}");
+
+        // A lane that has a lease is served by it; the stale pointer is moot.
+        provision_stacked_worktree(&anchor, &lane_a).unwrap();
+        assert!(StackedStore::open_if_leased(&lane_a).unwrap().is_some());
+
         let _ = remove_readonly_tree(&root);
     }
 }

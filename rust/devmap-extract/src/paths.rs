@@ -205,6 +205,21 @@ pub fn stack_delta_path(root: impl AsRef<Path>) -> PathBuf {
     join_rel(state_dir(root), STACK_DELTA_RELPATH)
 }
 
+/// Retired Phase 1 worktree base-store pointer relative to the state directory.
+pub const LEGACY_BASE_STORE_REF_RELPATH: &str = "codeintel/base_store_ref.json";
+
+/// Locate a retired `base_store_ref.json` pointer file in `root` across either
+/// `.devmap`, `.devcouncil`, or `$DEVMAP_HOME`, if present.
+pub fn find_legacy_base_store_ref(root: impl AsRef<Path>) -> Option<PathBuf> {
+    let root = root.as_ref();
+    let candidates = [
+        join_rel(state_dir(root), LEGACY_BASE_STORE_REF_RELPATH),
+        join_rel(root.join(STATE_DIR), LEGACY_BASE_STORE_REF_RELPATH),
+        join_rel(root.join(LEGACY_STATE_DIR), LEGACY_BASE_STORE_REF_RELPATH),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 /// Path to the `<store>.csr` mmap sidecar accompanying `store`.
 pub fn csr_path_for_store(store: impl AsRef<Path>) -> PathBuf {
     let mut name = store.as_ref().as_os_str().to_owned();
