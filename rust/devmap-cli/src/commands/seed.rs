@@ -181,52 +181,90 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             source_store.display()
         );
     }
-    if target_db.exists() {
-        bail!(
-            "devmap seed: target store {} already exists",
-            target_db.display()
-        );
-    }
+    ensure_target_absent(&target_db)?;
     if let Some(parent) = target_db.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
 
     let _writer = Store::lock_writer_at(&target_db, Store::WRITER_LOCK_WAIT)?;
+    // Another seed may have placed the store while this one waited.
+    ensure_target_absent(&target_db)?;
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
     seed::discard_staged(&staged);
-    let method = (|| -> anyhow::Result<SeedMethod> {
+    let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
         let m = seed::stage_seed_healing_wal(&source_store, &staged)
             .with_context(|| format!("cannot seed from {}", source_store.display()))?;
         seed::rebind_staged(&staged, &root)?;
-        Store::open(&staged)
+        let staged_store = Store::open(&staged)
             .with_context(|| "the seeded store cannot be opened by this devmap".to_string())?;
+        if let Some(damage) = staged_store.search_index_unreadable()? {
+            bail!(
+                "the donor devmap store {} has a damaged search index ({damage}); run `devmap build --full` on {} before seeding",
+                source_store.display(),
+                source.display(),
+            );
+        }
+        let tree_matches_donor = staged_store.latest_generation_matches_working_tree()?
+            && staged_store
+                .latest_budget_refusals()?
+                .is_none_or(|refused| refused.total == 0);
+        if tree_matches_donor {
+            // The lane's tree is the donor's, so its graph is the donor's; only
+            // the HEAD it is stamped with can differ. A HEAD that cannot be read
+            // is a refusal: placing a store under the donor's stamp would read
+            // as stale or as another commit's.
+            let lane_head = devmap_store::current_git_head(&root).with_context(|| {
+                format!(
+                    "cannot read the HEAD of {} to stamp the seeded store",
+                    root.display()
+                )
+            })?;
+            if staged_store.latest_generation_head_sha()?.as_deref() != Some(lane_head.as_str()) {
+                staged_store.restamp_latest_head(&lane_head)?;
+            }
+            let src_csr = csr_path_for_store(&source_store);
+            if src_csr.is_file() {
+                drop(staged_store);
+                seed::seed_artifact(&src_csr, &csr_path_for_store(&staged)).with_context(|| {
+                    format!("cannot stage CSR sidecar from {}", src_csr.display())
+                })?;
+            } else {
+                staged_store.write_latest_csr_sidecar_strict()?;
+                drop(staged_store);
+            }
+        } else {
+            drop(staged_store);
+            seed_resolution_reuse_dirs(&source, &root);
+            crate::commands::build::build_staged_seed_store(&staged, &root)?;
+            // The staged build took its own writer lock; it is private to this
+            // pid and released, so it is removed rather than left beside the store.
+            seed::remove_staged_writer_lock(&staged)?;
+        }
         seed::settle_staged(&staged)?;
-        std::fs::rename(&staged, &target_db)
-            .with_context(|| format!("cannot place {}", target_db.display()))?;
-        Ok(m)
+        place_staged(&staged, &target_db)?;
+        Ok((m, tree_matches_donor))
     })();
-    let method = match method {
-        Ok(m) => m,
+    let (method, tree_matches_donor) = match staged_outcome {
+        Ok(pair) => pair,
         Err(err) => {
             seed::discard_staged(&staged);
             return Err(err);
         }
     };
 
-    let src_csr = csr_path_for_store(&source_store);
-    if src_csr.is_file() {
-        let _ = seed::seed_artifact(&src_csr, &csr_path_for_store(&target_db));
-    }
-    // The store is placed: nothing after this point may fail the command. A
-    // missing artifact or reuse cache costs the next manifest a full write,
-    // never correctness, so it is a named note, not an error that would leave a
-    // placed store behind a non-zero exit.
-    if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
-        eprintln!(
-            "devmap seed: store placed at {}, but derived artifacts were not seeded (the next manifest is written in full): {error:#}",
-            target_db.display()
-        );
+    // The store is placed: nothing after this point may fail the command. When
+    // the lane's tree matched the donor's, seed consumer artifacts and reuse
+    // caches as a best-effort note; when the lane diverged, `resolution-reuse-*`
+    // was already seeded and updated during the staged incremental build, and
+    // donor artifacts would describe the wrong tree.
+    if tree_matches_donor {
+        if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
+            eprintln!(
+                "devmap seed: store placed at {}, but derived artifacts were not seeded (the next manifest is written in full): {error:#}",
+                target_db.display()
+            );
+        }
     }
 
     let elapsed_ms = started.elapsed().as_millis();
@@ -275,15 +313,27 @@ impl<'a> StagedSeed<'a> {
         &self.staged_db
     }
 
-    pub(crate) fn commit(mut self, progress: &ProgressReporter) -> anyhow::Result<Store> {
-        seed::settle_staged(&self.staged_db)?;
-        std::fs::rename(&self.staged_db, &self.final_db)
-            .with_context(|| format!("cannot place {}", self.final_db.display()))?;
-        self.committed = true;
-        let src_csr = csr_path_for_store(&self.plan.source_store);
-        if src_csr.is_file() {
-            let _ = seed::seed_artifact(&src_csr, &csr_path_for_store(&self.final_db));
+    /// Place the staged store (and its CSR sidecar) at the final path.
+    ///
+    /// `tree_matches_donor` says the staged store still describes the donor's
+    /// tree, so the donor's CSR sidecar is its CSR too. A store that was built
+    /// further carries its own sidecar, written before this call.
+    pub(crate) fn commit(
+        mut self,
+        progress: &ProgressReporter,
+        tree_matches_donor: bool,
+    ) -> anyhow::Result<Store> {
+        if tree_matches_donor {
+            let src_csr = csr_path_for_store(&self.plan.source_store);
+            if src_csr.is_file() {
+                seed::seed_artifact(&src_csr, &csr_path_for_store(&self.staged_db)).with_context(
+                    || format!("cannot stage CSR sidecar from {}", src_csr.display()),
+                )?;
+            }
         }
+        seed::settle_staged(&self.staged_db)?;
+        place_staged(&self.staged_db, &self.final_db)?;
+        self.committed = true;
         self.plan.seed_artifacts(progress);
         Store::open(&self.final_db)
             .with_context(|| format!("cannot reopen placed store {}", self.final_db.display()))
@@ -398,18 +448,7 @@ impl Plan {
     }
 
     fn seed_resolution_reuse(&self) {
-        let src_state = state_dir(&self.main);
-        let dst_state = state_dir(&self.root);
-        if let Ok(entries) = std::fs::read_dir(&src_state) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if let Some(name_str) = name.to_str() {
-                    if name_str.starts_with("resolution-reuse-") && entry.path().is_dir() {
-                        let _ = seed::seed_directory_cow(&entry.path(), &dst_state.join(name_str));
-                    }
-                }
-            }
-        }
+        seed_resolution_reuse_dirs(&self.main, &self.root);
     }
 
     /// Clone the main checkout's manifest artifacts beside the placed store so
@@ -454,4 +493,78 @@ impl Plan {
         seed::settle_staged(staged)?;
         Ok(method)
     }
+}
+
+/// Clone `source_root`'s `resolution-reuse-*` directories into `target_root`'s
+/// state directory. Best-effort: a cache that did not seed costs a cold resolve.
+fn seed_resolution_reuse_dirs(source_root: &Path, target_root: &Path) {
+    let src_state = state_dir(source_root);
+    let dst_state = state_dir(target_root);
+    if let Ok(entries) = std::fs::read_dir(&src_state) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(name_str) = name.to_str() {
+                if name_str.starts_with("resolution-reuse-") && entry.path().is_dir() {
+                    let _ = seed::seed_directory_cow(&entry.path(), &dst_state.join(name_str));
+                }
+            }
+        }
+    }
+}
+
+/// Refuse a target that is present in any form, a dangling symlink included
+/// (`exists()` follows it and calls it absent). A target that cannot be
+/// inspected is a refusal, not an absence.
+fn ensure_target_absent(target_db: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(target_db) {
+        Ok(_) => bail!(
+            "devmap seed: target store {} already exists",
+            target_db.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", target_db.display())),
+    }
+}
+
+/// Place a settled staged store, and its CSR sidecar when it has one, at
+/// `final_db`, which must be absent and whose writer lock the caller holds.
+///
+/// Orphaned `-wal` / `-shm` beside the absent `final_db` are swept first so
+/// SQLite cannot replay stale frames onto the placed store. The sidecar goes
+/// first and is withdrawn if the store then fails to place, so a store is never
+/// paired with a sidecar of another generation, and no step's failure is dropped.
+fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
+    ensure_target_absent(final_db)?;
+    seed::remove_file_if_present(&seed::sidecar(final_db, "-wal"))?;
+    seed::remove_file_if_present(&seed::sidecar(final_db, "-shm"))?;
+    let staged_csr = csr_path_for_store(staged_db);
+    let final_csr = csr_path_for_store(final_db);
+    let placed_csr = match std::fs::symlink_metadata(&staged_csr) {
+        Ok(meta) if meta.is_file() => {
+            std::fs::rename(&staged_csr, &final_csr)
+                .with_context(|| format!("cannot place CSR sidecar {}", final_csr.display()))?;
+            true
+        }
+        Ok(_) => bail!(
+            "staged CSR sidecar {} is not a regular file",
+            staged_csr.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", staged_csr.display()))
+        }
+    };
+    if let Err(error) = std::fs::rename(staged_db, final_db) {
+        let error =
+            anyhow::Error::new(error).context(format!("cannot place {}", final_db.display()));
+        if placed_csr {
+            if let Err(rollback) = seed::remove_file_if_present(&final_csr) {
+                return Err(error.context(format!(
+                    "and the CSR sidecar placed before it could not be withdrawn: {rollback:#}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }

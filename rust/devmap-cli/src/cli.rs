@@ -274,7 +274,7 @@ pub(crate) enum ProgressMode {
 /// Supplying *any* of the three switches the whole set to caller-supplied: a run
 /// that mixed one caller digest with two of its own would stamp an identity no
 /// single snapshot of the tree ever had.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, Default, clap::Args)]
 pub(crate) struct StampFlags {
     /// Caller-computed `generated_head` (`git rev-parse HEAD`).
     #[arg(long)]
@@ -315,8 +315,20 @@ pub(crate) struct InventoryFlags {
     #[arg(long)]
     no_untracked: bool,
     /// Inventory ceiling (`indexing.max_indexed_files`).
-    #[arg(long, default_value_t = 50_000)]
+    #[arg(long, default_value_t = DEFAULT_MAX_INDEXED_FILES)]
     max_indexed_files: usize,
+}
+
+const DEFAULT_MAX_INDEXED_FILES: usize = 50_000;
+
+impl Default for InventoryFlags {
+    /// The flags as clap fills them when none is given.
+    fn default() -> Self {
+        Self {
+            no_untracked: false,
+            max_indexed_files: DEFAULT_MAX_INDEXED_FILES,
+        }
+    }
 }
 
 impl From<InventoryFlags> for InventoryLimits {
@@ -335,7 +347,7 @@ impl From<InventoryFlags> for InventoryLimits {
 /// a budget degrades the affected candidate lists and records a
 /// `coverage_gaps.resolution_budget` row saying what was capped, unless
 /// `--refuse-on-resolve-limit` asks for the old refusal.
-#[derive(Debug, Clone, Copy, clap::Args)]
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub(crate) struct ResolveLimitFlags {
     /// Most candidate-table entries resolution may visit looking up bare names.
     #[arg(long, value_name = "N")]

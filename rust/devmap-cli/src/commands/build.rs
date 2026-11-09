@@ -20,7 +20,7 @@ use crate::output::{emit_json, ensure_parent};
 use crate::progress;
 use crate::reporter::ProgressReporter;
 
-#[derive(clap::Args)]
+#[derive(Clone, clap::Args)]
 #[group(id = "Build")]
 pub(crate) struct Args {
     #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
@@ -158,10 +158,88 @@ pub(crate) fn run(
     progress: Option<&ProgressReporter>,
     args: &Args,
 ) -> anyhow::Result<()> {
-    run_build(cli, progress, args).map_err(|error| refuse_if_damaged(&cli.db(), error))
+    let request = BuildRequest {
+        cli,
+        args,
+        emit_output: true,
+    };
+    run_build(&request, progress).map_err(|error| refuse_if_damaged(&cli.db(), error))
 }
 
-fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> anyhow::Result<()> {
+/// One build to run: where (`cli`: store, root, output mode), what (`args`),
+/// and whether its result is printed.
+///
+/// The one input of [`run_build`], filled in by every caller, so a build the
+/// process starts for itself does not re-enter through argv parsing.
+#[derive(Clone, Copy)]
+pub(crate) struct BuildRequest<'a> {
+    pub(crate) cli: &'a Cli,
+    pub(crate) args: &'a Args,
+    /// `false` for a build whose outcome is the caller's to report, not stdout's.
+    pub(crate) emit_output: bool,
+}
+
+impl Args {
+    /// The arguments of a plain incremental `devmap build` of `root`: every
+    /// flag at its clap default.
+    fn incremental(root: &std::path::Path) -> Self {
+        Self {
+            path: root.to_path_buf(),
+            affected: None,
+            deleted: None,
+            full: false,
+            verify_rows: false,
+            manifest: false,
+            output: None,
+            graph_output: None,
+            guides: false,
+            adopt_guides: false,
+            force: false,
+            lsp: false,
+            seed_from: None,
+            stamps: StampFlags::default(),
+            inventory: InventoryFlags::default(),
+            resolve_limits: ResolveLimitFlags::default(),
+        }
+    }
+}
+
+/// Run a silent incremental build of `root` against a staged seed store
+/// (`<db>.seed-<pid>`) before atomic placement, then write its CSR sidecar.
+pub(crate) fn build_staged_seed_store(
+    staged_db: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let args = Args::incremental(root);
+    let staged_cli = Cli {
+        db: Some(staged_db.to_path_buf()),
+        root: Some(root.to_path_buf()),
+        json: false,
+        progress: crate::cli::ProgressMode::Never,
+        verbose: false,
+        command: crate::cli::Commands::Build(args.clone()),
+    };
+    let reporter = ProgressReporter::new(crate::cli::ProgressMode::Never, false, false);
+    let request = BuildRequest {
+        cli: &staged_cli,
+        args: &args,
+        emit_output: false,
+    };
+    run_build(&request, Some(&reporter)).map_err(|error| refuse_if_damaged(staged_db, error))?;
+    let store = Store::open(staged_db)?;
+    store.write_latest_csr_sidecar_strict()?;
+    Ok(())
+}
+
+fn run_build(
+    request: &BuildRequest<'_>,
+    progress: Option<&ProgressReporter>,
+) -> anyhow::Result<()> {
+    let BuildRequest {
+        cli,
+        args,
+        emit_output,
+    } = *request;
     let Args {
         // Read through `cli.root_hint()` below, which already falls back to
         // this positional when `--root` is absent. Binding it here as well
@@ -576,7 +654,7 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
             store.restamp_latest_head(&head)?;
             let store = if let Some(staged) = staged_seed.take() {
                 drop(store);
-                staged.commit(progress)?
+                staged.commit(progress, true)?
             } else {
                 store
             };
@@ -620,6 +698,9 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
                 .collect();
             drop(_writer);
             progress.up_to_date(generation, file_count);
+            if !emit_output {
+                return Ok(());
+            }
             if cli.json {
                 // Built through `serde_json` and carrying `timings`,
                 // like every other build result.
@@ -1102,8 +1183,12 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     }
 
     let store = if let Some(staged) = staged_seed.take() {
+        // The staged store holds this lane's own generation, so its CSR is
+        // written from it, strictly, before placement; the donor's would be
+        // another generation.
+        store.write_latest_csr_sidecar_strict()?;
         drop(store);
-        staged.commit(progress)?
+        staged.commit(progress, false)?
     } else {
         store
     };
@@ -1125,6 +1210,9 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     )?;
     drop(_writer);
     progress.complete(gen_id);
+    if !emit_output {
+        return Ok(());
+    }
     if cli.json {
         let mut result = serde_json::json!({
                 "generation_id": gen_id,

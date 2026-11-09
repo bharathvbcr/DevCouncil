@@ -89,16 +89,41 @@ impl Fingerprint {
     }
 }
 
-/// Remove `path` and its `-wal` / `-shm` / `-journal`. For files this process
-/// staged. A sidecar that is a symlink is unlinked, never followed.
+/// Remove `path` and its `-wal` / `-shm` / `-journal` / `.csr`. For files this
+/// process staged. A sidecar that is a symlink is unlinked, never followed.
+///
+/// The writer lock (`<path>.writer.lock`) is deliberately not on this list:
+/// this function also runs on shared paths (a lane's delta store, a target
+/// store), and unlinking a lock file another process holds an `flock` on splits
+/// the lock in two. A private staged store's lock goes through
+/// [`remove_staged_writer_lock`].
 pub fn discard_staged(path: &Path) {
     for file in [
         path.to_path_buf(),
         sidecar(path, "-wal"),
         sidecar(path, "-shm"),
         sidecar(path, "-journal"),
+        sidecar(path, ".csr"),
     ] {
         let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Remove the writer lock a build took on a private staged store
+/// (`<db>.seed-<pid>`), once that build has released it. The staged name is
+/// this process's alone, so nothing can be waiting on the file. An absent lock
+/// is fine; any other failure is returned.
+pub fn remove_staged_writer_lock(staged: &Path) -> Result<()> {
+    remove_file_if_present(&crate::Store::writer_lock_path(staged))
+}
+
+/// Unlink `path`. A path that is already absent is success; any other failure
+/// is returned, so a caller that needs the file gone is told when it is not.
+pub fn remove_file_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
     }
 }
 
@@ -965,7 +990,10 @@ mod tests {
         std::fs::remove_file(&src).unwrap();
         std::fs::write(&src, b"impostor").unwrap();
         clone_or_copy_file(&held, &tmp.join("dst.bin")).unwrap();
-        assert_eq!(std::fs::read(tmp.join("dst.bin")).unwrap(), b"original bytes");
+        assert_eq!(
+            std::fs::read(tmp.join("dst.bin")).unwrap(),
+            b"original bytes"
+        );
         assert!(
             clone_or_copy_file(&held, &tmp.join("dst.bin")).is_err(),
             "a clone never replaces a name"
@@ -995,7 +1023,11 @@ mod tests {
         std::fs::write(&src, &payload).unwrap();
         let held = std::fs::File::open(&src).unwrap();
         let method = clone_or_copy_file(&held, &dir.join("dst.bin")).unwrap();
-        assert_eq!(method, SeedMethod::Copy, "this volume was expected to have no reflink");
+        assert_eq!(
+            method,
+            SeedMethod::Copy,
+            "this volume was expected to have no reflink"
+        );
         assert_eq!(std::fs::read(dir.join("dst.bin")).unwrap(), payload);
         assert!(
             clone_or_copy_file(&held, &dir.join("dst.bin")).is_err(),
@@ -1064,6 +1096,48 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644));
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discard_staged_removes_the_csr_sidecar_and_never_a_writer_lock() {
+        let tmp = temp_test_dir("discard-csr");
+        let db = tmp.join("devmap.sqlite.seed-1");
+        let lock = Store::writer_lock_path(&db);
+        for file in [
+            db.clone(),
+            sidecar(&db, "-wal"),
+            sidecar(&db, ".csr"),
+            lock.clone(),
+        ] {
+            std::fs::write(&file, b"x").unwrap();
+        }
+        discard_staged(&db);
+        assert!(!db.exists() && !sidecar(&db, "-wal").exists());
+        assert!(
+            !sidecar(&db, ".csr").exists(),
+            "the staged CSR is discarded"
+        );
+        assert!(
+            lock.exists(),
+            "discard_staged runs on shared paths and must not unlink a writer lock"
+        );
+        remove_staged_writer_lock(&db).unwrap();
+        assert!(!lock.exists());
+        remove_staged_writer_lock(&db).expect("an absent lock is success");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn remove_file_if_present_reports_everything_but_absence() {
+        let tmp = temp_test_dir("remove-present");
+        remove_file_if_present(&tmp.join("absent")).expect("absent is success");
+        let dir = tmp.join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(
+            remove_file_if_present(&dir).is_err(),
+            "a failure is surfaced"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
