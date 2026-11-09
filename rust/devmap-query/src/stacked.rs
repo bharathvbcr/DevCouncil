@@ -6902,6 +6902,139 @@ mod tests {
         let _ = remove_readonly_tree(&root);
     }
 
+    /// A lane whose base holds `callees` functions and whose delta holds one file
+    /// per callee, each calling its own: the merge does one base lookup per
+    /// distinct callee.
+    #[cfg(all(feature = "parse", unix))]
+    fn lane_with_a_delta_caller_per_callee(tag: &str, callees: usize) -> (PathBuf, PathBuf) {
+        let base_src: String = (0..callees)
+            .map(|i| format!("pub fn callee_{i}() -> i32 {{ {i} }}\n"))
+            .collect();
+        let (root, _anchor, lane) = lane_over(tag, &[("src/base.rs", base_src.as_str())]);
+        for i in 0..callees {
+            fs::write(
+                lane.join(format!("src/d{i}.rs")),
+                format!("pub fn caller_{i}() -> i32 {{\n    callee_{i}()\n}}\n"),
+            )
+            .unwrap();
+        }
+        a3_sync(&lane);
+        (root, lane)
+    }
+
+    /// A `Cancel` that counts every consultation and, when `trip_at` is set,
+    /// cancels itself at that consultation.
+    #[cfg(all(feature = "parse", unix))]
+    fn counting_cancel(
+        trip_at: Option<usize>,
+    ) -> (crate::cancel::Cancel, Arc<std::sync::atomic::AtomicUsize>) {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flag = crate::cancel::Cancel::new();
+        let handle = flag.clone();
+        let seen = Arc::clone(&checks);
+        let cancel = flag.with_check_probe(move || {
+            let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if trip_at == Some(n) {
+                handle.cancel();
+            }
+        });
+        (cancel, checks)
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn impact_request(query: &str) -> crate::Request<String> {
+        crate::Request {
+            query: query.to_string(),
+            token_budget: 4000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        }
+    }
+
+    /// Cancellation has to reach the merged-edge rebuild. The merge reads every
+    /// base edge and does one FTS lookup per distinct delta callee; a caller that
+    /// has stopped waiting must not leave that running on a blocking thread.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn the_merged_edge_rebuild_consults_cancellation_once_per_callee_lookup() {
+        const CALLEES: usize = 24;
+        let (root, lane) = lane_with_a_delta_caller_per_callee("merge-cancel-count", CALLEES);
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        let (first, first_checks) = counting_cancel(None);
+        crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .with_cancel(first)
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        // The merge is cached now, so this run consults the flag only for the
+        // engine's own work; the difference is what the merge itself consulted.
+        let (second, second_checks) = counting_cancel(None);
+        crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .with_cancel(second)
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        let in_merge = first_checks
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .saturating_sub(second_checks.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            in_merge >= CALLEES,
+            "the merge made {in_merge} cancellation checks for {CALLEES} distinct callee lookups"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_cancelled_merge_returns_cancelled_caches_nothing_and_the_next_call_is_complete() {
+        const CALLEES: usize = 24;
+        let (root, lane) = lane_with_a_delta_caller_per_callee("merge-cancel-trip", CALLEES);
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        // The engine's own consultations, with the merge already cached.
+        let primed = StackedStore::open(&lane).unwrap();
+        primed.generation_edges_with_id().unwrap().unwrap();
+        let (probe, engine_only) = counting_cancel(None);
+        crate::StoreQueryEngine::new(primed.base_store())
+            .with_stacked(Some(&primed))
+            .with_cancel(probe)
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        let engine_only = engine_only.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Trip three consultations past everything the engine does outside the
+        // merge, which lands inside it.
+        let (cancel, _) = counting_cancel(Some(engine_only + 3));
+        let err = crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .with_cancel(cancel)
+            .impact(impact_request("callee_5"))
+            .expect_err("a cancelled merge must not return an answer");
+        assert!(
+            err.downcast_ref::<crate::cancel::QueryCancelled>().is_some(),
+            "the error must be the typed cancellation, got: {err:#}"
+        );
+        assert!(
+            stacked.merged_edges.lock().unwrap().is_none(),
+            "a cancelled merge must not leave a result in the cache"
+        );
+
+        let answer = crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        assert!(
+            answer
+                .items
+                .iter()
+                .any(|edge| edge.source_symbol.contains("caller_5")),
+            "the call after a cancelled merge must hold the full delta: {:?}",
+            answer.items
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
     /// Cost of the merged-`GenerationEdges` rebuild against the MCP per-call
     /// ceiling (`devmap-serve/src/mcp.rs` `CALL_TIMEOUT`, 30 s). Every MCP call
     /// opens a fresh `StackedStore`, so this runs per call while the delta is
