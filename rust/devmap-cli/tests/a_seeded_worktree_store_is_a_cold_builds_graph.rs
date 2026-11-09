@@ -1087,3 +1087,332 @@ fn a_seed_that_fails_at_placement_discards_the_staged_artifact_stamp() {
         "staged files left behind after a failed placement"
     );
 }
+
+/// Every regular file under `dir`: relative path, length, mtime and bytes.
+fn state_snapshot(
+    dir: &Path,
+) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, Vec<u8>)> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                pending.push(path);
+            } else {
+                let rel = path.strip_prefix(dir).unwrap().to_path_buf();
+                out.insert(
+                    rel,
+                    (
+                        meta.len(),
+                        meta.modified().unwrap(),
+                        fs::read(&path).unwrap(),
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
+fn json_of(out: &Output) -> Value {
+    assert!(out.status.success(), "{}", stderr(out));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn stacked_cli_read_commands_merge_delta_without_writing_a_single_byte_and_refuse_legacy_pointer() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    let state = lane.join(".devmap/codeintel");
+    let delta_path = state.join("delta.sqlite");
+    assert!(!delta_path.exists(), "a clean lane has no delta yet");
+
+    // A caller of `beta` that only the delta holds, synced by the explicit write verb.
+    fs::write(
+        lane.join("src/a.py"),
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n\n\ndef stacked_delta_fn():\n    return beta()\n",
+    )
+    .unwrap();
+    let sync_out = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(sync_out.status.success(), "{}", stderr(&sync_out));
+    assert!(delta_path.is_file());
+
+    // An edit that is not synced: a read must not ingest it.
+    fs::write(
+        lane.join("src/c.py"),
+        "def unsynced_after_delta():\n    return 2\n",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let before = state_snapshot(&state);
+
+    let impact = json_of(&fx.devmap(&lane, &["--json", "impact", "--", "beta"]));
+    let callers: Vec<&str> = impact["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["source_symbol"].as_str())
+        .collect();
+    assert!(
+        callers.iter().any(|c| c.contains("stacked_delta_fn")),
+        "impact over a synced lane must list the delta caller: {impact}"
+    );
+    let search = json_of(&fx.devmap(&lane, &["--json", "search", "--", "stacked_delta_fn"]));
+    assert_eq!(search["shown"], 1, "{search}");
+    let unsynced = json_of(&fx.devmap(&lane, &["--json", "search", "--", "unsynced_after_delta"]));
+    assert_eq!(
+        unsynced["shown"], 0,
+        "a read must not sync an edit: {unsynced}"
+    );
+    json_of(&fx.devmap(&lane, &["--json", "explore", "--", "stacked_delta_fn"]));
+    json_of(&fx.devmap(&lane, &["--json", "deps", "--", "src/a.py"]));
+
+    let after = state_snapshot(&state);
+    let changed: Vec<&PathBuf> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "CLI read commands changed a byte or an mtime under the lane's state dir: {changed:?}"
+    );
+    assert!(!state.join("delta.sqlite-wal").exists());
+    assert!(!state.join("delta.sqlite-shm").exists());
+
+    // A retired pointer with no store and no lease is refused by name and nothing is created.
+    let cold = fx.at("cold");
+    let legacy_ref = cold.join(".devmap/codeintel/base_store_ref.json");
+    fs::create_dir_all(legacy_ref.parent().unwrap()).unwrap();
+    fs::write(
+        &legacy_ref,
+        serde_json::json!({"anchor_repo_root": fx.main()}).to_string(),
+    )
+    .unwrap();
+    let legacy_search = fx.devmap(&cold, &["--json", "search", "--", "alpha"]);
+    assert!(!legacy_search.status.success());
+    assert!(
+        stderr(&legacy_search).contains("seed --stacked --from"),
+        "legacy refusal must name the replacement command: {}",
+        stderr(&legacy_search)
+    );
+    assert!(!cold.join(".devmap/codeintel/stack_lease.json").exists());
+    assert!(!cold.join(".devmap/codeintel/delta.sqlite").exists());
+}
+
+#[test]
+fn a_lane_refuses_the_commands_that_read_the_whole_store_instead_of_answering_from_its_base() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+
+    for args in [
+        &["--json", "routes"][..],
+        &["--json", "history"][..],
+        &["--json", "snapshots"][..],
+    ] {
+        let out = fx.devmap(&lane, args);
+        assert!(!out.status.success(), "{args:?} must refuse on a lane");
+        let err = stderr(&out);
+        assert!(
+            err.contains("uses a stacked delta store") && err.contains("devmap build"),
+            "{args:?} must say why and what to run: {err}"
+        );
+    }
+}
+
+/// The `dead` rows' symbol names.
+fn dead_names(dead: &Value) -> Vec<String> {
+    dead["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a dead answer has an items list: {dead}"))
+        .iter()
+        .filter_map(|row| row["symbol_name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Over a lane, `dead` is the base's list with the delta's edits applied. It
+/// cannot see two things the delta does: a base symbol whose only caller the
+/// delta deleted is dead and is not listed, and a symbol the delta adds with no
+/// caller is dead and is not listed. Either the answer lists them or it says,
+/// in the field the engine already uses for "the producer did not see
+/// everything", that the delta may have made more symbols dead. A silent,
+/// complete-looking list is the failure.
+#[test]
+fn dead_over_a_lane_never_silently_omits_what_the_delta_made_dead() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+
+    let base_dead = json_of(&fx.devmap(&fx.main(), &["--json", "dead"]));
+    assert!(
+        !dead_names(&base_dead).iter().any(|n| n.contains("alpha")),
+        "the fixture's alpha has a caller in the base: {base_dead}"
+    );
+
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    // (a) b.py held the only caller of alpha; the lane deletes it.
+    fs::remove_file(lane.join("src/b.py")).unwrap();
+    // (b) a symbol the delta adds, with no caller.
+    fs::write(
+        lane.join("src/c.py"),
+        "def orphan_added_by_the_delta():\n    return 3\n",
+    )
+    .unwrap();
+    let sync_out = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(sync_out.status.success(), "{}", stderr(&sync_out));
+
+    let dead = json_of(&fx.devmap(&lane, &["--json", "dead"]));
+    let names = dead_names(&dead);
+    let marked = dead["walk_incomplete"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("delta"));
+    for (case, name) in [
+        ("the delta deleted the only caller", "alpha"),
+        ("the delta added a symbol with no caller", "orphan_added_by_the_delta"),
+    ] {
+        assert!(
+            names.iter().any(|n| n.contains(name)) || marked,
+            "{case}: `dead` over the lane neither lists {name} nor says the delta may have made \
+             more symbols dead: {dead}"
+        );
+    }
+}
+
+/// The sentence `walk_incomplete` carries for an edit the delta has not
+/// ingested. The MCP server says the same thing; both are one function.
+const UNSYNCED: &str = "edited file(s) are not in the stacked delta yet";
+
+/// A lane answers from a base plus a delta that a detached hook syncs. When the
+/// hook lags, every rerouted CLI command must say which edited files its answer
+/// does not cover, in `--json` and in the human output, and the commands that
+/// do not go through the engine's freshness exit (`literals`, `doc-drift`,
+/// `savings`) must also carry the delta's freshness stamp.
+#[test]
+fn every_rerouted_cli_command_names_the_edits_a_lane_answer_does_not_cover() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+
+    // One synced edit, so the lane has a delta, then one the hook has not synced.
+    fs::write(
+        lane.join("src/a.py"),
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n\n\ndef synced_delta_fn():\n    return beta()\n",
+    )
+    .unwrap();
+    let sync_out = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(sync_out.status.success(), "{}", stderr(&sync_out));
+    fs::write(
+        lane.join("src/c.py"),
+        "def unsynced_after_delta():\n    return 'UNSYNCED_LITERAL'\n",
+    )
+    .unwrap();
+
+    let commands: [&[&str]; 12] = [
+        &["impact", "--", "beta"],
+        &["literals", "--", "UNSYNCED_LITERAL"],
+        &["doc-drift"],
+        &["savings"],
+        &["search", "--", "alpha"],
+        &["explore", "--", "alpha"],
+        &["deps", "--", "src/a.py"],
+        &["dead"],
+        &["clones"],
+        &["neighbors", "--", "beta"],
+        &["skeleton", "--", "src/a.py"],
+        &["affected", "--", "beta"],
+    ];
+    for args in commands {
+        let mut json_args = vec!["--json"];
+        json_args.extend_from_slice(args);
+        let answer = json_of(&fx.devmap(&lane, &json_args));
+        let walk = answer["walk_incomplete"].as_str().unwrap_or_default();
+        assert!(
+            walk.contains(UNSYNCED) && walk.contains("src/c.py"),
+            "`devmap {args:?}` over a lagging lane must say which edit it does not cover: {answer}"
+        );
+
+        let human = fx.devmap(&lane, args);
+        assert!(human.status.success(), "{}", stderr(&human));
+        let text = String::from_utf8_lossy(&human.stdout);
+        assert!(
+            text.contains(UNSYNCED) && text.contains("src/c.py"),
+            "`devmap {args:?}` human output must print the same warning: {text}"
+        );
+    }
+
+    for args in [&["literals", "--", "UNSYNCED_LITERAL"][..], &["doc-drift"], &["savings"]] {
+        let mut json_args = vec!["--json"];
+        json_args.extend_from_slice(args);
+        let answer = json_of(&fx.devmap(&lane, &json_args));
+        assert!(
+            answer["source_freshness"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("stacked delta")),
+            "`devmap {args:?}` must carry the delta's freshness stamp: {answer}"
+        );
+    }
+
+    // A plain (non-lane) store's answers are untouched.
+    let plain = json_of(&fx.devmap(&fx.main(), &["--json", "impact", "--", "beta"]));
+    assert!(
+        plain["walk_incomplete"]
+            .as_str()
+            .is_none_or(|reason| !reason.contains("stacked")),
+        "{plain}"
+    );
+}
+
+/// `dead` over a lane lists the base's abandoned cycles from the base's own
+/// scan. A delta that deletes the cycle's file makes that list false, and the
+/// delta cannot be re-scanned here, so the scan is dropped and the answer says
+/// so, naming the delta.
+#[test]
+fn dead_over_a_lane_does_not_list_a_cycle_the_delta_deleted() {
+    let fx = Fixture::new();
+    let main = fx.main();
+    fs::write(
+        main.join("src/cyc.py"),
+        "def cyc_one():\n    return cyc_two()\n\n\ndef cyc_two():\n    return cyc_three()\n\n\ndef cyc_three():\n    return cyc_one()\n",
+    )
+    .unwrap();
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-qm", "cycle"]);
+    git(&main, &["worktree", "add", "-q", "--detach", "../lane2"]);
+    fx.build_main();
+    let base = json_of(&fx.devmap(&main, &["--json", "dead"]));
+    assert!(
+        base["dead_clusters"].to_string().contains("cyc_one"),
+        "the fixture's cycle is an abandoned cluster in the base: {base}"
+    );
+
+    let lane = fx.at("lane2");
+    let seeded = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seeded.status.success(), "{}", stderr(&seeded));
+    fs::remove_file(lane.join("src/cyc.py")).unwrap();
+    let synced = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(synced.status.success(), "{}", stderr(&synced));
+
+    let dead = json_of(&fx.devmap(&lane, &["--json", "dead"]));
+    assert!(
+        !dead.to_string().contains("cyc_one"),
+        "the deleted cycle is still listed: {dead}"
+    );
+    assert!(
+        dead["dead_clusters_incomplete"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("delta") && reason.contains("src/cyc.py")),
+        "the answer must say the cluster scan was dropped, naming the delta: {dead}"
+    );
+}

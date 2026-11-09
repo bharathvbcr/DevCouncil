@@ -27,17 +27,19 @@
 //! under the writer lock and answers `None`; provision refuses a lane that has
 //! a store.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use devmap_extract::model::Extraction;
+use devmap_extract::model::{Extraction, WiringKind};
 use devmap_extract::paths::{
-    code_graph_path, compact_code_graph_path, csr_path_for_store, registered_common_git_dir,
-    repo_map_path, same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
+    code_graph_path, compact_code_graph_path, csr_path_for_store, find_legacy_base_store_ref,
+    main_checkout_of, registered_common_git_dir, repo_map_path, repo_root_from_store,
+    same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
 };
 use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
@@ -47,12 +49,20 @@ use devmap_store::seed::{
     promote_immutable_base_to_store, read_file_at, seed_artifact, seed_directory_cow,
     set_file_readonly, set_file_writable, stage_seed_healing_wal,
 };
-use devmap_store::{Store, StoredSymbol};
+use devmap_resolve::model::LangFamily;
+use devmap_store::{
+    CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
+    StoredEdge, StoredFile, StoredSymbol,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::write_atomic;
 use crate::cas::{blake3_hash, CAS_TOMBSTONE};
+use crate::engine::traversal::node_id_of;
 use crate::overlay::{OverlayEdge, RoaringBitmap, WorktreeOverlay};
+
+/// `(generation, repository root, [(path, language)])`: the file list a scope resolves against.
+pub type ScopeInputs = (u32, Option<String>, Vec<(String, String)>);
 
 /// Format of both the lease and the published manifest. 2 moved the base into
 /// the lane (`stack/`); a v1 lease named a shared cache entry.
@@ -300,17 +310,97 @@ fn now_unix_ms() -> u64 {
 /// How long provision and GC wait for each other before failing closed.
 pub const BASES_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The writer locks this module takes, in the only order a thread may hold
+/// them: the lane's delta, then its store, then the shared bases directory.
+/// `sync_worktree` holds the delta lock while an auto-rebase takes the store
+/// lock; provision holds the delta lock before the bases lock. A thread that
+/// took them in another order could deadlock against one that took them in
+/// this one, so [`ordered_lock`] asserts the order (debug builds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LockRank {
+    Delta,
+    Store,
+    Bases,
+}
+
+thread_local! {
+    static HELD_LOCK_RANKS: std::cell::RefCell<Vec<LockRank>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A held writer lock and its place in this thread's lock order. The lock is
+/// released before the rank is popped.
+#[derive(Debug)]
+struct OrderedLock {
+    _lock: devmap_store::WriterLock,
+    _rank: RankGuard,
+}
+
+#[derive(Debug)]
+struct RankGuard(LockRank);
+
+impl RankGuard {
+    fn enter(rank: LockRank) -> Self {
+        HELD_LOCK_RANKS.with(|held| {
+            let mut held = held.borrow_mut();
+            debug_assert!(
+                held.last().is_none_or(|last| *last < rank),
+                "lock order violated: taking {rank:?} while holding {held:?} \
+                 (the order is delta, then store, then bases)"
+            );
+            held.push(rank);
+        });
+        Self(rank)
+    }
+}
+
+impl Drop for RankGuard {
+    fn drop(&mut self) {
+        HELD_LOCK_RANKS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(at) = held.iter().rposition(|rank| *rank == self.0) {
+                held.remove(at);
+            }
+        });
+    }
+}
+
+/// Take `acquire`'s lock as `rank`. The order is checked before the call
+/// blocks, so a violation fails instead of waiting out `wait`.
+fn ordered_lock(
+    rank: LockRank,
+    acquire: impl FnOnce() -> Result<devmap_store::WriterLock>,
+) -> Result<OrderedLock> {
+    let guard = RankGuard::enter(rank);
+    let lock = acquire()?;
+    Ok(OrderedLock {
+        _lock: lock,
+        _rank: guard,
+    })
+}
+
+/// The writer lock on `<state>/codeintel/delta.sqlite` for `worktree_root`:
+/// every write to the delta holds it.
+fn lock_delta_writer_at(worktree_root: &Path, wait: std::time::Duration) -> Result<OrderedLock> {
+    let delta_path = stack_delta_path(worktree_root);
+    ordered_lock(LockRank::Delta, || Store::lock_writer_at(&delta_path, wait))
+}
+
+/// The writer lock on the lane's `devmap.sqlite` path.
+fn lock_store_writer_at(store: &Path, wait: std::time::Duration) -> Result<OrderedLock> {
+    ordered_lock(LockRank::Store, || Store::lock_writer_at(store, wait))
+}
+
 /// The exclusive lock on `<common_git_dir>/devmap/bases/.lock`, held by GC for
 /// its whole run and by provision from before publishing until the lease is
 /// written. Bounded; the timeout names the holder's pid.
-fn lock_bases(
-    common_git_dir: &Path,
-    wait: std::time::Duration,
-) -> Result<devmap_store::WriterLock> {
+fn lock_bases(common_git_dir: &Path, wait: std::time::Duration) -> Result<OrderedLock> {
     let bases_dir = bases_root_dir(common_git_dir);
     fs::create_dir_all(&bases_dir)
         .with_context(|| format!("cannot create {}", bases_dir.display()))?;
-    Store::lock_file_at(&bases_dir.join(".lock"), wait)
+    ordered_lock(LockRank::Bases, || {
+        Store::lock_file_at(&bases_dir.join(".lock"), wait)
+    })
 }
 
 pub fn bases_root_dir(common_git_dir: &Path) -> PathBuf {
@@ -940,6 +1030,69 @@ fn is_tool_state_path(path: &str) -> bool {
         || path.starts_with(".devcouncil/")
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LegacyBaseStoreRef {
+    #[serde(default)]
+    anchor_repo_root: Option<String>,
+    #[serde(default, alias = "base_store_path", alias = "base_sqlite_path")]
+    anchor_db_path: Option<String>,
+}
+
+/// Inspect `<worktree_root>/<state>/codeintel/base_store_ref.json` (if present)
+/// and return the registered anchor checkout root it names when that checkout
+/// is a different registered worktree of the same repository and has a store.
+/// A hint for the refusal's upgrade command: it only reads, and every failure
+/// is "no hint", never a reason to trust the pointer.
+pub fn legacy_base_store_anchor_root(worktree_root: &Path) -> Option<PathBuf> {
+    let ref_path = find_legacy_base_store_ref(worktree_root)?;
+    let meta = fs::symlink_metadata(&ref_path).ok()?;
+    if !meta.is_file() || meta.len() > 64 * 1024 {
+        return None;
+    }
+    let raw = fs::read_to_string(&ref_path).ok()?;
+    let parsed: LegacyBaseStoreRef = serde_json::from_str(&raw).ok()?;
+    let anchor_raw = parsed
+        .anchor_repo_root
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            parsed
+                .anchor_db_path
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|p| repo_root_from_store(Path::new(&p)))
+        })?;
+    let anchor_canon = anchor_raw.canonicalize().ok()?;
+    let wt_canon = worktree_root.canonicalize().ok()?;
+    if anchor_canon == wt_canon || !same_registered_repo(&anchor_canon, &wt_canon) {
+        return None;
+    }
+    store_path(&anchor_canon).is_file().then_some(anchor_canon)
+}
+
+/// Fail closed on a retired `base_store_ref.json` pointer without writing or
+/// upgrading anything on a read. A lane that has a store or a lease is served
+/// by those, so the pointer is moot and this answers `Ok`.
+pub fn refuse_legacy_base_store_ref(worktree_root: &Path) -> Result<()> {
+    let wt_canon = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    if store_path(&wt_canon).is_file() || stack_lease_path(&wt_canon).is_file() {
+        return Ok(());
+    }
+    let Some(ref_path) = find_legacy_base_store_ref(&wt_canon) else {
+        return Ok(());
+    };
+    let donor_hint = legacy_base_store_anchor_root(&wt_canon)
+        .or_else(|| main_checkout_of(&wt_canon))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<main>".to_string());
+    bail!(
+        "retired legacy worktree pointer {} is no longer accepted on read; \
+         run `devmap seed --stacked --from {donor_hint}` (or `devmap build --manifest`) to upgrade",
+        ref_path.display()
+    )
+}
+
 /// Refuse unless `source`'s `HEAD` is `expected_head` and its tracked and
 /// untracked files are clean against it (tool-owned state excepted).
 fn assert_donor_is_clean_head(source: &Path, expected_head: &str) -> Result<()> {
@@ -1043,6 +1196,13 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
             source_canon.display()
         )
     })?;
+    // A lane that already has a delta may be mid-sync: wait for that writer
+    // before touching the lane, and before the bases lock (delta, then bases).
+    let _delta_lock = if stack_delta_path(&wt_canon).exists() {
+        Some(lock_delta_writer_at(&wt_canon, Store::WRITER_LOCK_WAIT)?)
+    } else {
+        None
+    };
     let _bases_lock = lock_bases(&common_git_dir, BASES_LOCK_WAIT)?;
     let (published, manifest) = publish_base_snapshot(&source_canon)?;
     let key = BaseKey::of_manifest(&manifest)?;
@@ -1355,6 +1515,9 @@ pub struct StackedStore {
     delta: Option<DeltaStore>,
     delta_writable: bool,
     overlay: WorktreeOverlay,
+    /// The base edge index merged with the delta's edges, built on first use and
+    /// dropped whenever the overlay is rebuilt. Unused while the delta is empty.
+    merged_edges: Mutex<Option<(u32, Arc<GenerationEdges>)>>,
 }
 
 impl std::fmt::Debug for StackedStore {
@@ -1418,6 +1581,7 @@ impl StackedStore {
             delta,
             delta_writable: false,
             overlay,
+            merged_edges: Mutex::new(None),
         })
     }
 
@@ -1426,6 +1590,7 @@ impl StackedStore {
     /// recovery command.
     pub fn open_if_leased(worktree_root: &Path) -> Result<Option<Self>> {
         if !stack_lease_path(worktree_root).is_file() {
+            refuse_legacy_base_store_ref(worktree_root)?;
             return Ok(None);
         }
         if store_path(worktree_root).is_file() {
@@ -1491,11 +1656,175 @@ impl StackedStore {
         &self.overlay
     }
 
+    /// Whether the delta holds any edit or deletion. With none, every engine
+    /// surface is the base's own answer.
+    pub fn has_delta_changes(&self) -> bool {
+        !self.overlay.modified_files.is_empty() || !self.overlay.tombstoned_files.is_empty()
+    }
+
+    /// The freshness stamp of an answer merged over the delta. It is never
+    /// `verified`: the base is a generation behind the tree and the delta covers
+    /// only the files that were synced.
+    pub fn delta_source_freshness(&self) -> crate::model::SourceFreshness {
+        crate::model::SourceFreshness::unverified(format!(
+            "answered over immutable base generation {} merged with {} uncommitted stacked delta file(s) ({} deleted)",
+            self.lease.generation_id,
+            self.overlay.modified_files.len(),
+            self.overlay.tombstoned_files.len()
+        ))
+    }
+
+    /// Why `dead` over this lane may be missing symbols, or `None` when the
+    /// delta changes nothing (the answer is then the base's own).
+    ///
+    /// `dead_page` filters the base's dead rows against the merged edges, so it
+    /// can only ever drop rows the delta resurrected. It cannot add the two
+    /// kinds the delta creates: a base symbol whose only caller the delta edited
+    /// away or deleted, and a symbol the delta adds with no caller. Listing
+    /// them would take the base's exemption rules (entry points, tests,
+    /// visibility) re-applied over the merged graph, so the answer says it is a
+    /// lower bound instead, naming the delta files that can cause it.
+    pub fn dead_lower_bound_reason(&self) -> Option<String> {
+        let delta = self.delta_files_summary()?;
+        Some(format!(
+            "dead symbols over this lane are a lower bound: the stacked delta {delta}, so a base symbol whose only caller the delta removed, and a symbol the delta adds with no caller, may be missing from the list; run `devmap build` for a complete answer"
+        ))
+    }
+
+    /// Why the base's abandoned-cycle scan is not reported over this lane, or
+    /// `None` when the delta changes nothing. The scan is a whole-graph pass
+    /// over the base; a delta that deletes a cycle's file, or adds a caller
+    /// into one, makes its clusters false, and the engine does not re-run it
+    /// over the merged edges, so it is dropped rather than passed through.
+    pub fn dead_clusters_dropped_reason(&self) -> Option<String> {
+        let delta = self.delta_files_summary()?;
+        Some(format!(
+            "abandoned-cycle clusters are not reported over this lane: the base's cluster scan cannot see the stacked delta, which {delta}; run `devmap build` for the cluster list"
+        ))
+    }
+
+    /// "edits or adds N file(s) (..) and deletes M (..)" for the delta, or
+    /// `None` when it changes nothing.
+    fn delta_files_summary(&self) -> Option<String> {
+        if !self.has_delta_changes() {
+            return None;
+        }
+        let mut edited: Vec<String> = self
+            .overlay
+            .modified_files
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let mut deleted: Vec<String> = self
+            .overlay
+            .tombstoned_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        edited.sort();
+        deleted.sort();
+        let name = |files: &[String]| {
+            let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+            format!(
+                "{}{}",
+                shown.join(", "),
+                if files.len() > shown.len() { ", ..." } else { "" }
+            )
+        };
+        Some(format!(
+            "edits or adds {} file(s) ({}) and deletes {} ({})",
+            edited.len(),
+            name(&edited),
+            deleted.len(),
+            name(&deleted)
+        ))
+    }
+
+    /// What a lane answer may be missing, or `None` when it is complete.
+    ///
+    /// A lane answers from an immutable base plus a delta that a detached hook
+    /// syncs, so every answer except `status` (which reports the delta itself)
+    /// can be missing the lane's own edits. This is the one place that says so,
+    /// for the MCP server and the CLI alike: the delta's size, a delta that does
+    /// not exist yet, and the edited files it has not ingested.
+    pub fn incompleteness_reason(&self) -> Result<Option<String>> {
+        let st = self.status()?;
+        let mut reasons = Vec::new();
+        if st.dirty_files > 0 || st.tombstoned_files > 0 {
+            reasons.push(format!(
+                "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges): this answer comes from the immutable base plus whatever the delta covers; run `devmap build --manifest` for full cross-file resolution",
+                st.dirty_files, st.tombstoned_files, st.delta_edges
+            ));
+        }
+        if !self.delta_present() {
+            reasons.push(
+                "this lane has no delta.sqlite yet (no sync has run): its delta is read as empty"
+                    .to_string(),
+            );
+        }
+        match self.unsynced_paths() {
+            Ok(paths) if !paths.is_empty() => {
+                let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+                reasons.push(format!(
+                    "{} edited file(s) are not in the stacked delta yet ({}{}); run `devmap seed --sync-delta` or `devmap build --manifest`",
+                    paths.len(),
+                    shown.join(", "),
+                    if paths.len() > shown.len() { ", ..." } else { "" }
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => reasons.push(format!(
+                "cannot tell whether the stacked delta is current ({err}); run `devmap build --manifest`"
+            )),
+        }
+        Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
+    /// Put [`Self::incompleteness_reason`] on a lane answer's JSON, appended to
+    /// any `walk_incomplete` the producer already gave, and stamp the
+    /// delta's freshness on an answer type that carries none of its own
+    /// (`literals`, `doc_drift`, `savings` do not go through the engine's
+    /// freshness exit). A value that is not an object is left alone.
+    pub fn attach_incompleteness(&self, value: &mut serde_json::Value) -> Result<()> {
+        let reason = self.incompleteness_reason()?;
+        let Some(object) = value.as_object_mut() else {
+            return Ok(());
+        };
+        if let Some(reason) = reason {
+            let existing = object
+                .get("walk_incomplete")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            if let Some(combined) = devmap_analyze::combine_reasons(existing, Some(reason)) {
+                object.insert("walk_incomplete".into(), serde_json::Value::String(combined));
+            }
+        }
+        if self.has_delta_changes() && !object.contains_key("source_freshness") {
+            object.insert(
+                "source_freshness".into(),
+                serde_json::to_value(self.delta_source_freshness())?,
+            );
+        }
+        Ok(())
+    }
+
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
     /// `delta.sqlite` and refresh the `WorktreeOverlay` (`F4`).
     ///
     /// Never invokes regex fallback and never writes to any shared/anchor CAS.
     pub fn record_extracted_file(
+        &mut self,
+        rel_path: &str,
+        source_bytes: &[u8],
+        extraction: &Extraction,
+    ) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.record_extracted_file_locked(rel_path, source_bytes, extraction)
+    }
+
+    /// [`Self::record_extracted_file`] for a caller that holds the delta writer lock.
+    fn record_extracted_file_locked(
         &mut self,
         rel_path: &str,
         source_bytes: &[u8],
@@ -1517,6 +1846,12 @@ impl StackedStore {
     /// Mark `rel_path` as deleted in the worktree's private `delta.sqlite` and
     /// mask all of its base symbols in `WorktreeOverlay` (`F4`).
     pub fn record_deleted_file(&mut self, rel_path: &str) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.record_deleted_file_locked(rel_path)
+    }
+
+    /// [`Self::record_deleted_file`] for a caller that holds the delta writer lock.
+    fn record_deleted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         self.writable_delta()?
             .tombstone_file(&normalized, CAS_TOMBSTONE, now_unix_ms())?;
@@ -1525,6 +1860,12 @@ impl StackedStore {
 
     /// Clear `rel_path` from `delta.sqlite` when it matches the base snapshot again.
     pub fn clear_reverted_file(&mut self, rel_path: &str) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.clear_reverted_file_locked(rel_path)
+    }
+
+    /// [`Self::clear_reverted_file`] for a caller that holds the delta writer lock.
+    fn clear_reverted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         self.writable_delta()?.remove_clean_file(&normalized)?;
         self.reload_overlay()
@@ -1534,6 +1875,13 @@ impl StackedStore {
     /// Tree-sitter frontend (`devmap_extract::extract_file`) — never regex!
     #[cfg(feature = "parse")]
     pub fn sync_file_from_disk(&mut self, rel_path: &str) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.sync_file_from_disk_locked(rel_path)
+    }
+
+    /// [`Self::sync_file_from_disk`] for a caller that holds the delta writer lock.
+    #[cfg(feature = "parse")]
+    fn sync_file_from_disk_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         if devmap_extract::languages::is_ignored_path(&normalized) {
             return Ok(());
@@ -1541,10 +1889,10 @@ impl StackedStore {
         let full = self.worktree_root.join(&normalized);
         match fs::symlink_metadata(&full) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.record_deleted_file(&normalized)
+                self.record_deleted_file_locked(&normalized)
             }
             Err(err) => Err(err).with_context(|| format!("cannot stat {}", full.display())),
-            Ok(meta) if !meta.is_file() => self.record_deleted_file(&normalized),
+            Ok(meta) if !meta.is_file() => self.record_deleted_file_locked(&normalized),
             Ok(_) => {
                 if !devmap_extract::languages::is_indexable_source(&normalized) {
                     return Ok(());
@@ -1558,11 +1906,11 @@ impl StackedStore {
                     let lang = devmap_extract::languages::detect_language(Path::new(&normalized));
                     let key = devmap_extract::cache::CacheKey::for_source(lang, source_str);
                     if key.content_hash == base_file.content_hash {
-                        return self.clear_reverted_file(&normalized);
+                        return self.clear_reverted_file_locked(&normalized);
                     }
                 }
                 let extraction = devmap_extract::extract_file(&normalized, source_str);
-                self.record_extracted_file(&normalized, &bytes, &extraction)
+                self.record_extracted_file_locked(&normalized, &bytes, &extraction)
             }
         }
     }
@@ -1572,6 +1920,11 @@ impl StackedStore {
     /// `devmap.sqlite` when thresholds (`250` dirty files / `16 MiB`) are exceeded.
     #[cfg(feature = "parse")]
     pub fn sync_worktree(&mut self) -> Result<StackedSyncReport> {
+        // The delta writer lock covers the whole sync: the snapshot of what the
+        // delta holds, every row written, and the auto-rebase below (which
+        // takes the store lock under it: delta, then store). Not taken by any
+        // read path.
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
         let changed_paths = git_changed_paths_against_head(&self.worktree_root, &self.base)?;
         let existing_delta: BTreeSet<String> = match &self.delta {
             Some(delta) => delta
@@ -1596,12 +1949,12 @@ impl StackedStore {
                 if !devmap_extract::languages::is_indexable_source(rel_path) {
                     continue;
                 }
-                self.sync_file_from_disk(rel_path)?;
+                self.sync_file_from_disk_locked(rel_path)?;
                 synced_files += 1;
             } else if self.base.latest_path_is_indexed(rel_path)?
                 || existing_delta.contains(rel_path)
             {
-                self.record_deleted_file(rel_path)?;
+                self.record_deleted_file_locked(rel_path)?;
                 deleted_files += 1;
             }
         }
@@ -1610,7 +1963,7 @@ impl StackedStore {
         // or removed after it was synced; it equals the base again.
         for prev in existing_delta {
             if !changed_paths.contains(&prev) {
-                self.clear_reverted_file(&prev)?;
+                self.clear_reverted_file_locked(&prev)?;
                 cleaned_files += 1;
             }
         }
@@ -1714,7 +2067,7 @@ impl StackedStore {
         }
         // Another writer (a build, a drain) may be placing this store: hold the
         // same lock they hold for the whole promotion.
-        let _writer = Store::lock_writer_at(&target_db, wait)?;
+        let _writer = lock_store_writer_at(&target_db, wait)?;
         if fs::symlink_metadata(&target_db).is_ok() {
             bail!(
                 "refusing to materialize over an existing store {}; its stack lease is stale \
@@ -1921,6 +2274,557 @@ impl StackedStore {
         Ok(out)
     }
 
+    pub fn latest_file(&self, rel_path: &str) -> Result<Option<StoredFile>> {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return Ok(None);
+        };
+        let p = Path::new(&normalized);
+        if self.overlay.is_file_tombstoned(p) {
+            return Ok(None);
+        }
+        if let Some(ext) = self.overlay.added_extractions.get(&normalized) {
+            return Ok(Some(StoredFile {
+                path: normalized,
+                language: ext.language.clone(),
+                content_hash: ext.content_hash,
+                parse_outcome: ext.parse_outcome.clone(),
+                engine: ext.engine.clone(),
+            }));
+        }
+        Ok(self.base.latest_file(&normalized)?)
+    }
+
+    pub fn latest_extraction_for_path(&self, rel_path: &str) -> Result<Option<Extraction>> {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return Ok(None);
+        };
+        let p = Path::new(&normalized);
+        if self.overlay.is_file_tombstoned(p) {
+            return Ok(None);
+        }
+        if let Some(ext) = self.overlay.added_extractions.get(&normalized) {
+            return Ok(Some(ext.clone()));
+        }
+        Ok(self.base.latest_extraction_for_path(&normalized)?)
+    }
+
+    /// A unified `GenerationEdges` adjacency: the base's edges that the delta did
+    /// not mask, plus the delta files' own `Contains`, `Calls` and `Imports` edges,
+    /// so every `StoreQueryEngine` traversal (`impact`, `trace`, `neighbors`,
+    /// `explore`, `affected_tests`, `dependencies`, `ask`) sees worktree edits and
+    /// deletions. The merged index is cached until the overlay is rebuilt.
+    ///
+    /// The rebuild reads every base edge and does one base lookup per distinct
+    /// delta callee, so it consults `cancel` as it goes. A cancelled rebuild
+    /// returns [`crate::cancel::QueryCancelled`] and caches nothing: the cache
+    /// is written only with a finished merge.
+    pub fn generation_edges_with_id(
+        &self,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<(u32, Arc<GenerationEdges>)>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.generation_edges_with_id()?);
+        }
+        let mut guard = self
+            .merged_edges
+            .lock()
+            .map_err(|_| anyhow::anyhow!("StackedStore merged_edges mutex poisoned"))?;
+        if let Some((generation, cached)) = guard.as_ref() {
+            return Ok(Some((*generation, Arc::clone(cached))));
+        }
+        let Some((generation, base_index)) = self.base.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let built = Arc::new(merge_generation_edges(
+            &base_index,
+            &self.overlay,
+            &self.base,
+            generation,
+            cancel,
+        )?);
+        *guard = Some((generation, Arc::clone(&built)));
+        Ok(Some((generation, built)))
+    }
+
+    pub fn file_edges(
+        &self,
+        path: &str,
+        min_confidence: f32,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<FileEdges>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.file_edges(path, min_confidence)?);
+        }
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some(file) = self.latest_file(path)? else {
+            return Ok(None);
+        };
+        let Some((generation, index)) = self.generation_edges_with_id(cancel)? else {
+            return Ok(None);
+        };
+        let mut edges = Vec::new();
+        let mut inbound_edges = 0usize;
+        for id in 0..index.len() as u32 {
+            if !index.admits(id, min_confidence) {
+                continue;
+            }
+            if index.source_file(id) == file.path {
+                edges.push(index.stored_edge(id));
+            } else if index.target_file(id) == file.path {
+                inbound_edges += 1;
+            }
+        }
+        edges.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.source_file.cmp(&b.source_file))
+                .then_with(|| a.target_file.cmp(&b.target_file))
+                .then_with(|| a.source_symbol.cmp(&b.source_symbol))
+                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+                .then_with(|| a.edge_kind.cmp(&b.edge_kind))
+        });
+        Ok(Some(FileEdges {
+            generation,
+            file,
+            edges,
+            inbound_edges,
+            analysis: index.analysis().cloned(),
+        }))
+    }
+
+    pub fn all_indexed_files(&self) -> Result<Option<ScopeInputs>> {
+        let Some((gen_id, _root, base_files)) = self.base.latest_scope_inputs()? else {
+            return Ok(None);
+        };
+        let mut by_path: std::collections::BTreeMap<String, String> = base_files
+            .into_iter()
+            .filter(|(p, _)| {
+                let path_ref = Path::new(p);
+                !self.overlay.is_file_tombstoned(path_ref)
+                    && !self.overlay.modified_files.contains_key(path_ref)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            by_path.insert(path.clone(), ext.language.clone());
+        }
+        let wt_root = Some(self.worktree_root.to_string_lossy().into_owned());
+        Ok(Some((gen_id, wt_root, by_path.into_iter().collect())))
+    }
+
+    pub fn all_merged_symbols(&self) -> Result<Option<SearchPage>> {
+        let Some(mut page) = self.base.all_symbols_page()? else {
+            return Ok(None);
+        };
+        page.rows.retain(|sym| {
+            let p = Path::new(&sym.path);
+            !self.overlay.is_file_tombstoned(p)
+                && !self.overlay.modified_files.contains_key(p)
+                && !self.overlay.is_symbol_tombstoned(&sym.qualified_name)
+        });
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(path) {
+                for sym in &ext.symbols {
+                    page.rows.push(StoredSymbol {
+                        name: sym.name.clone(),
+                        qualified_name: sym.qualified_name.clone(),
+                        kind: sym.kind.as_str().to_string(),
+                        path: path.clone(),
+                        span_start: sym.span.start_byte,
+                        span_end: sym.span.end_byte,
+                        is_exported: sym.is_exported,
+                        content_hash: ext.content_hash,
+                    });
+                }
+            }
+        }
+        page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        page.repo_root = Some(self.worktree_root.to_string_lossy().into_owned());
+        Ok(Some(page))
+    }
+
+    pub fn keyword_page(
+        &self,
+        query: &str,
+        pool: usize,
+        filter: Option<&crate::scope::NameQueryFilter>,
+    ) -> Result<Option<SearchPage>> {
+        let Some(mut page) = self.all_merged_symbols()? else {
+            return Ok(None);
+        };
+        let Some((_, root, all_files)) = self.all_indexed_files()? else {
+            return Ok(None);
+        };
+        let corpus_files = u32::try_from(all_files.len()).unwrap_or(u32::MAX);
+        let corpus_symbols = page.total;
+
+        if let Some(filter) = filter {
+            let mut scope_paths = Vec::new();
+            let mut scope_langs = Vec::new();
+            if let Some(scope) = filter.symbol_scope().map_err(anyhow::Error::msg)? {
+                let resolved = scope.resolve(&all_files, root.as_deref())?;
+                scope_paths = resolved.report.paths.clone();
+                scope_langs = resolved.report.languages.clone();
+                page.rows.retain(|row| resolved.contains(&row.path));
+            }
+            let kinds = filter.kinds();
+            if !kinds.is_empty() {
+                let present: BTreeSet<String> =
+                    page.rows.iter().map(|row| row.kind.clone()).collect();
+                let missing: Vec<String> = kinds
+                    .iter()
+                    .filter(|k| !present.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    bail!(crate::scope::missing_kind_message(
+                        &missing,
+                        &present,
+                        !scope_paths.is_empty() || !scope_langs.is_empty()
+                    ));
+                }
+                page.rows.retain(|row| kinds.iter().any(|k| k == &row.kind));
+            }
+            let scoped_files = page
+                .rows
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let scoped_symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+            page.narrowing = Some(SearchNarrowing {
+                paths: scope_paths,
+                languages: scope_langs,
+                kinds: kinds.to_vec(),
+                files: u32::try_from(scoped_files).unwrap_or(u32::MAX),
+                symbols: scoped_symbols,
+                corpus_files,
+                corpus_symbols,
+            });
+        }
+
+        let trimmed = query.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            let terms: Vec<&str> = trimmed
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+                .collect();
+            page.rows.retain(|sym| {
+                let name_l = sym.name.to_ascii_lowercase();
+                let qual_l = sym.qualified_name.to_ascii_lowercase();
+                if terms.is_empty() {
+                    name_l.contains(&trimmed) || qual_l.contains(&trimmed)
+                } else {
+                    terms
+                        .iter()
+                        .all(|term| name_l.contains(term) || qual_l.contains(term))
+                }
+            });
+        }
+
+        page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        page.rows.sort_by(|a, b| {
+            let exact_a = a.name.eq_ignore_ascii_case(&trimmed);
+            let exact_b = b.name.eq_ignore_ascii_case(&trimmed);
+            exact_b
+                .cmp(&exact_a)
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        if page.rows.len() > pool {
+            page.rows.truncate(pool);
+        }
+        Ok(Some(page))
+    }
+
+    pub fn ranking_corpus(
+        &self,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> Result<Option<(SearchPage, Option<crate::scope::ResolvedScope>)>> {
+        let Some(mut page) = self.all_merged_symbols()? else {
+            return Ok(None);
+        };
+        let Some(scope) = scope else {
+            return Ok(Some((page, None)));
+        };
+        let Some((_, root, files)) = self.all_indexed_files()? else {
+            return Ok(None);
+        };
+        let mut resolved = scope.resolve(&files, root.as_deref())?;
+        let corpus_symbols = page.rows.len();
+        page.rows.retain(|row| resolved.contains(&row.path));
+        resolved.report.symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        resolved.report.corpus_symbols = u32::try_from(corpus_symbols).unwrap_or(u32::MAX);
+        page.total = resolved.report.symbols;
+        Ok(Some((page, Some(resolved))))
+    }
+
+    pub fn latest_test_entry_symbols(&self) -> Result<HashSet<String>> {
+        let mut symbols = self.base.latest_test_entry_symbols()?;
+        if !self.has_delta_changes() {
+            return Ok(symbols);
+        }
+        symbols.retain(|sym| {
+            if self.overlay.is_symbol_tombstoned(sym) {
+                return false;
+            }
+            if let Some((file_part, _)) = sym.split_once("::") {
+                let p = Path::new(file_part);
+                if self.overlay.is_file_tombstoned(p) || self.overlay.modified_files.contains_key(p)
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        for ext in self.overlay.added_extractions.values() {
+            for annotation in &ext.wiring {
+                if annotation.kind == WiringKind::RuntimeEntryPoint
+                    && devmap_extract::wiring::is_test_harness_reason(&annotation.details)
+                {
+                    symbols.insert(annotation.target_symbol.clone());
+                }
+            }
+        }
+        Ok(symbols)
+    }
+
+    pub fn dead_page(
+        &self,
+        limit: usize,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<DeadPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.dead_page(limit)?);
+        }
+        let fetch = limit.saturating_add(self.overlay.modified_files.len() * 8 + 64);
+        let Some(mut page) = self.base.dead_page(fetch)? else {
+            return Ok(None);
+        };
+        let edges_opt = self
+            .generation_edges_with_id(cancel)?
+            .map(|(_, idx)| idx);
+        let before_filter = page.rows.len();
+        page.rows.retain(|row| {
+            let p = Path::new(&row.file_path);
+            let qn = node_id_of(&row.file_path, &row.symbol_name);
+            if self.overlay.is_file_tombstoned(p)
+                || self.overlay.modified_files.contains_key(p)
+                || self.overlay.is_symbol_tombstoned(&qn)
+                || self.overlay.is_symbol_tombstoned(&row.symbol_name)
+            {
+                return false;
+            }
+            if let Some(ref idx) = edges_opt {
+                let has_inbound_call = idx
+                    .into_target_symbol(&qn)
+                    .iter()
+                    .chain(idx.into_target_symbol(&row.symbol_name).iter())
+                    .any(|id| {
+                        idx.kind(*id) != devmap_extract::model::EdgeKind::Contains
+                            && idx.source_symbol(*id) != qn
+                            && idx.source_symbol(*id) != row.symbol_name
+                    });
+                if has_inbound_call {
+                    return false;
+                }
+            }
+            true
+        });
+        let removed_count = before_filter.saturating_sub(page.rows.len());
+        page.total_non_exempt = page.total_non_exempt.saturating_sub(removed_count);
+        if page.rows.len() > limit {
+            page.rows.truncate(limit);
+        }
+        Ok(Some(page))
+    }
+
+    pub fn callers_page(
+        &self,
+        targets: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<CallersPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self
+                .base
+                .callers_page(targets, exclude_file, min_confidence)?);
+        }
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some((generation, index)) = self.generation_edges_with_id(cancel)? else {
+            return Ok(None);
+        };
+        let mut callers = Vec::new();
+        let mut total_unfiltered = 0usize;
+        let target_set: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+        for target in target_set {
+            for id in index.into_target_symbol(target) {
+                if index.kind(*id) != devmap_extract::model::EdgeKind::Calls
+                    || index.source_file(*id) == exclude_file
+                {
+                    continue;
+                }
+                total_unfiltered += 1;
+                if index.admits(*id, min_confidence) {
+                    callers.push(index.stored_edge(*id));
+                }
+            }
+        }
+        callers.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+                .then_with(|| left.source_file.cmp(&right.source_file))
+                .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        });
+        Ok(Some(CallersPage {
+            generation,
+            callers,
+            total_unfiltered,
+        }))
+    }
+
+    pub fn latest_parse_failures(&self) -> Result<(usize, Vec<String>)> {
+        let (base_total, base_paths) = self.base.latest_parse_failures()?;
+        if !self.has_delta_changes() {
+            return Ok((base_total, base_paths));
+        }
+        let mut paths: Vec<String> = base_paths
+            .into_iter()
+            .filter(|p| {
+                let pr = Path::new(p);
+                !self.overlay.is_file_tombstoned(pr)
+                    && !self.overlay.modified_files.contains_key(pr)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            if matches!(
+                ext.parse_outcome,
+                devmap_extract::model::ParseOutcome::Failed { .. }
+            ) {
+                paths.push(path.clone());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let total = paths.len();
+        Ok((total, paths))
+    }
+
+    pub fn merged_extractions_cancellable(
+        &self,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Vec<Extraction>> {
+        let mut exts = self
+            .base
+            .latest_extractions_until(&mut || cancel.check().is_err())?
+            .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))?;
+        if !self.has_delta_changes() {
+            return Ok(exts);
+        }
+        exts.retain(|ext| {
+            let p = Path::new(&ext.file_path);
+            !self.overlay.is_file_tombstoned(p) && !self.overlay.modified_files.contains_key(p)
+        });
+        for ext in self.overlay.added_extractions.values() {
+            exts.push(ext.clone());
+        }
+        Ok(exts)
+    }
+
+    pub fn latest_clone_candidates(&self) -> Result<(Vec<devmap_analyze::CloneCandidate>, usize)> {
+        let (mut candidates, mut unsigned) = self.base.latest_clone_candidates()?;
+        if !self.has_delta_changes() {
+            return Ok((candidates, unsigned));
+        }
+        candidates.retain(|cand| {
+            let p = Path::new(&cand.file_path);
+            !self.overlay.is_file_tombstoned(p)
+                && !self.overlay.modified_files.contains_key(p)
+                && !self.overlay.is_symbol_tombstoned(&cand.qualified_name)
+        });
+        let mut dirty_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
+        dirty_paths.sort();
+        for path in dirty_paths {
+            if let Some(ext) = self.overlay.added_extractions.get(path) {
+                for sym in &ext.symbols {
+                    if let Some(sig) = sym.body_signature {
+                        candidates.push(devmap_analyze::CloneCandidate {
+                            file_path: path.clone(),
+                            symbol_name: sym.name.clone(),
+                            qualified_name: sym.qualified_name.clone(),
+                            span_start: sym.span.start_byte,
+                            span_end: sym.span.end_byte,
+                            kind: sym.kind,
+                            exact: sig.exact,
+                            structural: sig.structural,
+                            nodes: sig.nodes,
+                        });
+                    } else {
+                        unsigned += 1;
+                    }
+                }
+            }
+        }
+        Ok((candidates, unsigned))
+    }
+
+    pub fn search_literals(
+        &self,
+        query: &str,
+        exact: bool,
+        page_cap: usize,
+    ) -> Result<Option<devmap_store::LiteralPage>> {
+        if !self.has_delta_changes() {
+            return Ok(self.base.search_literals(query, exact, page_cap)?);
+        }
+        let fetch = page_cap.saturating_add(self.overlay.modified_files.len() * 16 + 64);
+        let Some(base_page) = self.base.search_literals(query, exact, fetch)? else {
+            return Ok(None);
+        };
+        let mut rows: Vec<devmap_store::StoredLiteral> = base_page
+            .rows
+            .into_iter()
+            .filter(|lit| {
+                let p = Path::new(&lit.file_path);
+                !self.overlay.is_file_tombstoned(p) && !self.overlay.modified_files.contains_key(p)
+            })
+            .collect();
+        for (path, ext) in &self.overlay.added_extractions {
+            for lit in &ext.literals {
+                let matched = if exact {
+                    lit.value == query
+                } else {
+                    lit.value.contains(query)
+                };
+                if matched {
+                    rows.push(devmap_store::StoredLiteral {
+                        file_path: path.clone(),
+                        line: lit.line,
+                        span_start: u32::try_from(lit.start_byte).unwrap_or(u32::MAX),
+                        value: lit.value.clone(),
+                        qualified_name: lit.enclosing_qualified_name.clone(),
+                        symbol_name: lit.enclosing_name.clone(),
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.span_start.cmp(&b.span_start))
+        });
+        let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        if rows.len() > page_cap.max(1) {
+            rows.truncate(page_cap.max(1));
+        }
+        Ok(Some(devmap_store::LiteralPage { total, rows }))
+    }
     pub fn status(&self) -> Result<StackedStatus> {
         let delta_bytes = self.delta.as_ref().map_or(0, DeltaStore::bytes_on_disk);
         let dirty_files = self.overlay.modified_files.len();
@@ -1952,8 +2856,467 @@ impl StackedStore {
             &self.base,
             self.delta.as_ref(),
         )?;
+        // The merged edge index was built from the overlay just replaced.
+        *self
+            .merged_edges
+            .get_mut()
+            .map_err(|_| anyhow::anyhow!("StackedStore merged_edges mutex poisoned"))? = None;
         Ok(())
     }
+}
+
+fn bare_tail(symbol: &str) -> Option<&str> {
+    let tail = symbol.rsplit("::").next().unwrap_or(symbol);
+    let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
+struct ImportAliasMaps {
+    /// `local_name -> (module_specifier, imported_name)` from `ExtractedImport::binding_pairs()`.
+    symbol_aliases: BTreeMap<String, (String, String)>,
+    /// `module_alias -> module_specifier` when `imported_names` is empty (excluding `.`).
+    module_aliases: BTreeMap<String, String>,
+}
+
+fn import_alias_maps(ext: &Extraction) -> ImportAliasMaps {
+    let mut symbol_aliases = BTreeMap::new();
+    let mut module_aliases = BTreeMap::new();
+    for imp in &ext.imports {
+        let spec = imp.module_specifier.trim();
+        for (local, imported) in imp.binding_pairs() {
+            let local = local.trim();
+            let imported = imported.trim();
+            if !local.is_empty() && !imported.is_empty() {
+                symbol_aliases.insert(local.to_string(), (spec.to_string(), imported.to_string()));
+            }
+        }
+        if imp.imported_names.is_empty() {
+            if let Some(alias) = imp.alias.as_deref().map(str::trim) {
+                if !alias.is_empty() && alias != "." && !spec.is_empty() {
+                    module_aliases.insert(alias.to_string(), spec.to_string());
+                }
+            }
+        }
+    }
+    ImportAliasMaps {
+        symbol_aliases,
+        module_aliases,
+    }
+}
+
+fn specifier_matches_path(specifier: &str, candidate_path: &str) -> bool {
+    let mut s = specifier.trim();
+    while let Some(rest) = s
+        .strip_prefix("./")
+        .or_else(|| s.strip_prefix("../"))
+        .or_else(|| s.strip_prefix("crate::"))
+        .or_else(|| s.strip_prefix("self::"))
+        .or_else(|| s.strip_prefix("super::"))
+    {
+        s = rest;
+    }
+    if matches!(s, "" | "crate" | "self" | "super" | ".") {
+        return false;
+    }
+    let cand_no_ext = candidate_path
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(candidate_path);
+    let mut norm_variants = Vec::with_capacity(2);
+    let slash_spec = s.replace("::", "/").trim_matches('/').to_string();
+    if !slash_spec.is_empty() {
+        norm_variants.push(slash_spec);
+    }
+    if s.contains('.') && !s.contains('/') && !s.contains("::") {
+        let dot_spec = s.trim_start_matches('.').replace('.', "/");
+        if !dot_spec.is_empty() && !norm_variants.contains(&dot_spec) {
+            norm_variants.push(dot_spec);
+        }
+    }
+    norm_variants.iter().any(|norm_spec| {
+        cand_no_ext == norm_spec
+            || cand_no_ext.ends_with(&format!("/{norm_spec}"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/mod"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/index"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/__init__"))
+    })
+}
+
+/// The most base rows one callee lookup will read. A name matching more than this
+/// is too common to resolve by uniqueness.
+const CALLEE_LOOKUP_CEILING: usize = 4096;
+
+/// Every base symbol the index matches for `callee`, with whether that is the
+/// *whole* match set. `search_page` counts and reads in one snapshot, so
+/// `exhaustive` is `rows.len() >= total`: a capped read is never mistaken for a
+/// complete one.
+fn base_symbols_for_callee(base: &Store, callee: &str) -> Result<(Vec<StoredSymbol>, bool)> {
+    base_symbols_for_callee_within(base, callee, CALLEE_LOOKUP_CEILING)
+}
+
+fn base_symbols_for_callee_within(
+    base: &Store,
+    callee: &str,
+    ceiling: usize,
+) -> Result<(Vec<StoredSymbol>, bool)> {
+    let Some(page) = base.search_page(callee, ceiling)? else {
+        return Ok((Vec::new(), true));
+    };
+    let exhaustive = page.rows.len() >= usize::try_from(page.total).unwrap_or(usize::MAX);
+    Ok((page.rows, exhaustive))
+}
+
+/// The edges one dirty file contributes to the merged index.
+///
+/// `base_scope_paths` is every path the base indexes, read once per merge by the
+/// caller. `lookups` memoises [`base_symbols_for_callee`] across the merge.
+fn resolve_delta_stored_edges(
+    rel_path: &str,
+    ext: &Extraction,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+    base_scope_paths: &[String],
+    lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>,
+    cancel: &crate::cancel::Cancel,
+) -> Result<Vec<StoredEdge>> {
+    let mut out = Vec::new();
+    let caller_family = LangFamily::from_lang(devmap_extract::languages::detect_language(
+        Path::new(rel_path),
+    ));
+    let aliases = import_alias_maps(ext);
+
+    for sym in &ext.symbols {
+        out.push(StoredEdge {
+            source_file: rel_path.to_string(),
+            target_file: rel_path.to_string(),
+            source_symbol: rel_path.to_string(),
+            target_symbol: sym.qualified_name.clone(),
+            edge_kind: "Contains".to_string(),
+            confidence: 1.0,
+            resolution: Some("Structural".to_string()),
+        });
+    }
+
+    for call in &ext.calls {
+        let raw_callee = call.callee_name.trim();
+        if raw_callee.is_empty() {
+            continue;
+        }
+        let source_symbol = call
+            .caller_symbol
+            .as_deref()
+            .map(|caller| {
+                let want_qual = node_id_of(rel_path, caller);
+                ext.symbols
+                    .iter()
+                    .find(|s| {
+                        s.qualified_name == caller
+                            || s.name == caller
+                            || node_id_of(rel_path, &s.qualified_name) == want_qual
+                    })
+                    .map(|s| s.qualified_name.clone())
+                    .unwrap_or(want_qual)
+            })
+            .unwrap_or_else(|| rel_path.to_string());
+        let raw_recv =
+            call.receiver_expr.as_deref().map(str::trim).filter(|r| {
+                !r.is_empty() && !matches!(*r, "self" | "this" | "Self" | "super" | "cls")
+            });
+
+        // 1. SameFile resolution (deterministic 1.0) checks raw local callee/receiver first.
+        let same_file: Vec<&devmap_extract::model::ExtractedSymbol> = ext
+            .symbols
+            .iter()
+            .filter(|s| {
+                let tail_ok =
+                    s.name == raw_callee || bare_tail(&s.qualified_name) == Some(raw_callee);
+                if !tail_ok {
+                    return false;
+                }
+                match raw_recv {
+                    Some(r) => {
+                        s.qualified_name.contains(&format!("{r}.{raw_callee}"))
+                            || s.qualified_name.contains(&format!("{r}::{raw_callee}"))
+                    }
+                    None => true,
+                }
+            })
+            .collect();
+        if same_file.len() == 1 {
+            out.push(StoredEdge {
+                source_file: rel_path.to_string(),
+                target_file: rel_path.to_string(),
+                source_symbol,
+                target_symbol: same_file[0].qualified_name.clone(),
+                edge_kind: "Calls".to_string(),
+                confidence: 1.0,
+                resolution: Some("SameFile".to_string()),
+            });
+            continue;
+        }
+        if !same_file.is_empty() {
+            continue;
+        }
+
+        // Resolve symbol and module import aliases (`use a::b as c`, `import { b as c }`,
+        // `use crate::mod_a as m`, `import * as m`).
+        let mut explicit_specs: Vec<String> = Vec::new();
+        let (callee, recv): (&str, Option<&str>) = match raw_recv {
+            None => {
+                if let Some((spec, imported)) = aliases.symbol_aliases.get(raw_callee) {
+                    if !spec.is_empty() {
+                        explicit_specs.push(spec.clone());
+                    }
+                    (imported.as_str(), None)
+                } else {
+                    (raw_callee, None)
+                }
+            }
+            Some(r) => {
+                if let Some(mod_spec) = aliases.module_aliases.get(r) {
+                    explicit_specs.push(mod_spec.clone());
+                    (raw_callee, None)
+                } else if let Some((spec, imported)) = aliases.symbol_aliases.get(r) {
+                    if !spec.is_empty() {
+                        explicit_specs.push(spec.clone());
+                        explicit_specs.push(format!("{spec}::{imported}"));
+                        explicit_specs.push(format!("{spec}/{imported}"));
+                    } else {
+                        explicit_specs.push(imported.clone());
+                    }
+                    (raw_callee, Some(imported.as_str()))
+                } else {
+                    (raw_callee, Some(r))
+                }
+            }
+        };
+
+        // 2. Cross-file resolution across other delta extractions + non-masked base symbols.
+        let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+        for (other_path, other_ext) in &overlay.added_extractions {
+            if other_path == rel_path {
+                continue;
+            }
+            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(
+                other_path,
+            )));
+            if fam != caller_family {
+                continue;
+            }
+            for s in &other_ext.symbols {
+                if s.name == callee || bare_tail(&s.qualified_name) == Some(callee) {
+                    candidates.insert((other_path.clone(), s.qualified_name.clone()));
+                }
+            }
+        }
+        if !lookups.contains_key(callee) {
+            cancel.check()?;
+            lookups.insert(callee.to_string(), base_symbols_for_callee(base, callee)?);
+        }
+        let (base_rows, base_exhaustive) = &lookups[callee];
+        for sym in base_rows {
+            if sym.path == rel_path {
+                continue;
+            }
+            let p = Path::new(&sym.path);
+            if overlay.is_file_tombstoned(p)
+                || overlay.modified_files.contains_key(p)
+                || overlay.is_symbol_tombstoned(&sym.qualified_name)
+            {
+                continue;
+            }
+            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
+            if fam != caller_family {
+                continue;
+            }
+            if sym.name == callee || bare_tail(&sym.qualified_name) == Some(callee) {
+                candidates.insert((sym.path.clone(), sym.qualified_name.clone()));
+            }
+        }
+
+        if let Some(r) = recv {
+            let narrowed: BTreeSet<(String, String)> = candidates
+                .iter()
+                .filter(|(cand_file, cand_qual)| {
+                    cand_qual.contains(&format!("{r}.{callee}"))
+                        || cand_qual.contains(&format!("{r}::{callee}"))
+                        || Path::new(cand_file).file_stem().and_then(|s| s.to_str()) == Some(r)
+                })
+                .cloned()
+                .collect();
+            if !narrowed.is_empty() {
+                candidates = narrowed;
+            }
+        }
+
+        let imported: Vec<&(String, String)> = candidates
+            .iter()
+            .filter(|(cand_file, _)| {
+                Path::new(cand_file).parent() == Path::new(rel_path).parent()
+                    || explicit_specs
+                        .iter()
+                        .any(|spec| specifier_matches_path(spec, cand_file))
+                    || ext
+                        .imports
+                        .iter()
+                        .any(|imp| specifier_matches_path(&imp.module_specifier, cand_file))
+            })
+            .collect();
+
+        if imported.len() == 1 {
+            let (target_file, target_symbol) = imported[0];
+            out.push(StoredEdge {
+                source_file: rel_path.to_string(),
+                target_file: target_file.clone(),
+                source_symbol,
+                target_symbol: target_symbol.clone(),
+                edge_kind: "Calls".to_string(),
+                confidence: 0.9,
+                resolution: Some("ImportScoped".to_string()),
+            });
+        } else if candidates.len() == 1 && *base_exhaustive {
+            // `UniqueGlobal` claims no other symbol in the corpus carries the
+            // name. That holds only when the base lookup saw every match; a read
+            // that hit the ceiling proves nothing, so it adds no edge.
+            if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
+                out.push(StoredEdge {
+                    source_file: rel_path.to_string(),
+                    target_file,
+                    source_symbol,
+                    target_symbol,
+                    edge_kind: "Calls".to_string(),
+                    confidence: 0.9,
+                    resolution: Some("UniqueGlobal".to_string()),
+                });
+            }
+        }
+    }
+
+    for imp in &ext.imports {
+        let spec = imp.module_specifier.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let mut candidate_specs = vec![spec.to_string()];
+        for (_, imported) in imp.binding_pairs() {
+            let imported = imported.trim();
+            if !imported.is_empty() {
+                candidate_specs.push(format!("{spec}::{imported}"));
+                candidate_specs.push(format!("{spec}/{imported}"));
+            }
+        }
+        for cand_spec in candidate_specs {
+            let mut matched_files: BTreeSet<String> = BTreeSet::new();
+            for other_path in overlay.added_extractions.keys() {
+                if other_path != rel_path && specifier_matches_path(&cand_spec, other_path) {
+                    matched_files.insert(other_path.clone());
+                }
+            }
+            if matched_files.is_empty() {
+                for bp in base_scope_paths {
+                    let p = Path::new(bp);
+                    if bp != rel_path
+                        && !overlay.is_file_tombstoned(p)
+                        && specifier_matches_path(&cand_spec, bp)
+                    {
+                        matched_files.insert(bp.clone());
+                    }
+                }
+            }
+            if matched_files.len() == 1 {
+                if let Some(target_file) = matched_files.into_iter().next() {
+                    out.push(StoredEdge {
+                        source_file: rel_path.to_string(),
+                        target_file: target_file.clone(),
+                        source_symbol: rel_path.to_string(),
+                        target_symbol: target_file,
+                        edge_kind: "Imports".to_string(),
+                        confidence: 1.0,
+                        resolution: Some("ImportScoped".to_string()),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// The base edge index with the delta applied: base edges whose file or symbol
+/// the delta masked are dropped, and each dirty file's own edges are added.
+/// Edges are de-duplicated on `(source file, target file, source symbol, target
+/// symbol, kind)`.
+///
+/// This walks every base edge and materialises the survivors, so its cost grows
+/// with the base. `StackedStore::generation_edges_with_id` caches the result.
+fn merge_generation_edges(
+    base_index: &GenerationEdges,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+    generation: u32,
+    cancel: &crate::cancel::Cancel,
+) -> Result<GenerationEdges> {
+    let mut merged: Vec<StoredEdge> = Vec::with_capacity(base_index.len() + 64);
+    let mut seen: HashSet<(String, String, String, String, String)> = HashSet::new();
+    let key_of = |edge: &StoredEdge| {
+        (
+            edge.source_file.clone(),
+            edge.target_file.clone(),
+            edge.source_symbol.clone(),
+            edge.target_symbol.clone(),
+            edge.edge_kind.clone(),
+        )
+    };
+
+    for id in 0..base_index.len() as u32 {
+        cancel.check_every(id as usize)?;
+        let src_p = Path::new(base_index.source_file(id));
+        let dst_p = Path::new(base_index.target_file(id));
+        if overlay.is_file_tombstoned(src_p)
+            || overlay.modified_files.contains_key(src_p)
+            || overlay.is_file_tombstoned(dst_p)
+            || overlay.is_symbol_tombstoned(base_index.source_symbol(id))
+            || overlay.is_symbol_tombstoned(base_index.target_symbol(id))
+        {
+            continue;
+        }
+        let edge = base_index.stored_edge(id);
+        seen.insert(key_of(&edge));
+        merged.push(edge);
+    }
+
+    let base_scope_paths: Vec<String> = base
+        .latest_scope_inputs()?
+        .map(|(_, _, base_files)| base_files.into_iter().map(|(bp, _)| bp).collect())
+        .unwrap_or_default();
+    let mut lookups = BTreeMap::new();
+    let mut dirty_paths: Vec<&String> = overlay.added_extractions.keys().collect();
+    dirty_paths.sort();
+    for rel_path in dirty_paths {
+        cancel.check()?;
+        let Some(ext) = overlay.added_extractions.get(rel_path) else {
+            continue;
+        };
+        for edge in resolve_delta_stored_edges(
+            rel_path,
+            ext,
+            overlay,
+            base,
+            &base_scope_paths,
+            &mut lookups,
+            cancel,
+        )? {
+            if seen.insert(key_of(&edge)) {
+                merged.push(edge);
+            }
+        }
+    }
+
+    Ok(
+        GenerationEdges::build(Arc::new(merged), base_index.analysis().cloned())?
+            .with_generation(generation),
+    )
 }
 
 fn build_overlay_from_delta(
@@ -2116,7 +3479,17 @@ const STALE_LEASE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mil
 /// when the store is gone by then (the lease is live again, nothing retired).
 fn retire_stale_lease(worktree_root: &Path) -> Result<bool> {
     let target_db = store_path(worktree_root);
-    let _writer = Store::lock_writer_at(&target_db, STALE_LEASE_LOCK_WAIT).with_context(|| {
+    // Retirement deletes the delta, and every write to the delta holds this
+    // lock. The order is delta, then store, then bases.
+    let _delta = lock_delta_writer_at(worktree_root, STALE_LEASE_LOCK_WAIT).with_context(|| {
+        format!(
+            "{} has a store and a stale stack lease, but the delta writer lock on {} is held; \
+             wait for that sync to finish and run `devmap seed --sync-delta` again",
+            worktree_root.display(),
+            stack_delta_path(worktree_root).display()
+        )
+    })?;
+    let _writer = lock_store_writer_at(&target_db, STALE_LEASE_LOCK_WAIT).with_context(|| {
         format!(
             "{} has a store and a stale stack lease, but the writer lock on {} is held; \
              wait for that process to finish and run `devmap seed --sync-delta` again",
@@ -2816,8 +4189,14 @@ mod tests {
         let a = StackedStore::open(&lane_a).expect("lane-a survives GC of its source entry");
         assert!(!symbol_names(&a, "src/svc.go").is_empty());
 
-        // A held bases lock is a bounded refusal, not a race.
-        let held = lock_bases(&common, std::time::Duration::from_secs(5)).unwrap();
+        // A held bases lock is a bounded refusal, not a race. The holder stands
+        // in for another process (a provision), so it takes the file lock
+        // directly: this thread's own lock-order bookkeeping must not see it.
+        let bases_dir = bases_root_dir(&common);
+        fs::create_dir_all(&bases_dir).unwrap();
+        let held =
+            Store::lock_file_at(&bases_dir.join(".lock"), std::time::Duration::from_secs(5))
+                .unwrap();
         let err = gc_unused_bases_waiting(&common, std::time::Duration::from_millis(300))
             .expect_err("GC must not run while a provision holds the bases lock")
             .to_string();
@@ -5163,5 +6542,939 @@ mod tests {
         let r = DeltaStore::open_read_only(dir.join("delta.sqlite")).unwrap().expect("exists");
         assert_eq!(r.dirty_file_count().unwrap(), 2, "an orphan journal altered the recreated delta");
         let _ = remove_readonly_tree(&root);
+    }
+
+    /// Every file under `dir` with its bytes, for "nothing was written" checks.
+    #[cfg(feature = "parse")]
+    fn state_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(d) = pending.pop() {
+            for entry in fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    out.push((path.clone(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn legacy_base_store_ref_is_cleanly_refused_without_silent_upgrade() {
+        let root = temp_repo_dir("legacy-ref-refused");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        // Two plain lanes: no lease, no store, so the pointer is all there is.
+        let lane_a = add_lane(&anchor, &root, "lane-a");
+        let lane_b = add_lane(&anchor, &root, "lane-b");
+        let anchor_canon = anchor.canonicalize().unwrap();
+
+        // A pointer at an unrelated repository resolves to no hint, and the
+        // refusal still names the upgrade command.
+        let unrelated = root.join("unrelated");
+        seed_indexed_git_repo(&unrelated);
+        let ref_a = lane_a.join(".devcouncil/codeintel/base_store_ref.json");
+        fs::create_dir_all(ref_a.parent().unwrap()).unwrap();
+        fs::write(
+            &ref_a,
+            serde_json::to_vec(&serde_json::json!({
+                "anchor_repo_root": unrelated.canonicalize().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(legacy_base_store_anchor_root(&lane_a).is_none());
+        let before = state_snapshot(&lane_a.join(".devcouncil"));
+        let err = StackedStore::open_if_leased(&lane_a)
+            .expect_err("a legacy pointer must be refused")
+            .to_string();
+        assert!(err.contains("retired legacy worktree pointer"), "{err}");
+        assert!(err.contains("devmap seed --stacked --from"), "{err}");
+        assert_eq!(state_snapshot(&lane_a.join(".devcouncil")), before);
+        assert!(!stack_lease_path(lane_a.canonicalize().unwrap()).exists());
+        assert!(!stack_delta_path(lane_a.canonicalize().unwrap()).exists());
+        assert!(!store_path(lane_a.canonicalize().unwrap()).exists());
+
+        // A pointer at the sibling anchor puts that exact path in the command.
+        fs::write(
+            &ref_a,
+            serde_json::to_vec(&serde_json::json!({ "anchor_repo_root": &anchor_canon })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_base_store_anchor_root(&lane_a),
+            Some(anchor_canon.clone())
+        );
+        let err = StackedStore::open_if_leased(&lane_a)
+            .expect_err("a sibling pointer must still be refused")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "devmap seed --stacked --from {}",
+                anchor_canon.display()
+            )),
+            "{err}"
+        );
+
+        // The `.devmap` spelling and the `base_store_path` field are refused too.
+        let ref_b = lane_b.join(".devmap/codeintel/base_store_ref.json");
+        fs::create_dir_all(ref_b.parent().unwrap()).unwrap();
+        fs::write(
+            &ref_b,
+            serde_json::to_vec(&serde_json::json!({
+                "base_store_path": store_path(&anchor_canon),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = StackedStore::open_if_leased(&lane_b)
+            .expect_err("the .devmap pointer must be refused")
+            .to_string();
+        assert!(err.contains("devmap seed --stacked --from"), "{err}");
+
+        // A lane that has a lease is served by it; the stale pointer is moot.
+        provision_stacked_worktree(&anchor, &lane_a).unwrap();
+        assert!(StackedStore::open_if_leased(&lane_a).unwrap().is_some());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn delta_writer_lock_is_taken_by_writes_never_by_reads_and_keeps_its_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let (root, _anchor, lane) = a3_lane("delta-writer-lock");
+        let lock_path = Store::writer_lock_path(&stack_delta_path(lane.canonicalize().unwrap()));
+
+        // The hook's read path (open, status) must never create or take it.
+        {
+            let read_only = StackedStore::open(&lane).unwrap();
+            read_only.status().unwrap();
+        }
+        assert!(
+            !lock_path.exists(),
+            "a read-only open created {}",
+            lock_path.display()
+        );
+
+        // A write takes it and leaves the file in place, so a flock waiter can
+        // never be split across two inodes.
+        {
+            let mut first = StackedStore::open(&lane).unwrap();
+            first.record_deleted_file("src/a.rs").unwrap();
+        }
+        let first_meta = fs::metadata(&lock_path).expect("a write must have taken the lock");
+        {
+            let mut second = StackedStore::open(&lane).unwrap();
+            second.record_deleted_file("src/b.rs").unwrap();
+        }
+        let second_meta = fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            (first_meta.dev(), first_meta.ino()),
+            (second_meta.dev(), second_meta.ino())
+        );
+
+        // While another holder has it, a contender is refused, and it is free
+        // again once released.
+        let delta = stack_delta_path(lane.canonicalize().unwrap());
+        let held = Store::lock_writer_at(&delta, std::time::Duration::from_secs(2)).unwrap();
+        assert!(Store::lock_writer_at(&delta, std::time::Duration::from_millis(50)).is_err());
+        drop(held);
+        assert!(Store::lock_writer_at(&delta, std::time::Duration::from_secs(2)).is_ok());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn writer_locks_are_taken_delta_then_store_then_bases() {
+        let ranks = || HELD_LOCK_RANKS.with(|held| held.borrow().clone());
+        let _delta = RankGuard::enter(LockRank::Delta);
+        let store = RankGuard::enter(LockRank::Store);
+        let bases = RankGuard::enter(LockRank::Bases);
+        assert_eq!(
+            ranks(),
+            vec![LockRank::Delta, LockRank::Store, LockRank::Bases]
+        );
+        drop(bases);
+        drop(store);
+        assert_eq!(ranks(), vec![LockRank::Delta]);
+        // Released, the store rank can be taken again.
+        drop(RankGuard::enter(LockRank::Store));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lock order violated")]
+    fn taking_the_delta_lock_while_holding_the_store_lock_is_refused() {
+        let _store = RankGuard::enter(LockRank::Store);
+        let _delta = RankGuard::enter(LockRank::Delta);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn commit_all(anchor: &Path) {
+        fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
+        run_git_ok(anchor, &["init", "-b", "main"]);
+        run_git_ok(anchor, &["add", "."]);
+        run_git_ok(anchor, &["commit", "-m", "initial"]);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn lane_over(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_repo_dir(tag);
+        let anchor = root.join("anchor");
+        for (rel, text) in files {
+            let path = anchor.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        commit_all(&anchor);
+        let rels: Vec<&str> = files.iter().map(|(rel, _)| *rel).collect();
+        index_tree(&anchor, &rels);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        (root, anchor, lane)
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn store_query_engine_with_stacked_answers_all_graph_and_search_surfaces_over_delta_edits_and_deletions(
+    ) {
+        let (root, _anchor, lane) = lane_over(
+            "full-engine-surfaces",
+            &[
+                (
+                    "src/db.rs",
+                    "pub fn run_query() -> i32 { 42 }\npub fn legacy_literal_holder() -> &'static str { \"OLD_SECRET_TAG\" }\n",
+                ),
+                (
+                    "src/dead_mod.rs",
+                    "pub(crate) fn orphan_fn() -> i32 { 0 }\npub(crate) fn soon_called() -> i32 { 7 }\n",
+                ),
+                (
+                    "src/obsolete.rs",
+                    "pub(crate) fn vanished_api() -> &'static str { \"VANISHED_LITERAL\" }\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub mod db;\npub mod dead_mod;\npub mod obsolete;\npub fn handle_req() -> i32 { db::run_query() }\n",
+                ),
+                (
+                    "tests/smoke.rs",
+                    "#[test]\nfn test_handle_req() {\n    let _ = handle_req();\n}\n",
+                ),
+            ],
+        );
+
+        fs::write(
+            lane.join("src/db.rs"),
+            "// header comment shifting spans\npub fn run_query() -> i32 { 99 }\npub fn stream_rows() -> i32 {\n    let _tag = \"LIVE_DELTA_LITERAL\";\n    run_query() + soon_called()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lane.join("src/api.rs"),
+            "use crate::db;\npub fn serve_stream() -> i32 {\n    stream_rows()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lane.join("tests/smoke.rs"),
+            "#[test]\nfn test_handle_req() {\n    let _ = handle_req();\n}\n\n#[test]\nfn test_stream_pipeline() {\n    let _ = serve_stream();\n}\n",
+        )
+        .unwrap();
+        fs::remove_file(lane.join("src/obsolete.rs")).unwrap();
+        a3_sync(&lane);
+
+        let lane_canon = lane.canonicalize().unwrap();
+        let delta_file = stack_delta_path(&lane_canon);
+        let lease_file = stack_lease_path(&lane_canon);
+        let delta_before = fs::read(&delta_file).unwrap();
+        let lease_before = fs::read(&lease_file).unwrap();
+
+        // An edit that is on disk only: a read-only open must not ingest it.
+        fs::write(
+            lane.join("src/unsynced_scratch.rs"),
+            "pub fn unsynced_only_on_disk() {}\n",
+        )
+        .unwrap();
+
+        let stacked = StackedStore::open(&lane).unwrap();
+        let engine =
+            crate::StoreQueryEngine::new(stacked.base_store()).with_stacked(Some(&stacked));
+        let request = |query: &str, depth: usize| crate::Request {
+            query: query.to_string(),
+            token_budget: 4000,
+            min_confidence: 0.0,
+            max_depth: depth,
+        };
+
+        let search_new = engine.search(request("stream_rows", 1)).unwrap();
+        assert_eq!(search_new.items.len(), 1);
+        assert!(search_new.items[0]
+            .source_span
+            .contains("LIVE_DELTA_LITERAL"));
+        assert!(engine
+            .search(request("unsynced_only_on_disk", 1))
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(engine
+            .search(request("vanished_api", 1))
+            .unwrap()
+            .items
+            .is_empty());
+
+        let sem = engine.search_semantic("stream rows", 4000).unwrap();
+        assert!(sem.items.iter().any(|h| h.symbol_name == "stream_rows"));
+        let ask_res = engine.ask("stream rows", 4000, 0.0).unwrap();
+        assert!(ask_res.items.iter().any(|h| h.symbol_name == "stream_rows"));
+
+        let exp = engine.explore("stream_rows", 10, 4000, 0.0, 2).unwrap();
+        assert_eq!(exp.definitions.items.len(), 1);
+        let entry = &exp.definitions.items[0];
+        assert!(entry
+            .callers
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("serve_stream")));
+        assert!(entry
+            .callees
+            .items
+            .iter()
+            .any(|e| e.target_symbol.contains("run_query")));
+
+        let imp = engine.impact(request("run_query", 5)).unwrap();
+        assert!(imp
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("stream_rows")));
+        assert!(imp
+            .items
+            .iter()
+            .any(|e| e.source_symbol.contains("test_stream_pipeline")));
+        let layered = engine.impact_layered(request("run_query", 5)).unwrap();
+        assert!(!layered.edges.items.is_empty());
+
+        let neigh = engine
+            .neighbors(&["stream_rows".to_string()], 4000, 0.0, 1)
+            .unwrap();
+        assert_eq!(neigh.len(), 1);
+        assert!(!neigh[0].callers.items.is_empty());
+        assert!(!neigh[0].callees.items.is_empty());
+
+        let tr = engine
+            .trace_between(crate::Request {
+                query: ("test_stream_pipeline".to_string(), "run_query".to_string()),
+                token_budget: 4000,
+                min_confidence: 0.0,
+                max_depth: 5,
+            })
+            .unwrap();
+        assert!(!tr.items.is_empty());
+
+        let deps_api = engine.dependencies(request("src/api.rs", 1)).unwrap();
+        assert!(deps_api.items.iter().any(|e| e.target_file == "src/db.rs"));
+
+        let aff = engine
+            .affected_tests(&["src/db.rs".to_string()], 4000, 0.0, 5)
+            .unwrap();
+        assert!(aff
+            .tests
+            .items
+            .iter()
+            .any(|t| t.symbols.iter().any(|s| s.contains("test_stream_pipeline"))));
+
+        // A repository-relative and a worktree-absolute path reach the same row.
+        let abs_db = lane_canon.join("src/db.rs");
+        let skel_db = engine.skeleton(abs_db.to_str().unwrap(), 4000).unwrap();
+        assert_eq!(skel_db.presence, crate::SkeletonPresence::Indexed);
+        assert!(skel_db
+            .items
+            .iter()
+            .any(|i| i.qualified_name.contains("stream_rows")));
+        let skel_del = engine.skeleton("src/obsolete.rs", 4000).unwrap();
+        assert_eq!(skel_del.presence, crate::SkeletonPresence::NotInIndex);
+
+        let dead = engine.dead_symbols(4000).unwrap();
+        let dead_names: Vec<&str> = dead.items.iter().map(|d| d.symbol_name.as_str()).collect();
+        assert!(dead_names.contains(&"orphan_fn"), "{dead_names:?}");
+        assert!(!dead_names.contains(&"soon_called"), "{dead_names:?}");
+        assert!(!dead_names.contains(&"vanished_api"), "{dead_names:?}");
+
+        assert_eq!(
+            engine
+                .literals("LIVE_DELTA_LITERAL", false, 4000)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert!(engine
+            .literals("OLD_SECRET_TAG", false, 4000)
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(engine
+            .literals("VANISHED_LITERAL", false, 4000)
+            .unwrap()
+            .items
+            .is_empty());
+
+        let prev = engine
+            .preview(
+                "src/db.rs",
+                "pub fn run_query() -> i32 { 99 }\npub fn stream_rows(limit: usize) -> i32 { limit as i32 }\n",
+                4000,
+                0.0,
+            )
+            .unwrap();
+        assert!(prev.delta_available);
+        assert!(prev
+            .broken_callers
+            .items
+            .iter()
+            .any(|e| e.caller_symbol.contains("serve_stream")));
+
+        drop(engine);
+        drop(stacked);
+        assert_eq!(
+            fs::read(&delta_file).unwrap(),
+            delta_before,
+            "queries must not mutate a byte of delta.sqlite"
+        );
+        assert_eq!(
+            fs::read(&lease_file).unwrap(),
+            lease_before,
+            "queries must not mutate stack_lease.json"
+        );
+        assert!(!delta_file.with_extension("sqlite-wal").exists());
+        assert!(!delta_file.with_extension("sqlite-shm").exists());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn test_stacked_aliased_imports_resolve_calls_and_affected_tests() {
+        let (root, _anchor, lane) = lane_over(
+            "aliased-imports",
+            &[
+                (
+                    "src/callee.rs",
+                    "pub fn probe_callee() -> i32 {\n    7\n}\n",
+                ),
+                (
+                    "src/mod_callee.rs",
+                    "pub fn mod_target() -> i32 {\n    11\n}\n",
+                ),
+                ("src/lib.rs", "pub mod callee;\npub mod mod_callee;\n"),
+                (
+                    "tests/alias_test.rs",
+                    "#[test]\nfn test_initial() {\n    assert_eq!(1, 1);\n}\n",
+                ),
+            ],
+        );
+        fs::write(
+            lane.join("tests/alias_test.rs"),
+            "use crate::callee::probe_callee as aliased_callee;\nuse crate::mod_callee as mc;\n\n#[test]\nfn test_via_symbol_alias() {\n    let _ = aliased_callee();\n}\n\n#[test]\nfn test_via_module_alias() {\n    let _ = mc::mod_target();\n}\n",
+        )
+        .unwrap();
+        a3_sync(&lane);
+
+        let stacked = StackedStore::open(&lane).unwrap();
+        let engine =
+            crate::StoreQueryEngine::new(stacked.base_store()).with_stacked(Some(&stacked));
+        for (target, test) in [
+            ("probe_callee", "test_via_symbol_alias"),
+            ("mod_target", "test_via_module_alias"),
+        ] {
+            let affected = engine
+                .affected_tests(&[target.to_string()], 4000, 0.0, 5)
+                .unwrap();
+            assert!(
+                affected
+                    .tests
+                    .items
+                    .iter()
+                    .any(|t| t.symbols.iter().any(|s| s.contains(test))),
+                "an aliased import must reach {target} from {test}: {:?}",
+                affected.tests.items
+            );
+        }
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A delta call whose callee name the base does not hold uniquely is not a
+    /// `UniqueGlobal` edge. The label asserts "no other symbol carries this name",
+    /// which a lookup that stopped at a cap cannot know.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_delta_call_is_unique_global_only_when_the_base_lookup_saw_every_match() {
+        let (root, _anchor, lane) = lane_over(
+            "unique-global-label",
+            &[
+                ("core/db.rs", "pub fn run_query() -> i32 { 42 }\n"),
+                ("src/other.rs", "pub fn other_fn() -> i32 { 1 }\n"),
+            ],
+        );
+        fs::write(
+            lane.join("src/api.rs"),
+            "pub fn serve() -> i32 {\n    run_query()\n}\n",
+        )
+        .unwrap();
+        a3_sync(&lane);
+        let stacked = StackedStore::open(&lane).unwrap();
+        let ext = stacked
+            .overlay()
+            .added_extractions
+            .get("src/api.rs")
+            .expect("the synced file is in the overlay")
+            .clone();
+        let scope: Vec<String> = vec!["core/db.rs".to_string(), "src/other.rs".to_string()];
+        let calls_to_run_query = |lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>| {
+            resolve_delta_stored_edges(
+                "src/api.rs",
+                &ext,
+                stacked.overlay(),
+                stacked.base_store(),
+                &scope,
+                lookups,
+                &crate::cancel::Cancel::new(),
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.edge_kind == "Calls" && e.target_symbol.contains("run_query"))
+            .collect::<Vec<_>>()
+        };
+
+        // The real lookup sees the one match: a unique-global edge.
+        let found = calls_to_run_query(&mut BTreeMap::new());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].resolution.as_deref(), Some("UniqueGlobal"));
+
+        // The same rows, but a lookup that reports it stopped short: no such claim.
+        let (rows, _) = base_symbols_for_callee(stacked.base_store(), "run_query").unwrap();
+        assert!(!rows.is_empty());
+        let mut capped = BTreeMap::new();
+        capped.insert("run_query".to_string(), (rows, false));
+        assert!(
+            calls_to_run_query(&mut capped).is_empty(),
+            "a capped lookup must not mint a unique-global edge"
+        );
+
+        // A ceiling below the match count is reported as not exhaustive.
+        let (_, exhaustive) =
+            base_symbols_for_callee_within(stacked.base_store(), "run_query", 0).unwrap();
+        assert!(
+            !exhaustive,
+            "a zero-row read of a matching name is not exhaustive"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A lane whose base holds `callees` functions and whose delta holds one file
+    /// per callee, each calling its own: the merge does one base lookup per
+    /// distinct callee.
+    #[cfg(all(feature = "parse", unix))]
+    fn lane_with_a_delta_caller_per_callee(tag: &str, callees: usize) -> (PathBuf, PathBuf) {
+        let base_src: String = (0..callees)
+            .map(|i| format!("pub fn callee_{i}() -> i32 {{ {i} }}\n"))
+            .collect();
+        let (root, _anchor, lane) = lane_over(tag, &[("src/base.rs", base_src.as_str())]);
+        for i in 0..callees {
+            fs::write(
+                lane.join(format!("src/d{i}.rs")),
+                format!("pub fn caller_{i}() -> i32 {{\n    callee_{i}()\n}}\n"),
+            )
+            .unwrap();
+        }
+        a3_sync(&lane);
+        (root, lane)
+    }
+
+    /// A `Cancel` that counts every consultation and, when `trip_at` is set,
+    /// cancels itself at that consultation.
+    #[cfg(all(feature = "parse", unix))]
+    fn counting_cancel(
+        trip_at: Option<usize>,
+    ) -> (crate::cancel::Cancel, Arc<std::sync::atomic::AtomicUsize>) {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flag = crate::cancel::Cancel::new();
+        let handle = flag.clone();
+        let seen = Arc::clone(&checks);
+        let cancel = flag.with_check_probe(move || {
+            let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if trip_at == Some(n) {
+                handle.cancel();
+            }
+        });
+        (cancel, checks)
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    fn impact_request(query: &str) -> crate::Request<String> {
+        crate::Request {
+            query: query.to_string(),
+            token_budget: 4000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        }
+    }
+
+    /// Cancellation has to reach the merged-edge rebuild. The merge reads every
+    /// base edge and does one FTS lookup per distinct delta callee; a caller that
+    /// has stopped waiting must not leave that running on a blocking thread.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn the_merged_edge_rebuild_consults_cancellation_once_per_callee_lookup() {
+        const CALLEES: usize = 24;
+        let (root, lane) = lane_with_a_delta_caller_per_callee("merge-cancel-count", CALLEES);
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        let (first, first_checks) = counting_cancel(None);
+        crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .with_cancel(first)
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        // The merge is cached now, so this run consults the flag only for the
+        // engine's own work; the difference is what the merge itself consulted.
+        let (second, second_checks) = counting_cancel(None);
+        crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .with_cancel(second)
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        let in_merge = first_checks
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .saturating_sub(second_checks.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            in_merge >= CALLEES,
+            "the merge made {in_merge} cancellation checks for {CALLEES} distinct callee lookups"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_cancelled_merge_returns_cancelled_caches_nothing_and_the_next_call_is_complete() {
+        const CALLEES: usize = 24;
+        let (root, lane) = lane_with_a_delta_caller_per_callee("merge-cancel-trip", CALLEES);
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        // The engine's own consultations, with the merge already cached.
+        let primed = StackedStore::open(&lane).unwrap();
+        primed
+            .generation_edges_with_id(&crate::cancel::Cancel::new())
+            .unwrap()
+            .unwrap();
+        let (probe, engine_only) = counting_cancel(None);
+        crate::StoreQueryEngine::new(primed.base_store())
+            .with_stacked(Some(&primed))
+            .with_cancel(probe)
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        let engine_only = engine_only.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Trip three consultations past everything the engine does outside the
+        // merge, which lands inside it.
+        let (cancel, _) = counting_cancel(Some(engine_only + 3));
+        let err = crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .with_cancel(cancel)
+            .impact(impact_request("callee_5"))
+            .expect_err("a cancelled merge must not return an answer");
+        assert!(
+            err.downcast_ref::<crate::cancel::QueryCancelled>().is_some(),
+            "the error must be the typed cancellation, got: {err:#}"
+        );
+        assert!(
+            stacked.merged_edges.lock().unwrap().is_none(),
+            "a cancelled merge must not leave a result in the cache"
+        );
+
+        let answer = crate::StoreQueryEngine::new(stacked.base_store())
+            .with_stacked(Some(&stacked))
+            .impact(impact_request("callee_5"))
+            .unwrap();
+        assert!(
+            answer
+                .items
+                .iter()
+                .any(|edge| edge.source_symbol.contains("caller_5")),
+            "the call after a cancelled merge must hold the full delta: {:?}",
+            answer.items
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn dead_over_a_lane_is_a_named_lower_bound_exactly_when_the_delta_changes_something() {
+        let (root, _anchor, lane) = lane_over(
+            "dead-lower-bound",
+            &[
+                ("src/helper.rs", "pub fn helper() -> i32 { 1 }\n"),
+                ("src/user.rs", "pub fn user() -> i32 { helper() }\n"),
+            ],
+        );
+        let clean = StackedStore::open(&lane).unwrap();
+        assert_eq!(clean.dead_lower_bound_reason(), None);
+        let engine = crate::StoreQueryEngine::new(clean.base_store()).with_stacked(Some(&clean));
+        let answer = engine.dead_symbols(4000).unwrap();
+        assert!(
+            answer
+                .walk_incomplete
+                .as_deref()
+                .is_none_or(|r| !r.contains("lower bound")),
+            "a lane with no delta answers as its base: {:?}",
+            answer.walk_incomplete
+        );
+
+        fs::remove_file(lane.join("src/user.rs")).unwrap();
+        fs::write(lane.join("src/fresh.rs"), "pub fn fresh() -> i32 { 3 }\n").unwrap();
+        a3_sync(&lane);
+        let dirty = StackedStore::open(&lane).unwrap();
+        let reason = dirty
+            .dead_lower_bound_reason()
+            .expect("a delta that edits and deletes files is a lower bound");
+        assert!(
+            reason.contains("src/fresh.rs") && reason.contains("src/user.rs"),
+            "the reason names the delta's files: {reason}"
+        );
+        let engine = crate::StoreQueryEngine::new(dirty.base_store()).with_stacked(Some(&dirty));
+        let answer = engine.dead_symbols(4000).unwrap();
+        assert!(
+            answer
+                .walk_incomplete
+                .as_deref()
+                .is_some_and(|r| r.contains("lower bound") && r.contains("src/user.rs")),
+            "{:?}",
+            answer.walk_incomplete
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attach_incompleteness_appends_to_a_producer_reason_and_stamps_a_bare_answer() {
+        let (root, _anchor, lane) = lane_over(
+            "attach-incompleteness",
+            &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")],
+        );
+        // Nothing synced, one edit on disk.
+        fs::write(lane.join("src/b.rs"), "pub fn b() -> i32 { 2 }\n").unwrap();
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        let mut answer = serde_json::json!({"walk_incomplete": "producer reason", "items": []});
+        stacked.attach_incompleteness(&mut answer).unwrap();
+        let walk = answer["walk_incomplete"].as_str().unwrap();
+        assert!(walk.starts_with("producer reason; "), "{walk}");
+        assert!(
+            walk.contains("no delta.sqlite yet") && walk.contains("src/b.rs"),
+            "{walk}"
+        );
+        assert!(
+            answer.get("source_freshness").is_none(),
+            "a lane with no delta changes is the base's own answer: {answer}"
+        );
+
+        a3_sync(&lane);
+        let synced = StackedStore::open(&lane).unwrap();
+        let mut bare = serde_json::json!({"items": []});
+        synced.attach_incompleteness(&mut bare).unwrap();
+        assert!(
+            bare["source_freshness"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("stacked delta file(s)")),
+            "{bare}"
+        );
+        let mut stamped = serde_json::json!({"source_freshness": {"fresh": true}});
+        synced.attach_incompleteness(&mut stamped).unwrap();
+        assert_eq!(
+            stamped["source_freshness"],
+            serde_json::json!({"fresh": true}),
+            "an answer that already carries a stamp keeps it"
+        );
+        let mut not_an_object = serde_json::json!([1, 2]);
+        synced.attach_incompleteness(&mut not_an_object).unwrap();
+        assert_eq!(not_an_object, serde_json::json!([1, 2]));
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Retiring a stale lease deletes the delta, and every write to the delta
+    /// holds the delta writer lock, so a retirement must not delete it while a
+    /// sync holds that lock. The lock order is delta, then store, then bases.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn retiring_a_stale_lease_waits_on_the_delta_writer_lock_before_deleting_the_delta() {
+        let (root, wt, _lane, _store) = a3_store_beside_lease();
+        let delta = stack_delta_path(&wt);
+        fs::write(&delta, b"a delta a sync is writing").unwrap();
+
+        // Another thread holds the delta lock, as a running `seed --sync-delta` would.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let wt = wt.clone();
+            std::thread::spawn(move || {
+                let _held = lock_delta_writer_at(&wt, std::time::Duration::from_secs(5)).unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        locked_rx.recv().unwrap();
+
+        let refused = retire_stale_lease(&wt);
+        let delta_survived = delta.is_file();
+        let lease_survived = stack_lease_path(&wt).is_file();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let err = format!("{:#}", refused.expect_err("a held delta lock must refuse the retirement"));
+        assert!(err.contains("delta"), "the refusal names the delta lock: {err}");
+        assert!(delta_survived, "the delta was deleted under a held delta writer lock");
+        assert!(lease_survived, "a refused retirement changes nothing");
+
+        assert!(retire_stale_lease(&wt).unwrap(), "with the lock free the lease retires");
+        assert!(!delta.exists() && !stack_lease_path(&wt).exists());
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A merge cancelled before it starts stops at its first consultation, well
+    /// inside a bound that a full merge of this delta is not held to.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_pre_cancelled_merge_stops_at_the_first_check_and_quickly() {
+        const CALLEES: usize = 24;
+        let (root, lane) = lane_with_a_delta_caller_per_callee("merge-pre-cancelled", CALLEES);
+        let stacked = StackedStore::open(&lane).unwrap();
+        let (cancel, checks) = counting_cancel(Some(1));
+
+        let started = std::time::Instant::now();
+        let err = stacked
+            .generation_edges_with_id(&cancel)
+            .expect_err("a cancelled merge must not produce an index");
+        let elapsed = started.elapsed();
+
+        assert!(err.downcast_ref::<crate::cancel::QueryCancelled>().is_some());
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the merge kept consulting the flag after it was cancelled"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a pre-cancelled merge took {elapsed:?}"
+        );
+        assert!(stacked.merged_edges.lock().unwrap().is_none());
+        let (_, full) = stacked
+            .generation_edges_with_id(&crate::cancel::Cancel::new())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !full.into_target_symbol("src/base.rs::callee_7").is_empty(),
+            "the uncancelled call after a cancelled one must be the full merge"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Cost of the merged-`GenerationEdges` rebuild against the MCP per-call
+    /// ceiling (`devmap-serve/src/mcp.rs` `CALL_TIMEOUT`, 30 s). Every MCP call
+    /// opens a fresh `StackedStore`, so this runs per call while the delta is
+    /// non-empty. Ignored by default; run it with
+    /// `cargo test -p devmap-query --lib --release merged_generation_edges -- --ignored --nocapture`.
+    ///
+    /// The base index is synthetic at 100k edges. When `DEVMAP_BENCH_STORE` names
+    /// a real store (read only), that store's own edge index and symbol lookups
+    /// are used instead, with a delta of two real source files and one deletion.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+    fn merged_generation_edges_rebuild_is_bounded_against_the_mcp_call_timeout() {
+        const MCP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const RUNS: usize = 7;
+
+        let (root, base, base_index) = match std::env::var_os("DEVMAP_BENCH_STORE") {
+            Some(path) => {
+                let store = Store::open_read_only(Path::new(&path)).unwrap();
+                let (_, index) = store.generation_edges_with_id().unwrap().unwrap();
+                (None, store, index)
+            }
+            None => {
+                let (root, _anchor, lane) =
+                    lane_over("merge-bench", &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")]);
+                let stacked = StackedStore::open(&lane).unwrap();
+                let base = open_lane_base_store(&stacked.lease().base_sqlite_path()).unwrap();
+                let edges: Vec<StoredEdge> = (0..100_000u32)
+                    .map(|i| StoredEdge {
+                        source_file: format!("src/m{}.rs", i % 2000),
+                        target_file: format!("src/m{}.rs", (i / 50) % 2000),
+                        source_symbol: format!("src/m{}.rs::f{}", i % 2000, i / 2000),
+                        target_symbol: format!("src/m{}.rs::f{}", (i / 50) % 2000, i % 50),
+                        edge_kind: "Calls".to_string(),
+                        confidence: 1.0,
+                        resolution: Some("SameFile".to_string()),
+                    })
+                    .collect();
+                let index = Arc::new(GenerationEdges::build(Arc::new(edges), None).unwrap());
+                (Some(root), base, index)
+            }
+        };
+
+        let mut overlay = WorktreeOverlay::new("bench", 1);
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (id, rel) in ["stacked.rs", "engine.rs"].iter().enumerate() {
+            let src = fs::read_to_string(manifest.join("src").join(rel)).unwrap();
+            let repo_rel = format!("rust/devmap-query/src/{rel}");
+            let ext = devmap_extract::extract_file(&repo_rel, &src);
+            let id = u32::try_from(id).unwrap();
+            overlay.record_modified_file(&repo_rel, "bench", Some(id));
+            overlay.record_extraction(repo_rel, ext, id);
+        }
+        overlay.mark_file_tombstone("src/m1.rs", Some(9));
+        assert!(!overlay.modified_files.is_empty());
+
+        let mut timings = Vec::new();
+        let mut merged_len = 0;
+        for _ in 0..RUNS {
+            let started = std::time::Instant::now();
+            let merged = merge_generation_edges(
+                &base_index,
+                &overlay,
+                &base,
+                1,
+                &crate::cancel::Cancel::new(),
+            )
+            .unwrap();
+            timings.push(started.elapsed());
+            merged_len = merged.len();
+        }
+        timings.sort();
+        let min = timings[0];
+        eprintln!(
+            "merge_generation_edges: base edges {}, merged edges {}, runs {RUNS}, min {:?}, median {:?}, max {:?}, MCP CALL_TIMEOUT {:?}",
+            base_index.len(),
+            merged_len,
+            min,
+            timings[RUNS / 2],
+            timings[RUNS - 1],
+            MCP_CALL_TIMEOUT
+        );
+        assert!(
+            base_index.len() >= 90_000,
+            "the benchmark must run at about 100k base edges, got {}",
+            base_index.len()
+        );
+        assert!(
+            min < MCP_CALL_TIMEOUT / 3,
+            "the merged-edge rebuild must leave the call most of its {MCP_CALL_TIMEOUT:?}: min {min:?}"
+        );
+        if let Some(root) = root {
+            let _ = remove_readonly_tree(&root);
+        }
     }
 }

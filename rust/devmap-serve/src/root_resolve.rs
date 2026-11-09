@@ -436,6 +436,7 @@ pub fn effective_store_for_root(root: &Path) -> Result<Option<PathBuf>, String> 
     }
     let lease_path = paths::stack_lease_path(root);
     if !lease_path.is_file() {
+        devmap_query::stacked::refuse_legacy_base_store_ref(root).map_err(|err| err.to_string())?;
         return Ok(None);
     }
     let lease = devmap_query::stacked::StackLease::read_from(&lease_path).map_err(|err| {
@@ -972,5 +973,21 @@ mod tests {
         let raw = root.to_str().unwrap();
         let opened = validate_repo_path(raw).expect("a `$` that is no variable is a name");
         assert_eq!(opened, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn effective_store_refuses_a_retired_base_store_pointer_with_no_store_or_lease() {
+        let root = scratch("legacy-pointer");
+        assert_eq!(effective_store_for_root(&root), Ok(None));
+        let pointer = root.join(".devmap/codeintel/base_store_ref.json");
+        fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        fs::write(&pointer, br#"{"anchor_repo_root":"/nowhere"}"#).unwrap();
+        let err = effective_store_for_root(&root).expect_err("a legacy pointer fails closed");
+        assert!(err.contains("retired legacy worktree pointer"), "{err}");
+        assert!(err.contains("devmap seed --stacked --from"), "{err}");
+        // A store beside the pointer makes the pointer moot.
+        let store = plant_store(&root);
+        assert_eq!(effective_store_for_root(&root), Ok(Some(store)));
+        let _ = fs::remove_dir_all(&root);
     }
 }

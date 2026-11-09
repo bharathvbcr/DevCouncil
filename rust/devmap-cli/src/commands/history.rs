@@ -10,7 +10,7 @@ pub(crate) struct Args {
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let Args { last } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let rows = store.build_history(*last)?;
 
     if cli.json {

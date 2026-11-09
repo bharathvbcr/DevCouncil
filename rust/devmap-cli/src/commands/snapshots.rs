@@ -14,7 +14,7 @@ pub(crate) struct Args {
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let Args { file, budget } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let extractions = store.latest_extractions()?;
     let resp = semantic_snapshots(
         &extractions,

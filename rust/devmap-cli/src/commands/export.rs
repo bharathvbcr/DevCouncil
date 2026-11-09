@@ -22,7 +22,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json && out.as_deref() == Some(std::path::Path::new("-")) {
         anyhow::bail!("--json cannot be combined with --out -: choose a JSON receipt with an output file, or raw GraphML on stdout");
     }
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let graph = graph_value_for_read(&store, &cli.db())?;
     let gen_id = store.latest_generation_id()?.unwrap_or(0);
     let (xml, report) = devmap_query::export::export_graphml(&graph);

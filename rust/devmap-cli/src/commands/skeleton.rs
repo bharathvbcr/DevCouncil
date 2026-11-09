@@ -1,7 +1,7 @@
-use devmap_query::{ResolutionAvailability, StoreQueryEngine};
+use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_json, emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{emit_truncation, emit_unavailable, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Skeleton")]
@@ -15,11 +15,12 @@ pub(crate) struct Args {
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let Args { file, budget } = args;
     let store = open_for_read(cli)?;
-    let payload = StoreQueryEngine::new(&store).skeleton(file, *budget)?;
+    let payload = store.engine().skeleton(file, *budget)?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&payload)?)?;
+        store.emit_answer(cli, serde_json::to_value(&payload)?)?;
     } else {
         emit_skeleton(&payload);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

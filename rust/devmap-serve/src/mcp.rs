@@ -53,7 +53,9 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::admission::Admission;
-use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION};
+use crate::protocol::{
+    dispatch, dispatch_with_stacked, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION,
+};
 use crate::repo_scope::{
     canonicalize_path, infer_root_from_store, open_mcp_store, store_for_repo_path, CacheLookup,
     RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin,
@@ -3051,59 +3053,6 @@ being reported because a partial traversal cannot be distinguished from a comple
     }
 }
 
-/// A stacked lane answers from an immutable base plus a delta that a detached
-/// hook syncs, so every answer except `status` (which reports the delta itself)
-/// can be missing the lane's own edits. Say so on the answer, appended to any
-/// reason the producer already gave rather than skipped when one exists.
-fn attach_stacked_incompleteness(
-    value: &mut Value,
-    stacked: &devmap_query::stacked::StackedStore,
-    st: &devmap_query::stacked::StackedStatus,
-) {
-    let mut reasons = Vec::new();
-    if st.dirty_files > 0 || st.tombstoned_files > 0 {
-        reasons.push(format!(
-            "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges): this answer comes from the immutable base plus whatever the delta covers; run `devmap build --manifest` for full cross-file resolution",
-            st.dirty_files, st.tombstoned_files, st.delta_edges
-        ));
-    }
-    if !stacked.delta_present() {
-        reasons.push(
-            "this lane has no delta.sqlite yet (no sync has run): its delta is read as empty"
-                .to_string(),
-        );
-    }
-    match stacked.unsynced_paths() {
-        Ok(paths) if !paths.is_empty() => {
-            let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
-            reasons.push(format!(
-                "{} edited file(s) are not in the stacked delta yet ({}{}); run `devmap seed --sync-delta` or `devmap build --manifest`",
-                paths.len(),
-                shown.join(", "),
-                if paths.len() > shown.len() { ", ..." } else { "" }
-            ));
-        }
-        Ok(_) => {}
-        Err(err) => reasons.push(format!(
-            "cannot tell whether the stacked delta is current ({err}); run `devmap build --manifest`"
-        )),
-    }
-    if reasons.is_empty() {
-        return;
-    }
-    if let Some(obj) = value.as_object_mut() {
-        let existing = obj
-            .get("walk_incomplete")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        if let Some(combined) = devmap_analyze::combine_reasons(existing, Some(reasons.join("; ")))
-        {
-            obj.insert("walk_incomplete".into(), json!(combined));
-        }
-    }
-}
-
 fn dispatch_with_stacked_overlay(
     engine: &Store,
     attr_root: &Path,
@@ -3116,20 +3065,15 @@ fn dispatch_with_stacked_overlay(
     };
     let st = stacked.status()?;
     let is_status = matches!(request.command, IpcCommand::Status);
-    let plain_search = match &request.command {
-        IpcCommand::Search {
-            query,
-            budget,
-            semantic: false,
-            paths,
-            languages,
-            kinds,
-        } if paths.is_empty() && languages.is_empty() && kinds.is_empty() => {
-            Some((query.clone(), *budget))
-        }
-        _ => None,
-    };
-    let mut value = dispatch(stacked.base_store(), request, cancel, unapplied)?;
+    // The engine merges the delta itself (`keyword_page` for search, the merged
+    // edge index for every traversal), so no answer is patched afterwards.
+    let mut value = dispatch_with_stacked(
+        stacked.base_store(),
+        Some(&stacked),
+        request,
+        cancel,
+        unapplied,
+    )?;
     if is_status {
         if let Some(obj) = value.as_object_mut() {
             obj.insert("stacked".into(), serde_json::to_value(&st)?);
@@ -3148,65 +3092,8 @@ fn dispatch_with_stacked_overlay(
         return Ok(value);
     }
 
-    if let Some((query, _budget)) = plain_search {
-        if st.dirty_files > 0 || st.tombstoned_files > 0 {
-            let delta_hits = stacked.search_symbols(&query, 64)?;
-            if let Some(obj) = value.as_object_mut() {
-                let mut merged = Vec::new();
-                let mut seen = std::collections::BTreeSet::new();
-                for sym in delta_hits {
-                    if seen.insert((sym.path.clone(), sym.qualified_name.clone())) {
-                        merged.push(json!({
-                            "symbol_name": sym.name,
-                            "qualified_name": sym.qualified_name,
-                            "file_path": sym.path,
-                            "kind": sym.kind,
-                            "score": 1.0,
-                            "source_span": format!("{}..{}", sym.span_start, sym.span_end),
-                        }));
-                    }
-                }
-                if let Some(existing) = obj.get("items").and_then(Value::as_array) {
-                    for item in existing {
-                        let fp = item.get("file_path").and_then(Value::as_str).unwrap_or("");
-                        let qn = item
-                            .get("qualified_name")
-                            .or_else(|| item.get("symbol_name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let p = Path::new(fp);
-                        if stacked.overlay().is_file_tombstoned(p)
-                            || stacked.overlay().modified_files.contains_key(p)
-                            || stacked.overlay().is_symbol_tombstoned(qn)
-                        {
-                            continue;
-                        }
-                        if seen.insert((fp.to_string(), qn.to_string())) {
-                            merged.push(item.clone());
-                        }
-                    }
-                }
-                let shown = merged.len();
-                let hidden = obj.get("hidden").and_then(Value::as_u64).unwrap_or(0) as usize;
-                // The merge can only add hits: the total never shrinks below the
-                // base's own, and a base truncation stays a truncation.
-                let base_total = obj.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let base_truncated = obj
-                    .get("truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let total = base_total.max(shown.saturating_add(hidden));
-                obj.insert("items".into(), Value::Array(merged));
-                obj.insert("shown".into(), json!(shown));
-                obj.insert("total".into(), json!(total));
-                obj.insert("truncated".into(), json!(base_truncated || hidden > 0));
-            }
-        }
-        attach_stacked_incompleteness(&mut value, &stacked, &st);
-        return Ok(value);
-    }
-
-    attach_stacked_incompleteness(&mut value, &stacked, &st);
+    // One owner for what a lane answer may be missing, shared with the CLI.
+    stacked.attach_incompleteness(&mut value)?;
     Ok(value)
 }
 

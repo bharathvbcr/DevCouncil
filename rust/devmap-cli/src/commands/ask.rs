@@ -1,9 +1,7 @@
-use devmap_query::{ResolutionAvailability, StoreQueryEngine};
+use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{
-    emit_json, emit_scope, emit_search, emit_truncation, emit_unavailable, open_for_read,
-};
+use crate::output::{emit_scope, emit_search, emit_truncation, emit_unavailable, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Ask")]
@@ -46,13 +44,14 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         } => {
             let scope = devmap_query::SymbolScope::new(paths, languages)?;
             let store = open_for_read(cli)?;
-            let engine = StoreQueryEngine::new(&store);
+            let engine = store.engine();
             let pack =
                 engine.ask_evidence_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
-                emit_json(cli, &serde_json::to_value(&pack)?)?;
+                store.emit_answer(cli, serde_json::to_value(&pack)?)?;
             } else {
                 emit_evidence_pack(&pack);
+                store.warn_incomplete()?;
             }
         }
         Args {
@@ -65,12 +64,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         } => {
             let scope = devmap_query::SymbolScope::new(paths, languages)?;
             let store = open_for_read(cli)?;
-            let engine = StoreQueryEngine::new(&store);
+            let engine = store.engine();
             let resp = engine.ask_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
-                emit_json(cli, &serde_json::to_value(&resp)?)?;
+                store.emit_answer(cli, serde_json::to_value(&resp)?)?;
             } else {
                 emit_search(&resp);
+                store.warn_incomplete()?;
             }
         }
     }

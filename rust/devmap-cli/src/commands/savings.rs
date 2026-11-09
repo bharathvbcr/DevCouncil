@@ -1,7 +1,5 @@
-use devmap_query::StoreQueryEngine;
-
 use crate::cli::Cli;
-use crate::output::{emit_json, open_for_read};
+use crate::output::open_for_read;
 
 #[derive(clap::Args)]
 #[group(id = "Savings")]
@@ -16,11 +14,12 @@ pub(crate) struct Args {
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let Args { query, budget } = args;
     let store = open_for_read(cli)?;
-    let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
+    let report = store.engine().savings(query.as_deref(), *budget)?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_savings(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

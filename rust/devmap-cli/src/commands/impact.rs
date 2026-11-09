@@ -1,7 +1,7 @@
-use devmap_query::{Request, StoreQueryEngine};
+use devmap_query::Request;
 
 use crate::cli::Cli;
-use crate::output::{emit_blast_radius, emit_edges, emit_json, open_for_read};
+use crate::output::{emit_blast_radius, emit_edges, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Impact")]
@@ -44,7 +44,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         layers,
     } = args;
     let store = open_for_read(cli)?;
-    let engine = StoreQueryEngine::new(&store);
+    let engine = store.engine();
     let req = Request {
         query: target.clone(),
         token_budget: *budget,
@@ -57,10 +57,11 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         // caller asked to narrow.
         let resp = engine.impact_layered(req)?;
         if cli.json {
-            emit_json(cli, &serde_json::to_value(&resp)?)?;
+            store.emit_answer(cli, serde_json::to_value(&resp)?)?;
         } else {
             emit_edges(&resp.edges);
             emit_blast_radius(&resp.blast_radius);
+            store.warn_incomplete()?;
         }
     } else {
         let resp = engine.impact_at_rung(
@@ -70,9 +71,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             min_rung.as_deref().and_then(devmap_query::Rung::parse),
         )?;
         if cli.json {
-            emit_json(cli, &serde_json::to_value(&resp)?)?;
+            store.emit_answer(cli, serde_json::to_value(&resp)?)?;
         } else {
             emit_edges(&resp);
+            store.warn_incomplete()?;
         }
     }
     Ok(())

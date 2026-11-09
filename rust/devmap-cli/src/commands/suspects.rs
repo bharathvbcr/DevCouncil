@@ -27,7 +27,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         since,
         depth,
     } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let root =
         std::path::absolute(cli.root_hint()).unwrap_or_else(|_| cli.root_hint().to_path_buf());
     let graph = dc_regress_store::StoreGraph::new(&store, &root)?;

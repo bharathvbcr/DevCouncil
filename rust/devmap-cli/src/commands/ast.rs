@@ -29,7 +29,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         limit,
         facets,
     } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     if *facets {
         let facets = devmap_query::ast::ast_facets(&store)?;
         if cli.json {

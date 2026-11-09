@@ -1,9 +1,7 @@
-use devmap_query::{ResolutionAvailability, StoreQueryEngine};
+use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{
-    emit_blast_radius, emit_json, emit_truncation, emit_unavailable, open_for_read,
-};
+use crate::output::{emit_blast_radius, emit_truncation, emit_unavailable, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Affected")]
@@ -26,12 +24,14 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         min_confidence,
     } = args;
     let store = open_for_read(cli)?;
-    let report =
-        StoreQueryEngine::new(&store).affected_tests(targets, *budget, *min_confidence, *depth)?;
+    let report = store
+        .engine()
+        .affected_tests(targets, *budget, *min_confidence, *depth)?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_affected(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

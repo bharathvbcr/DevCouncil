@@ -1,8 +1,8 @@
-use devmap_query::{ResolutionAvailability, StoreQueryEngine};
+use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
 use crate::output::{
-    emit_blast_radius, emit_json, emit_scope, emit_truncation, emit_unavailable, open_for_read,
+    emit_blast_radius, emit_scope, emit_truncation, emit_unavailable, open_for_read,
 };
 
 #[derive(clap::Args)]
@@ -44,7 +44,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     } = args;
     let filter = devmap_query::NameQueryFilter::new(paths, languages, kinds)?;
     let store = open_for_read(cli)?;
-    let report = StoreQueryEngine::new(&store).explore_filtered(
+    let report = store.engine().explore_filtered(
         query,
         *limit,
         *budget,
@@ -53,9 +53,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         filter.as_ref(),
     )?;
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
         emit_explore(&report);
+        store.warn_incomplete()?;
     }
     Ok(())
 }

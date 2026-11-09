@@ -19,7 +19,7 @@ mod gaps;
 mod hits;
 mod in_memory;
 mod trace;
-mod traversal;
+pub(crate) mod traversal;
 mod verdict;
 mod workspace;
 
@@ -158,6 +158,7 @@ pub struct QueryEngine<'a> {
 /// `QueryEngine`, this type never extracts or resolves source files.
 pub struct StoreQueryEngine<'a> {
     store: &'a Store,
+    stacked: Option<&'a crate::stacked::StackedStore>,
     /// Consulted inside the long loops. Default is a flag nobody sets, so a
     /// caller that has no way to give up (the CLI) behaves exactly as before.
     cancel: Cancel,
@@ -171,8 +172,76 @@ impl<'a> StoreQueryEngine<'a> {
     pub fn new(store: &'a Store) -> Self {
         Self {
             store,
+            stacked: None,
             cancel: Cancel::new(),
             interleave: None,
+        }
+    }
+
+    /// Answer over a [`crate::stacked::StackedStore`] delta overlay (`F1`, `F4`, `F10`).
+    pub fn with_stacked(mut self, stacked: Option<&'a crate::stacked::StackedStore>) -> Self {
+        self.stacked = stacked;
+        self
+    }
+
+    pub(super) fn latest_file(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<devmap_store::StoredFile>> {
+        if let Some(stacked) = self.stacked {
+            stacked.latest_file(path)
+        } else {
+            Ok(self.store.latest_file(path)?)
+        }
+    }
+
+    pub(super) fn latest_repo_root(&self) -> anyhow::Result<Option<String>> {
+        if let Some(stacked) = self.stacked {
+            Ok(Some(stacked.worktree_root().to_string_lossy().into_owned()))
+        } else {
+            Ok(self.store.latest_repo_root()?)
+        }
+    }
+
+    pub(super) fn latest_scope_inputs(
+        &self,
+    ) -> anyhow::Result<Option<crate::stacked::ScopeInputs>> {
+        if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
+            stacked.all_indexed_files()
+        } else {
+            let wt_root = self
+                .stacked
+                .map(|s| s.worktree_root().to_string_lossy().into_owned());
+            Ok(self
+                .store
+                .latest_scope_inputs()?
+                .map(|(gen, root, files)| (gen, wt_root.or(root), files)))
+        }
+    }
+
+    fn latest_extraction_for_path(&self, path: &str) -> anyhow::Result<Option<Extraction>> {
+        if let Some(stacked) = self.stacked {
+            stacked.latest_extraction_for_path(path)
+        } else {
+            Ok(self.store.latest_extraction_for_path(path)?)
+        }
+    }
+
+    fn generation_edges_with_id(
+        &self,
+    ) -> anyhow::Result<Option<(u32, std::sync::Arc<GenerationEdges>)>> {
+        if let Some(stacked) = self.stacked {
+            stacked.generation_edges_with_id(&self.cancel)
+        } else {
+            Ok(self.store.generation_edges_with_id()?)
+        }
+    }
+
+    fn latest_test_entry_symbols(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        if let Some(stacked) = self.stacked {
+            stacked.latest_test_entry_symbols()
+        } else {
+            Ok(self.store.latest_test_entry_symbols()?)
         }
     }
 
@@ -223,8 +292,12 @@ impl<'a> StoreQueryEngine<'a> {
         if let Some(hook) = &self.interleave {
             hook();
         }
-        let verdict = SourceFreshness::from_store(self.store.query_source_freshness());
-        answer.stamp(&pin_verdict(before, verdict));
+        if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
+            answer.stamp(&stacked.delta_source_freshness());
+        } else {
+            let verdict = SourceFreshness::from_store(self.store.query_source_freshness());
+            answer.stamp(&pin_verdict(before, verdict));
+        }
         Ok(answer)
     }
 
@@ -357,10 +430,21 @@ impl<'a> StoreQueryEngine<'a> {
         pool: usize,
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> anyhow::Result<Option<devmap_store::SearchPage>> {
+        if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
+            return stacked.keyword_page(query, pool, filter);
+        }
+        let wt_root = self
+            .stacked
+            .map(|s| s.worktree_root().to_string_lossy().into_owned());
         let Some(filter) = filter else {
-            return Ok(self.store.search_page(query, pool)?);
+            return Ok(self.store.search_page(query, pool)?.map(|mut page| {
+                if let Some(root) = wt_root {
+                    page.repo_root = Some(root);
+                }
+                page
+            }));
         };
-        let Some((generation, root, files)) = self.store.latest_scope_inputs()? else {
+        let Some((generation, root, files)) = self.latest_scope_inputs()? else {
             return Ok(None);
         };
         let (paths, languages) = match filter.symbol_scope()? {
@@ -377,7 +461,13 @@ impl<'a> StoreQueryEngine<'a> {
         };
         Ok(self
             .store
-            .search_page_in(generation, query, pool, Some(&narrowing))?)
+            .search_page_in(generation, query, pool, Some(&narrowing))?
+            .map(|mut page| {
+                if let Some(root) = wt_root {
+                    page.repo_root = Some(root);
+                }
+                page
+            }))
     }
 
     pub fn dependencies(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -405,7 +495,12 @@ impl<'a> StoreQueryEngine<'a> {
             // An indexed file path is read first and wins a spelling collision with
             // a symbol. Anything else is a symbol query and goes through the same
             // resolution `impact` uses.
-            let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
+            let snapshot = if let Some(stacked) = self.stacked {
+                stacked.file_edges(&req.query, req.min_confidence, &self.cancel)?
+            } else {
+                self.store.file_edges(&req.query, req.min_confidence)?
+            };
+            let Some(snapshot) = snapshot else {
                 return self.symbol_dependencies(req, min_rung);
             };
             if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
@@ -650,7 +745,7 @@ impl<'a> StoreQueryEngine<'a> {
             devmap_store::checked_min_confidence(req.min_confidence)?;
             let layer_budget = req.token_budget / 2;
             let edge_budget = req.token_budget.saturating_sub(layer_budget);
-            let Some((generation, index)) = self.store.generation_edges_with_id()? else {
+            let Some((generation, index)) = self.generation_edges_with_id()? else {
                 let reason = "no persisted generation is available".to_string();
                 return Ok(LayeredImpact {
                     edges: unavailable_response(ResolutionAvailability::Unavailable {
@@ -1155,7 +1250,7 @@ impl<'a> StoreQueryEngine<'a> {
     /// build that lands mid-walk cannot mix two generations into one answer,
     /// and the next call after it gets the new one.
     fn generation_edges(&self) -> anyhow::Result<Option<std::sync::Arc<GenerationEdges>>> {
-        Ok(self.store.generation_edges()?)
+        Ok(self.generation_edges_with_id()?.map(|(_, index)| index))
     }
 
     fn traverse(
@@ -1173,7 +1268,7 @@ impl<'a> StoreQueryEngine<'a> {
         // locks, reads and drops — so nothing below this line holds it. An
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
-        let Some((generation, index)) = self.store.generation_edges_with_id()? else {
+        let Some((generation, index)) = self.generation_edges_with_id()? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
@@ -1205,7 +1300,11 @@ impl<'a> StoreQueryEngine<'a> {
     /// otherwise a lower bound. The store lock is not held by the caller.
     /// A failed read stays an error: an empty note would read as a clean walk.
     fn note_failed_parses<T>(&self, response: &mut Response<T>) -> anyhow::Result<Option<String>> {
-        let (total, paths) = self.store.latest_parse_failures()?;
+        let (total, paths) = if let Some(stacked) = self.stacked {
+            stacked.latest_parse_failures()?
+        } else {
+            self.store.latest_parse_failures()?
+        };
         let note = failed_parse_note(total, &paths);
         response.walk_incomplete =
             devmap_analyze::combine_reasons(response.walk_incomplete.take(), note.clone());
@@ -1375,6 +1474,14 @@ impl<'a> StoreQueryEngine<'a> {
             let (rows, truncated) = found.remove(&name).unwrap_or_default();
             namesakes.truncated |= truncated;
             for row in rows {
+                if let Some(stacked) = self.stacked {
+                    let src = Path::new(&row.source_file);
+                    if stacked.overlay().is_file_tombstoned(src)
+                        || stacked.overlay().modified_files.contains_key(src)
+                    {
+                        continue;
+                    }
+                }
                 if !families.is_empty() && !families.contains(&family_of_path(&row.source_file)) {
                     namesakes.other_language_sites += 1;
                     continue;
@@ -1698,7 +1805,7 @@ impl<'a> StoreQueryEngine<'a> {
         };
         for path in distinct.into_iter().take(MAX_CALL_BLIND_FILES_CHECKED) {
             self.cancel.check()?;
-            let Some(file) = self.store.latest_file(path)? else {
+            let Some(file) = self.latest_file(path)? else {
                 starts.checked += 1;
                 continue;
             };
@@ -1912,7 +2019,6 @@ impl<'a> StoreQueryEngine<'a> {
         // whose language was never recorded must not be labelled with a guess.
         for definition in &mut definitions.items {
             definition.language = self
-                .store
                 .latest_file(&definition.file_path)?
                 .map(|file| file.language);
         }
@@ -2042,7 +2148,7 @@ impl<'a> StoreQueryEngine<'a> {
             // A test is a symbol in a test file or one a test runner invokes, so a
             // `#[test] fn` beside the code it tests is named too; its file is the
             // entry's `path`, like any other test's.
-            let test_symbols = self.store.latest_test_entry_symbols()?;
+            let test_symbols = self.latest_test_entry_symbols()?;
 
             // Derived from the *complete* walk, never from the budgeted layers.
             // Reading the presentation back would drop every test whose band the
@@ -2278,7 +2384,12 @@ impl<'a> StoreQueryEngine<'a> {
             // and reports `truncated` for the right reason.
             let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
             self.cancel.check()?;
-            let Some(page) = self.store.dead_page(limit)? else {
+            let page = if let Some(stacked) = self.stacked {
+                stacked.dead_page(limit, &self.cancel)?
+            } else {
+                self.store.dead_page(limit)?
+            };
+            let Some(page) = page else {
                 return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                     reason: "no persisted generation is available".to_string(),
                 }));
@@ -2297,6 +2408,12 @@ impl<'a> StoreQueryEngine<'a> {
             response.hidden = response.total.saturating_sub(response.shown);
             response.truncated = response.hidden > 0;
             response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+            // A lane's list is the base's with the delta's resurrections
+            // removed; what the delta killed is not in it, so say so.
+            if let Some(reason) = self.stacked.and_then(|s| s.dead_lower_bound_reason()) {
+                response.walk_incomplete =
+                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(reason));
+            }
             self.note_failed_parses(&mut response)?;
             // The other half of the answer, and until now the half nothing could
             // see. A one-hop inbound-edge join structurally cannot report a
@@ -2305,7 +2422,11 @@ impl<'a> StoreQueryEngine<'a> {
             // entire class of finding. `DeadClusterScan::clusters` is capped at
             // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
             // own; what the cap dropped travels beside it.
-            if let Some(scan) = page.dead_clusters {
+            let dropped = self.stacked.and_then(|s| s.dead_clusters_dropped_reason());
+            if let Some(reason) = dropped {
+                // The base's scan describes the base, not this lane.
+                response.dead_clusters_incomplete = Some(reason);
+            } else if let Some(scan) = page.dead_clusters {
                 if scan.refused_oversized_graph {
                     // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
                     // empty list here would say the walk ran and found nothing.
@@ -2340,7 +2461,7 @@ impl<'a> StoreQueryEngine<'a> {
         {
             return Ok(());
         }
-        let source_root = self.store.latest_repo_root()?;
+        let source_root = self.latest_repo_root()?;
         let mut indexes: BTreeMap<String, Option<LineIndex>> = BTreeMap::new();
         for evidence in rows.iter_mut().filter_map(|row| row.evidence.as_mut()) {
             let (Some(path), Some(byte)) = (evidence.first_path.as_ref(), evidence.first_byte)
@@ -2402,7 +2523,11 @@ impl<'a> StoreQueryEngine<'a> {
             // Both the candidate read and the grouping cover every signed symbol of
             // the generation before the budget cuts anything.
             self.cancel.check()?;
-            let (candidates, unsigned) = self.store.latest_clone_candidates()?;
+            let (candidates, unsigned) = if let Some(stacked) = self.stacked {
+                stacked.latest_clone_candidates()?
+            } else {
+                self.store.latest_clone_candidates()?
+            };
             self.cancel.check()?;
             let summary = group_clones(&candidates, unsigned);
             let matching: Vec<_> = summary
@@ -2427,9 +2552,14 @@ impl<'a> StoreQueryEngine<'a> {
     pub fn skeleton(&self, path: &str, token_budget: u32) -> anyhow::Result<SkeletonReport> {
         self.exit(|| {
             self.cancel.check()?;
-            let path = resolve_skeleton_path(self.store, path)?;
-            let freshness = SourceFreshness::from_store(self.store.query_source_freshness());
-            let Some(extraction) = self.store.latest_extraction_for_path(&path)? else {
+            let source_root = self.latest_repo_root()?;
+            let path = resolve_skeleton_path(source_root.as_deref(), path);
+            let freshness = if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
+                stacked.delta_source_freshness()
+            } else {
+                SourceFreshness::from_store(self.store.query_source_freshness())
+            };
+            let Some(extraction) = self.latest_extraction_for_path(&path)? else {
                 // Distinguish "no generation at all" from "this path is absent".
                 // Both look like an empty list; only the latter is a finding about
                 // the path the caller named.
@@ -2476,7 +2606,6 @@ impl<'a> StoreQueryEngine<'a> {
             // an editor shows. Spans were recorded against the indexed content; a
             // dirty buffer can shift them, which is disclosed via lines_from_bytes
             // only when the file cannot be read at all.
-            let source_root = self.store.latest_repo_root()?;
             let on_disk = devmap_extract::safe_fs::read_repo_source(
                 source_root.as_deref().map(Path::new),
                 &path,
@@ -2697,7 +2826,12 @@ impl<'a> StoreQueryEngine<'a> {
         if query.trim().is_empty() {
             anyhow::bail!("literals requires a non-empty query");
         }
-        let Some(page) = self.store.search_literals(query, exact, LITERAL_PAGE_CAP)? else {
+        let page = if let Some(stacked) = self.stacked {
+            stacked.search_literals(query, exact, LITERAL_PAGE_CAP)?
+        } else {
+            self.store.search_literals(query, exact, LITERAL_PAGE_CAP)?
+        };
+        let Some(page) = page else {
             return Ok(LiteralReport {
                 query: query.to_string(),
                 exact,
@@ -2772,8 +2906,9 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         default_excludes: bool,
     ) -> anyhow::Result<crate::doc_drift::DocDriftReport> {
-        crate::doc_drift::doc_drift_report_with(
+        crate::doc_drift::doc_drift_report_with_stacked(
             self.store,
+            self.stacked,
             &self.cancel,
             &crate::doc_drift::DocDriftOptions {
                 paths,
@@ -2801,12 +2936,26 @@ impl<'a> StoreQueryEngine<'a> {
             Option<crate::scope::ResolvedScope>,
         )>,
     > {
+        if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
+            return stacked.ranking_corpus(scope);
+        }
+        let wt_root = self
+            .stacked
+            .map(|s| s.worktree_root().to_string_lossy().into_owned());
         let Some(scope) = scope else {
-            return Ok(self.store.all_symbols_page()?.map(|page| (page, None)));
+            return Ok(self.store.all_symbols_page()?.map(|mut page| {
+                if let Some(root) = wt_root {
+                    page.repo_root = Some(root);
+                }
+                (page, None)
+            }));
         };
         let Some((mut page, files)) = self.store.all_symbols_page_with_files()? else {
             return Ok(None);
         };
+        if let Some(root) = wt_root {
+            page.repo_root = Some(root);
+        }
         let mut resolved = scope.resolve(&files, page.repo_root.as_deref())?;
         let corpus_symbols = page.rows.len();
         page.rows.retain(|row| resolved.contains(&row.path));
@@ -2962,10 +3111,7 @@ impl<'a> StoreQueryEngine<'a> {
             let (edges, test_symbols) = if response.items.is_empty() {
                 (None, std::collections::HashSet::new())
             } else {
-                (
-                    self.generation_edges()?,
-                    self.store.latest_test_entry_symbols()?,
-                )
+                (self.generation_edges()?, self.latest_test_entry_symbols()?)
             };
             let (related_tests, coverage_gap, outside_scope) = match edges.as_deref() {
                 Some(edges) => self.evidence_related_tests(
@@ -3169,10 +3315,12 @@ impl<'a> StoreQueryEngine<'a> {
         // holding the store's connection, so a caller that has already gone is
         // asked first, and again between rows.
         self.cancel.check()?;
-        let docstrings = crate::ask::docstring_by_qualified_name(&latest_extractions_cancellable(
-            self.store,
-            &self.cancel,
-        )?);
+        let extractions = if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
+            stacked.merged_extractions_cancellable(&self.cancel)?
+        } else {
+            latest_extractions_cancellable(self.store, &self.cancel)?
+        };
+        let docstrings = crate::ask::docstring_by_qualified_name(&extractions);
         let texts: Vec<String> = symbols
             .iter()
             .map(|symbol| {
@@ -3376,7 +3524,7 @@ impl<'a> StoreQueryEngine<'a> {
     /// than treated as zero bytes: a corpus figure that silently omits what it
     /// could not open understates the alternative and flatters the map.
     pub fn savings(&self, query: Option<&str>, token_budget: u32) -> anyhow::Result<SavingsReport> {
-        let repo_root = self.store.latest_repo_root()?;
+        let repo_root = self.latest_repo_root()?;
         let resolve = |path: &str| -> PathBuf {
             match &repo_root {
                 Some(root) if !Path::new(path).is_absolute() => Path::new(root).join(path),
@@ -3386,9 +3534,16 @@ impl<'a> StoreQueryEngine<'a> {
         let size_of =
             |path: &str| -> Option<u64> { std::fs::metadata(resolve(path)).ok().map(|m| m.len()) };
 
-        let indexed_paths = match self.store.latest_generation_id()? {
-            Some(gen) => self.store.list_generation_paths(gen)?,
-            None => Vec::new(),
+        let indexed_paths = if let Some(stacked) = self.stacked {
+            stacked
+                .all_indexed_files()?
+                .map(|(_, _, files)| files.into_iter().map(|(p, _)| p).collect())
+                .unwrap_or_default()
+        } else {
+            match self.store.latest_generation_id()? {
+                Some(gen) => self.store.list_generation_paths(gen)?,
+                None => Vec::new(),
+            }
         };
         let mut corpus_bytes = 0u64;
         let mut corpus_files_unreadable = 0usize;
@@ -3511,7 +3666,7 @@ impl<'a> StoreQueryEngine<'a> {
                     file_path: path.to_string(),
                     parse_status,
                     delta_available: false,
-                    file_is_indexed: self.store.latest_extraction_for_path(path)?.is_some(),
+                    file_is_indexed: self.latest_extraction_for_path(path)?.is_some(),
                     compared_against: "nothing".to_string(),
                     degraded_reason: Some(format!(
                         "the buffer was not parsed ({reason}); no delta is reported, \
@@ -3533,7 +3688,7 @@ impl<'a> StoreQueryEngine<'a> {
             // candidate change. The store is still consulted, but only for the
             // caller graph, where being a generation behind is a known and stated
             // property rather than a wrong diff.
-            let file_is_indexed = self.store.latest_extraction_for_path(path)?.is_some();
+            let file_is_indexed = self.latest_extraction_for_path(path)?.is_some();
             // Resolved against the generation's own root, not the process's working
             // directory. Indexed paths are repository-relative, and the two callers
             // of this have different working directories: the CLI runs wherever the
@@ -3544,7 +3699,7 @@ impl<'a> StoreQueryEngine<'a> {
             // Containment is enforced *before* the read: `path` arrives from an IPC
             // caller, and this is the only query that reads a file the caller
             // names. See `contained_repo_path`.
-            let source_root = self.store.latest_repo_root()?;
+            let source_root = self.latest_repo_root()?;
             contained_repo_path(source_root.as_deref(), path)?;
             // `.ok()` here used to collapse two different facts into one. "There is
             // no such file" and "the file is there and I could not read it"
@@ -3693,7 +3848,11 @@ impl<'a> StoreQueryEngine<'a> {
             // reports that the confidence floor hid nothing. Drawn from one
             // generation the floored set is a subset of the unfiltered one, so the
             // subtraction cannot underflow at all.
-            let page = self.store.callers_page(&at_risk, path, min_confidence)?;
+            let page = if let Some(stacked) = self.stacked {
+                stacked.callers_page(&at_risk, path, min_confidence, &self.cancel)?
+            } else {
+                self.store.callers_page(&at_risk, path, min_confidence)?
+            };
             let (caller_edges, total_unfiltered) = match page {
                 Some(page) => (page.callers, page.total_unfiltered),
                 None => (Vec::new(), 0),
