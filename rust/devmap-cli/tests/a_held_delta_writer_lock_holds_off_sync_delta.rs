@@ -188,7 +188,7 @@ fn sync_delta_waits_for_a_held_delta_writer_lock_and_writes_nothing_meanwhile() 
             String::from_utf8_lossy(&out.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(report["synced_files"], 1, "{report}");
+        assert_eq!(report["synced_files"], 2, "{report}");
         assert_ne!(
             delta_bytes(&delta),
             before,

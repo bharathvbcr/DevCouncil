@@ -301,17 +301,97 @@ fn now_unix_ms() -> u64 {
 /// How long provision and GC wait for each other before failing closed.
 pub const BASES_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The writer locks this module takes, in the only order a thread may hold
+/// them: the lane's delta, then its store, then the shared bases directory.
+/// `sync_worktree` holds the delta lock while an auto-rebase takes the store
+/// lock; provision holds the delta lock before the bases lock. A thread that
+/// took them in another order could deadlock against one that took them in
+/// this one, so [`ordered_lock`] asserts the order (debug builds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LockRank {
+    Delta,
+    Store,
+    Bases,
+}
+
+thread_local! {
+    static HELD_LOCK_RANKS: std::cell::RefCell<Vec<LockRank>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A held writer lock and its place in this thread's lock order. The lock is
+/// released before the rank is popped.
+#[derive(Debug)]
+struct OrderedLock {
+    _lock: devmap_store::WriterLock,
+    _rank: RankGuard,
+}
+
+#[derive(Debug)]
+struct RankGuard(LockRank);
+
+impl RankGuard {
+    fn enter(rank: LockRank) -> Self {
+        HELD_LOCK_RANKS.with(|held| {
+            let mut held = held.borrow_mut();
+            debug_assert!(
+                held.last().is_none_or(|last| *last < rank),
+                "lock order violated: taking {rank:?} while holding {held:?} \
+                 (the order is delta, then store, then bases)"
+            );
+            held.push(rank);
+        });
+        Self(rank)
+    }
+}
+
+impl Drop for RankGuard {
+    fn drop(&mut self) {
+        HELD_LOCK_RANKS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(at) = held.iter().rposition(|rank| *rank == self.0) {
+                held.remove(at);
+            }
+        });
+    }
+}
+
+/// Take `acquire`'s lock as `rank`. The order is checked before the call
+/// blocks, so a violation fails instead of waiting out `wait`.
+fn ordered_lock(
+    rank: LockRank,
+    acquire: impl FnOnce() -> Result<devmap_store::WriterLock>,
+) -> Result<OrderedLock> {
+    let guard = RankGuard::enter(rank);
+    let lock = acquire()?;
+    Ok(OrderedLock {
+        _lock: lock,
+        _rank: guard,
+    })
+}
+
+/// The writer lock on `<state>/codeintel/delta.sqlite` for `worktree_root`:
+/// every write to the delta holds it.
+fn lock_delta_writer_at(worktree_root: &Path, wait: std::time::Duration) -> Result<OrderedLock> {
+    let delta_path = stack_delta_path(worktree_root);
+    ordered_lock(LockRank::Delta, || Store::lock_writer_at(&delta_path, wait))
+}
+
+/// The writer lock on the lane's `devmap.sqlite` path.
+fn lock_store_writer_at(store: &Path, wait: std::time::Duration) -> Result<OrderedLock> {
+    ordered_lock(LockRank::Store, || Store::lock_writer_at(store, wait))
+}
+
 /// The exclusive lock on `<common_git_dir>/devmap/bases/.lock`, held by GC for
 /// its whole run and by provision from before publishing until the lease is
 /// written. Bounded; the timeout names the holder's pid.
-fn lock_bases(
-    common_git_dir: &Path,
-    wait: std::time::Duration,
-) -> Result<devmap_store::WriterLock> {
+fn lock_bases(common_git_dir: &Path, wait: std::time::Duration) -> Result<OrderedLock> {
     let bases_dir = bases_root_dir(common_git_dir);
     fs::create_dir_all(&bases_dir)
         .with_context(|| format!("cannot create {}", bases_dir.display()))?;
-    Store::lock_file_at(&bases_dir.join(".lock"), wait)
+    ordered_lock(LockRank::Bases, || {
+        Store::lock_file_at(&bases_dir.join(".lock"), wait)
+    })
 }
 
 pub fn bases_root_dir(common_git_dir: &Path) -> PathBuf {
@@ -1107,6 +1187,13 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
             source_canon.display()
         )
     })?;
+    // A lane that already has a delta may be mid-sync: wait for that writer
+    // before touching the lane, and before the bases lock (delta, then bases).
+    let _delta_lock = if stack_delta_path(&wt_canon).exists() {
+        Some(lock_delta_writer_at(&wt_canon, Store::WRITER_LOCK_WAIT)?)
+    } else {
+        None
+    };
     let _bases_lock = lock_bases(&common_git_dir, BASES_LOCK_WAIT)?;
     let (published, manifest) = publish_base_snapshot(&source_canon)?;
     let key = BaseKey::of_manifest(&manifest)?;
@@ -1566,6 +1653,17 @@ impl StackedStore {
         source_bytes: &[u8],
         extraction: &Extraction,
     ) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.record_extracted_file_locked(rel_path, source_bytes, extraction)
+    }
+
+    /// [`Self::record_extracted_file`] for a caller that holds the delta writer lock.
+    fn record_extracted_file_locked(
+        &mut self,
+        rel_path: &str,
+        source_bytes: &[u8],
+        extraction: &Extraction,
+    ) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         let cas_hash = blake3_hash(source_bytes);
         let edges = extract_delta_edges(&normalized, extraction);
@@ -1582,6 +1680,12 @@ impl StackedStore {
     /// Mark `rel_path` as deleted in the worktree's private `delta.sqlite` and
     /// mask all of its base symbols in `WorktreeOverlay` (`F4`).
     pub fn record_deleted_file(&mut self, rel_path: &str) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.record_deleted_file_locked(rel_path)
+    }
+
+    /// [`Self::record_deleted_file`] for a caller that holds the delta writer lock.
+    fn record_deleted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         self.writable_delta()?
             .tombstone_file(&normalized, CAS_TOMBSTONE, now_unix_ms())?;
@@ -1590,6 +1694,12 @@ impl StackedStore {
 
     /// Clear `rel_path` from `delta.sqlite` when it matches the base snapshot again.
     pub fn clear_reverted_file(&mut self, rel_path: &str) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.clear_reverted_file_locked(rel_path)
+    }
+
+    /// [`Self::clear_reverted_file`] for a caller that holds the delta writer lock.
+    fn clear_reverted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         self.writable_delta()?.remove_clean_file(&normalized)?;
         self.reload_overlay()
@@ -1599,6 +1709,13 @@ impl StackedStore {
     /// Tree-sitter frontend (`devmap_extract::extract_file`) — never regex!
     #[cfg(feature = "parse")]
     pub fn sync_file_from_disk(&mut self, rel_path: &str) -> Result<()> {
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
+        self.sync_file_from_disk_locked(rel_path)
+    }
+
+    /// [`Self::sync_file_from_disk`] for a caller that holds the delta writer lock.
+    #[cfg(feature = "parse")]
+    fn sync_file_from_disk_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
         if devmap_extract::languages::is_ignored_path(&normalized) {
             return Ok(());
@@ -1606,10 +1723,10 @@ impl StackedStore {
         let full = self.worktree_root.join(&normalized);
         match fs::symlink_metadata(&full) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.record_deleted_file(&normalized)
+                self.record_deleted_file_locked(&normalized)
             }
             Err(err) => Err(err).with_context(|| format!("cannot stat {}", full.display())),
-            Ok(meta) if !meta.is_file() => self.record_deleted_file(&normalized),
+            Ok(meta) if !meta.is_file() => self.record_deleted_file_locked(&normalized),
             Ok(_) => {
                 if !devmap_extract::languages::is_indexable_source(&normalized) {
                     return Ok(());
@@ -1623,11 +1740,11 @@ impl StackedStore {
                     let lang = devmap_extract::languages::detect_language(Path::new(&normalized));
                     let key = devmap_extract::cache::CacheKey::for_source(lang, source_str);
                     if key.content_hash == base_file.content_hash {
-                        return self.clear_reverted_file(&normalized);
+                        return self.clear_reverted_file_locked(&normalized);
                     }
                 }
                 let extraction = devmap_extract::extract_file(&normalized, source_str);
-                self.record_extracted_file(&normalized, &bytes, &extraction)
+                self.record_extracted_file_locked(&normalized, &bytes, &extraction)
             }
         }
     }
@@ -1637,6 +1754,11 @@ impl StackedStore {
     /// `devmap.sqlite` when thresholds (`250` dirty files / `16 MiB`) are exceeded.
     #[cfg(feature = "parse")]
     pub fn sync_worktree(&mut self) -> Result<StackedSyncReport> {
+        // The delta writer lock covers the whole sync: the snapshot of what the
+        // delta holds, every row written, and the auto-rebase below (which
+        // takes the store lock under it: delta, then store). Not taken by any
+        // read path.
+        let _delta_lock = lock_delta_writer_at(&self.worktree_root, Store::WRITER_LOCK_WAIT)?;
         let changed_paths = git_changed_paths_against_head(&self.worktree_root, &self.base)?;
         let existing_delta: BTreeSet<String> = match &self.delta {
             Some(delta) => delta
@@ -1661,12 +1783,12 @@ impl StackedStore {
                 if !devmap_extract::languages::is_indexable_source(rel_path) {
                     continue;
                 }
-                self.sync_file_from_disk(rel_path)?;
+                self.sync_file_from_disk_locked(rel_path)?;
                 synced_files += 1;
             } else if self.base.latest_path_is_indexed(rel_path)?
                 || existing_delta.contains(rel_path)
             {
-                self.record_deleted_file(rel_path)?;
+                self.record_deleted_file_locked(rel_path)?;
                 deleted_files += 1;
             }
         }
@@ -1675,7 +1797,7 @@ impl StackedStore {
         // or removed after it was synced; it equals the base again.
         for prev in existing_delta {
             if !changed_paths.contains(&prev) {
-                self.clear_reverted_file(&prev)?;
+                self.clear_reverted_file_locked(&prev)?;
                 cleaned_files += 1;
             }
         }
@@ -1779,7 +1901,7 @@ impl StackedStore {
         }
         // Another writer (a build, a drain) may be placing this store: hold the
         // same lock they hold for the whole promotion.
-        let _writer = Store::lock_writer_at(&target_db, wait)?;
+        let _writer = lock_store_writer_at(&target_db, wait)?;
         if fs::symlink_metadata(&target_db).is_ok() {
             bail!(
                 "refusing to materialize over an existing store {}; its stack lease is stale \
@@ -2181,7 +2303,7 @@ const STALE_LEASE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mil
 /// when the store is gone by then (the lease is live again, nothing retired).
 fn retire_stale_lease(worktree_root: &Path) -> Result<bool> {
     let target_db = store_path(worktree_root);
-    let _writer = Store::lock_writer_at(&target_db, STALE_LEASE_LOCK_WAIT).with_context(|| {
+    let _writer = lock_store_writer_at(&target_db, STALE_LEASE_LOCK_WAIT).with_context(|| {
         format!(
             "{} has a store and a stale stack lease, but the writer lock on {} is held; \
              wait for that process to finish and run `devmap seed --sync-delta` again",
@@ -2881,8 +3003,14 @@ mod tests {
         let a = StackedStore::open(&lane_a).expect("lane-a survives GC of its source entry");
         assert!(!symbol_names(&a, "src/svc.go").is_empty());
 
-        // A held bases lock is a bounded refusal, not a race.
-        let held = lock_bases(&common, std::time::Duration::from_secs(5)).unwrap();
+        // A held bases lock is a bounded refusal, not a race. The holder stands
+        // in for another process (a provision), so it takes the file lock
+        // directly: this thread's own lock-order bookkeeping must not see it.
+        let bases_dir = bases_root_dir(&common);
+        fs::create_dir_all(&bases_dir).unwrap();
+        let held =
+            Store::lock_file_at(&bases_dir.join(".lock"), std::time::Duration::from_secs(5))
+                .unwrap();
         let err = gc_unused_bases_waiting(&common, std::time::Duration::from_millis(300))
             .expect_err("GC must not run while a provision holds the bases lock")
             .to_string();
@@ -5328,5 +5456,76 @@ mod tests {
         assert!(StackedStore::open_if_leased(&lane_a).unwrap().is_some());
 
         let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn delta_writer_lock_is_taken_by_writes_never_by_reads_and_keeps_its_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let (root, _anchor, lane) = a3_lane("delta-writer-lock");
+        let lock_path = Store::writer_lock_path(&stack_delta_path(lane.canonicalize().unwrap()));
+
+        // The hook's read path (open, status) must never create or take it.
+        {
+            let read_only = StackedStore::open(&lane).unwrap();
+            read_only.status().unwrap();
+        }
+        assert!(
+            !lock_path.exists(),
+            "a read-only open created {}",
+            lock_path.display()
+        );
+
+        // A write takes it and leaves the file in place, so a flock waiter can
+        // never be split across two inodes.
+        {
+            let mut first = StackedStore::open(&lane).unwrap();
+            first.record_deleted_file("src/a.rs").unwrap();
+        }
+        let first_meta = fs::metadata(&lock_path).expect("a write must have taken the lock");
+        {
+            let mut second = StackedStore::open(&lane).unwrap();
+            second.record_deleted_file("src/b.rs").unwrap();
+        }
+        let second_meta = fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            (first_meta.dev(), first_meta.ino()),
+            (second_meta.dev(), second_meta.ino())
+        );
+
+        // While another holder has it, a contender is refused, and it is free
+        // again once released.
+        let delta = stack_delta_path(lane.canonicalize().unwrap());
+        let held = Store::lock_writer_at(&delta, std::time::Duration::from_secs(2)).unwrap();
+        assert!(Store::lock_writer_at(&delta, std::time::Duration::from_millis(50)).is_err());
+        drop(held);
+        assert!(Store::lock_writer_at(&delta, std::time::Duration::from_secs(2)).is_ok());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn writer_locks_are_taken_delta_then_store_then_bases() {
+        let ranks = || HELD_LOCK_RANKS.with(|held| held.borrow().clone());
+        let _delta = RankGuard::enter(LockRank::Delta);
+        let store = RankGuard::enter(LockRank::Store);
+        let bases = RankGuard::enter(LockRank::Bases);
+        assert_eq!(
+            ranks(),
+            vec![LockRank::Delta, LockRank::Store, LockRank::Bases]
+        );
+        drop(bases);
+        drop(store);
+        assert_eq!(ranks(), vec![LockRank::Delta]);
+        // Released, the store rank can be taken again.
+        drop(RankGuard::enter(LockRank::Store));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lock order violated")]
+    fn taking_the_delta_lock_while_holding_the_store_lock_is_refused() {
+        let _store = RankGuard::enter(LockRank::Store);
+        let _delta = RankGuard::enter(LockRank::Delta);
     }
 }
