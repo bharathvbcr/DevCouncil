@@ -1420,3 +1420,232 @@ fn a_cached_store_follows_a_build_that_writes_in_place() {
         "the cached store must see what an in-place build committed"
     );
 }
+
+/// Every regular file under `dir`: relative path, length, mtime and bytes.
+fn state_snapshot(
+    dir: &Path,
+) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, Vec<u8>)> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                pending.push(path);
+            } else {
+                let rel = path.strip_prefix(dir).unwrap().to_path_buf();
+                out.insert(
+                    rel,
+                    (
+                        meta.len(),
+                        meta.modified().unwrap(),
+                        std::fs::read(&path).unwrap(),
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn mcp_stacked_graph_tools_merge_delta_with_zero_writes_and_refuse_legacy_pointer() {
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    let base = scratch("mcp-stacked-zero-write");
+    let anchor = base.join("anchor");
+    let stacked_wt = base.join("stacked-wt");
+    let legacy_wt = base.join("legacy-wt");
+    std::fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    std::fs::write(
+        anchor.join("lib.rs"),
+        "pub fn shared_target() -> i32 { 1 }\npub fn base_caller() -> i32 { shared_target() }\n",
+    )
+    .unwrap();
+    git(&anchor, &["add", "lib.rs"]);
+    git(&anchor, &["commit", "-qm", "init"]);
+    for wt in [&stacked_wt, &legacy_wt] {
+        git(
+            &anchor,
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+        );
+    }
+    let head = git(&anchor, &["rev-parse", "HEAD"]);
+
+    let anchor_db = devmap_extract::paths::store_path(&anchor);
+    std::fs::create_dir_all(anchor_db.parent().unwrap()).unwrap();
+    {
+        let store = devmap_store::Store::open(&anchor_db).unwrap();
+        store
+            .bind_repo_root(&anchor.canonicalize().unwrap())
+            .unwrap();
+        let src = std::fs::read_to_string(anchor.join("lib.rs")).unwrap();
+        let exts = vec![devmap_extract::extract_file("lib.rs", &src)];
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&exts);
+        let res = resolver.resolve_all(&exts).unwrap();
+        let analysis = devmap_analyze::analyze(&exts, &res);
+        store
+            .save_generation_with_metadata(
+                &exts,
+                &res,
+                &analysis,
+                devmap_store::GenerationWriteOpts::default(),
+                &head,
+            )
+            .unwrap();
+        let _ = store.write_latest_csr_sidecar().unwrap();
+    }
+
+    devmap_query::stacked::provision_stacked_worktree(&anchor, &stacked_wt).unwrap();
+    let lease_path = devmap_extract::paths::stack_lease_path(&stacked_wt);
+    let state = lease_path.parent().unwrap().to_path_buf();
+
+    // The delta drops `base_caller` and adds `delta_caller() -> shared_target()`.
+    std::fs::write(
+        stacked_wt.join("lib.rs"),
+        "pub fn shared_target() -> i32 { 1 }\npub fn delta_caller() -> i32 { shared_target() }\n",
+    )
+    .unwrap();
+    {
+        let mut s = devmap_query::stacked::StackedStore::open(&stacked_wt).unwrap();
+        s.sync_file_from_disk("lib.rs").unwrap();
+    }
+    // A second edit that is on disk only: a read must not ingest it.
+    std::fs::write(
+        stacked_wt.join("unsynced.rs"),
+        "pub fn unsynced_fn() -> i32 { shared_target() }\n",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let before = state_snapshot(&state);
+    assert!(
+        before.contains_key(Path::new("delta.sqlite"))
+            && before.contains_key(Path::new("stack_lease.json"))
+            && before.keys().any(|p| p.starts_with("stack")),
+        "the fixture must hold a delta, a lease and a stack/ dir: {:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    let slot = Arc::new(StoreSlot::resolving(
+        None,
+        stacked_wt.clone(),
+        Some(anchor.clone()),
+    ));
+    let repo = stacked_wt.display().to_string();
+
+    let impact = call(
+        &slot,
+        "devmap_impact",
+        json!({"repo_path": repo, "target": "shared_target"}),
+    )
+    .await;
+    assert_eq!(impact["result"]["isError"], json!(false), "{impact}");
+    let callers: Vec<&str> = structured(&impact)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["source_symbol"].as_str())
+        .collect();
+    assert!(
+        callers.iter().any(|c| c.contains("delta_caller")),
+        "impact of a base callee must list the delta caller: {impact}"
+    );
+    assert!(
+        !callers.iter().any(|c| c.contains("base_caller")),
+        "impact must mask the caller the delta removed: {impact}"
+    );
+
+    let search = call(
+        &slot,
+        "devmap_search",
+        json!({"repo_path": repo, "query": "delta_caller"}),
+    )
+    .await;
+    assert_eq!(search["result"]["isError"], json!(false), "{search}");
+    assert_eq!(structured(&search)["shown"], json!(1), "{search}");
+    let unsynced = call(
+        &slot,
+        "devmap_search",
+        json!({"repo_path": repo, "query": "unsynced_fn"}),
+    )
+    .await;
+    assert_eq!(structured(&unsynced)["shown"], json!(0), "{unsynced}");
+
+    let skeleton = call(
+        &slot,
+        "devmap_skeleton",
+        json!({"repo_path": repo, "file": "lib.rs"}),
+    )
+    .await;
+    assert_eq!(skeleton["result"]["isError"], json!(false), "{skeleton}");
+    let skeleton_text = structured(&skeleton).to_string();
+    assert!(
+        skeleton_text.contains("delta_caller") && !skeleton_text.contains("base_caller"),
+        "skeleton must show the edit, not the base: {skeleton}"
+    );
+
+    let explore = call(
+        &slot,
+        "devmap_explore",
+        json!({"repo_path": repo, "query": "delta_caller"}),
+    )
+    .await;
+    assert_eq!(explore["result"]["isError"], json!(false), "{explore}");
+    assert_eq!(
+        structured(&explore)["definitions"]["shown"],
+        json!(1),
+        "{explore}"
+    );
+
+    assert_eq!(
+        state_snapshot(&state),
+        before,
+        "an MCP read changed a byte or an mtime under the lane's state dir (store, lease, delta, stack/)"
+    );
+
+    // A retired pointer on a lane with no store and no lease fails closed, by name.
+    let legacy_ref = legacy_wt.join(".devmap/codeintel/base_store_ref.json");
+    std::fs::create_dir_all(legacy_ref.parent().unwrap()).unwrap();
+    std::fs::write(
+        &legacy_ref,
+        json!({"anchor_repo_root": anchor, "base_sqlite_path": anchor_db}).to_string(),
+    )
+    .unwrap();
+    let legacy_resp = call(
+        &slot,
+        "devmap_search",
+        json!({"repo_path": legacy_wt.display().to_string(), "query": "shared_target"}),
+    )
+    .await;
+    assert_eq!(
+        legacy_resp["result"]["isError"],
+        json!(true),
+        "{legacy_resp}"
+    );
+    let legacy_err = tool_error_text(&legacy_resp);
+    assert!(
+        legacy_err.contains("seed --stacked --from"),
+        "the refusal must name the upgrade command: {legacy_err}"
+    );
+    assert!(!devmap_extract::paths::stack_lease_path(&legacy_wt).exists());
+    assert!(!devmap_extract::paths::stack_delta_path(&legacy_wt).exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
