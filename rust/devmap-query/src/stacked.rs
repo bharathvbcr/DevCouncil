@@ -7274,6 +7274,45 @@ mod tests {
         let _ = remove_readonly_tree(&root);
     }
 
+    /// Retiring a stale lease deletes the delta, and every write to the delta
+    /// holds the delta writer lock, so a retirement must not delete it while a
+    /// sync holds that lock. The lock order is delta, then store, then bases.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn retiring_a_stale_lease_waits_on_the_delta_writer_lock_before_deleting_the_delta() {
+        let (root, wt, _lane, _store) = a3_store_beside_lease();
+        let delta = stack_delta_path(&wt);
+        fs::write(&delta, b"a delta a sync is writing").unwrap();
+
+        // Another thread holds the delta lock, as a running `seed --sync-delta` would.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let wt = wt.clone();
+            std::thread::spawn(move || {
+                let _held = lock_delta_writer_at(&wt, std::time::Duration::from_secs(5)).unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        locked_rx.recv().unwrap();
+
+        let refused = retire_stale_lease(&wt);
+        let delta_survived = delta.is_file();
+        let lease_survived = stack_lease_path(&wt).is_file();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let err = format!("{:#}", refused.expect_err("a held delta lock must refuse the retirement"));
+        assert!(err.contains("delta"), "the refusal names the delta lock: {err}");
+        assert!(delta_survived, "the delta was deleted under a held delta writer lock");
+        assert!(lease_survived, "a refused retirement changes nothing");
+
+        assert!(retire_stale_lease(&wt).unwrap(), "with the lock free the lease retires");
+        assert!(!delta.exists() && !stack_lease_path(&wt).exists());
+        let _ = remove_readonly_tree(&root);
+    }
+
     /// A merge cancelled before it starts stops at its first consultation, well
     /// inside a bound that a full merge of this delta is not held to.
     #[cfg(all(feature = "parse", unix))]
