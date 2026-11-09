@@ -1387,6 +1387,21 @@ pub(crate) fn dispatch(
     cancel: &devmap_query::Cancel,
     unapplied: &UnappliedEdits,
 ) -> anyhow::Result<Value> {
+    dispatch_with_stacked(store, None, request, cancel, unapplied)
+}
+
+/// [`dispatch`] over a stacked worktree: `stacked` carries the lane's delta, and
+/// the engine answers from the base merged with it. `store` must be the stacked
+/// store's own base (`StackedStore::base_store`); the commands that read the
+/// store directly (`status`, `blast`, `suspects`, the graph and route views)
+/// still answer from that base alone.
+pub(crate) fn dispatch_with_stacked(
+    store: &Store,
+    stacked: Option<&devmap_query::stacked::StackedStore>,
+    request: IpcRequest,
+    cancel: &devmap_query::Cancel,
+    unapplied: &UnappliedEdits,
+) -> anyhow::Result<Value> {
     if request.version != PROTOCOL_VERSION {
         anyhow::bail!(
             "unsupported protocol version {}; server requires {}",
@@ -1394,7 +1409,9 @@ pub(crate) fn dispatch(
             PROTOCOL_VERSION
         );
     }
-    let engine = StoreQueryEngine::new(store).with_cancel(cancel.clone());
+    let engine = StoreQueryEngine::new(store)
+        .with_stacked(stacked)
+        .with_cancel(cancel.clone());
     match request.command {
         IpcCommand::Status => {
             let status = store.status("daemon")?;

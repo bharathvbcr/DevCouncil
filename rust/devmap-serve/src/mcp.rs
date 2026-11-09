@@ -53,7 +53,9 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::admission::Admission;
-use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION};
+use crate::protocol::{
+    dispatch, dispatch_with_stacked, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION,
+};
 use crate::repo_scope::{
     canonicalize_path, infer_root_from_store, open_mcp_store, store_for_repo_path, CacheLookup,
     RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin,
@@ -3116,20 +3118,15 @@ fn dispatch_with_stacked_overlay(
     };
     let st = stacked.status()?;
     let is_status = matches!(request.command, IpcCommand::Status);
-    let plain_search = match &request.command {
-        IpcCommand::Search {
-            query,
-            budget,
-            semantic: false,
-            paths,
-            languages,
-            kinds,
-        } if paths.is_empty() && languages.is_empty() && kinds.is_empty() => {
-            Some((query.clone(), *budget))
-        }
-        _ => None,
-    };
-    let mut value = dispatch(stacked.base_store(), request, cancel, unapplied)?;
+    // The engine merges the delta itself (`keyword_page` for search, the merged
+    // edge index for every traversal), so no answer is patched afterwards.
+    let mut value = dispatch_with_stacked(
+        stacked.base_store(),
+        Some(&stacked),
+        request,
+        cancel,
+        unapplied,
+    )?;
     if is_status {
         if let Some(obj) = value.as_object_mut() {
             obj.insert("stacked".into(), serde_json::to_value(&st)?);
@@ -3145,64 +3142,6 @@ fn dispatch_with_stacked_overlay(
                 );
             }
         }
-        return Ok(value);
-    }
-
-    if let Some((query, _budget)) = plain_search {
-        if st.dirty_files > 0 || st.tombstoned_files > 0 {
-            let delta_hits = stacked.search_symbols(&query, 64)?;
-            if let Some(obj) = value.as_object_mut() {
-                let mut merged = Vec::new();
-                let mut seen = std::collections::BTreeSet::new();
-                for sym in delta_hits {
-                    if seen.insert((sym.path.clone(), sym.qualified_name.clone())) {
-                        merged.push(json!({
-                            "symbol_name": sym.name,
-                            "qualified_name": sym.qualified_name,
-                            "file_path": sym.path,
-                            "kind": sym.kind,
-                            "score": 1.0,
-                            "source_span": format!("{}..{}", sym.span_start, sym.span_end),
-                        }));
-                    }
-                }
-                if let Some(existing) = obj.get("items").and_then(Value::as_array) {
-                    for item in existing {
-                        let fp = item.get("file_path").and_then(Value::as_str).unwrap_or("");
-                        let qn = item
-                            .get("qualified_name")
-                            .or_else(|| item.get("symbol_name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let p = Path::new(fp);
-                        if stacked.overlay().is_file_tombstoned(p)
-                            || stacked.overlay().modified_files.contains_key(p)
-                            || stacked.overlay().is_symbol_tombstoned(qn)
-                        {
-                            continue;
-                        }
-                        if seen.insert((fp.to_string(), qn.to_string())) {
-                            merged.push(item.clone());
-                        }
-                    }
-                }
-                let shown = merged.len();
-                let hidden = obj.get("hidden").and_then(Value::as_u64).unwrap_or(0) as usize;
-                // The merge can only add hits: the total never shrinks below the
-                // base's own, and a base truncation stays a truncation.
-                let base_total = obj.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let base_truncated = obj
-                    .get("truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let total = base_total.max(shown.saturating_add(hidden));
-                obj.insert("items".into(), Value::Array(merged));
-                obj.insert("shown".into(), json!(shown));
-                obj.insert("total".into(), json!(total));
-                obj.insert("truncated".into(), json!(base_truncated || hidden > 0));
-            }
-        }
-        attach_stacked_incompleteness(&mut value, &stacked, &st);
         return Ok(value);
     }
 

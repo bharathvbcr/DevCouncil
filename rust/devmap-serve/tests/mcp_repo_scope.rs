@@ -1580,6 +1580,11 @@ async fn mcp_stacked_graph_tools_merge_delta_with_zero_writes_and_refuse_legacy_
     .await;
     assert_eq!(search["result"]["isError"], json!(false), "{search}");
     assert_eq!(structured(&search)["shown"], json!(1), "{search}");
+    // The delta hit is ranked by the engine like any other hit, not stamped with a
+    // fixed 1.0 by the transport.
+    let score = structured(&search)["items"][0]["score"].as_f64().unwrap();
+    eprintln!("delta-only search hit score: {score}");
+    assert!(score.is_finite() && score > 0.0, "{search}");
     let unsynced = call(
         &slot,
         "devmap_search",
@@ -1614,10 +1619,20 @@ async fn mcp_stacked_graph_tools_merge_delta_with_zero_writes_and_refuse_legacy_
         "{explore}"
     );
 
-    assert_eq!(
-        state_snapshot(&state),
-        before,
-        "an MCP read changed a byte or an mtime under the lane's state dir (store, lease, delta, stack/)"
+    let after = state_snapshot(&state);
+    // `stack/sessions/` is the MCP query log (`session_log`), which every
+    // `tools/call` appends to beside the store. It is documented, best-effort
+    // telemetry and holds neither the base, the lease nor the delta, so it is the
+    // one thing a read may write.
+    let changed: Vec<&PathBuf> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| !path.starts_with("stack/sessions"))
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "an MCP read changed a byte or an mtime under the lane's state dir (store, lease, delta, stack/): {changed:?}"
     );
 
     // A retired pointer on a lane with no store and no lease fails closed, by name.
