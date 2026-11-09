@@ -1675,3 +1675,81 @@ async fn mcp_stacked_graph_tools_merge_delta_with_zero_writes_and_refuse_legacy_
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// MCP `dead` over a lane must not list a base cycle the delta deleted: the
+/// base's cluster scan is dropped and the answer says so.
+#[tokio::test]
+async fn mcp_dead_over_a_lane_drops_the_cluster_scan_when_the_delta_deletes_the_cycle() {
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+    let base = scratch("mcp-dead-cycle");
+    let anchor = base.join("anchor");
+    let lane = base.join("lane");
+    std::fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    let cycle = "def cyc_one():\n    return cyc_two()\n\n\ndef cyc_two():\n    return cyc_three()\n\n\ndef cyc_three():\n    return cyc_one()\n";
+    std::fs::write(anchor.join("cyc.py"), cycle).unwrap();
+    git(&anchor, &["add", "cyc.py"]);
+    git(&anchor, &["commit", "-qm", "init"]);
+    git(&anchor, &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()]);
+    let head = git(&anchor, &["rev-parse", "HEAD"]);
+    let anchor_db = devmap_extract::paths::store_path(&anchor);
+    std::fs::create_dir_all(anchor_db.parent().unwrap()).unwrap();
+    {
+        let store = devmap_store::Store::open(&anchor_db).unwrap();
+        store.bind_repo_root(&anchor.canonicalize().unwrap()).unwrap();
+        let exts = vec![devmap_extract::extract_file("cyc.py", cycle)];
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&exts);
+        let res = resolver.resolve_all(&exts).unwrap();
+        let analysis = devmap_analyze::analyze(&exts, &res);
+        store
+            .save_generation_with_metadata(
+                &exts,
+                &res,
+                &analysis,
+                devmap_store::GenerationWriteOpts::default(),
+                &head,
+            )
+            .unwrap();
+        let _ = store.write_latest_csr_sidecar().unwrap();
+    }
+    devmap_query::stacked::provision_stacked_worktree(&anchor, &lane).unwrap();
+    let slot = Arc::new(StoreSlot::resolving(None, lane.clone(), Some(anchor.clone())));
+    let repo = lane.display().to_string();
+
+    let before = call(&slot, "devmap_dead_symbols", json!({"repo_path": repo})).await;
+    assert_eq!(before["result"]["isError"], json!(false), "{before}");
+    assert!(
+        structured(&before)["dead_clusters"].to_string().contains("cyc_one"),
+        "premise: the base lists the cycle: {before}"
+    );
+
+    std::fs::remove_file(lane.join("cyc.py")).unwrap();
+    {
+        let mut s = devmap_query::stacked::StackedStore::open(&lane).unwrap();
+        s.sync_worktree().unwrap();
+    }
+    let after = call(&slot, "devmap_dead_symbols", json!({"repo_path": repo})).await;
+    assert_eq!(after["result"]["isError"], json!(false), "{after}");
+    assert!(
+        !structured(&after).to_string().contains("cyc_one"),
+        "the deleted cycle is still listed: {after}"
+    );
+    assert!(
+        structured(&after)["dead_clusters_incomplete"]
+            .as_str()
+            .is_some_and(|r| r.contains("delta") && r.contains("cyc.py")),
+        "{after}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

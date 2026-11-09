@@ -913,3 +913,46 @@ fn every_rerouted_cli_command_names_the_edits_a_lane_answer_does_not_cover() {
         "{plain}"
     );
 }
+
+/// `dead` over a lane lists the base's abandoned cycles from the base's own
+/// scan. A delta that deletes the cycle's file makes that list false, and the
+/// delta cannot be re-scanned here, so the scan is dropped and the answer says
+/// so, naming the delta.
+#[test]
+fn dead_over_a_lane_does_not_list_a_cycle_the_delta_deleted() {
+    let fx = Fixture::new();
+    let main = fx.main();
+    fs::write(
+        main.join("src/cyc.py"),
+        "def cyc_one():\n    return cyc_two()\n\n\ndef cyc_two():\n    return cyc_three()\n\n\ndef cyc_three():\n    return cyc_one()\n",
+    )
+    .unwrap();
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-qm", "cycle"]);
+    git(&main, &["worktree", "add", "-q", "--detach", "../lane2"]);
+    fx.build_main();
+    let base = json_of(&fx.devmap(&main, &["--json", "dead"]));
+    assert!(
+        base["dead_clusters"].to_string().contains("cyc_one"),
+        "the fixture's cycle is an abandoned cluster in the base: {base}"
+    );
+
+    let lane = fx.at("lane2");
+    let seeded = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seeded.status.success(), "{}", stderr(&seeded));
+    fs::remove_file(lane.join("src/cyc.py")).unwrap();
+    let synced = fx.devmap(&lane, &["--json", "seed", "--sync-delta"]);
+    assert!(synced.status.success(), "{}", stderr(&synced));
+
+    let dead = json_of(&fx.devmap(&lane, &["--json", "dead"]));
+    assert!(
+        !dead.to_string().contains("cyc_one"),
+        "the deleted cycle is still listed: {dead}"
+    );
+    assert!(
+        dead["dead_clusters_incomplete"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("delta") && reason.contains("src/cyc.py")),
+        "the answer must say the cluster scan was dropped, naming the delta: {dead}"
+    );
+}
