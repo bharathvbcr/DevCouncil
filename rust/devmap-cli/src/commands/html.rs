@@ -35,7 +35,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         level,
         max_nodes,
     } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let gen_id = store.latest_generation_id()?.unwrap_or(0);
     let repo_root = store.latest_repo_root()?;
 

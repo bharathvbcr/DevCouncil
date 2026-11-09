@@ -1,4 +1,4 @@
-use devmap_query::{Request, StoreQueryEngine};
+use devmap_query::Request;
 
 use crate::cli::Cli;
 use crate::output::{emit_json, emit_search, open_for_read};
@@ -40,7 +40,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     } = args;
     let filter = devmap_query::NameQueryFilter::new(paths, languages, kinds)?;
     let store = open_for_read(cli)?;
-    let engine = StoreQueryEngine::new(&store);
+    let engine = store.engine();
     let resp = if *semantic {
         let scope = filter
             .as_ref()

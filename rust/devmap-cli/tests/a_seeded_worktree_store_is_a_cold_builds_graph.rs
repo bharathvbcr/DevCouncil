@@ -713,10 +713,15 @@ fn stacked_cli_read_commands_merge_delta_without_writing_a_single_byte_and_refus
     json_of(&fx.devmap(&lane, &["--json", "explore", "--", "stacked_delta_fn"]));
     json_of(&fx.devmap(&lane, &["--json", "deps", "--", "src/a.py"]));
 
-    assert_eq!(
-        state_snapshot(&state),
-        before,
-        "CLI read commands changed a byte or an mtime under the lane's state dir"
+    let after = state_snapshot(&state);
+    let changed: Vec<&PathBuf> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "CLI read commands changed a byte or an mtime under the lane's state dir: {changed:?}"
     );
     assert!(!state.join("delta.sqlite-wal").exists());
     assert!(!state.join("delta.sqlite-shm").exists());
@@ -739,4 +744,27 @@ fn stacked_cli_read_commands_merge_delta_without_writing_a_single_byte_and_refus
     );
     assert!(!cold.join(".devmap/codeintel/stack_lease.json").exists());
     assert!(!cold.join(".devmap/codeintel/delta.sqlite").exists());
+}
+
+#[test]
+fn a_lane_refuses_the_commands_that_read_the_whole_store_instead_of_answering_from_its_base() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+
+    for args in [
+        &["--json", "routes"][..],
+        &["--json", "history"][..],
+        &["--json", "snapshots"][..],
+    ] {
+        let out = fx.devmap(&lane, args);
+        assert!(!out.status.success(), "{args:?} must refuse on a lane");
+        let err = stderr(&out);
+        assert!(
+            err.contains("uses a stacked delta store") && err.contains("devmap build"),
+            "{args:?} must say why and what to run: {err}"
+        );
+    }
 }

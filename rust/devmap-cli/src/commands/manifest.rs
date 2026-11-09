@@ -80,7 +80,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         stamps,
         inventory,
     } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let outcome = write_consumer_artifacts(
         &store,
         ManifestRequest {

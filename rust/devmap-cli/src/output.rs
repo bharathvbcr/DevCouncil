@@ -6,9 +6,51 @@ use devmap_store::Store;
 
 use crate::cli::Cli;
 
-pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
+/// What a read command opened: the worktree's own store, or a stacked lane
+/// (an immutable base plus a delta) that has no store of its own.
+pub(crate) enum ReadStore {
+    Plain(Box<Store>),
+    Stacked(Box<devmap_query::StackedStore>),
+}
+
+impl ReadStore {
+    /// The query engine over what was opened. A lane answers from its base
+    /// merged with its delta.
+    pub(crate) fn engine(&self) -> devmap_query::StoreQueryEngine<'_> {
+        match self {
+            Self::Plain(store) => devmap_query::StoreQueryEngine::new(store),
+            Self::Stacked(stacked) => devmap_query::StoreQueryEngine::new(stacked.base_store())
+                .with_stacked(Some(stacked)),
+        }
+    }
+
+    /// The store, for a command that reads the whole of it. A lane has none to
+    /// give, and answering such a command from its base alone would be silent.
+    pub(crate) fn require_plain(self) -> anyhow::Result<Store> {
+        match self {
+            Self::Plain(store) => Ok(*store),
+            Self::Stacked(stacked) => anyhow::bail!(
+                "worktree at {} uses a stacked delta store (no standalone devmap.sqlite); \
+                 this command reads the whole store, so run `devmap build` first",
+                stacked.worktree_root().display()
+            ),
+        }
+    }
+}
+
+/// The one opener for read commands. It never writes, never syncs a delta and
+/// never upgrades: a worktree with a store gets that store; one with only a
+/// stack lease gets the lane; a retired `base_store_ref.json` pointer is refused
+/// by name (`StackedStore::open_if_leased` runs `refuse_legacy_base_store_ref`
+/// for a lane with neither a store nor a lease).
+pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<ReadStore> {
     let db = cli.db();
     if !db.is_file() {
+        if cli.db.is_none() {
+            if let Some(stacked) = devmap_query::StackedStore::open_if_leased(&cli.root_hint())? {
+                return Ok(ReadStore::Stacked(Box::new(stacked)));
+            }
+        }
         anyhow::bail!(
             "no devmap store at {} — run `devmap build` first",
             db.display()
@@ -19,7 +61,7 @@ pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
     if cli.db.is_none() {
         store.validate_repo_root(&cli.root_hint())?;
     }
-    Ok(store)
+    Ok(ReadStore::Plain(Box::new(store)))
 }
 
 pub(crate) fn ensure_parent(path: &std::path::Path) -> anyhow::Result<()> {

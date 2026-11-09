@@ -15,7 +15,7 @@ pub(crate) struct Args {
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let Args { query, limit } = args;
-    let store = open_for_read(cli)?;
+    let store = open_for_read(cli)?.require_plain()?;
     let graph = devmap_query::graph_core_for_store(&store)?;
     let result = devmap_query::cypher::run(&graph, query, *limit);
     if cli.json {

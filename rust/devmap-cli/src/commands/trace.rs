@@ -1,4 +1,4 @@
-use devmap_query::{Request, StoreQueryEngine};
+use devmap_query::Request;
 
 use crate::cli::Cli;
 use crate::output::{emit_edges, emit_json, open_for_read};
@@ -33,7 +33,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         min_rung,
     } = args;
     let store = open_for_read(cli)?;
-    let engine = StoreQueryEngine::new(&store);
+    let engine = store.engine();
     let rung = min_rung.as_deref().and_then(devmap_query::Rung::parse);
     let resp = if let Some(destination) = to {
         // The path variant answers with one path rather than an edge

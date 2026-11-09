@@ -1,4 +1,4 @@
-use devmap_query::{ResolutionAvailability, StoreQueryEngine};
+use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
 use crate::output::{
@@ -46,7 +46,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         } => {
             let scope = devmap_query::SymbolScope::new(paths, languages)?;
             let store = open_for_read(cli)?;
-            let engine = StoreQueryEngine::new(&store);
+            let engine = store.engine();
             let pack =
                 engine.ask_evidence_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
@@ -65,7 +65,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         } => {
             let scope = devmap_query::SymbolScope::new(paths, languages)?;
             let store = open_for_read(cli)?;
-            let engine = StoreQueryEngine::new(&store);
+            let engine = store.engine();
             let resp = engine.ask_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;

@@ -1,5 +1,3 @@
-use devmap_query::StoreQueryEngine;
-
 use crate::cli::Cli;
 use crate::output::{emit_edges, emit_json, open_for_read};
 
@@ -33,7 +31,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         min_rung,
     } = args;
     let store = open_for_read(cli)?;
-    let engine = StoreQueryEngine::new(&store);
+    let engine = store.engine();
     // `check_rung` above has already refused an unparseable name, so a
     // `None` here means no floor was asked for and never that one was
     // asked for and dropped.
