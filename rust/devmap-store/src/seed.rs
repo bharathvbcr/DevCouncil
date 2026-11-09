@@ -89,7 +89,8 @@ impl Fingerprint {
     }
 }
 
-/// Remove `path` and its `-wal` / `-shm` / `-journal` / `.csr`. For files this
+/// Remove `path` and its `-wal` / `-shm` / `-journal` / `.csr` /
+/// `.artifacts.json`. For files this
 /// process staged. A sidecar that is a symlink is unlinked, never followed.
 ///
 /// The writer lock (`<path>.writer.lock`) is deliberately not on this list:
@@ -104,6 +105,7 @@ pub fn discard_staged(path: &Path) {
         sidecar(path, "-shm"),
         sidecar(path, "-journal"),
         sidecar(path, ".csr"),
+        sidecar(path, ".artifacts.json"),
     ] {
         let _ = std::fs::remove_file(file);
     }
@@ -124,7 +126,15 @@ pub fn remove_staged_writer_lock(staged: &Path) -> Result<()> {
             staged.display()
         );
     }
-    remove_file_if_present(&crate::Store::writer_lock_path(staged))
+    let lock = crate::Store::writer_lock_path(staged);
+    match std::fs::symlink_metadata(&lock) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("refusing to remove {}: it is a symlink", lock.display())
+        }
+        Ok(_) => remove_file_if_present(&lock),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", lock.display())),
+    }
 }
 
 /// Unlink `path`. A path that is already absent is success; any other failure
@@ -1118,6 +1128,7 @@ mod tests {
             db.clone(),
             sidecar(&db, "-wal"),
             sidecar(&db, ".csr"),
+            sidecar(&db, ".artifacts.json"),
             lock.clone(),
         ] {
             std::fs::write(&file, b"x").unwrap();
@@ -1127,6 +1138,10 @@ mod tests {
         assert!(
             !sidecar(&db, ".csr").exists(),
             "the staged CSR is discarded"
+        );
+        assert!(
+            !sidecar(&db, ".artifacts.json").exists(),
+            "the staged artifact stamp is discarded"
         );
         assert!(
             lock.exists(),
@@ -1146,6 +1161,19 @@ mod tests {
         let other = tmp.join(format!("devmap.sqlite.seed-{}", std::process::id() + 1));
         assert!(remove_staged_writer_lock(&other).is_err());
         assert!(shared_lock.exists(), "a refused removal unlinks nothing");
+
+        #[cfg(unix)]
+        {
+            let target = tmp.join("elsewhere");
+            std::fs::write(&target, b"x").unwrap();
+            std::os::unix::fs::symlink(&target, &lock).unwrap();
+            assert!(
+                remove_staged_writer_lock(&db).is_err(),
+                "a symlinked lock is refused, not unlinked"
+            );
+            assert!(std::fs::symlink_metadata(&lock).is_ok());
+            assert!(target.exists());
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

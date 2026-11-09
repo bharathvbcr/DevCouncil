@@ -532,52 +532,82 @@ fn ensure_target_absent(target_db: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Place a settled staged store, and its CSR sidecar when it has one, at
+/// The sidecars that follow a store: its CSR graph and the artifact stamp the
+/// manifest writes beside it. Each describes the one store it sits beside.
+const STORE_SIDECARS: [&str; 2] = [".csr", ".artifacts.json"];
+
+/// Place a settled staged store, and its sidecars when it has them, at
 /// `final_db`, which must be absent and whose writer lock the caller holds.
 ///
-/// Orphaned `-wal` / `-shm` beside the absent `final_db` are swept first so
-/// SQLite cannot replay stale frames onto the placed store. The sidecar goes
-/// first and is withdrawn if the store then fails to place, so a store is never
-/// paired with a sidecar of another generation, and no step's failure is dropped.
+/// Orphaned `-wal` / `-shm` / `-journal` beside the absent `final_db` are swept
+/// first so SQLite cannot replay stale frames onto the placed store. The
+/// sidecars go first and are withdrawn if the store then fails to place, so a
+/// store is never paired with a sidecar of another generation, and no step's
+/// failure is dropped. A sidecar the staged store does not bring is swept from
+/// the final path: one left there by an earlier store describes another
+/// generation, and readers check only a generation number or the artifacts'
+/// stat.
+///
+/// The artifact stamp is renamed, not rewritten at the final path: the build
+/// that wrote it ran against the staged path, nothing may exist at the final
+/// path before the whole set is placed, and nothing may remain at the staged
+/// path after.
 fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
     ensure_target_absent(final_db)?;
-    seed::remove_file_if_present(&seed::sidecar(final_db, "-wal"))?;
-    seed::remove_file_if_present(&seed::sidecar(final_db, "-shm"))?;
-    seed::remove_file_if_present(&seed::sidecar(final_db, "-journal"))?;
-    let staged_csr = csr_path_for_store(staged_db);
-    let final_csr = csr_path_for_store(final_db);
-    let placed_csr = match std::fs::symlink_metadata(&staged_csr) {
-        Ok(meta) if meta.is_file() => {
-            std::fs::rename(&staged_csr, &final_csr)
-                .with_context(|| format!("cannot place CSR sidecar {}", final_csr.display()))?;
-            true
+    for suffix in ["-wal", "-shm", "-journal"] {
+        seed::remove_file_if_present(&seed::sidecar(final_db, suffix))?;
+    }
+    let mut placed: Vec<PathBuf> = Vec::new();
+    for suffix in STORE_SIDECARS {
+        let staged_side = seed::sidecar(staged_db, suffix);
+        let final_side = seed::sidecar(final_db, suffix);
+        match std::fs::symlink_metadata(&staged_side) {
+            Ok(meta) if meta.is_file() => {
+                if let Err(error) = std::fs::rename(&staged_side, &final_side) {
+                    let error = anyhow::Error::new(error)
+                        .context(format!("cannot place {}", final_side.display()));
+                    return Err(withdraw(&placed, error));
+                }
+                placed.push(final_side);
+            }
+            Ok(_) => {
+                let error = anyhow!(
+                    "staged sidecar {} is not a regular file",
+                    staged_side.display()
+                );
+                return Err(withdraw(&placed, error));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = seed::remove_file_if_present(&final_side) {
+                    return Err(withdraw(&placed, error));
+                }
+            }
+            Err(error) => {
+                let error = anyhow::Error::new(error)
+                    .context(format!("cannot inspect {}", staged_side.display()));
+                return Err(withdraw(&placed, error));
+            }
         }
-        Ok(_) => bail!(
-            "staged CSR sidecar {} is not a regular file",
-            staged_csr.display()
-        ),
-        // The staged store brings no sidecar, so none may sit beside it: one
-        // left by an earlier store at this path names another generation's
-        // graph, and a reader checks only the generation number.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            seed::remove_file_if_present(&final_csr)?;
-            false
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", staged_csr.display()))
-        }
-    };
+    }
     if let Err(error) = std::fs::rename(staged_db, final_db) {
         let error =
             anyhow::Error::new(error).context(format!("cannot place {}", final_db.display()));
-        if placed_csr {
-            if let Err(rollback) = seed::remove_file_if_present(&final_csr) {
-                return Err(error.context(format!(
-                    "and the CSR sidecar placed before it could not be withdrawn: {rollback:#}"
-                )));
-            }
-        }
-        return Err(error);
+        return Err(withdraw(&placed, error));
     }
     Ok(())
+}
+
+/// `error`, after taking back the sidecars already placed; a sidecar that
+/// cannot be withdrawn is named on the error.
+fn withdraw(placed: &[PathBuf], error: anyhow::Error) -> anyhow::Error {
+    let mut error = error;
+    for side in placed {
+        if let Err(rollback) = seed::remove_file_if_present(side) {
+            error = error.context(format!(
+                "and {} placed before it could not be withdrawn: {rollback:#}",
+                side.display()
+            ));
+        }
+    }
+    error
 }

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! `write_latest_csr_sidecar_strict` reports what the best-effort wrapper
 //! absorbs.
 //!
