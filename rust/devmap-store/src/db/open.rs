@@ -1,4 +1,6 @@
-use super::{refusal, sidecar_links, SidecarLinks, Store, WriterLock, CONNECTION_SETUP};
+use super::{
+    refusal, sidecar_links, ReaderMemory, SidecarLinks, Store, WriterLock, CONNECTION_SETUP,
+};
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
 use std::path::Path;
@@ -221,10 +223,16 @@ impl Store {
     /// even when the application has write access to the file. A writer must
     /// upgrade an older store explicitly before an advisory reader can use it.
     pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref()))
+        Self::open_read_only_with(db_path, ReaderMemory::CURRENT)
     }
 
-    fn open_read_only_once(db_path: &Path) -> Result<Self> {
+    /// [`Self::open_read_only`] with the connection's page cache and file
+    /// mapping set to `memory` instead of [`ReaderMemory::CURRENT`].
+    pub fn open_read_only_with<P: AsRef<Path>>(db_path: P, memory: ReaderMemory) -> Result<Self> {
+        Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref(), memory))
+    }
+
+    fn open_read_only_once(db_path: &Path, memory: ReaderMemory) -> Result<Self> {
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
         let path = resolved.as_path();
@@ -281,6 +289,10 @@ impl Store {
         Self::admit_reader_schema(&conn, &path.display().to_string(), stamped)?;
         Self::reject_triggers(&conn)?;
         Self::configure_connection(&conn)?;
+        conn.pragma_update(None, "cache_size", -i64::from(memory.cache_kib))?;
+        if memory.mmap_bytes != 0 {
+            conn.pragma_update(None, "mmap_size", memory.mmap_bytes as i64)?;
+        }
         Self::validate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),

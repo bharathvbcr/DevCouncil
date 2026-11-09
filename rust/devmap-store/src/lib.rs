@@ -27,7 +27,7 @@ pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
     FileSymbolsPage, GenerationWriteOpts, KeywordNarrowing, LiteralPage, PageSizeConversion,
     PendingClaim, PendingEnqueueReport, PendingReconcile, PendingSupersede, PendingWatermark,
-    QuerySourceFreshness, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
+    QuerySourceFreshness, ReaderMemory, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
     StoredEdge, StoredFile, StoredLiteral, StoredSymbol, UnresolvedSiteRow, UnresolvedSitesByName,
     UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
     WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,

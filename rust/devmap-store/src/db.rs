@@ -535,6 +535,28 @@ fn lock_conn(
         })
 }
 
+/// Memory a read-only connection may use for SQLite's page cache and file
+/// mapping.
+///
+/// A named pair rather than two loose numbers so the open path and a benchmark
+/// that compares settings share one definition. See
+/// `devmap-serve/examples/mcp_reader_memory_bench.rs` for the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderMemory {
+    /// SQLite `cache_size`, in KiB.
+    pub cache_kib: u32,
+    /// SQLite `mmap_size`, in bytes; 0 reads through the page cache only.
+    pub mmap_bytes: u64,
+}
+
+impl ReaderMemory {
+    /// What every read-only connection uses.
+    pub const CURRENT: Self = Self {
+        cache_kib: (-Store::CACHE_SIZE_KIB) as u32,
+        mmap_bytes: 0,
+    };
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     /// The file this store was opened from, when it has one.
