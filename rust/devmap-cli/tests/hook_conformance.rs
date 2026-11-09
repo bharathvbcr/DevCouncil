@@ -2081,3 +2081,38 @@ fn post_tool_use_blast_names_why_the_list_is_short() {
 
 #[cfg(unix)]
 include!("../../testsupport/restriction.rs");
+
+/// A linked `codeintel/hooks` directory is refused, and the refusal is said on
+/// stderr by the hook itself; nothing is written through the link.
+#[cfg(unix)]
+#[test]
+fn a_linked_hooks_directory_is_reported_on_stderr_and_not_written_through() {
+    let root = scratch("linked-hooks-notice");
+    seed_store(&root);
+    let victim = root.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    let hooks = root.join(".devcouncil/codeintel/hooks");
+    std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "linked-hooks",
+        "cwd": root.to_string_lossy(),
+        "tool_name": "Read",
+        "tool_input": {"file_path": root.join("a.py").to_string_lossy()},
+    });
+    let run = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    let written = std::fs::read_dir(&victim).unwrap().count();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("symbolic link") && run.stderr.contains("hooks"),
+        "the refused link must be named on stderr: {:?}",
+        run.stderr
+    );
+    assert_eq!(run.stderr.lines().count(), 1, "one line: {:?}", run.stderr);
+    assert_eq!(written, 0, "a marker was written through the link");
+}

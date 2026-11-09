@@ -64,6 +64,9 @@ fn doctor_report(
         "plugin_cleanup_note": plugin_cleanup_note(),
         "profile_hooks_warning": profile_hooks_warning(&std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())),
         "stale_server_warning": stale_server_warning(root),
+        "hooks_marker_dir_warning": crate::hook::marker_dir_link_warning(
+            &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+        ),
         "mcp_registrations": mcp_registration_inventory(),
         "git": git_report(root),
     });

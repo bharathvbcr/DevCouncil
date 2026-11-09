@@ -439,3 +439,26 @@ fn doctor_reports_skills_that_no_longer_match_the_receipt() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cwd);
 }
+
+/// A linked hooks directory is refused by the hook; doctor says so, with the
+/// path and the remedy, instead of leaving it a silent skip.
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_linked_hooks_directory() {
+    let home = scratch("linked-hooks-home");
+    let repo = scratch("linked-hooks-repo");
+    let victim = repo.join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+    let hooks = repo.join(".devcouncil/codeintel/hooks");
+    let clean = doctor_with_home(&home, &repo);
+    assert!(clean["hooks_marker_dir_warning"].is_null(), "{clean}");
+    std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+
+    let report = doctor_with_home(&home, &repo);
+    let warning = report["hooks_marker_dir_warning"].as_str().unwrap_or("");
+    assert!(warning.contains("hooks") && warning.contains("symbolic link"), "{report}");
+    assert!(warning.contains("Remedy"), "{warning}");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&repo);
+}

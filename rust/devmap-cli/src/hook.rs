@@ -1927,6 +1927,13 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
     // or a linked ancestor, is refused, so neither the marker nor the pruning
     // below can reach into a directory the link points at.
     let Ok(pinned) = PinnedDir::open(dir, true) else {
+        // A refused link is a fact the owner must be told, not a quiet skip.
+        // The marker directory is the one place per-session state could live,
+        // and it is the refused one, so this notice repeats on every hook
+        // invocation instead of once per session.
+        if let Some(link) = linked_component(dir) {
+            eprintln!("{}", linked_component_notice(&link));
+        }
         return Claim::Skip;
     };
     match pinned.open_file(std::ffi::OsStr::new(name), Access::Append, Creation::New) {
@@ -1936,6 +1943,45 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
         }
         Err(_) => Claim::Skip,
     }
+}
+
+/// The first component of `dir` that is a symbolic link, or `None`.
+///
+/// `PinnedDir::open` refuses every link in the path; this names which one, by
+/// `symlink_metadata` only, so it never follows the link it reports. The macOS
+/// `/var` and `/tmp` system aliases are not reported, matching `PinnedDir`.
+pub(crate) fn linked_component(dir: &Path) -> Option<PathBuf> {
+    let mut current = PathBuf::new();
+    for component in dir.components() {
+        current.push(component);
+        #[cfg(target_os = "macos")]
+        if current == Path::new("/var") || current == Path::new("/tmp") {
+            continue;
+        }
+        if current
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Some(current);
+        }
+    }
+    None
+}
+
+/// The one-line stderr/doctor text for a refused linked marker component.
+pub(crate) fn linked_component_notice(link: &Path) -> String {
+    format!(
+        "devmap hook: {} is a symbolic link, so the hook refuses to write session markers \
+         through it and skips its once-per-session notices. Remedy: replace the link with a \
+         real directory (remove the link, then let the hook recreate it).",
+        link.display()
+    )
+}
+
+/// The refused linked component of this repository's hook marker directory,
+/// for `devmap doctor`. Read-only.
+pub(crate) fn marker_dir_link_warning(root: &Path) -> Option<String> {
+    linked_component(&marker_dir(root)).map(|link| linked_component_notice(&link))
 }
 
 /// Assemble the context block from already-summarized repository clauses.
@@ -2012,7 +2058,7 @@ fn probe(
     // Canonicalize before spawn. A failure here is a hook error, not an empty
     // probe: spawning the unresolved path, or a binary that lives inside the
     // repository being probed, is the thing this boundary refuses.
-    let executable = canonical_probe_executable(executable, root)?;
+    let executable = canonical_hook_executable(executable, root, "probe")?;
     let mut command = Command::new(&executable);
     command.args(["--root"]).arg(root).args(args);
     let bounds = subprocess::Bounds {
@@ -2092,6 +2138,8 @@ fn detach_post_tool_root(executable: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 fn detach_stack_sync(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    let executable = canonical_hook_executable(executable, root, "detach")?;
+    let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "stack-sync");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
@@ -2156,6 +2204,11 @@ fn detach_build_with(
     root: &Path,
     seed_from: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let executable = canonical_hook_executable(executable, root, "detach")?;
+    if let Some(main) = seed_from {
+        canonical_hook_executable(&executable, main, "detach")?;
+    }
+    let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "build");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
@@ -2181,6 +2234,8 @@ fn detach_session_report(
     root: &Path,
     session: Option<&str>,
 ) -> anyhow::Result<()> {
+    let executable = canonical_hook_executable(executable, root, "detach")?;
+    let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, &session_report_lock_kind(session));
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
@@ -2518,30 +2573,39 @@ pub(crate) fn shell_quote_hook_executable(text: &str) -> anyhow::Result<String> 
     Ok(shell_single_quote(text))
 }
 
-/// Canonical executable `probe` may spawn, or an error when the path cannot
-/// be resolved or is inside `root`.
+/// Canonical executable a hook may spawn for `root`, or an error when the path
+/// cannot be resolved or is inside `root`. `action` ("probe", "detach") names
+/// the refused operation in the diagnostic.
+///
+/// This is the one owner of the containment check: `probe` and every detached
+/// spawn (`detach_build_with`, `detach_stack_sync`, `detach_session_report`)
+/// route through it, so no hook path starts a binary the repository can replace.
 ///
 /// "Not inside the repository" is the whole policy: there is no install-directory
 /// allowlist. Containment is canonical components, not a string prefix
 /// (`/repo-evil` is not inside `/repo`). On Unix an ancestor with the repo's
 /// device and inode counts too, so a symlink inside the repo that points at
 /// an outside binary is still inside.
-fn canonical_probe_executable(executable: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+fn canonical_hook_executable(
+    executable: &Path,
+    root: &Path,
+    action: &str,
+) -> anyhow::Result<PathBuf> {
     let canonical_exe = executable.canonicalize().with_context(|| {
         format!(
-            "refusing to probe: could not canonicalize executable {}",
+            "refusing to {action}: could not canonicalize executable {}",
             executable.display()
         )
     })?;
     let canonical_root = root.canonicalize().with_context(|| {
         format!(
-            "refusing to probe: could not canonicalize repository {}",
+            "refusing to {action}: could not canonicalize repository {}",
             root.display()
         )
     })?;
     if executable_is_inside_repo(executable, &canonical_exe, root, &canonical_root) {
         bail!(
-            "refusing to probe: executable {} is inside repository {}",
+            "refusing to {action}: executable {} is inside repository {}",
             executable.display(),
             canonical_root.display()
         );
@@ -3047,6 +3111,129 @@ mod tests {
             stdout.as_deref().unwrap_or("").contains("outside-ran"),
             "{stdout:?}"
         );
+    }
+
+    /// Every detached spawn shares the probe's containment owner: PostToolUse
+    /// (`detach_build`, `detach_stack_sync`) and SessionEnd
+    /// (`detach_session_report`) refuse a binary inside the repository, take no
+    /// lock, and spawn nothing.
+    #[cfg(unix)]
+    #[test]
+    fn every_detach_refuses_an_executable_inside_the_repository() {
+        let base = scratch_dir("detach-inside");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+        let results = [
+            detach_build(&exe, &repo),
+            detach_stack_sync(&exe, &repo),
+            detach_session_report(&exe, &repo, Some("s1")),
+            detach_post_tool_root(&exe, &repo),
+        ];
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let locked = coalesce_lock_dir(&repo, "build").exists();
+        let _ = fs::remove_dir_all(&base);
+        for result in results {
+            let message = result.expect_err("an in-repo detach must be refused").to_string();
+            assert!(
+                message.contains("refusing to detach") && message.contains("inside"),
+                "{message}"
+            );
+        }
+        assert!(!ran, "the in-repo executable was spawned");
+        assert!(!locked, "a refused detach must not take the coalesce lock");
+    }
+
+    /// A symlink inside the repo that points at an outside binary is inside.
+    #[cfg(unix)]
+    #[test]
+    fn detach_refuses_a_symlink_inside_the_repository() {
+        let base = scratch_dir("detach-symlink");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let real = outside.join("devmap");
+        write_script(&real, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+        let link = repo.join("devmap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = detach_session_report(&link, &repo, None);
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(result.is_err(), "an in-repo symlink must be refused");
+        assert!(!ran, "the in-repo symlink was spawned");
+    }
+
+    /// A seeded build also refuses a binary inside the main checkout it seeds from.
+    #[cfg(unix)]
+    #[test]
+    fn a_seeded_build_refuses_an_executable_inside_the_seed_checkout() {
+        let base = scratch_dir("detach-seed");
+        let lane = base.join("lane");
+        let main = base.join("main");
+        fs::create_dir_all(&lane).unwrap();
+        fs::create_dir_all(&main).unwrap();
+        let marker = base.join("ran");
+        let exe = main.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+        let result = detach_seeded_build(&exe, &lane, &main);
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(result.is_err(), "an executable inside the seed checkout must be refused");
+        assert!(!ran);
+    }
+
+    /// `repo-evil` is a string prefix of `repo` but not inside it: still detaches.
+    #[cfg(unix)]
+    #[test]
+    fn detach_runs_an_executable_in_a_prefixed_sibling_directory() {
+        let base = scratch_dir("detach-sibling");
+        let repo = base.join("repo");
+        let evil = base.join("repo-evil");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let marker = base.join("ran");
+        let exe = evil.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+        let result = detach_session_report(&exe, &repo, Some("s2"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        result.expect("a sibling outside the repo must detach");
+        assert!(ran, "the sibling executable did not run");
+    }
+
+    /// An executable that cannot be canonicalized spawns nothing and is an error.
+    #[cfg(unix)]
+    #[test]
+    fn detach_with_an_unresolvable_executable_is_an_error_and_spawns_nothing() {
+        let base = scratch_dir("detach-missing");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let missing = base.join("no-such-devmap");
+
+        let result = detach_build(&missing, &repo);
+        let locked = coalesce_lock_dir(&repo, "build").exists();
+        let _ = fs::remove_dir_all(&base);
+        let message = result.expect_err("an unresolvable executable must not detach").to_string();
+        assert!(
+            message.contains("refusing to detach") && message.contains("canonicalize"),
+            "{message}"
+        );
+        assert!(!locked);
     }
 
     #[cfg(unix)]
@@ -4318,7 +4505,7 @@ mod tests {
         fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o555)).unwrap();
 
         let payload = json!({ "cwd": &root });
-        let notice = unindexed_worktree_notice(&payload, Path::new("devmap"))
+        let notice = unindexed_worktree_notice(&payload, Path::new("/bin/sh"))
             .expect("a linked unindexed worktree is named");
         let text = notice
             .pointer("/hookSpecificOutput/additionalContext")
@@ -5487,9 +5674,12 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         // Another report holds the store-wide lock the old code used for all.
-        let held = coalesce_lock_dir(&root, "session-report");
+        // The binary lives beside the hooked repository, not inside it.
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let held = coalesce_lock_dir(&repo, "session-report");
         assert!(try_acquire_lock_dir(&held).unwrap());
-        detach_session_report(&script, &root, Some("ending-session")).unwrap();
+        detach_session_report(&script, &repo, Some("ending-session")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -5593,6 +5783,29 @@ mod tests {
     /// owner never meant to hand over. The marker claim must not create a file
     /// there, and the pruning that follows a claim must not delete from it: a
     /// hostile checkout could otherwise aim both at the victim's `nav.*` files.
+    /// The refused link is named, not silently skipped: the first link in the
+    /// path is reported, a real directory is not, and doctor's warning carries
+    /// the path and the remedy.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_hooks_component_is_named_for_the_notice_and_doctor() {
+        let root = scratch("hooks-linked-notice");
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let hooks = marker_dir(&root);
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        assert_eq!(linked_component(&hooks), None);
+        assert_eq!(marker_dir_link_warning(&root), None);
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+
+        assert_eq!(linked_component(&hooks), Some(hooks.clone()));
+        let warning = marker_dir_link_warning(&root).expect("a linked hooks dir is reported");
+        assert!(warning.contains(&hooks.display().to_string()), "{warning}");
+        assert!(warning.contains("Remedy"), "{warning}");
+        assert!(!warning.contains('\n'), "one line: {warning}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_linked_marker_directory_receives_no_write_and_loses_no_file() {
