@@ -2178,7 +2178,15 @@ impl StackedStore {
     /// so every `StoreQueryEngine` traversal (`impact`, `trace`, `neighbors`,
     /// `explore`, `affected_tests`, `dependencies`, `ask`) sees worktree edits and
     /// deletions. The merged index is cached until the overlay is rebuilt.
-    pub fn generation_edges_with_id(&self) -> Result<Option<(u32, Arc<GenerationEdges>)>> {
+    ///
+    /// The rebuild reads every base edge and does one base lookup per distinct
+    /// delta callee, so it consults `cancel` as it goes. A cancelled rebuild
+    /// returns [`crate::cancel::QueryCancelled`] and caches nothing: the cache
+    /// is written only with a finished merge.
+    pub fn generation_edges_with_id(
+        &self,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<(u32, Arc<GenerationEdges>)>> {
         if !self.has_delta_changes() {
             return Ok(self.base.generation_edges_with_id()?);
         }
@@ -2197,12 +2205,18 @@ impl StackedStore {
             &self.overlay,
             &self.base,
             generation,
+            cancel,
         )?);
         *guard = Some((generation, Arc::clone(&built)));
         Ok(Some((generation, built)))
     }
 
-    pub fn file_edges(&self, path: &str, min_confidence: f32) -> Result<Option<FileEdges>> {
+    pub fn file_edges(
+        &self,
+        path: &str,
+        min_confidence: f32,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<FileEdges>> {
         if !self.has_delta_changes() {
             return Ok(self.base.file_edges(path, min_confidence)?);
         }
@@ -2210,7 +2224,7 @@ impl StackedStore {
         let Some(file) = self.latest_file(path)? else {
             return Ok(None);
         };
-        let Some((generation, index)) = self.generation_edges_with_id()? else {
+        let Some((generation, index)) = self.generation_edges_with_id(cancel)? else {
             return Ok(None);
         };
         let mut edges = Vec::new();
@@ -2442,7 +2456,11 @@ impl StackedStore {
         Ok(symbols)
     }
 
-    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
+    pub fn dead_page(
+        &self,
+        limit: usize,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Option<DeadPage>> {
         if !self.has_delta_changes() {
             return Ok(self.base.dead_page(limit)?);
         }
@@ -2450,7 +2468,9 @@ impl StackedStore {
         let Some(mut page) = self.base.dead_page(fetch)? else {
             return Ok(None);
         };
-        let edges_opt = self.generation_edges_with_id()?.map(|(_, idx)| idx);
+        let edges_opt = self
+            .generation_edges_with_id(cancel)?
+            .map(|(_, idx)| idx);
         let before_filter = page.rows.len();
         page.rows.retain(|row| {
             let p = Path::new(&row.file_path);
@@ -2491,6 +2511,7 @@ impl StackedStore {
         targets: &[String],
         exclude_file: &str,
         min_confidence: f32,
+        cancel: &crate::cancel::Cancel,
     ) -> Result<Option<CallersPage>> {
         if !self.has_delta_changes() {
             return Ok(self
@@ -2498,7 +2519,7 @@ impl StackedStore {
                 .callers_page(targets, exclude_file, min_confidence)?);
         }
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
-        let Some((generation, index)) = self.generation_edges_with_id()? else {
+        let Some((generation, index)) = self.generation_edges_with_id(cancel)? else {
             return Ok(None);
         };
         let mut callers = Vec::new();
@@ -2821,6 +2842,7 @@ fn resolve_delta_stored_edges(
     base: &Store,
     base_scope_paths: &[String],
     lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>,
+    cancel: &crate::cancel::Cancel,
 ) -> Result<Vec<StoredEdge>> {
     let mut out = Vec::new();
     let caller_family = LangFamily::from_lang(devmap_extract::languages::detect_language(
@@ -2953,6 +2975,7 @@ fn resolve_delta_stored_edges(
             }
         }
         if !lookups.contains_key(callee) {
+            cancel.check()?;
             lookups.insert(callee.to_string(), base_symbols_for_callee(base, callee)?);
         }
         let (base_rows, base_exhaustive) = &lookups[callee];
@@ -3097,6 +3120,7 @@ fn merge_generation_edges(
     overlay: &WorktreeOverlay,
     base: &Store,
     generation: u32,
+    cancel: &crate::cancel::Cancel,
 ) -> Result<GenerationEdges> {
     let mut merged: Vec<StoredEdge> = Vec::with_capacity(base_index.len() + 64);
     let mut seen: HashSet<(String, String, String, String, String)> = HashSet::new();
@@ -3111,6 +3135,7 @@ fn merge_generation_edges(
     };
 
     for id in 0..base_index.len() as u32 {
+        cancel.check_every(id as usize)?;
         let src_p = Path::new(base_index.source_file(id));
         let dst_p = Path::new(base_index.target_file(id));
         if overlay.is_file_tombstoned(src_p)
@@ -3134,6 +3159,7 @@ fn merge_generation_edges(
     let mut dirty_paths: Vec<&String> = overlay.added_extractions.keys().collect();
     dirty_paths.sort();
     for rel_path in dirty_paths {
+        cancel.check()?;
         let Some(ext) = overlay.added_extractions.get(rel_path) else {
             continue;
         };
@@ -3144,6 +3170,7 @@ fn merge_generation_edges(
             base,
             &base_scope_paths,
             &mut lookups,
+            cancel,
         )? {
             if seen.insert(key_of(&edge)) {
                 merged.push(edge);
@@ -6870,6 +6897,7 @@ mod tests {
                 stacked.base_store(),
                 &scope,
                 lookups,
+                &crate::cancel::Cancel::new(),
             )
             .unwrap()
             .into_iter()
@@ -6994,7 +7022,10 @@ mod tests {
 
         // The engine's own consultations, with the merge already cached.
         let primed = StackedStore::open(&lane).unwrap();
-        primed.generation_edges_with_id().unwrap().unwrap();
+        primed
+            .generation_edges_with_id(&crate::cancel::Cancel::new())
+            .unwrap()
+            .unwrap();
         let (probe, engine_only) = counting_cancel(None);
         crate::StoreQueryEngine::new(primed.base_store())
             .with_stacked(Some(&primed))
@@ -7031,6 +7062,44 @@ mod tests {
                 .any(|edge| edge.source_symbol.contains("caller_5")),
             "the call after a cancelled merge must hold the full delta: {:?}",
             answer.items
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A merge cancelled before it starts stops at its first consultation, well
+    /// inside a bound that a full merge of this delta is not held to.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_pre_cancelled_merge_stops_at_the_first_check_and_quickly() {
+        const CALLEES: usize = 24;
+        let (root, lane) = lane_with_a_delta_caller_per_callee("merge-pre-cancelled", CALLEES);
+        let stacked = StackedStore::open(&lane).unwrap();
+        let (cancel, checks) = counting_cancel(Some(1));
+
+        let started = std::time::Instant::now();
+        let err = stacked
+            .generation_edges_with_id(&cancel)
+            .expect_err("a cancelled merge must not produce an index");
+        let elapsed = started.elapsed();
+
+        assert!(err.downcast_ref::<crate::cancel::QueryCancelled>().is_some());
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the merge kept consulting the flag after it was cancelled"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a pre-cancelled merge took {elapsed:?}"
+        );
+        assert!(stacked.merged_edges.lock().unwrap().is_none());
+        let (_, full) = stacked
+            .generation_edges_with_id(&crate::cancel::Cancel::new())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !full.into_target_symbol("src/base.rs::callee_7").is_empty(),
+            "the uncancelled call after a cancelled one must be the full merge"
         );
         let _ = remove_readonly_tree(&root);
     }
@@ -7095,7 +7164,14 @@ mod tests {
         let mut merged_len = 0;
         for _ in 0..RUNS {
             let started = std::time::Instant::now();
-            let merged = merge_generation_edges(&base_index, &overlay, &base, 1).unwrap();
+            let merged = merge_generation_edges(
+                &base_index,
+                &overlay,
+                &base,
+                1,
+                &crate::cancel::Cancel::new(),
+            )
+            .unwrap();
             timings.push(started.elapsed());
             merged_len = merged.len();
         }
