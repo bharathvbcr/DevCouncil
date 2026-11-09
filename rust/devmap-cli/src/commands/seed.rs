@@ -221,7 +221,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                 )
             })?;
             if staged_store.latest_generation_head_sha()?.as_deref() != Some(lane_head.as_str()) {
-                staged_store.restamp_latest_head(&lane_head)?;
+                staged_store.restamp_latest_head_keeping_seed_rebind(&lane_head)?;
             }
             let src_csr = csr_path_for_store(&source_store);
             if src_csr.is_file() {
@@ -537,6 +537,7 @@ fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
     ensure_target_absent(final_db)?;
     seed::remove_file_if_present(&seed::sidecar(final_db, "-wal"))?;
     seed::remove_file_if_present(&seed::sidecar(final_db, "-shm"))?;
+    seed::remove_file_if_present(&seed::sidecar(final_db, "-journal"))?;
     let staged_csr = csr_path_for_store(staged_db);
     let final_csr = csr_path_for_store(final_db);
     let placed_csr = match std::fs::symlink_metadata(&staged_csr) {
@@ -549,7 +550,13 @@ fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
             "staged CSR sidecar {} is not a regular file",
             staged_csr.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // The staged store brings no sidecar, so none may sit beside it: one
+        // left by an earlier store at this path names another generation's
+        // graph, and a reader checks only the generation number.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            seed::remove_file_if_present(&final_csr)?;
+            false
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("cannot inspect {}", staged_csr.display()))
         }

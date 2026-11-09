@@ -180,8 +180,10 @@ pub(crate) struct BuildRequest<'a> {
 }
 
 impl Args {
-    /// The arguments of a plain incremental `devmap build` of `root`: every
-    /// flag at its clap default.
+    /// The arguments of an incremental `devmap build --manifest` of `root`:
+    /// every other flag at its clap default. A staged seed always writes the
+    /// consumer artifacts, as `--seed-from` does, so a seeded lane never lacks
+    /// a manifest.
     fn incremental(root: &std::path::Path) -> Self {
         Self {
             path: root.to_path_buf(),
@@ -189,7 +191,7 @@ impl Args {
             deleted: None,
             full: false,
             verify_rows: false,
-            manifest: false,
+            manifest: true,
             output: None,
             graph_output: None,
             guides: false,
