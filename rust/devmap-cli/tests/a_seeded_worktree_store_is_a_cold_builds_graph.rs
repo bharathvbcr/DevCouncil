@@ -843,3 +843,145 @@ fn seeded_build_and_standalone_seed_guard_csr_generation_dangling_symlinks_and_o
     let search_clean = fx.devmap(&orphan_lane, &["--json", "search", "--", "alpha"]);
     assert!(search_clean.status.success(), "{}", stderr(&search_clean));
 }
+
+fn generation_rows(root: &Path) -> Vec<(i64, String, String)> {
+    let conn = Connection::open(store(root)).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, repo_root, head_sha FROM generations ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn head_of(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A `.csr` that outlived its store is another generation's graph. GitPulse maps
+/// whichever sidecar sits beside the store and checks only the generation
+/// number, so placing a store beside it without sweeping it is a silent wrong
+/// answer. The donor here has no CSR (a plain `build` never writes one), which is
+/// the usual case for a hook-driven `build --seed-from`.
+#[test]
+fn a_stale_csr_beside_an_absent_store_is_swept_when_the_seeded_store_brings_none() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let main = fx.main();
+    assert!(
+        !main.join(".devmap/codeintel/devmap.sqlite.csr").exists(),
+        "fixture precondition: the donor has no CSR sidecar"
+    );
+    let lane = fx.at("lane");
+    let ci = lane.join(".devmap/codeintel");
+    fs::create_dir_all(&ci).unwrap();
+    let stale = ci.join("devmap.sqlite.csr");
+    fs::write(&stale, b"A-CSR-OF-ANOTHER-GENERATION").unwrap();
+
+    let out = fx.devmap(&lane, &["build", "--seed-from", main.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(store(&lane).is_file(), "the seeded store was placed");
+    assert!(
+        !stale.exists(),
+        "a store was placed beside a sidecar it did not write"
+    );
+}
+
+/// The standalone seed of a lane whose tree equals the donor's but whose HEAD
+/// does not (an empty commit). The graph is the donor's, so no generation is
+/// written; only the stamp moves. Historical generations stay as the donor wrote
+/// them (CoW-shared, `seed_rebind` binds the latest row), which a normalising
+/// restamp would undo.
+#[test]
+fn a_standalone_seed_at_another_head_stamps_the_lane_head_and_leaves_history_untouched() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let main = fx.main();
+    let full = fx.devmap(&main, &["build", "--full"]);
+    assert!(full.status.success(), "{}", stderr(&full));
+    let donor_rows = generation_rows(&main);
+    assert!(
+        donor_rows.len() >= 2,
+        "fixture precondition: the donor holds a historical generation: {donor_rows:?}"
+    );
+
+    let lane = fx.at("lane");
+    git(
+        &lane,
+        &["commit", "-q", "--allow-empty", "-m", "lane-moved"],
+    );
+    let lane_head = head_of(&lane);
+    assert_ne!(lane_head, head_of(&main), "the fixture must move HEAD");
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let rows = generation_rows(&lane);
+    assert_eq!(
+        rows.len(),
+        donor_rows.len(),
+        "a tree that matches the donor writes no generation"
+    );
+    let (latest, history) = rows.split_last().unwrap();
+    assert_eq!(
+        latest.2, lane_head,
+        "the latest generation is stamped with the lane HEAD"
+    );
+    assert_eq!(
+        latest.1,
+        lane.to_str().unwrap(),
+        "the latest generation is bound to the lane"
+    );
+    assert_eq!(
+        history,
+        &donor_rows[..donor_rows.len() - 1],
+        "historical generations must stay byte-identical to the donor's"
+    );
+    let rebind: i64 = scalar(&lane, "SELECT count(*) FROM seed_rebind");
+    assert_eq!(rebind, 1, "the seed rebind outlives the stamp");
+}
+
+/// A diverged standalone seed builds the lane's edits, so the donor's artifacts
+/// no longer describe it. The lane must still not lack a manifest (spec F2), the
+/// same as a seeded build.
+#[test]
+fn a_diverged_standalone_seed_writes_the_consumer_artifacts() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit(&lane);
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let paths_out = fx.devmap(&lane, &["--json", "paths"]);
+    assert!(paths_out.status.success(), "{}", stderr(&paths_out));
+    let paths: Value = serde_json::from_slice(&paths_out.stdout).unwrap();
+    for key in ["repo_map", "code_graph"] {
+        let path = PathBuf::from(
+            paths[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{key}: {paths}")),
+        );
+        assert!(
+            path.starts_with(&lane),
+            "{key} resolves into the lane: {path:?}"
+        );
+        assert!(
+            path.is_file(),
+            "a diverged seed left the lane without {key}: {path:?}"
+        );
+    }
+    let graph = graph(&lane);
+    let text = graph.to_string();
+    assert!(
+        text.contains("delta"),
+        "the lane's graph describes the lane's edit, not the donor's tree"
+    );
+}
