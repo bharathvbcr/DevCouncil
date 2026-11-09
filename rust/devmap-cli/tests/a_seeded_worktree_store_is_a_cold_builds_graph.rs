@@ -627,3 +627,219 @@ fn seeded_build_writes_manifest_even_when_main_has_no_manifest_artifacts() {
         "seeded worktree lacked code_graph.json when main omitted --manifest"
     );
 }
+
+#[test]
+fn standalone_seed_builds_lane_edits_and_stamps_lane_head_before_atomic_placement() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+
+    // Advance `lane` with its own committed symbol so `lane` HEAD != `main` HEAD.
+    fs::write(
+        lane.join("src/a.py"),
+        "def alpha():\n    return beta()\n\n\ndef beta():\n    return 1\n\n\ndef lane_committed_only():\n    return beta()\n",
+    )
+    .unwrap();
+    git(&lane, &["add", "."]);
+    git(&lane, &["commit", "-qm", "lane-diverged"]);
+    let lane_head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&lane)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Run standalone `devmap seed` WITHOUT running `devmap build` afterwards (`F-g`).
+    let seed_out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    let seed_json: Value = serde_json::from_slice(&seed_out.stdout).unwrap();
+    assert_eq!(seed_json["mode"], "cow");
+
+    // Immediately queryable for `lane_committed_only`, fresh, and stamped with `lane`'s HEAD.
+    let search_out = fx.devmap(&lane, &["--json", "search", "--", "lane_committed_only"]);
+    assert!(search_out.status.success(), "{}", stderr(&search_out));
+    let search_json: Value = serde_json::from_slice(&search_out.stdout).unwrap();
+    assert_eq!(
+        search_json["shown"], 1,
+        "standalone seed must index lane's own edits before placement: {search_json}"
+    );
+
+    let status_out = fx.devmap(&lane, &["--json", "status"]);
+    assert!(status_out.status.success(), "{}", stderr(&status_out));
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["is_fresh"], true, "{status_json}");
+    assert_eq!(status_json["query_ready"], true, "{status_json}");
+    assert!(
+        status_json["generation_id"].as_i64().unwrap_or(0) >= 2,
+        "expected generation +1 for diverged lane: {status_json}"
+    );
+
+    let recorded_head: String = scalar(
+        &lane,
+        "SELECT head_sha FROM generations ORDER BY id DESC LIMIT 1",
+    );
+    assert_eq!(recorded_head, lane_head);
+    assert!(
+        lane.join(".devmap/codeintel/devmap.sqlite.csr").is_file(),
+        "CSR sidecar must be materialized alongside placed store"
+    );
+
+    // Simulated build failure on staged store (`DROP TABLE nodes_fts_data` in donor + diverged
+    // `sibling` tree) must fail before placement and leave zero store or staged files in `sibling`.
+    let donor_db = fx.main().join(".devmap/codeintel/devmap.sqlite");
+    {
+        let conn = Connection::open(&donor_db).unwrap();
+        conn.execute_batch("DROP TABLE nodes_fts_data;").unwrap();
+    }
+    let sibling = fx.at("sibling");
+    edit(&sibling);
+    let failed_seed = fx.devmap(&sibling, &["--json", "seed"]);
+    assert!(
+        !failed_seed.status.success(),
+        "staged build failure must fail devmap seed; stdout: {}",
+        String::from_utf8_lossy(&failed_seed.stdout)
+    );
+    assert!(
+        !sibling.join(".devmap/codeintel/devmap.sqlite").exists(),
+        "failed staged build must never place partial devmap.sqlite"
+    );
+    let leftovers: Vec<_> = fs::read_dir(sibling.join(".devmap/codeintel"))
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        leftovers
+            .iter()
+            .all(|e| !e.file_name().to_string_lossy().contains(".seed-")),
+        "staged files left behind after build failure: {leftovers:?}"
+    );
+}
+
+#[test]
+fn seeded_build_and_standalone_seed_guard_csr_generation_dangling_symlinks_and_orphaned_wal() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let main = fx.main();
+    // Materialize a donor CSR at generation 1 on `main`.
+    {
+        let donor_store = devmap_store::Store::open(main.join(".devmap/codeintel/devmap.sqlite"))
+            .expect("open donor store");
+        let csr_path = donor_store
+            .write_latest_csr_sidecar()
+            .expect("write donor csr")
+            .expect("donor csr path");
+        let reader = devmap_store::csr::CsrGraphReader::open_mmap(&csr_path).unwrap();
+        assert_eq!(reader.generation() as i64, 1);
+    }
+
+    // 1. `devmap build --seed-from <main>` on a diverged lane builds generation >= 2:
+    // its `.csr` sidecar MUST match the lane's new generation, NOT stale donor generation 1!
+    let diverged = fx.at("lane");
+    edit(&diverged);
+    let build_out = fx.devmap(&diverged, &["build", "--seed-from", main.to_str().unwrap()]);
+    assert!(build_out.status.success(), "{}", stderr(&build_out));
+    let diverged_gen: i64 = scalar(
+        &diverged,
+        "SELECT id FROM generations ORDER BY id DESC LIMIT 1",
+    );
+    assert!(
+        diverged_gen >= 2,
+        "expected generation >= 2, got {diverged_gen}"
+    );
+    let diverged_csr = diverged.join(".devmap/codeintel/devmap.sqlite.csr");
+    assert!(
+        diverged_csr.is_file(),
+        "diverged --seed-from build must write fresh CSR sidecar"
+    );
+    let csr_reader = devmap_store::csr::CsrGraphReader::open_mmap(&diverged_csr).unwrap();
+    assert_eq!(
+        csr_reader.generation() as i64,
+        diverged_gen,
+        "diverged --seed-from must not overwrite lane CSR with stale donor generation 1 CSR"
+    );
+
+    // 2. Re-running `devmap seed` on `diverged` (where valid `devmap.sqlite` + `.csr` exist)
+    // must fail closed without clobbering either file's bytes!
+    let db_bytes_before = fs::read(diverged.join(".devmap/codeintel/devmap.sqlite")).unwrap();
+    let csr_bytes_before = fs::read(&diverged_csr).unwrap();
+    let reseed_out = fx.devmap(&diverged, &["--json", "seed"]);
+    assert!(
+        !reseed_out.status.success(),
+        "re-seeding over existing store must fail"
+    );
+    assert_eq!(
+        fs::read(diverged.join(".devmap/codeintel/devmap.sqlite")).unwrap(),
+        db_bytes_before,
+        "refused seed must not clobber existing devmap.sqlite"
+    );
+    assert_eq!(
+        fs::read(&diverged_csr).unwrap(),
+        csr_bytes_before,
+        "refused seed must not clobber existing devmap.sqlite.csr"
+    );
+
+    // 3. Dangling symlink at `target_db` must be refused without unlinking or replacing it!
+    #[cfg(unix)]
+    {
+        let symlink_lane = fx.at("cold");
+        let ci_dir = symlink_lane.join(".devmap/codeintel");
+        fs::create_dir_all(&ci_dir).unwrap();
+        let sym_db = ci_dir.join("devmap.sqlite");
+        std::os::unix::fs::symlink(ci_dir.join("nonexistent-target.sqlite"), &sym_db).unwrap();
+        let sym_out = fx.devmap(&symlink_lane, &["--json", "seed"]);
+        assert!(
+            !sym_out.status.success(),
+            "dangling symlink at target_db must be refused"
+        );
+        assert!(
+            fs::symlink_metadata(&sym_db)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "refused seed must leave existing symlink intact"
+        );
+    }
+
+    // 4. Orphaned `-wal` / `-shm` files sitting in `.devmap/codeintel` (with no `devmap.sqlite`)
+    // must be swept under the writer lock before `devmap seed` places `devmap.sqlite`,
+    // and CSR sidecar write failures must surface as errors without placing a store!
+    let orphan_lane = fx.at("sibling");
+    let orphan_ci = orphan_lane.join(".devmap/codeintel");
+    fs::create_dir_all(&orphan_ci).unwrap();
+    fs::write(
+        orphan_ci.join("devmap.sqlite-wal"),
+        b"GARBAGE_ORPHAN_WAL_FRAMES",
+    )
+    .unwrap();
+    fs::write(orphan_ci.join("devmap.sqlite-shm"), b"GARBAGE_ORPHAN_SHM").unwrap();
+
+    // Block final CSR placement by placing a directory at `devmap.sqlite.csr`:
+    // `devmap seed` must surface the error and NOT leave a partial `devmap.sqlite`!
+    fs::create_dir_all(orphan_ci.join("devmap.sqlite.csr")).unwrap();
+    let blocked_csr = fx.devmap(&orphan_lane, &["--json", "seed"]);
+    assert!(
+        !blocked_csr.status.success(),
+        "CSR placement failure must fail devmap seed"
+    );
+    assert!(
+        !orphan_ci.join("devmap.sqlite").exists(),
+        "failed CSR placement must not leave devmap.sqlite behind"
+    );
+    fs::remove_dir_all(orphan_ci.join("devmap.sqlite.csr")).unwrap();
+
+    // Re-plant orphaned WAL/SHM and verify clean `devmap seed` sweeps them and opens cleanly.
+    fs::write(
+        orphan_ci.join("devmap.sqlite-wal"),
+        b"GARBAGE_ORPHAN_WAL_FRAMES",
+    )
+    .unwrap();
+    fs::write(orphan_ci.join("devmap.sqlite-shm"), b"GARBAGE_ORPHAN_SHM").unwrap();
+    let clean_seed = fx.devmap(&orphan_lane, &["--json", "seed"]);
+    assert!(clean_seed.status.success(), "{}", stderr(&clean_seed));
+    let search_clean = fx.devmap(&orphan_lane, &["--json", "search", "--", "alpha"]);
+    assert!(search_clean.status.success(), "{}", stderr(&search_clean));
+}
