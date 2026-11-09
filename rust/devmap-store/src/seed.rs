@@ -111,9 +111,19 @@ pub fn discard_staged(path: &Path) {
 
 /// Remove the writer lock a build took on a private staged store
 /// (`<db>.seed-<pid>`), once that build has released it. The staged name is
-/// this process's alone, so nothing can be waiting on the file. An absent lock
-/// is fine; any other failure is returned.
+/// this process's alone, so nothing can be waiting on the file. A path that is
+/// not this process's `.seed-<pid>` staging name is refused: unlinking the lock
+/// of a store another process may hold splits it in two. An absent lock is
+/// fine; any other failure is returned.
 pub fn remove_staged_writer_lock(staged: &Path) -> Result<()> {
+    let private_suffix = format!(".seed-{}", std::process::id());
+    let name = staged.file_name().and_then(|name| name.to_str());
+    if !name.is_some_and(|name| name.ends_with(&private_suffix)) {
+        bail!(
+            "refusing to remove the writer lock of {}: not a private `{private_suffix}` staged store",
+            staged.display()
+        );
+    }
     remove_file_if_present(&crate::Store::writer_lock_path(staged))
 }
 
@@ -1102,7 +1112,7 @@ mod tests {
     #[test]
     fn discard_staged_removes_the_csr_sidecar_and_never_a_writer_lock() {
         let tmp = temp_test_dir("discard-csr");
-        let db = tmp.join("devmap.sqlite.seed-1");
+        let db = tmp.join(format!("devmap.sqlite.seed-{}", std::process::id()));
         let lock = Store::writer_lock_path(&db);
         for file in [
             db.clone(),
@@ -1125,6 +1135,17 @@ mod tests {
         remove_staged_writer_lock(&db).unwrap();
         assert!(!lock.exists());
         remove_staged_writer_lock(&db).expect("an absent lock is success");
+
+        let shared = tmp.join("devmap.sqlite");
+        let shared_lock = Store::writer_lock_path(&shared);
+        std::fs::write(&shared_lock, b"x").unwrap();
+        assert!(
+            remove_staged_writer_lock(&shared).is_err(),
+            "only a private .seed-<pid> staging name may have its lock removed"
+        );
+        let other = tmp.join(format!("devmap.sqlite.seed-{}", std::process::id() + 1));
+        assert!(remove_staged_writer_lock(&other).is_err());
+        assert!(shared_lock.exists(), "a refused removal unlinks nothing");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

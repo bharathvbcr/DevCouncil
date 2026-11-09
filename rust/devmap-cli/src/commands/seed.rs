@@ -249,7 +249,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         Ok(pair) => pair,
         Err(err) => {
             seed::discard_staged(&staged);
-            return Err(err);
+            // The staged build may have taken its writer lock before it failed.
+            return Err(match seed::remove_staged_writer_lock(&staged) {
+                Ok(()) => err,
+                Err(lock) => err.context(format!(
+                    "and the staged writer lock could not be removed: {lock:#}"
+                )),
+            });
         }
     };
 
