@@ -985,3 +985,42 @@ fn a_diverged_standalone_seed_writes_the_consumer_artifacts() {
         "the lane's graph describes the lane's edit, not the donor's tree"
     );
 }
+
+/// The staged build takes its own writer lock (`<target>.seed-<pid>.writer.lock`).
+/// A build that fails after taking it must not leave that file behind: each
+/// failed seed would leave one more. The failure here is injected after the lock
+/// exists: a directory where the lane's code graph goes, so extraction,
+/// resolution and the lock all happen and the manifest write then fails.
+#[test]
+fn a_staged_build_that_fails_after_taking_its_lock_leaves_no_staged_file_or_lock() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit(&lane);
+    fs::create_dir_all(lane.join(".devmap/graph/code_graph.json")).unwrap();
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(
+        !out.status.success(),
+        "a staged build that cannot write its manifest must fail the seed"
+    );
+    assert!(
+        stderr(&out).contains("managed file is not a regular file"),
+        "the failure came from the manifest write, after the staged lock was taken: {}",
+        stderr(&out)
+    );
+    assert!(
+        !store(&lane).exists(),
+        "a failed seed must not place a store"
+    );
+    let leftovers: Vec<String> = fs::read_dir(lane.join(".devmap/codeintel"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".seed-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staged files left behind after a failed staged build: {leftovers:?}"
+    );
+}
