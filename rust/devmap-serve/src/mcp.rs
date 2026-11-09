@@ -45,7 +45,7 @@
 //! point that makes it to the point that acts on it.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use devmap_store::Store;
@@ -57,8 +57,9 @@ use crate::protocol::{
     dispatch, dispatch_with_stacked, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION,
 };
 use crate::repo_scope::{
-    canonicalize_path, infer_root_from_store, open_mcp_store, store_for_repo_path, CacheLookup,
-    RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin,
+    canonicalize_path, corrupt_store_message, infer_root_from_store, open_mcp_store,
+    store_for_repo_path, CacheLookup, IdleSweeper, RepositoryRef, StoreFileIdentity, StoreLru,
+    StoreOrigin, STORE_IDLE_SWEEP,
 };
 use crate::root_resolve::{file_uri_to_path, roots_with_stores, RootResolveInput, MAX_ROOTS};
 
@@ -109,7 +110,10 @@ enum SlotMode {
 /// selects among them without falling back to another repository.
 pub struct StoreSlot {
     mode: SlotMode,
-    opened: Mutex<StoreLru>,
+    opened: Arc<Mutex<StoreLru>>,
+    /// Drops stores nobody has used for `repo_scope::STORE_IDLE_TTL`; started with the
+    /// first store this slot opens, ended with the slot.
+    sweeper: OnceLock<Option<IdleSweeper>>,
     unusable_mcp_roots: Mutex<usize>,
     roots_list_seq: Mutex<u64>,
     /// The executable this server was started from, taken when the slot is
@@ -126,7 +130,8 @@ impl StoreSlot {
             mode: SlotMode::Pinned {
                 db_path: db_path.into(),
             },
-            opened: Mutex::new(StoreLru::new()),
+            opened: Arc::new(Mutex::new(StoreLru::new())),
+            sweeper: OnceLock::new(),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
             started_as: crate::binary_identity::executable_identity(),
@@ -157,7 +162,8 @@ impl StoreSlot {
                 last_applied_seq: Mutex::new(0),
                 roots_error: Mutex::new(None),
             },
-            opened: Mutex::new(StoreLru::new()),
+            opened: Arc::new(Mutex::new(StoreLru::new())),
+            sweeper: OnceLock::new(),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
             started_as: crate::binary_identity::executable_identity(),
@@ -177,7 +183,8 @@ impl StoreSlot {
             mode: SlotMode::Pinned {
                 db_path: db_path.clone(),
             },
-            opened: Mutex::new(cache),
+            opened: Arc::new(Mutex::new(cache)),
+            sweeper: OnceLock::new(),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
             started_as: crate::binary_identity::executable_identity(),
@@ -491,6 +498,7 @@ with an absolute repository path."
             .map_err(|error| format!("unsafe store path: {error}"))?;
         {
             let mut cache = crate::lock_recover(&self.opened);
+            cache.evict_idle();
             for candidate in [key.as_path(), store_path] {
                 if let CacheLookup::Hit(store) =
                     cache.get_verified(candidate, |path| std::fs::metadata(path))
@@ -510,7 +518,24 @@ with an absolute repository path."
         let store = Arc::new(open_mcp_store(store_path)?);
         let mut cache = crate::lock_recover(&self.opened);
         cache.insert(key, Arc::clone(&store), StoreOrigin::Opened(identity));
+        drop(cache);
+        self.sweeper
+            .get_or_init(|| IdleSweeper::start(Arc::downgrade(&self.opened), STORE_IDLE_SWEEP));
         Ok(store)
+    }
+
+    /// Forget the cached connection for `store_path`, so the next
+    /// [`Self::open_for_call`] opens the file afresh.
+    ///
+    /// Called when a query on that connection reported `SQLITE_CORRUPT`: a
+    /// handle that has seen damaged pages is not served a second time, whether
+    /// the damage is in the file or only in what the handle cached of it.
+    fn evict_cached(&self, store_path: &Path) {
+        let mut cache = crate::lock_recover(&self.opened);
+        if let Ok(key) = devmap_extract::safe_fs::resolve_file_alias(store_path) {
+            cache.evict(&key);
+        }
+        cache.evict(store_path);
     }
 
     /// Open the store this call should read, honouring optional `repo_path`.
@@ -2988,15 +3013,62 @@ async fn call_tool(
     // `notifications/cancelled` can trip it while this call is still running.
     // Dropping a blocking task's handle only detaches it; the flag is the only
     // thing that actually stops the traversal.
-    let worker_cancel = cancel.clone();
-    let unapplied = crate::protocol::UnappliedEdits::default();
     let attr_root = attribution.root.clone();
-    let handle = tokio::task::spawn_blocking(move || {
-        dispatch_with_stacked_overlay(&engine, &attr_root, request, &worker_cancel, &unapplied)
-    });
+    let mut outcome = run_dispatch(
+        engine,
+        attr_root.clone(),
+        request,
+        &cancel,
+        CALL_TIMEOUT.saturating_sub(started.elapsed()),
+    )
+    .await;
+
+    // The one seam every tool call passes through. A query that reports
+    // `SQLITE_CORRUPT` on a cached connection is never answered from that
+    // connection again: the entry is evicted, the file reopened once, and the
+    // call retried. A handle can see damaged pages that the file no longer has
+    // (the 2026-11-09 "database disk image is malformed" answers came from such
+    // a handle); a file that is damaged says so a second time, and the call then
+    // fails naming the store and the next step rather than quoting SQLite alone.
+    if let Ok(Ok(Err(first))) = &outcome {
+        if Store::is_database_corrupt(first) {
+            store.evict_cached(&db_path);
+            outcome = match (
+                store.open_for_call(repo_path.as_deref()),
+                to_ipc_command(&name, params.get("arguments")),
+            ) {
+                (Ok((engine, _)), Ok(command)) => {
+                    let again = run_dispatch(
+                        engine,
+                        attr_root,
+                        IpcRequest {
+                            version: PROTOCOL_VERSION,
+                            command,
+                        },
+                        &cancel,
+                        CALL_TIMEOUT.saturating_sub(started.elapsed()),
+                    )
+                    .await;
+                    match again {
+                        Ok(Ok(Err(second))) if Store::is_database_corrupt(&second) => {
+                            store.evict_cached(&db_path);
+                            Ok(Ok(Err(anyhow::anyhow!(corrupt_store_message(
+                                &db_path, &second
+                            )))))
+                        }
+                        other => other,
+                    }
+                }
+                // The reopen itself failed (it names the store and, for damage,
+                // the remedy), or the arguments no longer parse: report that.
+                (Err(reason), _) => Ok(Ok(Err(anyhow::anyhow!(reason)))),
+                (_, Err(err)) => Ok(Ok(Err(anyhow::anyhow!(err.message().to_string())))),
+            };
+        }
+    }
 
     let latency_ms = || started.elapsed().as_millis() as u64;
-    match tokio::time::timeout(CALL_TIMEOUT, handle).await {
+    match outcome {
         Ok(Ok(Ok(value))) => {
             crate::session_log::append_query(
                 &db_path,
@@ -3051,6 +3123,31 @@ being reported because a partial traversal cannot be distinguished from a comple
             Ok(tool_error(message))
         }
     }
+}
+
+/// What one engine run yields: the timeout, the task, then the query itself.
+type DispatchOutcome = Result<
+    Result<anyhow::Result<Value>, tokio::task::JoinError>,
+    tokio::time::error::Elapsed,
+>;
+
+/// Run one request on the blocking pool under `budget`.
+///
+/// The cancel flag is what stops the traversal when the budget runs out;
+/// dropping a blocking task's handle only detaches it.
+async fn run_dispatch(
+    engine: Arc<Store>,
+    attr_root: PathBuf,
+    request: IpcRequest,
+    cancel: &devmap_query::Cancel,
+    budget: Duration,
+) -> DispatchOutcome {
+    let worker_cancel = cancel.clone();
+    let unapplied = crate::protocol::UnappliedEdits::default();
+    let handle = tokio::task::spawn_blocking(move || {
+        dispatch_with_stacked_overlay(&engine, &attr_root, request, &worker_cancel, &unapplied)
+    });
+    tokio::time::timeout(budget, handle).await
 }
 
 fn dispatch_with_stacked_overlay(
