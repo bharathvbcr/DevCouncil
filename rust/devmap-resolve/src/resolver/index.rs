@@ -2147,7 +2147,11 @@ impl Resolver {
             .iter()
             .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
         {
-            for import in ext.imports.iter().filter(|i| i.alias.as_deref() == Some(".")) {
+            for import in ext
+                .imports
+                .iter()
+                .filter(|i| i.alias.as_deref() == Some("."))
+            {
                 if let Some(target) = self.resolve_import_path(
                     &ext.file_path,
                     &ext.language,
@@ -2173,9 +2177,11 @@ impl Resolver {
             .iter()
             .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
         {
-            for import in ext.imports.iter().filter(|i| {
-                i.alias.as_deref() != Some(".") && !i.imported_names.is_empty()
-            }) {
+            for import in ext
+                .imports
+                .iter()
+                .filter(|i| i.alias.as_deref() != Some(".") && !i.imported_names.is_empty())
+            {
                 let Some(target) = self.resolve_import_path(
                     &ext.file_path,
                     &ext.language,

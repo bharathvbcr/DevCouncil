@@ -603,8 +603,7 @@ impl Resolver {
         });
         // A name another declaration shares - a struct called like the trait -
         // is no reason to refuse a Rust trait the calling file itself names.
-        let named_trait_file = if is_protocol && self.type_name_is_identifiable(family, protocol)
-        {
+        let named_trait_file = if is_protocol && self.type_name_is_identifiable(family, protocol) {
             None
         } else {
             Some(self.rust_trait_named_by(family, call_file, protocol)?)
