@@ -57,6 +57,8 @@ export interface MapViewOptions {
   colorFor?: LanguageColorFor;
   /** Appended to the honesty line when the view is a capped sample. */
   capHint?: string;
+  /** Ring meanings drawn under the toolbar: `[css colour variable, label]`, plus a closing sentence. */
+  ringLegend?: { rings: ReadonlyArray<readonly [string, string]>; note: string };
   /** Text shown when the payload has no nodes at all. */
   emptyHint?: string;
   /** Called after the selection changes (id, or null when cleared). */
@@ -175,6 +177,7 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
   const filtersPanel = h("div", { class: "cm-menu", attrs: { role: "group", "aria-label": "Graph filters" } });
   const filtersWrap = h("div", { class: "cm-filters" }, filtersBtn, filtersPanel);
   const note = h("p", { class: "cm-note", attrs: { role: "note", "data-testid": "code-graph-truncation" } });
+  const legendEl = h("div", { class: "cm-ring-legend", attrs: { "aria-label": "Ring legend" } });
   const warnings = h("p", { class: "cm-note", attrs: { role: "note" } });
   const groupChips = h("div", { class: "cm-chips", attrs: { "aria-label": "Communities" } });
   const groupPager = h("div", { class: "cm-pager" });
@@ -211,6 +214,7 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
     ),
     note,
     warnings,
+    legendEl,
     groupRow,
     stage,
     inspector,
@@ -605,6 +609,21 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
     warnings.hidden = model.warnings.length === 0;
   }
 
+  function refreshLegend(): void {
+    const legendSpec = options.ringLegend;
+    legendEl.hidden = !legendSpec;
+    if (!legendSpec) return;
+    replaceChildren(
+      legendEl,
+      ...legendSpec.rings.map(([variable, label]) => {
+        const ring = h("span", { class: "cm-ring", attrs: { "aria-hidden": "true" } });
+        ring.style.borderColor = `var(${variable})`;
+        return h("span", { class: "cm-ring-item" }, ring, label);
+      }),
+      h("span", { class: "cm-muted", text: legendSpec.note }),
+    );
+  }
+
   function refreshToolbar(): void {
     pressed(nodesBtn, showNodeList);
     pressed(labelsBtn, showLabels);
@@ -804,6 +823,7 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
   function refresh(): void {
     if (destroyed) return;
     refreshCounts();
+    refreshLegend();
     refreshToolbar();
     refreshFilters();
     refreshGroups();

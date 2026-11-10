@@ -456,11 +456,7 @@ pub fn render_html(graph: &Value, options: &VizOptions) -> String {
     });
     // One shell, driven by `payload.view`: this view and the repo map differ in
     // what a node *is*, not in how the page works.
-    crate::page::render_shell(
-        &format!("{} — code graph", options.title),
-        None,
-        &payload,
-    )
+    crate::page::render_shell(&format!("{} — code graph", options.title), None, &payload)
 }
 
 /// What a page's script reads off its payload that the payload does not carry.

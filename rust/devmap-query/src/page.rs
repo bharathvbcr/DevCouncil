@@ -85,14 +85,18 @@ mod tests {
         // It is inlined raw. `</script` ends the element whatever JavaScript
         // thinks of it, and `<!--` can open an escaped state that swallows the
         // closing tag.
-        assert!(CODE_MAP_BUNDLE.len() > 10_000, "the bundle is the real build");
+        assert!(
+            CODE_MAP_BUNDLE.len() > 10_000,
+            "the bundle is the real build"
+        );
         assert!(!CODE_MAP_BUNDLE.to_ascii_lowercase().contains("</script"));
         assert!(!CODE_MAP_BUNDLE.contains("<!--"));
     }
 
     #[test]
     fn the_payload_is_escaped_for_a_raw_text_script_and_survives_the_round_trip() {
-        let payload = json!({"name": "</script><script>alert(1)</script><!-- &", "sep": "\u{2028}"});
+        let payload =
+            json!({"name": "</script><script>alert(1)</script><!-- &", "sep": "\u{2028}"});
         let html = render_shell("t", None, &payload);
         let between = html
             .split(&format!("id=\"{PAYLOAD_ELEMENT_ID}\">"))
@@ -113,6 +117,10 @@ mod tests {
         assert!(html.contains("<title>&lt;b&gt;x&lt;/b&gt;</title>"));
         assert!(html.contains("<!-- fingerprint:a--&gt;b&lt;script&gt; -->"));
         assert_eq!(html.matches("id=\"app\"").count(), 1);
-        assert_eq!(html.matches(&format!("id=\"{PAYLOAD_ELEMENT_ID}\"")).count(), 1);
+        assert_eq!(
+            html.matches(&format!("id=\"{PAYLOAD_ELEMENT_ID}\""))
+                .count(),
+            1
+        );
     }
 }

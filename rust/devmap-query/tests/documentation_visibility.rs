@@ -82,7 +82,5 @@ fn documentation_visibility_uses_full_file_attribution_for_subsystems() {
         payload.get("files").is_none(),
         "the inventory must stay out of the preview"
     );
-    assert!(
-        render_map_preview_html(&map, &fingerprint_for(&map)).contains("Hide notes & Markdown")
-    );
+    assert!(render_map_preview_html(&map, &fingerprint_for(&map)).contains("Hide notes & Markdown"));
 }

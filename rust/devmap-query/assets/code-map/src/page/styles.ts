@@ -173,6 +173,9 @@ ul { padding: 0; list-style: none; }
 .cm-menu-item[aria-pressed="true"] { color: var(--cm-accent); }
 .cm-menu-sep { height: 6px; }
 .cm-note { padding: 0 20px 8px; color: var(--cm-warn); font-size: 12px; }
+.cm-ring-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 0 20px 8px; font-size: 12px; }
+.cm-ring-item { display: inline-flex; align-items: center; gap: 6px; color: var(--cm-muted); }
+.cm-ring { width: 10px; height: 10px; border: 2px solid; border-radius: 50%; }
 .cm-group-row { display: flex; min-width: 0; }
 .cm-chips { display: flex; flex: 1; min-width: 0; gap: 6px; overflow-x: auto; padding: 0 20px 10px; scrollbar-width: thin; }
 .cm-chip { display: inline-flex; flex: none; max-width: 220px; align-items: center; gap: 6px; padding: 2px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--cm-muted); font-size: 12px; }

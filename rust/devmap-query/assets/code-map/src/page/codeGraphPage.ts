@@ -27,6 +27,12 @@ export function mountCodeGraphPage(root: HTMLElement, DATA: Record<string, unkno
     caption: view.level ? `Code graph · ${view.level}` : "Code graph",
     flagFilters: view.flagFilters,
     capHint: view.capHint,
+    ringLegend: {
+      rings: [["--cm-dead", "dead candidate"], ["--cm-unwired", "unwired"], ["--cm-entry", "entry point"]],
+      // An isolated config or README has no ring and no edges, and beside a legend
+      // that names "dead" and "unwired" a lone dot reads as one of them.
+      note: "No ring: reached, or data that is not a liveness candidate. Select a node for its liveness verdict and why.",
+    },
     emptyHint: "This generation has no nodes at this level to draw. Build the index first, or switch level.",
     detailFor: (node) => {
       const row = rows.get(node.id);

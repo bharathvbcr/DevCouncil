@@ -372,6 +372,9 @@ fn file_nodes_carry_a_liveness_verdict_the_page_can_render() {
 
     // And the page renders the category rather than leaving a lone data dot
     // unexplained beside a legend that names "dead" and "unwired".
+    // (The legend moved from a colour swatch to a ring legend under the toolbar:
+    // dots are language-coloured now and only dead, unwired and entry nodes
+    // carry a ring. The sentence naming the category is the same.)
     assert!(
         built.html.contains("not a liveness candidate"),
         "the legend must name the category"
