@@ -173,3 +173,25 @@ rs.f4s2	F4	callers/src/scopemod/mid.rs::mid_f4s	callers/src/scopemod.rs::Scoped.
 rs.f4s3	F4	callers/src/scopemod/leaf_f4s.rs::leaf_named_f4s	callers/src/otherq.rs::Quarantine.new_f4	edge	must		the leaf also sees the name its parent imports by name (use crate::otherq::Quarantine)
 rs.f4s4	F4	callers/src/scopemod/leaf_f4s.rs::leaf_named_f4s	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		and not the namesake type of another module
 rs.f4s5	F4	callers/src/scopemod/mid.rs::mid_f4s	callers/src/otherq.rs::Quarantine.new_f4	edge	must		control: the parent's own named import
+rs.g1a	F4	callers/src/g1.rs::top_g1	callers/src/g1da.rs::Dup.new_g1	edge	must		regression test: the top-level caller imports Dup from g1da; the namesake is only inside mod inner
+rs.g1b	F4	callers/src/g1.rs::top_g1	callers/src/g1.rs::Dup.new_g1	forbid_any_tier	must		regression test: the inline-module namesake is not in scope at top_g1
+rs.g1c	F4	callers/src/g1.rs::inner_g1	callers/src/g1.rs::Dup.new_g1	edge	must		guard: inside mod inner the namesake IS in scope
+rs.g2a	F4	callers/src/g2.rs::t_g2	callers/src/g2db.rs::Dup.new_g2	edge	must		regression test: mod tests imports Dup from g2db, over the file-level Dup
+rs.g2b	F4	callers/src/g2.rs::t_g2	callers/src/g2.rs::Dup.new_g2	forbid_any_tier	must		regression test: the file-level Dup is shadowed by the module's own import
+rs.g2c	F4	callers/src/g2.rs::outer_g2	callers/src/g2.rs::Dup.new_g2	edge	must		guard: outside mod tests the file-level Dup is the one
+rs.g3a	F4	callers/src/g3.rs::imported_g3	callers/src/g3db.rs::Dup.new_g3	edge	must		regression test: the function-local Dup does not reach imported_g3
+rs.g3b	F4	callers/src/g3.rs::imported_g3	callers/src/g3.rs::local_g3.Dup.new_g3	forbid_any_tier	must		regression test: a function-local type is not in scope outside its function
+rs.g3c	F4	callers/src/g3.rs::local_g3	callers/src/g3.rs::local_g3.Dup.new_g3	edge	should		guard: inside local_g3 the local Dup shadows the import
+rs.g3d	F4	callers/src/g3.rs::local_g3	callers/src/g3db.rs::Dup.new_g3	forbid_any_tier	must		guard: and not the imported one
+rs.g4a	F4b	callers/src/g4.rs::top_g4	callers/src/util_g4.rs::helper_g4	edge	must		regression test: the glob brings helper_g4 to top_g4; the only local declaration is inside mod tests
+rs.g4b	F4b	callers/src/g4.rs::top_g4	callers/src/g4.rs::helper_g4	forbid_any_tier	must		regression test: a declaration inside mod tests is not in scope at top_g4
+rs.g4c	F4b	callers/src/g4.rs::t_g4	callers/src/g4.rs::helper_g4	edge	must		guard: inside mod tests its own helper_g4 is in scope
+rs.g5a	F3	callers/src/g5.rs::read_g5	callers/src/g5mod.rs::stdin	forbid_any_tier	must		regression test: a private fn stdin is not published by the glob chain; the named std import wins
+rs.g5b	F3	callers/src/g5.rs::read_g5	callers/src/g5mod.rs::open_g5	edge	must		guard: the pub item the chain does publish still binds
+rs.g5c	F3	callers/src/g5mod.rs::open_g5	callers/src/g5mod.rs::stdin	edge	must		guard: inside its own module the private fn is in scope
+rs.g5d	F3	callers/src/g5c.rs::call_made_g5	callers/src/g5v.rs::made_g5	forbid	must		regression test: a second publisher of made_g5 is a macro the index cannot see, so one visible declaration is not the whole publisher set
+rs.g6a	F4	callers/src/g6use.rs::conv_g6	callers/src/g6src.rs::CmdErr.from	edge	must		regression test: the true impl (From<SrcErr>) is in a file other than the type's
+rs.g6b	F4	callers/src/g6use.rs::conv_g6	callers/src/g6err.rs::CmdErr.from	forbid	must		regression test: CmdErr has two From impls; the type's own file is not the answer
+rs.g6c	F4	callers/src/g6err.rs::conv_one_g6	callers/src/g6err.rs::CmdOne.from	edge	must		guard: a type with exactly one From impl still binds
+rs.g6d	F4	callers/src/g6two.rs::conv_two_g6	callers/src/g6two.rs::Twice.from	forbid	must		regression test: two From impls in one file; the first is not the answer
+rs.g6e	F4	callers/src/g6two.rs::conv_two_g6	callers/src/g6two.rs::Twice.from@232	forbid	must		regression test: nor is the second chosen by position

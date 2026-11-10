@@ -18,10 +18,10 @@
     "present": 74
   },
   "rust": {
-    "forbid_any_tier_rows": 17,
-    "known_failing": 0,
-    "positive_rows": 142,
-    "present": 142
+    "forbid_any_tier_rows": 23,
+    "known_failing": 13,
+    "positive_rows": 154,
+    "present": 149
   },
   "swift": {
     "forbid_any_tier_rows": 9,
