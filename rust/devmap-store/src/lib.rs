@@ -20,17 +20,17 @@ pub use coverage::{
     GAP_RESOLUTION_BUDGET,
 };
 pub use csr::{
-    apply_v30_pragmas, AtomicGraphHandle, CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord,
-    FastBitSet, IncrementalDigestEngine, DC_GRAPH_MAGIC, DC_GRAPH_VERSION, V30_PRAGMAS,
+    AtomicGraphHandle, CsrFileChanged, CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord,
+    FastBitSet, IncrementalDigestEngine, DC_GRAPH_MAGIC, DC_GRAPH_VERSION,
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
     FileSymbolsPage, GenerationWriteOpts, KeywordNarrowing, LiteralPage, PageSizeConversion,
     PendingClaim, PendingEnqueueReport, PendingReconcile, PendingSupersede, PendingWatermark,
-    QuerySourceFreshness, ReaderMemory, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
-    StoredEdge, StoredFile, StoredLiteral, StoredSymbol, UnresolvedSiteRow, UnresolvedSitesByName,
-    UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
-    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
+    QuerySourceFreshness, ReaderMemory, SearchNarrowing, SearchPage, SourceTreeDelta, Store,
+    StoreStatus, StoredEdge, StoredFile, StoredLiteral, StoredSymbol, UnresolvedSiteRow,
+    UnresolvedSitesByName, UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode,
+    WalCheckpointResult, WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

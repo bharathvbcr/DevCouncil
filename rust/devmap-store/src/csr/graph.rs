@@ -58,17 +58,53 @@ pub struct CsrHeader {
     pub attributes_offset: u64,
 }
 
+/// The mapped file changed after it was mapped: it was truncated, extended or
+/// rewritten in place. A truncated mapping is `SIGBUS` on first touch, and an
+/// in-place rewrite makes the boundaries checked at open stale, so the reader
+/// refuses to be used rather than answer from either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsrFileChanged {
+    pub mapped_len: u64,
+    pub found_len: Option<u64>,
+}
+
+impl std::fmt::Display for CsrFileChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.found_len {
+            Some(found) => write!(
+                f,
+                "the CSR graph file changed after it was mapped (mapped {} bytes, now {found} \
+bytes or a newer modification time); reopen it",
+                self.mapped_len
+            ),
+            None => write!(
+                f,
+                "the CSR graph file can no longer be examined after it was mapped (mapped {} \
+bytes); reopen it",
+                self.mapped_len
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CsrFileChanged {}
+
 #[cfg(unix)]
 struct RawMmap {
     ptr: *const u8,
     len: usize,
+    /// The descriptor the mapping was made from, held so a later `fstat`
+    /// describes this file and never whatever a name points at now.
+    file: File,
+    modified: Option<std::time::SystemTime>,
 }
 
 #[cfg(unix)]
 impl RawMmap {
-    fn map(file: &File) -> Result<Self> {
+    fn map(file: File) -> Result<Self> {
         use std::os::unix::io::AsRawFd;
-        let len = file.metadata()?.len() as usize;
+        let metadata = file.metadata()?;
+        let len = metadata.len() as usize;
         if len == 0 {
             bail!("Cannot mmap empty CSR graph file");
         }
@@ -88,11 +124,29 @@ impl RawMmap {
         Ok(Self {
             ptr: raw as *const u8,
             len,
+            modified: metadata.modified().ok(),
+            file,
         })
     }
 
     fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// `fstat` on the held descriptor against what was mapped.
+    fn recheck(&self) -> std::result::Result<(), CsrFileChanged> {
+        let mapped_len = self.len as u64;
+        let now = self.file.metadata().map_err(|_| CsrFileChanged {
+            mapped_len,
+            found_len: None,
+        })?;
+        if now.len() != mapped_len || now.modified().ok() != self.modified {
+            return Err(CsrFileChanged {
+                mapped_len,
+                found_len: Some(now.len()),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -179,7 +233,7 @@ impl CsrGraphReader {
         {
             let file = File::open(path)
                 .with_context(|| format!("Failed to open CSR graph file: {:?}", path))?;
-            let mmap = RawMmap::map(&file)?;
+            let mmap = RawMmap::map(file)?;
             Self::from_backend(StorageBackend::Mmap(mmap))
         }
         #[cfg(not(unix))]
@@ -228,34 +282,30 @@ impl CsrGraphReader {
         let base = slice.as_ptr() as usize;
         // One section: `count` elements of `size` bytes at `offset`, wholly inside
         // the file, past the header, and aligned for the element.
-        let section = |name: &str,
-                       offset: u64,
-                       count: usize,
-                       size: usize,
-                       align: usize|
-         -> Result<usize> {
-            let offset = usize::try_from(offset)
-                .with_context(|| format!("CSR {name} offset {offset} does not fit"))?;
-            let bytes = count
-                .checked_mul(size)
-                .with_context(|| format!("CSR {name} section size overflows ({count} x {size})"))?;
-            let end = offset
-                .checked_add(bytes)
-                .with_context(|| format!("CSR {name} section end overflows"))?;
-            if end > slice.len() {
-                bail!(
-                    "CSR {name} section ends at {end}, past the file length {}",
-                    slice.len()
-                );
-            }
-            if offset < header_len {
-                bail!("CSR {name} section at {offset} overlaps the {header_len}-byte header");
-            }
-            if base.wrapping_add(offset) % align != 0 {
-                bail!("CSR {name} section at {offset} is not aligned to {align} bytes");
-            }
-            Ok(offset)
-        };
+        let section =
+            |name: &str, offset: u64, count: usize, size: usize, align: usize| -> Result<usize> {
+                let offset = usize::try_from(offset)
+                    .with_context(|| format!("CSR {name} offset {offset} does not fit"))?;
+                let bytes = count.checked_mul(size).with_context(|| {
+                    format!("CSR {name} section size overflows ({count} x {size})")
+                })?;
+                let end = offset
+                    .checked_add(bytes)
+                    .with_context(|| format!("CSR {name} section end overflows"))?;
+                if end > slice.len() {
+                    bail!(
+                        "CSR {name} section ends at {end}, past the file length {}",
+                        slice.len()
+                    );
+                }
+                if offset < header_len {
+                    bail!("CSR {name} section at {offset} overlaps the {header_len}-byte header");
+                }
+                if base.wrapping_add(offset) % align != 0 {
+                    bail!("CSR {name} section at {offset} is not aligned to {align} bytes");
+                }
+                Ok(offset)
+            };
         let nodes_at = section(
             "nodes",
             header.nodes_offset,
@@ -322,6 +372,25 @@ impl CsrGraphReader {
             col_indices,
             attributes,
         })
+    }
+
+    /// Whether the mapped file is still the one that was validated at open.
+    ///
+    /// The checks in [`Self::open_mmap`] hold for the bytes as they were. A file
+    /// truncated afterwards is `SIGBUS` on the next touch, and one rewritten in
+    /// place invalidates the checked row boundaries. Call this at the start of
+    /// each query-level operation and reopen on `Err`; the accessors do not
+    /// call it themselves, because an `fstat` per hop would cost more than the
+    /// hop. It narrows the window and does not close it: a truncation between
+    /// this check and the access that follows is still a signal, which only a
+    /// reader that copies the file out (or never shares it with a writer)
+    /// avoids. An in-memory reader never changes.
+    pub fn ensure_unchanged(&self) -> std::result::Result<(), CsrFileChanged> {
+        match &self._storage {
+            #[cfg(unix)]
+            StorageBackend::Mmap(mapped) => mapped.recheck(),
+            StorageBackend::Buffer(_) => Ok(()),
+        }
     }
 
     #[inline(always)]
@@ -541,13 +610,36 @@ impl CsrGraphWriter {
 
     pub fn write_to_file(self, path: &Path) -> Result<()> {
         let bytes = self.build();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        // Written beside the target and renamed over it, never in place: a
+        // reader that has `path` mapped keeps the old, complete inode, where
+        // `File::create` on the same file would truncate the pages under it
+        // (SIGBUS on its next touch) or rewrite them under its checked bounds.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = path
+            .file_name()
+            .context("CSR graph path has no file name")?
+            .to_string_lossy();
+        let temp = parent.join(format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let written = (|| -> Result<()> {
+            let mut file = File::create(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
-        let mut file = File::create(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        Ok(())
+        written
     }
 }
 
