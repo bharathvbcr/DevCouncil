@@ -471,7 +471,7 @@ impl Resolver {
                 }
                 // J-T1, the last route of a Java type name: declaration, same
                 // package and imports have all failed, so `java.lang` is what is
-                // left. `CStyle` is C, C++ and C# too, so it is the Java *file*
+                // left. C, C++ and C# have a `String` of their own, so it is the Java *file*
                 // that gates the table, and a JVM-language declaration of the
                 // name anywhere in the corpus keeps the miss unexplained: it may
                 // be a bind failure, not the JDK's type. A namesake in another

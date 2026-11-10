@@ -319,6 +319,8 @@ fn the_generic_bucket_never_admits_a_resolution() {
         LangFamily::Go,
         LangFamily::Rust,
         LangFamily::CStyle,
+        LangFamily::Java,
+        LangFamily::CSharp,
         LangFamily::Swift,
         LangFamily::Kotlin,
         LangFamily::Ruby,

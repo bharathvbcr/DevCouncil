@@ -463,8 +463,8 @@ fn a_java_declaration_of_the_name_keeps_the_miss_unexplained() {
 
 #[test]
 fn a_csharp_string_is_not_java_lang() {
-    // `CStyle` is one family for C, C++, C#, Objective-C and Java; the table is
-    // Java's alone.
+    // C# is its own family now, but the table is Java's alone and is gated on
+    // the `.java` extension, not on the family.
     let (_, result) = resolve(&[
         (
             "n/Person.cs",
