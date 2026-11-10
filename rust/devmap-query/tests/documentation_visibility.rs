@@ -51,7 +51,12 @@ fn documentation_visibility_classifies_files_and_owned_symbols_without_dropping_
     for node in symbols["nodes"].as_array().unwrap() {
         assert_eq!(node["documentation"], json!(node["id"] != "fn"));
     }
-    assert!(render_html(&graph, &VizOptions::default()).contains("Hide notes &amp; Markdown"));
+    // The label is now text the page builds into its Filters menu, so it is
+    // the plain string `Hide notes & Markdown` inside the inlined bundle; the
+    // old assertion looked for the `&amp;` entity in server-rendered markup.
+    // The control's behaviour (a checked box drops the document nodes) is
+    // pinned in a real browser by `tests/support/page_probe.cjs`.
+    assert!(render_html(&graph, &VizOptions::default()).contains("Hide notes & Markdown"));
 }
 
 #[test]
@@ -78,6 +83,6 @@ fn documentation_visibility_uses_full_file_attribution_for_subsystems() {
         "the inventory must stay out of the preview"
     );
     assert!(
-        render_map_preview_html(&map, &fingerprint_for(&map)).contains("Hide notes &amp; Markdown")
+        render_map_preview_html(&map, &fingerprint_for(&map)).contains("Hide notes & Markdown")
     );
 }

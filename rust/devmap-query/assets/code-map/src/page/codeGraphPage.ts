@@ -26,6 +26,7 @@ export function mountCodeGraphPage(root: HTMLElement, DATA: Record<string, unkno
     title: `${view.title} — ${view.suffix}`,
     caption: view.level ? `Code graph · ${view.level}` : "Code graph",
     flagFilters: view.flagFilters,
+    capHint: view.capHint,
     emptyHint: "This generation has no nodes at this level to draw. Build the index first, or switch level.",
     detailFor: (node) => {
       const row = rows.get(node.id);

@@ -15,12 +15,15 @@ import { mountRepoMapPage } from "./repoMapPage";
 import { PAGE_CSS } from "./styles";
 
 export const PAYLOAD_ELEMENT_ID = "devmap-payload";
+/** Stamped on <html> so a test can tell this renderer from any other page. */
+export const PAGE_RENDERER = "devmap-code-map";
 
 function showError(root: HTMLElement, title: string, detail: string): void {
   replaceChildren(root, h("div", { class: "page-error", attrs: { role: "alert" } }, h("strong", { text: title }), h("span", { text: detail })));
 }
 
 export function mountPage(doc: Document): void {
+  doc.documentElement.setAttribute("data-renderer", PAGE_RENDERER);
   const style = doc.createElement("style");
   style.textContent = PAGE_CSS;
   doc.head.appendChild(style);

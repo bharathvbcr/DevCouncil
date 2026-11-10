@@ -55,6 +55,8 @@ export interface MapViewOptions {
   /** Extra `[label, value]` rows for the inspector of a node. */
   detailFor?: (node: LaidOutNode) => ReadonlyArray<readonly [string, string]>;
   colorFor?: LanguageColorFor;
+  /** Appended to the honesty line when the view is a capped sample. */
+  capHint?: string;
   /** Text shown when the payload has no nodes at all. */
   emptyHint?: string;
   /** Called after the selection changes (id, or null when cleared). */
@@ -596,7 +598,7 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
     parts.push(h("span", { text: `· ${matches.length} of ${model.nodes.length} match filters`, attrs: { "data-testid": "graph-filter-count" } }));
     if (filtersActive()) parts.push(clearFiltersBtn);
     replaceChildren(counts, ...parts);
-    const lines = [legend.honesty, legend.coverageLabel].filter((line): line is string => Boolean(line));
+    const lines = [legend.honesty, legend.nodesTruncated ? options.capHint : null, legend.coverageLabel].filter((line): line is string => Boolean(line));
     note.textContent = lines.join(" ");
     note.hidden = lines.length === 0;
     warnings.textContent = model.warnings.join(" ");

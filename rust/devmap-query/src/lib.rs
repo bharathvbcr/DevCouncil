@@ -30,6 +30,7 @@ pub mod manifest;
 pub mod map_preview;
 pub mod model;
 pub mod overlay;
+mod page;
 pub mod query_match;
 pub mod rung;
 pub mod scope;
