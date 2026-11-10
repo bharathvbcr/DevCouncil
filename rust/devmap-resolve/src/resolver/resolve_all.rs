@@ -7,7 +7,7 @@ use super::*;
 /// The blobs live in the repository state directory, not in sqlite. A resolver
 /// change that alters a file's edges without changing its content hash bumps
 /// this; a mismatch is a miss, and the file is resolved again.
-pub const RESOLUTION_REUSE_EPOCH: &str = "1";
+pub const RESOLUTION_REUSE_EPOCH: &str = "2";
 
 /// One file's resolution before the whole-tree post-pass.
 ///

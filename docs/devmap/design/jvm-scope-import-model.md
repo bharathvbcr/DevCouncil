@@ -53,10 +53,14 @@ All paths are under `rust/devmap-resolve/src/resolver/` unless stated.
   (`index.rs:190-200`), `supertypes`/`subtypes` by bare name (`index.rs:1321`),
   `return_types` by `(file, symbol)`. **The key is the bare simple name**: `a.Repo`,
   `b.Repo` and `Outer.Repo` share one row [V].
-- Java's family is `CStyle`, shared with C, C++, C#, ObjC, CUDA (`model.rs:70`); Kotlin
-  and Scala have their own families (`model.rs:95,98`). `Family::admits` is equality
-  (`model.rs:127`). So `type_methods` cannot join a Java caller to a Kotlin class;
-  `jvm_qualified_member` (`imports.rs:217-265`) is a hand bridge for that [V].
+- There are three families where there used to be one `CStyle`: the C-like group
+  `CStyle` (c, cpp, objc, cuda; Metal rides the `cpp` key), `Java` and `CSharp`
+  (`LangFamily::from_lang`, `model.rs`). Kotlin and Scala have their own families too.
+  `LangFamily::admits` is equality, so a Java caller cannot join a C#, C-like, Kotlin or
+  Scala declaration through `type_methods` or the global rung. Kotlin and Java cross
+  through `jvm_qualified_member` (`imports.rs`), a hand bridge gated on
+  `family == Kotlin || language == "java"`; it is not family equality, and the split
+  does not touch it [V].
 
 ### 1.3 Import table
 
@@ -588,7 +592,7 @@ guard through `-p devmap-cli --test it`. Section 5's "now" was [I]; this section
 - Surprises confirmed by reading: `receiver_type_method` (`dispatch.rs:589-628`) has no import,
   package or visibility test for non-Swift, non-Go families; a JVM star import is bound under the
   local name `"*"` (`import_local_name` takes `rsplit('.')`, `scope.rs:4-27`, bound at
-  `index.rs:1134-1136`); Java is `LangFamily::CStyle` (`model.rs:70`).
+  `index.rs:1134-1136`); Java is `LangFamily::Java`, its own family since the CStyle split (it shared `CStyle` with C, C++, C#, ObjC and CUDA before), so Java reaches Kotlin only through `jvm_qualified_member`, not through family equality.
 - The `to_file` matcher is file-plus-member-name based. Every probe that asserts *absence* with it
   should be re-read for the e6 trap before it is un-ignored.
 

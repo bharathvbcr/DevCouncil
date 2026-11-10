@@ -50,6 +50,8 @@ mod commonjs_member_exports;
 #[cfg(feature = "parse")]
 mod commonjs_require_bindings;
 #[cfg(feature = "parse")]
+mod cstyle_family_split;
+#[cfg(feature = "parse")]
 mod dead_hardening_characterization;
 #[cfg(feature = "parse")]
 mod deref_transparent_receivers;
