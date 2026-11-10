@@ -1416,3 +1416,75 @@ fn dead_over_a_lane_does_not_list_a_cycle_the_delta_deleted() {
         "the answer must say the cluster scan was dropped, naming the delta: {dead}"
     );
 }
+
+/// A lane's lease claims a generation, a `HEAD` and a donor root. A lease whose
+/// claim disagrees with the base it admitted is refused by every command that
+/// opens the lane, naming the field, and `status` never reports the lease's
+/// generation as the base's.
+#[test]
+fn a_lease_that_disagrees_with_its_base_is_refused_by_every_lane_command() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    let lease_file = lane.join(".devmap/codeintel/stack_lease.json");
+    let honest = fs::read(&lease_file).unwrap();
+    let honest_json: Value = serde_json::from_slice(&honest).unwrap();
+    let forged_generation = honest_json["generation_id"].as_u64().unwrap() + 41;
+
+    let cases = [
+        ("generation_id", serde_json::json!(forged_generation)),
+        (
+            "head_sha",
+            serde_json::json!("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "source_repo_root",
+            serde_json::json!("/nonexistent/some/other/repo"),
+        ),
+        (
+            "source_repo_root",
+            serde_json::json!(lane.canonicalize().unwrap().to_string_lossy()),
+        ),
+    ];
+    // Every (case, command) pair is tried and the failures reported together.
+    let mut unguarded = Vec::new();
+    for (field, forged) in cases {
+        let mut tampered = honest_json.clone();
+        tampered[field] = forged.clone();
+        fs::write(&lease_file, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        for args in [
+            &["--json", "impact", "alpha"][..],
+            &["--json", "search", "--", "alpha"][..],
+            &["--json", "seed", "--sync-delta"][..],
+        ] {
+            let out = fx.devmap(&lane, args);
+            if out.status.success() {
+                unguarded.push(format!("{field} = {forged}: `{args:?}` answered over a lease that disagrees with its base"));
+            } else if !stderr(&out).contains(&format!("lease {field}")) {
+                unguarded.push(format!("{field}: `{args:?}` did not name the field: {}", stderr(&out)));
+            }
+        }
+
+        let status = fx.devmap(&lane, &["--json", "status"]);
+        let st: Value = serde_json::from_slice(&status.stdout).unwrap();
+        if st["query_ready"] != Value::Bool(false) {
+            unguarded.push(format!("{field} = {forged}: status stayed query_ready: {st}"));
+        }
+        if !st["degraded_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("lease {field}"))
+        {
+            unguarded.push(format!("{field}: status did not name the field: {st}"));
+        }
+        if st.get("stacked").is_some() {
+            unguarded.push(format!(
+                "{field}: status reported a lease generation the base does not hold: {st}"
+            ));
+        }
+    }
+    assert!(unguarded.is_empty(), "lease claims that were not refused: {unguarded:#?}");
+}

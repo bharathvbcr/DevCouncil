@@ -461,8 +461,8 @@ impl Store {
     /// `None` when the generation recorded no root — an older store, or one
     /// built outside a repository. Never an empty string dressed as a path.
     pub fn latest_generation_repo_root(&self) -> Result<Option<String>> {
-        let conn = lock_conn(&self.conn)?;
         if let Some(ref override_root) = self.repo_root_override {
+            let conn = lock_conn(&self.conn)?;
             let has_gen: Option<i64> = conn
                 .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
                 .optional()?;
@@ -470,6 +470,15 @@ impl Store {
                 has_gen.and_then(|_| (!override_root.is_empty()).then(|| override_root.clone()))
             );
         }
+        self.stored_latest_generation_repo_root()
+    }
+
+    /// [`Self::latest_generation_repo_root`] read from the store itself, whatever
+    /// root the caller opened it with. A claim about what a file holds (a stacked
+    /// lease's `source_repo_root`) must be checked against the stored row; the
+    /// override is the caller's own opinion and would always agree with itself.
+    pub fn stored_latest_generation_repo_root(&self) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
         if let Some(seeded) = Self::seeded_repo_root_in(&conn)? {
             let has_gen: Option<i64> = conn
                 .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))

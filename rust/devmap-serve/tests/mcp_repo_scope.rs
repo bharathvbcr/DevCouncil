@@ -1284,6 +1284,91 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A committed, indexed donor and a provisioned stacked lane, no delta.
+fn provisioned_stacked_lane(tag: &str) -> (PathBuf, PathBuf) {
+    let base = scratch(tag);
+    let anchor = base.join("anchor");
+    let lane = base.join("wt-stacked");
+    std::fs::create_dir_all(&anchor).unwrap();
+    std::fs::write(anchor.join("lib.rs"), "pub fn base_only() -> i32 { 1 }\n").unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["add", "."]);
+    git(&anchor, &["commit", "-qm", "base"]);
+    git(&anchor, &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()]);
+    let head = git(&anchor, &["rev-parse", "HEAD"]);
+    let anchor_db = devmap_extract::paths::store_path(&anchor);
+    std::fs::create_dir_all(anchor_db.parent().unwrap()).unwrap();
+    let store = devmap_store::Store::open(&anchor_db).unwrap();
+    store.bind_repo_root(&anchor.canonicalize().unwrap()).unwrap();
+    let exts = vec![devmap_extract::extract_file("lib.rs", "pub fn base_only() -> i32 { 1 }\n")];
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&exts);
+    let res = resolver.resolve_all(&exts).unwrap();
+    let analysis = devmap_analyze::analyze(&exts, &res);
+    store
+        .save_generation_with_metadata(
+            &exts,
+            &res,
+            &analysis,
+            devmap_store::GenerationWriteOpts::default(),
+            &head,
+        )
+        .unwrap();
+    drop(store);
+    devmap_query::stacked::provision_stacked_worktree(&anchor, &lane).unwrap();
+    (base, lane)
+}
+
+/// A lease whose generation, `HEAD` or donor root disagrees with the base it
+/// admitted must make every MCP call over the lane an error naming the field,
+/// never an answer (and never a status that reports the lease's generation).
+#[tokio::test]
+async fn a_lease_that_disagrees_with_its_base_is_an_mcp_error_naming_the_field() {
+    let (base, lane) = provisioned_stacked_lane("stacked-mcp-lease-claims");
+    let lease_path = devmap_extract::paths::stack_lease_path(&lane);
+    let honest: serde_json::Value = serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+    let cases = [
+        ("generation_id", json!(honest["generation_id"].as_u64().unwrap() + 41)),
+        ("head_sha", json!("0123456789abcdef0123456789abcdef01234567")),
+        ("source_repo_root", json!("/nonexistent/some/other/repo")),
+        ("source_repo_root", json!(lane.canonicalize().unwrap().to_string_lossy())),
+    ];
+    let mut unguarded = Vec::new();
+    for (field, forged) in cases {
+        let mut tampered = honest.clone();
+        tampered[field] = forged.clone();
+        std::fs::write(&lease_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        let slot = Arc::new(StoreSlot::resolving(None, lane.clone(), None));
+        for (tool, args) in [
+            ("devmap_status", json!({"repo_path": lane.display().to_string()})),
+            (
+                "devmap_search",
+                json!({"repo_path": lane.display().to_string(), "query": "base_only"}),
+            ),
+        ] {
+            let response = call(&slot, tool, args).await;
+            if response["result"]["isError"] != json!(true) {
+                unguarded.push(format!("{tool} answered over a lease with {field} = {forged}"));
+            } else if !tool_error_text(&response).contains(&format!("lease {field}")) {
+                unguarded.push(format!("{tool} did not name {field}: {response}"));
+            }
+        }
+    }
+    assert!(unguarded.is_empty(), "lease claims that were not refused: {unguarded:#?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[tokio::test]
 async fn extra_non_git_mcp_root_does_not_block_the_indexed_root() {
     let base = scratch("extra-root");
