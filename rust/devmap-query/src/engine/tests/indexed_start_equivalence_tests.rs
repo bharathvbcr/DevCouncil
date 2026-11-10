@@ -496,3 +496,45 @@ fn a_component_is_found_by_its_file_stem() {
         .expect("starts")
         .is_empty());
 }
+
+/// The two silences of a component lookup are named in the answer's note.
+#[test]
+fn a_component_passed_over_or_missed_by_case_is_named() {
+    let rows = vec![
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/MarkdownBody.svelte",
+            "ui/MarkdownBody.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Real.ts::Real",
+            "ui/Real.ts",
+            EdgeKind::Calls,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Real.svelte",
+            "ui/Real.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+    ];
+    let index = GenerationEdges::build(std::sync::Arc::new(rows), None).expect("index");
+    let cancel = Cancel::new();
+    let note = |query: &str| component_note(&index, query, true, &cancel).expect("note");
+
+    let passed_over = note("Real").expect("a symbol won over a component");
+    assert!(passed_over.contains("ui/Real.svelte"), "{passed_over}");
+    let case_only = note("markdownbody").expect("a case-only miss");
+    assert!(case_only.contains("ui/MarkdownBody.svelte"), "{case_only}");
+    assert!(note("MarkdownBody").is_none(), "an exact component needs no note");
+    assert!(note("nothing_here").is_none());
+    assert!(note("ui/Real.svelte").is_none(), "a path is not a bare name");
+}

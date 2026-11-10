@@ -146,14 +146,18 @@ fn separator_insensitive_eq(left: &[u8], right: &[u8]) -> bool {
 /// `::`), only the template-component extensions, and only the whole stem, so
 /// `Foo.test.svelte` is not `Foo`.
 pub fn component_file_matches(symbol: &str, name: &str) -> bool {
+    component_stem(symbol) == Some(name)
+}
+
+/// The stem of a template component's `File` node (`MarkdownBody` for
+/// `src/lib/MarkdownBody.svelte`), and `None` for anything else.
+pub fn component_stem(symbol: &str) -> Option<&str> {
     if symbol.contains("::") {
-        return false;
+        return None;
     }
     let file = symbol.rsplit(['/', '\\']).next().unwrap_or(symbol);
-    let Some((stem, extension)) = file.rsplit_once('.') else {
-        return false;
-    };
-    matches!(extension, "svelte" | "vue" | "astro") && stem == name
+    let (stem, extension) = file.rsplit_once('.')?;
+    matches!(extension, "svelte" | "vue" | "astro").then_some(stem)
 }
 
 pub fn symbol_matches(symbol: &str, query: &str) -> bool {
