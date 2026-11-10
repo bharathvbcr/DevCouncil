@@ -15,7 +15,7 @@ use crate::commands::manifest::{
     manifest_json, report_manifest, resolve_graph_output, resolve_map_output,
     write_consumer_artifacts, ManifestOutcome, ManifestRequest,
 };
-use crate::commands::status::store_status_fields;
+use crate::commands::status::{store_status_fields, store_status_fields_from};
 use crate::output::{emit_json, ensure_parent};
 use crate::progress;
 use crate::reporter::ProgressReporter;
@@ -671,7 +671,7 @@ fn run_build(
             }
             let manifest = build_manifest_payload(
                 cli,
-                &progress.display,
+                progress,
                 &store,
                 *write_manifest,
                 path,
@@ -1199,7 +1199,7 @@ fn run_build(
     }
     let manifest = build_manifest_payload(
         cli,
-        &progress.display,
+        progress,
         &store,
         *write_manifest,
         path,
@@ -1531,7 +1531,7 @@ struct BuildManifestPayload {
 #[allow(clippy::too_many_arguments)]
 fn build_manifest_payload(
     cli: &Cli,
-    progress: &progress::Display,
+    progress: &crate::reporter::ProgressReporter,
     store: &Store,
     enabled: bool,
     path: &std::path::Path,
@@ -1564,7 +1564,15 @@ fn build_manifest_payload(
     // The store's own view, so a caller does not need a third process to learn
     // whether the generation it just built is fresh, degraded or backed up
     // behind a pending queue.
-    payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db())?);
+    // The status the write already took, unless the write added guide files to
+    // the tree: those can move the source snapshot, so that case asks again.
+    payload["status"] = serde_json::Value::Object(progress.timed("artifacts:store_status", || {
+        if guides.is_some() {
+            store_status_fields(store, &cli.db())
+        } else {
+            store_status_fields_from(store, &cli.db(), &outcome.store_status)
+        }
+    })?);
     Ok(Some(BuildManifestPayload {
         json: payload,
         outcome,

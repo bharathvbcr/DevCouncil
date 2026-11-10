@@ -387,6 +387,16 @@ pub(crate) fn store_status_fields(
     db: &std::path::Path,
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let status = store.status(&db.display().to_string())?;
+    store_status_fields_from(store, db, &status)
+}
+
+/// [`store_status_fields`] over a status the caller already took, for a caller
+/// that has just walked the tree for it and must not walk it a second time.
+pub(crate) fn store_status_fields_from(
+    store: &Store,
+    db: &std::path::Path,
+    status: &devmap_store::StoreStatus,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     // K-A2: the graph's own degradation belongs in the answer a health check
     // reads.
     //
@@ -404,7 +414,7 @@ pub(crate) fn store_status_fields(
     // this payload also renders it as `budget_refused`.
     let budget_refused = store.latest_budget_refusals()?;
     let degraded_reason =
-        devmap_serve::store_degraded_reason(store, &status, budget_refused.as_ref())?;
+        devmap_serve::store_degraded_reason(store, status, budget_refused.as_ref())?;
     let budget_refused_json = budget_refused.as_ref().map(|sample| {
         serde_json::json!({
             "total": sample.total,
@@ -424,7 +434,7 @@ pub(crate) fn store_status_fields(
         // K-A6: one owner for this rule, shared with the daemon's `status`.
         // Computing it here as `pending_count == 0` is what let a store with no
         // generation at all report as current.
-        "is_fresh": devmap_serve::index_is_fresh(&status),
+        "is_fresh": devmap_serve::index_is_fresh(status),
         "source_freshness": status.source_freshness,
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
@@ -446,7 +456,7 @@ pub(crate) fn store_status_fields(
         // `parser.c` against a 1 MiB ceiling — from a broken one without
         // opening the database. Rendered by `devmap_serve::coverage_gaps_json`,
         // shared with the daemon's own `status`.
-        "coverage_gaps": devmap_serve::coverage_gaps_json(&status),
+        "coverage_gaps": devmap_serve::coverage_gaps_json(status),
         // The budget-refused subset of `coverage_gaps.parse_failed`, capped
         // with its total. `null` when no generation was measured; `total: 0`
         // is a measurement.
@@ -470,6 +480,15 @@ pub(crate) fn store_status_fields(
         // recomputed. `null` when absent (no generation, or a summary written
         // before the field existed) — unexplained is not zero.
         "resolution_rate": store.latest_resolution_rate()?,
+        // Whether `repo_map.json` / `code_graph.json` were written from this
+        // generation. A plain `build` advances the store and writes neither,
+        // so a consumer reading the files directly needs this to tell an older
+        // artifact from a current one. Read from the sidecar, never the files.
+        "artifacts": devmap_query::ArtifactCurrency::of(
+            devmap_query::ArtifactStamp::read(&crate::commands::manifest::artifact_stamp_path(db))
+                .as_ref(),
+            status.latest_generation,
+        ),
     }) else {
         unreachable!("json! of an object literal is an object")
     };

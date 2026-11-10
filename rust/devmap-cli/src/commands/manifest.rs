@@ -7,11 +7,12 @@ use devmap_query::{
     write_manifest_atomically, write_verbose_code_graph_atomically, ArtifactStamp, FreshnessInfo,
     StampedFreshness, CODE_GRAPH_SCHEMA_VERSION,
 };
-use devmap_store::Store;
+use devmap_store::{Store, StoreStatus};
 
 use crate::cli::{default_root_hint, root_parser, Cli, InventoryFlags, StampFlags};
 use crate::output::{emit_json, ensure_parent, open_for_read};
-use crate::{diagnostic, progress};
+use crate::reporter::ProgressReporter;
+use crate::diagnostic;
 
 #[derive(clap::Args)]
 #[group(id = "Manifest")]
@@ -115,7 +116,7 @@ pub(crate) fn guide_request(
 /// Everything one `manifest` write needs, whether it was asked for on its own
 /// or fused onto the end of a build.
 pub(crate) struct ManifestRequest<'a> {
-    pub(crate) progress: Option<&'a progress::Display>,
+    pub(crate) progress: Option<&'a ProgressReporter>,
     /// The tree the caller named. Used only when the store cannot say where its
     /// repository root is.
     pub(crate) path: &'a std::path::Path,
@@ -148,6 +149,9 @@ pub(crate) struct ManifestOutcome {
     /// `caller` / `kernel` / `unavailable` — where the three stamps came from.
     freshness_source: &'static str,
     freshness_unavailable_reason: String,
+    /// The store status taken at the start of the write, so a caller that
+    /// reports status next (the fused build) does not walk the tree again.
+    pub(crate) store_status: StoreStatus,
 }
 
 /// `<db>.artifacts.json` — the stamp beside the store the artifacts came from.
@@ -156,7 +160,7 @@ pub(crate) struct ManifestOutcome {
 /// store's current generation produced, and two stores pointed at one output
 /// path must not share one stamp. It also keeps it out of the git inventory,
 /// so it can never change the fingerprint it helps compute.
-fn artifact_stamp_path(db: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn artifact_stamp_path(db: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.artifacts.json", db.display()))
 }
 
@@ -230,6 +234,20 @@ fn write_guides_if_requested(
     )?)
 }
 
+/// Time one phase of the artifact write under the stage that is open, when a
+/// reporter is present. The standalone `manifest` command has none and runs the
+/// work untimed.
+fn phase<T>(
+    progress: Option<&ProgressReporter>,
+    label: &str,
+    work: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match progress {
+        Some(progress) => progress.timed(label, work),
+        None => work(),
+    }
+}
+
 pub(crate) fn write_consumer_artifacts(
     store: &Store,
     request: ManifestRequest<'_>,
@@ -237,7 +255,9 @@ pub(crate) fn write_consumer_artifacts(
     let gen_id = store.latest_generation_id()?.ok_or_else(|| {
         anyhow::anyhow!("manifest unavailable: build a persisted generation first")
     })?;
-    let status = store.status(&request.db.display().to_string())?;
+    let status = phase(request.progress, "artifacts:status", || {
+        Ok(store.status(&request.db.display().to_string())?)
+    })?;
     let built_head = store
         .latest_generation_head()?
         .unwrap_or_else(|| "unavailable".to_string());
@@ -276,7 +296,9 @@ pub(crate) fn write_consumer_artifacts(
     {
         Some(supplied) => (supplied, "caller", String::new()),
         None => {
-            let digests = freshness::compute(&tree, request.inventory, true);
+            let digests = phase(request.progress, "artifacts:freshness", || {
+                Ok(freshness::compute(&tree, request.inventory, true))
+            })?;
             let source = if digests.unavailable_reason.is_empty() {
                 "kernel"
             } else {
@@ -355,8 +377,11 @@ pub(crate) fn write_consumer_artifacts(
     if let Some(compact) = &compact_dest {
         outputs.push(("compact_graph", compact.as_path()));
     }
-    if ArtifactStamp::read(&stamp_path).is_some_and(|stamp| stamp.still_current(&inputs, &outputs))
-    {
+    let stamp_holds = phase(request.progress, "artifacts:stamp_check", || {
+        Ok(ArtifactStamp::read(&stamp_path)
+            .is_some_and(|stamp| stamp.still_current(&inputs, &outputs)))
+    })?;
+    if stamp_holds {
         return Ok(ManifestOutcome {
             output: dest,
             graph_output: graph_dest,
@@ -366,18 +391,22 @@ pub(crate) fn write_consumer_artifacts(
             guides,
             freshness_source,
             freshness_unavailable_reason,
+            store_status: status,
         });
     }
 
-    let extractions = store.latest_extractions()?;
-    let analysis = store.latest_analysis()?.ok_or_else(|| {
-        anyhow::anyhow!("manifest unavailable: build a persisted generation first")
+    let (extractions, analysis, edges) = phase(request.progress, "artifacts:load", || {
+        let extractions = store.latest_extractions()?;
+        let analysis = store.latest_analysis()?.ok_or_else(|| {
+            anyhow::anyhow!("manifest unavailable: build a persisted generation first")
+        })?;
+        let edges = store
+            .latest_edges(0.0)?
+            .into_iter()
+            .map(resolved_edge_from_stored)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok((extractions, analysis, edges))
     })?;
-    let edges = store
-        .latest_edges(0.0)?
-        .into_iter()
-        .map(resolved_edge_from_stored)
-        .collect::<anyhow::Result<Vec<_>>>()?;
     // One freshness identity for both artifacts: a map and a graph stamped from
     // different generations is the drift the single command exists to prevent.
     let freshness = FreshnessInfo {
@@ -386,34 +415,41 @@ pub(crate) fn write_consumer_artifacts(
         pending_count: status.pending_count,
         stamped,
     };
-    let (_manifest, json_str) = generate_manifest_with_edges(
-        &extractions,
-        &analysis,
-        freshness.clone(),
-        &edges,
-        Some(tree.as_path()),
-    );
-    let (graph_json, compact_graph_json) = generate_code_graph_encodings(
-        &extractions,
-        &analysis,
-        &edges,
-        &freshness,
-        repo_root.as_deref(),
-        compact_dest.is_some(),
-    )?;
+    let (json_str, graph_json, compact_graph_json) =
+        phase(request.progress, "artifacts:render", || {
+            let (_manifest, json_str) = generate_manifest_with_edges(
+                &extractions,
+                &analysis,
+                freshness.clone(),
+                &edges,
+                Some(tree.as_path()),
+            );
+            let (graph_json, compact_graph_json) = generate_code_graph_encodings(
+                &extractions,
+                &analysis,
+                &edges,
+                &freshness,
+                repo_root.as_deref(),
+                compact_dest.is_some(),
+            )?;
+            Ok((json_str, graph_json, compact_graph_json))
+        })?;
 
-    ensure_parent(&dest)?;
-    write_manifest_atomically(&dest, &json_str, request.force)?;
-    ensure_parent(&graph_dest)?;
-    write_verbose_code_graph_atomically(&graph_dest, &graph_json, request.force)?;
-    // Written through the same clobber guard as the verbose artifact. A foreign
-    // file at this path is refused for the same reason: the guard's question is
-    // "did this kernel write what is already here", and the answer does not
-    // depend on the encoding.
-    if let (Some(destination), Some(json)) = (&compact_dest, &compact_graph_json) {
-        ensure_parent(destination)?;
-        write_code_graph_atomically(destination, json, request.force)?;
-    }
+    phase(request.progress, "artifacts:write", || {
+        ensure_parent(&dest)?;
+        write_manifest_atomically(&dest, &json_str, request.force)?;
+        ensure_parent(&graph_dest)?;
+        write_verbose_code_graph_atomically(&graph_dest, &graph_json, request.force)?;
+        // Written through the same clobber guard as the verbose artifact. A
+        // foreign file at this path is refused for the same reason: the guard's
+        // question is "did this kernel write what is already here", and the
+        // answer does not depend on the encoding.
+        if let (Some(destination), Some(json)) = (&compact_dest, &compact_graph_json) {
+            ensure_parent(destination)?;
+            write_code_graph_atomically(destination, json, request.force)?;
+        }
+        Ok(())
+    })?;
 
     // The stamp last, and only after every write succeeded: a stamp claiming
     // artifacts that were never written is a skip that skips nothing real.
@@ -421,26 +457,29 @@ pub(crate) fn write_consumer_artifacts(
     // regeneration, which is the behaviour that existed before the stamp.
     let note = |message: String| {
         if let Some(progress) = request.progress {
-            progress.diagnostic(message);
+            progress.display.diagnostic(message);
         } else {
             diagnostic(format_args!("{message}"));
         }
     };
-    match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
-        Ok(stamp) => {
-            if let Err(error) = stamp.write(&stamp_path) {
-                note(format!(
-                    "  note: could not record the artifact stamp at {} ({error}); \
-                     the next manifest will regenerate rather than skip",
-                    stamp_path.display()
-                ));
+    phase(request.progress, "artifacts:stamp_write", || {
+        match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
+            Ok(stamp) => {
+                if let Err(error) = stamp.write(&stamp_path) {
+                    note(format!(
+                        "  note: could not record the artifact stamp at {} ({error}); \
+                         the next manifest will regenerate rather than skip",
+                        stamp_path.display()
+                    ));
+                }
             }
+            Err(error) => note(format!(
+                "  note: could not stat the artifacts just written ({error}); \
+                 the next manifest will regenerate rather than skip"
+            )),
         }
-        Err(error) => note(format!(
-            "  note: could not stat the artifacts just written ({error}); \
-             the next manifest will regenerate rather than skip"
-        )),
-    }
+        Ok(())
+    })?;
 
     Ok(ManifestOutcome {
         output: dest,
@@ -451,6 +490,7 @@ pub(crate) fn write_consumer_artifacts(
         guides,
         freshness_source,
         freshness_unavailable_reason,
+        store_status: status,
     })
 }
 
