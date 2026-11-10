@@ -85,9 +85,39 @@ fn fts_failure(error: rusqlite::Error) -> rusqlite::Error {
     if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseCorrupt) {
         return error;
     }
-    refusal(fts_damage_reason(&format!(
+    let message = fts_damage_reason(&format!(
         "the full-text index (`nodes_fts`) could not be read: {error}"
-    )))
+    ));
+    rusqlite::Error::ToSqlConversionFailure(Box::new(FtsDamage {
+        message,
+        source: error,
+    }))
+}
+
+/// A corrupt read of the full-text index, worded for the reader and still
+/// carrying the SQLite error that caused it.
+///
+/// This used to be a bare [`StoreRefusal`], whose text no caller could tell
+/// from any other refusal: a server holding a stale handle saw the repair text
+/// and had no way to know the connection, not the index, was at fault.
+/// [`Store::sqlite_error_is_corrupt`] recognises it, so one predicate answers
+/// for every read.
+#[derive(Debug)]
+pub(crate) struct FtsDamage {
+    message: String,
+    source: rusqlite::Error,
+}
+
+impl std::fmt::Display for FtsDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FtsDamage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Typed refusal when a store's stamped schema is not this binary's.

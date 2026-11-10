@@ -8,7 +8,7 @@
 //! damaged file aside and building again was tried and parked: see
 //! `docs/devmap/design/auto-quarantine-parked.md`.
 
-use super::Store;
+use super::{FtsDamage, Store};
 
 impl Store {
     /// Whether `error`, or anything it wraps, is SQLite's `SQLITE_CORRUPT`.
@@ -28,8 +28,17 @@ impl Store {
     }
 
     /// [`Self::is_database_corrupt`] for an error not yet wrapped.
+    ///
+    /// A corrupt read of the full-text index arrives re-worded as a
+    /// [`FtsDamage`] that keeps the SQLite error as its source; it is damage
+    /// by construction, so it answers here too.
     pub fn sqlite_error_is_corrupt(error: &rusqlite::Error) -> bool {
         error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt)
+            || matches!(
+                error,
+                rusqlite::Error::ToSqlConversionFailure(inner)
+                    if inner.downcast_ref::<FtsDamage>().is_some()
+            )
     }
 }
 
@@ -54,6 +63,25 @@ mod tests {
             None,
         );
         assert!(!Store::is_database_corrupt(&anyhow::Error::from(busy)));
+        // A corrupt read of the full-text index is re-worded for the reader and
+        // is still damage, through the anyhow chain a tool call carries.
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".into()),
+        );
+        let reworded = crate::db::fts_failure(corrupt);
+        assert!(Store::sqlite_error_is_corrupt(&reworded));
+        assert!(Store::is_database_corrupt(
+            &anyhow::Error::from(reworded).context("devmap_search")
+        ));
+        // Any other error passes through fts_failure unchanged and is not damage.
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(!Store::sqlite_error_is_corrupt(&crate::db::fts_failure(
+            busy
+        )));
         // A file that is not a database at all is not called damage on this evidence.
         let not_a_db = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
