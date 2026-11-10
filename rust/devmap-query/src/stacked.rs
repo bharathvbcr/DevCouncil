@@ -1298,7 +1298,8 @@ fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str
             source.display()
         ),
     }
-    #[cfg(feature = "parse")]
+    // Asked the same way with or without the parsing frontend: the comparison
+    // is a scan and a manifest pass, and neither reaches a grammar.
     match store.latest_generation_matches_working_tree() {
         Ok(true) => Ok(()),
         Ok(false) => bail!(
@@ -1310,11 +1311,6 @@ fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str
             source.display()
         ),
     }
-    #[cfg(not(feature = "parse"))]
-    bail!(
-        "this build cannot confirm donor {}'s index matches its working tree (parse feature off); {remedy}",
-        source.display()
-    )
 }
 
 /// Provision a Glean-style stacked worktree lane at `worktree_root` backed by

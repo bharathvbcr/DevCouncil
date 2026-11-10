@@ -102,6 +102,9 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     (
         "devmap-query",
         &[
+            // Its generations are written by SQL, and its parity module is
+            // behind `parse` inside the file.
+            "a_donor_is_checked_without_grammars",
             "a_nan_floor_is_refused",
             // Exists to run without grammars: GitPulse's shape.
             "a_query_only_build_can_call_a_store_current",
