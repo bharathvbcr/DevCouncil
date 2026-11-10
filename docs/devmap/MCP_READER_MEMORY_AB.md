@@ -3,9 +3,11 @@
 Measured 2026-11-10 on `perf1109/mcp-reader` against its merge-base
 (`c2348467`), with `rust/devmap-serve/examples/mcp_ab_bench.rs`. Both arms are
 release builds of `devmap`, driven as real `devmap mcp --db <store>` processes
-over stdio. The branch arm is the code at the commit that fixed `status`
-(`7f8ee6b5`); the one commit after it adds an example file, not part of the
-binary.
+over stdio. The branch arm, and the binary run as both null arms, was built from
+the tree at `c5ca3495`: the `status` fix `7f8ee6b5` plus one example file that is
+not part of the binary. **It predates the hardening of the memo described under
+"The memo" below (own-write stamp and age bound); those changes were tested but
+not benchmarked.** The base arm was built from `c2348467`.
 
 | | |
 |---|---|
@@ -55,9 +57,13 @@ Null pair arms (same binary), median [min, max]:
 | Warm `status` (ms) | 98.76 [73.63, 124.95] | 98.28 [75.20, 136.32] |
 
 Every null difference is inside its arms' own spread, so both runs are valid.
-The null run was done on a busier machine (the same binary's warm `impact` was
-50 ms there and 36 ms in the real run), so absolute levels are not comparable
-between the two runs; only differences within one run are.
+Absolute levels differ between the two runs: the same binary's warm `impact` was
+50 ms in the null run and 36 ms in the real run, its warm `status` 98 and 72 ms.
+The 1-minute load figures at the ends of the runs (real 17.07 to 7.32, null 6.98
+to 13.18) do not explain it: the null run started at the lower load. Measured:
+the load at the two ends of each run. Inferred, not measured: other work on the
+host during the null run (a 1-minute load is a poor sample of a 15-minute run).
+Only differences within one run are compared.
 
 ## What it says
 
@@ -120,6 +126,27 @@ why the branch is now faster than base and not merely equal. A counting test
 (`one_status_takes_one_full_snapshot`) and four view-dropping tests assert the
 second warm call runs no SQL on the held tables; the stage example reproduces the
 breakdown.
+
+## The memo
+
+`status` holds four answers on the `Store`: the payload-identity check, the
+file-hash map the freshness walk compares, the edge-confidence count and a clean
+payload-encoding verdict (a fault is never held). Each is keyed on the
+generation, on SQLite's `PRAGMA data_version` (moves when another connection
+commits) and on this connection's own `total_changes()` (moves on every row the
+store's own writes touch, so no write path has to remember to end the memo: the
+key has one owner, `Store::connection_stamp`). Each is also bounded in age at
+60 seconds, because page damage or an in-place overwrite of the file moves none
+of those keys and a pass read once would otherwise be reported for the life of
+the process; at 60 s a health poll pays the scan (about 16 ms) at most once a
+minute. How often hooks call `status` was not measured. The file-hash map is
+not capped: one path string and one hash per indexed file, about 0.4 MB at 3,320
+files (estimated, not measured; an estimated 10 to 15 MB at 100,000 files), and
+it lives as long as the `Store`, so a writable daemon holds it for the life of
+the daemon. Callers of `latest_generation_payload_is_current` and
+`edge_confidence_mismatches` outside this crate (GitPulse's vendored copy,
+Manvi's linked one) get the same memo: a repeat within a minute returns the held
+answer unless a write moved a key.
 
 ## Reproduce
 
