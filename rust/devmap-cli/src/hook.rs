@@ -648,6 +648,24 @@ fn context_breaks_a_line(c: char) -> bool {
         || c == '\u{2028}'
         || c == '\u{2029}'
         || (c.is_control() && c != '\t')
+        || is_text_reordering_format(c)
+}
+
+/// Unicode format characters that reorder or hide text without being visible:
+/// bidi embeddings, overrides and isolates (U+202A-202E, U+2066-2069), the
+/// directional marks (U+200E, U+200F, U+061C), and zero-width characters
+/// (U+200B-200D, U+2060, U+FEFF). Right-to-left *letters* are not in this set:
+/// an Arabic or Hebrew directory name is ordinary text and passes through.
+fn is_text_reordering_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// `text` as one hook-context line. Line breaks and other controls are written
@@ -5016,6 +5034,23 @@ mod tests {
 
     /// Every breaking character is escaped, and every other character is kept.
     /// A fixed set stands in for a fuzzer: the function is total over `char`.
+    /// Bidi controls and zero-width characters are written as `\uXXXX`, so a
+    /// path cannot reorder or hide the hook line it lands in; RTL letters stay.
+    #[test]
+    fn context_line_escapes_bidi_and_zero_width_but_not_rtl_letters() {
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{200C}',
+            '\u{200D}', '\u{2060}', '\u{FEFF}',
+        ] {
+            let out = context_line(&format!("a{c}b"));
+            assert_eq!(out, format!("a\\u{:04x}b", u32::from(c)), "U+{:04X}", u32::from(c));
+        }
+        for name in ["\u{05E9}\u{05DC}\u{05D5}\u{05DD}", "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}", "repo-\u{05D0}\u{0628}"] {
+            assert_eq!(context_line(name), name, "an RTL name must pass through unchanged");
+        }
+    }
+
     #[test]
     fn context_line_keeps_text_and_escapes_every_break() {
         let samples = [
