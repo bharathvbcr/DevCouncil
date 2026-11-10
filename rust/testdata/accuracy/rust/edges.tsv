@@ -250,3 +250,15 @@ rs.s31	B ancestor glob	scopes/src/c31.rs::call_c31	scopes/src/p_ext.rs::h31	edge
 rs.s31.not	B ancestor glob	scopes/src/c31.rs::call_c31	scopes/src/c31.rs::h31	forbid_any_tier	must		the ancestors' namesake
 rs.s32	B ancestor glob	scopes/src/c32.rs::child_calls32	scopes/src/p_ext.rs::anc32	edge	must		glob in a tests module: the parent's namesake is not visible
 rs.s32.not	B ancestor glob	scopes/src/c32.rs::child_calls32	scopes/src/c32.rs::anc32	forbid_any_tier	must		the parent's namesake
+rs.s33a	E macro scope	scopes/src/c33.rs::mac_block	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		a macro in the block emits `use crate::p_db::Dup;`; the module-level import of p_da::Dup is shadowed there
+rs.s33b	E macro scope	scopes/src/c33.rs::mac_block2_value	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		the same, in a nested value block
+rs.s34a	E nearer glob	scopes/src/c34.rs::macro_glob	scopes/src/c34.rs::gm	forbid_any_tier	must		a block glob of a module whose `gm` is macro-made is nearer than the module's own gm
+rs.s34b	E nearer glob	scopes/src/c34.rs::std_glob	scopes/src/c34.rs::swap	forbid_any_tier	must		a block `use std::mem::*;` provides swap
+rs.s34c	E nearer glob	scopes/src/c34.rs::std_glob2	scopes/src/c34.rs::swap	forbid_any_tier	must		the same, second caller
+rs.s35a	E nearer glob	scopes/src/c35.rs::ext_glob	scopes/src/c35.rs::max	forbid_any_tier	must		a block glob of an unindexed external module (std::cmp) provides max
+rs.s35b	E nearer glob	scopes/src/c35.rs::macro_item_glob	scopes/src/c35.rs::made2	forbid_any_tier	must		a block glob of a module with an item macro that makes made2
+rs.s35c	E nearer glob	scopes/src/c35.rs::plain_via_glob	scopes/src/mm2.rs::plain2	edge	must		a plainly declared name of a module that also holds an item macro: the corpus-unique tier still finds it
+rs.s36a	E nearer glob	scopes/src/c36.rs::enum_glob	scopes/src/c36.rs::Mk	forbid_any_tier	must		a block glob of an enum's variants provides Mk (the variant, not the function)
+rs.s37a	E statement macro	scopes/src/c37.rs::std_macro_then_outer	scopes/src/c37.rs::h37a	edge	must		println! and vec! emit no items or imports: the outer declaration answers
+rs.s37b	E statement macro	scopes/src/c37.rs::unknown_macro_then_name	scopes/src/c37.rs::h37b	forbid_any_tier	must		a crate macro may declare h37b in the block
+rs.s38a	E statement macro	scopes/src/c38.rs::shadowed_dbg	scopes/src/c38.rs::h38	forbid_any_tier	must		a crate macro named dbg is not the std dbg: it may declare h38
