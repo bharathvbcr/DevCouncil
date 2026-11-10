@@ -348,7 +348,7 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
         }
         push_named_children(node, &mut stack);
     }
-    scopes.sort_by(|a, b| (a.start, a.end).cmp(&(b.start, b.end)));
+    scopes.sort_by_key(|scope| (scope.start, scope.end));
     scopes.dedup();
     restricted.sort();
     restricted.dedup();

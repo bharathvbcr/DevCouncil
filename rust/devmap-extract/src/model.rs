@@ -1652,6 +1652,7 @@ pub const CALLS_DROPPED_PREFIX: &str = "call sites dropped at the scan cap: ";
 pub struct RustScopeSpan {
     pub kind: RustScopeKind,
     /// The module's name; empty for a block.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub start: usize,
     pub end: usize,
