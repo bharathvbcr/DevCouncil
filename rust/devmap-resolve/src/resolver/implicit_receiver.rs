@@ -508,6 +508,7 @@ impl Resolver {
         call_file: &str,
         type_name: &str,
         hits: &'a [(String, String)],
+        site: Site<'_>,
     ) -> Option<(&'a str, &'a str)> {
         let mut uniq: Vec<&(String, String)> = hits.iter().collect();
         uniq.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -532,24 +533,51 @@ impl Resolver {
         if let Some(narrowed) = self.js_module_scoped_hits(call_file, type_name, &uniq) {
             uniq = narrowed;
         }
-        // Rust: two files each declare a type of this name with a method of this
-        // name. The call file's own evidence says which one it means - its own
-        // declaration, which shadows a glob, else the file its import (or glob)
-        // of the type name binds. Nothing narrows without that evidence, so a
-        // namesake the caller cannot see is still refused, never guessed.
-        if call_file.ends_with(".rs") && !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
-            let bound = self
-                .import_bindings
-                .get(call_file)
-                .and_then(|bindings| bindings.get(type_name))
-                .map(|(file, _)| file.as_str());
-            let own = uniq.iter().any(|hit| hit.0 == call_file);
-            let evidence = if own { Some(call_file) } else { bound };
-            if let Some(file) = evidence {
-                let narrowed: Vec<&(String, String)> =
-                    uniq.iter().copied().filter(|hit| hit.0 == file).collect();
-                if !narrowed.is_empty() {
-                    uniq = narrowed;
+        // Rust: which declaration of the type a name means is the module's
+        // answer, not the file's. Its own declaration (which shadows a glob)
+        // narrows to this file; an import or glob narrows to the file it binds;
+        // a name the site cannot place - a namesake only in a module around
+        // the site, or a binding the file's extents do not separate - narrows
+        // nothing, and is refused rather than guessed.
+        let rust_origin = if call_file.ends_with(".rs") {
+            self.rust_origin_at(call_file, type_name, site.pos, site.caller)
+        } else {
+            None
+        };
+        if rust_origin.is_some() && self.rust_method_is_overloaded_across_impls(type_name, &uniq) {
+            return None;
+        }
+        if let Some(origin) = rust_origin {
+            if origin == RustOrigin::Unknown {
+                return None;
+            }
+            // The type is declared in scope here, yet no body of the method is
+            // filed under it (a function-local type's methods are filed under
+            // the function). A namesake elsewhere is not its method.
+            if origin == RustOrigin::Own && !uniq.iter().any(|hit| hit.0 == call_file) {
+                return None;
+            }
+            if uniq.iter().all(|hit| hit.0 == uniq[0].0) {
+                if origin == RustOrigin::Absent && uniq[0].0 == call_file {
+                    return None;
+                }
+            } else {
+                let bound = self
+                    .import_bindings
+                    .get(call_file)
+                    .and_then(|bindings| bindings.get(type_name))
+                    .map(|(file, _)| file.as_str());
+                let evidence = if origin == RustOrigin::Own {
+                    Some(call_file)
+                } else {
+                    bound
+                };
+                if let Some(file) = evidence {
+                    let narrowed: Vec<&(String, String)> =
+                        uniq.iter().copied().filter(|hit| hit.0 == file).collect();
+                    if !narrowed.is_empty() {
+                        uniq = narrowed;
+                    }
                 }
             }
         }
@@ -586,6 +614,46 @@ impl Resolver {
                 _ => false,
             };
         corroborated.then_some((target_file.as_str(), target_symbol.as_str()))
+    }
+
+    /// Whether the method a Rust call names has several bodies the type's
+    /// name cannot tell apart: impls in files that do not declare the type
+    /// (`impl From<A> for E` beside `impl From<B> for E` elsewhere), or two
+    /// bodies in one file whose signatures differ (two trait impls, which the
+    /// extractor files as `m` and `m@<start>` just as it files a `#[cfg]` copy).
+    ///
+    /// Which impl runs depends on the argument's type, which no call site here
+    /// records, so a type's own file is not the answer: binding it would be a
+    /// confident edge to one impl of several. The caller declines, leaving the
+    /// call unresolved rather than wrong. A `#[cfg]` copy has the same
+    /// signature as its base and stays one method.
+    fn rust_method_is_overloaded_across_impls(
+        &self,
+        type_name: &str,
+        uniq: &[&(String, String)],
+    ) -> bool {
+        let files: BTreeSet<&str> = uniq.iter().map(|hit| hit.0.as_str()).collect();
+        if files.len() > 1
+            && files.iter().any(|file| {
+                !self
+                    .rust_site_scope
+                    .get(*file)
+                    .is_some_and(|scope| scope.declares_anywhere(type_name))
+            })
+        {
+            return true;
+        }
+        for file in files {
+            let own: Vec<&&(String, String)> = uniq.iter().filter(|hit| hit.0 == file).collect();
+            let signatures: BTreeSet<Option<&String>> = own
+                .iter()
+                .map(|hit| self.rust_signatures.get(&(hit.0.clone(), hit.1.clone())))
+                .collect();
+            if own.len() > 1 && signatures.len() > 1 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Every `type_methods` hit a Swift type spelling reaches from `call_file`

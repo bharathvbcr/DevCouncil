@@ -180,10 +180,18 @@ impl Resolver {
             && binding.is_none()
         {
             let key = (family, receiver.to_string(), name.to_string());
-            if let Some((target_file, target_symbol)) = self
-                .type_methods
-                .get(&key)
-                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+            if let Some((target_file, target_symbol)) =
+                self.type_methods.get(&key).and_then(|hits| {
+                    self.type_method_target(
+                        &ext.file_path,
+                        receiver,
+                        hits,
+                        Site::of(
+                            reference.span.start_byte,
+                            reference.enclosing_symbol.as_deref(),
+                        ),
+                    )
+                })
             {
                 return Some(self.reference_edge(
                     ext,
@@ -208,10 +216,18 @@ impl Resolver {
         {
             for member in Self::read_members(family, name) {
                 let key = (family, receiver.to_string(), member);
-                if let Some((target_file, target_symbol)) = self
-                    .type_methods
-                    .get(&key)
-                    .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+                if let Some((target_file, target_symbol)) =
+                    self.type_methods.get(&key).and_then(|hits| {
+                        self.type_method_target(
+                            &ext.file_path,
+                            receiver,
+                            hits,
+                            Site::of(
+                                reference.span.start_byte,
+                                reference.enclosing_symbol.as_deref(),
+                            ),
+                        )
+                    })
                 {
                     return Some(self.reference_edge(
                         ext,

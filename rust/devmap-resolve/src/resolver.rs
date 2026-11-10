@@ -390,6 +390,10 @@ pub struct Resolver {
     /// module path segment that is no child of a file may be a module one of
     /// these publishes (see `rust_module_through_globs`).
     rust_module_globs: BTreeMap<String, Vec<String>>,
+    /// Rust files whose set of published names the index cannot be sure it
+    /// holds whole: an item-position macro invocation, a partial parse, or a
+    /// `pub use m::*;` whose source is not indexed.
+    rust_opaque_publishers: BTreeSet<String>,
     /// Rust: a file a `#[path = "x.rs"] mod x;` declaration names -> the one
     /// file that declares it. That file is the module's parent, whatever the
     /// directory layout says (see `compute_rust_path_modules`).
@@ -735,6 +739,9 @@ pub struct Resolver {
     /// Per Rust file, the names of the inline `mod name { … }` blocks it
     /// declares. See `Extraction::rust_inline_modules`.
     rust_inline_modules: BTreeMap<String, BTreeSet<String>>,
+    /// Per Rust file, what its modules, declarations and imports let a call
+    /// site see. See `rust_site_scope`.
+    rust_site_scope: BTreeMap<String, rust_site_scope::RustFileScope>,
     /// Rust type name → the type it `Deref`s to; `None` when two indexed
     /// `impl Deref` blocks disagree about a type of that name.
     rust_deref_targets: BTreeMap<String, Option<String>>,
@@ -801,6 +808,7 @@ impl Resolver {
             reexport_chains: BTreeMap::new(),
             reexport_glob_cutoff: None,
             rust_module_globs: BTreeMap::new(),
+            rust_opaque_publishers: BTreeSet::new(),
             rust_path_modules: BTreeMap::new(),
             rust_scope_globs: BTreeMap::new(),
             rust_scope_named: BTreeMap::new(),
@@ -861,6 +869,7 @@ impl Resolver {
             swift_module_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
             rust_inline_modules: BTreeMap::new(),
+            rust_site_scope: BTreeMap::new(),
             rust_deref_targets: BTreeMap::new(),
             rust_blanket_methods: BTreeMap::new(),
             max_indexed_path_depth: 0,
@@ -915,6 +924,9 @@ pub use resolve_all::{
 mod candidates;
 
 mod rust_modules;
+
+mod rust_site_scope;
+use rust_site_scope::{RustOrigin, Site};
 
 mod scope;
 

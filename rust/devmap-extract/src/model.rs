@@ -1764,6 +1764,29 @@ pub struct Extraction {
     /// tells the two apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_inline_modules: Vec<String>,
+    /// `(name, start_byte, end_byte)` of every inline `mod name { … }` block a
+    /// Rust file declares, at any nesting, in source order. Empty for every
+    /// other language, and for a file with no inline module.
+    ///
+    /// `rust_inline_modules` says a module exists; this says which items sit
+    /// inside it. The extractor files an inline module's items under the file's
+    /// own namespace, so the symbol table cannot tell a `Dup` declared in
+    /// `mod inner` from one at file level, and a call in `mod tests` from one
+    /// outside it. A byte offset inside the block is how a resolver asks which
+    /// module a declaration, an import or a call belongs to. Not collected by
+    /// an extraction written before this field existed (names present, spans
+    /// empty): a reader must treat module membership there as unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_module_spans: Vec<(String, usize, usize)>,
+    /// The macro name of every item-position macro invocation (`mk!();` beside
+    /// `fn`s, at file level or inside an inline module) a Rust file makes.
+    /// Sorted and deduplicated; empty for every other language.
+    ///
+    /// Such an invocation can declare any item the index never sees, so a name
+    /// that looks unique among the visible declarations may have a second,
+    /// invisible publisher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_item_macros: Vec<String>,
     /// `(type, target)` for every `impl Deref for type { type Target = target; }`
     /// a Rust file declares, both reduced to their bare names. Sorted and
     /// deduplicated; empty for every other language.

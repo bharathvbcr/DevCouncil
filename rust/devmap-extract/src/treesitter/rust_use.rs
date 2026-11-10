@@ -253,11 +253,10 @@ pub(super) fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> 
 /// A `mod name;` declaration has no body and names a file, so it is not an
 /// inline module. The walk is an explicit worklist, bounded by the same
 /// deadline every other whole-tree pass here honours.
-pub(super) fn collect_rust_item_facts(
-    root: Node,
-    source: &str,
-) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
+pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts {
     let mut modules = BTreeSet::new();
+    let mut spans: Vec<(String, usize, usize)> = Vec::new();
+    let mut macros = BTreeSet::new();
     let mut derefs = BTreeSet::new();
     let mut blankets = BTreeSet::new();
     let mut stack = vec![root];
@@ -268,7 +267,16 @@ pub(super) fn collect_rust_item_facts(
         match node.kind() {
             "mod_item" if node.child_by_field_name("body").is_some() => {
                 if let Some(name) = get_child_text(node, "name", source) {
+                    spans.push((name.clone(), node.start_byte(), node.end_byte()));
                     modules.insert(name);
+                }
+            }
+            // An invocation that stands where an item would: its parent is an
+            // item list, or the `;`-terminated statement the grammar wraps it
+            // in at that position. One inside a block or expression is not.
+            "macro_invocation" if rust_macro_stands_as_item(node) => {
+                if let Some(path) = node.child_by_field_name("macro") {
+                    macros.insert(get_node_text(path, source));
                 }
             }
             "impl_item" => {
@@ -283,11 +291,35 @@ pub(super) fn collect_rust_item_facts(
         }
         push_named_children(node, &mut stack);
     }
-    (
-        modules.into_iter().collect(),
-        derefs.into_iter().collect(),
-        blankets.into_iter().collect(),
-    )
+    spans.sort();
+    spans.dedup();
+    RustItemFacts {
+        inline_modules: modules.into_iter().collect(),
+        module_spans: spans,
+        item_macros: macros.into_iter().collect(),
+        deref_targets: derefs.into_iter().collect(),
+        blanket_impl_params: blankets.into_iter().collect(),
+    }
+}
+
+fn rust_macro_stands_as_item(node: Node) -> bool {
+    let item_list = |n: Node| matches!(n.kind(), "source_file" | "declaration_list");
+    match node.parent() {
+        Some(p) if item_list(p) => true,
+        Some(p) if p.kind() == "expression_statement" => p.parent().is_some_and(item_list),
+        _ => false,
+    }
+}
+
+/// What one pass over a Rust file's items collects. Every list is sorted and
+/// deduplicated, and every one is empty for a file with nothing to report.
+#[derive(Default)]
+pub(super) struct RustItemFacts {
+    pub inline_modules: Vec<String>,
+    pub module_spans: Vec<(String, usize, usize)>,
+    pub item_macros: Vec<String>,
+    pub deref_targets: Vec<(String, String)>,
+    pub blanket_impl_params: Vec<String>,
 }
 
 /// `T` for a blanket impl, `impl<T: Display> Describe for T`: a trait impl

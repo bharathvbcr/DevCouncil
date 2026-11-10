@@ -21,6 +21,7 @@ impl Resolver {
         self.reexport_chains.clear();
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
+        self.rust_opaque_publishers.clear();
         self.rust_path_modules.clear();
         self.rust_scope_globs.clear();
         self.rust_scope_named.clear();
@@ -75,6 +76,7 @@ impl Resolver {
         self.swift_module_symbols.clear();
         self.scope_locals.clear();
         self.rust_inline_modules.clear();
+        self.rust_site_scope.clear();
         self.rust_deref_targets.clear();
         self.rust_blanket_methods.clear();
         self.max_indexed_path_depth = extractions
@@ -327,6 +329,12 @@ impl Resolver {
                         }
                     }
                 }
+            }
+            if ext.language == "rust" {
+                self.rust_site_scope.insert(
+                    ext.file_path.clone(),
+                    super::rust_site_scope::RustFileScope::build(ext),
+                );
             }
             if !ext.rust_inline_modules.is_empty() {
                 self.rust_inline_modules.insert(
@@ -731,6 +739,7 @@ impl Resolver {
         (self.reexport_chains, self.reexport_glob_cutoff) =
             self.compute_reexport_chains(extractions);
         self.rust_module_globs = self.compute_rust_module_globs(extractions);
+        self.rust_opaque_publishers = self.compute_rust_opaque_publishers(extractions);
         self.rust_path_modules = self.compute_rust_path_modules(extractions);
         self.rust_scope_globs = self.compute_rust_scope_globs(extractions);
         self.rust_scope_named = self.compute_rust_scope_named(extractions);
@@ -1112,19 +1121,24 @@ impl Resolver {
                         continue;
                     }
                     if alias == Some(".") {
-                        // Rust: every name the importing file declares at any
-                        // depth. An item it declares itself - in the file or in
-                        // one of its inline modules - shadows what a glob brings
-                        // in under that name, so the glob binds nothing for it
-                        // and the same-file rung answers.
-                        let own_rust_names: BTreeSet<&String> = if ext.language == "rust" {
-                            self.file_symbols
-                                .get(&ext.file_path)
-                                .into_iter()
-                                .flatten()
-                                .collect()
+                        // Rust: an item declared in the glob's own module
+                        // shadows what the glob brings in under that name, so
+                        // the glob binds nothing for it. A declaration in some
+                        // other module of the file does not: that module's
+                        // namesake is not in scope where the glob is, and the
+                        // call-site test (`rust_site_scope`) is what keeps it
+                        // from shadowing the glob for code that cannot see it.
+                        let glob_pos = imp.span.start_byte;
+                        let rust_scope = if ext.language == "rust" {
+                            self.rust_site_scope.get(&ext.file_path)
                         } else {
-                            BTreeSet::new()
+                            None
+                        };
+                        let shadowed = |name: &str| {
+                            rust_scope.is_some_and(|scope| {
+                                scope.declares_in_module_of(name, glob_pos)
+                                    || scope.imports_by_name_in_module_of(name, glob_pos)
+                            })
                         };
                         for file in &targets {
                             // X41. A glob of the file's *own* module —
@@ -1147,7 +1161,14 @@ impl Resolver {
                                     // itself shadows what a glob brings in under
                                     // the same name, so the glob binds nothing
                                     // for it and the same-file rung answers.
-                                    if ext.language == "rust" && own_rust_names.contains(name) {
+                                    if ext.language == "rust"
+                                        && (shadowed(name)
+                                            || !self.rust_item_is_visible_to(
+                                                &ext.file_path,
+                                                file,
+                                                name,
+                                            ))
+                                    {
                                         continue;
                                     }
                                     file_bindings
@@ -1161,7 +1182,7 @@ impl Resolver {
                                 && self.rust_path_modules.get(&ext.file_path) == Some(file)
                             {
                                 for (name, declarer) in self.rust_scope_published(file) {
-                                    if own_rust_names.contains(&name) {
+                                    if shadowed(&name) {
                                         continue;
                                     }
                                     if let Some(declarer) = declarer {
@@ -1177,8 +1198,20 @@ impl Resolver {
                             // Only a name exactly one declaration publishes
                             // binds; the importing file's own items still win.
                             if ext.language == "rust" {
-                                for (name, published_by) in self.rust_glob_published(file) {
-                                    if own_rust_names.contains(&name) {
+                                let (published, complete) =
+                                    self.rust_glob_published(&ext.file_path, file);
+                                for (name, published_by) in published {
+                                    if shadowed(&name) {
+                                        continue;
+                                    }
+                                    if !complete {
+                                        // A chain that may publish a name the
+                                        // index never saw cannot say this is
+                                        // the only declaration of it. Bind
+                                        // nothing, and record the name as one
+                                        // that may come from the glob's source,
+                                        // so no other rung binds a namesake.
+                                        unresolved_import(name, &imp.module_specifier);
                                         continue;
                                     }
                                     if let Some(published_by) = published_by {
@@ -2093,13 +2126,27 @@ impl Resolver {
 
     /// The names a Rust file publishes through its `pub use m::*;` globs, each
     /// with the one file declaring it - or `None` when two declarations in the
-    /// chain share the name, which no glob can pick between.
+    /// chain share the name, which no glob can pick between - and whether the
+    /// chain is known to publish nothing else.
+    ///
+    /// Only what `importer` can see is listed: a `pub` item, or a private one
+    /// when the importer sits inside the declaring module. A glob import does
+    /// not carry the rest. The set is *complete* only when no file in the chain
+    /// (the target included) may publish a name the index never saw - an
+    /// item-position macro, a partial parse, a glob over a source that is not
+    /// indexed - because "the one visible declaration" is then not the only
+    /// candidate.
     ///
     /// The walk follows globs of globs and is bounded by the files it has
     /// visited. A file's own items are not listed: the caller binds those first
     /// and they shadow anything a glob brings.
-    pub(super) fn rust_glob_published(&self, file: &str) -> BTreeMap<String, Option<String>> {
+    pub(super) fn rust_glob_published(
+        &self,
+        importer: &str,
+        file: &str,
+    ) -> (BTreeMap<String, Option<String>>, bool) {
         let mut published: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut complete = !self.rust_opaque_publishers.contains(file);
         let mut visited: BTreeSet<&str> = BTreeSet::from([file]);
         let mut pending: Vec<&str> = self
             .rust_module_globs
@@ -2112,8 +2159,13 @@ impl Resolver {
             if !visited.insert(globbed) {
                 continue;
             }
+            if self.rust_opaque_publishers.contains(globbed) {
+                complete = false;
+            }
             for name in self.file_symbols.get(globbed).into_iter().flatten() {
-                if !self.declared_at_file_level(globbed, name) {
+                if !self.declared_at_file_level(globbed, name)
+                    || !self.rust_item_is_visible_to(importer, globbed, name)
+                {
                     continue;
                 }
                 published
@@ -2133,7 +2185,63 @@ impl Resolver {
                     .map(String::as_str),
             );
         }
-        published
+        (published, complete)
+    }
+
+    /// Whether the Rust item `name` that `declarer` declares at file level is
+    /// visible to a glob import written in `importer`: it is `pub`, or the
+    /// importer is the declaring module or inside it. A module `m` is `m.rs`
+    /// with its children under `m/`, or the directory of `m/mod.rs`, `lib.rs`
+    /// or `main.rs`.
+    pub(super) fn rust_item_is_visible_to(
+        &self,
+        importer: &str,
+        declarer: &str,
+        name: &str,
+    ) -> bool {
+        let private = self
+            .unexported_symbols
+            .contains(&(declarer.to_string(), self.qualified_for(declarer, name)));
+        if !private || importer == declarer {
+            return true;
+        }
+        let module_dir = ["/mod.rs", "/lib.rs", "/main.rs"]
+            .iter()
+            .find_map(|tail| declarer.strip_suffix(tail))
+            .or_else(|| declarer.strip_suffix(".rs"));
+        module_dir.is_some_and(|dir| {
+            importer
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// Rust files whose published names the index cannot be sure it holds
+    /// whole. See `rust_opaque_publishers`.
+    pub(super) fn compute_rust_opaque_publishers(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeSet<String> {
+        let mut opaque = BTreeSet::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            let unseen_glob = ext.exports.iter().any(|export| {
+                export.exported_name == "*"
+                    && export.module_specifier.as_deref().is_none_or(|specifier| {
+                        self.resolve_import_path(&ext.file_path, &ext.language, specifier)
+                            .is_none()
+                    })
+            });
+            if !ext.rust_item_macros.is_empty()
+                || unseen_glob
+                || !matches!(ext.parse_outcome, ParseOutcome::Clean)
+            {
+                opaque.insert(ext.file_path.clone());
+            }
+        }
+        opaque
     }
 
     /// Every Rust `use m::*;` - private ones too - as `(file, the module file m
@@ -2241,7 +2349,7 @@ impl Resolver {
                     merge(name, Some(globbed.clone()));
                 }
             }
-            for (name, declarer) in self.rust_glob_published(globbed) {
+            for (name, declarer) in self.rust_glob_published(file, globbed).0 {
                 merge(&name, declarer);
             }
         }
