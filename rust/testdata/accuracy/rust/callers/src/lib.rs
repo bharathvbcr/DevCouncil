@@ -13,3 +13,9 @@ pub mod pathmod;
 pub mod plainmod;
 pub mod runner;
 pub mod sameglob;
+
+/// Names `Quarantine` with no declaration and no import in this file: two
+/// files declare one, so no edge is the right answer.
+pub fn anon_f4() {
+    let _ = Quarantine::new_f4();
+}

@@ -532,6 +532,27 @@ impl Resolver {
         if let Some(narrowed) = self.js_module_scoped_hits(call_file, type_name, &uniq) {
             uniq = narrowed;
         }
+        // Rust: two files each declare a type of this name with a method of this
+        // name. The call file's own evidence says which one it means - its own
+        // declaration, which shadows a glob, else the file its import (or glob)
+        // of the type name binds. Nothing narrows without that evidence, so a
+        // namesake the caller cannot see is still refused, never guessed.
+        if call_file.ends_with(".rs") && !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
+            let bound = self
+                .import_bindings
+                .get(call_file)
+                .and_then(|bindings| bindings.get(type_name))
+                .map(|(file, _)| file.as_str());
+            let own = uniq.iter().any(|hit| hit.0 == call_file);
+            let evidence = if own { Some(call_file) } else { bound };
+            if let Some(file) = evidence {
+                let narrowed: Vec<&(String, String)> =
+                    uniq.iter().copied().filter(|hit| hit.0 == file).collect();
+                if !narrowed.is_empty() {
+                    uniq = narrowed;
+                }
+            }
+        }
         if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
             return None;
         }

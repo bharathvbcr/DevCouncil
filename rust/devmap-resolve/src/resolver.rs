@@ -390,6 +390,10 @@ pub struct Resolver {
     /// module path segment that is no child of a file may be a module one of
     /// these publishes (see `rust_module_through_globs`).
     rust_module_globs: BTreeMap<String, Vec<String>>,
+    /// Rust: a file a `#[path = "x.rs"] mod x;` declaration names -> the one
+    /// file that declares it. That file is the module's parent, whatever the
+    /// directory layout says (see `compute_rust_path_modules`).
+    rust_path_modules: BTreeMap<String, String>,
     /// `<file>` -> the local binding its `export default` publishes. What an
     /// importer's `import X from` and a barrel's `export { default } from` ask
     /// for by the name `default`; see `default_binding`.
@@ -790,6 +794,7 @@ impl Resolver {
             reexport_chains: BTreeMap::new(),
             reexport_glob_cutoff: None,
             rust_module_globs: BTreeMap::new(),
+            rust_path_modules: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),

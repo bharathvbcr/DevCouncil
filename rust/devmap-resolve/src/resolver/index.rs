@@ -21,6 +21,7 @@ impl Resolver {
         self.reexport_chains.clear();
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
+        self.rust_path_modules.clear();
         self.default_exports.clear();
         self.inert_values.clear();
         self.star_export_files.clear();
@@ -728,6 +729,7 @@ impl Resolver {
         (self.reexport_chains, self.reexport_glob_cutoff) =
             self.compute_reexport_chains(extractions);
         self.rust_module_globs = self.compute_rust_module_globs(extractions);
+        self.rust_path_modules = self.compute_rust_path_modules(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
@@ -2029,6 +2031,59 @@ impl Resolver {
                 }
             }
         }
+    }
+
+    /// Every file a Rust `#[path = "x.rs"] mod x;` names, keyed to the file that
+    /// declares it.
+    ///
+    /// The module system makes the declaring file that module's parent: `super`
+    /// inside `x.rs` is the declaring module, wherever `x.rs` sits. The layout
+    /// rule `rust_module_dirs` applies (a leaf file's `super` is its directory's
+    /// `mod.rs`) is wrong for it, so a test module kept in a sibling file by
+    /// `#[path]` resolved `use super::*;` to the crate root and lost every type
+    /// of the module under test.
+    ///
+    /// The path is relative to the declaring file's directory. A file two
+    /// declarations claim has no single parent and is left out.
+    pub(super) fn compute_rust_path_modules(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<String, String> {
+        let mut claimed: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            for import in &ext.imports {
+                let declares_mod = import.raw_import.trim_start().starts_with("mod ");
+                let Some(path) = import
+                    .module_specifier
+                    .strip_prefix("self::")
+                    .filter(|path| declares_mod && path.ends_with(".rs"))
+                else {
+                    continue;
+                };
+                let Some(target) = Self::normalize_rel(&Self::parent_dir(&ext.file_path), path)
+                else {
+                    continue;
+                };
+                if target == ext.file_path || !self.file_symbols.contains_key(&target) {
+                    continue;
+                }
+                claimed
+                    .entry(target)
+                    .and_modify(|declarer| {
+                        if declarer.as_deref() != Some(ext.file_path.as_str()) {
+                            *declarer = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(ext.file_path.clone()));
+            }
+        }
+        claimed
+            .into_iter()
+            .filter_map(|(file, declarer)| declarer.map(|declarer| (file, declarer)))
+            .collect()
     }
 
     /// Every Rust `pub use m::*;` as `(file, the one module file m names)`.

@@ -158,3 +158,7 @@ rs.f2h	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Door.open_f2n
 rs.f2i	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Gate.open_f2n	edge	must		control: the trait declaration
 rs.f2j	F2	callers/src/dyngate.rs::pass_f2n	callers/src/gateother.rs::Gate.open_f2n	forbid_any_tier	must		the namesake struct's method is never a target
 rs.f8g	F8	callers/src/fieldname.rs::peek_f8	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		param.field and a.b.field reads are not calls of the method of the same name
+rs.f4f	F4	callers/src/otherq.rs::make_other_f4	callers/src/otherq.rs::Quarantine.new_f4	edge	must		a type declared in the calling file wins over a namesake elsewhere
+rs.f4g	F4	callers/src/otherq.rs::make_other_f4	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		and never reaches the namesake
+rs.f4h	F4	callers/src/lib.rs::anon_f4	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		no declaration and no import of Quarantine in the file: neither namesake is the answer
+rs.f4i	F4	callers/src/lib.rs::anon_f4	callers/src/otherq.rs::Quarantine.new_f4	forbid_any_tier	must		same, the other namesake
