@@ -2,6 +2,7 @@
   "_comment": "W4.2 — per-language net call-resolution rate over the labelled fixtures, in permille. Frozen so a grammar bump that silently stops matching a node kind fails CI on the language it broke, which no golden identity fixture can catch. Regenerate with DEVMAP_UPDATE_RESOLUTION_BASELINE=1 cargo test -p devmap-analyze --test resolution_rate_baseline, and only after reading why the number moved.",
   "_null_means": "The language extracts calls but this fixture contains no call site, so no rate was attempted. Not zero: a baseline of null and a current of 0 are different facts, and the test refuses to read either as the other.",
   "_tolerance_permille": 10,
+  "_svelte_note": "accuracy/svelte is Board.svelte, Directives.svelte and Stores.svelte only (its floor was 923 before Stores.svelte arrived; it is 750 now). The drop is not the runes: $state, $derived, $effect and $props are explained host globals and do not count against the rate. It is six lone markup identifiers that name script variables, recorded as Calls and classed local_binding (unattributed): Stores.svelte {pattern}{template}{member}{renamed}{size} and Board.svelte {cards}. Whether a lone identifier is a Call or a Reference is the owner's decision; until then 750 is what these files measure. The scope and store-read fixtures live in accuracy/svelte-scope so that easy resolutions there cannot dilute this floor.",
   "fixtures": {
     "accuracy/go": {
       "go": 795
@@ -41,8 +42,12 @@
       "rust": 714
     },
     "accuracy/svelte": {
-      "svelte": 850,
+      "svelte": 750,
       "typescript": 1000
+    },
+    "accuracy/svelte-scope": {
+      "svelte": 1000,
+      "typescript": null
     },
     "accuracy/swift": {
       "swift": 859

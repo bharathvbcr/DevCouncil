@@ -288,6 +288,47 @@ fn a_render_before_its_snippet_in_one_block_reaches_it() {
 }
 
 #[test]
+fn a_default_inside_a_binding_pattern_is_read_in_the_scope_outside_it() {
+    for (construct, source, bound) in [
+        ("each", "{#each rows as { a = fromEach() }}{a}{/each}", "a"),
+        (
+            "const",
+            "{#if go}{@const { c = fromConst() } = o}{c}{/if}",
+            "c",
+        ),
+        ("then", "{#await p then { d = fromThen() }}{d}{/await}", "d"),
+        (
+            "let",
+            "<svelte:fragment let:x={{ e = fromLet() }}>{e}</svelte:fragment>",
+            "e",
+        ),
+    ] {
+        let e = ex(source);
+        let default = format!("from{}", construct[..1].to_uppercase() + &construct[1..]);
+        assert_eq!(bare_calls(&e, &default), 1, "{construct}: {:?}", e.calls);
+        assert_eq!(bare_calls(&e, bound), 0, "{construct}: {:?}", e.calls);
+    }
+}
+
+#[test]
+fn a_component_tag_named_by_a_bound_name_records_nothing_of_that_name() {
+    let e = ex(&format!(
+        "{HEAD}{{#each rows as item}}<item.Comp />{{/each}}\n"
+    ));
+    assert!(is_clean(&e), "{:?}", e.parse_outcome);
+    assert_eq!(bare_calls(&e, "item"), 0, "{:?}", e.calls);
+    assert!(
+        e.calls.iter().all(|c| c.callee_name != "Comp")
+            && e.references
+                .iter()
+                .all(|r| r.name != "Comp" && r.name != "item"),
+        "calls {:?} references {:?}",
+        e.calls,
+        e.references
+    );
+}
+
+#[test]
 fn a_name_the_template_does_not_bind_is_still_a_call() {
     let e = ex(&format!(
         "{HEAD}{{#each rows as item}}{{row}}{{/each}}<button onclick={{row}}>x</button>\n"

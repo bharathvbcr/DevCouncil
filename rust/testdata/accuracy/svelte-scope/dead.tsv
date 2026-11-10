@@ -1,0 +1,30 @@
+# verdict<TAB>symbol_id<TAB>why
+exempt	src/Scopes.svelte::row	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::first	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::second	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::index	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::cell	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::shown	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::loaded	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::failed	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::slotted	module-script export of a component: not a dead candidate
+exempt	src/Scopes.svelte::renamed	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::row	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::first	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::second	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::index	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::cell	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::shown	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::loaded	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::failed	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::slotted	module-script export of a component: not a dead candidate
+exempt	src/ScopesEnd.svelte::renamed	module-script export of a component: not a dead candidate
+live	src/ScopesEnd.svelte::card	rendered with {@render}
+live	src/Scopes.svelte::card	rendered with {@render}
+live	src/lib/storedecoys.ts::muted	read as $muted in StoreSibling.svelte
+live	src/lib/storedecoys.ts::volume	read as $volume in StoreDecoys.svelte
+exempt	src/Scopes.svelte::item	module-script export of a component: not a dead candidate
+exempt	src/Defaults.svelte::fromEach	module-script export of a component: not a dead candidate
+exempt	src/Defaults.svelte::fromConst	module-script export of a component: not a dead candidate
+exempt	src/Defaults.svelte::fromThen	module-script export of a component: not a dead candidate
+exempt	src/Defaults.svelte::fromLet	module-script export of a component: not a dead candidate

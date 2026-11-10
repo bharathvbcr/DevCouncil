@@ -443,10 +443,13 @@ fn absorb_template_expressions(
                         walk.scopes.bind(at, name, Bound::Snippet(declared));
                     }
                 }
-                let names = child_of_kind(node, "snippet_start")
+                // A snippet's parameter defaults are read by its parameter parse.
+                let names = match child_of_kind(node, "snippet_start")
                     .and_then(|start| child_of_kind(start, "svelte_raw_text"))
-                    .map(|list| walk.names_in(list))
-                    .unwrap_or_default();
+                {
+                    Some(list) => walk.bind_node(extraction, list, at, false),
+                    None => Vec::new(),
+                };
                 push_block(&mut walk, extraction, node, at, names, &mut stack, &[]);
                 continue;
             }
@@ -459,9 +462,12 @@ fn absorb_template_expressions(
                     let (list, key) = parameter
                         .map(|node| split_each_parameter(node, source))
                         .unwrap_or_default();
-                    let names = parameter
-                        .map(|node| walk.names_of_text(&list, span_of(node)))
-                        .unwrap_or_default();
+                    let names = match parameter {
+                        Some(node) => {
+                            walk.bind_list(extraction, &list, node.start_byte(), at, true)
+                        }
+                        None => Vec::new(),
+                    };
                     if let Some(collection) = start.child_by_field_name("identifier") {
                         take_template_expression(collection, extraction, &mut walk, at);
                     }
@@ -496,9 +502,12 @@ fn absorb_template_expressions(
                     if let Some((expression, span)) = expression {
                         take_expression(expression, span, extraction, &mut walk, at);
                     }
-                    let names = pattern
-                        .map(|(list, span)| walk.names_of_text(&list, span))
-                        .unwrap_or_default();
+                    let names = match pattern {
+                        Some((list, span)) => {
+                            walk.bind_list(extraction, &list, span.start_byte, at, true)
+                        }
+                        None => Vec::new(),
+                    };
                     push_block(
                         &mut walk,
                         extraction,
@@ -518,10 +527,12 @@ fn absorb_template_expressions(
                 } else {
                     "catch_start"
                 };
-                let names = child_of_kind(node, header)
+                let names = match child_of_kind(node, header)
                     .and_then(|start| child_of_kind(start, "svelte_raw_text"))
-                    .map(|list| walk.names_in(list))
-                    .unwrap_or_default();
+                {
+                    Some(list) => walk.bind_node(extraction, list, at, true),
+                    None => Vec::new(),
+                };
                 push_block(
                     &mut walk,
                     extraction,
@@ -541,7 +552,7 @@ fn absorb_template_expressions(
                     if let Some((expression, span)) = expression {
                         take_expression(expression, span, extraction, &mut walk, at);
                     }
-                    for name in walk.names_of_text(&list, span_of(raw)) {
+                    for name in walk.bind_list(extraction, &list, raw.start_byte(), at, true) {
                         walk.scopes.bind(at, name, Bound::Local);
                     }
                     continue;
@@ -554,9 +565,10 @@ fn absorb_template_expressions(
                 continue;
             }
             "element" if svelte => {
-                let names = child_of_kind(node, "start_tag")
-                    .map(|tag| let_names(tag, &mut walk))
-                    .unwrap_or_default();
+                let names = match child_of_kind(node, "start_tag") {
+                    Some(tag) => let_names(tag, extraction, &mut walk, at),
+                    None => Vec::new(),
+                };
                 push_block(&mut walk, extraction, node, at, names, &mut stack, &[]);
                 continue;
             }
@@ -721,27 +733,54 @@ impl TemplateWalk<'_> {
     /// The names a binding list (`item`, `{ a, b }, index`, `a: T, b?: U`)
     /// binds, as the node spells it. A list that could not be read before the
     /// deadline binds nothing and is charged as unread.
-    fn names_in(&mut self, node: Node) -> Vec<String> {
+    fn bind_node(
+        &mut self,
+        extraction: &mut Extraction,
+        node: Node,
+        at: usize,
+        defaults: bool,
+    ) -> Vec<String> {
         let list = text_of(node, self.source);
-        self.names_of_text(&list, span_of(node))
+        self.bind_list(extraction, &list, node.start_byte(), at, defaults)
     }
 
-    fn names_of_text(&mut self, list: &str, span: Span) -> Vec<String> {
-        match binding_names(list, self.deadline) {
-            Some(names) => names,
-            None => {
-                self.diagnostics.push(format!(
-                    "extraction budget was exhausted before the names bound at bytes {}..{} \
-                     were read",
-                    span.start_byte, span.end_byte
-                ));
-                self.unparsed.push(TextRange {
-                    start_byte: span.start_byte,
-                    end_byte: span.end_byte,
-                });
-                Vec::new()
+    /// The names `list` binds, which starts at byte `offset` of the file. The
+    /// default values of its patterns (`{ a = f() }`) are expressions the
+    /// template runs, and with `defaults` they are read here in scope `at`:
+    /// the scope outside the binding, which a default does not see the names
+    /// of its own pattern in.
+    fn bind_list(
+        &mut self,
+        extraction: &mut Extraction,
+        list: &str,
+        offset: usize,
+        at: usize,
+        defaults: bool,
+    ) -> Vec<String> {
+        let Some(bindings) = binding_names(list, self.deadline) else {
+            self.diagnostics.push(format!(
+                "extraction budget was exhausted before the names bound at bytes {}..{} \
+                 were read",
+                offset,
+                offset + list.len()
+            ));
+            self.unparsed.push(TextRange {
+                start_byte: offset,
+                end_byte: offset + list.len(),
+            });
+            return Vec::new();
+        };
+        if defaults {
+            for (start, end) in bindings.defaults {
+                if let Some((expr, span)) = list
+                    .get(start..end)
+                    .and_then(|text| trimmed_expression(text, offset + start))
+                {
+                    take_expression(expr, span, extraction, self, at);
+                }
             }
         }
+        bindings.names
     }
 }
 
@@ -1020,7 +1059,12 @@ fn is_let_directive(node: Node, source: &str) -> bool {
 /// The names the `let:` directives of an element's start tag bind for its
 /// children: `let:item` binds `item`, `let:thing={renamed}` binds `renamed`,
 /// and `let:thing={{ a, b }}` binds `a` and `b`.
-fn let_names(tag: Node, walk: &mut TemplateWalk) -> Vec<String> {
+fn let_names(
+    tag: Node,
+    extraction: &mut Extraction,
+    walk: &mut TemplateWalk,
+    at: usize,
+) -> Vec<String> {
     let mut names = Vec::new();
     for attribute in children_of(tag)
         .into_iter()
@@ -1036,7 +1080,7 @@ fn let_names(tag: Node, walk: &mut TemplateWalk) -> Vec<String> {
             .and_then(|expression| child_of_kind(expression, "svelte_raw_text"));
         match value {
             Some(value) if !text_slice(value, walk.source).trim().is_empty() => {
-                names.extend(walk.names_in(value));
+                names.extend(walk.bind_node(extraction, value, at, true));
             }
             _ => {
                 let bound = directive.split('|').next().unwrap_or(directive);
@@ -1664,13 +1708,13 @@ fn split_each_parameter(node: Node, source: &str) -> (String, Option<JsExpr>) {
     (raw, None)
 }
 
+/// The expression of an `{#await}` header, and the binding its shorthand names.
+type AwaitHeader = (Option<(JsExpr, Span)>, Option<(String, Span)>);
+
 /// The header of `{#await EXPRESSION}`, `{#await EXPRESSION then PATTERN}` and
 /// `{#await EXPRESSION catch PATTERN}`: the expression, and the binding the
 /// shorthand names for the block's content.
-fn split_await_header(
-    node: Node,
-    source: &str,
-) -> (Option<(JsExpr, Span)>, Option<(String, Span)>) {
+fn split_await_header(node: Node, source: &str) -> AwaitHeader {
     let raw = text_of(node, source);
     let base = node.start_byte();
     let keyword = top_level(&raw).into_iter().find_map(|(at, c)| {
@@ -1687,16 +1731,20 @@ fn split_await_header(
             .then_some((at, word.len()))
     });
     match keyword {
-        Some((at, len)) => (
-            trimmed_expression(&raw[..at], base),
-            Some((
-                raw[at + len..].trim().to_string(),
-                Span {
-                    start_byte: base + at + len,
-                    end_byte: base + raw.len(),
-                },
-            )),
-        ),
+        Some((at, len)) => {
+            let rest = &raw[at + len..];
+            let start = base + at + len + (rest.len() - rest.trim_start().len());
+            (
+                trimmed_expression(&raw[..at], base),
+                Some((
+                    rest.trim().to_string(),
+                    Span {
+                        start_byte: start,
+                        end_byte: base + raw.len(),
+                    },
+                )),
+            )
+        }
         None => (trimmed_expression(&raw, base), None),
     }
 }
@@ -1724,12 +1772,23 @@ fn split_const_tag(node: Node, source: &str) -> (String, Option<(JsExpr, Span)>)
     }
 }
 
+/// What a binding list binds, and the default-value expressions inside its
+/// patterns as byte ranges of the list.
+struct Bindings {
+    names: Vec<String>,
+    defaults: Vec<(usize, usize)>,
+}
+
 /// The names a binding list binds: `item`, `item, index`, `{ a, b: c }, i`, or
-/// the parameters of a snippet (`a: T, b?: U`). `None` when the deadline passed
-/// before a list that needed a parse was read.
-fn binding_names(list: &str, deadline: Instant) -> Option<Vec<String>> {
+/// the parameters of a snippet (`a: T, b?: U`), with the defaults of its
+/// patterns. `None` when the deadline passed before a list that needed a parse
+/// was read.
+fn binding_names(list: &str, deadline: Instant) -> Option<Bindings> {
     if list.trim().is_empty() {
-        return Some(Vec::new());
+        return Some(Bindings {
+            names: Vec::new(),
+            defaults: Vec::new(),
+        });
     }
     // The common case is plain identifiers, which need no parse.
     let mut pieces = Vec::new();
@@ -1742,16 +1801,21 @@ fn binding_names(list: &str, deadline: Instant) -> Option<Vec<String>> {
     }
     pieces.push(&list[from..]);
     if pieces.iter().all(|piece| is_identifier(piece.trim())) {
-        return Some(
-            pieces
+        return Some(Bindings {
+            names: pieces
                 .iter()
                 .map(|piece| piece.trim().to_string())
                 .collect(),
-        );
+            defaults: Vec::new(),
+        });
     }
+    // The wrapper's one opening byte is not in the list.
     let program = format!("({list}) => {{}}");
     let tree = parse_typescript(&program, deadline)?;
-    let mut names = Vec::new();
+    let mut bindings = Bindings {
+        names: Vec::new(),
+        defaults: Vec::new(),
+    };
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "formal_parameters" {
@@ -1761,7 +1825,7 @@ fn binding_names(list: &str, deadline: Instant) -> Option<Vec<String>> {
                     "required_parameter" | "optional_parameter"
                 ) {
                     if let Some(pattern) = parameter.child_by_field_name("pattern") {
-                        pattern_names(pattern, &program, &mut names);
+                        pattern_names(pattern, &program, &mut bindings);
                     }
                 }
             }
@@ -1769,17 +1833,22 @@ fn binding_names(list: &str, deadline: Instant) -> Option<Vec<String>> {
         }
         stack.extend(children_of(node).into_iter().rev());
     }
-    Some(names)
+    for (start, end) in &mut bindings.defaults {
+        *start = start.saturating_sub(1).min(list.len());
+        *end = end.saturating_sub(1).min(list.len());
+    }
+    Some(bindings)
 }
 
-/// The names one binding pattern binds. A default value, a property key and a
-/// type are not names, so only the identifiers in binding position are taken.
-fn pattern_names(pattern: Node, program: &str, out: &mut Vec<String>) {
+/// The names one binding pattern binds, and its default values. A property key
+/// and a type are not names, so only the identifiers in binding position are
+/// taken; a default (`{ a = f() }`) is an expression, kept as a range.
+fn pattern_names(pattern: Node, program: &str, out: &mut Bindings) {
     let mut stack = vec![pattern];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "identifier" | "shorthand_property_identifier_pattern" => {
-                out.push(text_slice(node, program).to_string());
+                out.names.push(text_slice(node, program).to_string());
             }
             "object_pattern" | "array_pattern" | "rest_pattern" => {
                 let mut cursor = node.walk();
@@ -1787,6 +1856,9 @@ fn pattern_names(pattern: Node, program: &str, out: &mut Vec<String>) {
             }
             "pair_pattern" => stack.extend(node.child_by_field_name("value")),
             "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(right) = node.child_by_field_name("right") {
+                    out.defaults.push((right.start_byte(), right.end_byte()));
+                }
                 stack.extend(node.child_by_field_name("left"));
             }
             _ => {}

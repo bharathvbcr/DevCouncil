@@ -12,6 +12,7 @@
   export function failed(): void {}
   export function slotted(): void {}
   export function renamed(): void {}
+  export function item(): void {}
 </script>
 
 {#each [1, 2] as row}<b>{row}</b>{/each}
@@ -28,3 +29,5 @@
 {#await Promise.resolve(2)}<p>waiting</p>{:catch failed}<p>{failed}</p>{/await}
 
 <svelte:fragment slot="body" let:slotted let:thing={renamed}>{slotted}{renamed}</svelte:fragment>
+
+{#each [{ Comp: 1 }] as item}<item.Comp />{/each}
