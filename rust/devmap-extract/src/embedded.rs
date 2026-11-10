@@ -72,7 +72,7 @@ use std::time::Instant;
 
 use tree_sitter::Node;
 
-use crate::languages::LANGUAGE_SPECS;
+use crate::languages::{is_svelte_rune, LANGUAGE_SPECS};
 use crate::model::{
     ExtractedCall, ExtractedReference, Extraction, ParseOutcome, ReferenceKind, Span, SymbolKind,
     TextRange,
@@ -1085,12 +1085,6 @@ fn lone_js_identifier(text: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// The runes Svelte 5 compiles, which look like a `$store` read and are not.
-/// `$state.raw`, `$derived.by` and the rest begin with one of these.
-const SVELTE_RUNES: &[&str] = &[
-    "state", "derived", "effect", "props", "bindable", "inspect", "host",
-];
-
 /// `store` for a Svelte store auto-subscription `$store`, and `None` for a
 /// rune (`$state`), a compiler variable (`$$props`) and anything else.
 fn store_name(name: &str) -> Option<&str> {
@@ -1103,16 +1097,36 @@ fn store_name(name: &str) -> Option<&str> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
-    (!SVELTE_RUNES.contains(&store)).then_some(store)
+    (!is_svelte_rune(store)).then_some(store)
 }
 
-/// Whether `text` holds a `$` followed by a letter or `_`, the only way a
-/// store read can start. A cheap test that spares the parse below for the
-/// expressions and scripts that cannot hold one.
+/// Whether `text` holds a `$name` that is not a rune: the only way a store
+/// read can start. A cheap test that spares the parse below for the
+/// expressions and scripts that cannot hold one. A Svelte 5 script is full of
+/// runes (`$state`, `$derived.by`, `$props`), so a bare `$` test would send
+/// nearly every one of them to a second parse for nothing.
+///
+/// A superset of what [`store_reads`] finds, never a subset: a `$name` inside a
+/// string or a comment passes, and the parse then refuses it.
 fn may_read_a_store(text: &str) -> bool {
-    text.as_bytes()
-        .windows(2)
-        .any(|pair| pair[0] == b'$' && (pair[1].is_ascii_alphabetic() || pair[1] == b'_'))
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        if bytes[at] == b'$' && (bytes[at + 1].is_ascii_alphabetic() || bytes[at + 1] == b'_') {
+            let start = at + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if !is_svelte_rune(&text[start..end]) {
+                return true;
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    false
 }
 
 /// Whether `node` is the name a declaration, a parameter or a pattern binds,
@@ -1128,6 +1142,12 @@ fn binds_the_name(node: Node) -> bool {
     })
 }
 
+/// Every text [`store_reads`] has parsed on any thread, so a test can say a
+/// component never reached it. Tests run in parallel, so a test looks for text
+/// of its own rather than counting.
+#[cfg(test)]
+static STORE_READ_PROGRAMS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Every `$store` auto-subscription in `program`, as `(store, start, end)`
 /// with the byte range of the `$store` token, or `None` when the deadline
 /// passed before the parse finished.
@@ -1140,6 +1160,11 @@ fn binds_the_name(node: Node) -> bool {
 /// `shorthand_property_identifier` nodes (`{ $x }`) are candidates, and a name
 /// that a declaration or a parameter binds is not a use.
 fn store_reads(program: &str, deadline: Instant) -> Option<Vec<(String, usize, usize)>> {
+    #[cfg(test)]
+    STORE_READ_PROGRAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(program.to_string());
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
@@ -2356,6 +2381,67 @@ mod tests {
         assert!(
             DepthGuard::enter().is_some(),
             "the flag is released even though the inner attempt was refused"
+        );
+    }
+
+    #[test]
+    fn only_a_dollar_name_that_is_not_a_rune_can_be_a_store_read() {
+        for runes_only in [
+            "let a = $state(0);",
+            "$state.raw([])",
+            "$derived.by(() => 1)",
+            "$effect.pre(run)",
+            "const { size } = $props();",
+            "$bindable()",
+            "$inspect(a)",
+            "$host()",
+            "$$props.a",
+            "$state(1) + $derived(2)",
+        ] {
+            assert!(!may_read_a_store(runes_only), "{runes_only}");
+        }
+        for maybe_a_store in ["$store", "$stateful", "$state + $store", "x = $x_1", "$_"] {
+            assert!(may_read_a_store(maybe_a_store), "{maybe_a_store}");
+        }
+    }
+
+    fn parsed_for_store_reads(marker: &str) -> bool {
+        STORE_READ_PROGRAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|program| program.contains(marker))
+    }
+
+    #[test]
+    fn a_runes_only_component_triggers_no_store_read_parse() {
+        let marker = "RunesOnlyMarker7f3a";
+        let source = format!(
+            "<script lang=\"ts\">\n  let {marker} = $state(0);\n  let double = $derived({marker} * 2);\n  \
+             $effect(() => {{ console.log(double); }});\n  const {{ size }} = $props();\n  \
+             let raw = $state.raw([]);\n  $inspect({marker});\n</script>\n\
+             <p title={{String($state.snapshot({marker}))}}>{{{marker}}}</p>\n"
+        );
+        crate::extract_file_with_budget("src/R.svelte", &source, std::time::Duration::from_secs(600));
+        assert!(
+            !parsed_for_store_reads(marker),
+            "a component whose only `$name` tokens are runes was parsed for store reads"
+        );
+    }
+
+    #[test]
+    fn a_component_that_reads_a_store_is_still_parsed_for_it() {
+        let marker = "StoreReadMarker91c2";
+        let source = format!(
+            "<script lang=\"ts\">\n  import {{ store }} from './s';\n  let {marker} = $store + $state(0);\n</script>\n"
+        );
+        let extraction =
+            crate::extract_file_with_budget("src/S.svelte", &source, std::time::Duration::from_secs(600));
+        assert!(parsed_for_store_reads(marker));
+        assert!(
+            extraction.references.iter().any(|r| r.name == "store"),
+            "{:?}",
+            extraction.references
         );
     }
 }
