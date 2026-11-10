@@ -650,18 +650,22 @@ fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) {
 }
 
 /// The tag name of the component whose tag directly holds `node`, when it is
-/// a component (`<Comp>`, `<ns.Comp>`) rather than an HTML element.
+/// a component (`<Comp>`, `<ns.Comp>`, `<svelte:boundary>`) rather than an
+/// HTML element.
 fn component_parent(node: Node, source: &str) -> Option<String> {
     let mut at = node.parent();
     while let Some(parent) = at {
         if parent.kind() == "element" {
             let tag = child_of_kind(parent, "start_tag")?;
             let name = text_slice(child_of_kind(tag, "tag_name")?, source);
+            // `<svelte:boundary>` takes its `pending` and `failed` snippets
+            // the way a component takes its props.
             let component = name
                 .chars()
                 .next()
                 .is_some_and(|first| first.is_ascii_uppercase())
-                || name.contains('.');
+                || name.contains('.')
+                || name == "svelte:boundary";
             return component.then(|| name.to_string());
         }
         at = parent.parent();

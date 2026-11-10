@@ -99,6 +99,7 @@ fn a_default_value_in_a_snippet_parameter_is_still_a_call() {
 fn a_snippet_given_to_a_component_is_reached_by_the_runtime() {
     let e = ex(&format!(
         "{SCRIPT}<Dialog>\n  {{#snippet header()}}x{{/snippet}}\n</Dialog>\n\
+         <svelte:boundary>{{#snippet failed()}}x{{/snippet}}</svelte:boundary>\n\
          <div>{{#snippet plain()}}x{{/snippet}}</div>\n{{#snippet top()}}x{{/snippet}}\n"
     ));
     let entry = |name: &str| {
@@ -107,7 +108,7 @@ fn a_snippet_given_to_a_component_is_reached_by_the_runtime() {
                 && w.target_symbol == format!("src/Board.svelte::{name}")
         })
     };
-    assert!(entry("header"), "{:?}", e.wiring);
+    assert!(entry("header") && entry("failed"), "{:?}", e.wiring);
     assert!(!entry("plain") && !entry("top"), "{:?}", e.wiring);
 }
 
