@@ -27,6 +27,20 @@ impl Store {
         })
     }
 
+    /// Whether the damage is confined to the full-text index: the error is the
+    /// re-worded read of `nodes_fts` (see [`FtsDamage`]). A store with this
+    /// damage still answers every question that does not read the index, so a
+    /// caller must not treat the whole file as lost.
+    pub fn is_full_text_damage(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::ToSqlConversionFailure(inner))
+                    if inner.downcast_ref::<FtsDamage>().is_some()
+            )
+        })
+    }
+
     /// [`Self::is_database_corrupt`] for an error not yet wrapped.
     ///
     /// A corrupt read of the full-text index arrives re-worded as a

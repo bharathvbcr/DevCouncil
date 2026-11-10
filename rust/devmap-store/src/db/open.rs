@@ -232,6 +232,25 @@ impl Store {
         Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref(), memory))
     }
 
+    fn set_reader_memory(conn: &Connection, memory: ReaderMemory) -> Result<()> {
+        conn.pragma_update(None, "cache_size", -i64::from(memory.cache_kib))?;
+        if memory.mmap_bytes != 0 {
+            conn.pragma_update(None, "mmap_size", memory.mmap_bytes as i64)?;
+        }
+        Ok(())
+    }
+
+    /// Change this connection's page cache and file mapping after it was opened,
+    /// for a store handed back by an opener that does not take
+    /// [`ReaderMemory`] (a stacked lane's immutable base).
+    pub fn apply_reader_memory(&self, memory: ReaderMemory) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::set_reader_memory(&conn, memory)
+    }
+
     /// The page cache and file mapping this connection is using now, read back
     /// from SQLite rather than from what was asked for.
     pub fn memory_settings(&self) -> Result<ReaderMemory> {
@@ -311,10 +330,7 @@ impl Store {
         Self::admit_reader_schema(&conn, &path.display().to_string(), stamped)?;
         Self::reject_triggers(&conn)?;
         Self::configure_connection(&conn)?;
-        conn.pragma_update(None, "cache_size", -i64::from(memory.cache_kib))?;
-        if memory.mmap_bytes != 0 {
-            conn.pragma_update(None, "mmap_size", memory.mmap_bytes as i64)?;
-        }
+        Self::set_reader_memory(&conn, memory)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
