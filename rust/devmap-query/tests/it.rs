@@ -176,6 +176,7 @@ const ISOLATED: &[&str] = &[
     "a_delete_this_list_reads_for_its_answer",
     "a_fan_out_pays_for_its_index_once_per_direction",
     "query_work_is_bounded_by_the_answer",
+    "stacked_cstyle_family_split",
 ];
 
 mod every_test_file_is_a_module {
