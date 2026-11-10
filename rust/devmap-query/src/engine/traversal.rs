@@ -277,6 +277,18 @@ pub(super) fn indexed_traversal_starts(
                     ids.extend_from_slice(group);
                 }
             }
+            // A name that is no symbol may be a component: `MarkdownBody` is
+            // `MarkdownBody.svelte`, which the graph holds as a file node. Only
+            // when no symbol answers to the name, so a real symbol is never
+            // shadowed, and through the same ambiguity refusal below.
+            if ids.is_empty() {
+                for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
+                    cancel.check_every(checked)?;
+                    if crate::query_match::component_file_matches(candidate, name) {
+                        ids.extend_from_slice(group);
+                    }
+                }
+            }
         }
     }
     ids.retain(|id| index.admits(*id, min_confidence));

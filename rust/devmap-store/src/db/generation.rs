@@ -1604,17 +1604,32 @@ generation {latest}; run `devmap status` to re-verify",
             let total: usize = count.query_row(params![generation, label], |row| {
                 row.get::<_, i64>(0).map(|total| total as usize)
             })?;
-            let shown: Vec<CoverageGapRow> = page
-                .query_map(
-                    params![generation, label, crate::COVERAGE_GAP_SAMPLE as i64],
-                    |row| {
-                        Ok(CoverageGapRow {
-                            path: row.get(0)?,
-                            reason: row.get(1)?,
-                        })
-                    },
-                )?
+            // Partial parses are listed worst first, so the cap drops the
+            // harmless rows. That order needs every row's reason, so this kind
+            // is read whole and cut after sorting; every other kind is cut by
+            // path in SQL.
+            let by_severity = label == devmap_analyze::ExtractionGap::PartialParse.label();
+            let limit = if by_severity {
+                i64::MAX
+            } else {
+                crate::COVERAGE_GAP_SAMPLE as i64
+            };
+            let mut shown: Vec<CoverageGapRow> = page
+                .query_map(params![generation, label, limit], |row| {
+                    Ok(CoverageGapRow {
+                        path: row.get(0)?,
+                        reason: row.get(1)?,
+                    })
+                })?
                 .collect::<Result<Vec<_>>>()?;
+            if by_severity {
+                // Stable, so rows of equal severity stay in path order.
+                shown.sort_by_key(|row| {
+                    let (charged, lost) = devmap_analyze::partial_parse_severity(&row.reason);
+                    (std::cmp::Reverse(charged), std::cmp::Reverse(lost))
+                });
+                shown.truncate(crate::COVERAGE_GAP_SAMPLE);
+            }
             let slot = gaps.slot(label).expect("every label has a slot");
             *slot = CoverageGapSample { total, shown };
         }

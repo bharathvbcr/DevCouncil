@@ -431,18 +431,17 @@ fn absorb_template_expressions(
                     .children(&mut cursor)
                     .find(|child| child.kind() == "svelte_raw_text");
                 if let Some(args) = args {
-                    take_snippet_parameters(
-                        args,
+                    let mut walk = TemplateWalk {
                         source,
-                        extraction,
-                        &file_path,
+                        file_path: &file_path,
                         language,
                         deadline,
-                        &mut parsed,
-                        &mut unparsed,
-                        &mut diagnostics,
-                        &mut cap_noted,
-                    );
+                        parsed: &mut parsed,
+                        unparsed: &mut unparsed,
+                        diagnostics: &mut diagnostics,
+                        cap_noted: &mut cap_noted,
+                    };
+                    take_snippet_parameters(args, extraction, &mut walk);
                 }
                 continue;
             }
@@ -557,12 +556,8 @@ fn take_template_expression(
     } else {
         Wrap::Bare
     };
-    parse_template_text(
-        node,
-        &expr,
-        wrap,
+    let mut walk = TemplateWalk {
         source,
-        extraction,
         file_path,
         language,
         deadline,
@@ -570,23 +565,26 @@ fn take_template_expression(
         unparsed,
         diagnostics,
         cap_noted,
-    );
+    };
+    parse_template_text(node, &expr, wrap, extraction, &mut walk);
+}
+
+/// What one walk over a file's template expressions shares: the text, the
+/// budget, and the running record of what was read and what was not.
+struct TemplateWalk<'a> {
+    source: &'a str,
+    file_path: &'a str,
+    language: &'a str,
+    deadline: Instant,
+    parsed: &'a mut usize,
+    unparsed: &'a mut Vec<TextRange>,
+    diagnostics: &'a mut Vec<String>,
+    cap_noted: &'a mut bool,
 }
 
 /// The parameters of a `{#snippet}`, parsed as an arrow function's parameters.
-fn take_snippet_parameters(
-    node: Node,
-    source: &str,
-    extraction: &mut Extraction,
-    file_path: &str,
-    language: &str,
-    deadline: Instant,
-    parsed: &mut usize,
-    unparsed: &mut Vec<TextRange>,
-    diagnostics: &mut Vec<String>,
-    cap_noted: &mut bool,
-) {
-    let raw = text_of(node, source);
+fn take_snippet_parameters(node: Node, extraction: &mut Extraction, walk: &mut TemplateWalk) {
+    let raw = text_of(node, walk.source);
     let body = raw.trim();
     if body.is_empty() {
         return;
@@ -596,20 +594,7 @@ fn take_snippet_parameters(
         offset,
         body: body.to_string(),
     };
-    parse_template_text(
-        node,
-        &expr,
-        Wrap::SnippetParameters,
-        source,
-        extraction,
-        file_path,
-        language,
-        deadline,
-        parsed,
-        unparsed,
-        diagnostics,
-        cap_noted,
-    );
+    parse_template_text(node, &expr, Wrap::SnippetParameters, extraction, walk);
 }
 
 /// Declare `{#snippet name(…)}` as a function symbol of the file, so that
@@ -718,27 +703,31 @@ fn parse_template_text(
     node: Node,
     expr: &JsExpr,
     wrap: Wrap,
-    source: &str,
     extraction: &mut Extraction,
-    file_path: &str,
-    language: &str,
-    deadline: Instant,
-    parsed: &mut usize,
-    unparsed: &mut Vec<TextRange>,
-    diagnostics: &mut Vec<String>,
-    cap_noted: &mut bool,
+    walk: &mut TemplateWalk,
 ) {
+    let TemplateWalk {
+        source,
+        file_path,
+        language,
+        deadline,
+        parsed,
+        unparsed,
+        diagnostics,
+        cap_noted,
+    } = walk;
+    let (source, file_path, language, deadline) = (*source, *file_path, *language, *deadline);
     let span = span_of(node);
     let node_range = TextRange {
         start_byte: span.start_byte,
         end_byte: span.end_byte,
     };
-    if *parsed >= MAX_TEMPLATE_EXPRESSIONS {
-        if !*cap_noted {
+    if **parsed >= MAX_TEMPLATE_EXPRESSIONS {
+        if !**cap_noted {
             diagnostics.push(format!(
                 "template expressions past {MAX_TEMPLATE_EXPRESSIONS} were not parsed"
             ));
-            *cap_noted = true;
+            **cap_noted = true;
         }
         unparsed.push(node_range);
         return;
@@ -773,7 +762,7 @@ fn parse_template_text(
         diagnostics,
         outer_source,
     ) {
-        *parsed += 1;
+        **parsed += 1;
     }
 }
 

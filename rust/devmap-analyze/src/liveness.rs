@@ -2726,6 +2726,15 @@ enum PartialRegionVerdict<'a> {
     ZeroWidth,
 }
 
+/// Whether `symbol` is a `{#snippet}` block, which `devmap-extract` declares as
+/// a function whose signature is the opening tag.
+fn is_template_snippet(symbol: &ExtractedSymbol) -> bool {
+    symbol
+        .signature
+        .as_deref()
+        .is_some_and(|signature| signature.starts_with("{#snippet"))
+}
+
 /// Every error region of `ext`'s partial parse with its verdict, in the order
 /// the extractor reported them, duplicates removed. Empty for any other
 /// outcome.
@@ -2754,6 +2763,11 @@ fn partial_region_verdicts(ext: &Extraction) -> Vec<(TextRange, PartialRegionVer
                     .iter()
                     .filter(|symbol| {
                         symbol.kind != SymbolKind::File
+                            // A Svelte snippet is a declaration of markup. What
+                            // is lost inside it is a call the template made,
+                            // and the snippet surviving says nothing about the
+                            // callee that call named.
+                            && !is_template_snippet(symbol)
                             && symbol.span.start_byte <= range.start_byte
                             && range.end_byte <= symbol.span.end_byte
                     })
@@ -2904,6 +2918,23 @@ fn partial_parse_reason(ext: &Extraction) -> String {
         sentence.push_str(&format!("; not charged: {}", exempt.join(", ")));
     }
     sentence
+}
+
+/// How bad a stored `partial_parse` reason is, for ordering a capped listing:
+/// whether the file is charged against the ceiling, and how many bytes the
+/// tree lost. Reads back exactly what [`partial_parse_reason`] writes; a reason
+/// it cannot read is `(false, 0)`, which sorts last, never first.
+///
+/// A listing cut at fifty rows by path showed fifty harmless rows and hid the
+/// file with an eleven-kilobyte hole.
+pub fn partial_parse_severity(reason: &str) -> (bool, usize) {
+    let charged = reason.contains("; charged: ");
+    let lost = reason
+        .split_once(" byte(s) lost")
+        .and_then(|(head, _)| head.rsplit(", ").next())
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .unwrap_or(0);
+    (charged, lost)
 }
 
 /// The byte ranges a partial parse lost, merged and stated.
@@ -4540,5 +4571,43 @@ mod tests {
                 .all(|r| !r.symbol_name.contains("inside") || r.is_exempt),
             "a symbol inside an error range must be exempt: {overlapping:?}"
         );
+    }
+
+    /// A snippet that survives does not excuse an expression lost inside it:
+    /// the call that expression made is not in the graph, and the function it
+    /// named would read as dead with no charge against the ceiling.
+    #[test]
+    fn a_region_lost_inside_a_snippet_is_charged() {
+        let ext = devmap_extract::extract_file(
+            "src/A.svelte",
+            "<script>function f(){}</script>\n{#snippet s()}\n<button onclick={() => broken(}>x</button>\n{/snippet}\n",
+        );
+        assert!(
+            ext.symbols.iter().any(|symbol| symbol.name == "s"),
+            "the snippet is declared: {:?}",
+            ext.symbols
+        );
+        let verdicts = partial_region_verdicts(&ext);
+        assert!(!verdicts.is_empty(), "the broken expression is a region");
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, verdict)| *verdict == PartialRegionVerdict::Charged),
+            "{verdicts:?}"
+        );
+    }
+
+    /// The severity read back from a stored reason is what the producer wrote.
+    #[test]
+    fn partial_parse_severity_reads_the_producers_sentence() {
+        let charged = devmap_extract::extract_file(
+            "src/A.svelte",
+            "<script>function f(){}</script>\n<button onclick={() => broken(}>x</button>\n",
+        );
+        let reason = partial_parse_reason(&charged);
+        let (is_charged, lost) = partial_parse_severity(&reason);
+        assert!(is_charged, "{reason}");
+        assert!(lost > 0, "{reason}");
+        assert_eq!(partial_parse_severity("unrelated text"), (false, 0));
     }
 }

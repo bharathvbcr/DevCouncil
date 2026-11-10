@@ -7,3 +7,5 @@ live	src/lib/format.ts::padCell	called from the template
 live	src/Board.svelte::columnTitle	rendered with {@render}
 live	src/Board.svelte::cardRow	rendered with {@render}
 live	src/lib/stores.ts::previewMarkers	read only as $previewMarkers
+exported_unreferenced	src/lib/decoy.ts::columnLabel	never imported; the decoy for a same-named import
+exported_unreferenced	src/lib/decoy.ts::priorityLabel	never imported; the decoy for a same-named import

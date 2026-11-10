@@ -35,7 +35,8 @@ pub use graph_intel::{
 pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, confident_tier_eligible,
     confident_tier_unproven_reason, earned_confident_tier, exempt_symbol_names, exemption_token,
-    extraction_coverage, extraction_gaps, language_can_reference, DiscoveryCoverage,
+    extraction_coverage, extraction_gaps, language_can_reference, partial_parse_severity,
+    DiscoveryCoverage,
     ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome, CALL_BLIND_REASON,
     CONFIDENT_TIER_ELIGIBLE, CONFIDENT_TIER_UNPROVEN, COVERAGE_LOSS_CONFIDENCE_CAP,
     COVERAGE_LOSS_REASON, EXPORTED_NOT_EXAMINED_REASON, EXPORTED_UNREFERENCED, EXTERNAL_SUPERTYPE,

@@ -40,6 +40,10 @@
     "accuracy/rust-rootcrate": {
       "rust": 714
     },
+    "accuracy/svelte": {
+      "svelte": 923,
+      "typescript": 1000
+    },
     "accuracy/swift": {
       "swift": 859
     },
