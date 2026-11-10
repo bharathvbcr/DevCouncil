@@ -129,3 +129,31 @@ rs.c44g	C44	libnamed/tests/it.rs::it_c44	libnamed/src/engine.rs::only_from_bin_c
 rs.c48a	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_a_c48	edge	must		let-pattern shadowing its own initializer callee
 rs.c48b	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_b_c48	edge	must		
 rs.c48c	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_c_c48	edge	must		
+rs.f8a	F8	callers/src/fieldname.rs::Recorder.attended	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		self.attended.lock() reads a field; no self-edge to the method of the same name
+rs.f8b	F8	callers/src/fieldname.rs::Recorder.flip_f8	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		let v = self.attended.lock(): a field read is not a call of the method
+rs.f8c	F8	callers/src/fieldname.rs::Recorder.flip_f8	callers/src/fieldname.rs::Observer.attended	forbid_any_tier	must		nor a call of another type's namesake method
+rs.f8d	F8	callers/src/fieldname.rs::Recorder.attended	callers/src/fieldname.rs::Observer.attended	forbid_any_tier	must		field read does not reach another type's namesake method
+rs.f8e	F8	callers/src/fieldname.rs::Recorder.check_f8	callers/src/fieldname.rs::Recorder.attended	edge	must		self.attended() IS a method call (control: must keep its edge)
+rs.f8f	F8	callers/src/fieldname.rs::use_f8	callers/src/fieldname.rs::Observer.attended	edge	must		typed receiver call (control)
+rs.f4a	F4	callers/src/pathmod_tests.rs::path_test_f4	callers/src/pathmod.rs::Quarantine.new_f4	edge	must		#[path] test module: use super::* is the declaring module
+rs.f4b	F4	callers/src/pathmod_tests.rs::path_test_f4	callers/src/otherq.rs::Quarantine.new_f4	forbid	must		a namesake type in another module is not reachable from the test module
+rs.f4c	F4	callers/src/pathmod_tests.rs	callers/src/pathmod.rs	import	must		use super::* in a #[path] module imports the declaring file
+rs.f4d	F4	callers/src/plainmod/tests.rs::plain_test_f4c	callers/src/plainmod.rs::Vault.new_f4c	edge	must		control: the conventional plainmod/tests.rs resolves super correctly
+rs.f4e	F4	callers/src/pathmod.rs::make_f4	callers/src/pathmod.rs::Quarantine.new_f4	edge	must		control: same-file path call
+rs.f4b1	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob/tests.rs::helper_f4b	edge	must		a same-file item wins over the glob-imported namesake
+rs.f4b2	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob.rs::helper_f4b	forbid_any_tier	must		the glob-imported namesake is shadowed by the module's own item
+rs.f4b3	F4b	callers/src/sameglob.rs::parent_f4b	callers/src/sameglob.rs::helper_f4b	edge	must		control
+rs.f3a	F3	callers/src/runner.rs::run_f3	callers/src/handlers/alpha.rs::cmd_alpha_f3	edge	must		bare handler item through use handlers::* and pub use alpha::*
+rs.f3b	F3	callers/src/runner.rs::run_f3	callers/src/handlers/beta.rs::cmd_beta_f3	edge	must		second glob of the same chain
+rs.f3c	F3	callers/src/runner.rs::run_f3	callers/src/handlers/gamma.rs::cmd_twice_f3	forbid_any_tier	must		two globs publish cmd_twice_f3: a bare name that names two symbols resolves to neither
+rs.f3d	F3	callers/src/runner.rs::run_f3	callers/src/handlers/delta.rs::cmd_twice_f3	forbid_any_tier	must		same, the other symbol
+rs.f2a	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::RealHost.attended_f2	edge	must		Arc<dyn Host> call reaches impl Host for RealHost
+rs.f2b	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::StubHost.attended_f2	edge	must		and every other impl
+rs.f2c	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::RealHost.attended_f2	edge	must		&dyn Host call reaches the impl
+rs.f2d	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::StubHost.attended_f2	edge	must		and every other impl
+rs.f2e	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::Unrelated.attended_f2	forbid_any_tier	must		a type that does not implement Host is never a target
+rs.f2f	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::Host.attended_f2	edge	must		control: the trait declaration keeps its edge
+rs.f2g	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::Host.attended_f2	edge	must		control: &dyn Host keeps the trait declaration edge
+rs.f2h	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Door.open_f2n	edge	must		Arc<dyn Gate> reaches the impl although a struct Gate exists elsewhere
+rs.f2i	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Gate.open_f2n	edge	must		control: the trait declaration
+rs.f2j	F2	callers/src/dyngate.rs::pass_f2n	callers/src/gateother.rs::Gate.open_f2n	forbid_any_tier	must		the namesake struct's method is never a target
