@@ -1229,26 +1229,15 @@ impl Store {
             return Ok(None);
         };
         let csr_path = Self::csr_sidecar_path(db_path);
-        let mut tmp_name = csr_path.file_name().map_or_else(
-            || std::ffi::OsString::from("devmap.sqlite.csr"),
-            |n| n.to_os_string(),
-        );
-        tmp_name.push(format!(".tmp.{}", std::process::id()));
-        let tmp_path = csr_path.with_file_name(tmp_name);
-        if let Err(err) = index.to_csr_writer().write_to_file(&tmp_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(anyhow::anyhow!(
-                "cannot write CSR sidecar {}: {err}",
-                tmp_path.display()
-            ));
-        }
-        if let Err(err) = std::fs::rename(&tmp_path, &csr_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(anyhow::anyhow!(
-                "cannot place CSR sidecar {}: {err}",
-                csr_path.display()
-            ));
-        }
+        // `write_to_file` owns the one temp-then-rename layer (with the
+        // directory fsync and the replaced file's mode), so the sidecar is
+        // written straight to its final name.
+        index
+            .to_csr_writer()
+            .write_to_file(&csr_path)
+            .map_err(|err| {
+                anyhow::anyhow!("cannot write CSR sidecar {}: {err}", csr_path.display())
+            })?;
         Ok(Some(csr_path))
     }
 

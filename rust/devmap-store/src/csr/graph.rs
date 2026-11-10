@@ -633,7 +633,17 @@ impl CsrGraphWriter {
             let mut file = File::create(&temp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+            // A replaced file keeps its permissions: the rename would
+            // otherwise swap in the temp file's default mode.
+            if let Ok(existing) = std::fs::metadata(path) {
+                std::fs::set_permissions(&temp, existing.permissions())?;
+            }
             std::fs::rename(&temp, path)?;
+            // Make the rename itself durable. Not all platforms can open a
+            // directory for syncing (Windows cannot), and the data file is
+            // already synced, so only a Unix failure is reported.
+            #[cfg(unix)]
+            File::open(parent)?.sync_all()?;
             Ok(())
         })();
         if written.is_err() {
