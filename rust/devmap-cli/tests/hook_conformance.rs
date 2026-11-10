@@ -2082,37 +2082,55 @@ fn post_tool_use_blast_names_why_the_list_is_short() {
 #[cfg(unix)]
 include!("../../testsupport/restriction.rs");
 
-/// A linked `codeintel/hooks` directory is refused, and the refusal is said on
-/// stderr by the hook itself; nothing is written through the link.
+/// A linked `codeintel/hooks` directory is refused. SessionStart (once per
+/// session) says so in its context; the per-tool-call hook stays quiet; nothing
+/// is written through the link.
 #[cfg(unix)]
 #[test]
-fn a_linked_hooks_directory_is_reported_on_stderr_and_not_written_through() {
+fn a_linked_hooks_directory_is_reported_at_session_start_only() {
     let root = scratch("linked-hooks-notice");
     seed_store(&root);
     let victim = root.join("victim");
     std::fs::create_dir_all(&victim).unwrap();
     let hooks = root.join(".devcouncil/codeintel/hooks");
     std::os::unix::fs::symlink(&victim, &hooks).unwrap();
-    let payload = json!({
+    let pre = json!({
         "hook_event_name": "PreToolUse",
         "session_id": "linked-hooks",
         "cwd": root.to_string_lossy(),
         "tool_name": "Read",
         "tool_input": {"file_path": root.join("a.py").to_string_lossy()},
     });
-    let run = run_hook(
+    let pre_run = run_hook(
         "pre-tool-use",
-        serde_json::to_string(&payload).unwrap().as_bytes(),
+        serde_json::to_string(&pre).unwrap().as_bytes(),
+        &[],
+    );
+    let start = json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "sessionStart",
+        "workspace_roots": [root.to_string_lossy()],
+    });
+    let start_run = run_hook(
+        "session-start",
+        serde_json::to_string(&start).unwrap().as_bytes(),
         &[],
     );
     let written = std::fs::read_dir(&victim).unwrap().count();
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(pre_run.code, Some(0), "{}", pre_run.stderr);
     assert!(
-        run.stderr.contains("symbolic link") && run.stderr.contains("hooks"),
-        "the refused link must be named on stderr: {:?}",
-        run.stderr
+        pre_run.stderr.trim().is_empty(),
+        "the per-tool-call hook must stay quiet: {:?}",
+        pre_run.stderr
     );
-    assert_eq!(run.stderr.lines().count(), 1, "one line: {:?}", run.stderr);
+    assert_eq!(start_run.code, Some(0), "{}", start_run.stderr);
+    let value: serde_json::Value = serde_json::from_str(start_run.stdout.trim())
+        .unwrap_or_else(|err| panic!("session-start json ({err}): {:?}", start_run.stdout));
+    let context = value["additional_context"].as_str().unwrap_or("");
+    assert!(
+        context.contains("are refused") && context.contains("hooks"),
+        "SessionStart must name the refused marker directory: {context:?}"
+    );
     assert_eq!(written, 0, "a marker was written through the link");
 }

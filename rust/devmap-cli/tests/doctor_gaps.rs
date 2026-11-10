@@ -457,7 +457,10 @@ fn doctor_reports_a_linked_hooks_directory() {
 
     let report = doctor_with_home(&home, &repo);
     let warning = report["hooks_marker_dir_warning"].as_str().unwrap_or("");
-    assert!(warning.contains("hooks") && warning.contains("symbolic link"), "{report}");
+    assert!(
+        warning.contains("hooks") && warning.contains("are refused"),
+        "{report}"
+    );
     assert!(warning.contains("Remedy"), "{warning}");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&repo);

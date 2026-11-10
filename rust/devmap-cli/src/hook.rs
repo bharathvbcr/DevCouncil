@@ -863,6 +863,9 @@ const DEVMAP_DIRECTIVE: &str = "Ask DevMap before reading files: devmap_search, 
 /// pathological status payload cannot crowd out the directive or the notes.
 const REPO_CLAUSE_CAP: usize = 200;
 
+/// Longest refused-marker-directory line, at most one per repository.
+const MARKER_REFUSAL_CAP: usize = 400;
+
 /// Longest installation-health *detail*. One per session, not one per
 /// repository: a mismatched plugin bundle is a property of the installation.
 ///
@@ -891,8 +894,10 @@ const HEALTH_REMEDY: &str = "re-run `devmap claude plugin` and reinstall the bun
 /// structural maximum is the point: the previous flat `truncate(.., 400)` ran
 /// after the notes were appended, so on a capped or timed-out pass it deleted
 /// the very sentence that said the pass was partial.
-const SESSION_START_CONTEXT_CAP: usize =
-    MAX_HOOK_ROOTS * REPO_CLAUSE_CAP + HEALTH_NOTE_CAP + HEALTH_REMEDY.len() + 512;
+const SESSION_START_CONTEXT_CAP: usize = MAX_HOOK_ROOTS * (REPO_CLAUSE_CAP + MARKER_REFUSAL_CAP)
+    + HEALTH_NOTE_CAP
+    + HEALTH_REMEDY.len()
+    + 512;
 
 /// Coverage buckets that mean information was lost.
 ///
@@ -1068,6 +1073,9 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
             clause.push_str(&format!("; last session {last}"));
         }
         clauses.push(truncate(&clause, REPO_CLAUSE_CAP));
+        if let Some(refusal) = marker_dir_refusal(root) {
+            clauses.push(truncate(&refusal, MARKER_REFUSAL_CAP));
+        }
     }
 
     let additional = compose_session_start(
@@ -1927,13 +1935,9 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
     // or a linked ancestor, is refused, so neither the marker nor the pruning
     // below can reach into a directory the link points at.
     let Ok(pinned) = PinnedDir::open(dir, true) else {
-        // A refused link is a fact the owner must be told, not a quiet skip.
-        // The marker directory is the one place per-session state could live,
-        // and it is the refused one, so this notice repeats on every hook
-        // invocation instead of once per session.
-        if let Some(link) = linked_component(dir) {
-            eprintln!("{}", linked_component_notice(&link));
-        }
+        // Quiet here on purpose: this runs on every tool call. The refusal is
+        // reported once per session by SessionStart and by `devmap doctor`,
+        // from [`marker_dir_refusal`], which asks `PinnedDir` the same question.
         return Claim::Skip;
     };
     match pinned.open_file(std::ffi::OsStr::new(name), Access::Append, Creation::New) {
@@ -1945,43 +1949,27 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
     }
 }
 
-/// The first component of `dir` that is a symbolic link, or `None`.
+/// `PinnedDir`'s own refusal of this repository's hook marker directory, as one
+/// hook-context line, or `None` when the directory opens (or does not exist yet,
+/// which `claim_once` creates). Read-only: it opens with `create = false`.
 ///
-/// `PinnedDir::open` refuses every link in the path; this names which one, by
-/// `symlink_metadata` only, so it never follows the link it reports. The macOS
-/// `/var` and `/tmp` system aliases are not reported, matching `PinnedDir`.
-pub(crate) fn linked_component(dir: &Path) -> Option<PathBuf> {
-    let mut current = PathBuf::new();
-    for component in dir.components() {
-        current.push(component);
-        #[cfg(target_os = "macos")]
-        if current == Path::new("/var") || current == Path::new("/tmp") {
-            continue;
-        }
-        if current
-            .symlink_metadata()
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            return Some(current);
-        }
+/// There is no second symlink walk and no exemption list here: the text is the
+/// error `PinnedDir::open` returns, so it names a link in the directory or in
+/// any ancestor exactly when `claim_once` would skip. A checkout reached
+/// through a symlinked ancestor therefore gets this notice too: its markers are
+/// dead today, and the notice says so rather than hiding it.
+pub(crate) fn marker_dir_refusal(root: &Path) -> Option<String> {
+    use devmap_extract::safe_fs::PinnedDir;
+    match PinnedDir::open(&marker_dir(root), false) {
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(context_line(&format!(
+            "hook markers for {} are refused ({error}); once-per-session hook notices cannot \
+             be recorded there. Remedy: make the marker directory a real directory, not a \
+             link or path through one",
+            root.display()
+        ))),
     }
-    None
-}
-
-/// The one-line stderr/doctor text for a refused linked marker component.
-pub(crate) fn linked_component_notice(link: &Path) -> String {
-    format!(
-        "devmap hook: {} is a symbolic link, so the hook refuses to write session markers \
-         through it and skips its once-per-session notices. Remedy: replace the link with a \
-         real directory (remove the link, then let the hook recreate it).",
-        link.display()
-    )
-}
-
-/// The refused linked component of this repository's hook marker directory,
-/// for `devmap doctor`. Read-only.
-pub(crate) fn marker_dir_link_warning(root: &Path) -> Option<String> {
-    linked_component(&marker_dir(root)).map(|link| linked_component_notice(&link))
 }
 
 /// Assemble the context block from already-summarized repository clauses.
@@ -3138,7 +3126,9 @@ mod tests {
         let locked = coalesce_lock_dir(&repo, "build").exists();
         let _ = fs::remove_dir_all(&base);
         for result in results {
-            let message = result.expect_err("an in-repo detach must be refused").to_string();
+            let message = result
+                .expect_err("an in-repo detach must be refused")
+                .to_string();
             assert!(
                 message.contains("refusing to detach") && message.contains("inside"),
                 "{message}"
@@ -3188,7 +3178,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let ran = marker.exists();
         let _ = fs::remove_dir_all(&base);
-        assert!(result.is_err(), "an executable inside the seed checkout must be refused");
+        assert!(
+            result.is_err(),
+            "an executable inside the seed checkout must be refused"
+        );
         assert!(!ran);
     }
 
@@ -3228,7 +3221,9 @@ mod tests {
         let result = detach_build(&missing, &repo);
         let locked = coalesce_lock_dir(&repo, "build").exists();
         let _ = fs::remove_dir_all(&base);
-        let message = result.expect_err("an unresolvable executable must not detach").to_string();
+        let message = result
+            .expect_err("an unresolvable executable must not detach")
+            .to_string();
         assert!(
             message.contains("refusing to detach") && message.contains("canonicalize"),
             "{message}"
@@ -3514,6 +3509,54 @@ mod tests {
             "refusal must not look like a summary"
         );
         assert!(!ran, "run_hook spawned the in-repo executable");
+    }
+
+    /// A refused detach is told to the user: PostToolUse and SessionEnd exit 1
+    /// with a stderr diagnostic naming the refusal, never an empty success that
+    /// leaves a silently stale index, and the in-repo binary is not started.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_detach_is_reported_by_post_tool_use_and_session_end() {
+        for event in [HookEvent::PostToolUse, HookEvent::SessionEnd] {
+            let base = scratch_dir("run-hook-detach");
+            let repo = base.join("repo");
+            fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+            fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+            let marker = base.join("ran");
+            let exe = repo.join("devmap");
+            write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+            let outcome = run_hook(
+                event,
+                br#"{"session_id":"detach-refusal"}"#,
+                &exe,
+                Some(&repo),
+            );
+
+            std::thread::sleep(Duration::from_millis(300));
+            let ran = marker.exists();
+            let _ = fs::remove_dir_all(&base);
+            assert_eq!(
+                outcome.exit_code,
+                1,
+                "{}: {:?}",
+                event.as_str(),
+                outcome.stderr_line
+            );
+            let line = outcome
+                .stderr_line
+                .expect("a refused detach is a stderr diagnostic");
+            assert!(
+                line.contains("refusing to detach") && line.contains("inside"),
+                "{}: {line}",
+                event.as_str()
+            );
+            assert!(
+                !ran,
+                "{}: the in-repo executable was spawned",
+                event.as_str()
+            );
+        }
     }
 
     /// A missing executable fails canonicalize. `run_hook` must surface that as
@@ -5779,33 +5822,68 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The refusal text is `PinnedDir`'s own: a linked hooks directory is named
+    /// (path escaped onto one line), a real or absent one is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_hooks_directory_is_named_from_the_pinned_refusal() {
+        let root = scratch("hooks-linked-notice");
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        assert_eq!(
+            marker_dir_refusal(&root),
+            None,
+            "an absent state dir is not a refusal"
+        );
+        let hooks = marker_dir(&root);
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        assert_eq!(
+            marker_dir_refusal(&root),
+            None,
+            "an absent hooks dir is not a refusal"
+        );
+        fs::create_dir_all(&hooks).unwrap();
+        assert_eq!(
+            marker_dir_refusal(&root),
+            None,
+            "a real hooks dir is not a refusal"
+        );
+        fs::remove_dir(&hooks).unwrap();
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+
+        let notice = marker_dir_refusal(&root).expect("a linked hooks dir is refused");
+        assert!(notice.contains("hooks"), "{notice}");
+        assert!(notice.contains("Remedy"), "{notice}");
+        assert!(!notice.contains('\n'), "one line: {notice}");
+        // Refused by claim_once at the same moment, so the two cannot disagree.
+        assert_eq!(claim_once(&hooks, "nav.x.0"), Claim::Skip);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A newline in the repository path must not break the notice onto a second line.
+    #[cfg(unix)]
+    #[test]
+    fn the_refusal_notice_escapes_a_newline_in_the_path() {
+        let base = scratch("hooks-linked-newline");
+        let root = base.join("lane\nname");
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let hooks = marker_dir(&root);
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+        let notice = marker_dir_refusal(&root).expect("refused");
+        assert!(
+            !notice.contains('\n') && !notice.contains('\r'),
+            "{notice:?}"
+        );
+        assert!(notice.contains("lane\\u000aname"), "{notice:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// `.devcouncil/codeintel/hooks` linked at a directory the repository's
     /// owner never meant to hand over. The marker claim must not create a file
     /// there, and the pruning that follows a claim must not delete from it: a
     /// hostile checkout could otherwise aim both at the victim's `nav.*` files.
-    /// The refused link is named, not silently skipped: the first link in the
-    /// path is reported, a real directory is not, and doctor's warning carries
-    /// the path and the remedy.
-    #[cfg(unix)]
-    #[test]
-    fn a_linked_hooks_component_is_named_for_the_notice_and_doctor() {
-        let root = scratch("hooks-linked-notice");
-        let victim = root.join("victim");
-        fs::create_dir_all(&victim).unwrap();
-        let hooks = marker_dir(&root);
-        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
-        assert_eq!(linked_component(&hooks), None);
-        assert_eq!(marker_dir_link_warning(&root), None);
-        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
-
-        assert_eq!(linked_component(&hooks), Some(hooks.clone()));
-        let warning = marker_dir_link_warning(&root).expect("a linked hooks dir is reported");
-        assert!(warning.contains(&hooks.display().to_string()), "{warning}");
-        assert!(warning.contains("Remedy"), "{warning}");
-        assert!(!warning.contains('\n'), "one line: {warning}");
-        let _ = fs::remove_dir_all(&root);
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_linked_marker_directory_receives_no_write_and_loses_no_file() {
