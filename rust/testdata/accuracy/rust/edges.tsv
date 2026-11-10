@@ -189,7 +189,7 @@ rs.g4c	F4b	callers/src/g4.rs::t_g4	callers/src/g4.rs::helper_g4	edge	must		guard
 rs.g5a	F3	callers/src/g5.rs::read_g5	callers/src/g5mod.rs::stdin	forbid_any_tier	must		regression test: a private fn stdin is not published by the glob chain; the named std import wins
 rs.g5b	F3	callers/src/g5.rs::read_g5	callers/src/g5mod.rs::open_g5	edge	must		guard: the pub item the chain does publish still binds
 rs.g5c	F3	callers/src/g5mod.rs::open_g5	callers/src/g5mod.rs::stdin	edge	must		guard: inside its own module the private fn is in scope
-rs.g5d	F3	callers/src/g5c.rs::call_made_g5	callers/src/g5v.rs::made_g5	forbid	must		regression test: a second publisher of made_g5 is a macro the index cannot see, so one visible declaration is not the whole publisher set
+rs.g5d	F3	callers/src/g5c.rs::call_made_g5	callers/src/g5v.rs::made_g5	edge	should		regression test (tier asserted in devmap-resolve rust_glob_publication): a chain with an item-position macro cannot claim made_g5 at the import tier; the one visible declaration still lands, as the corpus-unique rung's 0.9
 rs.g6a	F4	callers/src/g6use.rs::conv_g6	callers/src/g6src.rs::CmdErr.from	edge	must		regression test: the true impl (From<SrcErr>) is in a file other than the type's
 rs.g6b	F4	callers/src/g6use.rs::conv_g6	callers/src/g6err.rs::CmdErr.from	forbid	must		regression test: CmdErr has two From impls; the type's own file is not the answer
 rs.g6c	F4	callers/src/g6err.rs::conv_one_g6	callers/src/g6err.rs::CmdOne.from	edge	must		guard: a type with exactly one From impl still binds

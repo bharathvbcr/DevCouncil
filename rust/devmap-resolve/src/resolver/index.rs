@@ -1207,11 +1207,11 @@ impl Resolver {
                                     if !complete {
                                         // A chain that may publish a name the
                                         // index never saw cannot say this is
-                                        // the only declaration of it. Bind
-                                        // nothing, and record the name as one
-                                        // that may come from the glob's source,
-                                        // so no other rung binds a namesake.
-                                        unresolved_import(name, &imp.module_specifier);
+                                        // the only declaration of it, so it
+                                        // binds no ImportScoped edge. The name
+                                        // stays open for the corpus-unique rung
+                                        // below, which claims no more than that
+                                        // one declaration exists (0.9).
                                         continue;
                                     }
                                     if let Some(published_by) = published_by {
@@ -2192,7 +2192,7 @@ impl Resolver {
     /// visible to a glob import written in `importer`: it is `pub`, or the
     /// importer is the declaring module or inside it. A module `m` is `m.rs`
     /// with its children under `m/`, or the directory of `m/mod.rs`, `lib.rs`
-    /// or `main.rs`.
+    /// or `main.rs`, or a `#[path]` child it declares.
     pub(super) fn rust_item_is_visible_to(
         &self,
         importer: &str,
@@ -2204,6 +2204,16 @@ impl Resolver {
             .contains(&(declarer.to_string(), self.qualified_for(declarer, name)));
         if !private || importer == declarer {
             return true;
+        }
+        // A `#[path]` child is a module of the file that declares it, wherever
+        // the child's file sits, so it sees that parent's private items.
+        let mut parent = self.rust_path_modules.get(importer);
+        for _ in 0..16 {
+            match parent {
+                Some(file) if file == declarer => return true,
+                Some(file) => parent = self.rust_path_modules.get(file),
+                None => break,
+            }
         }
         let module_dir = ["/mod.rs", "/lib.rs", "/main.rs"]
             .iter()

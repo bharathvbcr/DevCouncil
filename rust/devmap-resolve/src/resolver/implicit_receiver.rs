@@ -544,9 +544,7 @@ impl Resolver {
         } else {
             None
         };
-        if rust_origin.is_some() && self.rust_method_is_overloaded_across_impls(type_name, &uniq) {
-            return None;
-        }
+        let all_hits = uniq.clone();
         if let Some(origin) = rust_origin {
             if origin == RustOrigin::Unknown {
                 return None;
@@ -582,6 +580,11 @@ impl Resolver {
             }
         }
         if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
+            return None;
+        }
+        if rust_origin.is_some()
+            && self.rust_method_is_overloaded_across_impls(type_name, &all_hits, &uniq[0].0)
+        {
             return None;
         }
         let (target_file, target_symbol) = uniq[0];
@@ -630,30 +633,33 @@ impl Resolver {
     fn rust_method_is_overloaded_across_impls(
         &self,
         type_name: &str,
-        uniq: &[&(String, String)],
+        all_hits: &[&(String, String)],
+        chosen: &str,
     ) -> bool {
-        let files: BTreeSet<&str> = uniq.iter().map(|hit| hit.0.as_str()).collect();
-        if files.len() > 1
-            && files.iter().any(|file| {
-                !self
+        // A file that declares no type of this name but binds the name to the
+        // chosen file holds an impl of *that* type. A file that declares its
+        // own, or binds the name elsewhere, holds a namesake's.
+        let foreign_impl = all_hits.iter().any(|hit| {
+            hit.0 != chosen
+                && !self
                     .rust_site_scope
-                    .get(*file)
+                    .get(hit.0.as_str())
                     .is_some_and(|scope| scope.declares_anywhere(type_name))
-            })
-        {
+                && self
+                    .import_bindings
+                    .get(hit.0.as_str())
+                    .and_then(|bindings| bindings.get(type_name))
+                    .is_some_and(|(file, _)| file == chosen)
+        });
+        if foreign_impl {
             return true;
         }
-        for file in files {
-            let own: Vec<&&(String, String)> = uniq.iter().filter(|hit| hit.0 == file).collect();
-            let signatures: BTreeSet<Option<&String>> = own
-                .iter()
-                .map(|hit| self.rust_signatures.get(&(hit.0.clone(), hit.1.clone())))
-                .collect();
-            if own.len() > 1 && signatures.len() > 1 {
-                return true;
-            }
-        }
-        false
+        let own: Vec<&&(String, String)> = all_hits.iter().filter(|hit| hit.0 == chosen).collect();
+        let signatures: BTreeSet<Option<&String>> = own
+            .iter()
+            .map(|hit| self.rust_signatures.get(&(hit.0.clone(), hit.1.clone())))
+            .collect();
+        own.len() > 1 && signatures.len() > 1
     }
 
     /// Every `type_methods` hit a Swift type spelling reaches from `call_file`
