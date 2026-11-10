@@ -394,6 +394,13 @@ pub struct Resolver {
     /// file that declares it. That file is the module's parent, whatever the
     /// directory layout says (see `compute_rust_path_modules`).
     rust_path_modules: BTreeMap<String, String>,
+    /// Rust: `<file>` -> the module files its `use m::*;` globs name, private
+    /// ones included. A child module sees what its parent's private globs
+    /// brought in, which `rust_module_globs` (the `pub use` surface) does not say.
+    rust_scope_globs: BTreeMap<String, Vec<String>>,
+    /// Rust: `<file>` -> `(name, file, name)` for each unaliased name its `use`
+    /// lines import by name. The same child-module visibility as the globs above.
+    rust_scope_named: BTreeMap<String, Vec<(String, String)>>,
     /// `<file>` -> the local binding its `export default` publishes. What an
     /// importer's `import X from` and a barrel's `export { default } from` ask
     /// for by the name `default`; see `default_binding`.
@@ -795,6 +802,8 @@ impl Resolver {
             reexport_glob_cutoff: None,
             rust_module_globs: BTreeMap::new(),
             rust_path_modules: BTreeMap::new(),
+            rust_scope_globs: BTreeMap::new(),
+            rust_scope_named: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),

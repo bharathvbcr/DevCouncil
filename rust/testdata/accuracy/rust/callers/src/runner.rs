@@ -11,4 +11,5 @@ pub fn anchor_f3() -> u32 {
         + crate::handlers::beta::cmd_beta_f3()
         + crate::handlers::gamma::cmd_twice_f3()
         + crate::handlers::delta::cmd_twice_f3()
+        + crate::handlers::alpha::shared_f4r()
 }

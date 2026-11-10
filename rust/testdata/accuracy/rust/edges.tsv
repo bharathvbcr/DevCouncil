@@ -165,3 +165,11 @@ rs.f4i	F4	callers/src/lib.rs::anon_f4	callers/src/otherq.rs::Quarantine.new_f4	f
 rs.f4b4	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob.rs::parent_f4b	edge	must		control: a name the glob publishes and the module does not declare still binds through it
 rs.f2k	F2	callers/src/dyntwin_a.rs::call_a_f2t	callers/src/dyntwin_a.rs::Twin.go_f2t	edge	must		control: the trait declaration the file names
 rs.f2l	F2	callers/src/dyntwin_a.rs::call_a_f2t	callers/src/dyntwin_b.rs::SideB.go_f2t	forbid_any_tier	must		an impl of a namesake trait in another file is never a target
+rs.f4r1	F4b	callers/src/inlinemod.rs::call_f4r	callers/src/inlinemod.rs::shared_f4r	edge	must		regression shape: a fn of an inline test module wins over a name the file's glob chain publishes
+rs.f4r2	F4b	callers/src/inlinemod.rs::call_f4r	callers/src/handlers/alpha.rs::shared_f4r	forbid_any_tier	must		and never reaches the published namesake
+rs.f4r3	F4b	callers/src/inlinemod.rs::outer_f4r	callers/src/handlers/alpha.rs::cmd_alpha_f3	edge	must		control: a name the glob chain publishes still binds in a file that declares others
+rs.f4s1	F4	callers/src/scopemod/leaf_f4s.rs::leaf_f4s	callers/src/scopemod.rs::Scoped.new_f4s	edge	must		a #[path] leaf under a conventional child: use super::* reaches what the child's own use super::* brought in
+rs.f4s2	F4	callers/src/scopemod/mid.rs::mid_f4s	callers/src/scopemod.rs::Scoped.new_f4s	edge	must		control: the conventional child
+rs.f4s3	F4	callers/src/scopemod/leaf_f4s.rs::leaf_named_f4s	callers/src/otherq.rs::Quarantine.new_f4	edge	must		the leaf also sees the name its parent imports by name (use crate::otherq::Quarantine)
+rs.f4s4	F4	callers/src/scopemod/leaf_f4s.rs::leaf_named_f4s	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		and not the namesake type of another module
+rs.f4s5	F4	callers/src/scopemod/mid.rs::mid_f4s	callers/src/otherq.rs::Quarantine.new_f4	edge	must		control: the parent's own named import

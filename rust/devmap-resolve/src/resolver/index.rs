@@ -22,6 +22,8 @@ impl Resolver {
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
         self.rust_path_modules.clear();
+        self.rust_scope_globs.clear();
+        self.rust_scope_named.clear();
         self.default_exports.clear();
         self.inert_values.clear();
         self.star_export_files.clear();
@@ -730,6 +732,8 @@ impl Resolver {
             self.compute_reexport_chains(extractions);
         self.rust_module_globs = self.compute_rust_module_globs(extractions);
         self.rust_path_modules = self.compute_rust_path_modules(extractions);
+        self.rust_scope_globs = self.compute_rust_scope_globs(extractions);
+        self.rust_scope_named = self.compute_rust_scope_named(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
@@ -1108,6 +1112,20 @@ impl Resolver {
                         continue;
                     }
                     if alias == Some(".") {
+                        // Rust: every name the importing file declares at any
+                        // depth. An item it declares itself - in the file or in
+                        // one of its inline modules - shadows what a glob brings
+                        // in under that name, so the glob binds nothing for it
+                        // and the same-file rung answers.
+                        let own_rust_names: BTreeSet<&String> = if ext.language == "rust" {
+                            self.file_symbols
+                                .get(&ext.file_path)
+                                .into_iter()
+                                .flatten()
+                                .collect()
+                        } else {
+                            BTreeSet::new()
+                        };
                         for file in &targets {
                             // X41. A glob of the file's *own* module —
                             // `mod tests { use super::*; }` — is skipped, and
@@ -1129,14 +1147,28 @@ impl Resolver {
                                     // itself shadows what a glob brings in under
                                     // the same name, so the glob binds nothing
                                     // for it and the same-file rung answers.
-                                    if ext.language == "rust"
-                                        && self.declared_at_file_level(&ext.file_path, name)
-                                    {
+                                    if ext.language == "rust" && own_rust_names.contains(name) {
                                         continue;
                                     }
                                     file_bindings
                                         .entry(name.clone())
                                         .or_insert_with(|| (file.clone(), name.clone()));
+                                }
+                            }
+                            // Rust: a `#[path]` child also sees what its declaring
+                            // parent's private globs brought in.
+                            if ext.language == "rust"
+                                && self.rust_path_modules.get(&ext.file_path) == Some(file)
+                            {
+                                for (name, declarer) in self.rust_scope_published(file) {
+                                    if own_rust_names.contains(&name) {
+                                        continue;
+                                    }
+                                    if let Some(declarer) = declarer {
+                                        file_bindings
+                                            .entry(name.clone())
+                                            .or_insert_with(|| (declarer, name));
+                                    }
                                 }
                             }
                             // Rust: what the target publishes through its own
@@ -1146,6 +1178,9 @@ impl Resolver {
                             // binds; the importing file's own items still win.
                             if ext.language == "rust" {
                                 for (name, published_by) in self.rust_glob_published(file) {
+                                    if own_rust_names.contains(&name) {
+                                        continue;
+                                    }
                                     if let Some(published_by) = published_by {
                                         file_bindings
                                             .entry(name.clone())
@@ -2099,6 +2134,112 @@ impl Resolver {
             );
         }
         published
+    }
+
+    /// Every Rust `use m::*;` - private ones too - as `(file, the module file m
+    /// names)`.
+    pub(super) fn compute_rust_scope_globs(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut globs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            for import in ext.imports.iter().filter(|i| i.alias.as_deref() == Some(".")) {
+                if let Some(target) = self.resolve_import_path(
+                    &ext.file_path,
+                    &ext.language,
+                    &import.module_specifier,
+                ) {
+                    if target != ext.file_path {
+                        globs.entry(ext.file_path.clone()).or_default().push(target);
+                    }
+                }
+            }
+        }
+        globs
+    }
+
+    /// Every name a Rust file imports by name and without an alias, as
+    /// `(name, the file the import resolves to)`.
+    pub(super) fn compute_rust_scope_named(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<String, Vec<(String, String)>> {
+        let mut named: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            for import in ext.imports.iter().filter(|i| {
+                i.alias.as_deref() != Some(".") && !i.imported_names.is_empty()
+            }) {
+                let Some(target) = self.resolve_import_path(
+                    &ext.file_path,
+                    &ext.language,
+                    &import.module_specifier,
+                ) else {
+                    continue;
+                };
+                if target == ext.file_path {
+                    continue;
+                }
+                for (index, name) in import.imported_names.iter().enumerate() {
+                    let local = import.local_names.get(index).filter(|l| !l.is_empty());
+                    if local.is_none_or(|local| local == name) {
+                        named
+                            .entry(ext.file_path.clone())
+                            .or_default()
+                            .push((name.clone(), target.clone()));
+                    }
+                }
+            }
+        }
+        named
+    }
+
+    /// What the module `file` has in scope through its own `use m::*;` globs:
+    /// each globbed file's items and what that file publishes in turn, each name
+    /// with the one file declaring it or `None` when two declare it.
+    ///
+    /// Read only for a `#[path]` child of `file`: a child sees its parent's
+    /// private imports, so `use super::*;` there brings in what the parent's own
+    /// `use super::*;` brought in.
+    pub(super) fn rust_scope_published(&self, file: &str) -> BTreeMap<String, Option<String>> {
+        let mut scope: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for (name, target) in self.rust_scope_named.get(file).into_iter().flatten() {
+            scope
+                .entry(name.clone())
+                .and_modify(|seen| {
+                    if seen.as_deref() != Some(target.as_str()) {
+                        *seen = None;
+                    }
+                })
+                .or_insert_with(|| Some(target.clone()));
+        }
+        for globbed in self.rust_scope_globs.get(file).into_iter().flatten() {
+            let mut merge = |name: &str, declarer: Option<String>| {
+                scope
+                    .entry(name.to_string())
+                    .and_modify(|seen| {
+                        if *seen != declarer {
+                            *seen = None;
+                        }
+                    })
+                    .or_insert(declarer);
+            };
+            for name in self.file_symbols.get(globbed).into_iter().flatten() {
+                if self.declared_at_file_level(globbed, name) {
+                    merge(name, Some(globbed.clone()));
+                }
+            }
+            for (name, declarer) in self.rust_glob_published(globbed) {
+                merge(&name, declarer);
+            }
+        }
+        scope
     }
 
     /// Every file a Rust `#[path = "x.rs"] mod x;` names, keyed to the file that

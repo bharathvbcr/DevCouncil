@@ -10,10 +10,12 @@ pub mod dyntwin_b;
 pub mod gateother;
 pub mod fieldname;
 pub mod handlers;
+pub mod inlinemod;
 pub mod otherq;
 pub mod pathmod;
 pub mod plainmod;
 pub mod runner;
+pub mod scopemod;
 pub mod sameglob;
 
 /// Names `Quarantine` with no declaration and no import in this file: two
