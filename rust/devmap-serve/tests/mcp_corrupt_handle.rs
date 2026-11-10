@@ -182,43 +182,79 @@ async fn a_damaged_store_file_is_reported_by_name_with_the_next_step_and_not_cac
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Corruption met inside the full-text index used to reach the agent as the
-/// `repair --fts` text with no store path, no eviction and no retry, because
-/// the store re-worded the SQLite error and dropped its code.
+/// Corruption met only inside the full-text index refuses search, names the
+/// index and its real repair (`devmap repair --fts`), and leaves every other
+/// tool answering from the same handle. (Expectation changed: this used to
+/// assert the whole-store `devmap doctor` / `devmap build` text and that every
+/// call, status included, was refused as "has not changed since".)
 #[tokio::test]
-async fn damage_met_in_the_full_text_index_is_evicted_retried_and_named() {
+async fn damage_met_only_in_the_full_text_index_refuses_search_and_nothing_else() {
     let root = scratch("fts");
     let db = plant_indexed_store(&root);
     let slot = Arc::new(StoreSlot::new(&db));
-    slot.get().expect("opens and caches the store");
+    let cached = slot.get().expect("opens and caches the store");
     let original = damage_full_text_index(&db);
 
-    let first = call(&slot, "devmap_search", json!({"query": "helper"})).await;
-    let text = error_text(&first);
+    let text = error_text(&call(&slot, "devmap_search", json!({"query": "helper"})).await);
     assert!(
         text.contains(&db.display().to_string()),
         "must name the store {}: {text}",
         db.display()
     );
     assert!(
-        text.contains("devmap doctor") && text.contains("devmap build"),
-        "must name the next step: {text}"
-    );
-    assert!(
-        text.contains("opened afresh"),
-        "must say the retry on a fresh connection also failed: {text}"
+        text.contains("full-text index") && text.contains("devmap repair --fts"),
+        "must name the index and its repair: {text}"
     );
 
-    // The file has not changed: the next call is refused without reading it.
+    // The same handle still answers the tools that do not read the index.
+    let status = call(&slot, "devmap_status", json!({})).await;
+    assert_eq!(status["result"]["isError"], json!(false), "{status}");
+    let graph = call(&slot, "devmap_impact", json!({"target": "helper"})).await;
+    assert_eq!(graph["result"]["isError"], json!(false), "{graph}");
+
+    // A second search is refused with the same words, and the handle was not
+    // replaced on the way (no reopen per refused call).
     let again = error_text(&call(&slot, "devmap_search", json!({"query": "helper"})).await);
+    assert!(again.contains("devmap repair --fts"), "{again}");
     assert!(
-        again.contains("has not changed since"),
-        "a file already found damaged and unchanged is not opened and queried again: {again}"
+        Arc::ptr_eq(&cached, &slot.get().unwrap()),
+        "a full-text refusal must keep the working handle"
     );
 
-    // A change to the file clears the memory and the next call reads it.
+    // Repair clears it.
     restore_in_place(&db, &original);
     let healed = call(&slot, "devmap_search", json!({"query": "helper"})).await;
+    assert_eq!(healed["result"]["isError"], json!(false), "{healed}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The closest real test of "the file was replaced while the call was
+/// failing": the retry race itself cannot be arranged from outside the server,
+/// so this replaces the damaged file by rename (a new inode, as `devmap build`
+/// does) after the failure was reported and remembered. The very next call
+/// reads the new file; nothing remembered about the old one is applied to it.
+#[tokio::test]
+async fn a_damaged_store_replaced_by_rename_is_read_again_at_once() {
+    let root = scratch("replaced");
+    let db = plant_store(&root);
+    let healthy_copy = root.join("healthy-copy.sqlite");
+    std::fs::copy(&db, &healthy_copy).unwrap();
+    let slot = Arc::new(StoreSlot::new(&db));
+    slot.get().expect("opens and caches the store");
+    damage_in_place(&db);
+
+    let text = error_text(&call(&slot, "devmap_status", json!({})).await);
+    assert!(text.contains(&db.display().to_string()), "{text}");
+    // A second refusal is served from the memory and carries the cause and
+    // what clears it.
+    let again = error_text(&call(&slot, "devmap_status", json!({})).await);
+    assert!(
+        again.contains("has not changed since") && again.contains("SQLITE_CORRUPT"),
+        "the remembered refusal states the cause and that it clears when the file changes: {again}"
+    );
+
+    std::fs::rename(&healthy_copy, &db).unwrap();
+    let healed = call(&slot, "devmap_status", json!({})).await;
     assert_eq!(healed["result"]["isError"], json!(false), "{healed}");
     std::fs::remove_dir_all(root).unwrap();
 }

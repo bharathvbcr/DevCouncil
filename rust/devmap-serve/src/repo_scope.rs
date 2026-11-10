@@ -341,11 +341,15 @@ pub struct OpenFailure {
     /// SQLite reported `SQLITE_CORRUPT` (or a re-worded full-text corruption)
     /// while opening: the file is damaged, and a caller may remember that.
     pub corrupt: bool,
+    /// The error itself, without the wording around it, for a caller that
+    /// records it.
+    pub raw: String,
 }
 
 impl OpenFailure {
     fn other(message: String) -> Self {
         Self {
+            raw: message.clone(),
             message,
             corrupt: false,
         }
@@ -357,12 +361,21 @@ pub fn open_mcp_store_classified(path: &Path) -> Result<Store, OpenFailure> {
     if path.file_name().and_then(|n| n.to_str()) == Some("base.sqlite") {
         // A lane's private base: opened through its lease and recorded identity,
         // the same checks `StackedStore::open` makes.
-        return devmap_query::stacked::open_lane_base_store(path).map_err(|err| {
+        let base = devmap_query::stacked::open_lane_base_store(path).map_err(|err| {
             OpenFailure::other(format!(
                 "immutable base snapshot at {} could not be opened: {err}",
                 path.display()
             ))
-        });
+        })?;
+        // The lane opener takes no memory setting; the lane base is held open
+        // for as long as the cache holds it, like any other store here.
+        base.apply_reader_memory(MCP_READER_MEMORY).map_err(|err| {
+            OpenFailure::other(format!(
+                "immutable base snapshot at {} could not be configured: {err}",
+                path.display()
+            ))
+        })?;
+        return Ok(base);
     }
     match Store::open_read_only_with(path, MCP_READER_MEMORY) {
         Ok(store) => Ok(store),
@@ -374,6 +387,7 @@ will not be migrated in-place. Run `devmap build` in that repository. {err}",
         Err(err) if Store::sqlite_error_is_corrupt(&err) => Err(OpenFailure {
             message: corrupt_store_message(path, &err, CorruptContext::Reopened),
             corrupt: true,
+            raw: err.to_string(),
         }),
         Err(err) => Err(OpenFailure::other(format!(
             "devmap index at {} could not be opened: {err}",
@@ -411,12 +425,15 @@ pub fn corrupt_store_message(
     let cause = match context {
         CorruptContext::Reopened => {
             "including on a connection opened afresh, so this is the file and not a stale handle"
+                .to_string()
         }
-        CorruptContext::KnownUnchanged => {
-            "on an earlier call, and the file has not changed since, so it was not read again"
-        }
+        CorruptContext::KnownUnchanged => format!(
+            "on an earlier call, and the file has not changed since, so it was not read again \
+(this clears when the file changes, or after {} seconds)",
+            DAMAGE_MEMORY_TTL.as_secs()
+        ),
         CorruptContext::CallerOwned => {
-            "on a store this server was handed already open, which it does not reopen"
+            "on a store this server was handed already open, which it does not reopen".to_string()
         }
     };
     format!(
@@ -463,34 +480,95 @@ impl DamageStamp {
     }
 }
 
+/// How long a remembered verdict stands before one real open is tried again.
+///
+/// Thirty seconds, the scale of the ref cache's own freshness bounds. A burst
+/// of calls (an agent retrying a failed search a few times in a few seconds)
+/// costs one failing open between them; a verdict that was wrong, or a repair
+/// that leaves the stamp unchanged, clears itself within half a minute instead
+/// of needing the server restarted.
+pub const DAMAGE_MEMORY_TTL: Duration = Duration::from_secs(30);
+
+/// What was found damaged. Damage confined to the full-text index leaves every
+/// question that does not read it answerable, so it is remembered apart from
+/// damage to the file as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageKind {
+    File,
+    FullText,
+}
+
+struct DamageEntry {
+    key: PathBuf,
+    kind: DamageKind,
+    stamp: DamageStamp,
+    remembered_at: Instant,
+    cause: String,
+}
+
 /// Files found damaged, so a damaged store costs one stat per call and not an
 /// open and a failing query (twice) on every call, across every server.
-#[derive(Default)]
+///
+/// A verdict stands only while the file is the one it was found in (identity,
+/// length, modification time, `-wal`) and only for [`DAMAGE_MEMORY_TTL`].
 pub struct DamageMemory {
-    entries: Vec<(PathBuf, DamageStamp)>,
+    entries: Vec<DamageEntry>,
+    clock: Clock,
+}
+
+impl Default for DamageMemory {
+    fn default() -> Self {
+        Self::with_clock(system_clock())
+    }
 }
 
 impl DamageMemory {
-    pub fn remember(&mut self, key: PathBuf, stamp: DamageStamp) {
-        self.entries.retain(|(known, _)| *known != key);
+    pub fn with_clock(clock: Clock) -> Self {
+        Self {
+            entries: Vec::new(),
+            clock,
+        }
+    }
+
+    pub fn remember(&mut self, key: PathBuf, kind: DamageKind, stamp: DamageStamp, cause: String) {
+        self.entries
+            .retain(|known| !(known.key == key && known.kind == kind));
         if self.entries.len() >= DAMAGE_MEMORY_CAP {
             self.entries.remove(0);
         }
-        self.entries.push((key, stamp));
+        let remembered_at = (self.clock)();
+        self.entries.push(DamageEntry {
+            key,
+            kind,
+            stamp,
+            remembered_at,
+            cause,
+        });
     }
 
-    /// Whether `key` is remembered as damaged and `current` is still the file
-    /// that was. A stamp that differs, or a file that cannot be stat-ed,
-    /// forgets the entry: the file has changed, so it is read again.
-    pub fn still_damaged(&mut self, key: &Path, current: Option<DamageStamp>) -> bool {
-        let Some(pos) = self.entries.iter().position(|(known, _)| known == key) else {
-            return false;
-        };
-        if current == Some(self.entries[pos].1) {
-            return true;
+    /// The cause recorded for `key` if it is remembered as damaged in this way,
+    /// `current` is still the file that was, and the verdict has not outlived
+    /// [`DAMAGE_MEMORY_TTL`]. Otherwise the entry is forgotten (the file has
+    /// changed, cannot be seen, or the verdict is old) and the file is read
+    /// again.
+    pub fn recall(
+        &mut self,
+        key: &Path,
+        kind: DamageKind,
+        current: Option<DamageStamp>,
+    ) -> Option<String> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|known| known.key == key && known.kind == kind)?;
+        let now = (self.clock)();
+        let entry = &self.entries[pos];
+        let fresh = now.saturating_duration_since(entry.remembered_at) < DAMAGE_MEMORY_TTL;
+        if fresh && current == Some(entry.stamp) {
+            return Some(entry.cause.clone());
         }
         self.entries.remove(pos);
-        false
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -544,8 +622,8 @@ pub fn infer_root_from_store(store_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheLookup, Clock, DamageMemory, DamageStamp, IdleSweeper, StoreFileIdentity, StoreLru,
-        StoreOrigin, DAMAGE_MEMORY_CAP, STORE_IDLE_TTL,
+        CacheLookup, Clock, DamageKind, DamageMemory, DamageStamp, IdleSweeper, StoreFileIdentity,
+        StoreLru, StoreOrigin, DAMAGE_MEMORY_CAP, DAMAGE_MEMORY_TTL, STORE_IDLE_TTL,
     };
 
     include!("../../testsupport/timing.rs");
@@ -821,33 +899,100 @@ mod tests {
     fn a_damaged_file_is_remembered_until_it_changes() {
         let file = damaged_file("damage-memory");
         let mut memory = DamageMemory::default();
+        let file_kind = DamageKind::File;
         assert!(
-            !memory.still_damaged(&file, DamageStamp::of(&file)),
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_none(),
             "nothing known yet"
         );
 
-        memory.remember(file.clone(), DamageStamp::of(&file).unwrap());
-        assert!(memory.still_damaged(&file, DamageStamp::of(&file)));
+        memory.remember(
+            file.clone(),
+            file_kind,
+            DamageStamp::of(&file).unwrap(),
+            "page 7 is corrupt".to_string(),
+        );
+        assert_eq!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .as_deref(),
+            Some("page 7 is corrupt"),
+            "the recorded cause is what is recalled"
+        );
         assert!(
-            memory.still_damaged(&file, DamageStamp::of(&file)),
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_some(),
             "stays known"
         );
-
-        // New length and a later modification time.
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&file, b"repaired").unwrap();
         assert!(
-            !memory.still_damaged(&file, DamageStamp::of(&file)),
+            memory
+                .recall(&file, DamageKind::FullText, DamageStamp::of(&file))
+                .is_none(),
+            "a verdict about the file is not a verdict about its full-text index"
+        );
+
+        // A new length and a modification time set explicitly later: no sleeping,
+        // and no assumption about the timestamp resolution of this filesystem.
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, b"repaired").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(before + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_none(),
             "a changed file is read again"
         );
         assert!(memory.is_empty(), "and forgotten");
 
-        memory.remember(file.clone(), DamageStamp::of(&file).unwrap());
+        memory.remember(
+            file.clone(),
+            file_kind,
+            DamageStamp::of(&file).unwrap(),
+            "again".to_string(),
+        );
         std::fs::remove_file(&file).unwrap();
         assert!(
-            !memory.still_damaged(&file, DamageStamp::of(&file)),
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_none(),
             "a file that cannot be seen is not vouched for"
         );
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_remembered_verdict_expires_after_its_ttl_without_the_file_changing() {
+        let (clock, offset) = manual_clock();
+        let file = damaged_file("damage-ttl");
+        let mut memory = DamageMemory::with_clock(clock);
+        memory.remember(
+            file.clone(),
+            DamageKind::File,
+            DamageStamp::of(&file).unwrap(),
+            "cause".to_string(),
+        );
+        advance(&offset, DAMAGE_MEMORY_TTL - A_MOMENT);
+        assert!(
+            memory
+                .recall(&file, DamageKind::File, DamageStamp::of(&file))
+                .is_some(),
+            "just inside the ttl it stands"
+        );
+        advance(&offset, A_MOMENT);
+        assert!(
+            memory
+                .recall(&file, DamageKind::File, DamageStamp::of(&file))
+                .is_none(),
+            "at the ttl an unchanged file is read again: a wrong verdict clears itself"
+        );
+        assert!(memory.is_empty());
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
@@ -855,11 +1000,18 @@ mod tests {
     fn a_change_to_the_wal_alone_clears_a_remembered_damage() {
         let file = damaged_file("damage-wal");
         let mut memory = DamageMemory::default();
-        memory.remember(file.clone(), DamageStamp::of(&file).unwrap());
+        memory.remember(
+            file.clone(),
+            DamageKind::File,
+            DamageStamp::of(&file).unwrap(),
+            "cause".to_string(),
+        );
         let mut wal = file.as_os_str().to_owned();
         wal.push("-wal");
         std::fs::write(PathBuf::from(wal), b"frames").unwrap();
-        assert!(!memory.still_damaged(&file, DamageStamp::of(&file)));
+        assert!(memory
+            .recall(&file, DamageKind::File, DamageStamp::of(&file))
+            .is_none());
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
@@ -869,11 +1021,18 @@ mod tests {
         let file = damaged_file("damage-cap");
         let stamp = DamageStamp::of(&file).unwrap();
         for index in 0..DAMAGE_MEMORY_CAP * 3 {
-            memory.remember(PathBuf::from(format!("store-{index}")), stamp);
+            memory.remember(
+                PathBuf::from(format!("store-{index}")),
+                DamageKind::File,
+                stamp,
+                "cause".to_string(),
+            );
         }
         assert_eq!(memory.len(), DAMAGE_MEMORY_CAP);
         assert!(
-            !memory.still_damaged(Path::new("store-0"), Some(stamp)),
+            memory
+                .recall(Path::new("store-0"), DamageKind::File, Some(stamp))
+                .is_none(),
             "the oldest is the one forgotten"
         );
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();

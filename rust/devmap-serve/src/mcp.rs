@@ -58,8 +58,9 @@ use crate::protocol::{
 };
 use crate::repo_scope::{
     canonicalize_path, corrupt_store_message, infer_root_from_store, open_mcp_store_classified,
-    store_for_repo_path, CacheLookup, CorruptContext, DamageMemory, DamageStamp, IdleSweeper,
-    RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin, STORE_IDLE_SWEEP,
+    store_for_repo_path, CacheLookup, CorruptContext, DamageKind, DamageMemory, DamageStamp,
+    IdleSweeper, OpenFailure, RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin,
+    STORE_IDLE_SWEEP,
 };
 use crate::root_resolve::{file_uri_to_path, roots_with_stores, RootResolveInput, MAX_ROOTS};
 
@@ -505,8 +506,12 @@ with an absolute repository path."
         // here, after the cache lock is released, never under it.
         let idle = crate::lock_recover(&self.opened).evict_idle();
         drop(idle);
-        if let Some(message) = self.known_damage(&key) {
-            return Err(message);
+        if let Some(cause) = self.known_damage(&key, DamageKind::File) {
+            return Err(corrupt_store_message(
+                &key,
+                &cause,
+                CorruptContext::KnownUnchanged,
+            ));
         }
         {
             let mut cache = crate::lock_recover(&self.opened);
@@ -526,13 +531,14 @@ with an absolute repository path."
             Ok(metadata) if metadata.is_file() => StoreFileIdentity::of(&metadata),
             _ => return Err(explain_absence(store_path)),
         };
+        let stamp_before = DamageStamp::of(&key);
         let store = match open_mcp_store_classified(store_path) {
             Ok(store) => Arc::new(store),
             Err(failure) => {
                 // Damage found while opening is remembered like damage found
                 // by a query: the file is not opened again until it changes.
                 if failure.corrupt {
-                    self.remember_damage(store_path);
+                    self.remember_damage(store_path, DamageKind::File, stamp_before, &failure.raw);
                 }
                 return Err(failure.message);
             }
@@ -591,26 +597,95 @@ with an absolute repository path."
         }
     }
 
-    /// Record that the file at `store_path` is damaged as it stands now.
-    pub fn remember_damage(&self, store_path: &Path) {
-        let key = devmap_extract::safe_fs::resolve_file_alias(store_path)
-            .unwrap_or_else(|_| store_path.to_path_buf());
-        if let Some(stamp) = DamageStamp::of(&key) {
-            crate::lock_recover(&self.damaged).remember(key, stamp);
+    /// The key a verdict about `store_path` is filed under.
+    fn damage_key(store_path: &Path) -> PathBuf {
+        devmap_extract::safe_fs::resolve_file_alias(store_path)
+            .unwrap_or_else(|_| store_path.to_path_buf())
+    }
+
+    /// The state of the file at `store_path` now, to be taken BEFORE the
+    /// attempt whose failure may be remembered.
+    fn damage_stamp(store_path: &Path) -> Option<DamageStamp> {
+        DamageStamp::of(&Self::damage_key(store_path))
+    }
+
+    /// Record that the file at `store_path` was found damaged, with `cause`.
+    ///
+    /// `stamp_before` is the file's state before the attempt that failed. The
+    /// verdict is kept only if the file is in that same state now: a rebuild
+    /// that finished in between has replaced the file the attempt read, and
+    /// remembering the old verdict would refuse the new, healthy file.
+    ///
+    /// A stacked lane's base is never remembered: it is an immutable snapshot
+    /// whose stamp never changes, so a verdict about it could only be undone by
+    /// restarting the server, and damage in a lane is attributed to the lane's
+    /// own files by the lane path instead.
+    pub fn remember_damage(
+        &self,
+        store_path: &Path,
+        kind: DamageKind,
+        stamp_before: Option<DamageStamp>,
+        cause: &str,
+    ) {
+        if store_path.file_name().and_then(|name| name.to_str()) == Some("base.sqlite") {
+            return;
+        }
+        let key = Self::damage_key(store_path);
+        let now = DamageStamp::of(&key);
+        if stamp_before.is_some() && stamp_before == now {
+            if let Some(stamp) = now {
+                crate::lock_recover(&self.damaged).remember(key, kind, stamp, cause.to_string());
+            }
         }
     }
 
-    /// The error to give, without opening anything, when `key` was found
-    /// damaged on an earlier call and is the same file in the same state.
-    fn known_damage(&self, key: &Path) -> Option<String> {
-        let still = crate::lock_recover(&self.damaged).still_damaged(key, DamageStamp::of(key));
-        still.then(|| {
-            corrupt_store_message(
-                key,
-                &"database disk image is malformed",
-                CorruptContext::KnownUnchanged,
-            )
+    /// The cause recorded for `key` when it was found damaged in this way on an
+    /// earlier call, is the same file in the same state, and the verdict is
+    /// young enough to stand.
+    fn known_damage(&self, key: &Path, kind: DamageKind) -> Option<String> {
+        crate::lock_recover(&self.damaged).recall(key, kind, DamageStamp::of(key))
+    }
+
+    /// Open `store_path` without caching it, for a caller that will keep it
+    /// only if it works.
+    fn open_candidate(&self, store_path: &Path) -> Result<Candidate, OpenFailure> {
+        let identity = std::fs::metadata(store_path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|metadata| StoreFileIdentity::of(&metadata))
+            .ok_or_else(|| OpenFailure {
+                message: explain_absence(store_path),
+                corrupt: false,
+                raw: explain_absence(store_path),
+            })?;
+        let store = Arc::new(open_mcp_store_classified(store_path)?);
+        Ok(Candidate {
+            key: Self::damage_key(store_path),
+            store,
+            identity,
         })
+    }
+
+    /// Whether the entry for `store_path` was handed in by the caller.
+    fn holds_caller_owned(&self, store_path: &Path) -> bool {
+        let cache = crate::lock_recover(&self.opened);
+        cache.holds_caller_owned(&Self::damage_key(store_path))
+            || cache.holds_caller_owned(store_path)
+    }
+
+    /// Replace the cached connection for the candidate's path with it.
+    fn adopt(&self, candidate: Candidate) {
+        let replaced = {
+            let mut cache = crate::lock_recover(&self.opened);
+            let replaced = cache.evict_opened(&candidate.key);
+            cache.insert(
+                candidate.key,
+                candidate.store,
+                StoreOrigin::Opened(candidate.identity),
+            );
+            replaced
+        };
+        drop(replaced);
     }
 
     /// Open the store this call should read, honouring optional `repo_path`.
@@ -3200,34 +3275,41 @@ that failed is not a statement that nothing was found. {}",
     }
 }
 
-/// Name the lane file behind a corrupt error. The base snapshot is probed first
-/// because a failing probe there settles it; otherwise the delta, if there is
-/// one, is the file the answer also read.
-fn name_lane_damage(
-    stacked: &devmap_query::stacked::StackedStore,
-    error: anyhow::Error,
-) -> anyhow::Error {
+/// Name the lane file behind a corrupt error.
+///
+/// A lane has two SQLite files. The delta tags its own failures where they
+/// happen ([`devmap_store::DeltaDamaged`], added by every `DeltaStore` entry
+/// point, the open included), so a corrupt error carrying that tag is the
+/// delta's and anything else is the shared base snapshot's. Nothing is probed:
+/// a probe that happened not to read the damaged page would blame the wrong
+/// file.
+fn name_lane_damage(attr_root: &Path, error: anyhow::Error) -> anyhow::Error {
     if !Store::is_database_corrupt(&error) {
         return error;
     }
-    let base = stacked.base_store();
-    let base_failed = base
-        .status("lane-probe")
-        .err()
-        .is_some_and(|probe| Store::sqlite_error_is_corrupt(&probe));
-    let damage = match (base_failed, stacked.delta_store()) {
-        (false, Some(delta)) => LaneDamage {
-            file: delta.path().to_path_buf(),
+    let damage = match error.downcast_ref::<devmap_store::DeltaDamaged>() {
+        Some(delta) => LaneDamage {
+            file: delta.path.clone(),
             remedy: "Remove that file and run `devmap seed --sync-delta` (or \
 `devmap build --manifest`) in this worktree.",
         },
-        _ => LaneDamage {
-            file: base.path().map(Path::to_path_buf).unwrap_or_default(),
+        None => LaneDamage {
+            file: devmap_extract::paths::stack_lease_path(attr_root)
+                .parent()
+                .map(|state| state.join("stack").join("base.sqlite"))
+                .unwrap_or_default(),
             remedy: "Run `devmap seed --stacked --from <donor checkout>` in this worktree to \
 replace the lane's base snapshot.",
         },
     };
     error.context(damage)
+}
+
+/// An opened store that is not yet cached.
+struct Candidate {
+    key: PathBuf,
+    store: Arc<Store>,
+    identity: StoreFileIdentity,
 }
 
 /// What became of the cached entry a corrupt query used.
@@ -3250,8 +3332,12 @@ enum Eviction {
 /// * Otherwise the entry is evicted, the same path reopened once and the call
 ///   retried. The path is the failed attempt's own, never re-resolved, so the
 ///   retry cannot answer from a different repository while naming the first.
-/// * A second corrupt answer is remembered against the file's state, so the
-///   next call is refused with a stat and no open until the file changes.
+/// * Damage met only in the full-text index leaves the cached handle in place
+///   (it still answers every other tool); see [`recover_from_full_text_damage`].
+/// * A second corrupt answer is remembered against the file's state, taken
+///   before the reopen and checked again after the failure, so the next call is
+///   refused with a stat and no open until the file changes or the verdict
+///   expires.
 async fn recover_from_damage(
     slot: &StoreSlot,
     first: anyhow::Error,
@@ -3265,6 +3351,20 @@ async fn recover_from_damage(
     if let Some(lane) = first.downcast_ref::<LaneDamage>() {
         return report(format!("{lane} (raw: {first:#})"));
     }
+    let stamp_before = StoreSlot::damage_stamp(db_path);
+    if Store::is_full_text_damage(&first) {
+        return recover_from_full_text_damage(
+            slot,
+            first,
+            db_path,
+            attr_root,
+            (tool, arguments),
+            cancel,
+            started,
+            stamp_before,
+        )
+        .await;
+    }
     match slot.evict_cached(db_path) {
         Eviction::CallerOwned => {
             return report(corrupt_store_message(
@@ -3277,7 +3377,13 @@ async fn recover_from_damage(
     }
     let engine = match slot.reopen(db_path) {
         Ok(engine) => engine,
-        Err(reason) => return report(reason),
+        // Keep the first failure in the answer: the reopen failing says the
+        // file is unreadable now, not what this call first saw.
+        Err(reason) => {
+            return report(format!(
+                "{reason} (the first failure on this call was: {first:#})"
+            ))
+        }
     };
     let command = match to_ipc_command(tool, arguments) {
         Ok(command) => command,
@@ -3300,12 +3406,89 @@ async fn recover_from_damage(
                 return report(format!("{lane} (raw: {second:#})"));
             }
             slot.evict_cached(db_path);
-            slot.remember_damage(db_path);
-            report(corrupt_store_message(
-                db_path,
-                &second,
-                CorruptContext::Reopened,
+            slot.remember_damage(db_path, DamageKind::File, stamp_before, &second.to_string());
+            report(format!(
+                "{} (the first failure on this call was: {first:#})",
+                corrupt_store_message(db_path, &second, CorruptContext::Reopened)
             ))
+        }
+        other => other,
+    }
+}
+
+/// What a search says when the full-text index is damaged.
+fn full_text_damage_message(db_path: &Path, cause: &dyn std::fmt::Display) -> String {
+    format!(
+        "the full-text index of the devmap store at {} is damaged ({cause}). Search is \
+refused; every other tool still answers from this store. Run `devmap repair --fts` in that \
+repository to rebuild the index, which does not need a full rebuild.",
+        db_path.display()
+    )
+}
+
+/// A query met damage in the full-text index.
+///
+/// The file as a whole is not lost: this connection still answers every
+/// question that does not read the index, and a fresh open of such a file can
+/// fail (the index's configuration is read when it connects), so the cached
+/// handle is not evicted up front. A fresh handle is tried on the side; it
+/// replaces the cached one only if it answers (the old handle was stale), and
+/// otherwise the damage is remembered against the file's state so a repeated
+/// search is refused without opening anything again.
+#[allow(clippy::too_many_arguments)]
+async fn recover_from_full_text_damage(
+    slot: &StoreSlot,
+    first: anyhow::Error,
+    db_path: &Path,
+    attr_root: PathBuf,
+    (tool, arguments): (&str, Option<&Value>),
+    cancel: &devmap_query::Cancel,
+    started: Instant,
+    stamp_before: Option<DamageStamp>,
+) -> DispatchOutcome {
+    let report = |message: String| -> DispatchOutcome { Ok(Ok(Err(anyhow::anyhow!(message)))) };
+    let key = StoreSlot::damage_key(db_path);
+    // A store handed in already open is reported on and left as it is.
+    if slot.holds_caller_owned(db_path) {
+        return report(full_text_damage_message(db_path, &first));
+    }
+    if let Some(cause) = slot.known_damage(&key, DamageKind::FullText) {
+        return report(full_text_damage_message(db_path, &cause));
+    }
+    let remember = |cause: &str| {
+        slot.remember_damage(db_path, DamageKind::FullText, stamp_before, cause);
+    };
+    let candidate = match slot.open_candidate(db_path) {
+        Ok(candidate) => candidate,
+        Err(failure) if failure.corrupt => {
+            remember(&failure.raw);
+            return report(full_text_damage_message(db_path, &first));
+        }
+        Err(failure) => return report(failure.message),
+    };
+    let command = match to_ipc_command(tool, arguments) {
+        Ok(command) => command,
+        Err(err) => return report(err.message().to_string()),
+    };
+    let again = run_dispatch(
+        Arc::clone(&candidate.store),
+        attr_root,
+        IpcRequest {
+            version: PROTOCOL_VERSION,
+            command,
+        },
+        cancel,
+        CALL_TIMEOUT.saturating_sub(started.elapsed()),
+    )
+    .await;
+    match again {
+        Ok(Ok(Ok(value))) => {
+            slot.adopt(candidate);
+            Ok(Ok(Ok(value)))
+        }
+        Ok(Ok(Err(second))) if Store::is_full_text_damage(&second) => {
+            remember(&second.to_string());
+            report(full_text_damage_message(db_path, &second))
         }
         other => other,
     }
@@ -3341,13 +3524,16 @@ fn dispatch_with_stacked_overlay(
     cancel: &devmap_query::Cancel,
     unapplied: &crate::protocol::UnappliedEdits,
 ) -> anyhow::Result<Value> {
-    let Some(stacked) = devmap_query::stacked::StackedStore::open_if_leased(attr_root)? else {
-        return dispatch(engine, request, cancel, unapplied);
+    // The lane opens its own base and delta, never the cached `engine`, and the
+    // open reads both files: damage met there (a corrupt delta fails the open)
+    // is attributed like damage met later, so the open is inside the naming.
+    let stacked = match devmap_query::stacked::StackedStore::open_if_leased(attr_root) {
+        Ok(Some(stacked)) => stacked,
+        Ok(None) => return dispatch(engine, request, cancel, unapplied),
+        Err(error) => return Err(name_lane_damage(attr_root, error)),
     };
-    // The lane opens its own base and delta, never the cached `engine`, so
-    // damage found here says which lane file failed (see `name_lane_damage`).
     lane_answer(&stacked, request, cancel, unapplied)
-        .map_err(|error| name_lane_damage(&stacked, error))
+        .map_err(|error| name_lane_damage(attr_root, error))
 }
 
 fn lane_answer(
@@ -5026,7 +5212,35 @@ mod transport_audit_tests {
 
 #[cfg(test)]
 mod damage_recovery_tests {
-    use super::{recover_from_damage, StoreSlot};
+    use super::{name_lane_damage, recover_from_damage, StoreSlot};
+
+    /// The base is the untagged remainder: a corrupt error without the delta's
+    /// tag is named as the lane's base snapshot, with the base's remedy; a
+    /// tagged one is the delta's. (A real-file base-damage test is impossible:
+    /// the lease seal refuses a written base before SQLite can say corrupt.)
+    #[test]
+    fn a_corrupt_error_is_the_deltas_only_when_the_delta_tagged_it() {
+        let wt = Path::new("/lane/wt");
+        let untagged = format!("{:#}", name_lane_damage(wt, corrupt()));
+        assert!(untagged.contains("base.sqlite"), "{untagged}");
+        assert!(untagged.contains("devmap seed --stacked"), "{untagged}");
+
+        let delta_path = PathBuf::from("/lane/wt/.devmap/codeintel/delta.sqlite");
+        let tagged = corrupt().context(devmap_store::DeltaDamaged {
+            path: delta_path.clone(),
+        });
+        let tagged = format!("{:#}", name_lane_damage(wt, tagged));
+        assert!(
+            tagged.contains(&delta_path.display().to_string()),
+            "{tagged}"
+        );
+        assert!(tagged.contains("devmap seed --sync-delta"), "{tagged}");
+        assert!(!tagged.contains("base.sqlite"), "{tagged}");
+
+        let other = anyhow::anyhow!("disk full");
+        assert_eq!(format!("{}", name_lane_damage(wt, other)), "disk full");
+    }
+
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
