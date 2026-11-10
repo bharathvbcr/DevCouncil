@@ -181,6 +181,36 @@ Use `--level symbols` for symbol relationships. The JSON result reports
 and makes no network request. Retain shown and total node/link counts in the
 host UI so a cap cannot become a coverage claim.
 
+## Served pages
+
+`devmap mcp --http <ADDR>` (a bare port binds `127.0.0.1`) answers two
+read-only `GET` paths besides its POST-only MCP endpoint:
+
+| Path | Page |
+| --- | --- |
+| `/map_preview.html` | The repo map, rendered from the built `repo_map.json` |
+| `/code_graph.html` | The file-level code graph, rendered from `code_graph.json` |
+
+Both are the same pages `devmap map-html` and `devmap html` write, for the one
+repository the server already resolves for MCP calls. The path is matched
+exactly and no query parameter is read, so a request cannot choose a
+repository. A repository without the built artifact gets a `404` that names
+`devmap build --manifest`, never an empty page. Every other path and verb stays
+`405` with `Allow: POST`.
+
+The pages go through the transport's existing `Origin` and `Host` checks (any
+site `Origin` is refused, and so is a loopback listener reached under a public
+name), carry no CORS headers, and are served with a Content-Security-Policy that
+forbids all network access and framing, plus `X-Frame-Options: DENY`,
+`nosniff`, `no-store` and `no-referrer`. Because a `GET` needs no preflight,
+those checks and headers are what keep another site from reading a page; do not
+bind a routable address unless the repository map may be published there.
+
+The Antigravity sidecar (`antigravity/sidecars/devmap/sidecar.json`) launches
+`devmap mcp --http 127.0.0.1:9095` and points its aux pane at
+`/map_preview.html`. A test pins the manifest's flags and path to the real CLI
+and route.
+
 ## Marker inventory coverage
 
 The repository map keeps marker coverage separate from extraction and graph

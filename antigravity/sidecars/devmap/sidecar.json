@@ -1,7 +1,7 @@
 {
   "command": "devmap",
-  "args": ["serve", "--ui-sidecar", "--port", "9095"],
-  "description": "Interactive force-directed code graph visualizer and blast-radius inspector",
+  "args": ["mcp", "--http", "127.0.0.1:9095"],
+  "description": "Read-only repo map: subsystems, entry points, neighbors and liveness, served by the DevMap HTTP transport from the repository's built map",
   "display_name": "DevMap Code Graph Explorer",
   "has_web_ui": true,
   "restart_policy": "always",
