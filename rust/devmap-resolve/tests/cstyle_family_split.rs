@@ -202,6 +202,123 @@ fn an_extern_declaration_in_the_same_file_still_binds_same_file() {
     );
 }
 
+// ---- heritage, type references and receiver-typed calls ----------------------
+//
+// The attack round found the split also adds edges that are not bare-name
+// calls: a Java `extends`/`implements`, the type reference that goes with it,
+// and a receiver-typed call (`s.area()` on a `Shape` parameter) each had two
+// or three same-named types across Java, C# and C++, so they were ambiguous
+// and bound nothing. Inside one group the target is unique again.
+
+fn group_of(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "java" => "java",
+        "cs" => "csharp",
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "m" | "mm" | "cu" | "cuh" | "metal" => "c-like",
+        _ => "other",
+    }
+}
+
+/// Every edge whose two ends are in different groups.
+fn cross_group_edges(result: &ResolutionResult) -> Vec<String> {
+    result
+        .edges
+        .iter()
+        .filter(|e| {
+            let (s, t) = (group_of(&e.source_file), group_of(&e.target_file));
+            s != "other" && t != "other" && s != t
+        })
+        .map(|e| format!("{:?} {} -> {}", e.edge_kind, e.source_symbol, e.target_symbol))
+        .collect()
+}
+
+fn has_edge(result: &ResolutionResult, kind: EdgeKind, from_sym: &str, to_file: &str) -> bool {
+    result
+        .edges
+        .iter()
+        .any(|e| e.edge_kind == kind && e.source_symbol == from_sym && e.target_file == to_file)
+}
+
+fn heritage_corpus() -> ResolutionResult {
+    resolve(&[
+        // `Base` is declared in Java and in C#.
+        ("adv/Sub.java", "class Sub extends Base { int t(){ return inh(); } }\n"),
+        ("adv/BaseJ.java", "class Base { int inh(){return 1;} }\n"),
+        ("adv/BaseC.cs", "class Base { int inh(){return 2;} }\n"),
+        // `Shape` is declared in Java and in C#.
+        (
+            "adv/Sq.java",
+            "class Sq implements Shape { public int area(){return 1;} } class UseShape { int g(Shape s){ return s.area(); } }\n",
+        ),
+        ("adv/Shape.java", "interface Shape { int area(); }\n"),
+        ("adv/Shape.cs", "interface Shape { int area(); }\n"),
+        // `Widget` is declared in C++, C# and Java.
+        (
+            "adv/Widget.cpp",
+            "class Widget { public: int run(int x){return x;} };\nint use_widget(Widget* w){ return w->run(1); }\n",
+        ),
+        ("adv/Widget.cs", "class Widget { int run(int x){return x;} }\n"),
+        ("adv/Widget.java", "class Widget { int run(int x){return x;} }\n"),
+        // The same method name in Java and C#, and in Java and C.
+        ("adv/JCall.java", "class JCall { int go(){ return jc_name(1); } }\n"),
+        ("adv/J1.java", "class J1 { static int jc_name(int x){return x;} }\n"),
+        ("adv/J1.cs", "class J1c { static int jc_name(int x){return x;} }\n"),
+        ("adv/JCall2.java", "class JCall2 { int go(){ return jcc_name(1); } }\n"),
+        ("adv/J2.java", "class J2 { static int jcc_name(int x){return x;} }\n"),
+        ("adv/j2.c", "int jcc_name(int x){return x;}\n"),
+        // A name only C declares, called from Java and from C#: no edge may
+        // join the groups (this is what makes the invariant fail before).
+        ("adv/uc.c", "int only_in_c(int x){return x;}\n"),
+        ("adv/JU.java", "class JU { int go(){ return only_in_c(1); } }\n"),
+        ("adv/CsU.cs", "class CsU { static int go(){ return only_in_c(1); } }\n"),
+    ])
+}
+
+#[test]
+fn a_java_extends_and_its_inherited_call_bind_the_java_base() {
+    let result = heritage_corpus();
+    assert!(has_edge(&result, EdgeKind::Extends, "adv/Sub.java::Sub", "adv/BaseJ.java"), "Extends");
+    assert!(has_edge(&result, EdgeKind::References, "adv/Sub.java::Sub", "adv/BaseJ.java"), "References");
+    assert!(has_edge(&result, EdgeKind::Calls, "adv/Sub.java::Sub.t", "adv/BaseJ.java"), "inherited call");
+}
+
+#[test]
+fn a_java_implements_and_its_type_references_bind_the_java_interface() {
+    let result = heritage_corpus();
+    assert!(
+        has_edge(&result, EdgeKind::Implements, "adv/Sq.java::Sq", "adv/Shape.java"),
+        "Implements"
+    );
+    assert!(has_edge(&result, EdgeKind::References, "adv/Sq.java::Sq", "adv/Shape.java"));
+    assert!(has_edge(&result, EdgeKind::References, "adv/Sq.java::UseShape.g", "adv/Shape.java"));
+}
+
+#[test]
+fn a_receiver_typed_call_binds_the_member_of_its_own_groups_type() {
+    let result = heritage_corpus();
+    assert!(
+        has_edge(&result, EdgeKind::Calls, "adv/Sq.java::UseShape.g", "adv/Shape.java"),
+        "Java s.area() on a Shape parameter"
+    );
+    assert!(
+        has_edge(&result, EdgeKind::Calls, "adv/Widget.cpp::use_widget", "adv/Widget.cpp"),
+        "C++ w->run() on a Widget pointer"
+    );
+}
+
+#[test]
+fn a_java_bare_call_with_a_csharp_or_c_namesake_binds_the_java_method() {
+    let result = heritage_corpus();
+    assert!(has_edge(&result, EdgeKind::Calls, "adv/JCall.java::JCall.go", "adv/J1.java"), "Java + C# namesake");
+    assert!(has_edge(&result, EdgeKind::Calls, "adv/JCall2.java::JCall2.go", "adv/J2.java"), "Java + C namesake");
+}
+
+#[test]
+fn no_edge_of_any_kind_crosses_a_group() {
+    let crossing = cross_group_edges(&heritage_corpus());
+    assert!(crossing.is_empty(), "cross-group edges: {crossing:#?}");
+}
+
 // ---- the family table --------------------------------------------------------
 
 #[test]
