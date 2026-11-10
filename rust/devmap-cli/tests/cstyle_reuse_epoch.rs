@@ -75,6 +75,51 @@ fn has_stale_edge(root: &std::path::Path) -> bool {
 /// edge is in the latest generation and in `Cls.java`'s reuse blob under
 /// `resolution-reuse-1`.
 fn warm_store_from_the_base_resolver(label: &str) -> std::path::PathBuf {
+    stage_store(label, false)
+}
+
+/// Stamp every stored payload with the extractor identity ONE BELOW this
+/// binary's, which is exactly the "v99 over a v98 store" case.
+///
+/// The field and comparison are the no-change shortcut's own: `build.rs:588`
+/// gates the early return on `store.latest_generation_payload_is_current()`,
+/// which (`devmap-store/src/db/generation.rs:582-613`) compares each latest
+/// payload's `file_payloads.analyzer_version` with
+/// `devmap_extract::cache::current_payload_identity(language).1`, that is
+/// `"{ANALYZER_VERSION}:extract-v{EXTRACTION_SCHEMA_VERSION}"`
+/// (`devmap-extract/src/cache.rs:875`). The value written here is that string
+/// with the schema number lowered by one, per language.
+fn stamp_older_extractor(root: &std::path::Path) {
+    let conn = rusqlite::Connection::open(db_path(root)).unwrap();
+    let languages: Vec<String> = conn
+        .prepare("SELECT DISTINCT language FROM file_payloads")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(!languages.is_empty(), "the store carries payloads");
+    for language in languages {
+        let (_, current) = devmap_extract::cache::current_payload_identity(&language);
+        let (prefix, n) = current.rsplit_once("extract-v").expect("an extract-vNN identity");
+        let older = format!("{prefix}extract-v{}", n.parse::<u32>().unwrap() - 1);
+        let stored: String = conn
+            .query_row(
+                "SELECT DISTINCT analyzer_version FROM file_payloads WHERE language = ?1",
+                [&language],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, current, "{language}: the store was built by this binary");
+        conn.execute(
+            "UPDATE file_payloads SET analyzer_version = ?1 WHERE language = ?2",
+            [&older, &language],
+        )
+        .unwrap();
+    }
+}
+
+fn stage_store(label: &str, older_extractor: bool) -> std::path::PathBuf {
     let root = scratch(label);
     build(&root, &[]);
     assert!(
@@ -131,6 +176,9 @@ fn warm_store_from_the_base_resolver(label: &str) -> std::path::PathBuf {
     assert_eq!(added, 1, "the stale edge was staged");
     drop(conn);
     assert!(has_stale_edge(&root), "the staged store carries the stale edge");
+    if older_extractor {
+        stamp_older_extractor(&root);
+    }
     root
 }
 
@@ -197,4 +245,42 @@ fn a_zero_edit_build_keeps_the_stale_edge_by_the_no_change_shortcut() {
     let out = build(&root, &[]);
     assert!(out.contains("No source changes"), "expected the shortcut; build said:\n{out}");
     assert!(has_stale_edge(&root));
+}
+
+/// The forcing step the no-change shortcut does have: a store stamped by an
+/// older extractor is not "still current", so a ZERO-EDIT build re-extracts and
+/// re-resolves instead of returning early. Combined with the epoch (the reuse
+/// blobs of a pre-split store sit under `resolution-reuse-1`, which this build
+/// never reads), the pre-split cross-group edge is gone. This is what an
+/// extract-schema bump does to every store built before it.
+#[test]
+fn a_zero_edit_build_over_an_older_extractor_store_drops_the_stale_edge() {
+    let root = stage_store("zero-older", true);
+    let out = build(&root, &[]);
+    assert!(
+        !out.contains("No source changes"),
+        "an older extractor identity must defeat the no-change shortcut; build said:\n{out}"
+    );
+    assert!(
+        !has_stale_edge(&root),
+        "a pre-split cross-group edge survived a zero-edit build over an older extractor; build said:\n{out}"
+    );
+    assert_legacy_reuse_dir_removed(&root);
+}
+
+/// The paired control that makes the test above discriminate: the SAME staged
+/// store and the same zero-edit build, with the extractor stamp EQUAL to this
+/// binary's (nothing stamped), takes the shortcut and keeps the stale edge.
+/// Only the version stamp differs between the two tests.
+#[test]
+fn a_zero_edit_build_over_a_current_extractor_store_keeps_the_stale_edge() {
+    let root = stage_store("zero-current", false);
+    let out = build(&root, &[]);
+    assert!(out.contains("No source changes"), "expected the shortcut; build said:\n{out}");
+    assert!(has_stale_edge(&root), "the stale edge must still be there");
+    assert!(
+        devmap_extract::paths::state_dir(&root).join("resolution-reuse-1").exists()
+            || devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH == "1",
+        "the shortcut returns before the reuse directories are pruned"
+    );
 }
