@@ -139,3 +139,40 @@ fn a_type_receiver_is_not_narrowed_without_scope_facts() {
     let stale = calls_from(&resolve(&files, true), "src/user.rs::fl");
     assert!(confident(&stale).is_empty(), "{stale:?}");
 }
+
+/// Scope facts that were recorded before macros were: the scopes are there, the
+/// macros are not, and "no macro recorded" must read as unknown.
+fn resolve_without_macro_facts(files: &[(&str, &str)]) -> ResolutionResult {
+    let mut extractions: Vec<Extraction> = files
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    for extraction in &mut extractions {
+        let facts = extraction
+            .rust_scope_facts
+            .as_mut()
+            .expect("a fresh extraction records scope facts");
+        facts.macros = None;
+    }
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    resolver.resolve_all(&extractions).unwrap()
+}
+
+#[test]
+fn scope_facts_without_macro_facts_are_unknown_not_macro_free() {
+    let files = [
+        ("src/lib.rs", "pub mod user;\n"),
+        (
+            "src/user.rs",
+            "pub fn h() -> u16 { 2 }\npub fn run() -> u16 { h() }\n",
+        ),
+    ];
+    let fresh = calls_from(&resolve(&files, false), "src/user.rs::run");
+    assert_eq!(fresh, vec![("src/user.rs::h".to_string(), "same_file")]);
+    let stale = calls_from(&resolve_without_macro_facts(&files), "src/user.rs::run");
+    assert!(
+        confident(&stale).is_empty(),
+        "a payload that says nothing of its macros is unknown: {stale:?}"
+    );
+}

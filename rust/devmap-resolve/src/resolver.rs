@@ -394,6 +394,14 @@ pub struct Resolver {
     /// holds whole: an item-position macro invocation, a partial parse, or a
     /// `pub use m::*;` whose source is not indexed.
     rust_opaque_publishers: BTreeSet<String>,
+    /// Every `macro_rules!` name of the crate; `None` when some Rust file does
+    /// not say which it defines, in which case no macro is taken as silent.
+    rust_defined_macros: Option<BTreeSet<String>>,
+    /// For a glob import written in a block of a file's own module, keyed by
+    /// `(file, import start byte)`: every name the glob might provide, with the
+    /// one declaration it comes from (`None` when that is not one declaration).
+    /// Present only when the index can prove the set whole.
+    rust_glob_names: BTreeMap<(String, usize), rust_site_scope::GlobNames>,
     /// Rust: a file a `#[path = "x.rs"] mod x;` declaration names -> the one
     /// file that declares it. That file is the module's parent, whatever the
     /// directory layout says (see `compute_rust_path_modules`).
@@ -815,6 +823,8 @@ impl Resolver {
             reexport_glob_cutoff: None,
             rust_module_globs: BTreeMap::new(),
             rust_opaque_publishers: BTreeSet::new(),
+            rust_defined_macros: None,
+            rust_glob_names: BTreeMap::new(),
             rust_path_modules: BTreeMap::new(),
             rust_scope_globs: BTreeMap::new(),
             rust_scope_named: BTreeMap::new(),

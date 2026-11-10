@@ -1664,6 +1664,24 @@ pub enum RustScopeKind {
     Block,
 }
 
+/// One macro invocation that stands where an item or a statement would: a
+/// `mk!();` in a module body or a block. Such an invocation can declare items
+/// and `use`s the index never sees, in the scope that holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustMacroCall {
+    /// The macro path as written (`mk`, `std::println`).
+    pub name: String,
+    pub start: usize,
+}
+
+/// The macros a Rust file invokes in item or statement position and the ones it
+/// defines with `macro_rules!`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustMacroFacts {
+    pub calls: Vec<RustMacroCall>,
+    pub defined: Vec<String>,
+}
+
 /// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].
 ///
 /// The extractor files an inline module's items, and the items of a function
@@ -1685,6 +1703,11 @@ pub struct RustScopeFacts {
     /// attribute: two bodies of one method that both sit in such spans are
     /// alternatives, not two impls.
     pub cfg_spans: Vec<(usize, usize)>,
+    /// The macros invoked in item or statement position and the ones defined.
+    /// `None` is "not recorded" (a payload written before they were), which a
+    /// reader must treat as unknown, never as "no macros".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macros: Option<RustMacroFacts>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -22,6 +22,8 @@ impl Resolver {
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
         self.rust_opaque_publishers.clear();
+        self.rust_defined_macros = None;
+        self.rust_glob_names.clear();
         self.rust_path_modules.clear();
         self.rust_scope_globs.clear();
         self.rust_scope_named.clear();
@@ -81,6 +83,7 @@ impl Resolver {
         self.rust_cfg_bodies.clear();
         self.rust_deref_targets.clear();
         self.rust_blanket_methods.clear();
+        self.rust_defined_macros = Self::compute_rust_defined_macros(extractions);
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -333,7 +336,10 @@ impl Resolver {
                 }
             }
             if ext.language == "rust" {
-                let scope = super::rust_site_scope::RustFileScope::build(ext);
+                let scope = super::rust_site_scope::RustFileScope::build(
+                    ext,
+                    self.rust_defined_macros.as_ref(),
+                );
                 for sym in &ext.symbols {
                     if scope.is_under_cfg(sym.span.start_byte) {
                         self.rust_cfg_bodies
@@ -749,6 +755,7 @@ impl Resolver {
         self.rust_path_modules = self.compute_rust_path_modules(extractions);
         self.rust_scope_globs = self.compute_rust_scope_globs(extractions);
         self.rust_scope_named = self.compute_rust_scope_named(extractions);
+        self.rust_glob_names = self.compute_rust_glob_names(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
@@ -2494,6 +2501,149 @@ impl Resolver {
             .into_iter()
             .filter_map(|(file, declarer)| declarer.map(|declarer| (file, declarer)))
             .collect()
+    }
+
+    /// Every `macro_rules!` name a Rust file defines, `None` when some Rust file
+    /// does not record its macros: a name it might define cannot be ruled out.
+    pub(super) fn compute_rust_defined_macros(
+        extractions: &[Extraction],
+    ) -> Option<BTreeSet<String>> {
+        let mut defined = BTreeSet::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            let macros = ext.rust_scope_facts.as_ref()?.macros.as_ref()?;
+            defined.extend(macros.defined.iter().cloned());
+        }
+        Some(defined)
+    }
+
+    /// For each glob import written inside a block of a file's own module, the
+    /// whole set of names it might provide, when the index can prove the set.
+    ///
+    /// The glob must name a module file whose last path segment is the file's
+    /// own module name (so `use m::E::*;`, which names an enum and resolves to
+    /// the file of `m`, is refused), with no leading `super`. The module and
+    /// every module its `pub use m2::*;` re-exports must be indexed, parsed
+    /// cleanly, hold no item-position macro and no glob of their own that is
+    /// not a `pub use`. The set is their visible declarations, the names they
+    /// re-export, and every name they import (a module's descendants see those).
+    /// Anything else leaves the glob out, and a glob left out may provide any
+    /// name.
+    pub(super) fn compute_rust_glob_names(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<(String, usize), super::rust_site_scope::GlobNames> {
+        let by_file: BTreeMap<&str, &Extraction> = extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+            .map(|ext| (ext.file_path.as_str(), ext))
+            .collect();
+        let mut out = BTreeMap::new();
+        for ext in by_file.values() {
+            let Some(scope) = self.rust_site_scope.get(&ext.file_path) else {
+                continue;
+            };
+            for imp in ext.imports.iter().filter(|imp| {
+                imp.alias.as_deref() == Some(".")
+                    && !imp.raw_import.trim_start().starts_with("mod ")
+            }) {
+                let at = imp.span.start_byte;
+                if !scope.is_known()
+                    || !scope.is_root_block_glob(at)
+                    || !scope.has_cross_file_glob_at(at)
+                    || imp.raw_import.contains("super::")
+                {
+                    continue;
+                }
+                let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, &imp.module_specifier)
+                else {
+                    continue;
+                };
+                let last = imp.module_specifier.rsplit("::").next().unwrap_or("");
+                let names_the_file = target != ext.file_path
+                    && Self::rust_module_dir(&target)
+                        .and_then(|dir| dir.rsplit('/').next())
+                        .is_some_and(|module| module == last);
+                if !names_the_file {
+                    continue;
+                }
+                if let Some(names) = self.rust_glob_name_set(&ext.file_path, &target, &by_file) {
+                    out.insert((ext.file_path.clone(), at), names);
+                }
+            }
+        }
+        out
+    }
+
+    /// The names `importer`'s glob of the module file `target` might provide,
+    /// each with the one declaration it comes from;
+    /// `None` when the set cannot be proven whole. See
+    /// [`Self::compute_rust_glob_names`].
+    fn rust_glob_name_set(
+        &self,
+        importer: &str,
+        target: &str,
+        by_file: &BTreeMap<&str, &Extraction>,
+    ) -> Option<super::rust_site_scope::GlobNames> {
+        let mut names = super::rust_site_scope::GlobNames::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        let mut pending = vec![target];
+        while let Some(file) = pending.pop() {
+            if !visited.insert(file) {
+                continue;
+            }
+            if self.rust_opaque_publishers.contains(file) {
+                return None;
+            }
+            let scope = self.rust_site_scope.get(file).filter(|s| s.is_known())?;
+            let ext = by_file.get(file)?;
+            // A glob that is not a `pub use` is private to the module, yet a
+            // descendant that globs the module sees what it brought in.
+            let re_exported: BTreeSet<&str> = ext
+                .exports
+                .iter()
+                .filter(|export| export.exported_name == "*")
+                .filter_map(|export| export.module_specifier.as_deref())
+                .collect();
+            let private_glob = ext.imports.iter().any(|imp| {
+                imp.alias.as_deref() == Some(".")
+                    && !imp.raw_import.trim_start().starts_with("mod ")
+                    && !re_exported.contains(imp.module_specifier.as_str())
+            });
+            if private_glob {
+                return None;
+            }
+            for name in self.file_symbols.get(file).into_iter().flatten() {
+                let visible = scope
+                    .root_decl(name)
+                    .is_some_and(|decl| self.rust_decl_is_visible_to(importer, file, &decl.vis));
+                if visible {
+                    names
+                        .entry(name.clone())
+                        .and_modify(|bound| {
+                            if bound.as_ref().is_some_and(|(declarer, _)| declarer != file) {
+                                *bound = None;
+                            }
+                        })
+                        .or_insert_with(|| Some((file.to_string(), name.clone())));
+                }
+            }
+            // Present, but from a declaration this walk does not name.
+            for name in scope.exports().iter().chain(scope.imported_names()) {
+                names.insert(name.clone(), None);
+            }
+            pending.extend(
+                self.rust_module_globs
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            );
+        }
+        Some(names)
     }
 
     /// Every Rust `pub use m::*;` as `(file, the one module file m names)`.

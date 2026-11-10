@@ -19,6 +19,27 @@
 //!    items to their own module and its descendants, `pub(super)` to the parent
 //!    module and its descendants, `pub(in path)` to that module and its
 //!    descendants, `pub(crate)` and `pub` to everyone.
+//! 5. A macro invoked in item or statement position can declare items and `use`s
+//!    in the scope that holds it, and the index cannot expand it.
+//!
+//! The walk outward from a call site asks, at each scope in turn:
+//!
+//! * (a) does it declare the name, or import it by name? That answers.
+//! * (c) otherwise, does it hold a macro invocation that could emit the name?
+//!   Then the answer is `Unknown` and the walk stops. [`SILENT_MACROS`] lists the
+//!   only macros taken to emit nothing, and only while no `macro_rules!` of the
+//!   crate redefines the name.
+//! * (b) otherwise, does it hold a glob import the index cannot prove does NOT
+//!   provide the name? In a block that is `Unknown` and the walk stops; at the
+//!   module level the glob is `Glob` and the file-wide bindings say whether it
+//!   bound the name. A glob is provably irrelevant only when its source module
+//!   is indexed, parsed cleanly, holds no item macro and no private glob, and
+//!   neither it nor the globs it re-exports publish the name
+//!   ([`Resolver::compute_rust_glob_names`]).
+//! * (d) only then does the walk continue outward.
+//!
+//! Every "could not prove" is `Unknown`; none becomes an outer or a default
+//! origin.
 //!
 //! The extractor files an inline module's items, and the items of a function
 //! body, under the file's own namespace, so the symbol table cannot say any of
@@ -29,11 +50,65 @@
 //! existed, or a walk cut short) is `Unknown`, and Unknown never yields a
 //! confident edge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use devmap_extract::model::{Extraction, RustScopeKind, SymbolKind};
 
 use super::Resolver;
+
+/// Macros that emit no item and no `use`, so a call of one in a scope says
+/// nothing about the names that scope holds. The one place the list lives. It
+/// binds only a macro not redefined by a `macro_rules!` of the same name in the
+/// crate, and a path that names `std`, `core`, `alloc`, `log` or `tracing`.
+const SILENT_MACROS: &[&str] = &[
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "vec",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "matches",
+    "panic",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "dbg",
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "event",
+];
+
+/// Crates whose macros [`SILENT_MACROS`] names when written with a path.
+const SILENT_MACRO_ROOTS: &[&str] = &["std", "core", "alloc", "log", "tracing"];
+
+/// Whether the macro invoked as `path` is known to emit no item and no `use`.
+/// `defined` is every `macro_rules!` name in the crate, `None` when some file
+/// does not say.
+fn macro_is_silent(path: &str, defined: Option<&BTreeSet<String>>) -> bool {
+    let Some(defined) = defined else {
+        return false;
+    };
+    let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
+    let Some(name) = segments.pop() else {
+        return false;
+    };
+    let qualified_ok = segments
+        .first()
+        .is_none_or(|root| SILENT_MACRO_ROOTS.contains(root));
+    qualified_ok && SILENT_MACROS.contains(&name) && !defined.contains(name)
+}
 
 /// Where a use of a name inside a file comes from, as far as that file's own
 /// scopes say.
@@ -45,11 +120,13 @@ pub(super) enum RustOrigin {
     Own,
     /// An explicit `use path::Name;` in scope that names another file.
     Named,
-    /// Neither, but a glob import is in scope and may bring the name in.
+    /// Neither, but a glob import is in the site's module and may bring the
+    /// name in.
     Glob,
     /// Nothing in scope binds the name.
     Absent,
-    /// The scopes of the file are not known, or are known but not enough to say.
+    /// The scopes of the file are not known, or are known but not enough to say:
+    /// a macro or a glob nearer than any answer may provide the name.
     Unknown,
 }
 
@@ -100,6 +177,8 @@ struct GlobImport {
     /// Enclosing modules climbed by `use super::*` that stay inside the file;
     /// `None` for a glob that names another file.
     in_file_supers: Option<usize>,
+    /// Start byte of the import, the key of what it provides in the resolver.
+    at: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -111,13 +190,28 @@ struct Scope {
     parent: Option<usize>,
 }
 
+/// The names a block glob might provide, each with the one declaration it comes
+/// from (`None` when that is not one declaration the index names).
+pub(super) type GlobNames = BTreeMap<String, Option<(String, String)>>;
+
+/// What the index can say about one glob import and one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GlobAnswer {
+    /// The glob provably cannot provide the name.
+    Irrelevant,
+    /// The glob provably provides it, from one declaration.
+    Provides,
+    /// It may, or the index cannot say.
+    Unknown,
+}
+
 /// What a lookup found.
 pub(super) struct Lookup {
     pub(super) origin: RustOrigin,
+    /// The block glob that provably provides the name, when that is the answer.
+    pub(super) glob_at: Option<usize>,
     /// `(import start, local name)` of the named import that answered.
     pub(super) import_at: Option<(usize, String)>,
-    /// A glob sits in a scope nearer than the one that answered.
-    pub(super) glob_nearer: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +223,11 @@ pub(super) struct RustFileScope {
     named: BTreeMap<String, Vec<NamedImport>>,
     globs: Vec<GlobImport>,
     cfg_spans: Vec<(usize, usize)>,
+    /// Scopes that hold a macro invocation which may emit items or `use`s.
+    macro_scopes: BTreeSet<usize>,
+    /// Names the file re-exports from elsewhere (`pub use a::b;`,
+    /// `pub use a::b as c;`); its own `pub` items are in `decls`.
+    exports: BTreeSet<String>,
 }
 
 fn leading_supers(raw_import: &str) -> usize {
@@ -143,7 +242,9 @@ fn leading_supers(raw_import: &str) -> usize {
 }
 
 impl RustFileScope {
-    pub(super) fn build(ext: &Extraction) -> Self {
+    /// `defined_macros` is every `macro_rules!` name of the crate, `None` when
+    /// some file does not say.
+    pub(super) fn build(ext: &Extraction, defined_macros: Option<&BTreeSet<String>>) -> Self {
         let mut scope = Self {
             scopes: vec![Scope {
                 module: true,
@@ -157,8 +258,23 @@ impl RustFileScope {
         let Some(facts) = ext.rust_scope_facts.as_ref() else {
             return scope;
         };
+        // Facts written before macros were recorded cannot say which scopes
+        // hold one, which is not the same as holding none.
+        let Some(macros) = facts.macros.as_ref() else {
+            return scope;
+        };
         scope.known = true;
         scope.cfg_spans = facts.cfg_spans.clone();
+        scope.exports = ext
+            .exports
+            .iter()
+            .filter(|export| {
+                export.module_specifier.is_some()
+                    && export.exported_name != "*"
+                    && !export.exported_name.is_empty()
+            })
+            .map(|export| export.exported_name.clone())
+            .collect();
         // `facts.scopes` is in source order, so a scope's parent is the nearest
         // earlier one that contains it.
         for span in &facts.scopes {
@@ -172,6 +288,12 @@ impl RustFileScope {
                 end: span.end,
                 parent,
             });
+        }
+        for call in &macros.calls {
+            if !macro_is_silent(&call.name, defined_macros) {
+                let at = scope.scope_at(call.start);
+                scope.macro_scopes.insert(at);
+            }
         }
         let kinds: BTreeMap<&str, SymbolKind> = ext
             .symbols
@@ -241,6 +363,7 @@ impl RustFileScope {
                 scope.globs.push(GlobImport {
                     scope: at,
                     in_file_supers,
+                    at: imp.span.start_byte,
                 });
                 continue;
             }
@@ -414,32 +537,111 @@ impl RustFileScope {
         None
     }
 
-    pub(super) fn lookup(&self, name: &str, pos: usize) -> Lookup {
+    /// Whether a module `level` reaches, through `use super::*`, a scope that
+    /// holds a macro invocation which may emit the name.
+    fn super_levels_hold_macro(&self, level: usize, depth: usize) -> bool {
+        if depth >= 8 {
+            return true;
+        }
+        self.globs
+            .iter()
+            .filter(|g| g.scope == level)
+            .filter_map(|g| g.in_file_supers)
+            .filter_map(|n| self.climb(level, n))
+            .any(|target| {
+                self.macro_scopes.contains(&target)
+                    || self.super_levels_hold_macro(target, depth + 1)
+            })
+    }
+
+    /// Whether the glob import that starts at `at` is the one of a block that
+    /// sits in the file's own module: the only globs whose source module
+    /// [`Resolver::compute_rust_glob_names`] can name.
+    pub(super) fn is_root_block_glob(&self, at: usize) -> bool {
+        let scope = self.scope_at(at);
+        !self.scopes[scope].module && self.module_of(scope) == 0
+    }
+
+    /// Whether `at` starts a glob import that names another file.
+    pub(super) fn has_cross_file_glob_at(&self, at: usize) -> bool {
+        self.globs
+            .iter()
+            .any(|g| g.at == at && g.in_file_supers.is_none())
+    }
+
+    pub(super) fn exports(&self) -> &BTreeSet<String> {
+        &self.exports
+    }
+
+    pub(super) fn imported_names(&self) -> impl Iterator<Item = &String> {
+        self.named.keys()
+    }
+
+    /// Where `name` written at `pos` comes from. `glob_answer(at)` says what the
+    /// index can prove of the glob import starting at `at` and this name.
+    pub(super) fn lookup(
+        &self,
+        name: &str,
+        pos: usize,
+        glob_answer: &dyn Fn(usize) -> GlobAnswer,
+    ) -> Lookup {
+        let unknown = Lookup {
+            origin: RustOrigin::Unknown,
+            import_at: None,
+            glob_at: None,
+        };
         if !self.known {
-            return Lookup {
-                origin: RustOrigin::Unknown,
-                import_at: None,
-                glob_nearer: false,
-            };
+            return unknown;
         }
         let mut level = self.scope_at(pos);
-        let mut glob_nearer = false;
+        let mut glob_in_module = false;
         loop {
+            // (a) A declaration or a named import answers.
             if let Some((origin, import_at)) = self.explicit_in(level, name, 0) {
                 return Lookup {
                     origin,
                     import_at,
-                    glob_nearer,
+                    glob_at: None,
                 };
             }
-            if self
-                .globs
-                .iter()
-                .any(|g| g.scope == level && g.in_file_supers.is_none())
+            // (c) A macro that may emit the name leaves it unanswered here.
+            if self.macro_scopes.contains(&level)
+                || (self.scopes[level].module && self.super_levels_hold_macro(level, 0))
             {
-                glob_nearer = true;
+                return unknown;
             }
-            if self.scopes[level].module {
+            // (b) A glob that may provide it does too.
+            let module = self.scopes[level].module;
+            let mut unproven = false;
+            let mut provides: Vec<usize> = Vec::new();
+            for g in self.globs.iter().filter(|g| g.scope == level) {
+                match g.in_file_supers {
+                    // A module follows `use super::*` through its parent.
+                    Some(_) => unproven |= !module,
+                    None => match glob_answer(g.at) {
+                        GlobAnswer::Irrelevant => {}
+                        GlobAnswer::Provides => provides.push(g.at),
+                        GlobAnswer::Unknown => unproven = true,
+                    },
+                }
+            }
+            if !module {
+                // Two globs that both provide the name make it ambiguous.
+                if unproven || provides.len() > 1 {
+                    return unknown;
+                }
+                if let Some(&at) = provides.first() {
+                    return Lookup {
+                        origin: RustOrigin::Glob,
+                        import_at: None,
+                        glob_at: Some(at),
+                    };
+                }
+            } else if unproven || !provides.is_empty() {
+                glob_in_module = true;
+            }
+            // (d) Outward, up to the module boundary.
+            if module {
                 break;
             }
             match self.scopes[level].parent {
@@ -448,34 +650,41 @@ impl RustFileScope {
             }
         }
         Lookup {
-            origin: if glob_nearer {
+            origin: if glob_in_module {
                 RustOrigin::Glob
             } else {
                 RustOrigin::Absent
             },
             import_at: None,
-            glob_nearer: false,
+            glob_at: None,
         }
     }
 }
 
 impl Resolver {
+    /// The lookup of `name` at `pos` in `file`, with what the index can prove of the
+    /// glob imports in scope. `None` for a file this resolver
+    /// holds no Rust scope for.
+    fn rust_lookup(&self, file: &str, name: &str, pos: usize) -> Option<Lookup> {
+        let scope = self.rust_site_scope.get(file)?;
+        Some(scope.lookup(
+            name,
+            pos,
+            &|at| match self.rust_glob_names.get(&(file.to_string(), at)) {
+                None => GlobAnswer::Unknown,
+                Some(provided) => match provided.get(name) {
+                    None => GlobAnswer::Irrelevant,
+                    Some(Some(_)) => GlobAnswer::Provides,
+                    Some(None) => GlobAnswer::Unknown,
+                },
+            },
+        ))
+    }
+
     /// Where the bare `name`, written at `site` in `file`, comes from. `None`
     /// for a file this resolver holds no Rust scope for.
     pub(super) fn rust_origin_at(&self, file: &str, name: &str, site: Site) -> Option<RustOrigin> {
-        let lookup = self.rust_site_scope.get(file)?.lookup(name, site.pos);
-        // A glob in a scope nearer than the answer shadows it only if that glob
-        // provides the name, which the file-wide bindings say.
-        if lookup.glob_nearer
-            && lookup.origin != RustOrigin::Unknown
-            && self
-                .import_bindings
-                .get(file)
-                .is_some_and(|bindings| bindings.contains_key(name))
-        {
-            return Some(RustOrigin::Glob);
-        }
-        Some(lookup.origin)
+        Some(self.rust_lookup(file, name, site.pos)?.origin)
     }
 
     /// The `(file, declared name)` the explicit import that answers `name` at
@@ -486,7 +695,7 @@ impl Resolver {
         name: &str,
         site: Site,
     ) -> Option<&(String, String)> {
-        let lookup = self.rust_site_scope.get(file)?.lookup(name, site.pos);
+        let lookup = self.rust_lookup(file, name, site.pos)?;
         if lookup.origin != RustOrigin::Named {
             return None;
         }
@@ -509,11 +718,37 @@ impl Resolver {
         if family != super::LangFamily::Rust {
             return self.import_binding_at(family, file, scope, name);
         }
-        match self.rust_origin_at(file, name, site)? {
+        let lookup = self.rust_lookup(file, name, site.pos)?;
+        match lookup.origin {
             RustOrigin::Named => self.rust_named_binding_at(file, name, site),
+            // A block glob the index proved to provide the name binds it to its
+            // own declaration; any other glob is told by the file-wide table.
+            RustOrigin::Glob if lookup.glob_at.is_some() => self
+                .rust_glob_names
+                .get(&(file.to_string(), lookup.glob_at?))?
+                .get(name)?
+                .as_ref(),
             RustOrigin::Glob | RustOrigin::Absent => self.import_bindings.get(file)?.get(name),
             RustOrigin::Own | RustOrigin::Unknown => None,
         }
+    }
+
+    /// Whether the corpus-unique rung must not bind a bare Rust call to a
+    /// declaration of `target_file`: the origin of the name is unknown here, and
+    /// the one namesake lies in the call's own file, which is the declaration a
+    /// nearer macro or glob would be shadowing. A namesake in another file is
+    /// the unique rung's ordinary guess and stays at its tier.
+    pub(super) fn rust_unique_rung_declines(
+        &self,
+        family: super::LangFamily,
+        file: &str,
+        name: &str,
+        target_file: &str,
+        site: Site,
+    ) -> bool {
+        family == super::LangFamily::Rust
+            && target_file == file
+            && self.rust_origin_at(file, name, site) == Some(RustOrigin::Unknown)
     }
 
     /// Whether the import rung must stand aside for a bare Rust call: a

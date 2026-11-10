@@ -257,6 +257,8 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
     let mut modules = BTreeSet::new();
     let mut scopes: Vec<RustScopeSpan> = Vec::new();
     let mut macros = BTreeSet::new();
+    let mut macro_calls: Vec<RustMacroCall> = Vec::new();
+    let mut macros_defined = BTreeSet::new();
     let mut restricted: Vec<(usize, String)> = Vec::new();
     let mut cfg_spans: Vec<(usize, usize)> = Vec::new();
     let mut derefs = BTreeSet::new();
@@ -284,9 +286,9 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
             }
             "block" => {
                 let mut cursor = node.walk();
-                let holds_names = node
-                    .named_children(&mut cursor)
-                    .any(|child| rust_node_declares_names(child.kind()));
+                let holds_names = node.named_children(&mut cursor).any(|child| {
+                    rust_node_declares_names(child.kind()) || rust_statement_macro(child)
+                });
                 if holds_names {
                     scopes.push(RustScopeSpan {
                         kind: RustScopeKind::Block,
@@ -298,10 +300,27 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
             }
             // An invocation that stands where an item would: its parent is an
             // item list, or the `;`-terminated statement the grammar wraps it
-            // in at that position. One inside a block or expression is not.
-            "macro_invocation" if rust_macro_stands_as_item(node) => {
-                if let Some(path) = node.child_by_field_name("macro") {
-                    macros.insert(get_node_text(path, source));
+            // in at that position. One that stands as a statement of a block
+            // can declare items and `use`s for that block as well. One inside
+            // an expression cannot.
+            "macro_invocation" => {
+                let as_item = rust_macro_stands_as_item(node);
+                if as_item || rust_macro_stands_as_statement(node) {
+                    if let Some(path) = node.child_by_field_name("macro") {
+                        let name = get_node_text(path, source);
+                        if as_item {
+                            macros.insert(name.clone());
+                        }
+                        macro_calls.push(RustMacroCall {
+                            name,
+                            start: node.start_byte(),
+                        });
+                    }
+                }
+            }
+            "macro_definition" => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    macros_defined.insert(name);
                 }
             }
             "impl_item" => {
@@ -354,6 +373,8 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
     restricted.dedup();
     cfg_spans.sort();
     cfg_spans.dedup();
+    macro_calls.sort_by_key(|call| call.start);
+    macro_calls.dedup();
     RustItemFacts {
         inline_modules: modules.into_iter().collect(),
         scope_facts: complete.then(|| RustScopeFacts {
@@ -361,6 +382,10 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
             item_macros: macros.into_iter().collect(),
             restricted_visibility: restricted,
             cfg_spans,
+            macros: Some(RustMacroFacts {
+                calls: macro_calls,
+                defined: macros_defined.into_iter().collect(),
+            }),
         }),
         deref_targets: derefs.into_iter().collect(),
         blanket_impl_params: blankets.into_iter().collect(),
@@ -408,6 +433,31 @@ fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
         previous = sibling.prev_sibling();
     }
     false
+}
+
+/// Whether the invocation is a statement of a block: directly, or wrapped in
+/// the expression statement the grammar puts around `mk!();`.
+fn rust_macro_stands_as_statement(node: Node) -> bool {
+    match node.parent() {
+        Some(p) if p.kind() == "block" => true,
+        Some(p) if p.kind() == "expression_statement" => {
+            p.parent().is_some_and(|b| b.kind() == "block")
+        }
+        _ => false,
+    }
+}
+
+/// Whether a child of a block is a statement-position macro invocation.
+fn rust_statement_macro(child: Node) -> bool {
+    match child.kind() {
+        "macro_invocation" => true,
+        "expression_statement" => {
+            let mut cursor = child.walk();
+            let first = child.named_children(&mut cursor).next();
+            first.is_some_and(|inner| inner.kind() == "macro_invocation")
+        }
+        _ => false,
+    }
 }
 
 fn rust_macro_stands_as_item(node: Node) -> bool {

@@ -1865,7 +1865,15 @@ impl Resolver {
                                     target_f,
                                     target_identity,
                                 );
-                            if !out_of_scope {
+                            if !out_of_scope
+                                && !self.rust_unique_rung_declines(
+                                    family,
+                                    &ext.file_path,
+                                    &call.callee_name,
+                                    target_f,
+                                    Site::of(call.span.start_byte),
+                                )
+                            {
                                 resolution = Some(Arc::new(Resolution::UniqueGlobal {
                                     target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
                                 }));

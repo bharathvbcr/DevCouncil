@@ -560,14 +560,9 @@ impl Resolver {
                     return None;
                 }
             } else {
-                let bound = if origin == RustOrigin::Named {
-                    self.rust_named_binding_at(call_file, type_name, site)
-                } else {
-                    self.import_bindings
-                        .get(call_file)
-                        .and_then(|bindings| bindings.get(type_name))
-                }
-                .map(|(file, _)| file.as_str());
+                let bound = self
+                    .import_binding_for_site(LangFamily::Rust, call_file, None, type_name, site)
+                    .map(|(file, _)| file.as_str());
                 let evidence = if origin == RustOrigin::Own {
                     Some(call_file)
                 } else {
