@@ -157,3 +157,4 @@ rs.f2g	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::Host.attended_f
 rs.f2h	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Door.open_f2n	edge	must		Arc<dyn Gate> reaches the impl although a struct Gate exists elsewhere
 rs.f2i	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Gate.open_f2n	edge	must		control: the trait declaration
 rs.f2j	F2	callers/src/dyngate.rs::pass_f2n	callers/src/gateother.rs::Gate.open_f2n	forbid_any_tier	must		the namesake struct's method is never a target
+rs.f8g	F8	callers/src/fieldname.rs::peek_f8	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		param.field and a.b.field reads are not calls of the method of the same name
