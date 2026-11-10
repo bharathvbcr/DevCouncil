@@ -395,6 +395,9 @@ fn absorb_template_expressions(
     let mut unparsed: Vec<TextRange> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
     let mut cap_noted = false;
+    // Lone identifiers recorded as calls, to be re-read once the snippets of
+    // the whole file are known (`{row}` may come before `{#snippet row()}`).
+    let mut lone_calls: Vec<(String, Span)> = Vec::new();
     while let Some(node) = stack.pop() {
         match node.kind() {
             "script_element" | "style_element" | "frontmatter" => continue,
@@ -404,7 +407,7 @@ fn absorb_template_expressions(
             // `directive_attribute`. A plain attribute is neither, so
             // `class="not js ("` is not parsed as JavaScript.
             "expression" | "raw_text_expr" | "svelte_raw_text" => {
-                take_template_expression(
+                let lone = take_template_expression(
                     node,
                     source,
                     extraction,
@@ -416,13 +419,29 @@ fn absorb_template_expressions(
                     &mut diagnostics,
                     &mut cap_noted,
                 );
+                lone_calls.extend(lone);
                 continue;
             }
             // `{#snippet name(params)}…{/snippet}`: a function of the
             // component, declared in the template. Its children are walked
             // after it, so the calls in its body are read as before.
             "snippet_statement" if extraction.language == "svelte" => {
-                declare_snippet(extraction, node, source);
+                // A second snippet of one name cannot be a node of its own, so
+                // it is charged: its declaration is not in the graph.
+                if !declare_snippet(extraction, node, source) {
+                    unparsed.push(TextRange {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    });
+                }
+            }
+            // `use:action`, `transition:fade`, `in:`, `out:`, `animate:`: the
+            // directive names a function the runtime calls. It is a use of the
+            // name, however the file imported or declared it.
+            "attribute" if extraction.language == "svelte" => {
+                if let Some(reference) = directive_reference(node, source, &file_path) {
+                    extraction.references.push(reference);
+                }
             }
             // The parameter list is TypeScript parameters, not an expression.
             "snippet_start" => {
@@ -491,6 +510,42 @@ fn absorb_template_expressions(
         let children: Vec<Node> = node.children(&mut cursor).collect();
         stack.extend(children.into_iter().rev());
     }
+    // `{row}` or `prop={row}` naming a snippet hands it over; it is not called
+    // here. The lone identifier was recorded as a call before the snippet was
+    // known; it is a reference to the snippet.
+    for (name, span) in lone_calls {
+        let is_snippet = extraction.symbols.iter().any(|symbol| {
+            symbol.name == name
+                && symbol
+                    .signature
+                    .as_deref()
+                    .is_some_and(|signature| signature.starts_with("{#snippet"))
+        });
+        if !is_snippet {
+            continue;
+        }
+        extraction
+            .calls
+            .retain(|call| {
+                !(call.callee_name == name
+                    && call.span.start_byte == span.start_byte
+                    && call.span.end_byte == span.end_byte)
+            });
+        extraction.references.retain(|reference| {
+            !(reference.name == name
+                && reference.kind == ReferenceKind::Call
+                && reference.span.start_byte == span.start_byte
+                && reference.span.end_byte == span.end_byte)
+        });
+        extraction.references.push(ExtractedReference {
+            name,
+            kind: ReferenceKind::Name,
+            span,
+            enclosing_symbol: Some(file_path.clone()),
+            assigned_to: None,
+            receiver_expr: None,
+        });
+    }
     extraction.diagnostics.extend(diagnostics);
     fold_unparsed_ranges(&mut extraction.parse_outcome, unparsed);
 }
@@ -509,25 +564,25 @@ fn take_template_expression(
     unparsed: &mut Vec<TextRange>,
     diagnostics: &mut Vec<String>,
     cap_noted: &mut bool,
-) {
-    let Some(expr) = js_expression_body(node, source) else {
-        return;
-    };
+) -> Option<(String, Span)> {
+    let expr = js_expression_body(node, source)?;
     let svelte = extraction.language == "svelte";
     if let Some(name) = lone_js_identifier(&expr.body) {
         let span = span_of(node);
         // `{$store}`: the name is a store auto-subscription, a read of `store`.
         // It is not a call, and no function is named `$store`.
         if let Some(store) = svelte.then(|| store_name(&name)).flatten() {
-            extraction.references.push(ExtractedReference {
-                name: store.to_string(),
-                kind: ReferenceKind::Name,
-                span,
-                enclosing_symbol: Some(file_path.to_string()),
-                assigned_to: None,
-                receiver_expr: None,
-            });
-            return;
+            if store_can_be_a_target(extraction, store) {
+                extraction.references.push(ExtractedReference {
+                    name: store.to_string(),
+                    kind: ReferenceKind::Name,
+                    span,
+                    enclosing_symbol: Some(file_path.to_string()),
+                    assigned_to: None,
+                    receiver_expr: None,
+                });
+            }
+            return None;
         }
         extraction.calls.push(ExtractedCall {
             caller_symbol: Some(file_path.to_string()),
@@ -536,17 +591,14 @@ fn take_template_expression(
             span: span.clone(),
         });
         extraction.references.push(ExtractedReference {
-            name,
+            name: name.clone(),
             kind: ReferenceKind::Call,
-            span,
+            span: span.clone(),
             enclosing_symbol: Some(file_path.to_string()),
             assigned_to: None,
             receiver_expr: None,
         });
-        return;
-    }
-    if svelte {
-        push_store_reads(extraction, &expr.body, expr.offset, file_path);
+        return Some((name, span));
     }
     // `{` here is an object literal (`:class="{ active: isActive }"`). The
     // statement grammar reads a leading `{` as a block, and a quoted key
@@ -567,6 +619,7 @@ fn take_template_expression(
         cap_noted,
     };
     parse_template_text(node, &expr, wrap, extraction, &mut walk);
+    None
 }
 
 /// What one walk over a file's template expressions shares: the text, the
@@ -605,12 +658,12 @@ fn take_snippet_parameters(node: Node, extraction: &mut Extraction, walk: &mut T
 /// reached by the runtime, like a framework callback. A second snippet of a
 /// name the file already declares (a nested scope) is not declared again,
 /// because one qualified name is one node.
-fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) {
+fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) -> bool {
     let Some(start) = child_of_kind(node, "snippet_start") else {
-        return;
+        return true;
     };
     let Some(name_node) = child_of_kind(start, "snippet_name") else {
-        return;
+        return true;
     };
     let name = text_slice(name_node, source).to_string();
     let qualified = format!("{}::{name}", extraction.file_path);
@@ -621,10 +674,10 @@ fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) {
     {
         extraction.diagnostics.push(format!(
             "snippet `{name}` at byte {} shares the name of an earlier declaration and was not \
-             declared again",
+             declared again; its bytes are charged as unread",
             node.start_byte()
         ));
-        return;
+        return false;
     }
     let signature: String = text_slice(start, source).chars().take(200).collect();
     extraction.symbols.push(crate::model::ExtractedSymbol {
@@ -647,6 +700,34 @@ fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) {
             details: format!("snippet passed to <{component}> as a child, rendered by the component"),
         });
     }
+    true
+}
+
+/// The reference a Svelte directive makes to its function: `use:focus` names
+/// `focus`, `transition:fade|local` names `fade`, and `use:actions.focus`
+/// names `actions`. Any other attribute, and `class:` / `bind:` / `on:` /
+/// `let:`, which name no function, are `None`.
+fn directive_reference(node: Node, source: &str, file_path: &str) -> Option<ExtractedReference> {
+    let name_node = child_of_kind(node, "attribute_name")?;
+    let text = text_slice(name_node, source);
+    let (kind, rest) = text.split_once(':')?;
+    if !matches!(kind, "use" | "transition" | "in" | "out" | "animate") {
+        return None;
+    }
+    let function = rest.split('|').next()?.split('.').next()?;
+    lone_js_identifier(function).filter(|name| name == function)?;
+    let start = name_node.start_byte() + kind.len() + 1;
+    Some(ExtractedReference {
+        name: function.to_string(),
+        kind: ReferenceKind::Name,
+        span: Span {
+            start_byte: start,
+            end_byte: start + function.len(),
+        },
+        enclosing_symbol: Some(file_path.to_string()),
+        assigned_to: None,
+        receiver_expr: None,
+    })
 }
 
 /// The tag name of the component whose tag directly holds `node`, when it is
@@ -751,6 +832,20 @@ fn parse_template_text(
     let outer_source = source;
     let wrapped = wrap.program(&expr.body);
     let program: &str = wrapped.as_deref().unwrap_or(expr.body.as_str());
+    // Store reads: past the bound and the deadline above they are not read,
+    // and the expression is charged as unread; here they are, under the same
+    // deadline as the parse.
+    if wrap != Wrap::SnippetParameters && extraction.language == "svelte" {
+        let lead = usize::from(wrap != Wrap::Bare);
+        if push_store_reads(extraction, program, expr.offset, lead, deadline).is_err() {
+            diagnostics.push(format!(
+                "extraction budget was exhausted before the store reads of the template \
+                 expression at bytes {}..{}; they were not read",
+                node_range.start_byte, node_range.end_byte
+            ));
+            unparsed.push(node_range.clone());
+        }
+    }
     let mut inner =
         crate::treesitter::extract_treesitter_with_budget(file_path, language, program, remaining);
     if wrap != Wrap::Bare {
@@ -1019,130 +1114,103 @@ fn store_name(name: &str) -> Option<&str> {
     (!SVELTE_RUNES.contains(&store)).then_some(store)
 }
 
-/// Where the code of an expression is, as the reads of `$store` find it.
-#[derive(Debug, Clone, Copy)]
-enum ScanMode {
-    /// Code, with the depth of `{` opened since the mode began. A template
-    /// literal's `${` starts a frame of its own, closed by its matching `}`.
-    Code(usize),
-    Quote(u8),
-    Template,
-    LineComment,
-    BlockComment,
+/// Whether `text` holds a `$` followed by a letter or `_`, the only way a
+/// store read can start. A cheap test that spares the parse below for the
+/// expressions and scripts that cannot hold one.
+fn may_read_a_store(text: &str) -> bool {
+    text.as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'$' && (pair[1].is_ascii_alphabetic() || pair[1] == b'_'))
 }
 
-/// Every `$store` auto-subscription in `text`, as `(store, start, end)` with
-/// the byte range of the `$store` token.
+/// Whether `node` is the name a declaration, a parameter or a pattern binds,
+/// as opposed to a use of a name.
+fn binds_the_name(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    ["name", "pattern", "parameter"].iter().any(|field| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == node.id())
+    })
+}
+
+/// Every `$store` auto-subscription in `program`, as `(store, start, end)`
+/// with the byte range of the `$store` token, or `None` when the deadline
+/// passed before the parse finished.
 ///
-/// A token in a string or a comment is text, and a `.$x` is a property. The
-/// scan is over source text rather than over the parse because the parse of a
-/// template expression keeps no identifier that is not called, and a store is
-/// usually read, not called (`{$markers.length}`).
-fn store_reads(text: &str) -> Vec<(String, usize, usize)> {
-    let bytes = text.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    let mut found = Vec::new();
-    let mut stack: Vec<ScanMode> = vec![ScanMode::Code(0)];
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        let next = bytes.get(i + 1).copied();
-        let Some(mode) = stack.last_mut() else {
-            break;
-        };
-        match mode {
-            ScanMode::Code(depth) => match byte {
-                b'\'' | b'"' => {
-                    stack.push(ScanMode::Quote(byte));
-                    i += 1;
-                }
-                b'`' => {
-                    stack.push(ScanMode::Template);
-                    i += 1;
-                }
-                b'/' if next == Some(b'/') => {
-                    stack.push(ScanMode::LineComment);
-                    i += 2;
-                }
-                b'/' if next == Some(b'*') => {
-                    stack.push(ScanMode::BlockComment);
-                    i += 2;
-                }
-                b'{' => {
-                    *depth += 1;
-                    i += 1;
-                }
-                b'}' => {
-                    if *depth > 0 {
-                        *depth -= 1;
-                    } else if stack.len() > 1 {
-                        stack.pop();
-                    }
-                    i += 1;
-                }
-                b'$' => {
-                    let preceded = i > 0 && (is_ident(bytes[i - 1]) || bytes[i - 1] == b'.');
-                    let mut end = i + 1;
-                    while end < bytes.len() && is_ident(bytes[end]) {
-                        end += 1;
-                    }
-                    if !preceded {
-                        if let Some(store) = text.get(i..end).and_then(store_name) {
-                            found.push((store.to_string(), i, end));
-                        }
-                    }
-                    i = end;
-                }
-                _ => i += 1,
-            },
-            ScanMode::Quote(quote) => {
-                if byte == b'\\' {
-                    i += 2;
-                } else {
-                    if byte == *quote {
-                        stack.pop();
-                    }
-                    i += 1;
-                }
-            }
-            ScanMode::Template => match byte {
-                b'\\' => i += 2,
-                b'`' => {
-                    stack.pop();
-                    i += 1;
-                }
-                b'$' if next == Some(b'{') => {
-                    stack.push(ScanMode::Code(0));
-                    i += 2;
-                }
-                _ => i += 1,
-            },
-            ScanMode::LineComment => {
-                if byte == b'\n' {
-                    stack.pop();
-                }
-                i += 1;
-            }
-            ScanMode::BlockComment => {
-                if byte == b'*' && next == Some(b'/') {
-                    stack.pop();
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
+/// A store read is an identifier in expression position in the syntax tree. A
+/// string, a template literal's text, a regular expression, a comment, an
+/// object key, a property name (`obj.$x`), a destructuring key and a label are
+/// each a node of another kind, so none of them can match: there is no text
+/// scan. Only the TypeScript grammar's `identifier` and
+/// `shorthand_property_identifier` nodes (`{ $x }`) are candidates, and a name
+/// that a declaration or a parameter binds is not a use.
+fn store_reads(program: &str, deadline: Instant) -> Option<Vec<(String, usize, usize)>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .ok()?;
+    let (tree, cancelled) = crate::treesitter::parse_until(&mut parser, program, deadline);
+    if cancelled {
+        return None;
     }
-    found
+    let tree = tree?;
+    let mut found = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "identifier" | "shorthand_property_identifier") {
+            if let Some(store) = program
+                .get(node.start_byte()..node.end_byte())
+                .and_then(store_name)
+            {
+                if !binds_the_name(node) {
+                    found.push((store.to_string(), node.start_byte(), node.end_byte()));
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    found.sort_by_key(|(_, start, _)| *start);
+    Some(found)
 }
 
-/// Record each `$store` read in `body` (which starts at byte `offset` of the
-/// file) as a reference to the store `store`, which the file imports or
-/// declares. The enclosing symbol is the innermost declaration holding the
-/// read, or the file.
-fn push_store_reads(extraction: &mut Extraction, body: &str, offset: usize, file_path: &str) {
-    for (store, start, end) in store_reads(body) {
-        let at = offset.saturating_add(start);
+/// Whether a `$name` can be a subscription to a name of this component.
+///
+/// Svelte reads `$name` as a subscription to whatever `name` is, so a store
+/// read of a same-component function or class is a mistake in the program and
+/// not a use of that function: it is not recorded, so it cannot keep the
+/// function alive. An import or a variable can be a store and DevMap does not
+/// know the type of either, so a read of one is recorded and resolves like any
+/// other reference to that name, at the tier the resolver gives it.
+fn store_can_be_a_target(extraction: &Extraction, name: &str) -> bool {
+    !extraction.symbols.iter().any(|symbol| {
+        symbol.name == name && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class)
+    })
+}
+
+/// Record the store reads of `program` as references to the stores read.
+/// `base` is the byte of the file `program` starts at, less `lead` bytes of
+/// wrapper in front of the text. `Err` is a deadline: nothing was read.
+fn push_store_reads(
+    extraction: &mut Extraction,
+    program: &str,
+    base: usize,
+    lead: usize,
+    deadline: Instant,
+) -> Result<(), ()> {
+    if !may_read_a_store(program) {
+        return Ok(());
+    }
+    let reads = store_reads(program, deadline).ok_or(())?;
+    for (store, start, end) in reads {
+        if !store_can_be_a_target(extraction, &store) {
+            continue;
+        }
+        let at = base.saturating_add(start.saturating_sub(lead));
         let enclosing = extraction
             .symbols
             .iter()
@@ -1153,7 +1221,7 @@ fn push_store_reads(extraction: &mut Extraction, body: &str, offset: usize, file
             })
             .min_by_key(|symbol| symbol.span.end_byte - symbol.span.start_byte)
             .map_or_else(
-                || file_path.to_string(),
+                || extraction.file_path.clone(),
                 |symbol| symbol.qualified_name.clone(),
             );
         extraction.references.push(ExtractedReference {
@@ -1161,13 +1229,14 @@ fn push_store_reads(extraction: &mut Extraction, body: &str, offset: usize, file
             kind: ReferenceKind::Name,
             span: Span {
                 start_byte: at,
-                end_byte: offset.saturating_add(end),
+                end_byte: base.saturating_add(end.saturating_sub(lead)),
             },
             enclosing_symbol: Some(enclosing),
             assigned_to: None,
             receiver_expr: None,
         });
     }
+    Ok(())
 }
 
 pub(crate) fn span_of(node: Node) -> Span {
@@ -1598,9 +1667,18 @@ pub(crate) fn merge_embedded_scripts(
         }
 
         absorb(extraction, inner, region.content.start_byte, source);
-        if outer_grammar == "svelte" {
-            let file_path = extraction.file_path.clone();
-            push_store_reads(extraction, text, region.content.start_byte, &file_path);
+        if outer_grammar == "svelte"
+            && push_store_reads(extraction, text, region.content.start_byte, 0, deadline).is_err()
+        {
+            diagnostics.push(format!(
+                "extraction budget was exhausted before the store reads of the script at bytes \
+                 {}..{}; they were not read",
+                region.content.start_byte, region.content.end_byte
+            ));
+            unparsed.push(TextRange {
+                start_byte: region.element.start_byte,
+                end_byte: region.element.end_byte,
+            });
         }
     }
 

@@ -9,3 +9,17 @@ live	src/Board.svelte::cardRow	rendered with {@render}
 live	src/lib/stores.ts::previewMarkers	read only as $previewMarkers
 exported_unreferenced	src/lib/decoy.ts::columnLabel	never imported; the decoy for a same-named import
 exported_unreferenced	src/lib/decoy.ts::priorityLabel	never imported; the decoy for a same-named import
+exempt	src/Stores.svelte::foo	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::bar	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::item	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::zap	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::state	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::derived	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::effect	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::props	module-script export of a component: not a dead candidate
+exported_unreferenced	src/lib/decoy.ts::fade	never imported
+live	src/lib/actions.ts::focusTrap	named only by a directive
+live	src/lib/actions.ts::grow	named only by a directive
+live	src/lib/actions.ts::shrink	named only by a directive
+live	src/lib/actions.ts::reorder	named only by a directive
+live	src/lib/actions.ts::slide	named only by a directive

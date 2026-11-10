@@ -134,3 +134,124 @@ fn runes_strings_and_properties_are_not_store_reads() {
         assert!(!names.contains(&not_a_store), "{not_a_store}: {names:?}");
     }
 }
+
+// ------------------------------------------------------------------ round 2
+
+const PROBE: &str = "<script lang=\"ts\">\n\
+  const pattern = /^\\$foo|\\$bar$/;\n\
+  const obj = { $item: 1, $zap: 2 };\n\
+  const s = \"$foo\";\n\
+  const t = `cost $foo and ${1}`;\n\
+  // $foo in a comment\n\
+  const m = obj.$foo;\n\
+  const { $foo: x } = obj;\n\
+  $bar: for (;;) { break $bar; }\n\
+  let a = $state(0);\n\
+  function foo() {}\n\
+  function bar() {}\n\
+  function item() {}\n\
+  function zap() {}\n\
+  function state() {}\n\
+</script>\n\
+<p title={\"$foo\"}>{`$zap`}{obj.$foo}{/\\$bar/.test(s)}</p>\n";
+
+#[test]
+fn only_an_identifier_in_expression_position_is_a_store_read() {
+    let e = ex(PROBE);
+    let names = name_references(&e);
+    for local in ["foo", "bar", "item", "zap", "state"] {
+        assert!(!names.contains(&local), "{local} read as a store: {:?}", e.references);
+    }
+}
+
+#[test]
+fn a_store_read_never_binds_a_function_of_the_component() {
+    let e = ex("<script lang=\"ts\">\n  import { markers } from './stores';\n  function helper() {}\n  let n = $markers;\n</script>\n{$helper}{$helper.x}{$markers}\n");
+    let names = name_references(&e);
+    assert!(!names.contains(&"helper"), "{:?}", e.references);
+    assert!(names.contains(&"markers"), "{:?}", e.references);
+}
+
+#[test]
+fn a_shorthand_property_and_an_assignment_are_store_reads() {
+    let e = ex("<script lang=\"ts\">\n  import { a, b } from './stores';\n  const o = { $a };\n  $b = 1;\n</script>\n");
+    let names = name_references(&e);
+    assert!(names.contains(&"a") && names.contains(&"b"), "{:?}", e.references);
+}
+
+#[test]
+fn a_snippet_passed_as_a_prop_is_a_reference_not_a_call() {
+    let e = ex(&format!(
+        "{SCRIPT}<Comp {{row}} cell={{row}} />\n{{#snippet row()}}x{{/snippet}}\n{{@render row()}}\n"
+    ));
+    let called = e.calls.iter().filter(|c| c.callee_name == "row").count();
+    assert_eq!(called, 1, "only the render is a call: {:?}", e.calls);
+    let referred = name_references(&e).iter().filter(|n| **n == "row").count();
+    assert_eq!(referred, 2, "{:?}", e.references);
+}
+
+#[test]
+fn a_second_snippet_of_one_name_is_charged_not_dropped() {
+    let source = format!("{SCRIPT}{{#snippet a()}}x{{/snippet}}\n<div>{{#snippet a()}}y{{/snippet}}</div>\n");
+    let e = ex(&source);
+    let ParseOutcome::Partial { error_ranges, .. } = &e.parse_outcome else {
+        panic!("a snippet that is not declared must be charged: {:?}", e.parse_outcome);
+    };
+    let second = source.rfind("{#snippet a()}").expect("second snippet");
+    assert!(
+        error_ranges.iter().any(|r| r.start_byte <= second && second < r.end_byte),
+        "{error_ranges:?}"
+    );
+}
+
+#[test]
+fn a_directive_names_the_function_it_runs() {
+    let e = ex("<script lang=\"ts\">\n  import { focus } from './actions';\n  import { fade } from 'svelte/transition';\n  let x = 1;\n</script>\n\
+<div use:focus={1} transition:fade|local in:fly out:fade animate:flip class:active bind:value={x} on:click={() => 1} use:ns.pick></div>\n");
+    let names = name_references(&e);
+    for used in ["focus", "fade", "fly", "flip", "ns"] {
+        assert!(names.contains(&used), "{used}: {:?}", e.references);
+    }
+    for not_a_function in ["active", "value", "click"] {
+        assert!(!names.contains(&not_a_function), "{not_a_function}: {:?}", e.references);
+    }
+}
+
+fn vue_with(count: usize) -> String {
+    let mut source = String::from("<script setup lang=\"ts\">\nfunction f(n: number) { return n; }\n</script>\n<template>\n");
+    for index in 0..count {
+        source.push_str(&format!("  <li>{{{{ f({index}) }}}}</li>\n"));
+    }
+    source.push_str("</template>\n");
+    source
+}
+
+#[test]
+fn vue_reads_the_same_below_the_old_bound_and_all_of_it_above() {
+    let small = extract_file_with_budget("src/A.vue", &vue_with(50), Duration::from_secs(600));
+    assert!(is_clean(&small), "{:?}", small.parse_outcome);
+    assert_eq!(small.calls.iter().filter(|c| c.callee_name == "f").count(), 50);
+    // Between the old bound (256) and the new one: now read whole.
+    let large = extract_file_with_budget("src/A.vue", &vue_with(300), Duration::from_secs(600));
+    assert!(is_clean(&large), "{:?}", large.parse_outcome);
+    assert_eq!(large.calls.iter().filter(|c| c.callee_name == "f").count(), 300);
+}
+
+/// Astro's grammar hands its `{...}` expressions back as text, which this walk
+/// does not read at all, so the bound on template expressions cannot change
+/// what an Astro file yields: below it and above it the answer is the frontmatter.
+#[test]
+fn astro_is_untouched_by_the_template_expression_bound() {
+    let build = |count: usize| {
+        let mut source = String::from("---\nfunction f(n: number) { return n; }\n---\n<ul>\n");
+        for index in 0..count {
+            source.push_str(&format!("  <li>{{f({index})}}</li>\n"));
+        }
+        source.push_str("</ul>\n");
+        extract_file_with_budget("src/A.astro", &source, Duration::from_secs(600))
+    };
+    let (small, large) = (build(50), build(300));
+    assert!(is_clean(&small) && is_clean(&large));
+    assert_eq!(small.calls.len(), large.calls.len(), "template expressions are not walked");
+    assert!(small.symbols.iter().any(|s| s.name == "f"));
+}

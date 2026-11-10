@@ -17,3 +17,17 @@ sv.decoy_b	namesake	src/Board.svelte	src/lib/decoy.ts::priorityLabel	forbid_any_
 sv.render_a	{@render} of a snippet	src/Board.svelte	src/Board.svelte::columnTitle	edge	must		{@render columnTitle(status)}; a snippet is a symbol
 sv.render_b	{@render} of a snippet	src/Board.svelte	src/Board.svelte::cardRow	edge	must		{@render cardRow(card)} inside an {#each}
 sv.store_read	$store read	src/Board.svelte	src/lib/stores.ts::previewMarkers	edge	must		$previewMarkers in markup is the import's only use
+sv.store_not_foo	not a store read of foo	src/Stores.svelte	src/Stores.svelte::foo	forbid_any_tier	must		$-prefixed spellings of `foo` that are not store reads, beside a function of that name
+sv.store_not_bar	not a store read of bar	src/Stores.svelte	src/Stores.svelte::bar	forbid_any_tier	must		$-prefixed spellings of `bar` that are not store reads, beside a function of that name
+sv.store_not_item	not a store read of item	src/Stores.svelte	src/Stores.svelte::item	forbid_any_tier	must		$-prefixed spellings of `item` that are not store reads, beside a function of that name
+sv.store_not_zap	not a store read of zap	src/Stores.svelte	src/Stores.svelte::zap	forbid_any_tier	must		$-prefixed spellings of `zap` that are not store reads, beside a function of that name
+sv.store_not_state	not a store read of state	src/Stores.svelte	src/Stores.svelte::state	forbid_any_tier	must		$-prefixed spellings of `state` that are not store reads, beside a function of that name
+sv.store_not_derived	not a store read of derived	src/Stores.svelte	src/Stores.svelte::derived	forbid_any_tier	must		$-prefixed spellings of `derived` that are not store reads, beside a function of that name
+sv.store_not_effect	not a store read of effect	src/Stores.svelte	src/Stores.svelte::effect	forbid_any_tier	must		$-prefixed spellings of `effect` that are not store reads, beside a function of that name
+sv.store_not_props	not a store read of props	src/Stores.svelte	src/Stores.svelte::props	forbid_any_tier	must		$-prefixed spellings of `props` that are not store reads, beside a function of that name
+sv.directive_use	use: directive	src/Directives.svelte	src/lib/actions.ts::focusTrap	edge	must		use:focusTrap names the imported function
+sv.directive_in	in: directive	src/Directives.svelte	src/lib/actions.ts::grow	edge	must		in:grow names the imported function
+sv.directive_out	out: directive	src/Directives.svelte	src/lib/actions.ts::shrink	edge	must		out:shrink names the imported function
+sv.directive_animate	animate: directive	src/Directives.svelte	src/lib/actions.ts::reorder	edge	must		animate:reorder names the imported function
+sv.directive_transition_external	transition: of an imported name	src/Directives.svelte	src/lib/decoy.ts::fade	forbid_any_tier	must		transition:fade is svelte/transition's fade, not a local namesake
+sv.directive_transition	transition: directive	src/Directives.svelte	src/lib/actions.ts::slide	edge	must		transition:slide names the imported function
