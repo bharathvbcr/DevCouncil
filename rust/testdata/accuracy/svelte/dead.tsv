@@ -23,3 +23,5 @@ live	src/lib/actions.ts::grow	named only by a directive
 live	src/lib/actions.ts::shrink	named only by a directive
 live	src/lib/actions.ts::reorder	named only by a directive
 live	src/lib/actions.ts::slide	named only by a directive
+live	src/lib/storedecoys.ts::muted	read as $muted in StoreSibling.svelte
+live	src/lib/storedecoys.ts::volume	read as $volume in StoreDecoys.svelte

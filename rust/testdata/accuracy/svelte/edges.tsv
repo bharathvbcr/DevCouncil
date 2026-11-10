@@ -31,3 +31,6 @@ sv.directive_out	out: directive	src/Directives.svelte	src/lib/actions.ts::shrink
 sv.directive_animate	animate: directive	src/Directives.svelte	src/lib/actions.ts::reorder	edge	must		animate:reorder names the imported function
 sv.directive_transition_external	transition: of an imported name	src/Directives.svelte	src/lib/decoy.ts::fade	forbid_any_tier	must		transition:fade is svelte/transition's fade, not a local namesake
 sv.directive_transition	transition: directive	src/Directives.svelte	src/lib/actions.ts::slide	edge	must		transition:slide names the imported function
+sv.imported_store_not_read	imported store, $ spellings that are not reads	src/StoreDecoys.svelte	src/lib/storedecoys.ts::muted	forbid_any_tier	must		a regex, a string, a template-literal text part, an object key, a label and a comment spell $muted; the import is a real store target
+sv.imported_store_read	imported store, the one true read	src/StoreDecoys.svelte	src/lib/storedecoys.ts::volume	edge	must		$volume in expression position beside the decoys
+sv.imported_store_sibling	imported store read	src/StoreSibling.svelte	src/lib/storedecoys.ts::muted	edge	must		{$muted} in markup is the import's only read

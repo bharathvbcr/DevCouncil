@@ -30,9 +30,9 @@
     "present": 113
   },
   "typescript": {
-    "forbid_any_tier_rows": 18,
+    "forbid_any_tier_rows": 19,
     "known_failing": 0,
-    "positive_rows": 92,
-    "present": 92
+    "positive_rows": 94,
+    "present": 94
   }
 }

@@ -164,6 +164,47 @@ fn only_an_identifier_in_expression_position_is_a_store_read() {
     }
 }
 
+/// An IMPORTED store: a real target for a read. `PROBE` above declares each of
+/// its names as a function of the file, and `store_can_be_a_target` drops a
+/// function before the syntax tree is consulted, so it would pass for a text
+/// scan too. Here only the tree stands between a `$foo` spelling and a read.
+const IMPORTED_DECOYS: &str = "<script lang=\"ts\">\n\
+  import { foo } from './stores';\n\
+  const pattern = /^\\$foo|\\$foo$/;\n\
+  const text = \"$foo\";\n\
+  const template = `cost $foo and ${text}`;\n\
+  const obj = { $foo: 1 };\n\
+  $foo: for (;;) { break $foo; }\n\
+  // $foo in a comment\n\
+</script>\n\
+<p title={\"$foo\"}>{`$foo`}{/\\$foo/ instanceof RegExp}{`${text}`}</p>\n";
+
+fn reads_of(e: &Extraction, store: &str) -> usize {
+    name_references(e).iter().filter(|n| **n == store).count()
+}
+
+#[test]
+fn a_dollar_spelling_that_is_not_in_expression_position_never_reads_an_imported_store() {
+    let e = ex(IMPORTED_DECOYS);
+    assert_eq!(
+        reads_of(&e, "foo"),
+        0,
+        "a regex, a string, a template-literal text part, an object key, a label and a \
+         comment are not reads: {:?}",
+        e.references
+    );
+}
+
+#[test]
+fn one_true_read_among_the_decoys_is_the_only_read_of_an_imported_store() {
+    let script = IMPORTED_DECOYS.replace("</script>", "  const read = $foo + 1;\n</script>");
+    let e = ex(&script);
+    assert_eq!(reads_of(&e, "foo"), 1, "{:?}", e.references);
+    let markup = IMPORTED_DECOYS.replace("</p>", "{$foo}</p>");
+    let e = ex(&markup);
+    assert_eq!(reads_of(&e, "foo"), 1, "{:?}", e.references);
+}
+
 #[test]
 fn a_store_read_never_binds_a_function_of_the_component() {
     let e = ex("<script lang=\"ts\">\n  import { markers } from './stores';\n  function helper() {}\n  let n = $markers;\n</script>\n{$helper}{$helper.x}{$markers}\n");
