@@ -704,9 +704,13 @@ pub struct Store {
     /// once. Unlike `generation_counts` these are *not* keyed by the generation
     /// id alone: they are integrity checks, and a row they judge can be
     /// rewritten in place under a standing id by another connection (a kernel
-    /// upgrade rewriting payload identities, a repair). Each is keyed by
-    /// `(generation, PRAGMA data_version)`, so a commit by any other
-    /// connection ends it, and only the newest key is held of each.
+    /// upgrade rewriting payload identities, a repair). Each is keyed by the
+    /// generation and a [`ConnectionStamp`], so a commit by any other
+    /// connection *or* by this store's own ends it, and bounded in age by
+    /// [`GENERATION_CHECK_MAX_AGE`] so damage no key can see is still found.
+    /// Only the newest key is held of each. The file-hash map is not capped:
+    /// it is one `String` and one `u64` per indexed file (about 0.4 MB at
+    /// 3,320 files) and lives as long as the `Store`.
     generation_checks: Mutex<GenerationChecks>,
     /// Last whole-tree source-freshness verdict from [`Store::status`].
     ///
@@ -717,22 +721,85 @@ pub struct Store {
     source_freshness_cache: Mutex<Option<CachedSourceFreshness>>,
 }
 
-/// A value computed for one generation of the database as one connection saw it.
+/// How long a held integrity answer may stand before it is read again.
+///
+/// Neither the generation, `data_version` nor the connection's own change
+/// count moves for damage to pages (a bad sector, a file overwritten in place
+/// by something that is not SQLite), so without a bound a pass read once would
+/// be reported for the life of the process while a fresh read fails. Sixty
+/// seconds: `status` is a health poll (session start, `mcp:doctor`, a human at
+/// a prompt), not a per-query call, so the common poller pays the 14 to 18 ms
+/// scan at most once a minute, while a fault that cannot be seen from the key
+/// is reported within a minute. (How often hooks call `status` was not
+/// measured; the bound is the largest delay in reporting damage judged
+/// acceptable for a diagnostic, not a figure derived from the call rate.)
+const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(test)]
+thread_local! {
+    /// Added to the memo clock by tests, so age is advanced and never slept.
+    static MEMO_CLOCK_SKEW: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// The memo's clock: `Instant::now()`, plus the test skew under `cfg(test)`.
+fn memo_now() -> std::time::Instant {
+    #[cfg(test)]
+    {
+        std::time::Instant::now() + MEMO_CLOCK_SKEW.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Instant::now()
+    }
+}
+
+/// What one connection's view of the database looked like when a held answer
+/// was read.
 ///
 /// `data_version` is SQLite's `PRAGMA data_version`: it changes when a
-/// *different* connection commits, which is exactly the writes this store's own
-/// connection cannot have made and a memo under the generation id would miss.
+/// *different* connection commits. `changes` is this connection's own
+/// `total_changes()`: it counts every row the connection's `INSERT`, `UPDATE`
+/// and `DELETE` statements (triggers included) have touched, so it moves on
+/// every write this store makes without any write path having to remember to
+/// say so. The pair covers every committed row change from any connection; what
+/// it cannot see (page damage, DDL, an in-place overwrite of the file) is what
+/// [`GENERATION_CHECK_MAX_AGE`] bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionStamp {
+    data_version: i64,
+    changes: u64,
+}
+
+/// A value computed for one generation as one connection saw it, and when.
 #[derive(Debug)]
 struct Keyed<T> {
     generation: u32,
-    data_version: i64,
+    stamp: ConnectionStamp,
+    held_at: std::time::Instant,
     value: T,
 }
 
 impl<T> Keyed<T> {
-    fn holds(slot: &Option<Self>, generation: u32, data_version: i64) -> Option<&T> {
+    fn new(generation: u32, stamp: ConnectionStamp, value: T) -> Self {
+        Self {
+            generation,
+            stamp,
+            held_at: memo_now(),
+            value,
+        }
+    }
+
+    /// The held value, if it was read for this generation and stamp and is
+    /// younger than [`GENERATION_CHECK_MAX_AGE`].
+    fn holds(slot: &Option<Self>, generation: u32, stamp: ConnectionStamp) -> Option<&T> {
+        let now = memo_now();
         slot.as_ref()
-            .filter(|held| held.generation == generation && held.data_version == data_version)
+            .filter(|held| {
+                held.generation == generation
+                    && held.stamp == stamp
+                    && now.saturating_duration_since(held.held_at) < GENERATION_CHECK_MAX_AGE
+            })
             .map(|held| &held.value)
     }
 }
