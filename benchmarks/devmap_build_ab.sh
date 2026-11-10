@@ -39,6 +39,10 @@ MANIFEST_FLAG=""
 if [ "${AB_MANIFEST:-0}" = 1 ]; then MANIFEST_FLAG="--manifest"; fi
 
 EDIT1=$(cd "$CORPUS" && git ls-files '*.ts' | head -1)
+# A corpus with no TypeScript edits its first Go file instead, so the harness
+# does not append to the corpus directory itself.
+if [ -z "$EDIT1" ]; then EDIT1=$(cd "$CORPUS" && git ls-files '*.go' | head -1); fi
+if [ -z "$EDIT1" ]; then echo "no .ts or .go file in $CORPUS to edit" >&2; exit 2; fi
 EDIT2=$(cd "$CORPUS" && git ls-files '*.rs' | head -1)
 
 row() {

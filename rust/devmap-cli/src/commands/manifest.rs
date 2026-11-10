@@ -7,7 +7,7 @@ use devmap_query::{
     write_manifest_atomically, write_verbose_code_graph_atomically, ArtifactStamp, FreshnessInfo,
     StampedFreshness, CODE_GRAPH_SCHEMA_VERSION,
 };
-use devmap_store::{Store, StoreStatus};
+use devmap_store::Store;
 
 use crate::cli::{default_root_hint, root_parser, Cli, InventoryFlags, StampFlags};
 use crate::output::{emit_json, ensure_parent, open_for_read};
@@ -149,9 +149,6 @@ pub(crate) struct ManifestOutcome {
     /// `caller` / `kernel` / `unavailable` — where the three stamps came from.
     freshness_source: &'static str,
     freshness_unavailable_reason: String,
-    /// The store status taken at the start of the write, so a caller that
-    /// reports status next (the fused build) does not walk the tree again.
-    pub(crate) store_status: StoreStatus,
 }
 
 /// `<db>.artifacts.json` — the stamp beside the store the artifacts came from.
@@ -391,7 +388,6 @@ pub(crate) fn write_consumer_artifacts(
             guides,
             freshness_source,
             freshness_unavailable_reason,
-            store_status: status,
         });
     }
 
@@ -490,7 +486,6 @@ pub(crate) fn write_consumer_artifacts(
         guides,
         freshness_source,
         freshness_unavailable_reason,
-        store_status: status,
     })
 }
 
