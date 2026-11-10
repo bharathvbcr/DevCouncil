@@ -255,20 +255,45 @@ pub(super) fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> 
 /// deadline every other whole-tree pass here honours.
 pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts {
     let mut modules = BTreeSet::new();
-    let mut spans: Vec<(String, usize, usize)> = Vec::new();
+    let mut scopes: Vec<RustScopeSpan> = Vec::new();
     let mut macros = BTreeSet::new();
+    let mut restricted: Vec<(usize, String)> = Vec::new();
+    let mut cfg_spans: Vec<(usize, usize)> = Vec::new();
     let mut derefs = BTreeSet::new();
     let mut blankets = BTreeSet::new();
+    let mut complete = true;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if walk_deadline_passed() {
+            complete = false;
             break;
         }
         match node.kind() {
-            "mod_item" if node.child_by_field_name("body").is_some() => {
-                if let Some(name) = get_child_text(node, "name", source) {
-                    spans.push((name.clone(), node.start_byte(), node.end_byte()));
-                    modules.insert(name);
+            "mod_item" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    if let Some(name) = get_child_text(node, "name", source) {
+                        scopes.push(RustScopeSpan {
+                            kind: RustScopeKind::Module,
+                            name: name.clone(),
+                            start: body.start_byte(),
+                            end: body.end_byte(),
+                        });
+                        modules.insert(name);
+                    }
+                }
+            }
+            "block" => {
+                let mut cursor = node.walk();
+                let holds_names = node
+                    .named_children(&mut cursor)
+                    .any(|child| rust_node_declares_names(child.kind()));
+                if holds_names {
+                    scopes.push(RustScopeSpan {
+                        kind: RustScopeKind::Block,
+                        name: String::new(),
+                        start: node.start_byte(),
+                        end: node.end_byte(),
+                    });
                 }
             }
             // An invocation that stands where an item would: its parent is an
@@ -289,17 +314,100 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
             }
             _ => {}
         }
+        if matches!(
+            node.kind(),
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "mod_item"
+                | "function_signature_item"
+        ) {
+            let mut cursor = node.walk();
+            let modifier = node
+                .children(&mut cursor)
+                .find(|child| child.kind() == "visibility_modifier");
+            if let Some(modifier) = modifier {
+                let text = get_node_text(modifier, source);
+                if text.contains('(') {
+                    restricted.push((
+                        node.start_byte(),
+                        text.split_whitespace().collect::<String>(),
+                    ));
+                }
+            }
+        }
+        if matches!(node.kind(), "function_item" | "impl_item" | "mod_item")
+            && rust_item_has_cfg_attribute(node, source)
+        {
+            cfg_spans.push((node.start_byte(), node.end_byte()));
+        }
         push_named_children(node, &mut stack);
     }
-    spans.sort();
-    spans.dedup();
+    scopes.sort_by(|a, b| (a.start, a.end).cmp(&(b.start, b.end)));
+    scopes.dedup();
+    restricted.sort();
+    restricted.dedup();
+    cfg_spans.sort();
+    cfg_spans.dedup();
     RustItemFacts {
         inline_modules: modules.into_iter().collect(),
-        module_spans: spans,
-        item_macros: macros.into_iter().collect(),
+        scope_facts: complete.then(|| RustScopeFacts {
+            scopes,
+            item_macros: macros.into_iter().collect(),
+            restricted_visibility: restricted,
+            cfg_spans,
+        }),
         deref_targets: derefs.into_iter().collect(),
         blanket_impl_params: blankets.into_iter().collect(),
     }
+}
+
+/// Whether a node of this kind, as a direct child of a block, declares or
+/// imports a name that only that block can see.
+fn rust_node_declares_names(kind: &str) -> bool {
+    matches!(
+        kind,
+        "use_declaration"
+            | "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "impl_item"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "mod_item"
+            | "macro_definition"
+            | "extern_crate_declaration"
+            | "foreign_mod_item"
+    )
+}
+
+/// Whether the attributes written directly above `node` include a `cfg` or
+/// `cfg_attr`.
+fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
+    let mut previous = node.prev_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => {
+                let text = get_node_text(sibling, source);
+                let inner = text.trim_start_matches("#[").trim_start();
+                if inner.starts_with("cfg(") || inner.starts_with("cfg_attr(") {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => return false,
+        }
+        previous = sibling.prev_sibling();
+    }
+    false
 }
 
 fn rust_macro_stands_as_item(node: Node) -> bool {
@@ -316,8 +424,8 @@ fn rust_macro_stands_as_item(node: Node) -> bool {
 #[derive(Default)]
 pub(super) struct RustItemFacts {
     pub inline_modules: Vec<String>,
-    pub module_spans: Vec<(String, usize, usize)>,
-    pub item_macros: Vec<String>,
+    /// `None` when the walk was cut short: the facts are then absent, not partial.
+    pub scope_facts: Option<RustScopeFacts>,
     pub deref_targets: Vec<(String, String)>,
     pub blanket_impl_params: Vec<String>,
 }

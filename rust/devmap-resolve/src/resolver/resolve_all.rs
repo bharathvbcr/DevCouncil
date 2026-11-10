@@ -431,7 +431,7 @@ impl Resolver {
                             if let Some((target_f, target_symbol)) = self
                                 .type_methods
                                 .get(&key)
-                                .and_then(|hits| self.type_method_target(&ext.file_path, &class_type, hits, Site::of(call.span.start_byte, call.caller_symbol.as_deref())))
+                                .and_then(|hits| self.type_method_target(&ext.file_path, &class_type, hits, Site::of(call.span.start_byte)))
                             {
                                 resolution = Some(Arc::new(Resolution::ReceiverType {
                                     target_symbol: target_symbol.to_string(),
@@ -466,7 +466,7 @@ impl Resolver {
                                 let key = (family, class_type.clone(), call.callee_name.clone());
                                 if let Some((target_f, target_symbol)) =
                                     self.type_methods.get(&key).and_then(|hits| {
-                                        self.type_method_target(&ext.file_path, &class_type, hits, Site::of(call.span.start_byte, call.caller_symbol.as_deref()))
+                                        self.type_method_target(&ext.file_path, &class_type, hits, Site::of(call.span.start_byte))
                                     })
                                 {
                                     resolution = Some(Arc::new(Resolution::ReceiverType {
@@ -1030,19 +1030,14 @@ impl Resolver {
                     // real method one fewer caller than it has.
                     if resolution.is_none()
                         && call.receiver_expr.is_none()
-                        && !self.rust_import_rung_declines(
-                            family,
-                            &ext.file_path,
-                            &call.callee_name,
-                            call.span.start_byte,
-                            call.caller_symbol.as_deref(),
-                        )
+                        && !self.rust_import_rung_declines(family, &ext.file_path, &call.callee_name, Site::of(call.span.start_byte))
                     {
-                        if let Some((target_f, target_sym)) = self.import_binding_at(
+                        if let Some((target_f, target_sym)) = self.import_binding_for_site(
                             family,
                             &ext.file_path,
                             read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                             &call.callee_name,
+                            Site::of(call.span.start_byte),
                         ) {
                             // A whole-module handle called as a function is the
                             // module's own value, which is what its default
@@ -1175,19 +1170,14 @@ impl Resolver {
                         };
                         if !recv.is_empty() && !method.is_empty()
                             && ext.local_binding_at(call.span.start_byte, &recv).is_none()
-                            && !self.rust_import_rung_declines(
-                                family,
-                                &ext.file_path,
-                                &recv,
-                                call.span.start_byte,
-                                call.caller_symbol.as_deref(),
-                            ) {
+                            && !self.rust_import_rung_declines(family, &ext.file_path, &recv, Site::of(call.span.start_byte)) {
                             {
-                                if let Some((target_f, imported)) = self.import_binding_at(
+                                if let Some((target_f, imported)) = self.import_binding_for_site(
                                     family,
                                     &ext.file_path,
                                     read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                                     &recv,
+                                    Site::of(call.span.start_byte),
                                 ) {
                                     // A module member: a member of a module
                                     // handle, of an imported type, or of an
@@ -1370,13 +1360,7 @@ impl Resolver {
                             if let Some(target_symbol) = self
                                 .lexical_call_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
                                 .filter(|_| {
-                                    !self.rust_same_file_rung_declines(
-                                        family,
-                                        &ext.file_path,
-                                        &call.callee_name,
-                                        call.span.start_byte,
-                                        call.caller_symbol.as_deref(),
-                                    )
+                                    !self.rust_same_file_rung_declines(family, &ext.file_path, &call.callee_name, Site::of(call.span.start_byte))
                                 })
                                 .filter(|identity| {
                                     !self.file_declares_as(&ext.file_path, identity, |kind| {
@@ -1505,7 +1489,7 @@ impl Resolver {
                                             &ext.file_path,
                                             type_name,
                                             hits,
-                                            Site::of(call.span.start_byte, call.caller_symbol.as_deref()),
+                                            Site::of(call.span.start_byte),
                                         )
                                     {
                                         resolution = Some(Arc::new(Resolution::ReceiverType {
@@ -2056,6 +2040,14 @@ impl Resolver {
                                             &call.callee_name,
                                             false,
                                         )
+                                        .or_else(|| {
+                                            self.rust_multi_impl_reason(
+                                                family,
+                                                &ext.file_path,
+                                                call.receiver_expr.as_deref(),
+                                                &call.callee_name,
+                                            )
+                                        })
                                         .unwrap_or_else(|| {
                                             format!(
                                                 "no resolution ladder rung matched {:?} in {} family {:?}",
@@ -2085,7 +2077,7 @@ impl Resolver {
                     let Some((target_f, target_sym)) = self
                         .type_methods
                         .get(&key)
-                        .and_then(|hits| self.type_method_target(&ext.file_path, error_type, hits, Site::of(conversion.span.start_byte, conversion.caller_symbol.as_deref())))
+                        .and_then(|hits| self.type_method_target(&ext.file_path, error_type, hits, Site::of(conversion.span.start_byte)))
                     else {
                         continue;
                     };

@@ -742,6 +742,12 @@ pub struct Resolver {
     /// Per Rust file, what its modules, declarations and imports let a call
     /// site see. See `rust_site_scope`.
     rust_site_scope: BTreeMap<String, rust_site_scope::RustFileScope>,
+    /// `(file, import start byte, local name)` -> the `(file, declared name)` that
+    /// one Rust `use` binds. The file-wide bindings keep one answer per name; a
+    /// `use` inside a block binds the same name to something else for that block.
+    rust_import_targets: BTreeMap<(String, usize, String), (String, String)>,
+    /// `(file, qualified name)` of the Rust bodies that sit under `#[cfg]`.
+    rust_cfg_bodies: BTreeSet<(String, String)>,
     /// Rust type name → the type it `Deref`s to; `None` when two indexed
     /// `impl Deref` blocks disagree about a type of that name.
     rust_deref_targets: BTreeMap<String, Option<String>>,
@@ -870,6 +876,8 @@ impl Resolver {
             scope_locals: BTreeSet::new(),
             rust_inline_modules: BTreeMap::new(),
             rust_site_scope: BTreeMap::new(),
+            rust_import_targets: BTreeMap::new(),
+            rust_cfg_bodies: BTreeSet::new(),
             rust_deref_targets: BTreeMap::new(),
             rust_blanket_methods: BTreeMap::new(),
             max_indexed_path_depth: 0,

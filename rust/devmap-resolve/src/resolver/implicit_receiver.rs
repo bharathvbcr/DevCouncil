@@ -508,7 +508,7 @@ impl Resolver {
         call_file: &str,
         type_name: &str,
         hits: &'a [(String, String)],
-        site: Site<'_>,
+        site: Site,
     ) -> Option<(&'a str, &'a str)> {
         let mut uniq: Vec<&(String, String)> = hits.iter().collect();
         uniq.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -540,7 +540,7 @@ impl Resolver {
         // the site, or a binding the file's extents do not separate - narrows
         // nothing, and is refused rather than guessed.
         let rust_origin = if call_file.ends_with(".rs") {
-            self.rust_origin_at(call_file, type_name, site.pos, site.caller)
+            self.rust_origin_at(call_file, type_name, site)
         } else {
             None
         };
@@ -560,11 +560,14 @@ impl Resolver {
                     return None;
                 }
             } else {
-                let bound = self
-                    .import_bindings
-                    .get(call_file)
-                    .and_then(|bindings| bindings.get(type_name))
-                    .map(|(file, _)| file.as_str());
+                let bound = if origin == RustOrigin::Named {
+                    self.rust_named_binding_at(call_file, type_name, site)
+                } else {
+                    self.import_bindings
+                        .get(call_file)
+                        .and_then(|bindings| bindings.get(type_name))
+                }
+                .map(|(file, _)| file.as_str());
                 let evidence = if origin == RustOrigin::Own {
                     Some(call_file)
                 } else {
@@ -655,11 +658,52 @@ impl Resolver {
             return true;
         }
         let own: Vec<&&(String, String)> = all_hits.iter().filter(|hit| hit.0 == chosen).collect();
-        let signatures: BTreeSet<Option<&String>> = own
+        // Bodies under `#[cfg]` are alternatives of one method.
+        let live: Vec<&&&(String, String)> = own
+            .iter()
+            .filter(|hit| {
+                !self
+                    .rust_cfg_bodies
+                    .contains(&(hit.0.clone(), hit.1.clone()))
+            })
+            .collect();
+        let signatures: BTreeSet<Option<&String>> = live
             .iter()
             .map(|hit| self.rust_signatures.get(&(hit.0.clone(), hit.1.clone())))
             .collect();
-        own.len() > 1 && signatures.len() > 1
+        live.len() > 1 && signatures.len() > 1
+    }
+
+    /// The reason text for a Rust `Type::method(..)` call left unresolved because
+    /// the type has several bodies of that method, or `None` when that is not why.
+    pub(super) fn rust_multi_impl_reason(
+        &self,
+        family: LangFamily,
+        file: &str,
+        receiver: Option<&str>,
+        method: &str,
+    ) -> Option<String> {
+        if family != LangFamily::Rust {
+            return None;
+        }
+        let type_name = receiver.filter(|r| Self::is_plain_ident(r))?;
+        let hits = self
+            .type_methods
+            .get(&(family, type_name.to_string(), method.to_string()))?;
+        let mut uniq: Vec<&(String, String)> = hits.iter().collect();
+        uniq.sort();
+        uniq.dedup();
+        let files: BTreeSet<&str> = uniq.iter().map(|hit| hit.0.as_str()).collect();
+        files
+            .iter()
+            .any(|chosen| self.rust_method_is_overloaded_across_impls(type_name, &uniq, chosen))
+            .then(|| {
+                format!(
+                    "several impls of {type_name}::{method} exist ({} bodies in {} files in this index); which one runs depends on the argument's type, which this call site does not record (called from {file})",
+                    uniq.len(),
+                    files.len()
+                )
+            })
     }
 
     /// Every `type_methods` hit a Swift type spelling reaches from `call_file`

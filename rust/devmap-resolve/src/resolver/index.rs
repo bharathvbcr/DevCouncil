@@ -77,6 +77,8 @@ impl Resolver {
         self.scope_locals.clear();
         self.rust_inline_modules.clear();
         self.rust_site_scope.clear();
+        self.rust_import_targets.clear();
+        self.rust_cfg_bodies.clear();
         self.rust_deref_targets.clear();
         self.rust_blanket_methods.clear();
         self.max_indexed_path_depth = extractions
@@ -331,10 +333,14 @@ impl Resolver {
                 }
             }
             if ext.language == "rust" {
-                self.rust_site_scope.insert(
-                    ext.file_path.clone(),
-                    super::rust_site_scope::RustFileScope::build(ext),
-                );
+                let scope = super::rust_site_scope::RustFileScope::build(ext);
+                for sym in &ext.symbols {
+                    if scope.is_under_cfg(sym.span.start_byte) {
+                        self.rust_cfg_bodies
+                            .insert((ext.file_path.clone(), sym.qualified_name.clone()));
+                    }
+                }
+                self.rust_site_scope.insert(ext.file_path.clone(), scope);
             }
             if !ext.rust_inline_modules.is_empty() {
                 self.rust_inline_modules.insert(
@@ -748,6 +754,7 @@ impl Resolver {
         // universe built above.
         for ext in extractions {
             let mut file_bindings = BTreeMap::new();
+            let mut file_rust_targets: Vec<((usize, String), (String, String))> = Vec::new();
             // The value-binding subset of `file_bindings`; see `value_imports`.
             let mut file_values: Vec<(String, (String, String))> = Vec::new();
             // SC18: the mirror of `file_bindings` — every local name whose
@@ -1054,6 +1061,12 @@ impl Resolver {
                                     .or_insert((target_f, declared_as));
                             } else {
                                 module_imported.insert(local.to_string());
+                                if ext.language == "rust" {
+                                    file_rust_targets.push((
+                                        (imp.span.start_byte, local.to_string()),
+                                        (target_f.clone(), declared_as.clone()),
+                                    ));
+                                }
                                 file_bindings.insert(local.to_string(), (target_f, declared_as));
                             }
                         } else {
@@ -1121,13 +1134,13 @@ impl Resolver {
                         continue;
                     }
                     if alias == Some(".") {
-                        // Rust: an item declared in the glob's own module
-                        // shadows what the glob brings in under that name, so
-                        // the glob binds nothing for it. A declaration in some
-                        // other module of the file does not: that module's
-                        // namesake is not in scope where the glob is, and the
-                        // call-site test (`rust_site_scope`) is what keeps it
-                        // from shadowing the glob for code that cannot see it.
+                        // Rust: an item declared, or imported by name, in the
+                        // glob's own scope shadows what the glob brings in under
+                        // that name, so the glob binds nothing for it. One in some
+                        // other scope of the file does not: it is not visible
+                        // where the glob is, and the call-site test
+                        // (`rust_site_scope`) keeps it from shadowing the glob for
+                        // code that cannot see it either.
                         let glob_pos = imp.span.start_byte;
                         let rust_scope = if ext.language == "rust" {
                             self.rust_site_scope.get(&ext.file_path)
@@ -1135,10 +1148,7 @@ impl Resolver {
                             None
                         };
                         let shadowed = |name: &str| {
-                            rust_scope.is_some_and(|scope| {
-                                scope.declares_in_module_of(name, glob_pos)
-                                    || scope.imports_by_name_in_module_of(name, glob_pos)
-                            })
+                            rust_scope.is_some_and(|scope| scope.shadows_glob_at(name, glob_pos))
                         };
                         for file in &targets {
                             // X41. A glob of the file's *own* module —
@@ -1157,19 +1167,26 @@ impl Resolver {
                             }
                             if let Some(syms) = self.file_symbols.get(file) {
                                 for name in syms {
-                                    // Rust: an item the importing file declares
-                                    // itself shadows what a glob brings in under
-                                    // the same name, so the glob binds nothing
-                                    // for it and the same-file rung answers.
-                                    if ext.language == "rust"
-                                        && (shadowed(name)
-                                            || !self.rust_item_is_visible_to(
-                                                &ext.file_path,
-                                                file,
-                                                name,
-                                            ))
-                                    {
-                                        continue;
+                                    if ext.language == "rust" {
+                                        // Only what the target declares in its own
+                                        // module and the importer may see; a file
+                                        // whose scopes are unknown publishes nothing
+                                        // at this tier.
+                                        let visible = self
+                                            .rust_site_scope
+                                            .get(file)
+                                            .filter(|scope| scope.is_known())
+                                            .and_then(|scope| scope.root_decl(name))
+                                            .is_some_and(|decl| {
+                                                self.rust_decl_is_visible_to(
+                                                    &ext.file_path,
+                                                    file,
+                                                    &decl.vis,
+                                                )
+                                            });
+                                        if shadowed(name) || !visible {
+                                            continue;
+                                        }
                                     }
                                     file_bindings
                                         .entry(name.clone())
@@ -1323,6 +1340,10 @@ impl Resolver {
             for (scope, names) in file_scoped {
                 self.python_scoped_import_bindings
                     .insert((ext.file_path.clone(), scope), names);
+            }
+            for ((at, local), target) in file_rust_targets {
+                self.rust_import_targets
+                    .insert((ext.file_path.clone(), at, local), target);
             }
             if !file_external.is_empty() {
                 self.external_imports
@@ -2162,10 +2183,17 @@ impl Resolver {
             if self.rust_opaque_publishers.contains(globbed) {
                 complete = false;
             }
+            let Some(globbed_scope) = self.rust_site_scope.get(globbed).filter(|s| s.is_known())
+            else {
+                // Nothing is known about what this file declares.
+                complete = false;
+                continue;
+            };
             for name in self.file_symbols.get(globbed).into_iter().flatten() {
-                if !self.declared_at_file_level(globbed, name)
-                    || !self.rust_item_is_visible_to(importer, globbed, name)
-                {
+                let visible = globbed_scope
+                    .root_decl(name)
+                    .is_some_and(|decl| self.rust_decl_is_visible_to(importer, globbed, &decl.vis));
+                if !visible {
                     continue;
                 }
                 published
@@ -2188,42 +2216,82 @@ impl Resolver {
         (published, complete)
     }
 
-    /// Whether the Rust item `name` that `declarer` declares at file level is
-    /// visible to a glob import written in `importer`: it is `pub`, or the
-    /// importer is the declaring module or inside it. A module `m` is `m.rs`
-    /// with its children under `m/`, or the directory of `m/mod.rs`, `lib.rs`
-    /// or `main.rs`, or a `#[path]` child it declares.
-    pub(super) fn rust_item_is_visible_to(
+    /// The directory a Rust file's own module owns: `m.rs` and `m/mod.rs` both
+    /// own `m/`; `lib.rs` and `main.rs` own the directory they sit in.
+    fn rust_module_dir(file: &str) -> Option<&str> {
+        ["/mod.rs", "/lib.rs", "/main.rs"]
+            .iter()
+            .find_map(|tail| file.strip_suffix(tail))
+            .or_else(|| file.strip_suffix(".rs"))
+    }
+
+    /// Whether the module of `importer` is `module_dir` or inside it.
+    fn rust_module_is_inside(importer: &str, module_dir: &str) -> bool {
+        Self::rust_module_dir(importer).is_some_and(|dir| {
+            dir == module_dir
+                || dir
+                    .strip_prefix(module_dir)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// Whether an item of `declarer`'s own module with visibility `vis` is
+    /// visible to a glob import written in `importer`. See the model in
+    /// `rust_site_scope`.
+    pub(super) fn rust_decl_is_visible_to(
         &self,
         importer: &str,
         declarer: &str,
-        name: &str,
+        vis: &super::rust_site_scope::RustVis,
     ) -> bool {
-        let private = self
-            .unexported_symbols
-            .contains(&(declarer.to_string(), self.qualified_for(declarer, name)));
-        if !private || importer == declarer {
+        use super::rust_site_scope::RustVis;
+        if importer == declarer {
             return true;
         }
+        let Some(own_dir) = Self::rust_module_dir(declarer) else {
+            return false;
+        };
         // A `#[path]` child is a module of the file that declares it, wherever
-        // the child's file sits, so it sees that parent's private items.
-        let mut parent = self.rust_path_modules.get(importer);
-        for _ in 0..16 {
-            match parent {
-                Some(file) if file == declarer => return true,
-                Some(file) => parent = self.rust_path_modules.get(file),
-                None => break,
+        // the child's file sits.
+        let inside_by_path = |module_file: &str| {
+            let mut parent = self.rust_path_modules.get(importer);
+            for _ in 0..16 {
+                match parent {
+                    Some(file) if file == module_file => return true,
+                    Some(file) => parent = self.rust_path_modules.get(file),
+                    None => return false,
+                }
+            }
+            false
+        };
+        match vis {
+            RustVis::Open => true,
+            RustVis::Private => {
+                Self::rust_module_is_inside(importer, own_dir) || inside_by_path(declarer)
+            }
+            RustVis::Super => match own_dir.rsplit_once('/') {
+                Some((parent_dir, _)) => {
+                    Self::rust_module_is_inside(importer, parent_dir)
+                        || self
+                            .rust_path_modules
+                            .get(declarer)
+                            .is_some_and(|parent| parent == importer || inside_by_path(parent))
+                }
+                None => true,
+            },
+            RustVis::In(path) => {
+                let path = path.trim();
+                match self.resolve_import_path(declarer, "rust", path) {
+                    Some(module_file) => {
+                        Self::rust_module_dir(&module_file)
+                            .is_some_and(|dir| Self::rust_module_is_inside(importer, dir))
+                            || inside_by_path(&module_file)
+                    }
+                    // A path this index cannot follow: do not publish.
+                    None => false,
+                }
             }
         }
-        let module_dir = ["/mod.rs", "/lib.rs", "/main.rs"]
-            .iter()
-            .find_map(|tail| declarer.strip_suffix(tail))
-            .or_else(|| declarer.strip_suffix(".rs"));
-        module_dir.is_some_and(|dir| {
-            importer
-                .strip_prefix(dir)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
     }
 
     /// Rust files whose published names the index cannot be sure it holds
@@ -2244,7 +2312,10 @@ impl Resolver {
                             .is_none()
                     })
             });
-            if !ext.rust_item_macros.is_empty()
+            if ext
+                .rust_scope_facts
+                .as_ref()
+                .is_none_or(|facts| !facts.item_macros.is_empty())
                 || unseen_glob
                 || !matches!(ext.parse_outcome, ParseOutcome::Clean)
             {
@@ -2313,10 +2384,16 @@ impl Resolver {
                 for (index, name) in import.imported_names.iter().enumerate() {
                     let local = import.local_names.get(index).filter(|l| !l.is_empty());
                     if local.is_none_or(|local| local == name) {
-                        named
-                            .entry(ext.file_path.clone())
-                            .or_default()
-                            .push((name.clone(), target.clone()));
+                        // Follow the module's own re-exports to the file that
+                        // declares the name: a module that only `pub use`s it
+                        // is not where it lives.
+                        let (declaring_file, declared_as) = self.declaring_site(&target, name);
+                        if declared_as == *name {
+                            named
+                                .entry(ext.file_path.clone())
+                                .or_default()
+                                .push((name.clone(), declaring_file));
+                        }
                     }
                 }
             }

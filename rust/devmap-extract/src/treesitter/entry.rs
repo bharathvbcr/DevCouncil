@@ -994,8 +994,7 @@ pub(super) fn extract_treesitter_before_deadline(
                 };
                 let RustItemFacts {
                     inline_modules: rust_inline_modules,
-                    module_spans: rust_module_spans,
-                    item_macros: rust_item_macros,
+                    scope_facts: rust_scope_facts,
                     deref_targets: rust_deref_targets,
                     blanket_impl_params: rust_blanket_impl_params,
                 } = rust_item_facts;
@@ -1057,8 +1056,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     // a second time.
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name, lang),
                     rust_inline_modules,
-                    rust_module_spans,
-                    rust_item_macros,
+                    rust_scope_facts,
                     rust_deref_targets,
                     rust_blanket_impl_params,
                     rust_implicit_calls,

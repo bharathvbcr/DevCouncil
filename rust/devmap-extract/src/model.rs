@@ -1645,6 +1645,47 @@ pub const MAX_CALL_BLIND_SITES: usize = 8_000;
 /// reason, so a capped file does not look complete.
 pub const CALLS_DROPPED_PREFIX: &str = "call sites dropped at the scan cap: ";
 
+/// One scope a Rust name can be declared or imported in below the file level:
+/// an inline `mod name { .. }` body, or a block that directly holds an item or a
+/// `use` (a function body, a nested block). Blocks that hold neither name nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustScopeSpan {
+    pub kind: RustScopeKind,
+    /// The module's name; empty for a block.
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RustScopeKind {
+    Module,
+    Block,
+}
+
+/// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].
+///
+/// The extractor files an inline module's items, and the items of a function
+/// body, under the enclosing namespace, so "this file declares `Dup`" says nothing
+/// about which code can see that declaration. These facts say where each scope
+/// sits, so a resolver can ask which declarations and imports a byte offset sees.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustScopeFacts {
+    /// Every module body and item-holding block, in source order.
+    pub scopes: Vec<RustScopeSpan>,
+    /// The macro name of every item-position macro invocation (`mk!();`), at any
+    /// depth. Such an invocation can declare names the index never sees.
+    pub item_macros: Vec<String>,
+    /// `(item start byte, visibility text)` for every item whose visibility is
+    /// restricted: `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path)`. A
+    /// plain `pub` and a private item are told apart by `is_exported`.
+    pub restricted_visibility: Vec<(usize, String)>,
+    /// Spans of the functions, impl blocks and modules under a `#[cfg(..)]`
+    /// attribute: two bodies of one method that both sit in such spans are
+    /// alternatives, not two impls.
+    pub cfg_spans: Vec<(usize, usize)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     pub file_path: String,
@@ -1764,29 +1805,13 @@ pub struct Extraction {
     /// tells the two apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_inline_modules: Vec<String>,
-    /// `(name, start_byte, end_byte)` of every inline `mod name { … }` block a
-    /// Rust file declares, at any nesting, in source order. Empty for every
-    /// other language, and for a file with no inline module.
-    ///
-    /// `rust_inline_modules` says a module exists; this says which items sit
-    /// inside it. The extractor files an inline module's items under the file's
-    /// own namespace, so the symbol table cannot tell a `Dup` declared in
-    /// `mod inner` from one at file level, and a call in `mod tests` from one
-    /// outside it. A byte offset inside the block is how a resolver asks which
-    /// module a declaration, an import or a call belongs to. Not collected by
-    /// an extraction written before this field existed (names present, spans
-    /// empty): a reader must treat module membership there as unknown.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rust_module_spans: Vec<(String, usize, usize)>,
-    /// The macro name of every item-position macro invocation (`mk!();` beside
-    /// `fn`s, at file level or inside an inline module) a Rust file makes.
-    /// Sorted and deduplicated; empty for every other language.
-    ///
-    /// Such an invocation can declare any item the index never sees, so a name
-    /// that looks unique among the visible declarations may have a second,
-    /// invisible publisher.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rust_item_macros: Vec<String>,
+    /// The scopes, item macros, restricted visibilities and `#[cfg]` items of a
+    /// Rust file, or `None` when none were collected - every other language, and
+    /// an extraction written before this field existed. `None` is not "empty":
+    /// a reader must treat it as "scope unknown" and never read it as "this file
+    /// declares nothing a call site could not see".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_scope_facts: Option<RustScopeFacts>,
     /// `(type, target)` for every `impl Deref for type { type Target = target; }`
     /// a Rust file declares, both reduced to their bare names. Sorted and
     /// deduplicated; empty for every other language.

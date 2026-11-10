@@ -175,6 +175,8 @@ mod rust_accuracy_core;
 #[cfg(feature = "parse")]
 mod rust_glob_publication;
 #[cfg(feature = "parse")]
+mod rust_missing_scope_facts;
+#[cfg(feature = "parse")]
 mod rust_module_paths;
 #[cfg(feature = "parse")]
 mod rust_qualified_path_calls;

@@ -186,10 +186,7 @@ impl Resolver {
                         &ext.file_path,
                         receiver,
                         hits,
-                        Site::of(
-                            reference.span.start_byte,
-                            reference.enclosing_symbol.as_deref(),
-                        ),
+                        Site::of(reference.span.start_byte),
                     )
                 })
             {
@@ -222,10 +219,7 @@ impl Resolver {
                             &ext.file_path,
                             receiver,
                             hits,
-                            Site::of(
-                                reference.span.start_byte,
-                                reference.enclosing_symbol.as_deref(),
-                            ),
+                            Site::of(reference.span.start_byte),
                         )
                     })
                 {
