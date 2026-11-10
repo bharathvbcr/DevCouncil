@@ -426,14 +426,7 @@ fn absorb_template_expressions(
             // component, declared in the template. Its children are walked
             // after it, so the calls in its body are read as before.
             "snippet_statement" if extraction.language == "svelte" => {
-                // A second snippet of one name cannot be a node of its own, so
-                // it is charged: its declaration is not in the graph.
-                if !declare_snippet(extraction, node, source) {
-                    unparsed.push(TextRange {
-                        start_byte: node.start_byte(),
-                        end_byte: node.end_byte(),
-                    });
-                }
+                declare_snippet(extraction, node, source);
             }
             // `use:action`, `transition:fade`, `in:`, `out:`, `animate:`: the
             // directive names a function the runtime calls. It is a use of the
@@ -656,28 +649,28 @@ fn take_snippet_parameters(node: Node, extraction: &mut Extraction, walk: &mut T
 /// A snippet given to a component as a child of its tag is a prop the
 /// component renders, and nothing in this file names it: it is recorded as
 /// reached by the runtime, like a framework callback. A second snippet of a
-/// name the file already declares (a nested scope) is not declared again,
-/// because one qualified name is one node.
-fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) -> bool {
+/// name the file already declares is declared as `name#2`.
+fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) {
     let Some(start) = child_of_kind(node, "snippet_start") else {
-        return true;
+        return;
     };
     let Some(name_node) = child_of_kind(start, "snippet_name") else {
-        return true;
+        return;
     };
     let name = text_slice(name_node, source).to_string();
-    let qualified = format!("{}::{name}", extraction.file_path);
-    if extraction
+    // One qualified name is one node. A snippet of a name the file already
+    // declares (a sibling in another branch, or a nested scope) is a different
+    // function with the same name: it is declared as `name#2`, `name#3`, in
+    // document order, so none of them is lost and none is charged.
+    let mut qualified = format!("{}::{name}", extraction.file_path);
+    let mut ordinal = 1usize;
+    while extraction
         .symbols
         .iter()
         .any(|symbol| symbol.qualified_name == qualified)
     {
-        extraction.diagnostics.push(format!(
-            "snippet `{name}` at byte {} shares the name of an earlier declaration and was not \
-             declared again; its bytes are charged as unread",
-            node.start_byte()
-        ));
-        return false;
+        ordinal += 1;
+        qualified = format!("{}::{name}#{ordinal}", extraction.file_path);
     }
     let signature: String = text_slice(start, source).chars().take(200).collect();
     extraction.symbols.push(crate::model::ExtractedSymbol {
@@ -700,7 +693,6 @@ fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) -> boo
             details: format!("snippet passed to <{component}> as a child, rendered by the component"),
         });
     }
-    true
 }
 
 /// The reference a Svelte directive makes to its function: `use:focus` names

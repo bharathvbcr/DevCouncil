@@ -191,17 +191,18 @@ fn a_snippet_passed_as_a_prop_is_a_reference_not_a_call() {
 }
 
 #[test]
-fn a_second_snippet_of_one_name_is_charged_not_dropped() {
+fn a_second_snippet_of_one_name_is_declared_beside_the_first() {
     let source = format!("{SCRIPT}{{#snippet a()}}x{{/snippet}}\n<div>{{#snippet a()}}y{{/snippet}}</div>\n");
     let e = ex(&source);
-    let ParseOutcome::Partial { error_ranges, .. } = &e.parse_outcome else {
-        panic!("a snippet that is not declared must be charged: {:?}", e.parse_outcome);
-    };
-    let second = source.rfind("{#snippet a()}").expect("second snippet");
-    assert!(
-        error_ranges.iter().any(|r| r.start_byte <= second && second < r.end_byte),
-        "{error_ranges:?}"
-    );
+    assert!(is_clean(&e), "{:?}", e.parse_outcome);
+    let mut qualified: Vec<&str> = e
+        .symbols
+        .iter()
+        .filter(|s| s.name == "a")
+        .map(|s| s.qualified_name.as_str())
+        .collect();
+    qualified.sort_unstable();
+    assert_eq!(qualified, ["src/Board.svelte::a", "src/Board.svelte::a#2"]);
 }
 
 #[test]
