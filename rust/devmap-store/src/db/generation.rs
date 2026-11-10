@@ -1,6 +1,6 @@
 use super::{
     checked_span, fts_damage_reason, fts_match_query, lock_conn, refusal, sqlite_limit,
-    validate_head_sha, BuildHistoryRow, CachedSourceFreshness, FileSymbolsPage, LedgerKey,
+    validate_head_sha, BuildHistoryRow, CachedSourceFreshness, FileSymbolsPage, Keyed, LedgerKey,
     QuerySourceFreshness, SourceTreeDelta, Store, StoreStatus, StoredSymbol, UnresolvedSiteRow,
     UnresolvedSitesByName, FTS_PAYLOAD_SQL, MAX_PENDING_ATTEMPTS,
 };
@@ -15,6 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 thread_local! {
+    /// Full [`Store::status_snapshot`] reads on this thread, for the test that
+    /// pins how many one `status` takes.
+    #[cfg(test)]
+    static STATUS_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
     static FRESHNESS_INTERLEAVE: Cell<Option<fn(&Store)>> = const { Cell::new(None) };
     static FRESHNESS_INTERLEAVE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
@@ -581,6 +585,27 @@ impl Store {
 
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
+        // Held per (generation, data_version): see `Store::generation_checks`.
+        let data_version = Self::data_version(&conn)?;
+        let generation: Option<u32> =
+            conn.query_row("SELECT max(id) FROM generations", [], |row| row.get(0))?;
+        if let (Some(generation), Ok(checks)) = (generation, self.generation_checks.lock()) {
+            if let Some(current) = Keyed::holds(&checks.payload_current, generation, data_version) {
+                return Ok(*current);
+            }
+        }
+        let current = Self::payload_is_current_locked(&conn)?;
+        if let (Some(generation), Ok(mut checks)) = (generation, self.generation_checks.lock()) {
+            checks.payload_current = Some(Keyed {
+                generation,
+                data_version,
+                value: current,
+            });
+        }
+        Ok(current)
+    }
+
+    fn payload_is_current_locked(conn: &rusqlite::Connection) -> Result<bool> {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT language, grammar_version, analyzer_version
              FROM generation_files
@@ -610,6 +635,48 @@ impl Store {
             }
         }
         Ok(true)
+    }
+
+    /// [`Store::latest_file_hashes`] for the freshness comparison, read once
+    /// per generation and shared.
+    ///
+    /// The generation id and its rows are read in one snapshot, so the map is
+    /// the one the id names; `status` compares it to a fresh tree walk on every
+    /// call. Held per (generation, data_version): see
+    /// `Store::generation_checks`.
+    fn latest_file_hashes_shared(&self) -> Result<std::sync::Arc<BTreeMap<String, u64>>> {
+        let conn = lock_conn(&self.conn)?;
+        let data_version = Self::data_version(&conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let Some(generation) = Self::latest_generation_id_locked(&snapshot)? else {
+            return Ok(std::sync::Arc::new(BTreeMap::new()));
+        };
+        if let Ok(checks) = self.generation_checks.lock() {
+            if let Some(hashes) = Keyed::holds(&checks.file_hashes, generation, data_version) {
+                return Ok(std::sync::Arc::clone(hashes));
+            }
+        }
+        let mut stmt = snapshot.prepare(
+            "SELECT p.path, f.content_hash
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1",
+        )?;
+        let hashes: BTreeMap<String, u64> = stmt
+            .query_map(params![generation], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<_>>()?;
+        drop(stmt);
+        let hashes = std::sync::Arc::new(hashes);
+        if let Ok(mut checks) = self.generation_checks.lock() {
+            checks.file_hashes = Some(Keyed {
+                generation,
+                data_version,
+                value: std::sync::Arc::clone(&hashes),
+            });
+        }
+        Ok(hashes)
     }
 
     /// `(path, content_hash)` for every file in the latest generation.
@@ -1117,8 +1184,8 @@ impl Store {
                 status.degraded_reason =
                     devmap_analyze::combine_reasons(source_reason, analyzer_reason);
                 // Both checks describe the same generation or neither may certify it.
-                let after = self.status_snapshot(db_path)?;
-                if after.latest_generation != Some(generation) || after.pending_count != 0 {
+                let (after_generation, after_pending) = self.generation_and_pending()?;
+                if after_generation != Some(generation) || after_pending != 0 {
                     status.source_freshness = None;
                     status.source_delta = None;
                     status.analyzer_freshness = None;
@@ -1247,7 +1314,7 @@ generation {latest}; run `devmap status` to re-verify",
                 None,
             ));
         };
-        let hashes = self.latest_file_hashes()?;
+        let hashes = self.latest_file_hashes_shared()?;
         let stored = self.latest_discovery_inventory()?;
         let scan = match cancel {
             Some(flag) => devmap_extract::scan_tree_cancellable(Path::new(&root), flag),
@@ -1355,8 +1422,8 @@ generation {latest}; run `devmap status` to re-verify",
         }
         // HEAD is provenance: an identical tree remains current after an empty
         // commit. A concurrent generation or pending edit invalidates the proof.
-        let after = self.status_snapshot("")?;
-        if after.latest_generation != Some(generation) || after.pending_count != 0 {
+        let (after_generation, after_pending) = self.generation_and_pending()?;
+        if after_generation != Some(generation) || after_pending != 0 {
             return Ok((
                 None,
                 Some("index changed during source verification; retry status".to_string()),
@@ -1366,8 +1433,34 @@ generation {latest}; run `devmap status` to re-verify",
         Ok((Some(true), None, None))
     }
 
-    fn status_snapshot(&self, db_path: &str) -> Result<StoreStatus> {
+    /// The latest generation and the pending-edit count, in one snapshot.
+    ///
+    /// The two re-checks `status` makes after its freshness walk compare
+    /// exactly these two fields to the ones it started from. They took a whole
+    /// [`Self::status_snapshot`] to do it, which also re-ran the full-text
+    /// health probe, the coverage-gap reads and the payload-encoding count
+    /// (the last one reads past every payload's blob: ~3 ms per snapshot on a
+    /// 16 MiB page cache, and three snapshots per `status`). Those describe the
+    /// store, not whether it moved during the walk, and the first snapshot has
+    /// already reported them.
+    fn generation_and_pending(&self) -> Result<(Option<u32>, usize)> {
         let conn = lock_conn(&self.conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let latest = Self::latest_generation_id_locked(&snapshot)?;
+        let pending: usize =
+            snapshot.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| {
+                row.get::<_, i64>(0).map(|n| n as usize)
+            })?;
+        Ok((latest, pending))
+    }
+
+    fn status_snapshot(&self, db_path: &str) -> Result<StoreStatus> {
+        #[cfg(test)]
+        STATUS_SNAPSHOTS.with(|taken| taken.set(taken.get() + 1));
+        let conn = lock_conn(&self.conn)?;
+        // Read before the snapshot, so a commit by another connection after this
+        // point can only make a held answer look older than it is.
+        let data_version = Self::data_version(&conn)?;
         // Every number below describes one instant. `status` resolves the
         // latest generation and then counts that generation's nodes and
         // edges in separate statements: without a snapshot those are
@@ -1458,7 +1551,8 @@ generation {latest}; run `devmap status` to re-verify",
         } else {
             None
         };
-        let encoding_reason = Self::payload_encoding_reason_locked(&snapshot)?;
+        let encoding_reason =
+            self.payload_encoding_reason_cached(&snapshot, latest, data_version)?;
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -1476,6 +1570,48 @@ generation {latest}; run `devmap status` to re-verify",
             quarantined_paths,
             coverage_gaps,
         })
+    }
+
+    /// [`Self::payload_encoding_reason_locked`], with a clean answer held.
+    ///
+    /// The count behind it reads `entry_wiring_json`, which sits behind each
+    /// row's `extraction_json` blob, so a small page cache walks every payload's
+    /// overflow chain to answer it: about 2 ms more per call on a 16 MiB cache
+    /// than on a 64 MiB one, on this repository. Only a clean answer is held,
+    /// per (generation, data_version): a row another connection adds or
+    /// breaks ends it, and a fault is always re-read because another
+    /// process's writer open can heal it.
+    fn payload_encoding_reason_cached(
+        &self,
+        snapshot: &rusqlite::Transaction<'_>,
+        generation: Option<u32>,
+        data_version: i64,
+    ) -> Result<Option<String>> {
+        if let (Some(generation), Ok(checks)) = (generation, self.generation_checks.lock()) {
+            if Keyed::holds(&checks.payload_encoding_clean, generation, data_version).is_some() {
+                return Ok(None);
+            }
+        }
+        let reason = Self::payload_encoding_reason_locked(snapshot)?;
+        if let (None, Some(generation), Ok(mut checks)) =
+            (&reason, generation, self.generation_checks.lock())
+        {
+            checks.payload_encoding_clean = Some(Keyed {
+                generation,
+                data_version,
+                value: (),
+            });
+        }
+        Ok(reason)
+    }
+
+    /// `PRAGMA data_version` for this connection: it differs between two reads
+    /// exactly when another connection committed in between (this connection's
+    /// own commits never change it, and every write this store makes either
+    /// takes a new generation id or is not one of the rows the held answers
+    /// describe).
+    fn data_version(conn: &rusqlite::Connection) -> Result<i64> {
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
     }
 
     /// How many unconverted payloads one status examines. Each examination
@@ -1975,9 +2111,17 @@ generation {latest}; run `devmap status` to re-verify",
     pub fn edge_confidence_mismatches(&self) -> Result<Option<usize>> {
         use devmap_resolve::model::ResolutionKind;
         let conn = lock_conn(&self.conn)?;
+        let data_version = Self::data_version(&conn)?;
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
+        if let Ok(checks) = self.generation_checks.lock() {
+            if let Some(count) =
+                Keyed::holds(&checks.edge_confidence_mismatches, generation, data_version)
+            {
+                return Ok(Some(*count));
+            }
+        }
         let ladder: String = ResolutionKind::ALL
             .iter()
             .map(|kind| {
@@ -1994,7 +2138,15 @@ generation {latest}; run `devmap status` to re-verify",
                AND CAST(ROUND(confidence * 1000) AS INTEGER) != CASE resolution{ladder} ELSE -1 END"
         );
         let count: i64 = snapshot.query_row(&sql, params![generation], |row| row.get(0))?;
-        Ok(Some(count.max(0) as usize))
+        let count = count.max(0) as usize;
+        if let Ok(mut checks) = self.generation_checks.lock() {
+            checks.edge_confidence_mismatches = Some(Keyed {
+                generation,
+                data_version,
+                value: count,
+            });
+        }
+        Ok(Some(count))
     }
 }
 
@@ -2177,5 +2329,203 @@ mod freshness_race {
         let counted = queue_blocks_cached_freshness(Ok(2)).expect("counted");
         assert_eq!(counted.fresh, None);
         assert!(counted.reason.unwrap().contains("2 changed path"));
+    }
+}
+
+/// `status` asks two whole-generation integrity questions on every call. Their
+/// answers are fixed by the generation id, so a second warm call must be
+/// answered without reading the generation's rows again.
+///
+/// The proof is not a clock: the view each question scans is dropped
+/// after the first answer, so a second call that ran its SQL would fail with
+/// "no such table" and one that answered from the memo cannot.
+#[cfg(test)]
+mod generation_checks_memo {
+    use super::*;
+
+    fn seeded() -> Store {
+        let store = Store::open_in_memory().expect("store");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (7, 1.0, 'seed', '{}')",
+                [],
+            )
+            .expect("generation");
+        }
+        store
+    }
+
+    fn drop_view(store: &Store, view: &str) {
+        let conn = lock_conn(&store.conn).expect("connection");
+        conn.execute(&format!("DROP VIEW {view}"), [])
+            .expect("drop view");
+    }
+
+    #[test]
+    fn a_second_edge_confidence_check_does_not_scan_the_edges_again() {
+        let store = seeded();
+        let first = store.edge_confidence_mismatches().expect("first");
+        assert_eq!(first, Some(0));
+        drop_view(&store, "generation_edges");
+        let second = store
+            .edge_confidence_mismatches()
+            .expect("a warm repeat must not touch generation_edges");
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn a_second_payload_check_does_not_scan_the_files_again() {
+        let store = seeded();
+        let first = store.latest_generation_payload_is_current().expect("first");
+        assert!(first, "a generation with no files has no stale payload");
+        drop_view(&store, "generation_files");
+        let second = store
+            .latest_generation_payload_is_current()
+            .expect("a warm repeat must not touch generation_files");
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn a_second_freshness_comparison_does_not_reread_the_file_hashes() {
+        let store = seeded();
+        let first = store.latest_file_hashes_shared().expect("first");
+        drop_view(&store, "generation_files");
+        let second = store
+            .latest_file_hashes_shared()
+            .expect("a warm repeat must not touch generation_files");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the repeat must hand back the held map, not a rebuilt one"
+        );
+    }
+
+    /// `status` re-reads the generation and the pending count after its freshness
+    /// walk to be sure the store did not move. That is two fields, and it used
+    /// to be two more whole snapshots (full-text probe, coverage gaps, payload
+    /// encoding count): three per call, against one now.
+    #[test]
+    fn one_status_takes_one_full_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("devmap-status-snapshots-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("root");
+        let store = seeded();
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "UPDATE generations SET repo_root = ?1 WHERE id = 7",
+                params![root.to_string_lossy()],
+            )
+            .expect("bind root");
+        }
+        STATUS_SNAPSHOTS.with(|taken| taken.set(0));
+        let status = store.status("db").expect("status");
+        let taken = STATUS_SNAPSHOTS.with(Cell::get);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            status.source_freshness,
+            Some(true),
+            "the walk must have run to completion for this count to mean anything: {status:?}"
+        );
+        assert_eq!(taken, 1, "status took {taken} full snapshots");
+    }
+
+    #[test]
+    fn a_clean_payload_encoding_verdict_is_not_recounted_for_the_same_generation() {
+        let store = seeded();
+        let ask = |generation: u32| {
+            let conn = lock_conn(&store.conn).expect("connection");
+            let data_version = Store::data_version(&conn).expect("data_version");
+            let snapshot = conn.unchecked_transaction().expect("snapshot");
+            store.payload_encoding_reason_cached(&snapshot, Some(generation), data_version)
+        };
+        assert_eq!(ask(7).expect("first"), None);
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute("DROP TABLE file_payloads", [])
+                .expect("drop table");
+        }
+        assert_eq!(
+            ask(7).expect("a warm clean repeat must not count the payloads"),
+            None
+        );
+        assert!(
+            ask(8).is_err(),
+            "a different generation was not found clean, so it must be counted"
+        );
+    }
+
+    /// The integrity checks judge rows another connection can rewrite under a
+    /// standing generation id (a kernel upgrade rewriting payload identities, a
+    /// repair, an old writer). A commit by any other connection must end every
+    /// held answer, or `status` would certify a store it no longer describes.
+    #[test]
+    fn a_commit_by_another_connection_ends_every_held_answer() {
+        let dir = std::env::temp_dir().join(format!("devmap-checks-memo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("devmap.sqlite");
+        let store = Store::open(&db).expect("store");
+        let foreign = rusqlite::Connection::open(&db).expect("foreign connection");
+        foreign
+            .execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (7, 1.0, 'seed', '{}')",
+                [],
+            )
+            .expect("generation");
+        assert_eq!(store.edge_confidence_mismatches().expect("held"), Some(0));
+        assert!(store.latest_generation_payload_is_current().expect("held"));
+        store.latest_file_hashes_shared().expect("held");
+        // Another connection commits after the answers above were held.
+        foreign
+            .execute("DROP VIEW generation_edges", [])
+            .expect("drop");
+        foreign
+            .execute("DROP VIEW generation_files", [])
+            .expect("drop");
+        let edges = store.edge_confidence_mismatches();
+        let payload = store.latest_generation_payload_is_current();
+        let hashes = store.latest_file_hashes_shared();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(edges.is_err(), "held edge answer survived a foreign commit");
+        assert!(
+            payload.is_err(),
+            "held payload answer survived a foreign commit"
+        );
+        assert!(hashes.is_err(), "held hashes survived a foreign commit");
+    }
+
+    #[test]
+    fn a_newer_generation_is_checked_afresh() {
+        let store = seeded();
+        assert_eq!(store.edge_confidence_mismatches().expect("g7"), Some(0));
+        assert!(store.latest_generation_payload_is_current().expect("g7"));
+        store.latest_file_hashes_shared().expect("g7");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (8, 2.0, 'next', '{}')",
+                [],
+            )
+            .expect("generation");
+        }
+        drop_view(&store, "generation_edges");
+        drop_view(&store, "generation_files");
+        assert!(
+            store.edge_confidence_mismatches().is_err(),
+            "generation 8 is not the memoised generation 7, so it must be read"
+        );
+        assert!(
+            store.latest_generation_payload_is_current().is_err(),
+            "generation 8 is not the memoised generation 7, so it must be read"
+        );
+        assert!(
+            store.latest_file_hashes_shared().is_err(),
+            "generation 8 is not the memoised generation 7, so it must be read"
+        );
     }
 }

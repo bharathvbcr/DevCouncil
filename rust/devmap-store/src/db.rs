@@ -695,6 +695,19 @@ pub struct Store {
     /// on the ScholarLM corpus is milliseconds; `devmap status` asks for it on
     /// every call and nothing else about it can change.
     generation_analysis_status: Mutex<Option<(u32, AnalysisStatus)>>,
+    /// Whole-generation reads `status` makes on every call.
+    ///
+    /// Scans of the generation's rows (`generation_files` for the payload
+    /// identities and the file hashes, `generation_edges` for the confidence
+    /// ladder, 14 to 18 ms on this repository). A reader with a small page
+    /// cache paid for them again on every warm `status`; held, they are read
+    /// once. Unlike `generation_counts` these are *not* keyed by the generation
+    /// id alone: they are integrity checks, and a row they judge can be
+    /// rewritten in place under a standing id by another connection (a kernel
+    /// upgrade rewriting payload identities, a repair). Each is keyed by
+    /// `(generation, PRAGMA data_version)`, so a commit by any other
+    /// connection ends it, and only the newest key is held of each.
+    generation_checks: Mutex<GenerationChecks>,
     /// Last whole-tree source-freshness verdict from [`Store::status`].
     ///
     /// Query envelopes read this rather than re-walking the tree: status is the
@@ -702,6 +715,41 @@ pub struct Store {
     /// generation they answered from, or an explicit unverified reason when
     /// nothing has been checked in this process.
     source_freshness_cache: Mutex<Option<CachedSourceFreshness>>,
+}
+
+/// A value computed for one generation of the database as one connection saw it.
+///
+/// `data_version` is SQLite's `PRAGMA data_version`: it changes when a
+/// *different* connection commits, which is exactly the writes this store's own
+/// connection cannot have made and a memo under the generation id would miss.
+#[derive(Debug)]
+struct Keyed<T> {
+    generation: u32,
+    data_version: i64,
+    value: T,
+}
+
+impl<T> Keyed<T> {
+    fn holds(slot: &Option<Self>, generation: u32, data_version: i64) -> Option<&T> {
+        slot.as_ref()
+            .filter(|held| held.generation == generation && held.data_version == data_version)
+            .map(|held| &held.value)
+    }
+}
+
+/// Memo of the integrity answers `status` repeats; see
+/// [`Store::generation_checks`].
+#[derive(Debug, Default)]
+struct GenerationChecks {
+    /// Every file's payload identity is the running build's.
+    payload_current: Option<Keyed<bool>>,
+    /// Edges whose confidence contradicts their resolution.
+    edge_confidence_mismatches: Option<Keyed<usize>>,
+    /// Path to content hash, for the freshness comparison.
+    file_hashes: Option<Keyed<std::sync::Arc<BTreeMap<String, u64>>>>,
+    /// No unconverted payload was found (a clean answer only; a fault is
+    /// re-read, since another process's writer open can heal it).
+    payload_encoding_clean: Option<Keyed<()>>,
 }
 
 /// Process-local memo of the last [`Store::status`] source check.

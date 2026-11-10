@@ -1,5 +1,6 @@
 use super::{
-    refusal, sidecar_links, ReaderMemory, SidecarLinks, Store, WriterLock, CONNECTION_SETUP,
+    refusal, sidecar_links, GenerationChecks, ReaderMemory, SidecarLinks, Store, WriterLock,
+    CONNECTION_SETUP,
 };
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
@@ -347,6 +348,7 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
@@ -523,6 +525,7 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only,
@@ -1267,6 +1270,7 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
@@ -1286,6 +1290,7 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: None,
             read_only: false,
