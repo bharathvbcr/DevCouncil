@@ -760,7 +760,7 @@ impl Resolver {
                                     LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => (!(family
                                         == LangFamily::Swift
                                         && Self::swift_call_chain_split(recv).is_some()))
-                                    .then(|| self.protocol_dispatch(family, &class_type, &call.callee_name))
+                                    .then(|| self.protocol_dispatch(family, &ext.file_path, &class_type, &call.callee_name))
                                     .flatten()
                                     .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
@@ -849,7 +849,7 @@ impl Resolver {
                             })
                         {
                             if let Some((direct, targets)) =
-                                self.protocol_dispatch(family, &bound, &call.callee_name)
+                                self.protocol_dispatch(family, &ext.file_path, &bound, &call.callee_name)
                             {
                                 resolution = Some(self.dispatch_through_interface(
                                     ext, call, &mut edges, &bound, direct, targets,
@@ -977,7 +977,7 @@ impl Resolver {
                                         .then(|| self.self_type_at(&ext.file_path, family, caller))
                                         .flatten()
                                         .and_then(|own| {
-                                            self.protocol_dispatch(family, &own, &call.callee_name)
+                                            self.protocol_dispatch(family, &ext.file_path, &own, &call.callee_name)
                                                 .map(|found| (own, found))
                                         });
                                     resolution = Some(match through_protocol {
@@ -1404,7 +1404,7 @@ impl Resolver {
                             }) => self
                                 .declaring_type_of(target_file, target_symbol)
                                 .and_then(|own| {
-                                    self.protocol_dispatch(family, own, &call.callee_name)
+                                    self.protocol_dispatch(family, &ext.file_path, own, &call.callee_name)
                                         .map(|found| (own.to_string(), found))
                                 })
                                 .filter(|(_, (_, targets))| !targets.is_empty()),

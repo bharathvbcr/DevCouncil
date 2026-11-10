@@ -5,6 +5,8 @@
 
 pub mod dynd;
 pub mod dyngate;
+pub mod dyntwin_a;
+pub mod dyntwin_b;
 pub mod gateother;
 pub mod fieldname;
 pub mod handlers;
