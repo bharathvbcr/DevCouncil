@@ -875,11 +875,14 @@ fn check_store_holds_key(store: &Store, key: &BaseKey, what: &str) -> Result<()>
 /// clone at admission (`admit_published_base`), before the lease is written.
 /// After that the lane's file is held to the lease only by its stat tuple
 /// (`check_identity`), at open and at `materialize_seeded_store`, which
-/// re-hashes the CSR sidecar (`verify_csr_content`) but not the base. So the
-/// lease's `base.sha256` is a record that nothing reads back, and open does not
-/// recompute it (it cannot inside the hook's 400 ms budget). Agreement between
-/// lease and store is consistency, not authentication: whoever can rewrite both
-/// the lease and a sealed store can still present a store of their choosing.
+/// re-hashes the CSR sidecar (`verify_csr_content`) but not the base. Ruling
+/// ft-3abcc3b9 (c), 2026-11-10: the stat identity pins the base bytes;
+/// `base.sha256` is recorded at admission and advisory after it, so open does
+/// not recompute it (it cannot inside the hook's 400 ms budget). Drop the field
+/// at the next STACK_FORMAT_VERSION bump; do not bump for it alone. Agreement
+/// between lease and store is consistency, not authentication: whoever can
+/// rewrite both the lease and a sealed store can still present a store of
+/// their choosing.
 ///
 /// The root is compared by [`same_root`], which does not need the donor's path
 /// to exist: the lane's base is its own clone and must open after the donor is
@@ -8185,19 +8188,21 @@ mod tests {
         let _ = remove_readonly_tree(&root);
     }
 
-    /// ATK-B2-1: the lease's `base.sha256` is a record nothing reads back, so a lease
-    /// whose recorded sha256 is not the base's hash still opens (the park invariant
-    /// names "sha" among the values an open must not succeed on). Pre-existing at c2348467.
+    /// Ruling ft-3abcc3b9 (c), 2026-11-10: the stat identity pins the base bytes;
+    /// `base.sha256` is recorded at admission and advisory after it. Drop the field
+    /// at the next STACK_FORMAT_VERSION bump; do not bump for it alone.
+    ///
+    /// So a lease whose recorded sha256 is not the base's hash still opens, through
+    /// both readers, while a stat-identity tamper of the base is still refused.
     #[cfg(all(feature = "parse", unix))]
     #[test]
-    #[ignore = "base.sha256 is not re-checked at open: owner decision ft-3abcc3b9 (hash at materialize, drop the field, or keep it)"]
-    fn atk2_a_lease_whose_base_sha256_is_not_the_bases_hash_is_refused_at_open() {
+    fn a_lease_only_base_sha256_mismatch_opens_because_stat_identity_is_the_anchor() {
         let root = temp_repo_dir("atk2-sha");
         let anchor = root.join("anchor");
         seed_indexed_git_repo(&anchor);
         let lane = add_lane(&anchor, &root, "lane");
         let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
-        let mut unguarded = Vec::new();
+        let mut refused = Vec::new();
         for forged in [
             serde_json::json!("ab".repeat(32)),
             serde_json::json!(""),
@@ -8207,15 +8212,37 @@ mod tests {
             let mut rec = honest.clone();
             rec["sha256"] = forged.clone();
             tamper_lease_field(&lane, "base", rec);
-            if StackedStore::open(&lane).is_ok() {
-                unguarded.push(format!("StackedStore::open accepted base.sha256 = {forged}"));
+            if let Err(e) = StackedStore::open(&lane) {
+                refused.push(format!("StackedStore::open refused base.sha256 = {forged}: {e:#}"));
             }
-            if open_lane_base_store(&lease.base_sqlite_path()).is_ok() {
-                unguarded.push(format!("open_lane_base_store accepted base.sha256 = {forged}"));
+            if let Err(e) = open_lane_base_store(&lease.base_sqlite_path()) {
+                refused.push(format!("open_lane_base_store refused base.sha256 = {forged}: {e:#}"));
             }
             tamper_lease_field(&lane, "base", honest);
         }
-        assert!(unguarded.is_empty(), "{unguarded:#?}");
+        assert!(refused.is_empty(), "{refused:#?}");
+
+        // The anchor: with the honest lease restored, a change to the base's stat
+        // identity (the same edit as `open_refuses_an_in_place_edit_that_moves_mtime`)
+        // is refused by both readers.
+        StackedStore::open(&lane).expect("the honest lease opens");
+        let base_dir = lease.base_dir();
+        let base_sqlite = base_dir.join("base.sqlite");
+        make_tree_writable(&base_dir);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut bytes = fs::read(&base_sqlite).unwrap();
+        let at = bytes.windows(6).position(|w| w == b"Helper").unwrap();
+        bytes[at] = b'X';
+        fs::write(&base_sqlite, &bytes).unwrap();
+        set_file_readonly(&base_sqlite).unwrap();
+        assert!(
+            StackedStore::open(&lane).is_err(),
+            "a stat-identity tamper must still be refused by StackedStore::open"
+        );
+        assert!(
+            open_lane_base_store(&lease.base_sqlite_path()).is_err(),
+            "a stat-identity tamper must still be refused by open_lane_base_store"
+        );
         let _ = remove_readonly_tree(&root);
     }
 }
