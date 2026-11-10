@@ -21,7 +21,7 @@ pub(crate) struct Args {
     ///
     ///   "PreToolUse": [{ "matcher": "Read|Grep|Glob", "hooks": [
     ///     { "type": "command", "timeout": 5,
-    ///       "command": "\"/abs/path/to/devmap\" hook pre-tool-use" }]}]
+    ///       "command": "'/abs/path/to/devmap' hook pre-tool-use" }]}]
     ///
     /// It restates the DevMap directive once per session, at the first
     /// navigation tool call, and stays silent when the index cannot answer.

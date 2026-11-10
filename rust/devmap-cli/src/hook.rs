@@ -381,16 +381,27 @@ fn run_hook_inner(
         }
         HookEvent::PostToolUse => {
             let started = Instant::now();
+            // A refused or failed detach is reported, but it must not drop the
+            // in-process work below that needs no spawn: the blast note.
+            let mut detach_error: Option<anyhow::Error> = None;
             let budget_note = if !selection.roots.is_empty() {
-                detach_roots(
+                match detach_roots(
                     executable,
                     &selection.roots,
                     DETACH_BUDGET,
                     detach_post_tool_root,
-                )?
+                ) {
+                    Ok(note) => note,
+                    Err(error) => {
+                        detach_error = Some(error);
+                        None
+                    }
+                }
             } else if pinned_root.is_none() {
                 if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
-                    let _ = detach_seeded_build(executable, &wt, &main);
+                    if let Err(error) = detach_seeded_build(executable, &wt, &main) {
+                        detach_error = Some(error);
+                    }
                 }
                 None
             } else {
@@ -404,8 +415,12 @@ fn run_hook_inner(
                 .roots
                 .first()
                 .and_then(|root| compose_write_blast(root, &payload, leftover));
+            // The exit code stays what a refused detach always gave: 1.
+            let exit_code = if detach_error.is_some() { 1 } else { 0 };
+            let detach_note =
+                detach_error.map(|error| format!("devmap hook post-tool-use: {error}"));
             Ok(HookOutcome {
-                exit_code: 0,
+                exit_code,
                 stdout: blast.map(|context| {
                     json!({
                         "hookSpecificOutput": {
@@ -414,7 +429,7 @@ fn run_hook_inner(
                         }
                     })
                 }),
-                stderr_line: join_notes(capped_note, budget_note),
+                stderr_line: join_notes(join_notes(capped_note, budget_note), detach_note),
                 roots: selection.roots,
             })
         }
@@ -648,6 +663,24 @@ fn context_breaks_a_line(c: char) -> bool {
         || c == '\u{2028}'
         || c == '\u{2029}'
         || (c.is_control() && c != '\t')
+        || is_text_reordering_format(c)
+}
+
+/// Unicode format characters that reorder or hide text without being visible:
+/// bidi embeddings, overrides and isolates (U+202A-202E, U+2066-2069), the
+/// directional marks (U+200E, U+200F, U+061C), and zero-width characters
+/// (U+200B-200D, U+2060, U+FEFF). Right-to-left *letters* are not in this set:
+/// an Arabic or Hebrew directory name is ordinary text and passes through.
+fn is_text_reordering_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// `text` as one hook-context line. Line breaks and other controls are written
@@ -863,6 +896,13 @@ const DEVMAP_DIRECTIVE: &str = "Ask DevMap before reading files: devmap_search, 
 /// pathological status payload cannot crowd out the directive or the notes.
 const REPO_CLAUSE_CAP: usize = 200;
 
+/// Longest refused-executable notice, at most one per repository. Larger than
+/// the marker line because the remedy text must survive truncation.
+const EXEC_REFUSAL_CAP: usize = 900;
+
+/// Longest refused-marker-directory line, at most one per repository.
+const MARKER_REFUSAL_CAP: usize = 400;
+
 /// Longest installation-health *detail*. One per session, not one per
 /// repository: a mismatched plugin bundle is a property of the installation.
 ///
@@ -891,8 +931,11 @@ const HEALTH_REMEDY: &str = "re-run `devmap claude plugin` and reinstall the bun
 /// structural maximum is the point: the previous flat `truncate(.., 400)` ran
 /// after the notes were appended, so on a capped or timed-out pass it deleted
 /// the very sentence that said the pass was partial.
-const SESSION_START_CONTEXT_CAP: usize =
-    MAX_HOOK_ROOTS * REPO_CLAUSE_CAP + HEALTH_NOTE_CAP + HEALTH_REMEDY.len() + 512;
+const SESSION_START_CONTEXT_CAP: usize = MAX_HOOK_ROOTS
+    * (REPO_CLAUSE_CAP + MARKER_REFUSAL_CAP + EXEC_REFUSAL_CAP)
+    + HEALTH_NOTE_CAP
+    + HEALTH_REMEDY.len()
+    + 512;
 
 /// Coverage buckets that mean information was lost.
 ///
@@ -1037,6 +1080,15 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
     let mut clauses: Vec<String> = Vec::new();
     let mut ran_out_of_time = false;
     for root in &selection.roots {
+        // A refused executable degrades to a notice in the agent's context; it
+        // does not take the whole SessionStart down with an error.
+        if let Err(error) = canonical_hook_executable(executable, root, "probe") {
+            clauses.push(truncate(
+                &refused_executable_notice(&error),
+                EXEC_REFUSAL_CAP,
+            ));
+            continue;
+        }
         let Some(status_text) = probe(
             executable,
             root,
@@ -1068,6 +1120,9 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
             clause.push_str(&format!("; last session {last}"));
         }
         clauses.push(truncate(&clause, REPO_CLAUSE_CAP));
+        if let Some(refusal) = marker_dir_refusal(root) {
+            clauses.push(truncate(&refusal, MARKER_REFUSAL_CAP));
+        }
     }
 
     let additional = compose_session_start(
@@ -1169,8 +1224,20 @@ fn pre_tool_use_sync(
     let Some(root) = selection.roots.first() else {
         return Ok(None);
     };
+    // Decide refusal before the claim is spent, and deliver it with the claim:
+    // a refused probe that consumed the once-per-session claim and then said
+    // nothing would leave the agent silent for the rest of the session.
+    let refusal = canonical_hook_executable(executable, root, "probe").err();
     if claim_once(&marker_dir(root), &session_marker_name(payload)) == Claim::Skip {
         return Ok(None);
+    }
+    if let Some(error) = refusal {
+        return Ok(Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": truncate(&refused_executable_notice(&error), EXEC_REFUSAL_CAP),
+            }
+        })));
     }
 
     let started = Instant::now();
@@ -1927,6 +1994,9 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
     // or a linked ancestor, is refused, so neither the marker nor the pruning
     // below can reach into a directory the link points at.
     let Ok(pinned) = PinnedDir::open(dir, true) else {
+        // Quiet here on purpose: this runs on every tool call. The refusal is
+        // reported once per session by SessionStart and by `devmap doctor`,
+        // from [`marker_dir_refusal`], which asks `PinnedDir` the same question.
         return Claim::Skip;
     };
     match pinned.open_file(std::ffi::OsStr::new(name), Access::Append, Creation::New) {
@@ -1935,6 +2005,29 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
             Claim::First
         }
         Err(_) => Claim::Skip,
+    }
+}
+
+/// `PinnedDir`'s own refusal of this repository's hook marker directory, as one
+/// hook-context line, or `None` when the directory opens (or does not exist yet,
+/// which `claim_once` creates). Read-only: it opens with `create = false`.
+///
+/// There is no second symlink walk and no exemption list here: the text is the
+/// error `PinnedDir::open` returns, so it names a link in the directory or in
+/// any ancestor exactly when `claim_once` would skip. A checkout reached
+/// through a symlinked ancestor therefore gets this notice too: its markers are
+/// dead today, and the notice says so rather than hiding it.
+pub(crate) fn marker_dir_refusal(root: &Path) -> Option<String> {
+    use devmap_extract::safe_fs::PinnedDir;
+    match PinnedDir::open(&marker_dir(root), false) {
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(context_line(&format!(
+            "hook markers for {} are refused ({error}); once-per-session hook notices cannot \
+             be recorded there. Remedy: make the marker directory a real directory, not a \
+             link or path through one",
+            root.display()
+        ))),
     }
 }
 
@@ -2009,7 +2102,11 @@ fn probe(
     if remaining.is_zero() {
         return Ok(None);
     }
-    let mut command = Command::new(executable);
+    // Canonicalize before spawn. A failure here is a hook error, not an empty
+    // probe: spawning the unresolved path, or a binary that lives inside the
+    // repository being probed, is the thing this boundary refuses.
+    let executable = canonical_hook_executable(executable, root, "probe")?;
+    let mut command = Command::new(&executable);
     command.args(["--root"]).arg(root).args(args);
     let bounds = subprocess::Bounds {
         deadline: remaining,
@@ -2088,6 +2185,8 @@ fn detach_post_tool_root(executable: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 fn detach_stack_sync(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    let executable = canonical_hook_executable(executable, root, "detach")?;
+    let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "stack-sync");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
@@ -2152,6 +2251,11 @@ fn detach_build_with(
     root: &Path,
     seed_from: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let executable = canonical_hook_executable(executable, root, "detach")?;
+    if let Some(main) = seed_from {
+        canonical_hook_executable(&executable, main, "detach")?;
+    }
+    let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "build");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
@@ -2177,6 +2281,8 @@ fn detach_session_report(
     root: &Path,
     session: Option<&str>,
 ) -> anyhow::Result<()> {
+    let executable = canonical_hook_executable(executable, root, "detach")?;
+    let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, &session_report_lock_kind(session));
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
@@ -2494,9 +2600,185 @@ impl Drop for OwnedLock {
     }
 }
 
-#[cfg(unix)]
-fn shell_single_quote(text: &str) -> String {
+/// Quote one shell word with single quotes. `'` becomes `'\''`.
+///
+/// Single quotes suppress `$(...)` and backticks. They do not contain a
+/// newline, CR, or NUL; [`shell_quote_hook_executable`] refuses those.
+pub(crate) fn shell_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Single-quote an executable path for a host shell command, or refuse a
+/// path single quotes cannot hold.
+pub(crate) fn shell_quote_hook_executable(text: &str) -> anyhow::Result<String> {
+    if text.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
+        bail!(
+            "the devmap executable path contains a newline, carriage return, or NUL \
+             and cannot be placed in a single-quoted shell command"
+        );
+    }
+    Ok(shell_single_quote(text))
+}
+
+/// What to do about a hook executable that sits inside the repository it
+/// serves. One text for every refusal message and notice; the commands are the
+/// ones `docs/cli-reference.md` (lines 81-87) documents for installing DevMap.
+const INSIDE_REPO_REMEDY: &str = "Remedy: install devmap outside the repository \
+     (`bash scripts/install.sh --only=devmap` from a checkout, or `cargo install --git \
+     https://github.com/bharathvbcr/DevCouncil.git --tag <release tag> --locked devmap-cli`) \
+     and point the hooks at that binary";
+
+/// The agent-visible line for a refused hook executable: the refusal message
+/// (which already names the executable, the repository top and the remedy),
+/// escaped onto one line.
+fn refused_executable_notice(error: &anyhow::Error) -> String {
+    context_line(&format!("DevMap hooks refused: {error:#}"))
+}
+
+/// The repository top for `canonical_root`: the nearest enclosing git worktree
+/// root (a `.git` directory or gitlink file), found by the one shared walk,
+/// [`devmap_extract::git_worktree_root`]; the root itself when none exists.
+fn repository_top(canonical_root: &Path) -> PathBuf {
+    devmap_extract::git_worktree_root(canonical_root)
+        .unwrap_or_else(|| canonical_root.to_path_buf())
+}
+
+/// Canonical executable a hook may spawn for `root`, or an error when the path
+/// cannot be resolved or is inside the repository.
+///
+/// "Inside the repository" is inside its top, as `docs/SECURITY_BOUNDARIES.md`
+/// (lines 25-33) defines it: run from `repo/backend`, a planted
+/// `repo/tools/bin/devmap` is still refused. The top is the nearest git
+/// worktree root above `root` ([`repository_top`]), else `root`. The document's
+/// further `.devcouncil` fallback is not implemented here: it would be a second
+/// walk beside `git_worktree_root`. `action` ("probe", "detach") names
+/// the refused operation in the diagnostic.
+///
+/// This is the one owner of the containment check: `probe` and every detached
+/// spawn (`detach_build_with`, `detach_stack_sync`, `detach_session_report`)
+/// route through it, so no hook path starts a binary the repository can replace.
+///
+/// "Not inside the repository" is the whole policy: there is no install-directory
+/// allowlist. Containment is canonical components, not a string prefix
+/// (`/repo-evil` is not inside `/repo`). On Unix an ancestor with the repo's
+/// device and inode counts too, so a symlink inside the repo that points at
+/// an outside binary is still inside.
+fn canonical_hook_executable(
+    executable: &Path,
+    root: &Path,
+    action: &str,
+) -> anyhow::Result<PathBuf> {
+    let canonical_exe = executable.canonicalize().with_context(|| {
+        format!(
+            "refusing to {action}: could not canonicalize executable {}",
+            executable.display()
+        )
+    })?;
+    let canonical_root = root.canonicalize().with_context(|| {
+        format!(
+            "refusing to {action}: could not canonicalize repository {}",
+            root.display()
+        )
+    })?;
+    // The repository top, not only the root this hook was handed: a hook whose
+    // root is `repo/sub` must still refuse `repo/tools/devmap`.
+    let top = repository_top(&canonical_root);
+    if executable_is_inside_repo(executable, &canonical_exe, root, &canonical_root)
+        || executable_is_inside_repo(executable, &canonical_exe, &top, &top)
+    {
+        bail!(
+            "refusing to {action}: executable {} is inside repository {} (top {}). {INSIDE_REPO_REMEDY}",
+            executable.display(),
+            canonical_root.display(),
+            top.display()
+        );
+    }
+    Ok(canonical_exe)
+}
+
+fn executable_is_inside_repo(
+    executable: &Path,
+    canonical_exe: &Path,
+    root: &Path,
+    canonical_root: &Path,
+) -> bool {
+    if path_is_within(canonical_exe, canonical_root) {
+        return true;
+    }
+    let exe_lex = normalize_lexical(&absolute_non_canonical(executable));
+    if path_is_within(&exe_lex, canonical_root) {
+        return true;
+    }
+    let root_lex = normalize_lexical(&absolute_non_canonical(root));
+    if path_is_within(&exe_lex, &root_lex) {
+        return true;
+    }
+    #[cfg(unix)]
+    if ancestor_matches_repo(canonical_root, &exe_lex)
+        || ancestor_matches_repo(canonical_root, canonical_exe)
+    {
+        return true;
+    }
+    false
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+fn absolute_non_canonical(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Drop `.` and `..` without resolving symlinks, so a later component check
+/// cannot treat `/repo-evil` as `/repo` and cannot treat a `..` that has
+/// already left the repo as still inside it.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out
+                    .components()
+                    .any(|part| matches!(part, Component::Normal(_)))
+                {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when any ancestor of `path` is `canonical_root`, compared by device
+/// and inode. Metadata that cannot be read is skipped; a component check
+/// already covered the canonical spelling.
+#[cfg(unix)]
+fn ancestor_matches_repo(canonical_root: &Path, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(repo_meta) = fs::metadata(canonical_root) else {
+        return false;
+    };
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(meta) = fs::metadata(&current) {
+            if meta.dev() == repo_meta.dev() && meta.ino() == repo_meta.ino() {
+                return true;
+            }
+        }
+        if !current.pop() {
+            return false;
+        }
+    }
 }
 
 /// Environment variable naming the coalescing lock a detached child owns and
@@ -2659,7 +2941,8 @@ pub fn shell_command(executable: &Path, event: HookEvent) -> anyhow::Result<Stri
     let text = abs
         .to_str()
         .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
-    Ok(format!("\"{text}\" hook {}", event.as_str()))
+    let quoted = shell_quote_hook_executable(text)?;
+    Ok(format!("{quoted} hook {}", event.as_str()))
 }
 
 #[cfg(test)]
@@ -2728,6 +3011,816 @@ mod tests {
         assert!(!planted_ran, "the cleanup ran the rm found on PATH");
         assert!(!lock_left, "the cleanup did not remove the lock");
     }
+
+    #[test]
+    fn shell_single_quote_wraps_and_escapes_apostrophes() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_single_quote("$(touch x)"), "'$(touch x)'");
+        assert_eq!(shell_single_quote("`touch x`"), "'`touch x`'");
+    }
+
+    #[cfg(unix)]
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-probe-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A binary whose canonical path is inside the repository must not be spawned.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_an_executable_inside_the_repository() {
+        let base = scratch_dir("inside");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("devmap");
+        write_script(
+            &exe,
+            &format!("#!/bin/sh\n: > '{}'\necho inside-ran\n", marker.display()),
+        );
+
+        let result = probe(
+            &exe,
+            &repo,
+            &["--json", "status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        let err = result.expect_err("an in-repo probe binary must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to probe") && message.contains("inside"),
+            "{message}"
+        );
+        assert!(!ran, "the in-repo executable was spawned");
+    }
+
+    /// A symlink that lives inside the repo and points at an outside binary is
+    /// still inside: canonicalizing the target alone would hide it.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_a_symlink_inside_the_repository() {
+        let base = scratch_dir("symlink");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let real = outside.join("devmap");
+        write_script(
+            &real,
+            &format!(
+                "#!/bin/sh\n: > '{}'\necho outside-target\n",
+                marker.display()
+            ),
+        );
+        let link = repo.join("devmap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = probe(
+            &link,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "symlink inside the repo was spawned: {result:?}"
+        );
+        assert!(!ran, "the symlink target ran");
+    }
+
+    /// The path string is not a prefix of the repo, but an ancestor is the repo
+    /// directory through a symlink. Device and inode are what make that inside.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_when_an_ancestor_is_the_repo_by_inode() {
+        let base = scratch_dir("inode");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        let via = base.join("via");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&via).unwrap();
+        let marker = base.join("ran");
+        let real = outside.join("devmap");
+        write_script(
+            &real,
+            &format!("#!/bin/sh\n: > '{}'\necho via-ran\n", marker.display()),
+        );
+        std::os::unix::fs::symlink(&real, repo.join("devmap")).unwrap();
+        let jump = via.join("jump");
+        std::os::unix::fs::symlink(&repo, &jump).unwrap();
+        let exe = jump.join("devmap");
+
+        let result = probe(
+            &exe,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        let err = result.expect_err("a symlink ancestor that is the repo must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("inside") && !message.contains("canonicalize executable"),
+            "{message}"
+        );
+        assert!(!ran, "the binary reached through the repo symlink ran");
+    }
+
+    /// `/repo-evil` shares a string prefix with `/repo` and is not inside it.
+    #[cfg(unix)]
+    #[test]
+    fn probe_runs_an_executable_outside_the_repository_including_a_prefixed_name() {
+        let base = scratch_dir("outside");
+        let repo = base.join("repo");
+        let evil = base.join("repo-evil");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let marker = base.join("ran");
+        let exe = evil.join("devmap");
+        write_script(
+            &exe,
+            &format!("#!/bin/sh\n: > '{}'\necho outside-ran\n", marker.display()),
+        );
+
+        let result = probe(
+            &exe,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+
+        let ran = marker.exists();
+        let message = result.as_ref().err().map(|err| err.to_string());
+        let _ = fs::remove_dir_all(&base);
+        let stdout = result.expect("an executable outside the repo must run");
+        assert!(
+            ran,
+            "outside executable did not run (stdout {stdout:?}, error {message:?})"
+        );
+        assert!(
+            stdout.as_deref().unwrap_or("").contains("outside-ran"),
+            "{stdout:?}"
+        );
+    }
+
+    /// Every detached spawn shares the probe's containment owner: PostToolUse
+    /// (`detach_build`, `detach_stack_sync`) and SessionEnd
+    /// (`detach_session_report`) refuse a binary inside the repository, take no
+    /// lock, and spawn nothing.
+    #[cfg(unix)]
+    #[test]
+    fn every_detach_refuses_an_executable_inside_the_repository() {
+        let base = scratch_dir("detach-inside");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+        let results = [
+            detach_build(&exe, &repo),
+            detach_stack_sync(&exe, &repo),
+            detach_session_report(&exe, &repo, Some("s1")),
+            detach_post_tool_root(&exe, &repo),
+        ];
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let locked = coalesce_lock_dir(&repo, "build").exists();
+        let _ = fs::remove_dir_all(&base);
+        for result in results {
+            let message = result
+                .expect_err("an in-repo detach must be refused")
+                .to_string();
+            assert!(
+                message.contains("refusing to detach") && message.contains("inside"),
+                "{message}"
+            );
+        }
+        assert!(!ran, "the in-repo executable was spawned");
+        assert!(!locked, "a refused detach must not take the coalesce lock");
+    }
+
+    /// A symlink inside the repo that points at an outside binary is inside.
+    #[cfg(unix)]
+    #[test]
+    fn detach_refuses_a_symlink_inside_the_repository() {
+        let base = scratch_dir("detach-symlink");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let real = outside.join("devmap");
+        write_script(&real, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+        let link = repo.join("devmap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = detach_session_report(&link, &repo, None);
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(result.is_err(), "an in-repo symlink must be refused");
+        assert!(!ran, "the in-repo symlink was spawned");
+    }
+
+    /// A seeded build also refuses a binary inside the main checkout it seeds from.
+    #[cfg(unix)]
+    #[test]
+    fn a_seeded_build_refuses_an_executable_inside_the_seed_checkout() {
+        let base = scratch_dir("detach-seed");
+        let lane = base.join("lane");
+        let main = base.join("main");
+        fs::create_dir_all(&lane).unwrap();
+        fs::create_dir_all(&main).unwrap();
+        let marker = base.join("ran");
+        let exe = main.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+        let result = detach_seeded_build(&exe, &lane, &main);
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "an executable inside the seed checkout must be refused"
+        );
+        assert!(!ran);
+    }
+
+    /// `repo-evil` is a string prefix of `repo` but not inside it: still detaches.
+    #[cfg(unix)]
+    #[test]
+    fn detach_runs_an_executable_in_a_prefixed_sibling_directory() {
+        let base = scratch_dir("detach-sibling");
+        let repo = base.join("repo");
+        let evil = base.join("repo-evil");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let marker = base.join("ran");
+        let exe = evil.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+        let result = detach_session_report(&exe, &repo, Some("s2"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        result.expect("a sibling outside the repo must detach");
+        assert!(ran, "the sibling executable did not run");
+    }
+
+    /// An executable that cannot be canonicalized spawns nothing and is an error.
+    #[cfg(unix)]
+    #[test]
+    fn detach_with_an_unresolvable_executable_is_an_error_and_spawns_nothing() {
+        let base = scratch_dir("detach-missing");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let missing = base.join("no-such-devmap");
+
+        let result = detach_build(&missing, &repo);
+        let locked = coalesce_lock_dir(&repo, "build").exists();
+        let _ = fs::remove_dir_all(&base);
+        let message = result
+            .expect_err("an unresolvable executable must not detach")
+            .to_string();
+        assert!(
+            message.contains("refusing to detach") && message.contains("canonicalize"),
+            "{message}"
+        );
+        assert!(!locked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_when_the_executable_cannot_be_canonicalized() {
+        let base = scratch_dir("missing");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let missing = base.join("no-such-devmap");
+
+        let result = probe(
+            &missing,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        let err = result.expect_err("a path that does not canonicalize must not spawn");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to probe") && message.contains("canonicalize"),
+            "{message}"
+        );
+    }
+
+    /// A dangling symlink and a symlink loop exist as directory entries and
+    /// still fail `canonicalize`. That is a diagnostic, not a spawn.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_a_dangling_symlink_or_a_symlink_loop() {
+        let base = scratch_dir("dangling");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let dangling = base.join("dangling-devmap");
+        std::os::unix::fs::symlink(base.join("missing-target"), &dangling).unwrap();
+        let loop_link = base.join("loop-devmap");
+        std::os::unix::fs::symlink(&loop_link, &loop_link).unwrap();
+
+        for exe in [&dangling, &loop_link] {
+            let result = probe(
+                exe,
+                &repo,
+                &["status"],
+                Instant::now(),
+                Duration::from_secs(5),
+            );
+            let err = result.expect_err("canonicalize failure must not spawn");
+            let message = err.to_string();
+            assert!(
+                message.contains("refusing to probe") && message.contains("canonicalize"),
+                "{exe:?} -> {message}"
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Zero remaining budget returns before spawn. An outside binary that would
+    /// otherwise run must not run, including when the budget was already spent.
+    #[cfg(unix)]
+    #[test]
+    fn probe_skips_spawn_when_the_deadline_is_already_zero() {
+        let base = scratch_dir("deadline");
+        let repo = base.join("repo");
+        let outside = base.join("other").join("target").join("debug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let exe = outside.join("devmap");
+        write_script(
+            &exe,
+            &format!("#!/bin/sh\n: > '{}'\necho deadline-ran\n", marker.display()),
+        );
+        let inside = repo.join("devmap");
+        write_script(
+            &inside,
+            &format!("#!/bin/sh\n: > '{}'\necho inside-ran\n", marker.display()),
+        );
+
+        let zero = probe(&exe, &repo, &["status"], Instant::now(), Duration::ZERO);
+        let spent = probe(
+            &exe,
+            &repo,
+            &["status"],
+            Instant::now()
+                .checked_sub(Duration::from_secs(30))
+                .expect("instant subtraction"),
+            Duration::from_secs(5),
+        );
+        let inside_zero = probe(&inside, &repo, &["status"], Instant::now(), Duration::ZERO);
+
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            matches!(zero, Ok(None)),
+            "a zero budget must skip spawn, got {zero:?}"
+        );
+        assert!(
+            matches!(spent, Ok(None)),
+            "an already-spent budget must skip spawn, got {spent:?}"
+        );
+        assert!(
+            matches!(inside_zero, Ok(None)),
+            "the deadline return stays ahead of the inside-repo refusal, got {inside_zero:?}"
+        );
+        assert!(!ran, "a deadline of zero still spawned the probe");
+    }
+
+    /// `repo/sub/../../repo-evil` is the sibling, not the repo. A `..` that
+    /// stays inside (`repo/sub/../devmap`) is still inside.
+    #[cfg(unix)]
+    #[test]
+    fn probe_treats_dotdot_by_components_not_as_a_string_prefix() {
+        let base = scratch_dir("dotdot");
+        let repo = base.join("repo");
+        let evil = base.join("repo-evil");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let marker = base.join("ran");
+        let outside_exe = evil.join("devmap");
+        write_script(
+            &outside_exe,
+            &format!("#!/bin/sh\n: > '{}'\necho dotdot-out\n", marker.display()),
+        );
+        let inside_exe = repo.join("devmap");
+        write_script(
+            &inside_exe,
+            &format!("#!/bin/sh\n: > '{}'\necho dotdot-in\n", marker.display()),
+        );
+
+        let outside_path = repo
+            .join("sub")
+            .join("..")
+            .join("..")
+            .join("repo-evil")
+            .join("devmap");
+        let outside = probe(
+            &outside_path,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran_outside = marker.exists();
+        let _ = fs::remove_file(&marker);
+        let inside_path = repo.join("sub").join("..").join("devmap");
+        let inside = probe(
+            &inside_path,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran_inside = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+
+        let stdout = outside.expect("a .. path that leaves the repo must run");
+        assert!(ran_outside, "sibling reached by .. did not run: {stdout:?}");
+        assert!(
+            inside.is_err(),
+            "a .. path that remains inside was spawned: {inside:?}"
+        );
+        assert!(!ran_inside, "the in-repo executable was spawned via ..");
+    }
+
+    /// The original path is `repo-evil`, which is not a string prefix of `repo`,
+    /// but it is a symlink to a binary whose canonical path is inside.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_when_a_prefixed_symlink_canonicalizes_inside() {
+        let base = scratch_dir("prefix-inside");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let marker = base.join("ran");
+        let real = repo.join("devmap");
+        write_script(
+            &real,
+            &format!(
+                "#!/bin/sh\n: > '{}'\necho prefix-inside\n",
+                marker.display()
+            ),
+        );
+        let evil = base.join("repo-evil");
+        std::os::unix::fs::symlink(&real, &evil).unwrap();
+
+        let result = probe(
+            &evil,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        let err = result.expect_err("canonical path inside the repo must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to probe") && message.contains("inside"),
+            "{message}"
+        );
+        assert!(!ran, "symlink named repo-evil ran its in-repo target");
+    }
+
+    /// A directory symlink that lives inside the repo and points outside is
+    /// still inside, even though the canonical target is not.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_through_an_in_repo_directory_symlink() {
+        let base = scratch_dir("dirlink");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let real = outside.join("devmap");
+        write_script(
+            &real,
+            &format!("#!/bin/sh\n: > '{}'\necho dirlink-ran\n", marker.display()),
+        );
+        std::os::unix::fs::symlink(&outside, repo.join("out")).unwrap();
+        let exe = repo.join("out").join("devmap");
+
+        let result = probe(
+            &exe,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "in-repo directory symlink was spawned: {result:?}"
+        );
+        assert!(
+            !ran,
+            "the outside target of an in-repo directory symlink ran"
+        );
+    }
+
+    /// The command layer reports the probe refusal as a hook error, not as an
+    /// empty success. `run_hook` is what `commands/hook.rs` prints and exits with.
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_reports_an_inside_repo_probe_refusal() {
+        let base = scratch_dir("run-hook");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("devmap");
+        write_script(
+            &exe,
+            &format!("#!/bin/sh\n: > '{}'\necho inside-ran\n", marker.display()),
+        );
+
+        let outcome = run_hook(
+            HookEvent::SessionStart,
+            br#"{"session_id":"probe-refusal"}"#,
+            &exe,
+            Some(&repo),
+        );
+
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        // SessionStart reports the refusal in the agent's context and exits 0
+        // (ruling C5b); the in-repo binary still never runs.
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        let text = outcome
+            .stdout
+            .expect("a refused probe must still answer SessionStart")
+            .to_string();
+        assert!(
+            text.contains("refusing to probe") && text.contains("inside"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Remedy"),
+            "the notice names the remedy: {text}"
+        );
+        assert!(!ran, "run_hook spawned the in-repo executable");
+    }
+
+    /// A refused detach is told to the user: PostToolUse and SessionEnd exit 1
+    /// with a stderr diagnostic naming the refusal, never an empty success that
+    /// leaves a silently stale index, and the in-repo binary is not started.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_detach_is_reported_by_post_tool_use_and_session_end() {
+        for event in [HookEvent::PostToolUse, HookEvent::SessionEnd] {
+            let base = scratch_dir("run-hook-detach");
+            let repo = base.join("repo");
+            fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+            fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+            let marker = base.join("ran");
+            let exe = repo.join("devmap");
+            write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+
+            let outcome = run_hook(
+                event,
+                br#"{"session_id":"detach-refusal"}"#,
+                &exe,
+                Some(&repo),
+            );
+
+            std::thread::sleep(Duration::from_millis(300));
+            let ran = marker.exists();
+            let _ = fs::remove_dir_all(&base);
+            assert_eq!(
+                outcome.exit_code,
+                1,
+                "{}: {:?}",
+                event.as_str(),
+                outcome.stderr_line
+            );
+            let line = outcome
+                .stderr_line
+                .expect("a refused detach is a stderr diagnostic");
+            assert!(
+                line.contains("refusing to detach") && line.contains("inside"),
+                "{}: {line}",
+                event.as_str()
+            );
+            assert!(
+                !ran,
+                "{}: the in-repo executable was spawned",
+                event.as_str()
+            );
+        }
+    }
+
+    /// A repository whose top (`.git`) is above the hooked root `repo/sub`, and a
+    /// binary at `repo/tools/devmap` outside that root: refused on every event,
+    /// by pinned root and by payload cwd, and never run.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_in_the_repository_top_is_refused_for_a_subroot_on_every_event() {
+        let base = scratch_dir("top-events");
+        let repo = base.join("repo");
+        let sub = repo.join("sub");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(sub.join(".devcouncil/codeintel")).unwrap();
+        fs::write(sub.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("tools/devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+        let payload = format!(r#"{{"session_id":"top","cwd":"{}"}}"#, sub.display());
+
+        for event in [HookEvent::PostToolUse, HookEvent::SessionEnd] {
+            for pinned in [Some(sub.as_path()), None] {
+                let outcome = run_hook(event, payload.as_bytes(), &exe, pinned);
+                assert_eq!(
+                    outcome.exit_code,
+                    1,
+                    "{} pinned={}",
+                    event.as_str(),
+                    pinned.is_some()
+                );
+                let line = outcome.stderr_line.expect("a refusal is a diagnostic");
+                assert!(
+                    line.contains("refusing to detach") && line.contains("Remedy"),
+                    "{}: {line}",
+                    event.as_str()
+                );
+            }
+        }
+        let start = run_hook(
+            HookEvent::SessionStart,
+            payload.as_bytes(),
+            &exe,
+            Some(&sub),
+        );
+        let start_text = start
+            .stdout
+            .expect("SessionStart still answers")
+            .to_string();
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(start.exit_code, 0);
+        assert!(
+            start_text.contains("refusing to probe") && start_text.contains("Remedy"),
+            "{start_text}"
+        );
+        assert!(!ran, "a binary in the repository top was spawned");
+    }
+
+    /// A refused probe must not spend the once-per-session claim in silence:
+    /// the first PreToolUse call delivers the refusal notice to the agent.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_pre_tool_use_probe_still_tells_the_agent_once() {
+        let base = scratch_dir("pre-refused");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+        let payload = format!(
+            r#"{{"session_id":"pre-refused","cwd":"{}","tool_name":"Read","tool_input":{{"file_path":"{}"}}}}"#,
+            repo.display(),
+            repo.join("a.py").display()
+        );
+
+        let first = run_hook(HookEvent::PreToolUse, payload.as_bytes(), &exe, Some(&repo));
+        let second = run_hook(HookEvent::PreToolUse, payload.as_bytes(), &exe, Some(&repo));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(first.exit_code, 0, "{:?}", first.stderr_line);
+        let text = first
+            .stdout
+            .expect("the refusal must reach the agent, not silence")
+            .to_string();
+        assert!(
+            text.contains("DevMap hooks refused") && text.contains("Remedy"),
+            "{text}"
+        );
+        assert!(!text.contains("permissionDecision"), "{text}");
+        assert!(second.stdout.is_none(), "the notice is once per session");
+        assert!(!ran, "the in-repo executable was spawned");
+    }
+
+    /// A refused detach keeps its exit code and stderr line, but the in-process
+    /// blast note (no spawn needed) is still delivered.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_post_tool_use_detach_still_delivers_the_blast_note() {
+        let base = scratch_dir("post-blast");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let exe = repo.join("devmap");
+        write_script(&exe, "#!/bin/sh\n");
+        let payload = format!(
+            r#"{{"session_id":"post-blast","cwd":"{}"}}"#,
+            repo.display()
+        );
+
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            payload.as_bytes(),
+            &exe,
+            Some(&repo),
+        );
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(
+            outcome.exit_code, 1,
+            "today's exit code for a refused detach"
+        );
+        let line = outcome.stderr_line.expect("the refusal stays on stderr");
+        assert!(
+            line.contains("refusing to detach") && line.contains("Remedy"),
+            "{line}"
+        );
+        let text = outcome
+            .stdout
+            .expect("the blast note must survive a refused detach")
+            .to_string();
+        assert!(text.contains("DevMap blast"), "{text}");
+    }
+
+    /// A missing executable fails canonicalize. `run_hook` must surface that as
+    /// exit 1 with a diagnostic, not as an empty success and not as a panic.
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_reports_a_missing_executable_as_exit_1() {
+        let base = scratch_dir("missing-hook");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let missing = base.join("no-such-devmap");
+
+        let outcome = run_hook(
+            HookEvent::SessionStart,
+            br#"{"session_id":"missing-exe"}"#,
+            &missing,
+            Some(&repo),
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        // SessionStart reports the refusal to the agent and exits 0 (ruling C5b):
+        // an unresolvable executable is a notice, not an empty success and not
+        // an error that takes the whole context down.
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        let text = outcome
+            .stdout
+            .expect("SessionStart must still answer")
+            .to_string();
+        assert!(
+            text.contains("refusing to probe") && text.contains("canonicalize"),
+            "{text}"
+        );
+    }
+
     use serde_json::json;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3167,7 +4260,15 @@ mod tests {
     fn pre_tool_use_never_emits_a_permission_decision() {
         let root = scratch("pretool-nopermission");
         store_bearing(&root);
-        let exe = fake_devmap(&root.join("bin"), healthy_status());
+        // Outside the repo: probe refuses a binary whose path is inside the
+        // repository it is about to read.
+        let bin = root.with_file_name(format!(
+            "{}-bin",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("stub")
+        ));
+        let exe = fake_devmap(&bin, healthy_status());
 
         let payload = json!({
             "session_id": "sec-1",
@@ -3212,6 +4313,7 @@ mod tests {
             "expected exactly one additionalContext, got keys {keys:?}"
         );
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     /// The common case must cost a string compare, not a filesystem walk.
@@ -3674,7 +4776,7 @@ mod tests {
         fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o555)).unwrap();
 
         let payload = json!({ "cwd": &root });
-        let notice = unindexed_worktree_notice(&payload, Path::new("devmap"))
+        let notice = unindexed_worktree_notice(&payload, Path::new("/bin/sh"))
             .expect("a linked unindexed worktree is named");
         let text = notice
             .pointer("/hookSpecificOutput/additionalContext")
@@ -4113,6 +5215,36 @@ mod tests {
 
     /// Every breaking character is escaped, and every other character is kept.
     /// A fixed set stands in for a fuzzer: the function is total over `char`.
+    /// Bidi controls and zero-width characters are written as `\uXXXX`, so a
+    /// path cannot reorder or hide the hook line it lands in; RTL letters stay.
+    #[test]
+    fn context_line_escapes_bidi_and_zero_width_but_not_rtl_letters() {
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{200C}',
+            '\u{200D}', '\u{2060}', '\u{FEFF}',
+        ] {
+            let out = context_line(&format!("a{c}b"));
+            assert_eq!(
+                out,
+                format!("a\\u{:04x}b", u32::from(c)),
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        for name in [
+            "\u{05E9}\u{05DC}\u{05D5}\u{05DD}",
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}",
+            "repo-\u{05D0}\u{0628}",
+        ] {
+            assert_eq!(
+                context_line(name),
+                name,
+                "an RTL name must pass through unchanged"
+            );
+        }
+    }
+
     #[test]
     fn context_line_keeps_text_and_escapes_every_break() {
         let samples = [
@@ -4687,7 +5819,13 @@ mod tests {
     fn second_navigation_call_in_a_session_is_silent() {
         let root = scratch("pretool-once");
         store_bearing(&root);
-        let exe = fake_devmap(&root.join("bin"), healthy_status());
+        let bin = root.with_file_name(format!(
+            "{}-bin",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("stub")
+        ));
+        let exe = fake_devmap(&bin, healthy_status());
         let payload = json!({
             "session_id": "once-1",
             "cwd": root.to_string_lossy(),
@@ -4707,6 +5845,7 @@ mod tests {
             second.stdout
         );
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     fn prompt(root: &Path, session: &str) -> HookOutcome {
@@ -4836,9 +5975,12 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         // Another report holds the store-wide lock the old code used for all.
-        let held = coalesce_lock_dir(&root, "session-report");
+        // The binary lives beside the hooked repository, not inside it.
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let held = coalesce_lock_dir(&repo, "session-report");
         assert!(try_acquire_lock_dir(&held).unwrap());
-        detach_session_report(&script, &root, Some("ending-session")).unwrap();
+        detach_session_report(&script, &repo, Some("ending-session")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -4936,6 +6078,64 @@ mod tests {
         fs::write(&blocked, b"x").unwrap();
         assert_eq!(claim_once(&blocked, "nav.x.0"), Claim::Skip);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The refusal text is `PinnedDir`'s own: a linked hooks directory is named
+    /// (path escaped onto one line), a real or absent one is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_hooks_directory_is_named_from_the_pinned_refusal() {
+        let root = scratch("hooks-linked-notice");
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        assert_eq!(
+            marker_dir_refusal(&root),
+            None,
+            "an absent state dir is not a refusal"
+        );
+        let hooks = marker_dir(&root);
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        assert_eq!(
+            marker_dir_refusal(&root),
+            None,
+            "an absent hooks dir is not a refusal"
+        );
+        fs::create_dir_all(&hooks).unwrap();
+        assert_eq!(
+            marker_dir_refusal(&root),
+            None,
+            "a real hooks dir is not a refusal"
+        );
+        fs::remove_dir(&hooks).unwrap();
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+
+        let notice = marker_dir_refusal(&root).expect("a linked hooks dir is refused");
+        assert!(notice.contains("hooks"), "{notice}");
+        assert!(notice.contains("Remedy"), "{notice}");
+        assert!(!notice.contains('\n'), "one line: {notice}");
+        // Refused by claim_once at the same moment, so the two cannot disagree.
+        assert_eq!(claim_once(&hooks, "nav.x.0"), Claim::Skip);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A newline in the repository path must not break the notice onto a second line.
+    #[cfg(unix)]
+    #[test]
+    fn the_refusal_notice_escapes_a_newline_in_the_path() {
+        let base = scratch("hooks-linked-newline");
+        let root = base.join("lane\nname");
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let hooks = marker_dir(&root);
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+        let notice = marker_dir_refusal(&root).expect("refused");
+        assert!(
+            !notice.contains('\n') && !notice.contains('\r'),
+            "{notice:?}"
+        );
+        assert!(notice.contains("lane\\u000aname"), "{notice:?}");
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// `.devcouncil/codeintel/hooks` linked at a directory the repository's
@@ -5757,5 +6957,276 @@ mod lock_tests {
         assert!(!text.contains("--seed-from"), "{text:?}");
         std::thread::sleep(Duration::from_millis(300));
         assert!(!fx.record.exists(), "a build was started without an opt-in");
+    }
+}
+
+/// Adversarial round 1 on w2/hook-trust (Lane C). Finding ids are in each name.
+#[cfg(all(test, unix))]
+mod attack_hook_trust {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::UNIX_EPOCH;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "atk-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn script(path: &Path, marker: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            path,
+            format!("#!/bin/sh\n: > '{}'\necho ran\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn assert_refused(exe: &Path, root: &Path, base: &Path, marker: &Path, what: &str) {
+        let result = probe(
+            exe,
+            root,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(base);
+        assert!(!ran, "{what}: the in-repo executable ran");
+        assert!(result.is_err(), "{what}: not refused: {result:?}");
+    }
+
+    /// ATK-C-2a: the same repo spelled with different case on case-insensitive APFS.
+    #[test]
+    fn atk_c2a_case_variant_spelling_of_the_repo_is_still_inside() {
+        let base = scratch("case");
+        let repo = base.join("Repo");
+        let marker = base.join("ran");
+        script(&repo.join("devmap"), &marker);
+        let lower = PathBuf::from(repo.to_string_lossy().to_lowercase());
+        if !lower.join("devmap").exists() {
+            let _ = fs::remove_dir_all(&base);
+            return; // case-sensitive volume: nothing to attack
+        }
+        assert_refused(
+            &lower.join("devmap"),
+            &repo,
+            &base,
+            &marker,
+            "case variant exe",
+        );
+    }
+
+    /// ATK-C-2b: repo root passed through a symlink, binary by the real path.
+    #[test]
+    fn atk_c2b_root_through_symlink_exe_by_real_path() {
+        let base = scratch("rootlink");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        script(&repo.join("bin/devmap"), &marker);
+        let via = base.join("via");
+        std::os::unix::fs::symlink(&repo, &via).unwrap();
+        assert_refused(
+            &repo.join("bin/devmap"),
+            &via,
+            &base,
+            &marker,
+            "root via symlink",
+        );
+    }
+
+    /// ATK-C-2c: `..`/`.` spellings, trailing slash on the root, binary under `.git`.
+    #[test]
+    fn atk_c2c_dotdot_trailing_slash_and_dot_git() {
+        let base = scratch("dots");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        script(&repo.join(".git/hooks/devmap"), &marker);
+        fs::create_dir_all(base.join("other")).unwrap();
+        let sneaky = base.join("other/../repo/./.git/hooks/devmap");
+        let slash_root = PathBuf::from(format!("{}/", repo.display()));
+        assert_refused(
+            &sneaky,
+            &slash_root,
+            &base,
+            &marker,
+            "dotdot + trailing slash",
+        );
+    }
+
+    /// ATK-C-2d: exe in a nested repo inside the hooked repo.
+    #[test]
+    fn atk_c2d_nested_repo_binary_inside_hooked_repo() {
+        let base = scratch("nested");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        fs::create_dir_all(repo.join("sub/.git")).unwrap();
+        script(&repo.join("sub/target/debug/devmap"), &marker);
+        assert_refused(
+            &repo.join("sub/target/debug/devmap"),
+            &repo,
+            &base,
+            &marker,
+            "nested",
+        );
+    }
+
+    /// ATK-C-2e: /tmp firmlink spelling vs /private/tmp (macOS) for the same repo.
+    #[test]
+    fn atk_c2e_firmlink_tmp_vs_private_tmp() {
+        let base = scratch("firm");
+        let s = base.to_string_lossy().to_string();
+        let Some(rest) = s.strip_prefix("/private") else {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        };
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        script(&repo.join("devmap"), &marker);
+        let alias_exe = PathBuf::from(format!("{rest}/repo/devmap"));
+        assert_refused(&alias_exe, &repo, &base, &marker, "firmlink alias exe");
+    }
+
+    /// ATK-C-2f (HIGH): docs/SECURITY_BOUNDARIES.md says "inside the repository" means
+    /// inside its TOP (nearest `.git`), not the root a command was handed. A hook whose
+    /// selected root is `repo/sub` (own store) must refuse `repo/tools/devmap`.
+    #[test]
+    fn atk_c2f_binary_in_repo_top_outside_the_selected_subroot_is_refused() {
+        let base = scratch("top");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        script(&repo.join("tools/devmap"), &marker);
+        assert_refused(
+            &repo.join("tools/devmap"),
+            &repo.join("sub"),
+            &base,
+            &marker,
+            "exe in repo top, root is a subdirectory",
+        );
+    }
+
+    /// ATK-C-5b (MEDIUM): a refused in-repo executable must not take the SessionStart
+    /// context down with it: the agent must still be told, in additionalContext, that
+    /// DevMap hooks were refused (today the hook errors out with empty stdout).
+    #[test]
+    fn atk_c5b_session_start_with_in_repo_exe_still_reports_to_the_agent() {
+        let base = scratch("ssrefuse");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        script(&repo.join("devmap"), &marker);
+        let selection = RootSelection::whole(vec![repo.clone()]);
+        let result = session_start_sync(&repo.join("devmap"), &selection);
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(!ran);
+        let value = result.expect("a refused probe must degrade to a notice, not an Err");
+        let text = value.to_string();
+        assert!(text.contains("refus"), "{text}");
+    }
+
+    /// ATK-C-7: hostile hooks paths must neither hang, panic, nor write.
+    #[test]
+    fn atk_c7_marker_dir_refusal_hostile_inputs_terminate_and_do_not_write() {
+        let base = scratch("hostile");
+        let root = base.join("repo");
+        let hooks = root.join(".devcouncil/codeintel/hooks");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        type Hostile = (&'static str, Box<dyn Fn()>);
+        let cases: Vec<Hostile> = vec![
+            (
+                "symlink to /",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        let _ = std::os::unix::fs::symlink("/", &h);
+                    }
+                }),
+            ),
+            (
+                "symlink loop",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        let _ = std::os::unix::fs::symlink(&h, &h);
+                    }
+                }),
+            ),
+            (
+                "fifo",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        let _ = Command::new("mkfifo").arg(&h).status();
+                    }
+                }),
+            ),
+            (
+                "mode 000 dir",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        fs::create_dir(&h).unwrap();
+                        fs::set_permissions(&h, fs::Permissions::from_mode(0o000)).unwrap();
+                    }
+                }),
+            ),
+        ];
+        for (name, make) in cases {
+            let _ = fs::set_permissions(&hooks, fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_file(&hooks);
+            let _ = fs::remove_dir(&hooks);
+            make();
+            let (tx, rx) = mpsc::channel();
+            let r = root.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(marker_dir_refusal(&r));
+            });
+            let got = rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{name}: marker_dir_refusal hung"));
+            assert!(got.is_some(), "{name}: hostile hooks path was not reported");
+        }
+        let _ = fs::set_permissions(&hooks, fs::Permissions::from_mode(0o755));
+        assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// ATK-C-5a: the printed refusal escapes ESC, newline and bidi controls in the path.
+    #[test]
+    fn atk_c5a_refusal_escapes_esc_newline_and_bidi_in_the_path() {
+        let base = scratch("esc");
+        let root = base.join("re\u{1b}[31mpo\nX\u{202e}evil");
+        let hooks = root.join(".devcouncil/codeintel/hooks");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+        let notice = marker_dir_refusal(&root).expect("linked hooks dir is refused");
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            !notice.chars().any(|c| c.is_control()),
+            "raw control: {notice:?}"
+        );
+        assert!(
+            !notice.contains('\u{202e}'),
+            "raw bidi override in hook context: {notice:?}"
+        );
     }
 }
