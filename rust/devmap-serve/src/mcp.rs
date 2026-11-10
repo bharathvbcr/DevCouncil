@@ -57,9 +57,9 @@ use crate::protocol::{
     dispatch, dispatch_with_stacked, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION,
 };
 use crate::repo_scope::{
-    canonicalize_path, corrupt_store_message, infer_root_from_store, open_mcp_store,
-    store_for_repo_path, CacheLookup, IdleSweeper, RepositoryRef, StoreFileIdentity, StoreLru,
-    StoreOrigin, STORE_IDLE_SWEEP,
+    canonicalize_path, corrupt_store_message, infer_root_from_store, open_mcp_store_classified,
+    store_for_repo_path, CacheLookup, CorruptContext, DamageMemory, DamageStamp, IdleSweeper,
+    RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin, STORE_IDLE_SWEEP,
 };
 use crate::root_resolve::{file_uri_to_path, roots_with_stores, RootResolveInput, MAX_ROOTS};
 
@@ -114,6 +114,8 @@ pub struct StoreSlot {
     /// Drops stores nobody has used for `repo_scope::STORE_IDLE_TTL`; started with the
     /// first store this slot opens, ended with the slot.
     sweeper: OnceLock<Option<IdleSweeper>>,
+    /// Files found damaged and not changed since; see [`DamageMemory`].
+    damaged: Mutex<DamageMemory>,
     unusable_mcp_roots: Mutex<usize>,
     roots_list_seq: Mutex<u64>,
     /// The executable this server was started from, taken when the slot is
@@ -132,6 +134,7 @@ impl StoreSlot {
             },
             opened: Arc::new(Mutex::new(StoreLru::new())),
             sweeper: OnceLock::new(),
+            damaged: Mutex::new(DamageMemory::default()),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
             started_as: crate::binary_identity::executable_identity(),
@@ -164,6 +167,7 @@ impl StoreSlot {
             },
             opened: Arc::new(Mutex::new(StoreLru::new())),
             sweeper: OnceLock::new(),
+            damaged: Mutex::new(DamageMemory::default()),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
             started_as: crate::binary_identity::executable_identity(),
@@ -185,6 +189,7 @@ impl StoreSlot {
             },
             opened: Arc::new(Mutex::new(cache)),
             sweeper: OnceLock::new(),
+            damaged: Mutex::new(DamageMemory::default()),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
             started_as: crate::binary_identity::executable_identity(),
@@ -496,9 +501,15 @@ with an absolute repository path."
     fn cache_open(&self, store_path: &Path) -> Result<Arc<Store>, String> {
         let key = devmap_extract::safe_fs::resolve_file_alias(store_path)
             .map_err(|error| format!("unsafe store path: {error}"))?;
+        // Closing a connection and freeing an edge index take time; they happen
+        // here, after the cache lock is released, never under it.
+        let idle = crate::lock_recover(&self.opened).evict_idle();
+        drop(idle);
+        if let Some(message) = self.known_damage(&key) {
+            return Err(message);
+        }
         {
             let mut cache = crate::lock_recover(&self.opened);
-            cache.evict_idle();
             for candidate in [key.as_path(), store_path] {
                 if let CacheLookup::Hit(store) =
                     cache.get_verified(candidate, |path| std::fs::metadata(path))
@@ -515,7 +526,17 @@ with an absolute repository path."
             Ok(metadata) if metadata.is_file() => StoreFileIdentity::of(&metadata),
             _ => return Err(explain_absence(store_path)),
         };
-        let store = Arc::new(open_mcp_store(store_path)?);
+        let store = match open_mcp_store_classified(store_path) {
+            Ok(store) => Arc::new(store),
+            Err(failure) => {
+                // Damage found while opening is remembered like damage found
+                // by a query: the file is not opened again until it changes.
+                if failure.corrupt {
+                    self.remember_damage(store_path);
+                }
+                return Err(failure.message);
+            }
+        };
         let mut cache = crate::lock_recover(&self.opened);
         cache.insert(key, Arc::clone(&store), StoreOrigin::Opened(identity));
         drop(cache);
@@ -524,18 +545,72 @@ with an absolute repository path."
         Ok(store)
     }
 
-    /// Forget the cached connection for `store_path`, so the next
-    /// [`Self::open_for_call`] opens the file afresh.
+    /// The store at exactly `store_path`, opened again if need be, with no
+    /// resolution of which repository to read.
+    ///
+    /// A retry after damage goes through here with the path the failed attempt
+    /// used, so it can only ever answer from the store the first attempt named;
+    /// re-running [`Self::open_for_call`] could resolve to another repository
+    /// if the client's MCP roots changed in between.
+    pub fn reopen(&self, store_path: &Path) -> Result<Arc<Store>, String> {
+        self.cache_open(store_path)
+    }
+
+    /// Forget the connection this slot opened for `store_path`, so the next
+    /// [`Self::reopen`] opens the file afresh. Returns whether there was one.
     ///
     /// Called when a query on that connection reported `SQLITE_CORRUPT`: a
     /// handle that has seen damaged pages is not served a second time, whether
-    /// the damage is in the file or only in what the handle cached of it.
-    fn evict_cached(&self, store_path: &Path) {
-        let mut cache = crate::lock_recover(&self.opened);
-        if let Ok(key) = devmap_extract::safe_fs::resolve_file_alias(store_path) {
-            cache.evict(&key);
+    /// the damage is in the file or only in what the handle cached of it. A
+    /// store the caller handed in is never evicted (see
+    /// [`StoreLru::evict_opened`]); the answer says so.
+    fn evict_cached(&self, store_path: &Path) -> Eviction {
+        let key = devmap_extract::safe_fs::resolve_file_alias(store_path).ok();
+        let mut evicted = Vec::new();
+        let caller_owned;
+        {
+            let mut cache = crate::lock_recover(&self.opened);
+            if let Some(key) = &key {
+                evicted.extend(cache.evict_opened(key));
+            }
+            evicted.extend(cache.evict_opened(store_path));
+            caller_owned = key
+                .as_deref()
+                .is_some_and(|key| cache.holds_caller_owned(key))
+                || cache.holds_caller_owned(store_path);
         }
-        cache.evict(store_path);
+        // Closed here, after the cache lock is released.
+        let dropped = !evicted.is_empty();
+        drop(evicted);
+        if dropped {
+            Eviction::Dropped
+        } else if caller_owned {
+            Eviction::CallerOwned
+        } else {
+            Eviction::NotCached
+        }
+    }
+
+    /// Record that the file at `store_path` is damaged as it stands now.
+    pub fn remember_damage(&self, store_path: &Path) {
+        let key = devmap_extract::safe_fs::resolve_file_alias(store_path)
+            .unwrap_or_else(|_| store_path.to_path_buf());
+        if let Some(stamp) = DamageStamp::of(&key) {
+            crate::lock_recover(&self.damaged).remember(key, stamp);
+        }
+    }
+
+    /// The error to give, without opening anything, when `key` was found
+    /// damaged on an earlier call and is the same file in the same state.
+    fn known_damage(&self, key: &Path) -> Option<String> {
+        let still = crate::lock_recover(&self.damaged).still_damaged(key, DamageStamp::of(key));
+        still.then(|| {
+            corrupt_store_message(
+                key,
+                &"database disk image is malformed",
+                CorruptContext::KnownUnchanged,
+            )
+        })
     }
 
     /// Open the store this call should read, honouring optional `repo_path`.
@@ -3030,42 +3105,21 @@ async fn call_tool(
     // (the 2026-11-09 "database disk image is malformed" answers came from such
     // a handle); a file that is damaged says so a second time, and the call then
     // fails naming the store and the next step rather than quoting SQLite alone.
-    if let Ok(Ok(Err(first))) = &outcome {
-        if Store::is_database_corrupt(first) {
-            store.evict_cached(&db_path);
-            outcome = match (
-                store.open_for_call(repo_path.as_deref()),
-                to_ipc_command(&name, params.get("arguments")),
-            ) {
-                (Ok((engine, _)), Ok(command)) => {
-                    let again = run_dispatch(
-                        engine,
-                        attr_root,
-                        IpcRequest {
-                            version: PROTOCOL_VERSION,
-                            command,
-                        },
-                        &cancel,
-                        CALL_TIMEOUT.saturating_sub(started.elapsed()),
-                    )
-                    .await;
-                    match again {
-                        Ok(Ok(Err(second))) if Store::is_database_corrupt(&second) => {
-                            store.evict_cached(&db_path);
-                            Ok(Ok(Err(anyhow::anyhow!(corrupt_store_message(
-                                &db_path, &second
-                            )))))
-                        }
-                        other => other,
-                    }
-                }
-                // The reopen itself failed (it names the store and, for damage,
-                // the remedy), or the arguments no longer parse: report that.
-                (Err(reason), _) => Ok(Ok(Err(anyhow::anyhow!(reason)))),
-                (_, Err(err)) => Ok(Ok(Err(anyhow::anyhow!(err.message().to_string())))),
-            };
+    outcome = match outcome {
+        Ok(Ok(Err(first))) if Store::is_database_corrupt(&first) => {
+            recover_from_damage(
+                store,
+                first,
+                &db_path,
+                attr_root,
+                (&name, params.get("arguments")),
+                &cancel,
+                started,
+            )
+            .await
         }
-    }
+        other => other,
+    };
 
     let latency_ms = || started.elapsed().as_millis() as u64;
     match outcome {
@@ -3125,11 +3179,141 @@ being reported because a partial traversal cannot be distinguished from a comple
     }
 }
 
+/// Damage reported by a file of a stacked lane, naming the file that failed and
+/// the remedy that applies to it. Carried as an error context so
+/// [`Store::is_database_corrupt`] still sees the SQLite error beneath it.
+#[derive(Debug)]
+struct LaneDamage {
+    file: PathBuf,
+    remedy: &'static str,
+}
+
+impl std::fmt::Display for LaneDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the stacked lane file {} reported SQLITE_CORRUPT. No answer is given, because a read \
+that failed is not a statement that nothing was found. {}",
+            self.file.display(),
+            self.remedy
+        )
+    }
+}
+
+/// Name the lane file behind a corrupt error. The base snapshot is probed first
+/// because a failing probe there settles it; otherwise the delta, if there is
+/// one, is the file the answer also read.
+fn name_lane_damage(
+    stacked: &devmap_query::stacked::StackedStore,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if !Store::is_database_corrupt(&error) {
+        return error;
+    }
+    let base = stacked.base_store();
+    let base_failed = base
+        .status("lane-probe")
+        .err()
+        .is_some_and(|probe| Store::sqlite_error_is_corrupt(&probe));
+    let damage = match (base_failed, stacked.delta_store()) {
+        (false, Some(delta)) => LaneDamage {
+            file: delta.path().to_path_buf(),
+            remedy: "Remove that file and run `devmap seed --sync-delta` (or \
+`devmap build --manifest`) in this worktree.",
+        },
+        _ => LaneDamage {
+            file: base.path().map(Path::to_path_buf).unwrap_or_default(),
+            remedy: "Run `devmap seed --stacked --from <donor checkout>` in this worktree to \
+replace the lane's base snapshot.",
+        },
+    };
+    error.context(damage)
+}
+
+/// What became of the cached entry a corrupt query used.
+enum Eviction {
+    /// This slot opened it and has dropped it.
+    Dropped,
+    /// The caller handed it in; it stays, and is reported on.
+    CallerOwned,
+    /// Nothing was cached under the path any more (an idle sweep, or a
+    /// concurrent call, got there first).
+    NotCached,
+}
+
+/// A query reported `SQLITE_CORRUPT`. Decide whether the connection or the file
+/// is at fault, and answer or explain accordingly.
+///
+/// * A lane (stacked) answer does not read the cached connection at all, so no
+///   entry is evicted and nothing is retried; the error names the lane file.
+/// * A store the caller handed in is reported on, not reopened.
+/// * Otherwise the entry is evicted, the same path reopened once and the call
+///   retried. The path is the failed attempt's own, never re-resolved, so the
+///   retry cannot answer from a different repository while naming the first.
+/// * A second corrupt answer is remembered against the file's state, so the
+///   next call is refused with a stat and no open until the file changes.
+async fn recover_from_damage(
+    slot: &StoreSlot,
+    first: anyhow::Error,
+    db_path: &Path,
+    attr_root: PathBuf,
+    (tool, arguments): (&str, Option<&Value>),
+    cancel: &devmap_query::Cancel,
+    started: Instant,
+) -> DispatchOutcome {
+    let report = |message: String| -> DispatchOutcome { Ok(Ok(Err(anyhow::anyhow!(message)))) };
+    if let Some(lane) = first.downcast_ref::<LaneDamage>() {
+        return report(format!("{lane} (raw: {first:#})"));
+    }
+    match slot.evict_cached(db_path) {
+        Eviction::CallerOwned => {
+            return report(corrupt_store_message(
+                db_path,
+                &first,
+                CorruptContext::CallerOwned,
+            ));
+        }
+        Eviction::Dropped | Eviction::NotCached => {}
+    }
+    let engine = match slot.reopen(db_path) {
+        Ok(engine) => engine,
+        Err(reason) => return report(reason),
+    };
+    let command = match to_ipc_command(tool, arguments) {
+        Ok(command) => command,
+        Err(err) => return report(err.message().to_string()),
+    };
+    let again = run_dispatch(
+        engine,
+        attr_root,
+        IpcRequest {
+            version: PROTOCOL_VERSION,
+            command,
+        },
+        cancel,
+        CALL_TIMEOUT.saturating_sub(started.elapsed()),
+    )
+    .await;
+    match again {
+        Ok(Ok(Err(second))) if Store::is_database_corrupt(&second) => {
+            if let Some(lane) = second.downcast_ref::<LaneDamage>() {
+                return report(format!("{lane} (raw: {second:#})"));
+            }
+            slot.evict_cached(db_path);
+            slot.remember_damage(db_path);
+            report(corrupt_store_message(
+                db_path,
+                &second,
+                CorruptContext::Reopened,
+            ))
+        }
+        other => other,
+    }
+}
+
 /// What one engine run yields: the timeout, the task, then the query itself.
-type DispatchOutcome = Result<
-    Result<anyhow::Result<Value>, tokio::task::JoinError>,
-    tokio::time::error::Elapsed,
->;
+type DispatchOutcome =
+    Result<Result<anyhow::Result<Value>, tokio::task::JoinError>, tokio::time::error::Elapsed>;
 
 /// Run one request on the blocking pool under `budget`.
 ///
@@ -3160,13 +3344,25 @@ fn dispatch_with_stacked_overlay(
     let Some(stacked) = devmap_query::stacked::StackedStore::open_if_leased(attr_root)? else {
         return dispatch(engine, request, cancel, unapplied);
     };
+    // The lane opens its own base and delta, never the cached `engine`, so
+    // damage found here says which lane file failed (see `name_lane_damage`).
+    lane_answer(&stacked, request, cancel, unapplied)
+        .map_err(|error| name_lane_damage(&stacked, error))
+}
+
+fn lane_answer(
+    stacked: &devmap_query::stacked::StackedStore,
+    request: IpcRequest,
+    cancel: &devmap_query::Cancel,
+    unapplied: &crate::protocol::UnappliedEdits,
+) -> anyhow::Result<Value> {
     let st = stacked.status()?;
     let is_status = matches!(request.command, IpcCommand::Status);
     // The engine merges the delta itself (`keyword_page` for search, the merged
     // edge index for every traversal), so no answer is patched afterwards.
     let mut value = dispatch_with_stacked(
         stacked.base_store(),
-        Some(&stacked),
+        Some(stacked),
         request,
         cancel,
         unapplied,
@@ -4825,5 +5021,90 @@ mod transport_audit_tests {
             blocker.await.unwrap();
             assert!(cancelled, "aborted async handler left its blocking worker uncancelled");
         });
+    }
+}
+
+#[cfg(test)]
+mod damage_recovery_tests {
+    use super::{recover_from_damage, StoreSlot};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-recover-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn plant(root: &Path) -> PathBuf {
+        let store = devmap_extract::paths::store_path(root);
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        let _ = devmap_store::Store::open(&store).expect("create store");
+        store.canonicalize().unwrap()
+    }
+
+    fn corrupt() -> anyhow::Error {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".into()),
+        ))
+    }
+
+    /// A store this slot opened itself, whose file is whole, reports corrupt
+    /// (a handle holding pages the file no longer has): the entry is replaced
+    /// by a fresh connection and the call answers.
+    #[tokio::test]
+    async fn an_opened_store_that_reports_corrupt_is_replaced_and_the_call_answers() {
+        let root = scratch("opened");
+        let db = plant(&root);
+        let slot = StoreSlot::new(&db);
+        let before = slot.get().expect("opens and caches");
+
+        let arguments = json!({});
+        let outcome = recover_from_damage(
+            &slot,
+            corrupt(),
+            &db,
+            root.clone(),
+            ("devmap_status", Some(&arguments)),
+            &devmap_query::Cancel::new(),
+            Instant::now(),
+        )
+        .await;
+        assert!(matches!(outcome, Ok(Ok(Ok(_)))), "{outcome:?}");
+
+        let after = slot.get().expect("cached again");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the connection that saw damage must not be served again"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The retry reads the path the failed attempt named, not whatever the
+    /// slot would resolve now: on an unpinned server the MCP roots can change
+    /// between the attempt and its retry.
+    #[test]
+    fn a_reopen_reads_the_named_path_not_the_resolved_repository() {
+        let (root_a, root_b) = (scratch("reopen-a"), scratch("reopen-b"));
+        let (a, b) = (plant(&root_a), plant(&root_b));
+        let slot = StoreSlot::resolving(None, root_b.clone(), None);
+        slot.set_mcp_roots(vec![root_b.clone()]);
+        let resolved = slot.get().expect("resolution picks b");
+        assert_eq!(resolved.path(), Some(b.as_path()));
+
+        let named = slot.reopen(&a).expect("reopens a by path");
+        assert_eq!(named.path(), Some(a.as_path()));
+        std::fs::remove_dir_all(root_a).unwrap();
+        std::fs::remove_dir_all(root_b).unwrap();
     }
 }
