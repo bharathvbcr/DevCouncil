@@ -522,7 +522,10 @@ func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root
 			// If the symlink points outside the sparse cone and is not tracked in
 			// the scratch index, refuse: out-of-cone `.gitignore` rules are not
 			// materialized on disk and an untracked out-of-cone target is not in
-			// the tree.
+			// the tree. This is stricter than a full checkout on purpose: an
+			// in-tree directory symlink and a dangling symlink are refused here
+			// because their targets are not tracked in HEAD, and a refusal
+			// fails closed where guessing would not.
 			if cone != nil && !cone.contains(lexRel) && !stagedSet[lexRel] {
 				return fmt.Errorf(
 					"%s is a symlink to %s outside the sparse-checkout cone and not tracked in HEAD",

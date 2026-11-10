@@ -868,9 +868,11 @@ fn head_of(dir: &Path) -> String {
 /// whichever sidecar sits beside the store and checks only the generation
 /// number, so placing a store beside it without sweeping it is a silent wrong
 /// answer. The donor here has no CSR (a plain `build` never writes one), which is
-/// the usual case for a hook-driven `build --seed-from`.
+/// the usual case for a hook-driven `build --seed-from`. The seeded store brings a
+/// fresh CSR of its own, so the stale file is replaced by one carrying the lane's
+/// generation.
 #[test]
-fn a_stale_csr_beside_an_absent_store_is_swept_when_the_seeded_store_brings_none() {
+fn a_stale_csr_beside_an_absent_store_is_replaced_by_a_fresh_one_when_the_donor_has_none() {
     let fx = Fixture::new();
     fx.build_main();
     let main = fx.main();
@@ -887,10 +889,14 @@ fn a_stale_csr_beside_an_absent_store_is_swept_when_the_seeded_store_brings_none
     let out = fx.devmap(&lane, &["build", "--seed-from", main.to_str().unwrap()]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(store(&lane).is_file(), "the seeded store was placed");
-    assert!(
-        !stale.exists(),
+    // The seeded store brings a CSR of its own now (a donor without one gets a
+    // fresh sidecar), so the stale file is replaced rather than left or absent.
+    assert_ne!(
+        fs::read(&stale).ok().as_deref(),
+        Some(b"A-CSR-OF-ANOTHER-GENERATION".as_slice()),
         "a store was placed beside a sidecar it did not write"
     );
+    assert_eq!(csr_generation(&stale), latest_generation(&lane));
 }
 
 /// The standalone seed of a lane whose tree equals the donor's but whose HEAD
@@ -1278,7 +1284,10 @@ fn dead_over_a_lane_never_silently_omits_what_the_delta_made_dead() {
         .is_some_and(|reason| reason.contains("delta"));
     for (case, name) in [
         ("the delta deleted the only caller", "alpha"),
-        ("the delta added a symbol with no caller", "orphan_added_by_the_delta"),
+        (
+            "the delta added a symbol with no caller",
+            "orphan_added_by_the_delta",
+        ),
     ] {
         assert!(
             names.iter().any(|n| n.contains(name)) || marked,
@@ -1352,7 +1361,11 @@ fn every_rerouted_cli_command_names_the_edits_a_lane_answer_does_not_cover() {
         );
     }
 
-    for args in [&["literals", "--", "UNSYNCED_LITERAL"][..], &["doc-drift"], &["savings"]] {
+    for args in [
+        &["literals", "--", "UNSYNCED_LITERAL"][..],
+        &["doc-drift"],
+        &["savings"],
+    ] {
         let mut json_args = vec!["--json"];
         json_args.extend_from_slice(args);
         let answer = json_of(&fx.devmap(&lane, &json_args));
@@ -1415,6 +1428,445 @@ fn dead_over_a_lane_does_not_list_a_cycle_the_delta_deleted() {
             .is_some_and(|reason| reason.contains("delta") && reason.contains("src/cyc.py")),
         "the answer must say the cluster scan was dropped, naming the delta: {dead}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Attack round on port lane Y (P7). Tests named `atk_*`. A test whose doc says
+// "FAILS = finding" fails on 0cbe4c6d by design; the others hold and are kept
+// as regressions.
+// ---------------------------------------------------------------------------
+
+/// The CSR's stamped generation (u64 LE at byte 16 of the 80-byte header).
+fn csr_generation(path: &Path) -> u64 {
+    let bytes = fs::read(path).unwrap();
+    u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+}
+
+fn latest_generation(root: &Path) -> u64 {
+    scalar::<i64>(root, "SELECT max(id) FROM generations") as u64
+}
+
+/// FAILS = finding (MEDIUM, pre-existing on 79468e96, propagated by the matching
+/// branch). A donor store that was deleted and rebuilt keeps an orphan `.csr`
+/// whose generation is AHEAD of the new store's. The matching-tree seed copies
+/// it unconditionally, so the lane's store (generation 1) sits beside a CSR
+/// stamped generation 3; GitPulse accepts that CSR the moment the lane reaches
+/// generation 3, whatever graph it holds.
+#[test]
+fn atk_a_donor_csr_stamped_ahead_of_the_donor_store_is_not_copied_into_the_lane() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let donor_csr = fx.main().join(".devmap/codeintel/devmap.sqlite.csr");
+    // A real CSR (from a seeded lane), restamped to generation 3.
+    let cold = fx.at("cold");
+    let out = fx.devmap(&cold, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mut bytes = fs::read(cold.join(".devmap/codeintel/devmap.sqlite.csr")).unwrap();
+    bytes[16..24].copy_from_slice(&3u64.to_le_bytes());
+    fs::write(&donor_csr, bytes).unwrap();
+    assert_eq!(latest_generation(&fx.main()), 1);
+
+    let lane = fx.at("lane");
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let lane_csr = lane.join(".devmap/codeintel/devmap.sqlite.csr");
+    if lane_csr.is_file() {
+        assert!(
+            csr_generation(&lane_csr) <= latest_generation(&lane),
+            "lane store is generation {} but its CSR is stamped generation {}",
+            latest_generation(&lane),
+            csr_generation(&lane_csr)
+        );
+    }
+}
+
+/// Two `devmap seed` processes at once on one lane: exactly one places, the
+/// other is refused, nothing staged is left, the store is intact and its CSR
+/// carries the store's generation.
+#[test]
+fn atk_two_concurrent_standalone_seeds_place_exactly_one_store() {
+    for diverge in [false, true] {
+        let fx = Fixture::new();
+        fx.build_main();
+        let lane = fx.at("lane");
+        if diverge {
+            edit(&lane);
+        }
+        let spawn = || {
+            Command::new(env!("CARGO_BIN_EXE_devmap"))
+                .arg("--root")
+                .arg(&lane)
+                .args(["--json", "seed"])
+                .current_dir(&fx.base)
+                .env_remove("DEVMAP_HOME")
+                .env("DEVMAP_AUTOSPAWN", "0")
+                .env("TOKIO_WORKER_THREADS", "2")
+                .env("RAYON_NUM_THREADS", "2")
+                .output()
+        };
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(spawn);
+            let b = s.spawn(spawn);
+            (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+        });
+        let ok = [a.status.success(), b.status.success()];
+        assert_eq!(
+            ok.iter().filter(|x| **x).count(),
+            1,
+            "diverge={diverge}: exactly one seed must place; a: {} b: {}",
+            stderr(&a),
+            stderr(&b)
+        );
+        assert_eq!(
+            seed_leftovers(&lane),
+            Vec::<String>::new(),
+            "diverge={diverge}"
+        );
+        let check: String = scalar(&lane, "PRAGMA integrity_check");
+        assert_eq!(check, "ok");
+        assert_eq!(
+            csr_generation(&lane.join(".devmap/codeintel/devmap.sqlite.csr")),
+            latest_generation(&lane)
+        );
+    }
+}
+
+/// A sidecar of every kind already sitting beside the absent final store is
+/// swept, for the matching path and the diverged path, and none of them reaches
+/// the placed store.
+#[test]
+fn atk_preplanted_sidecars_of_every_kind_never_reach_the_placed_store() {
+    for diverge in [false, true] {
+        let fx = Fixture::new();
+        fx.build_main();
+        let lane = fx.at("lane");
+        if diverge {
+            edit(&lane);
+        }
+        let ci = lane.join(".devmap/codeintel");
+        fs::create_dir_all(&ci).unwrap();
+        for (name, len) in [
+            ("devmap.sqlite-wal", 4096usize),
+            ("devmap.sqlite-shm", 32768),
+            ("devmap.sqlite-journal", 512),
+        ] {
+            fs::write(ci.join(name), vec![0xA5u8; len]).unwrap();
+        }
+        fs::write(ci.join("devmap.sqlite.csr"), b"garbage").unwrap();
+        fs::write(ci.join("devmap.sqlite.artifacts.json"), b"{\"garbage\":1}").unwrap();
+
+        let out = fx.devmap(&lane, &["--json", "seed"]);
+        assert!(out.status.success(), "diverge={diverge}: {}", stderr(&out));
+        let check: String = scalar(&lane, "PRAGMA integrity_check");
+        assert_eq!(check, "ok", "diverge={diverge}");
+        assert_eq!(
+            csr_generation(&ci.join("devmap.sqlite.csr")),
+            latest_generation(&lane),
+            "diverge={diverge}: the CSR beside the store is not the store's generation"
+        );
+        let stamp = ci.join("devmap.sqlite.artifacts.json");
+        if stamp.exists() {
+            assert_ne!(
+                fs::read(&stamp).unwrap(),
+                b"{\"garbage\":1}",
+                "diverge={diverge}"
+            );
+        }
+        assert_eq!(
+            seed_leftovers(&lane),
+            Vec::<String>::new(),
+            "diverge={diverge}"
+        );
+    }
+}
+
+/// A symlink planted as the final `.csr` or `-wal` is unlinked, never followed:
+/// the file it points at is untouched.
+#[cfg(unix)]
+#[test]
+fn atk_a_symlinked_final_sidecar_is_unlinked_not_followed() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let ci = lane.join(".devmap/codeintel");
+    fs::create_dir_all(&ci).unwrap();
+    let victim = fx.base.join("victim");
+    fs::write(&victim, "VICTIM").unwrap();
+    std::os::unix::fs::symlink(&victim, ci.join("devmap.sqlite.csr")).unwrap();
+    std::os::unix::fs::symlink(&victim, ci.join("devmap.sqlite-wal")).unwrap();
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "VICTIM");
+}
+
+/// Same tree, different HEAD, a donor with several generations: the seed keeps
+/// history, and the next plain build normalises it with no orphaned
+/// `seed_rebind` and no change of generation.
+#[test]
+fn atk_same_tree_other_head_then_a_plain_build_normalises_history() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let main = fx.main();
+    fs::write(main.join("src/e1.py"), "def e1():\n    return 1\n").unwrap();
+    git(&main, &["add", "src"]);
+    git(&main, &["commit", "-qm", "e1"]);
+    let out = fx.devmap(&main, &["build"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let lane = fx.at("lane");
+    git(&lane, &["checkout", "-q", "--detach", &head_of(&main)]);
+    git(&lane, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rows = generation_rows(&lane);
+    let last = rows.last().unwrap().0;
+    assert_eq!(rows.last().unwrap().2, head_of(&lane));
+    let out = fx.devmap(&lane, &["--json", "build"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rows = generation_rows(&lane);
+    assert_eq!(
+        rows.last().unwrap().0,
+        last,
+        "a plain build must not add a generation"
+    );
+    let lane_root = lane.to_string_lossy().into_owned();
+    assert!(
+        rows.iter().all(|(_, root, _)| *root == lane_root),
+        "history not normalised after the first build: {rows:?}"
+    );
+    let rebind: i64 = scalar(&lane, "SELECT count(*) FROM seed_rebind");
+    assert_eq!(rebind, 0, "orphaned seed_rebind after a normalising build");
+}
+
+/// A seed of every kind of lane-tree difference is the graph a plain build of
+/// that tree would produce: a build right after the seed has nothing to do.
+#[cfg(unix)]
+#[test]
+fn atk_a_seeded_store_is_what_a_build_of_the_lane_tree_would_write() {
+    type Setup = fn(&Path);
+    let cases: [(&str, Setup); 8] = [
+        ("ignored file", |l| {
+            fs::write(l.join(".gitignore"), "*.log\n").unwrap();
+            fs::write(l.join("junk.log"), "x").unwrap();
+        }),
+        ("untracked source", |l| {
+            fs::write(l.join("src/zed.py"), "def zed():\n    return 9\n").unwrap();
+        }),
+        ("staged source", |l| {
+            fs::write(l.join("src/zed.py"), "def zed():\n    return 9\n").unwrap();
+            git(l, &["add", "src/zed.py"]);
+        }),
+        ("mode only", |l| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(l.join("src/a.py"), fs::Permissions::from_mode(0o755)).unwrap();
+        }),
+        ("crlf rewrite", |l| {
+            let t = fs::read_to_string(l.join("src/a.py")).unwrap();
+            fs::write(l.join("src/a.py"), t.replace('\n', "\r\n")).unwrap();
+        }),
+        ("symlink added", |l| {
+            std::os::unix::fs::symlink("a.py", l.join("src/link.py")).unwrap();
+        }),
+        ("case-only rename", |l| {
+            git(l, &["mv", "src/b.py", "src/B.py"])
+        }),
+        ("nested repository", |l| {
+            fs::create_dir_all(l.join("vendor/x")).unwrap();
+            fs::write(l.join("vendor/x/v.py"), "def vx():\n    return 1\n").unwrap();
+            git(&l.join("vendor/x"), &["init", "-q"]);
+        }),
+    ];
+    for (name, setup) in cases {
+        let fx = Fixture::new();
+        fx.build_main();
+        let lane = fx.at("lane");
+        setup(&lane);
+        let out = fx.devmap(&lane, &["--json", "seed"]);
+        assert!(out.status.success(), "{name}: {}", stderr(&out));
+        let before = fs::read(store(&lane)).map(|_| ()).is_ok();
+        assert!(before, "{name}: no store placed");
+        let gen_before: Option<i64> = Connection::open(store(&lane))
+            .unwrap()
+            .query_row("SELECT max(id) FROM generations", [], |r| r.get(0))
+            .unwrap();
+        let out = fx.devmap(&lane, &["--json", "build"]);
+        assert!(out.status.success(), "{name}: {}", stderr(&out));
+        let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let d = &json["file_progress"]["delta"];
+        assert_eq!(
+            (
+                d["added"].as_i64(),
+                d["changed"].as_i64(),
+                d["removed"].as_i64()
+            ),
+            (Some(0), Some(0), Some(0)),
+            "{name}: the seeded graph disagrees with the lane's tree: {d}"
+        );
+        let gen_after: Option<i64> = Connection::open(store(&lane))
+            .unwrap()
+            .query_row("SELECT max(id) FROM generations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            gen_before, gen_after,
+            "{name}: a build after the seed wrote a generation"
+        );
+    }
+}
+
+/// FAILS = finding (LOW, pre-existing semantics of plain `build`). With the lane's
+/// HEAD unreadable the matching-tree seed refuses, but the diverged seed places
+/// a store whose latest generation is stamped `head_sha = "unavailable"`.
+#[test]
+fn atk_an_unreadable_head_refuses_a_diverged_seed_like_a_matching_one() {
+    for diverge in [false, true] {
+        let fx = Fixture::new();
+        fx.build_main();
+        let lane = fx.at("lane");
+        if diverge {
+            edit(&lane);
+        }
+        let gitdir = fs::read_to_string(lane.join(".git")).unwrap();
+        let gitdir = PathBuf::from(gitdir.trim().trim_start_matches("gitdir: "));
+        fs::write(gitdir.join("HEAD"), "garbage\n").unwrap();
+        let out = fx.devmap(&lane, &["--json", "seed"]);
+        assert!(
+            !out.status.success(),
+            "diverge={diverge}: a seed with an unreadable HEAD placed a store stamped {:?}",
+            Connection::open(store(&lane))
+                .and_then(|c| c.query_row(
+                    "SELECT head_sha FROM generations ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0)
+                ))
+                .ok()
+        );
+        assert!(!store(&lane).exists());
+        assert_eq!(seed_leftovers(&lane), Vec::<String>::new());
+    }
+}
+
+/// The `build --seed-from` site of the same rule as the standalone seed above: a
+/// donor CSR stamped for a generation the donor's store does not have is not
+/// carried into the lane, and the CSR the lane ends with is its own store's.
+#[test]
+fn a_seed_from_build_does_not_carry_a_donor_csr_stamped_for_another_generation() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let main = fx.main();
+    let donor_csr = main.join(".devmap/codeintel/devmap.sqlite.csr");
+    let cold = fx.at("cold");
+    let out = fx.devmap(&cold, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mut bytes = fs::read(cold.join(".devmap/codeintel/devmap.sqlite.csr")).unwrap();
+    bytes[16..24].copy_from_slice(&3u64.to_le_bytes());
+    fs::write(&donor_csr, bytes).unwrap();
+    assert_eq!(latest_generation(&main), 1);
+
+    let lane = fx.at("lane");
+    let out = fx.devmap(&lane, &["build", "--seed-from", main.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let lane_csr = lane.join(".devmap/codeintel/devmap.sqlite.csr");
+    assert!(lane_csr.is_file(), "the lane keeps a CSR of its own store");
+    assert_eq!(
+        csr_generation(&lane_csr),
+        latest_generation(&lane),
+        "the lane's CSR must carry its store's generation, not the donor orphan's"
+    );
+}
+
+/// The stamp the seed places is one the next `build --manifest` can use: that
+/// build proves the artifacts current and serializes nothing. Existence of the
+/// stamp file alone (above) does not show this.
+#[test]
+fn the_next_manifest_build_after_a_diverged_seed_skips_the_artifact_work() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit(&lane);
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = fx.devmap(&lane, &["--json", "build", "--manifest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        json_of(&out)["manifest"]["artifacts_unchanged"],
+        serde_json::json!(true),
+        "the seeded stamp did not let the next manifest skip"
+    );
+}
+
+/// Place a donor CSR that `kind` makes unusable, seed a lane from it by each
+/// entry point, and return the lane for the caller's assertions.
+#[cfg(unix)]
+fn seed_lane_over_bad_donor_csr(kind: &str, standalone: bool) -> (Fixture, PathBuf, Output) {
+    let fx = Fixture::new();
+    fx.build_main();
+    let main = fx.main();
+    let donor_csr = main.join(".devmap/codeintel/devmap.sqlite.csr");
+    match kind {
+        "corrupt header" => fs::write(&donor_csr, b"not a csr header").unwrap(),
+        "directory" => fs::create_dir_all(&donor_csr).unwrap(),
+        "dangling symlink" => {
+            std::os::unix::fs::symlink(main.join("no-such-csr"), &donor_csr).unwrap()
+        }
+        "missing" => {}
+        other => panic!("unknown kind {other}"),
+    }
+    let lane = fx.at("lane");
+    let out = if standalone {
+        fx.devmap(&lane, &["--json", "seed"])
+    } else {
+        fx.devmap(&lane, &["build", "--seed-from", main.to_str().unwrap()])
+    };
+    (fx, lane, out)
+}
+
+/// A donor CSR whose header cannot be opened is not placed: the lane gets a
+/// fresh CSR of its own store, and the fallback is said on stderr.
+#[cfg(unix)]
+#[test]
+fn a_corrupt_donor_csr_is_replaced_by_a_fresh_one_and_the_fallback_is_reported() {
+    for standalone in [true, false] {
+        let (_fx, lane, out) = seed_lane_over_bad_donor_csr("corrupt header", standalone);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let lane_csr = lane.join(".devmap/codeintel/devmap.sqlite.csr");
+        assert_eq!(
+            csr_generation(&lane_csr),
+            latest_generation(&lane),
+            "standalone={standalone}"
+        );
+        assert!(
+            stderr(&out).contains("unreadable"),
+            "standalone={standalone}: the fallback was silent: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// A donor with no usable CSR (absent, a directory, a dangling symlink) still
+/// leaves the lane with a CSR of its own store, by either entry point.
+#[cfg(unix)]
+#[test]
+fn a_donor_without_a_regular_csr_file_gives_the_lane_a_fresh_one_by_either_entry_point() {
+    for kind in ["missing", "directory", "dangling symlink"] {
+        for standalone in [true, false] {
+            let (_fx, lane, out) = seed_lane_over_bad_donor_csr(kind, standalone);
+            assert!(
+                out.status.success(),
+                "{kind}/{standalone}: {}",
+                stderr(&out)
+            );
+            let lane_csr = lane.join(".devmap/codeintel/devmap.sqlite.csr");
+            assert!(
+                fs::symlink_metadata(&lane_csr).is_ok_and(|m| m.is_file()),
+                "{kind}/standalone={standalone}: no CSR was placed"
+            );
+            assert_eq!(
+                csr_generation(&lane_csr),
+                latest_generation(&lane),
+                "{kind}/standalone={standalone}"
+            );
+        }
+    }
 }
 
 /// A lane's lease claims a generation, a `HEAD` and a donor root. A lease whose

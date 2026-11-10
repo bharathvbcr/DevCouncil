@@ -20,6 +20,7 @@ use devmap_query::{
     gc_unused_bases, provision_stacked_worktree, seed_derived_artifacts_and_reuse_caches,
     StackedStore, SyncTarget,
 };
+use devmap_store::csr::CsrGraphReader;
 use devmap_store::seed::{self, SeedMethod};
 use devmap_store::Store;
 
@@ -193,6 +194,22 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
     seed::discard_staged(&staged);
     let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
+        // A seed stamps the lane's HEAD on what it places, whether it keeps the
+        // donor's graph or builds the lane's own, so a HEAD that cannot be read
+        // is a refusal on both paths: a store placed under the donor's stamp
+        // would read as another commit's, and one stamped "unavailable" as no
+        // commit's. Only `devmap seed` refuses. `build --seed-from` and a plain
+        // `devmap build` keep the "unavailable" fallback (build.rs), because a
+        // build must still index a tree whose HEAD cannot be read. Whether
+        // `--seed-from` should refuse too is an owner decision: the SessionStart
+        // hook runs it (hook.rs:2153-2170), and a refusal there would stop a
+        // session's first build.
+        let lane_head = devmap_store::current_git_head(&root).with_context(|| {
+            format!(
+                "cannot read the HEAD of {} to stamp the seeded store",
+                root.display()
+            )
+        })?;
         let m = seed::stage_seed_healing_wal(&source_store, &staged)
             .with_context(|| format!("cannot seed from {}", source_store.display()))?;
         seed::rebind_staged(&staged, &root)?;
@@ -211,28 +228,12 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                 .is_none_or(|refused| refused.total == 0);
         if tree_matches_donor {
             // The lane's tree is the donor's, so its graph is the donor's; only
-            // the HEAD it is stamped with can differ. A HEAD that cannot be read
-            // is a refusal: placing a store under the donor's stamp would read
-            // as stale or as another commit's.
-            let lane_head = devmap_store::current_git_head(&root).with_context(|| {
-                format!(
-                    "cannot read the HEAD of {} to stamp the seeded store",
-                    root.display()
-                )
-            })?;
+            // the HEAD it is stamped with can differ.
             if staged_store.latest_generation_head_sha()?.as_deref() != Some(lane_head.as_str()) {
                 staged_store.restamp_latest_head_keeping_seed_rebind(&lane_head)?;
             }
-            let src_csr = csr_path_for_store(&source_store);
-            if src_csr.is_file() {
-                drop(staged_store);
-                seed::seed_artifact(&src_csr, &csr_path_for_store(&staged)).with_context(|| {
-                    format!("cannot stage CSR sidecar from {}", src_csr.display())
-                })?;
-            } else {
-                staged_store.write_latest_csr_sidecar_strict()?;
-                drop(staged_store);
-            }
+            stage_donor_csr(&staged_store, &csr_path_for_store(&source_store), &staged)?;
+            drop(staged_store);
         } else {
             drop(staged_store);
             seed_resolution_reuse_dirs(&source, &root);
@@ -296,6 +297,41 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Give the staged store a CSR sidecar. The donor's is copied to the private
+/// staged path first and that copy, not the donor's path, is what is checked: it
+/// is kept only when stamped with the staged store's latest generation, so a
+/// donor renamed or rewritten after the copy cannot be placed unchecked. A donor
+/// that is absent, not a regular file, unreadable or stamped for another
+/// generation (an orphan left by an earlier store at the donor's path) is not
+/// kept, and a fresh sidecar is written from the staged store instead. Readers
+/// accept a sidecar on its generation number alone, so a copy stamped for
+/// another store's generation would be served as this store's graph.
+fn stage_donor_csr(staged_store: &Store, donor_csr: &Path, staged_db: &Path) -> anyhow::Result<()> {
+    let Some(latest) = staged_store.latest_generation_id()? else {
+        return Ok(());
+    };
+    let staged_csr = csr_path_for_store(staged_db);
+    // `seed_artifact` places nothing when the donor is absent or not a regular
+    // file, or when a sidecar already sits at the staged path (of unknown
+    // generation); both fall through to the fresh write below.
+    let copied = seed::seed_artifact(donor_csr, &staged_csr)
+        .with_context(|| format!("cannot stage CSR sidecar from {}", donor_csr.display()))?
+        .is_some();
+    if copied {
+        match CsrGraphReader::open_mmap(&staged_csr) {
+            Ok(reader) if reader.generation() == u64::from(latest) => return Ok(()),
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "devmap seed: the donor CSR {} is unreadable ({error:#}); writing a fresh one",
+                donor_csr.display()
+            ),
+        }
+        seed::remove_file_if_present(&staged_csr)?;
+    }
+    staged_store.write_latest_csr_sidecar_strict()?;
+    Ok(())
+}
+
 pub(crate) struct Plan {
     root: PathBuf,
     main: PathBuf,
@@ -330,12 +366,15 @@ impl<'a> StagedSeed<'a> {
         tree_matches_donor: bool,
     ) -> anyhow::Result<Store> {
         if tree_matches_donor {
-            let src_csr = csr_path_for_store(&self.plan.source_store);
-            if src_csr.is_file() {
-                seed::seed_artifact(&src_csr, &csr_path_for_store(&self.staged_db)).with_context(
-                    || format!("cannot stage CSR sidecar from {}", src_csr.display()),
-                )?;
-            }
+            let staged_store = Store::open(&self.staged_db).with_context(|| {
+                format!("cannot reopen staged store {}", self.staged_db.display())
+            })?;
+            stage_donor_csr(
+                &staged_store,
+                &csr_path_for_store(&self.plan.source_store),
+                &self.staged_db,
+            )?;
+            drop(staged_store);
         }
         seed::settle_staged(&self.staged_db)?;
         place_staged(&self.staged_db, &self.final_db)?;
