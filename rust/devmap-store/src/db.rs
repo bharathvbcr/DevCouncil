@@ -565,10 +565,11 @@ fn lock_conn(
         })
 }
 
-/// Memory a read-only connection may use for SQLite's page cache and file
-/// mapping.
+/// What a read-only open is asked for: the memory its connection may use for
+/// SQLite's page cache and file mapping, and whether it may open a store whose
+/// full-text index alone is damaged.
 ///
-/// A named pair rather than two loose numbers so the open path and a benchmark
+/// A named record rather than loose arguments so the open path and a benchmark
 /// that compares settings share one definition. See
 /// `devmap-serve/examples/mcp_reader_memory_bench.rs` for the comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -577,6 +578,13 @@ pub struct ReaderMemory {
     pub cache_kib: u32,
     /// SQLite `mmap_size`, in bytes; 0 reads through the page cache only.
     pub mmap_bytes: u64,
+    /// Open a store whose only damage is in its full-text index (`nodes_fts`
+    /// and its shadow tables) instead of refusing it. The `Store` records the
+    /// damage ([`Store::full_text_damage`]) and every search refuses with the
+    /// typed full-text error; everything that does not read the index answers.
+    /// Damage that is not provably confined to the index is still refused.
+    /// `false` is the strict open every other caller gets.
+    pub tolerate_full_text_damage: bool,
 }
 
 impl ReaderMemory {
@@ -584,7 +592,16 @@ impl ReaderMemory {
     pub const CURRENT: Self = Self {
         cache_kib: (-Store::CACHE_SIZE_KIB) as u32,
         mmap_bytes: 0,
+        tolerate_full_text_damage: false,
     };
+
+    /// These settings, opening a store with a damaged full-text index degraded.
+    pub const fn tolerating_full_text_damage(self) -> Self {
+        Self {
+            tolerate_full_text_damage: true,
+            ..self
+        }
+    }
 }
 
 pub struct Store {
@@ -607,6 +624,10 @@ pub struct Store {
     /// refused by name ([`Store::refuse_if_read_only`]) instead of by SQLite
     /// error code.
     read_only: bool,
+    /// Why the full-text index was found damaged when this store was opened
+    /// degraded (see [`ReaderMemory::tolerate_full_text_damage`]); `None` for
+    /// every store that opened strictly.
+    full_text_damage: Option<String>,
     /// Worktree root override when this `Store` is an immutable shared base
     /// snapshot (`?immutable=1`, `chmod 0444`) opened on behalf of a linked
     /// worktree by `StackedStore`. `None` for every ordinary or seeded store.

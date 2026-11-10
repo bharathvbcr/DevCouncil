@@ -33,12 +33,113 @@ impl Store {
     /// caller must not treat the whole file as lost.
     pub fn is_full_text_damage(error: &anyhow::Error) -> bool {
         error.chain().any(|cause| {
-            matches!(
-                cause.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::ToSqlConversionFailure(inner))
-                    if inner.downcast_ref::<FtsDamage>().is_some()
-            )
+            cause
+                .downcast_ref::<rusqlite::Error>()
+                .is_some_and(Self::sqlite_error_is_full_text_damage)
         })
+    }
+
+    /// [`Self::is_full_text_damage`] for an error not yet wrapped, such as the
+    /// one a failed open returns.
+    pub fn sqlite_error_is_full_text_damage(error: &rusqlite::Error) -> bool {
+        matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(inner)
+                if inner.downcast_ref::<FtsDamage>().is_some()
+        )
+    }
+
+    /// Whether reading the full-text index ALONE fails with `SQLITE_CORRUPT`:
+    /// the virtual table, then each of its storage tables that exists.
+    ///
+    /// This is the evidence a corrupt error needs before it may be called
+    /// index damage. A statement that reads the index also reads other tables
+    /// (`payload_nodes`, `file_rows`, `paths`), so its failure says nothing about
+    /// which of them is damaged; a probe that touches only the index does.
+    /// A probe that passes proves nothing about the index being whole (a count
+    /// does not read overflow pages), and that is the safe direction: the caller
+    /// then treats the damage as the file's.
+    pub(super) fn full_text_index_unreadable(conn: &rusqlite::Connection) -> bool {
+        use rusqlite::OptionalExtension;
+        let corrupt = |result: rusqlite::Result<i64>| {
+            matches!(result, Err(error) if error.sqlite_error_code()
+                == Some(rusqlite::ErrorCode::DatabaseCorrupt))
+        };
+        if corrupt(conn.query_row("SELECT COUNT(*) FROM nodes_fts", [], |row| row.get(0))) {
+            return true;
+        }
+        for table in [
+            "nodes_fts_data",
+            "nodes_fts_idx",
+            "nodes_fts_content",
+            "nodes_fts_docsize",
+            "nodes_fts_config",
+        ] {
+            let present = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional();
+            if matches!(present, Ok(Some(_)))
+                && corrupt(conn.query_row(
+                    &format!("SELECT COUNT(*) FROM \"{table}\""),
+                    [],
+                    |row| row.get(0),
+                ))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The verdict on a corrupt error from a statement that reads `nodes_fts`
+    /// among other tables: index damage (typed, with the repair) only if the
+    /// index alone cannot be read, otherwise the error unchanged, which is
+    /// damage to the file as a whole. Any error that is not corruption passes
+    /// through.
+    pub(super) fn fts_verdict(
+        conn: &rusqlite::Connection,
+        error: rusqlite::Error,
+    ) -> rusqlite::Error {
+        if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+            return error;
+        }
+        if Self::full_text_index_unreadable(conn) {
+            super::fts_failure(error)
+        } else {
+            error
+        }
+    }
+
+    /// Validate the schema of a connection just opened, telling a store whose
+    /// only fault is its full-text index from every other fault.
+    ///
+    /// `Ok(None)`: valid. `Ok(Some(typed))`: invalid, and the damage is the
+    /// index's alone (the index cannot be read, and every other check passes
+    /// without it); `typed` is the full-text error a caller can recognise with
+    /// [`Self::is_full_text_damage`]. `Err`: anything else, including corruption
+    /// the index does not account for; never served.
+    pub(super) fn validate_schema_naming_index_damage(
+        conn: &rusqlite::Connection,
+    ) -> rusqlite::Result<Option<rusqlite::Error>> {
+        match Self::validate_schema(conn) {
+            Ok(()) => Ok(None),
+            Err(error)
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) =>
+            {
+                if Self::full_text_index_unreadable(conn)
+                    && Self::validate_schema_without_full_text(conn).is_ok()
+                {
+                    Ok(Some(super::fts_failure(error)))
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// [`Self::is_database_corrupt`] for an error not yet wrapped.

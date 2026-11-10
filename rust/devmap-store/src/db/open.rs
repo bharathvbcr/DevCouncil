@@ -270,6 +270,7 @@ impl Store {
         Ok(ReaderMemory {
             cache_kib: u32::try_from(cache_kib).unwrap_or(u32::MAX),
             mmap_bytes: mmap.max(0) as u64,
+            tolerate_full_text_damage: self.full_text_damage.is_some(),
         })
     }
 
@@ -331,7 +332,15 @@ impl Store {
         Self::reject_triggers(&conn)?;
         Self::configure_connection(&conn)?;
         Self::set_reader_memory(&conn, memory)?;
-        Self::validate_schema(&conn)?;
+        // A store whose full-text index alone is damaged comes back as that
+        // typed error, so a caller can tell it from every other refusal. A
+        // reader that asked to tolerate it opens the store degraded instead:
+        // the index is the only thing wrong, so nothing else is.
+        let full_text_damage = match Self::validate_schema_naming_index_damage(&conn)? {
+            None => None,
+            Some(damage) if memory.tolerate_full_text_damage => Some(damage.to_string()),
+            Some(damage) => return Err(damage),
+        };
         Ok(Self {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
@@ -341,8 +350,18 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
+            full_text_damage,
             repo_root_override: None,
         })
+    }
+
+    /// Why the full-text index was found damaged when this store was opened
+    /// degraded ([`ReaderMemory::tolerate_full_text_damage`]); `None` for a
+    /// store that opened strictly. Searches on a store with this set refuse
+    /// with the typed full-text error while the index stays unreadable; every
+    /// other question is answered.
+    pub fn full_text_damage(&self) -> Option<&str> {
+        self.full_text_damage.as_deref()
     }
 
     /// Whether a read-only open may read a store stamped `stamped`.
@@ -507,6 +526,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only,
+            full_text_damage: None,
             repo_root_override: None,
         })
     }
@@ -1250,6 +1270,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
+            full_text_damage: None,
             repo_root_override,
         })
     }
@@ -1268,6 +1289,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: None,
             read_only: false,
+            full_text_damage: None,
             repo_root_override: None,
         })
     }

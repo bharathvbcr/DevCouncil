@@ -32,6 +32,7 @@ pub const STORE_CACHE_CAP: usize = 8;
 pub const MCP_READER_MEMORY: devmap_store::ReaderMemory = devmap_store::ReaderMemory {
     cache_kib: 16_384,
     mmap_bytes: 0,
+    tolerate_full_text_damage: false,
 };
 
 /// How long a cached store may go unused before it is dropped.

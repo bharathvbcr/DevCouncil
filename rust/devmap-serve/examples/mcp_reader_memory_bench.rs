@@ -47,6 +47,7 @@ const ARMS: [(&str, ReaderMemory); 3] = [
         ReaderMemory {
             cache_kib: 16_384,
             mmap_bytes: 0,
+            tolerate_full_text_damage: false,
         },
     ),
     (
@@ -54,6 +55,7 @@ const ARMS: [(&str, ReaderMemory); 3] = [
         ReaderMemory {
             cache_kib: 16_384,
             mmap_bytes: 256 * 1024 * 1024,
+            tolerate_full_text_damage: false,
         },
     ),
 ];
