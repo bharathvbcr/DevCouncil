@@ -1,0 +1,9 @@
+# Dead-code truth for this fixture, read by devmap-analyze/tests/accuracy_fixtures.rs.
+# verdict<TAB>symbol_id<TAB>why
+live	src/lib/format.ts::columnLabel	called only from inside a top-level snippet
+live	src/lib/format.ts::priorityLabel	called only from inside a top-level snippet
+live	src/lib/format.ts::cardTone	called only from inside a top-level snippet
+live	src/lib/format.ts::padCell	called from the template
+live	src/Board.svelte::columnTitle	rendered with {@render}
+live	src/Board.svelte::cardRow	rendered with {@render}
+live	src/lib/stores.ts::previewMarkers	read only as $previewMarkers

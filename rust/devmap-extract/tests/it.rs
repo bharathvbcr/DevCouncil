@@ -164,6 +164,8 @@ mod stress_hardening;
 #[cfg(feature = "parse")]
 mod svelte_template_text;
 #[cfg(feature = "parse")]
+mod svelte_snippets_and_stores;
+#[cfg(feature = "parse")]
 mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_properties;

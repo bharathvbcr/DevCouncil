@@ -88,6 +88,21 @@ use crate::model::{
 /// text nothing read.
 const MAX_EMBEDDED_REGIONS: usize = 256;
 
+/// Most template expressions parsed from one file.
+///
+/// A different bound from [`MAX_EMBEDDED_REGIONS`], because the two count
+/// different things: a file holds a handful of `<script>` elements and hundreds
+/// of `{...}` expressions. Sharing the script bound capped a real component at
+/// its last 256 expressions (GitPulse's `TaskBoard.svelte` holds about 600), so
+/// every expression at the top of the template, where the snippets sit, was
+/// recorded as unread and the functions only they called read as dead.
+///
+/// Each expression is a parse of a few bytes, and the extraction deadline still
+/// bounds the sum. Expressions past the bound are **not** silently dropped: they
+/// are charged as unparsed, in document order, so it is the tail of the
+/// template that is charged and the same tail on every build.
+const MAX_TEMPLATE_EXPRESSIONS: usize = 4096;
+
 thread_local! {
     /// Whether this thread is already inside an embedded extraction.
     ///
@@ -403,6 +418,34 @@ fn absorb_template_expressions(
                 );
                 continue;
             }
+            // `{#snippet name(params)}…{/snippet}`: a function of the
+            // component, declared in the template. Its children are walked
+            // after it, so the calls in its body are read as before.
+            "snippet_statement" if extraction.language == "svelte" => {
+                declare_snippet(extraction, node, source);
+            }
+            // The parameter list is TypeScript parameters, not an expression.
+            "snippet_start" => {
+                let mut cursor = node.walk();
+                let args = node
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "svelte_raw_text");
+                if let Some(args) = args {
+                    take_snippet_parameters(
+                        args,
+                        source,
+                        extraction,
+                        &file_path,
+                        language,
+                        deadline,
+                        &mut parsed,
+                        &mut unparsed,
+                        &mut diagnostics,
+                        &mut cap_noted,
+                    );
+                }
+                continue;
+            }
             "interpolation" => {
                 let mut cursor = node.walk();
                 if let Some(text) = node
@@ -443,10 +486,11 @@ fn absorb_template_expressions(
             }
             _ => {}
         }
+        // Reversed, so the pop order is document order: when the bound is
+        // reached it is the end of the template that is charged, not the top.
         let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
     }
     extraction.diagnostics.extend(diagnostics);
     fold_unparsed_ranges(&mut extraction.parse_outcome, unparsed);
@@ -470,8 +514,22 @@ fn take_template_expression(
     let Some(expr) = js_expression_body(node, source) else {
         return;
     };
+    let svelte = extraction.language == "svelte";
     if let Some(name) = lone_js_identifier(&expr.body) {
         let span = span_of(node);
+        // `{$store}`: the name is a store auto-subscription, a read of `store`.
+        // It is not a call, and no function is named `$store`.
+        if let Some(store) = svelte.then(|| store_name(&name)).flatten() {
+            extraction.references.push(ExtractedReference {
+                name: store.to_string(),
+                kind: ReferenceKind::Name,
+                span,
+                enclosing_symbol: Some(file_path.to_string()),
+                assigned_to: None,
+                receiver_expr: None,
+            });
+            return;
+        }
         extraction.calls.push(ExtractedCall {
             caller_symbol: Some(file_path.to_string()),
             callee_name: name.clone(),
@@ -488,15 +546,197 @@ fn take_template_expression(
         });
         return;
     }
+    if svelte {
+        push_store_reads(extraction, &expr.body, expr.offset, file_path);
+    }
+    // `{` here is an object literal (`:class="{ active: isActive }"`). The
+    // statement grammar reads a leading `{` as a block, and a quoted key
+    // then fails, so the file would be Partial over JavaScript it accepts.
+    let wrap = if expr.body.starts_with('{') {
+        Wrap::ObjectLiteral
+    } else {
+        Wrap::Bare
+    };
+    parse_template_text(
+        node,
+        &expr,
+        wrap,
+        source,
+        extraction,
+        file_path,
+        language,
+        deadline,
+        parsed,
+        unparsed,
+        diagnostics,
+        cap_noted,
+    );
+}
+
+/// The parameters of a `{#snippet}`, parsed as an arrow function's parameters.
+fn take_snippet_parameters(
+    node: Node,
+    source: &str,
+    extraction: &mut Extraction,
+    file_path: &str,
+    language: &str,
+    deadline: Instant,
+    parsed: &mut usize,
+    unparsed: &mut Vec<TextRange>,
+    diagnostics: &mut Vec<String>,
+    cap_noted: &mut bool,
+) {
+    let raw = text_of(node, source);
+    let body = raw.trim();
+    if body.is_empty() {
+        return;
+    }
+    let offset = node.start_byte() + (raw.len() - raw.trim_start().len());
+    let expr = JsExpr {
+        offset,
+        body: body.to_string(),
+    };
+    parse_template_text(
+        node,
+        &expr,
+        Wrap::SnippetParameters,
+        source,
+        extraction,
+        file_path,
+        language,
+        deadline,
+        parsed,
+        unparsed,
+        diagnostics,
+        cap_noted,
+    );
+}
+
+/// Declare `{#snippet name(…)}` as a function symbol of the file, so that
+/// `{@render name()}` has something to call.
+///
+/// A snippet given to a component as a child of its tag is a prop the
+/// component renders, and nothing in this file names it: it is recorded as
+/// reached by the runtime, like a framework callback. A second snippet of a
+/// name the file already declares (a nested scope) is not declared again,
+/// because one qualified name is one node.
+fn declare_snippet(extraction: &mut Extraction, node: Node, source: &str) {
+    let Some(start) = child_of_kind(node, "snippet_start") else {
+        return;
+    };
+    let Some(name_node) = child_of_kind(start, "snippet_name") else {
+        return;
+    };
+    let name = text_slice(name_node, source).to_string();
+    let qualified = format!("{}::{name}", extraction.file_path);
+    if extraction
+        .symbols
+        .iter()
+        .any(|symbol| symbol.qualified_name == qualified)
+    {
+        extraction.diagnostics.push(format!(
+            "snippet `{name}` at byte {} shares the name of an earlier declaration and was not \
+             declared again",
+            node.start_byte()
+        ));
+        return;
+    }
+    let signature: String = text_slice(start, source).chars().take(200).collect();
+    extraction.symbols.push(crate::model::ExtractedSymbol {
+        name,
+        qualified_name: qualified.clone(),
+        kind: SymbolKind::Function,
+        span: span_of(node),
+        is_exported: false,
+        docstring: None,
+        signature: Some(signature),
+        parent_symbol: None,
+        body_signature: None,
+        declaration_hash: None,
+        return_type: None,
+    });
+    if let Some(component) = component_parent(node, source) {
+        extraction.wiring.push(crate::model::WiringAnnotation {
+            kind: crate::model::WiringKind::RuntimeEntryPoint,
+            target_symbol: qualified,
+            details: format!("snippet passed to <{component}> as a child, rendered by the component"),
+        });
+    }
+}
+
+/// The tag name of the component whose tag directly holds `node`, when it is
+/// a component (`<Comp>`, `<ns.Comp>`) rather than an HTML element.
+fn component_parent(node: Node, source: &str) -> Option<String> {
+    let mut at = node.parent();
+    while let Some(parent) = at {
+        if parent.kind() == "element" {
+            let tag = child_of_kind(parent, "start_tag")?;
+            let name = text_slice(child_of_kind(tag, "tag_name")?, source);
+            let component = name
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_uppercase())
+                || name.contains('.');
+            return component.then(|| name.to_string());
+        }
+        at = parent.parent();
+    }
+    None
+}
+
+/// How the text of a template expression is made a program on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    /// The text is parsed as it stands.
+    Bare,
+    /// The text is an object literal, which the statement grammar would read
+    /// as a block: it is parenthesised.
+    ObjectLiteral,
+    /// The text is the parameter list of a `{#snippet name(...)}`: it is
+    /// written as the parameters of an arrow function. Parsed as an expression
+    /// it is a labelled statement (`status: TaskStatus`) or a syntax error
+    /// (`info?: Item`), and the file would be `Partial` over text that is
+    /// ordinary TypeScript.
+    SnippetParameters,
+}
+
+impl Wrap {
+    /// The program the grammar reads. Its first byte is the one the spans are
+    /// rebased by, so every wrapper opens with exactly one byte of its own.
+    fn program(self, body: &str) -> Option<String> {
+        match self {
+            Wrap::Bare => None,
+            Wrap::ObjectLiteral => Some(format!("({body})")),
+            Wrap::SnippetParameters => Some(format!("({body}) => {{}}")),
+        }
+    }
+}
+
+/// Parse (or record as unread) the text of one template expression. `node` is
+/// the expression's node in the outer file and `expr` its text within it.
+fn parse_template_text(
+    node: Node,
+    expr: &JsExpr,
+    wrap: Wrap,
+    source: &str,
+    extraction: &mut Extraction,
+    file_path: &str,
+    language: &str,
+    deadline: Instant,
+    parsed: &mut usize,
+    unparsed: &mut Vec<TextRange>,
+    diagnostics: &mut Vec<String>,
+    cap_noted: &mut bool,
+) {
     let span = span_of(node);
     let node_range = TextRange {
         start_byte: span.start_byte,
         end_byte: span.end_byte,
     };
-    if *parsed >= MAX_EMBEDDED_REGIONS {
+    if *parsed >= MAX_TEMPLATE_EXPRESSIONS {
         if !*cap_noted {
             diagnostics.push(format!(
-                "template expressions past {MAX_EMBEDDED_REGIONS} were not parsed"
+                "template expressions past {MAX_TEMPLATE_EXPRESSIONS} were not parsed"
             ));
             *cap_noted = true;
         }
@@ -513,23 +753,14 @@ fn take_template_expression(
         unparsed.push(node_range);
         return;
     }
-    // `{` here is an object literal (`:class="{ active: isActive }"`). The
-    // statement grammar reads a leading `{` as a block, and a quoted key
-    // then fails, so the file would be Partial over JavaScript it accepts.
-    // The parentheses are not in the file. Spans are rebased by that byte.
+    // The wrapper's bytes are not in the file. Spans are rebased by its one
+    // opening byte.
     let outer_source = source;
-    let parenthesized = expr.body.starts_with('{');
-    let owned;
-    let source: &str = if parenthesized {
-        owned = format!("({})", expr.body);
-        owned.as_str()
-    } else {
-        owned = String::new();
-        expr.body.as_str()
-    };
+    let wrapped = wrap.program(&expr.body);
+    let program: &str = wrapped.as_deref().unwrap_or(expr.body.as_str());
     let mut inner =
-        crate::treesitter::extract_treesitter_with_budget(file_path, language, source, remaining);
-    if parenthesized {
+        crate::treesitter::extract_treesitter_with_budget(file_path, language, program, remaining);
+    if wrap != Wrap::Bare {
         rebase_parenthesized_expression(&mut inner, expr.body.len());
     }
     if record_template_parse(
@@ -630,7 +861,7 @@ fn vue_directive_value(node: Node) -> Option<Node> {
 /// Fold one template expression's inner outcome onto the outer extraction.
 ///
 /// Returns whether the expression spent a nested parse that produced symbols
-/// worth counting toward [`MAX_EMBEDDED_REGIONS`]. A failure or a skip did not
+/// worth counting toward [`MAX_TEMPLATE_EXPRESSIONS`]. A failure or a skip did not
 /// absorb anything, so a later expression that does parse is still counted.
 fn record_template_parse(
     extraction: &mut Extraction,
@@ -772,6 +1003,178 @@ fn lone_js_identifier(text: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// The runes Svelte 5 compiles, which look like a `$store` read and are not.
+/// `$state.raw`, `$derived.by` and the rest begin with one of these.
+const SVELTE_RUNES: &[&str] = &[
+    "state", "derived", "effect", "props", "bindable", "inspect", "host",
+];
+
+/// `store` for a Svelte store auto-subscription `$store`, and `None` for a
+/// rune (`$state`), a compiler variable (`$$props`) and anything else.
+fn store_name(name: &str) -> Option<&str> {
+    let store = name.strip_prefix('$')?;
+    let mut chars = store.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    (!SVELTE_RUNES.contains(&store)).then_some(store)
+}
+
+/// Where the code of an expression is, as the reads of `$store` find it.
+#[derive(Debug, Clone, Copy)]
+enum ScanMode {
+    /// Code, with the depth of `{` opened since the mode began. A template
+    /// literal's `${` starts a frame of its own, closed by its matching `}`.
+    Code(usize),
+    Quote(u8),
+    Template,
+    LineComment,
+    BlockComment,
+}
+
+/// Every `$store` auto-subscription in `text`, as `(store, start, end)` with
+/// the byte range of the `$store` token.
+///
+/// A token in a string or a comment is text, and a `.$x` is a property. The
+/// scan is over source text rather than over the parse because the parse of a
+/// template expression keeps no identifier that is not called, and a store is
+/// usually read, not called (`{$markers.length}`).
+fn store_reads(text: &str) -> Vec<(String, usize, usize)> {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut found = Vec::new();
+    let mut stack: Vec<ScanMode> = vec![ScanMode::Code(0)];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        let Some(mode) = stack.last_mut() else {
+            break;
+        };
+        match mode {
+            ScanMode::Code(depth) => match byte {
+                b'\'' | b'"' => {
+                    stack.push(ScanMode::Quote(byte));
+                    i += 1;
+                }
+                b'`' => {
+                    stack.push(ScanMode::Template);
+                    i += 1;
+                }
+                b'/' if next == Some(b'/') => {
+                    stack.push(ScanMode::LineComment);
+                    i += 2;
+                }
+                b'/' if next == Some(b'*') => {
+                    stack.push(ScanMode::BlockComment);
+                    i += 2;
+                }
+                b'{' => {
+                    *depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    if *depth > 0 {
+                        *depth -= 1;
+                    } else if stack.len() > 1 {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+                b'$' => {
+                    let preceded = i > 0 && (is_ident(bytes[i - 1]) || bytes[i - 1] == b'.');
+                    let mut end = i + 1;
+                    while end < bytes.len() && is_ident(bytes[end]) {
+                        end += 1;
+                    }
+                    if !preceded {
+                        if let Some(store) = text.get(i..end).and_then(store_name) {
+                            found.push((store.to_string(), i, end));
+                        }
+                    }
+                    i = end;
+                }
+                _ => i += 1,
+            },
+            ScanMode::Quote(quote) => {
+                if byte == b'\\' {
+                    i += 2;
+                } else {
+                    if byte == *quote {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            ScanMode::Template => match byte {
+                b'\\' => i += 2,
+                b'`' => {
+                    stack.pop();
+                    i += 1;
+                }
+                b'$' if next == Some(b'{') => {
+                    stack.push(ScanMode::Code(0));
+                    i += 2;
+                }
+                _ => i += 1,
+            },
+            ScanMode::LineComment => {
+                if byte == b'\n' {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            ScanMode::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    stack.pop();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Record each `$store` read in `body` (which starts at byte `offset` of the
+/// file) as a reference to the store `store`, which the file imports or
+/// declares. The enclosing symbol is the innermost declaration holding the
+/// read, or the file.
+fn push_store_reads(extraction: &mut Extraction, body: &str, offset: usize, file_path: &str) {
+    for (store, start, end) in store_reads(body) {
+        let at = offset.saturating_add(start);
+        let enclosing = extraction
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && symbol.span.start_byte <= at
+                    && at < symbol.span.end_byte
+            })
+            .min_by_key(|symbol| symbol.span.end_byte - symbol.span.start_byte)
+            .map_or_else(
+                || file_path.to_string(),
+                |symbol| symbol.qualified_name.clone(),
+            );
+        extraction.references.push(ExtractedReference {
+            name: store,
+            kind: ReferenceKind::Name,
+            span: Span {
+                start_byte: at,
+                end_byte: offset.saturating_add(end),
+            },
+            enclosing_symbol: Some(enclosing),
+            assigned_to: None,
+            receiver_expr: None,
+        });
+    }
 }
 
 pub(crate) fn span_of(node: Node) -> Span {
@@ -1202,6 +1605,10 @@ pub(crate) fn merge_embedded_scripts(
         }
 
         absorb(extraction, inner, region.content.start_byte, source);
+        if outer_grammar == "svelte" {
+            let file_path = extraction.file_path.clone();
+            push_store_reads(extraction, text, region.content.start_byte, &file_path);
+        }
     }
 
     extraction.diagnostics.extend(diagnostics);
@@ -1735,7 +2142,7 @@ mod tests {
         use std::time::Duration;
 
         let mut source = String::new();
-        for index in 0..(MAX_EMBEDDED_REGIONS + 1) {
+        for index in 0..(MAX_TEMPLATE_EXPRESSIONS + 1) {
             source.push_str(&format!(
                 "<button onclick={{() => f{index}()}}>x</button>\n"
             ));
@@ -1772,7 +2179,7 @@ mod tests {
             .count();
         assert_eq!(
             recorded,
-            MAX_EMBEDDED_REGIONS,
+            MAX_TEMPLATE_EXPRESSIONS,
             "one expression is past the cap and the rest are still calls: {:?}",
             extraction
                 .calls
@@ -1788,6 +2195,46 @@ mod tests {
                 .any(|line| line.contains("were not parsed")),
             "the cap has to say why it stopped: {:?}",
             extraction.diagnostics
+        );
+    }
+
+    /// The bound charges the end of the template, never its top: the walk is in
+    /// document order, so the expressions kept are the first ones.
+    #[test]
+    fn the_expressions_past_the_cap_are_the_last_ones() {
+        use std::time::Duration;
+
+        let mut source = String::new();
+        for index in 0..(MAX_TEMPLATE_EXPRESSIONS + 1) {
+            source.push_str(&format!(
+                "<button onclick={{() => f{index}()}}>x</button>\n"
+            ));
+        }
+        let mut extraction =
+            crate::treesitter::extract_treesitter("Cap.svelte", "svelte", "<p>hi</p>\n");
+        extraction.parse_outcome = ParseOutcome::Clean;
+        extraction.calls.clear();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_svelte_ng::LANGUAGE.into())
+            .expect("the svelte grammar loads");
+        let tree = parser.parse(&source, None).expect("the template parses");
+        absorb_template_expressions(
+            &mut extraction,
+            tree.root_node(),
+            &source,
+            "typescript",
+            Instant::now() + Duration::from_secs(180),
+        );
+        let names: Vec<&str> = extraction
+            .calls
+            .iter()
+            .map(|call| call.callee_name.as_str())
+            .collect();
+        assert!(names.contains(&"f0"), "the top of the template is read");
+        assert!(
+            !names.contains(&format!("f{MAX_TEMPLATE_EXPRESSIONS}").as_str()),
+            "the expression past the bound is the last one"
         );
     }
 

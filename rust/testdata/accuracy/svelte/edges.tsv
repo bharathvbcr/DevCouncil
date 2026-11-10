@@ -1,0 +1,19 @@
+# Svelte template fixture. Hand-written ground truth, written before DevMap ran on the
+# fixture; read by devmap-analyze/tests/accuracy_fixtures.rs (same columns as ../ts/edges.tsv).
+#
+# Columns (tab separated): id, construct, caller, callee, kind, level, ledger, note.
+# A template expression's caller is the component file itself (a bare path).
+#
+# Board.svelte is shaped like a real board component: two top-level {#snippet} blocks
+# straight after the script, then a run of 300 ordinary template expressions. The
+# snippets are the first template bytes, so they are the first thing a cap on how many
+# template expressions one file may parse takes away.
+sv.snip_call_a	snippet body call	src/Board.svelte	src/lib/format.ts::columnLabel	edge	must		{columnLabel(heading)} inside the first top-level snippet
+sv.snip_call_b	snippet body call	src/Board.svelte	src/lib/format.ts::priorityLabel	edge	must		{priorityLabel(card)} inside the second top-level snippet
+sv.snip_call_c	snippet body call	src/Board.svelte	src/lib/format.ts::cardTone	edge	must		class={cardTone(card)} inside the second top-level snippet
+sv.tail_call	template call after the snippets	src/Board.svelte	src/lib/format.ts::padCell	edge	must		{padCell(n)}; the control row, which parses today
+sv.decoy_a	namesake	src/Board.svelte	src/lib/decoy.ts::columnLabel	forbid_any_tier	must		decoy.ts is never imported by the component
+sv.decoy_b	namesake	src/Board.svelte	src/lib/decoy.ts::priorityLabel	forbid_any_tier	must		decoy.ts is never imported by the component
+sv.render_a	{@render} of a snippet	src/Board.svelte	src/Board.svelte::columnTitle	edge	must		{@render columnTitle(status)}; a snippet is a symbol
+sv.render_b	{@render} of a snippet	src/Board.svelte	src/Board.svelte::cardRow	edge	must		{@render cardRow(card)} inside an {#each}
+sv.store_read	$store read	src/Board.svelte	src/lib/stores.ts::previewMarkers	edge	must		$previewMarkers in markup is the import's only use

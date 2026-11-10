@@ -25,14 +25,14 @@
   },
   "swift": {
     "forbid_any_tier_rows": 9,
-    "known_failing": 6,
+    "known_failing": 4,
     "positive_rows": 117,
-    "present": 111
+    "present": 113
   },
   "typescript": {
-    "forbid_any_tier_rows": 7,
+    "forbid_any_tier_rows": 9,
     "known_failing": 0,
-    "positive_rows": 80,
-    "present": 80
+    "positive_rows": 87,
+    "present": 87
   }
 }

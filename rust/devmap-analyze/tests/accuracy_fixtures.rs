@@ -145,7 +145,10 @@ fn call_name(name: &str) -> &str {
 
 fn language_of(path: &str) -> &'static str {
     match devmap_extract::languages::detect_language(Path::new(path)) {
-        "tsx" | "javascript" | "jsx" => "typescript",
+        // A Svelte component is TypeScript with a template: its rows are scored
+        // with the TypeScript they call, so the gate does not need a language
+        // of its own to hold a file that mostly is TypeScript.
+        "tsx" | "javascript" | "jsx" | "svelte" => "typescript",
         "kotlin_script" => "kotlin",
         other => other,
     }
