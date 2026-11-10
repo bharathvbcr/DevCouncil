@@ -381,16 +381,27 @@ fn run_hook_inner(
         }
         HookEvent::PostToolUse => {
             let started = Instant::now();
+            // A refused or failed detach is reported, but it must not drop the
+            // in-process work below that needs no spawn: the blast note.
+            let mut detach_error: Option<anyhow::Error> = None;
             let budget_note = if !selection.roots.is_empty() {
-                detach_roots(
+                match detach_roots(
                     executable,
                     &selection.roots,
                     DETACH_BUDGET,
                     detach_post_tool_root,
-                )?
+                ) {
+                    Ok(note) => note,
+                    Err(error) => {
+                        detach_error = Some(error);
+                        None
+                    }
+                }
             } else if pinned_root.is_none() {
                 if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
-                    let _ = detach_seeded_build(executable, &wt, &main);
+                    if let Err(error) = detach_seeded_build(executable, &wt, &main) {
+                        detach_error = Some(error);
+                    }
                 }
                 None
             } else {
@@ -404,8 +415,12 @@ fn run_hook_inner(
                 .roots
                 .first()
                 .and_then(|root| compose_write_blast(root, &payload, leftover));
+            // The exit code stays what a refused detach always gave: 1.
+            let exit_code = if detach_error.is_some() { 1 } else { 0 };
+            let detach_note =
+                detach_error.map(|error| format!("devmap hook post-tool-use: {error}"));
             Ok(HookOutcome {
-                exit_code: 0,
+                exit_code,
                 stdout: blast.map(|context| {
                     json!({
                         "hookSpecificOutput": {
@@ -414,7 +429,7 @@ fn run_hook_inner(
                         }
                     })
                 }),
-                stderr_line: join_notes(capped_note, budget_note),
+                stderr_line: join_notes(join_notes(capped_note, budget_note), detach_note),
                 roots: selection.roots,
             })
         }
@@ -881,6 +896,10 @@ const DEVMAP_DIRECTIVE: &str = "Ask DevMap before reading files: devmap_search, 
 /// pathological status payload cannot crowd out the directive or the notes.
 const REPO_CLAUSE_CAP: usize = 200;
 
+/// Longest refused-executable notice, at most one per repository. Larger than
+/// the marker line because the remedy text must survive truncation.
+const EXEC_REFUSAL_CAP: usize = 900;
+
 /// Longest refused-marker-directory line, at most one per repository.
 const MARKER_REFUSAL_CAP: usize = 400;
 
@@ -912,7 +931,8 @@ const HEALTH_REMEDY: &str = "re-run `devmap claude plugin` and reinstall the bun
 /// structural maximum is the point: the previous flat `truncate(.., 400)` ran
 /// after the notes were appended, so on a capped or timed-out pass it deleted
 /// the very sentence that said the pass was partial.
-const SESSION_START_CONTEXT_CAP: usize = MAX_HOOK_ROOTS * (REPO_CLAUSE_CAP + MARKER_REFUSAL_CAP)
+const SESSION_START_CONTEXT_CAP: usize = MAX_HOOK_ROOTS
+    * (REPO_CLAUSE_CAP + MARKER_REFUSAL_CAP + EXEC_REFUSAL_CAP)
     + HEALTH_NOTE_CAP
     + HEALTH_REMEDY.len()
     + 512;
@@ -1060,6 +1080,15 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
     let mut clauses: Vec<String> = Vec::new();
     let mut ran_out_of_time = false;
     for root in &selection.roots {
+        // A refused executable degrades to a notice in the agent's context; it
+        // does not take the whole SessionStart down with an error.
+        if let Err(error) = canonical_hook_executable(executable, root, "probe") {
+            clauses.push(truncate(
+                &refused_executable_notice(&error),
+                EXEC_REFUSAL_CAP,
+            ));
+            continue;
+        }
         let Some(status_text) = probe(
             executable,
             root,
@@ -1195,8 +1224,20 @@ fn pre_tool_use_sync(
     let Some(root) = selection.roots.first() else {
         return Ok(None);
     };
+    // Decide refusal before the claim is spent, and deliver it with the claim:
+    // a refused probe that consumed the once-per-session claim and then said
+    // nothing would leave the agent silent for the rest of the session.
+    let refusal = canonical_hook_executable(executable, root, "probe").err();
     if claim_once(&marker_dir(root), &session_marker_name(payload)) == Claim::Skip {
         return Ok(None);
+    }
+    if let Some(error) = refusal {
+        return Ok(Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": truncate(&refused_executable_notice(&error), EXEC_REFUSAL_CAP),
+            }
+        })));
     }
 
     let started = Instant::now();
@@ -2587,6 +2628,13 @@ const INSIDE_REPO_REMEDY: &str = "Remedy: install devmap outside the repository 
      https://github.com/bharathvbcr/DevCouncil.git --tag <release tag> --locked devmap-cli`) \
      and point the hooks at that binary";
 
+/// The agent-visible line for a refused hook executable: the refusal message
+/// (which already names the executable, the repository top and the remedy),
+/// escaped onto one line.
+fn refused_executable_notice(error: &anyhow::Error) -> String {
+    context_line(&format!("DevMap hooks refused: {error:#}"))
+}
+
 /// The repository top for `canonical_root`: the nearest enclosing git worktree
 /// root (a `.git` directory or gitlink file), found by the one shared walk,
 /// [`devmap_extract::git_worktree_root`]; the root itself when none exists.
@@ -3543,17 +3591,20 @@ mod tests {
 
         let ran = marker.exists();
         let _ = fs::remove_dir_all(&base);
-        assert_eq!(outcome.exit_code, 1, "{:?}", outcome.stderr_line);
-        let line = outcome
-            .stderr_line
-            .expect("refusal must be a stderr diagnostic");
+        // SessionStart reports the refusal in the agent's context and exits 0
+        // (ruling C5b); the in-repo binary still never runs.
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        let text = outcome
+            .stdout
+            .expect("a refused probe must still answer SessionStart")
+            .to_string();
         assert!(
-            line.contains("refusing to probe") && line.contains("inside"),
-            "{line}"
+            text.contains("refusing to probe") && text.contains("inside"),
+            "{text}"
         );
         assert!(
-            outcome.stdout.is_none(),
-            "refusal must not look like a summary"
+            text.contains("Remedy"),
+            "the notice names the remedy: {text}"
         );
         assert!(!ran, "run_hook spawned the in-repo executable");
     }
@@ -3606,6 +3657,137 @@ mod tests {
         }
     }
 
+    /// A repository whose top (`.git`) is above the hooked root `repo/sub`, and a
+    /// binary at `repo/tools/devmap` outside that root: refused on every event,
+    /// by pinned root and by payload cwd, and never run.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_in_the_repository_top_is_refused_for_a_subroot_on_every_event() {
+        let base = scratch_dir("top-events");
+        let repo = base.join("repo");
+        let sub = repo.join("sub");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(sub.join(".devcouncil/codeintel")).unwrap();
+        fs::write(sub.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("tools/devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+        let payload = format!(r#"{{"session_id":"top","cwd":"{}"}}"#, sub.display());
+
+        for event in [HookEvent::PostToolUse, HookEvent::SessionEnd] {
+            for pinned in [Some(sub.as_path()), None] {
+                let outcome = run_hook(event, payload.as_bytes(), &exe, pinned);
+                assert_eq!(
+                    outcome.exit_code,
+                    1,
+                    "{} pinned={}",
+                    event.as_str(),
+                    pinned.is_some()
+                );
+                let line = outcome.stderr_line.expect("a refusal is a diagnostic");
+                assert!(
+                    line.contains("refusing to detach") && line.contains("Remedy"),
+                    "{}: {line}",
+                    event.as_str()
+                );
+            }
+        }
+        let start = run_hook(
+            HookEvent::SessionStart,
+            payload.as_bytes(),
+            &exe,
+            Some(&sub),
+        );
+        let start_text = start
+            .stdout
+            .expect("SessionStart still answers")
+            .to_string();
+        std::thread::sleep(Duration::from_millis(300));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(start.exit_code, 0);
+        assert!(
+            start_text.contains("refusing to probe") && start_text.contains("Remedy"),
+            "{start_text}"
+        );
+        assert!(!ran, "a binary in the repository top was spawned");
+    }
+
+    /// A refused probe must not spend the once-per-session claim in silence:
+    /// the first PreToolUse call delivers the refusal notice to the agent.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_pre_tool_use_probe_still_tells_the_agent_once() {
+        let base = scratch_dir("pre-refused");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let marker = base.join("ran");
+        let exe = repo.join("devmap");
+        write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+        let payload = format!(
+            r#"{{"session_id":"pre-refused","cwd":"{}","tool_name":"Read","tool_input":{{"file_path":"{}"}}}}"#,
+            repo.display(),
+            repo.join("a.py").display()
+        );
+
+        let first = run_hook(HookEvent::PreToolUse, payload.as_bytes(), &exe, Some(&repo));
+        let second = run_hook(HookEvent::PreToolUse, payload.as_bytes(), &exe, Some(&repo));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(first.exit_code, 0, "{:?}", first.stderr_line);
+        let text = first
+            .stdout
+            .expect("the refusal must reach the agent, not silence")
+            .to_string();
+        assert!(
+            text.contains("DevMap hooks refused") && text.contains("Remedy"),
+            "{text}"
+        );
+        assert!(!text.contains("permissionDecision"), "{text}");
+        assert!(second.stdout.is_none(), "the notice is once per session");
+        assert!(!ran, "the in-repo executable was spawned");
+    }
+
+    /// A refused detach keeps its exit code and stderr line, but the in-process
+    /// blast note (no spawn needed) is still delivered.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_post_tool_use_detach_still_delivers_the_blast_note() {
+        let base = scratch_dir("post-blast");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let exe = repo.join("devmap");
+        write_script(&exe, "#!/bin/sh\n");
+        let payload = format!(
+            r#"{{"session_id":"post-blast","cwd":"{}"}}"#,
+            repo.display()
+        );
+
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            payload.as_bytes(),
+            &exe,
+            Some(&repo),
+        );
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(
+            outcome.exit_code, 1,
+            "today's exit code for a refused detach"
+        );
+        let line = outcome.stderr_line.expect("the refusal stays on stderr");
+        assert!(
+            line.contains("refusing to detach") && line.contains("Remedy"),
+            "{line}"
+        );
+        let text = outcome
+            .stdout
+            .expect("the blast note must survive a refused detach")
+            .to_string();
+        assert!(text.contains("DevMap blast"), "{text}");
+    }
+
     /// A missing executable fails canonicalize. `run_hook` must surface that as
     /// exit 1 with a diagnostic, not as an empty success and not as a panic.
     #[cfg(unix)]
@@ -3625,18 +3807,17 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
-        assert_eq!(outcome.exit_code, 1, "{:?}", outcome.stderr_line);
-        let line = outcome
-            .stderr_line
-            .expect("canonicalize failure must be a stderr diagnostic");
+        // SessionStart reports the refusal to the agent and exits 0 (ruling C5b):
+        // an unresolvable executable is a notice, not an empty success and not
+        // an error that takes the whole context down.
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        let text = outcome
+            .stdout
+            .expect("SessionStart must still answer")
+            .to_string();
         assert!(
-            line.contains("refusing to probe") && line.contains("canonicalize"),
-            "{line}"
-        );
-        assert!(
-            outcome.stdout.is_none(),
-            "missing executable must not look like a summary: {:?}",
-            outcome.stdout
+            text.contains("refusing to probe") && text.contains("canonicalize"),
+            "{text}"
         );
     }
 
@@ -5044,10 +5225,23 @@ mod tests {
             '\u{200D}', '\u{2060}', '\u{FEFF}',
         ] {
             let out = context_line(&format!("a{c}b"));
-            assert_eq!(out, format!("a\\u{:04x}b", u32::from(c)), "U+{:04X}", u32::from(c));
+            assert_eq!(
+                out,
+                format!("a\\u{:04x}b", u32::from(c)),
+                "U+{:04X}",
+                u32::from(c)
+            );
         }
-        for name in ["\u{05E9}\u{05DC}\u{05D5}\u{05DD}", "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}", "repo-\u{05D0}\u{0628}"] {
-            assert_eq!(context_line(name), name, "an RTL name must pass through unchanged");
+        for name in [
+            "\u{05E9}\u{05DC}\u{05D5}\u{05DD}",
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}",
+            "repo-\u{05D0}\u{0628}",
+        ] {
+            assert_eq!(
+                context_line(name),
+                name,
+                "an RTL name must pass through unchanged"
+            );
         }
     }
 
@@ -6791,12 +6985,22 @@ mod attack_hook_trust {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(path, format!("#!/bin/sh\n: > '{}'\necho ran\n", marker.display())).unwrap();
+        fs::write(
+            path,
+            format!("#!/bin/sh\n: > '{}'\necho ran\n", marker.display()),
+        )
+        .unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn assert_refused(exe: &Path, root: &Path, base: &Path, marker: &Path, what: &str) {
-        let result = probe(exe, root, &["status"], Instant::now(), Duration::from_secs(5));
+        let result = probe(
+            exe,
+            root,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
         let ran = marker.exists();
         let _ = fs::remove_dir_all(base);
         assert!(!ran, "{what}: the in-repo executable ran");
@@ -6815,7 +7019,13 @@ mod attack_hook_trust {
             let _ = fs::remove_dir_all(&base);
             return; // case-sensitive volume: nothing to attack
         }
-        assert_refused(&lower.join("devmap"), &repo, &base, &marker, "case variant exe");
+        assert_refused(
+            &lower.join("devmap"),
+            &repo,
+            &base,
+            &marker,
+            "case variant exe",
+        );
     }
 
     /// ATK-C-2b: repo root passed through a symlink, binary by the real path.
@@ -6827,7 +7037,13 @@ mod attack_hook_trust {
         script(&repo.join("bin/devmap"), &marker);
         let via = base.join("via");
         std::os::unix::fs::symlink(&repo, &via).unwrap();
-        assert_refused(&repo.join("bin/devmap"), &via, &base, &marker, "root via symlink");
+        assert_refused(
+            &repo.join("bin/devmap"),
+            &via,
+            &base,
+            &marker,
+            "root via symlink",
+        );
     }
 
     /// ATK-C-2c: `..`/`.` spellings, trailing slash on the root, binary under `.git`.
@@ -6840,7 +7056,13 @@ mod attack_hook_trust {
         fs::create_dir_all(base.join("other")).unwrap();
         let sneaky = base.join("other/../repo/./.git/hooks/devmap");
         let slash_root = PathBuf::from(format!("{}/", repo.display()));
-        assert_refused(&sneaky, &slash_root, &base, &marker, "dotdot + trailing slash");
+        assert_refused(
+            &sneaky,
+            &slash_root,
+            &base,
+            &marker,
+            "dotdot + trailing slash",
+        );
     }
 
     /// ATK-C-2d: exe in a nested repo inside the hooked repo.
@@ -6851,7 +7073,13 @@ mod attack_hook_trust {
         let marker = base.join("ran");
         fs::create_dir_all(repo.join("sub/.git")).unwrap();
         script(&repo.join("sub/target/debug/devmap"), &marker);
-        assert_refused(&repo.join("sub/target/debug/devmap"), &repo, &base, &marker, "nested");
+        assert_refused(
+            &repo.join("sub/target/debug/devmap"),
+            &repo,
+            &base,
+            &marker,
+            "nested",
+        );
     }
 
     /// ATK-C-2e: /tmp firmlink spelling vs /private/tmp (macOS) for the same repo.
@@ -6920,11 +7148,45 @@ mod attack_hook_trust {
         fs::create_dir_all(hooks.parent().unwrap()).unwrap();
         let victim = base.join("victim");
         fs::create_dir_all(&victim).unwrap();
-        let cases: Vec<(&str, Box<dyn Fn()>)> = vec![
-            ("symlink to /", Box::new({ let h = hooks.clone(); move || { let _ = std::os::unix::fs::symlink("/", &h); } })),
-            ("symlink loop", Box::new({ let h = hooks.clone(); move || { let _ = std::os::unix::fs::symlink(&h, &h); } })),
-            ("fifo", Box::new({ let h = hooks.clone(); move || { let _ = Command::new("mkfifo").arg(&h).status(); } })),
-            ("mode 000 dir", Box::new({ let h = hooks.clone(); move || { fs::create_dir(&h).unwrap(); fs::set_permissions(&h, fs::Permissions::from_mode(0)).unwrap(); } })),
+        type Hostile = (&'static str, Box<dyn Fn()>);
+        let cases: Vec<Hostile> = vec![
+            (
+                "symlink to /",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        let _ = std::os::unix::fs::symlink("/", &h);
+                    }
+                }),
+            ),
+            (
+                "symlink loop",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        let _ = std::os::unix::fs::symlink(&h, &h);
+                    }
+                }),
+            ),
+            (
+                "fifo",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        let _ = Command::new("mkfifo").arg(&h).status();
+                    }
+                }),
+            ),
+            (
+                "mode 000 dir",
+                Box::new({
+                    let h = hooks.clone();
+                    move || {
+                        fs::create_dir(&h).unwrap();
+                        fs::set_permissions(&h, fs::Permissions::from_mode(0o000)).unwrap();
+                    }
+                }),
+            ),
         ];
         for (name, make) in cases {
             let _ = fs::set_permissions(&hooks, fs::Permissions::from_mode(0o755));
@@ -6958,7 +7220,10 @@ mod attack_hook_trust {
         std::os::unix::fs::symlink(&victim, &hooks).unwrap();
         let notice = marker_dir_refusal(&root).expect("linked hooks dir is refused");
         let _ = fs::remove_dir_all(&base);
-        assert!(!notice.chars().any(|c| c.is_control()), "raw control: {notice:?}");
+        assert!(
+            !notice.chars().any(|c| c.is_control()),
+            "raw control: {notice:?}"
+        );
         assert!(
             !notice.contains('\u{202e}'),
             "raw bidi override in hook context: {notice:?}"
