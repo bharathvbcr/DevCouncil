@@ -1139,6 +1139,20 @@ impl Resolver {
                                         .or_insert_with(|| (file.clone(), name.clone()));
                                 }
                             }
+                            // Rust: what the target publishes through its own
+                            // `pub use m::*;` globs (`use commands::*;` over a
+                            // `commands/mod.rs` that globs `alpha` and `beta`).
+                            // Only a name exactly one declaration publishes
+                            // binds; the importing file's own items still win.
+                            if ext.language == "rust" {
+                                for (name, published_by) in self.rust_glob_published(file) {
+                                    if let Some(published_by) = published_by {
+                                        file_bindings
+                                            .entry(name.clone())
+                                            .or_insert_with(|| (published_by, name));
+                                    }
+                                }
+                            }
                         }
                         continue;
                     }
@@ -2040,6 +2054,51 @@ impl Resolver {
                 }
             }
         }
+    }
+
+    /// The names a Rust file publishes through its `pub use m::*;` globs, each
+    /// with the one file declaring it - or `None` when two declarations in the
+    /// chain share the name, which no glob can pick between.
+    ///
+    /// The walk follows globs of globs and is bounded by the files it has
+    /// visited. A file's own items are not listed: the caller binds those first
+    /// and they shadow anything a glob brings.
+    pub(super) fn rust_glob_published(&self, file: &str) -> BTreeMap<String, Option<String>> {
+        let mut published: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::from([file]);
+        let mut pending: Vec<&str> = self
+            .rust_module_globs
+            .get(file)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        while let Some(globbed) = pending.pop() {
+            if !visited.insert(globbed) {
+                continue;
+            }
+            for name in self.file_symbols.get(globbed).into_iter().flatten() {
+                if !self.declared_at_file_level(globbed, name) {
+                    continue;
+                }
+                published
+                    .entry(name.clone())
+                    .and_modify(|declarer| {
+                        if declarer.as_deref() != Some(globbed) {
+                            *declarer = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(globbed.to_string()));
+            }
+            pending.extend(
+                self.rust_module_globs
+                    .get(globbed)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            );
+        }
+        published
     }
 
     /// Every file a Rust `#[path = "x.rs"] mod x;` names, keyed to the file that

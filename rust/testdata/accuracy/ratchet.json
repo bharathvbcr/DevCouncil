@@ -19,9 +19,9 @@
   },
   "rust": {
     "forbid_any_tier_rows": 14,
-    "known_failing": 3,
+    "known_failing": 1,
     "positive_rows": 135,
-    "present": 132
+    "present": 134
   },
   "swift": {
     "forbid_any_tier_rows": 9,
