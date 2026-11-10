@@ -162,3 +162,4 @@ rs.f4f	F4	callers/src/otherq.rs::make_other_f4	callers/src/otherq.rs::Quarantine
 rs.f4g	F4	callers/src/otherq.rs::make_other_f4	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		and never reaches the namesake
 rs.f4h	F4	callers/src/lib.rs::anon_f4	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		no declaration and no import of Quarantine in the file: neither namesake is the answer
 rs.f4i	F4	callers/src/lib.rs::anon_f4	callers/src/otherq.rs::Quarantine.new_f4	forbid_any_tier	must		same, the other namesake
+rs.f4b4	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob.rs::parent_f4b	edge	must		control: a name the glob publishes and the module does not declare still binds through it

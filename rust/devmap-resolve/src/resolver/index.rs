@@ -1125,6 +1125,15 @@ impl Resolver {
                             }
                             if let Some(syms) = self.file_symbols.get(file) {
                                 for name in syms {
+                                    // Rust: an item the importing file declares
+                                    // itself shadows what a glob brings in under
+                                    // the same name, so the glob binds nothing
+                                    // for it and the same-file rung answers.
+                                    if ext.language == "rust"
+                                        && self.declared_at_file_level(&ext.file_path, name)
+                                    {
+                                        continue;
+                                    }
                                     file_bindings
                                         .entry(name.clone())
                                         .or_insert_with(|| (file.clone(), name.clone()));
