@@ -48,14 +48,14 @@ fn a_file_rewritten_in_place_is_reported_by_ensure_unchanged() {
     let reader = CsrGraphReader::open_mmap(&path).unwrap();
     assert!(reader.ensure_unchanged().is_ok());
 
-    std::thread::sleep(std::time::Duration::from_millis(20));
     let bytes = std::fs::read(&path).unwrap();
+    let mapped_at = std::fs::metadata(&path).unwrap().modified().unwrap();
     // Same length, same inode, different modification time: an in-place rewrite.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .write_all(&bytes)
+    // The time is set explicitly rather than waited for, so the test does not
+    // depend on the timestamp resolution of the filesystem.
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.set_modified(mapped_at + std::time::Duration::from_secs(5))
         .unwrap();
 
     let changed = reader.ensure_unchanged().expect_err("rewritten in place");
