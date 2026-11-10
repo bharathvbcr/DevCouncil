@@ -1,0 +1,37 @@
+//! Scope fixture (round 3). One module per cell; see ../../edges.tsv rows `rs.s*`.
+#![allow(dead_code, unused_imports, unused_variables)]
+
+pub mod p_ext;
+pub mod p_ext2;
+pub mod p_dec;
+pub mod p_da;
+pub mod p_db;
+pub mod p_gt;
+pub mod p_e29;
+pub mod p_e29b;
+pub mod p30;
+pub mod p30_re;
+pub mod p30_decl;
+pub mod vis;
+pub mod vis_user;
+pub mod c10;
+pub mod c11;
+pub mod c12;
+pub mod c13;
+pub mod c14;
+pub mod c15;
+pub mod c16;
+pub mod c17;
+pub mod c18;
+pub mod c19;
+pub mod c20;
+pub mod c21;
+pub mod c22;
+pub mod c24;
+pub mod c25;
+pub mod c27;
+pub mod c28;
+pub mod c29;
+pub mod c30;
+pub mod c31;
+pub mod c32;

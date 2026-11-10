@@ -195,3 +195,58 @@ rs.g6b	F4	callers/src/g6use.rs::conv_g6	callers/src/g6err.rs::CmdErr.from	forbid
 rs.g6c	F4	callers/src/g6err.rs::conv_one_g6	callers/src/g6err.rs::CmdOne.from	edge	must		guard: a type with exactly one From impl still binds
 rs.g6d	F4	callers/src/g6two.rs::conv_two_g6	callers/src/g6two.rs::Twice.from	forbid	must		regression test: two From impls in one file; the first is not the answer
 rs.g6e	F4	callers/src/g6two.rs::conv_two_g6	callers/src/g6two.rs::Twice.from@232	forbid	must		regression test: nor is the second chosen by position
+
+rs.s10	B ancestor	scopes/src/c10.rs::call_c10	scopes/src/p_ext.rs::h10	edge	must		a namesake in the ancestor module is not visible to the child that imports the real one
+rs.s10.not	B ancestor	scopes/src/c10.rs::call_c10	scopes/src/c10.rs::h10	forbid_any_tier	must		the wrong namesake
+rs.s11	B ancestor	scopes/src/c11.rs::call_c11	scopes/src/p_ext.rs::h11	edge	must		three modules deep, ancestors' namesakes are not visible
+rs.s11.not	B ancestor	scopes/src/c11.rs::call_c11	scopes/src/c11.rs::h11	forbid_any_tier	must		the wrong namesake
+rs.s12	child module	scopes/src/c12.rs::call_c12	scopes/src/p_ext.rs::h12	edge	must		a namesake inside a child module is not visible to its parent
+rs.s12.not	child module	scopes/src/c12.rs::call_c12	scopes/src/c12.rs::h12	forbid_any_tier	must		the wrong namesake
+rs.s13	sibling module	scopes/src/c13.rs::call_c13	scopes/src/p_ext.rs::h13	edge	must		a namesake in a sibling module is not visible
+rs.s13.not	sibling module	scopes/src/c13.rs::call_c13	scopes/src/c13.rs::h13	forbid_any_tier	must		the wrong namesake
+rs.s14	glob	scopes/src/c14.rs::call_c14	scopes/src/p_ext.rs::h14	edge	must		a glob reaches the file it names, not an unrelated namesake
+rs.s14.not	glob	scopes/src/c14.rs::call_c14	scopes/src/p_dec.rs::h14	forbid_any_tier	must		the wrong namesake
+rs.s15a	C block use	scopes/src/c15.rs::call_c15	scopes/src/p_ext.rs::h15	edge	must		a use inside a function shadows the module's item in that function
+rs.s15a.not	C block use	scopes/src/c15.rs::call_c15	scopes/src/c15.rs::h15	forbid_any_tier	must		the wrong namesake
+rs.s15b	C block use	scopes/src/c15.rs::other_c15	scopes/src/c15.rs::h15	edge	must		and does not leak to the function beside it
+rs.s15b.not	C block use	scopes/src/c15.rs::other_c15	scopes/src/p_ext.rs::h15	forbid_any_tier	must		the wrong namesake
+rs.s16a	C block use of a type	scopes/src/c16.rs::fl_c16	scopes/src/p_db.rs::Dup.mk16	edge	must		a block-level use of a type shadows the module-level one in that block
+rs.s16a.not	C block use of a type	scopes/src/c16.rs::fl_c16	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		the wrong namesake
+rs.s16b	C block use of a type	scopes/src/c16.rs::other_c16	scopes/src/p_da.rs::Dup.mk16	edge	must		and does not leak to the function beside it
+rs.s16b.not	C block use of a type	scopes/src/c16.rs::other_c16	scopes/src/p_db.rs::Dup.mk16	forbid_any_tier	must		the wrong namesake
+rs.s17	A verify_status shape	scopes/src/c17.rs::evidence_store17	scopes/src/p_gt.rs::record17	edge	must		the function imports a record of its own; the module's two-argument record is not the callee
+rs.s17.not	A verify_status shape	scopes/src/c17.rs::evidence_store17	scopes/src/c17.rs::record17	forbid_any_tier	must		the wrong namesake
+rs.s17b	A verify_status shape	scopes/src/c17.rs::plain17	scopes/src/c17.rs::record17	edge	must		guard: outside the function the module's own record is the callee
+rs.s18	block glob	scopes/src/c18.rs::call_c18	scopes/src/p_ext.rs::h18	edge	must		a glob in a block shadows the enclosing module's item
+rs.s18.not	block glob	scopes/src/c18.rs::call_c18	scopes/src/c18.rs::h18	forbid_any_tier	must		the wrong namesake
+rs.s19	declaration over glob	scopes/src/c19.rs::call_c19	scopes/src/c19.rs::h19	edge	must		a declared item shadows a glob import of the same name
+rs.s19.not	declaration over glob	scopes/src/c19.rs::call_c19	scopes/src/p_ext.rs::h19	forbid_any_tier	must		the wrong namesake
+rs.s20	named over glob	scopes/src/c20.rs::call_c20	scopes/src/p_ext2.rs::h20	edge	must		a named import shadows a glob import of the same name
+rs.s20.not	named over glob	scopes/src/c20.rs::call_c20	scopes/src/p_ext.rs::h20	forbid_any_tier	must		the wrong namesake
+rs.s21	use super::*	scopes/src/c21.rs::call_c21	scopes/src/c21.rs::h21	edge	must		guard: `use super::*` brings the parent module's names in
+rs.s22	use super::name	scopes/src/c22.rs::call_c22	scopes/src/c22.rs::h22	edge	must		guard: a named use of a parent module's item
+rs.s24	full path	scopes/src/c24.rs::call_c24	scopes/src/p_ext.rs::h24	edge	must		a full path names its module, not the same-file namesake
+rs.s24.not	full path	scopes/src/c24.rs::call_c24	scopes/src/c24.rs::h24	forbid_any_tier	must		the wrong namesake
+rs.s25	super path	scopes/src/c25.rs::call_c25	scopes/src/c25.rs::h25	edge	must		guard: super:: names the parent module's item
+rs.s27a	recall: use checkout::{..}	scopes/src/c27.rs::call_c27a	scopes/src/c27.rs::pay27	edge	must		recall: a name reached through an inline module's use path
+rs.s27b	recall: use checkout::{..}	scopes/src/c27.rs::call_c27b	scopes/src/c27.rs::pay27	edge	must		recall: a name reached through an inline module's use path
+rs.s27c	recall: use checkout::{..}	scopes/src/c27.rs::call_c27c	scopes/src/c27.rs::pay27	edge	must		recall: a name reached through an inline module's use path
+rs.s27d	recall: use checkout::{..}	scopes/src/c27.rs::call_c27a	scopes/src/c27.rs::refund27	edge	must		recall: the second name of the same use group
+rs.s28	recall: cfg twins	scopes/src/c28.rs::call_c28	scopes/src/c28.rs::StatKey.of	edge	must		recall: two #[cfg] bodies of one method are one method
+rs.s29	recall: Type::from	scopes/src/c29.rs::call_c29	scopes/src/p_e29b.rs::E29.from	edge	must		recall: an explicit Type::from names a type with exactly one impl
+rs.s30	recall: path child through a re-export	scopes/src/p30_kid.rs::call_c30	scopes/src/p30_decl.rs::helper30	edge	must		recall: a #[path] child inherits a name its parent imports through a re-export
+rs.sv_priv_v1	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/pubs.rs::priv_v1	edge	must		a glob publishes only what is visible to the importer
+rs.sv_priv_v1.not	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::priv_v1	forbid_any_tier	must		the wrong namesake
+rs.sv_sup_v2	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/pubs.rs::sup_v2	edge	must		a glob publishes only what is visible to the importer
+rs.sv_sup_v2.not	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::sup_v2	forbid_any_tier	must		the wrong namesake
+rs.sv_inp_v3	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/pubs.rs::inp_v3	edge	must		a glob publishes only what is visible to the importer
+rs.sv_inp_v3.not	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::inp_v3	forbid_any_tier	must		the wrong namesake
+rs.sv_cr_v4	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::cr_v4	edge	must		guard: pub(crate) is visible everywhere
+rs.sv_pub_v5	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::pub_v5	edge	must		guard: pub is visible everywhere
+rs.sv_sup_w2	D visibility	scopes/src/vis/within.rs::call_within	scopes/src/vis/inner.rs::sup_w2	edge	must		guard: pub(super) is visible to the parent's descendants
+rs.sv_inp_w3	D visibility	scopes/src/vis/within.rs::call_within	scopes/src/vis/inner.rs::inp_w3	edge	must		guard: pub(in path) is visible inside that module
+rs.sv_priv_k	D visibility	scopes/src/vis/inner/kid.rs::call_kid	scopes/src/vis/inner.rs::priv_k	edge	must		guard: a private item is visible to its module's descendants
+rs.s31	B ancestor glob	scopes/src/c31.rs::call_c31	scopes/src/p_ext.rs::h31	edge	must		glob in a deep child module: the ancestors' namesakes are not visible
+rs.s31.not	B ancestor glob	scopes/src/c31.rs::call_c31	scopes/src/c31.rs::h31	forbid_any_tier	must		the ancestors' namesake
+rs.s32	B ancestor glob	scopes/src/c32.rs::child_calls32	scopes/src/p_ext.rs::anc32	edge	must		glob in a tests module: the parent's namesake is not visible
+rs.s32.not	B ancestor glob	scopes/src/c32.rs::child_calls32	scopes/src/c32.rs::anc32	forbid_any_tier	must		the parent's namesake
