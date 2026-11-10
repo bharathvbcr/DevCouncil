@@ -1232,13 +1232,29 @@ impl Store {
         // `write_to_file` owns the one temp-then-rename layer (with the
         // directory fsync and the replaced file's mode), so the sidecar is
         // written straight to its final name.
-        index
-            .to_csr_writer()
-            .write_to_file(&csr_path)
-            .map_err(|err| {
-                anyhow::anyhow!("cannot write CSR sidecar {}: {err}", csr_path.display())
-            })?;
-        Ok(Some(csr_path))
+        match index.to_csr_writer().write_to_file(&csr_path) {
+            Ok(()) => Ok(Some(csr_path)),
+            // Written, with its durability unconfirmed: say so, not "cannot write".
+            Err(err)
+                if err
+                    .downcast_ref::<crate::csr::graph::CsrWrittenUnsynced>()
+                    .is_some() =>
+            {
+                Err(err)
+            }
+            // The temp file was written and could not be placed.
+            Err(err) => match err.downcast_ref::<crate::csr::graph::CsrPlaceFailed>() {
+                Some(placed) => Err(anyhow::anyhow!(
+                    "cannot place CSR sidecar {}: {}",
+                    csr_path.display(),
+                    placed.source
+                )),
+                None => Err(anyhow::anyhow!(
+                    "cannot write CSR sidecar {}: {err}",
+                    csr_path.display()
+                )),
+            },
+        }
     }
 
     /// Best-effort wrapper around [`Self::write_latest_csr_sidecar_strict`] for
@@ -1251,7 +1267,14 @@ impl Store {
         }
         // A store with no readable edges is an error, not a missing sidecar.
         self.generation_edges_with_id()?;
-        Ok(self.write_latest_csr_sidecar_strict().ok().flatten())
+        match self.write_latest_csr_sidecar_strict() {
+            Ok(written) => Ok(written),
+            // The sidecar is in place and valid; only the directory sync is
+            // unconfirmed, and this wrapper's job is to have the file.
+            Err(err) => Ok(err
+                .downcast_ref::<crate::csr::graph::CsrWrittenUnsynced>()
+                .map(|unsynced| unsynced.path.clone())),
+        }
     }
 
     /// Open a zero-copy [`crate::csr::CsrGraphReader`] for the store's latest generation.

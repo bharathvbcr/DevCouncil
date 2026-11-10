@@ -638,18 +638,85 @@ impl CsrGraphWriter {
             if let Ok(existing) = std::fs::metadata(path) {
                 std::fs::set_permissions(&temp, existing.permissions())?;
             }
-            std::fs::rename(&temp, path)?;
-            // Make the rename itself durable. Not all platforms can open a
-            // directory for syncing (Windows cannot), and the data file is
-            // already synced, so only a Unix failure is reported.
-            #[cfg(unix)]
-            File::open(parent)?.sync_all()?;
+            std::fs::rename(&temp, path).map_err(|source| {
+                anyhow::Error::new(CsrPlaceFailed {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            })?;
             Ok(())
         })();
         if written.is_err() {
             let _ = std::fs::remove_file(&temp);
+            return written;
         }
-        written
+        // The file is in place. Make the rename itself durable. Not all
+        // platforms can open a directory for syncing (Windows cannot), and the
+        // data file is already synced, so only a Unix failure is reported, and
+        // as what it is: written, with its durability unconfirmed.
+        #[cfg(unix)]
+        {
+            if let Err(source) = File::open(parent).and_then(|dir| dir.sync_all()) {
+                return Err(anyhow::Error::new(CsrWrittenUnsynced {
+                    path: path.to_path_buf(),
+                    source,
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The temp file was written but could not be renamed over the target (a
+/// directory is there, or the target's directory refused it). Nothing was
+/// placed, and the temp file is removed.
+#[derive(Debug)]
+pub(crate) struct CsrPlaceFailed {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) source: std::io::Error,
+}
+
+impl std::fmt::Display for CsrPlaceFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot place CSR file {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CsrPlaceFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A `.csr` file was written and renamed into place, but syncing its directory
+/// failed, so the rename may not survive a crash. The file is there and valid;
+/// a caller must not report it as not written.
+#[derive(Debug)]
+pub(crate) struct CsrWrittenUnsynced {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) source: std::io::Error,
+}
+
+impl std::fmt::Display for CsrWrittenUnsynced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CSR file {} was written, but syncing its directory failed ({}), so it may not \
+             survive a crash",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CsrWrittenUnsynced {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 

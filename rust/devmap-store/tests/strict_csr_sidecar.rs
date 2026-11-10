@@ -157,6 +157,45 @@ fn strict_write_surfaces_an_unwritable_directory() {
     assert_eq!(wrapper.unwrap(), None);
 }
 
+/// A directory that can be written and entered but not opened for reading:
+/// the sidecar is created and renamed into place, then syncing the directory
+/// fails. The sidecar is there, and the error must not say it is not.
+#[test]
+fn strict_write_says_written_when_only_the_directory_sync_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new("unsynced");
+    let (store, db, generation) = indexed_store(&scratch);
+    let dir = db.parent().unwrap().to_path_buf();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+    let readable = fs::read_dir(&dir).is_ok();
+    let outcome = store.write_latest_csr_sidecar_strict();
+    let wrapper = store.write_latest_csr_sidecar();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        // Running as a user the mode does not bind (root): nothing to assert.
+        return;
+    }
+
+    let error = outcome.expect_err("the directory sync failed, which is reported");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("was written") && !message.contains("cannot write"),
+        "a sidecar that is in place is not reported as not written: {message}"
+    );
+    let sidecar = csr_of(&db);
+    assert_eq!(
+        CsrGraphReader::open_mmap(&sidecar).unwrap().generation(),
+        u64::from(generation),
+        "the sidecar is whole and current"
+    );
+    assert_eq!(
+        wrapper.unwrap(),
+        Some(sidecar),
+        "the read-time wrapper has the file it was asked to have"
+    );
+}
+
 #[test]
 fn strict_write_has_nothing_to_write_for_a_store_without_a_generation_or_without_a_file() {
     let scratch = Scratch::new("empty");
