@@ -259,6 +259,9 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
     let mut macros = BTreeSet::new();
     let mut macro_calls: Vec<RustMacroCall> = Vec::new();
     let mut macros_defined = BTreeSet::new();
+    let mut attr_macros: Vec<RustAttrMacro> = Vec::new();
+    let mut macro_use = false;
+    let mut extern_aliases = BTreeSet::new();
     let mut restricted: Vec<(usize, String)> = Vec::new();
     let mut cfg_spans: Vec<(usize, usize)> = Vec::new();
     let mut derefs = BTreeSet::new();
@@ -311,11 +314,63 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                         if as_item {
                             macros.insert(name.clone());
                         }
+                        let declares = if name.rsplit("::").next() == Some("thread_local") {
+                            rust_thread_local_statics(&get_node_text(node, source))
+                        } else {
+                            Vec::new()
+                        };
                         macro_calls.push(RustMacroCall {
                             name,
                             start: node.start_byte(),
+                            declares,
                         });
                     }
+                }
+            }
+            "attribute_item" => {
+                let text = get_node_text(node, source);
+                let inner = text
+                    .trim()
+                    .trim_start_matches("#[")
+                    .trim_end_matches(']')
+                    .trim();
+                let end = inner
+                    .find(|c: char| c == '(' || c == '=' || c.is_whitespace())
+                    .unwrap_or(inner.len());
+                let name = inner[..end].trim().to_string();
+                if name == "macro_use" {
+                    macro_use = true;
+                }
+                if !rust_attribute_is_inert(&name, inner) {
+                    let mut next = node.next_sibling();
+                    while let Some(n) = next {
+                        if matches!(
+                            n.kind(),
+                            "attribute_item" | "line_comment" | "block_comment"
+                        ) {
+                            next = n.next_sibling();
+                        } else {
+                            break;
+                        }
+                    }
+                    let in_block = node.parent().is_some_and(|p| p.kind() == "block");
+                    if let Some(item) = next.filter(|n| rust_node_declares_names(n.kind())) {
+                        let on_import = matches!(
+                            item.kind(),
+                            "use_declaration" | "mod_item" | "extern_crate_declaration"
+                        );
+                        if in_block || on_import {
+                            attr_macros.push(RustAttrMacro {
+                                name,
+                                start: node.start_byte(),
+                            });
+                        }
+                    }
+                }
+            }
+            "extern_crate_declaration" => {
+                if let Some(alias) = get_child_text(node, "alias", source) {
+                    extern_aliases.insert(alias);
                 }
             }
             "macro_definition" => {
@@ -385,6 +440,9 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
             macros: Some(RustMacroFacts {
                 calls: macro_calls,
                 defined: macros_defined.into_iter().collect(),
+                attrs: attr_macros,
+                macro_use,
+                extern_aliases: extern_aliases.into_iter().collect(),
             }),
         }),
         deref_targets: derefs.into_iter().collect(),
@@ -433,6 +491,99 @@ fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
         previous = sibling.prev_sibling();
     }
     false
+}
+
+/// Attributes that cannot emit an item or a `use`. A `derive` is inert only when
+/// every trait it names is a std one that emits an `impl` and nothing else.
+fn rust_attribute_is_inert(name: &str, whole: &str) -> bool {
+    const INERT: &[&str] = &[
+        "cfg",
+        "cfg_attr",
+        "allow",
+        "warn",
+        "deny",
+        "forbid",
+        "expect",
+        "doc",
+        "inline",
+        "must_use",
+        "test",
+        "ignore",
+        "should_panic",
+        "repr",
+        "non_exhaustive",
+        "deprecated",
+        "track_caller",
+        "cold",
+        "link",
+        "link_name",
+        "link_section",
+        "no_mangle",
+        "export_name",
+        "path",
+        "macro_use",
+        "macro_export",
+        "global_allocator",
+        "automatically_derived",
+    ];
+    const STD_DERIVES: &[&str] = &[
+        "Debug",
+        "Clone",
+        "Copy",
+        "PartialEq",
+        "Eq",
+        "Hash",
+        "PartialOrd",
+        "Ord",
+        "Default",
+    ];
+    if INERT.contains(&name) || name.starts_with("clippy::") || name.starts_with("rustfmt::") {
+        return true;
+    }
+    if name == "derive" {
+        let args = whole
+            .split_once('(')
+            .map_or("", |(_, rest)| rest.trim_end_matches(')'));
+        return args
+            .split(',')
+            .map(|t| t.trim().rsplit("::").next().unwrap_or("").trim())
+            .filter(|t| !t.is_empty())
+            .all(|t| STD_DERIVES.contains(&t));
+    }
+    false
+}
+
+/// The names a `thread_local!` invocation declares: the identifier after each
+/// `static` keyword (not the `'static` lifetime).
+fn rust_thread_local_statics(invocation: &str) -> Vec<String> {
+    let bytes: Vec<char> = invocation.chars().collect();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_alphanumeric() || bytes[i] == '_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
+                i += 1;
+            }
+            let word: String = bytes[start..i].iter().collect();
+            let quoted = start > 0 && bytes[start - 1] == '\'';
+            if word == "static" && !quoted {
+                while i < bytes.len() && bytes[i].is_whitespace() {
+                    i += 1;
+                }
+                let name_start = i;
+                while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
+                    i += 1;
+                }
+                if i > name_start {
+                    names.push(bytes[name_start..i].iter().collect());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    names
 }
 
 /// Whether the invocation is a statement of a block: directly, or wrapped in

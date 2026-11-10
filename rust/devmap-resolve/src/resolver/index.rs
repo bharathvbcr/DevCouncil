@@ -22,7 +22,7 @@ impl Resolver {
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
         self.rust_opaque_publishers.clear();
-        self.rust_defined_macros = None;
+        self.rust_crate_macros.clear();
         self.rust_glob_names.clear();
         self.rust_path_modules.clear();
         self.rust_scope_globs.clear();
@@ -83,7 +83,7 @@ impl Resolver {
         self.rust_cfg_bodies.clear();
         self.rust_deref_targets.clear();
         self.rust_blanket_methods.clear();
-        self.rust_defined_macros = Self::compute_rust_defined_macros(extractions);
+        self.rust_crate_macros = Self::compute_rust_crate_macros(extractions);
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -338,7 +338,8 @@ impl Resolver {
             if ext.language == "rust" {
                 let scope = super::rust_site_scope::RustFileScope::build(
                     ext,
-                    self.rust_defined_macros.as_ref(),
+                    self.rust_crate_macros
+                        .get(super::rust_site_scope::crate_key(&ext.file_path)),
                 );
                 for sym in &ext.symbols {
                     if scope.is_under_cfg(sym.span.start_byte) {
@@ -2503,20 +2504,74 @@ impl Resolver {
             .collect()
     }
 
-    /// Every `macro_rules!` name a Rust file defines, `None` when some Rust file
-    /// does not record its macros: a name it might define cannot be ruled out.
-    pub(super) fn compute_rust_defined_macros(
+    /// What could rebind a macro name, per crate. A crate in which some Rust file
+    /// does not record its macros is incomplete, and none of its macros is silent.
+    pub(super) fn compute_rust_crate_macros(
         extractions: &[Extraction],
-    ) -> Option<BTreeSet<String>> {
-        let mut defined = BTreeSet::new();
+    ) -> BTreeMap<String, super::rust_site_scope::CrateMacros> {
+        use super::rust_site_scope::{crate_key, CrateMacros};
+        const ROOTS: &[&str] = &["std", "core", "alloc", "log", "tracing", "anyhow", "eyre"];
+        let mut crates: BTreeMap<String, CrateMacros> = BTreeMap::new();
         for ext in extractions
             .iter()
             .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
         {
-            let macros = ext.rust_scope_facts.as_ref()?.macros.as_ref()?;
-            defined.extend(macros.defined.iter().cloned());
+            let env = crates
+                .entry(crate_key(&ext.file_path).to_string())
+                .or_insert_with(|| CrateMacros {
+                    complete: true,
+                    ..CrateMacros::default()
+                });
+            let Some(facts) = ext
+                .rust_scope_facts
+                .as_ref()
+                .and_then(|facts| facts.macros.as_ref())
+            else {
+                env.complete = false;
+                continue;
+            };
+            env.defined.extend(facts.defined.iter().cloned());
+            env.macro_use |= facts.macro_use;
+            env.shadowed_roots
+                .extend(facts.extern_aliases.iter().cloned());
+            env.shadowed_roots
+                .extend(ext.rust_inline_modules.iter().cloned());
+            if let Some(module) =
+                Self::rust_module_dir(&ext.file_path).and_then(|dir| dir.rsplit('/').next())
+            {
+                env.shadowed_roots.insert(module.to_string());
+            }
+            for imp in ext.imports.iter().filter(|imp| {
+                imp.alias.as_deref() != Some(".")
+                    && !imp.raw_import.trim_start().starts_with("mod ")
+            }) {
+                let root = imp.module_specifier.split("::").next().unwrap_or("");
+                for (i, imported) in imp.imported_names.iter().enumerate() {
+                    let local = imp
+                        .local_names
+                        .get(i)
+                        .filter(|local| !local.is_empty())
+                        .cloned()
+                        .or_else(|| {
+                            imp.alias
+                                .clone()
+                                .filter(|a| imp.imported_names.len() == 1 && a != "_")
+                        })
+                        .unwrap_or_else(|| imported.clone());
+                    if ROOTS.contains(&local.as_str()) {
+                        env.shadowed_roots.insert(local.clone());
+                    }
+                    // The name of a silent macro, bound by anything but that
+                    // macro's own crate under its own name.
+                    let owned =
+                        imported == &local && super::rust_site_scope::macro_owned_by(&local, root);
+                    if super::rust_site_scope::is_silent_macro_name(&local) && !owned {
+                        env.rebound.insert(local);
+                    }
+                }
+            }
         }
-        Some(defined)
+        crates
     }
 
     /// For each glob import written inside a block of a file's own module, the

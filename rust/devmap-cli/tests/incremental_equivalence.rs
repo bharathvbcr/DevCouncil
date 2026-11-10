@@ -1098,6 +1098,44 @@ fn a_tampered_reuse_hash_resolves_that_file() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Documents a hazard without fixing it: a reuse blob is checked only against the
+/// file's content hash and the budget receipt, not against which resolver wrote
+/// it, so a blob written under older resolution rules is reused as-is by a newer
+/// binary. A build that changes what the resolver decides must therefore move
+/// `RESOLUTION_REUSE_EPOCH` (which renames the reuse directory) together with
+/// `EXTRACTION_SCHEMA_VERSION`; the wave-3 schema bump is that fix point. This
+/// asserts today's behaviour and moves no key: when the epoch moves, the doctored
+/// blob below lives in the old directory and the file is resolved, so this test
+/// must then be changed to assert that.
+#[test]
+fn a_reuse_blob_written_under_other_rules_is_reused_today() {
+    let root = scratch("old-rules");
+    write_independent_tree(&root);
+    build_text(&root);
+    let blob = blob_for(&root, "src/mod_2.py");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
+    let edge = value["edges"]
+        .as_array_mut()
+        .and_then(|edges| edges.iter_mut().find(|edge| edge["edge_kind"] == "Calls"))
+        .expect("mod_2 holds a call edge");
+    edge["target_symbol"] = serde_json::json!("src/mod_2.py::decided_by_older_rules");
+    std::fs::write(&blob, serde_json::to_vec(&value).unwrap()).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 1 of 21 files"),
+        "the blob's content hash still matches, so mod_2 is not resolved; output was:\n{edited}"
+    );
+    assert!(
+        graph(&root)
+            .iter()
+            .any(|row| row.contains("decided_by_older_rules")),
+        "the edge an older resolver wrote is carried into the new generation"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_capped_previous_generation_is_not_reused() {
     let root = scratch("capped");

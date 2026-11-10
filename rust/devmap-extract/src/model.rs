@@ -1672,14 +1672,39 @@ pub struct RustMacroCall {
     /// The macro path as written (`mk`, `std::println`).
     pub name: String,
     pub start: usize,
+    /// For `thread_local!`: the `static` names its invocation writes, which are
+    /// all it declares. Empty for every other macro.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declares: Vec<String>,
+}
+
+/// An attribute macro (anything but a known inert built-in) written on an item
+/// that can hold or bring in names. It can emit items and `use`s beside the item.
+///
+/// Recorded only where that matters to a reader today: on an item inside a
+/// block, and on a `use`, `mod` or `extern crate` item at any depth. A module
+/// level `#[tauri::command] fn` is not recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustAttrMacro {
+    /// The attribute path as written (`pm::with_use`).
+    pub name: String,
+    pub start: usize,
 }
 
 /// The macros a Rust file invokes in item or statement position and the ones it
-/// defines with `macro_rules!`.
+/// defines with `macro_rules!`, plus what can rebind a macro's name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RustMacroFacts {
     pub calls: Vec<RustMacroCall>,
     pub defined: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attrs: Vec<RustAttrMacro>,
+    /// A `#[macro_use]` attribute sits somewhere in the file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub macro_use: bool,
+    /// The names `extern crate x as name;` binds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extern_aliases: Vec<String>,
 }
 
 /// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].

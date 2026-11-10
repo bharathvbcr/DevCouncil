@@ -178,3 +178,143 @@ fn a_macro_emitted_import_does_not_let_the_module_import_answer_a_type_path() {
         "the block's own `use` may have replaced the module's: {calls:?}"
     );
 }
+
+/// Two crates' worth of `Dup` and a caller that imports the first at module
+/// level; `body` runs inside `pub fn run() -> u8 { .. Dup::mk() }`.
+fn dup_caller(header: &str, before_call: &str) -> Vec<(String, &'static str)> {
+    let lib = if header.contains("#[macro_use]") {
+        "#[macro_use]\nextern crate dep;\npub mod da;\npub mod db;\npub mod user;\n"
+    } else {
+        "pub mod da;\npub mod db;\npub mod user;\n"
+    };
+    let user = format!(
+        "use crate::da::Dup;\n{}\npub fn run() -> u8 {{\n    {}\n    Dup::mk()\n}}\n",
+        header.replace("#[macro_use]", ""),
+        before_call
+    );
+    let result = resolve(&[
+        ("src/lib.rs", lib),
+        (
+            "src/da.rs",
+            "pub struct Dup;\nimpl Dup { pub fn mk() -> u16 { 2 } }\n",
+        ),
+        (
+            "src/db.rs",
+            "pub struct Dup;\nimpl Dup { pub fn mk() -> u8 { 1 } }\n",
+        ),
+        ("src/user.rs", user.as_str()),
+    ]);
+    calls_from(&result, "src/user.rs::run")
+}
+
+fn binds_da(calls: &[(String, &'static str)]) -> bool {
+    calls
+        .iter()
+        .any(|(target, _)| target == "src/da.rs::Dup.mk")
+}
+
+#[test]
+fn a_macro_imported_by_name_is_not_the_std_one() {
+    let calls = dup_caller("use dep::info;", "info!(crate::db::Dup);");
+    assert!(!binds_da(&calls), "{calls:?}");
+}
+
+#[test]
+fn a_macro_use_extern_crate_leaves_no_macro_silent() {
+    let calls = dup_caller("#[macro_use]", "vec!(crate::db::Dup);");
+    assert!(!binds_da(&calls), "{calls:?}");
+}
+
+#[test]
+fn a_crate_alias_is_not_the_crate_its_name_says() {
+    let calls = dup_caller("extern crate dep as log;", "log::info!(crate::db::Dup);");
+    assert!(!binds_da(&calls), "{calls:?}");
+}
+
+#[test]
+fn an_attribute_macro_on_a_block_item_leaves_the_block_unplaced() {
+    let calls = dup_caller("", "#[pm::with_use(crate::db::Dup)] fn _x() {}");
+    assert!(!binds_da(&calls), "{calls:?}");
+}
+
+#[test]
+fn an_inert_attribute_on_a_block_item_places_nothing_in_doubt() {
+    let calls = dup_caller("", "#[allow(dead_code)] #[inline] fn _x() {}");
+    assert_eq!(
+        calls,
+        vec![("src/da.rs::Dup.mk".to_string(), "receiver_type")]
+    );
+}
+
+#[test]
+fn a_derive_of_a_dependency_trait_is_not_inert() {
+    let calls = dup_caller("", "#[derive(Debug, Serialize)] struct _S;");
+    assert!(!binds_da(&calls), "{calls:?}");
+    let calls = dup_caller("", "#[derive(Debug, Clone)] struct _S;");
+    assert!(binds_da(&calls), "{calls:?}");
+}
+
+#[test]
+fn a_import_of_the_real_logging_macro_stays_silent() {
+    let calls = dup_caller("use log::info;", "info!(\"x\");");
+    assert!(binds_da(&calls), "{calls:?}");
+}
+
+#[test]
+fn thread_local_declares_only_the_statics_it_names() {
+    let result = resolve(&[
+        ("src/lib.rs", "pub mod user;\n"),
+        (
+            "src/user.rs",
+            "thread_local! {\n    static T: u8 = const { 1 };\n}\n\
+             pub fn h() -> u16 { 2 }\n\
+             pub fn run() -> u16 { h() }\n",
+        ),
+    ]);
+    assert_eq!(
+        calls_from(&result, "src/user.rs::run"),
+        vec![("src/user.rs::h".to_string(), "same_file")]
+    );
+}
+
+#[test]
+fn a_crate_thread_local_macro_is_not_the_std_one() {
+    let body = |defined: &str| {
+        let user = format!(
+            "{defined}pub fn h() -> u16 {{ 2 }}\npub fn run() -> u16 {{\n    thread_local!();\n    h()\n}}\n"
+        );
+        let result = resolve(&[
+            ("src/lib.rs", "pub mod user;\n"),
+            ("src/user.rs", user.as_str()),
+        ]);
+        calls_from(&result, "src/user.rs::run")
+    };
+    assert!(body("macro_rules! thread_local { () => { fn h() -> u8 { 1 } }; }\n").is_empty());
+    assert_eq!(
+        body(""),
+        vec![("src/user.rs::h".to_string(), "same_file")],
+        "the std macro declares only the statics it names"
+    );
+}
+
+#[test]
+fn bail_declares_nothing_when_it_is_anyhows() {
+    let body = |root: &str| {
+        let user = format!(
+            "pub fn h() -> u16 {{ 2 }}\npub fn run(f: bool) -> u16 {{\n    if f {{\n        {root}::bail!(\"no\");\n        return h();\n    }}\n    0\n}}\n"
+        );
+        let result = resolve(&[
+            ("src/lib.rs", "pub mod user;\n"),
+            ("src/user.rs", user.as_str()),
+        ]);
+        calls_from(&result, "src/user.rs::run")
+    };
+    assert_eq!(
+        body("anyhow"),
+        vec![("src/user.rs::h".to_string(), "same_file")]
+    );
+    assert!(
+        body("other").is_empty(),
+        "a path root that is not anyhow or eyre is not a silent macro"
+    );
+}

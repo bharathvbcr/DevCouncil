@@ -26,9 +26,11 @@
 //!
 //! * (a) does it declare the name, or import it by name? That answers.
 //! * (c) otherwise, does it hold a macro invocation that could emit the name?
-//!   Then the answer is `Unknown` and the walk stops. [`SILENT_MACROS`] lists the
-//!   only macros taken to emit nothing, and only while no `macro_rules!` of the
-//!   crate redefines the name.
+//!   Then the answer is `Unknown` and the walk stops. [`macro_providers`] lists the
+//!   only macros taken to emit nothing, and only while nothing in the crate
+//!   could have rebound the name or its path (see [`CrateMacros`]). An attribute
+//!   macro on a block item, or on a `use`, `mod` or `extern crate` item, counts
+//!   as a macro in the scope that holds it.
 //! * (b) otherwise, does it hold a glob import the index cannot prove does NOT
 //!   provide the name? In a block that is `Unknown` and the walk stops; at the
 //!   module level the glob is `Glob` and the file-wide bindings say whether it
@@ -56,58 +58,81 @@ use devmap_extract::model::{Extraction, RustScopeKind, SymbolKind};
 
 use super::Resolver;
 
-/// Macros that emit no item and no `use`, so a call of one in a scope says
-/// nothing about the names that scope holds. The one place the list lives. It
-/// binds only a macro not redefined by a `macro_rules!` of the same name in the
-/// crate, and a path that names `std`, `core`, `alloc`, `log` or `tracing`.
-const SILENT_MACROS: &[&str] = &[
-    "print",
-    "println",
-    "eprint",
-    "eprintln",
-    "format",
-    "format_args",
-    "write",
-    "writeln",
-    "vec",
-    "assert",
-    "assert_eq",
-    "assert_ne",
-    "debug_assert",
-    "debug_assert_eq",
-    "debug_assert_ne",
-    "matches",
-    "panic",
-    "todo",
-    "unimplemented",
-    "unreachable",
-    "dbg",
-    "trace",
-    "debug",
-    "info",
-    "warn",
-    "error",
-    "event",
-];
+/// The crates whose macro of this name is the real one, for the macros taken to
+/// emit no item and no `use` (and, for `thread_local!`, none but the `static`s it
+/// names). The one place the list lives. `None` for every other macro.
+fn macro_providers(name: &str) -> Option<&'static [&'static str]> {
+    const STD: &[&str] = &["std", "core", "alloc"];
+    const LOG: &[&str] = &["log", "tracing"];
+    const ERR: &[&str] = &["anyhow", "eyre"];
+    match name {
+        "print" | "println" | "eprint" | "eprintln" | "format" | "format_args" | "write"
+        | "writeln" | "vec" | "assert" | "assert_eq" | "assert_ne" | "debug_assert"
+        | "debug_assert_eq" | "debug_assert_ne" | "matches" | "panic" | "todo"
+        | "unimplemented" | "unreachable" | "dbg" | "thread_local" => Some(STD),
+        "trace" | "debug" | "info" | "warn" | "error" => Some(LOG),
+        "event" => Some(&["tracing"]),
+        "bail" | "ensure" => Some(ERR),
+        _ => None,
+    }
+}
 
-/// Crates whose macros [`SILENT_MACROS`] names when written with a path.
-const SILENT_MACRO_ROOTS: &[&str] = &["std", "core", "alloc", "log", "tracing"];
+/// Whether `name` is a macro [`macro_providers`] lists.
+pub(super) fn is_silent_macro_name(name: &str) -> bool {
+    macro_providers(name).is_some()
+}
 
-/// Whether the macro invoked as `path` is known to emit no item and no `use`.
-/// `defined` is every `macro_rules!` name in the crate, `None` when some file
-/// does not say.
-fn macro_is_silent(path: &str, defined: Option<&BTreeSet<String>>) -> bool {
-    let Some(defined) = defined else {
+/// Whether the crate named `root` is one that owns the macro `name`.
+pub(super) fn macro_owned_by(name: &str, root: &str) -> bool {
+    macro_providers(name).is_some_and(|providers| providers.contains(&root))
+}
+
+/// What could rebind a macro name inside one crate. A crate whose files do not
+/// all record their macros is `complete: false`, and no macro of it is silent.
+#[derive(Debug, Clone, Default)]
+pub(super) struct CrateMacros {
+    pub(super) complete: bool,
+    /// Every `macro_rules!` name of the crate.
+    pub(super) defined: BTreeSet<String>,
+    /// Names a `use` imports from anywhere but the one crate that owns the macro.
+    pub(super) rebound: BTreeSet<String>,
+    /// Path roots that are not the crate they look like: an `extern crate .. as`
+    /// alias, a module of the crate, a `use .. as` of the name.
+    pub(super) shadowed_roots: BTreeSet<String>,
+    /// A `#[macro_use]` sits somewhere in the crate.
+    pub(super) macro_use: bool,
+}
+
+/// The crate a file belongs to, as the path before its first `src`, `tests`,
+/// `benches` or `examples` directory.
+pub(super) fn crate_key(file: &str) -> &str {
+    ["/src/", "/tests/", "/benches/", "/examples/"]
+        .iter()
+        .filter_map(|dir| file.find(dir))
+        .min()
+        .map_or("", |at| &file[..at])
+}
+
+/// Whether the macro invoked as `path` is the real std/log/tracing/anyhow macro
+/// and emits nothing the index cannot see. Nothing in the crate may rebind its
+/// name or its path root.
+fn macro_is_silent(path: &str, env: Option<&CrateMacros>) -> bool {
+    let Some(env) = env.filter(|env| env.complete && !env.macro_use) else {
         return false;
     };
     let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
     let Some(name) = segments.pop() else {
         return false;
     };
-    let qualified_ok = segments
-        .first()
-        .is_none_or(|root| SILENT_MACRO_ROOTS.contains(root));
-    qualified_ok && SILENT_MACROS.contains(&name) && !defined.contains(name)
+    let Some(providers) = macro_providers(name) else {
+        return false;
+    };
+    let path_ok = match segments.as_slice() {
+        [] => true,
+        [root] => providers.contains(root) && !env.shadowed_roots.contains(*root),
+        _ => false,
+    };
+    path_ok && !env.defined.contains(name) && !env.rebound.contains(name)
 }
 
 /// Where a use of a name inside a file comes from, as far as that file's own
@@ -242,9 +267,9 @@ fn leading_supers(raw_import: &str) -> usize {
 }
 
 impl RustFileScope {
-    /// `defined_macros` is every `macro_rules!` name of the crate, `None` when
-    /// some file does not say.
-    pub(super) fn build(ext: &Extraction, defined_macros: Option<&BTreeSet<String>>) -> Self {
+    /// `macros` is what could rebind a macro name in the file's crate, `None`
+    /// when that is not known.
+    pub(super) fn build(ext: &Extraction, macros: Option<&CrateMacros>) -> Self {
         let mut scope = Self {
             scopes: vec![Scope {
                 module: true,
@@ -260,7 +285,7 @@ impl RustFileScope {
         };
         // Facts written before macros were recorded cannot say which scopes
         // hold one, which is not the same as holding none.
-        let Some(macros) = facts.macros.as_ref() else {
+        let Some(macro_facts) = facts.macros.as_ref() else {
             return scope;
         };
         scope.known = true;
@@ -289,11 +314,26 @@ impl RustFileScope {
                 parent,
             });
         }
-        for call in &macros.calls {
-            if !macro_is_silent(&call.name, defined_macros) {
+        let mut declared_by_macro: Vec<(usize, String)> = Vec::new();
+        for call in &macro_facts.calls {
+            if macro_is_silent(&call.name, macros) {
+                let at = scope.scope_at(call.start);
+                declared_by_macro.extend(call.declares.iter().map(|n| (at, n.clone())));
+            } else {
                 let at = scope.scope_at(call.start);
                 scope.macro_scopes.insert(at);
             }
+        }
+        // An attribute macro can emit items and `use`s beside its item.
+        for attr in &macro_facts.attrs {
+            let at = scope.scope_at(attr.start);
+            scope.macro_scopes.insert(at);
+        }
+        for (at, name) in declared_by_macro {
+            scope.decls.entry(name).or_default().push(RustDecl {
+                scope: at,
+                vis: RustVis::Private,
+            });
         }
         let kinds: BTreeMap<&str, SymbolKind> = ext
             .symbols
