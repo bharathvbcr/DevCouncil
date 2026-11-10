@@ -10,7 +10,11 @@
 #   inc2    another file changed                   (2 -> 3, prunes back to 2: steady state)
 # Every build's `--json` result is kept as <out>/<arm>-<rep>-<kind>.json and one
 # row per build lands in <out>/runs.tsv:
-#   arm rep kind total extract resolve analyze persist write prune_gen prune_ext vacuum symbols edges unresolved db_bytes
+#   arm rep kind total extract resolve analyze persist write prune_gen prune_ext vacuum artifacts art_status art_freshness art_load art_render art_write art_stamp symbols edges unresolved db_bytes
+# AB_MANIFEST=1 adds --manifest to every build, so the "writing consumer
+# artifacts" stage and its artifacts:* phases are measured (a build without the
+# flag writes none and those columns are empty). A binary that predates the
+# phases leaves the art_* columns empty and still reports the stage total.
 # summary.txt then gives min, median and max per arm and kind. A same-binary
 # pair of arms (a=X b=X) measures the noise floor.
 #
@@ -30,7 +34,9 @@ REPS=$3
 shift 3
 mkdir -p "$OUT"
 TSV="$OUT/runs.tsv"
-printf 'arm\trep\tkind\ttotal\textract\tresolve\tanalyze\tpersist\twrite\tprune_gen\tprune_ext\tvacuum\tsymbols\tedges\tunresolved\tdb_bytes\n' > "$TSV"
+printf 'arm\trep\tkind\ttotal\textract\tresolve\tanalyze\tpersist\twrite\tprune_gen\tprune_ext\tvacuum\tartifacts\tart_status\tart_freshness\tart_load\tart_render\tart_write\tart_stamp\tsymbols\tedges\tunresolved\tdb_bytes\n' > "$TSV"
+MANIFEST_FLAG=""
+if [ "${AB_MANIFEST:-0}" = 1 ]; then MANIFEST_FLAG="--manifest"; fi
 
 EDIT1=$(cd "$CORPUS" && git ls-files '*.ts' | head -1)
 EDIT2=$(cd "$CORPUS" && git ls-files '*.rs' | head -1)
@@ -56,7 +62,10 @@ def sec(prefix):
 size = sum(os.path.getsize(db + x) for x in ("", "-wal") if os.path.exists(db + x))
 print("\t".join([arm, rep, kind, "%.4f" % t["total_seconds"], sec("extract:files"), sec("resolving"),
                  sec("analyzing"), sec("persisting"), sec("persist:write"), sec("persist:prune_generations"),
-                 sec("persist:prune_extractions"), sec("persist:vacuum"), str(d["symbols"]), str(d["edges"]),
+                 sec("persist:prune_extractions"), sec("persist:vacuum"),
+                 sec("writing consumer artifacts"), sec("artifacts:status"), sec("artifacts:freshness"),
+                 sec("artifacts:load"), sec("artifacts:render"), sec("artifacts:write"),
+                 sec("artifacts:stamp_write"), str(d["symbols"]), str(d["edges"]),
                  str(d["unresolved_calls"]), str(size)]))
 PY
 }
@@ -65,7 +74,7 @@ build() {
   # $1 binary $2 db $3 json $4.. extra flags
   local bin=$1 db=$2 json=$3
   shift 3
-  "$bin" build "$CORPUS" --db "$db" --json --progress never "$@" > "$json" 2> "${json%.json}.err"
+  "$bin" build "$CORPUS" --db "$db" --json --progress never ${MANIFEST_FLAG:+"$MANIFEST_FLAG"} "$@" > "$json" 2> "${json%.json}.err"
 }
 
 FAILURES=()
@@ -113,7 +122,7 @@ done
 python3 -I - "$TSV" > "$OUT/summary.txt" <<'PY'
 import csv, statistics, sys
 rows = list(csv.DictReader(open(sys.argv[1]), delimiter="\t"))
-cols = ["total", "extract", "resolve", "analyze", "persist", "write", "prune_gen", "vacuum", "db_bytes"]
+cols = ["total", "extract", "resolve", "analyze", "persist", "write", "prune_gen", "vacuum", "artifacts", "art_status", "art_freshness", "art_load", "art_render", "art_write", "art_stamp", "db_bytes"]
 groups = {}
 for r in rows:
     groups.setdefault((r["kind"], r["arm"]), []).append(r)
