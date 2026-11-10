@@ -318,12 +318,15 @@ whole result instead of sampling candidates and publishing a partial graph.
 `CacheVerdict::Unreadable` must not be treated as outside a cache directory.
 
 Compact graph readers reject repeated structural keys instead of decoding an
-ambiguous layout. Both graph HTML renderers escape the composed tooltip label
-before handing it to the browser's HTML renderer. `escape::html_escape` is the
-single escape sink for generated artifacts; the graph renderer no longer keeps
-a private copy that omitted the apostrophe. The flag-filter control is built
-from DOM nodes rather than composed markup, so its element id and the id read
-back by `getElementById` cannot disagree.
+ambiguous layout. Both graph HTML pages go through one shell
+(`devmap-query/src/page.rs`): the only repository text interpolated into markup
+is the `<title>` and the fingerprint comment, both through
+`escape::html_escape` (the single escape sink for generated artifacts), and the
+payload rides as JSON in a raw-text script element escaped by
+`escape::json_script_escape`. The page script (the shared TypeScript package
+under `devmap-query/assets/code-map`) puts every name into the DOM as a text
+node, never as markup, so a hostile file name is inert structurally; its
+controls are built from DOM nodes, not composed strings.
 
 The human-readable CLI reports absent scan coverage as unreported rather than
 as complete, matching how the library reads the same field.
@@ -371,8 +374,9 @@ The project gate is `npm run ci:local`; `rust/verify.sh` adds release worker,
 determinism and resource checks beyond its quick mode. Security regressions
 live beside their owners (`*_security` tests, `renewal_identity`,
 `complete_secret_spans`, `ambiguity_budget`, and `nested_source_limits`), and
-in Go beside `integrate_write_security_test.go` and `proc/lookpath_test.go`. Browser
-tooltip tests require the explicit browser environment documented in
+in Go beside `integrate_write_security_test.go` and `proc/lookpath_test.go`. The
+browser test of the HTML pages (hostile names stay text in every place the page
+shows them) requires the explicit browser environment documented in
 `rust/devmap-query/tests/tooltip_security.rs`. Child-process tests marked
 ignored are invoked by bounded parent tests; running the children alone does
 not provide their timeout or stack controls.

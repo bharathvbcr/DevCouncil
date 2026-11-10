@@ -45,7 +45,7 @@ jobs:
         run: cargo test --locked -p dc-store --lib stress_search_profile -- --ignored --nocapture
 
   browser:
-    name: tooltip inertness in a real browser
+    name: page label inertness in a real browser
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -76,7 +76,7 @@ jobs:
             echo "DEVMAP_BROWSER_EXECUTABLE=$browser"
             echo "DEVMAP_TOOLTIP_FIXTURE_DIR=$RUNNER_TEMP/tooltip-fixture"
           } >> "$GITHUB_ENV"
-      - name: Tooltip regression
+      - name: Page label regression
         working-directory: rust
         run: "cargo test --locked -p devmap-query --test it -- tooltip_security:: --ignored --nocapture"
 

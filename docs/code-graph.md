@@ -109,9 +109,18 @@ samples carry separate totals. Trust current source when a map disagrees.
 ## Read the repository map page
 
 `devmap map-html` renders `map.html` from the map `devmap build --manifest`
-writes. It is one offline file: no network, no CDN, with the graph renderer
-inlined. Open it directly in a browser. It sits next to the symbol graph
-(`devmap html`), which is linked from its footer.
+writes. It is one offline file: no network, no CDN, no web fonts, with the page
+script and styles inlined. Open it directly in a browser. It sits next to the
+symbol graph (`devmap html`), which is linked from its footer. Over HTTP
+(`devmap mcp --http`) the same two pages are served read-only at
+`/map_preview.html` and `/code_graph.html`; see
+[HOST_INTEGRATION](devmap/HOST_INTEGRATION.md).
+
+Both pages draw with the renderer GitPulse's Map section uses: a deterministic
+layout (communities packed side by side, hubs near the centre, no simulation
+that keeps moving) and an opt-in **Globe** layout for the file and symbol
+graphs. Light or dark follows the system setting, and the page respects
+reduced-motion.
 
 Each dot is a subsystem, an area DevMap selected as a unit. The map shows a
 selected set, not a partition of the repository. The coverage note under
@@ -120,20 +129,28 @@ repo-wide language bar counts every indexed file.
 
 | On the page | Meaning |
 |---|---|
-| Dot colour | The subsystem's dominant language, in GitHub Linguist's colour. A ringed swatch has no Linguist colour and is drawn neutral. |
-| Dot size | File count by default. Layout offers degree and constant sizing. |
-| Green ring, ★ | The subsystem contains entry points. |
-| Blue edge | Neighbour: adjacent areas in the import and call graph. |
-| Purple edge | Handoff: work passes from one area into another through specific files. |
+| Dot colour | The subsystem's dominant language, in GitHub Linguist's colour. A ringed swatch in the language list has no Linguist colour and is drawn neutral. |
+| Dot size | Roughly how much the subsystem connects to. |
+| Green ring | The subsystem contains entry points. |
+| Plain line | Neighbour: adjacent areas in the import and call graph. |
+| Arrow | Handoff: work passes from one area into another through specific files. |
 | Stat tiles | Subsystems drawn, edges between them, indexed files, languages. Hover for definitions. |
 | Liveness badges | Repo-wide counts: entry roots, unwired files, dead symbols, unreachable files. Hover for definitions. |
 
-Selecting a subsystem opens its detail: language mix, entry points, critical
-files, clickable neighbours, handoffs and role files. A neighbour that is not a
-drawn subsystem is shown greyed and does not link. "not computed for this map"
-means the map was built without that evidence, which differs from "none". "Hide
-notes & Markdown" removes subsystems whose indexed files are all notes or
-documentation; mixed subsystems stay.
+The Navigator is an area tree with a filter and the standard tree keys (arrows,
+Home, End, Enter). Selecting an area opens its detail: language mix, entry
+points, critical files, a tests sample, clickable neighbours, handoffs and role
+files, with **Show on map** to find its dot. The pages are read-only: where
+GitPulse opens a file in its editor, a file here is a **Copy path** button. A
+neighbour that is not a drawn subsystem is shown greyed and does not link. "Not
+computed for this map" means the map was built without that evidence, which
+differs from "none". The tests list is a capped sample and the payload carries no
+total, so the page says "Sample of N" and never an "N of M" it cannot back.
+**Hide notes & Markdown** (under Filters) removes subsystems whose indexed files
+are all notes or documentation; mixed subsystems stay.
+
+Keyboard on the map: arrows pan (rotate on the globe), `+` and `-` zoom, `0`
+fits, Enter copies the selected node's path, Escape clears filters.
 
 The liveness badges follow the rules in the next section. They are candidates,
 and a count shown as "N of M" or "total unknown" is a sample. When

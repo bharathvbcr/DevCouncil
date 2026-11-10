@@ -715,7 +715,8 @@ devmap map-html .                      # subsystems, coloured by language
 `html` draws the code graph; `map-html` draws the subsystem map from
 `repo_map.json`, colouring each node by its dominant language in GitHub
 Linguist's own palette and carrying the coverage the map does *not* have —
-subsystems are a selected set, not a partition.
+subsystems are a selected set, not a partition. Both use the shared code-map
+renderer (below), so they look and behave like GitPulse's Map section.
 
 `map-html` reads the resolved state directory's `repo_map.json` and writes
 `map.html` beside it, honoring `.devmap/`, legacy `.devcouncil/`, and
@@ -734,12 +735,47 @@ coverage and cap counts. Regenerate existing HTML to get the new control; use
 `devmap map-html . --force` to replace a preview whose map fingerprint is unchanged.
 
 One self-contained HTML file. It opens from a `file://` URL on a machine with no
-network and no package manager, because the renderer is embedded.
+network and no package manager, because the page script and styles are
+embedded. The page never makes a request of its own.
 
-The view is capped — a force layout over 12,000 nodes is a hairball that pins a
-CPU — so nodes are ranked by degree and the most connected survive. The cap is
+The view is capped — a layout over 12,000 nodes is a hairball — so nodes are
+ranked by degree and the most connected survive. The cap is
 never silent: the page header reads `1,000 of 12,103 nodes`, and the same two
 numbers ride in `--json`.
+
+### The shared code-map package
+
+Both pages are one TypeScript package, `rust/devmap-query/assets/code-map/`,
+which DevCouncil owns and GitPulse vendors (its `scripts/vendor-crates.mjs`
+copies `src`, `build.rs` and `assets`, so the same files appear under
+`src-tauri/vendored/devmap-query/assets/code-map/`). The modules under `src/`
+(layout, filtering, trace, globe, area tree, canvas renderer) take no DOM and no
+Bun API, use extensionless relative imports, and take their theme and language
+palette as injected values, so GitPulse imports them as they are. `src/page/` is
+the DOM shell (vanilla TypeScript, no framework) and is the only part that
+touches `document`.
+
+- **Build.** `npm run build:code-map` bundles `src/page/entry.ts` with Bun's
+  built-in bundler into `rust/devmap-query/assets/code-map.js.bundle`, which
+  `viz::render_html` and `map_preview::render_map_preview_html` inline through
+  one entry point (`page.rs`). The `.bundle` suffix keeps DevMap from parsing
+  the minified file. There are no npm dependencies.
+- **Drift.** `npm run check:code-map` rebuilds to a temp path and byte-compares
+  with the checked-in bundle, and refuses to run on a Bun other than the one in
+  `.bun-version`. CI runs it, installing Bun with `oven-sh/setup-bun` pinned to a
+  commit; `npm run ci:local` runs it too.
+- **Tests.** `npm run test:code-map` runs `bun test` over `tests/`.
+- **Types.** Bun does not type-check. The gate is GitPulse's `svelte-check` /
+  `tsc` over its vendored copy. The test files import `bun:test`, so a consumer's
+  tsconfig should include `assets/code-map/src` and not `assets/code-map/tests`
+  (or map `bun:test` to its own runner, as the tests use only `describe`, `it`
+  and `expect`).
+- **Pages.** The Rust side only embeds the payload (escaped for a raw-text
+  script: `<`, `>` and `&` as `\u` escapes) and the bundle. Every name from the
+  repository reaches the DOM as a text node, so a file called
+  `<img onerror=...>` is inert; a real-browser test
+  (`tests/support/page_probe.cjs`, run by the ignored
+  `repository_labels_stay_inert_in_a_real_browser`) pins that.
 
 ### Structural search
 
