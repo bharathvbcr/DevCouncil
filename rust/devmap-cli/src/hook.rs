@@ -6701,3 +6701,203 @@ mod lock_tests {
         assert!(!fx.record.exists(), "a build was started without an opt-in");
     }
 }
+
+/// Adversarial round 1 on w2/hook-trust (Lane C). Finding ids are in each name.
+#[cfg(all(test, unix))]
+mod attack_hook_trust {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::UNIX_EPOCH;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "atk-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn script(path: &Path, marker: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, format!("#!/bin/sh\n: > '{}'\necho ran\n", marker.display())).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn assert_refused(exe: &Path, root: &Path, base: &Path, marker: &Path, what: &str) {
+        let result = probe(exe, root, &["status"], Instant::now(), Duration::from_secs(5));
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(base);
+        assert!(!ran, "{what}: the in-repo executable ran");
+        assert!(result.is_err(), "{what}: not refused: {result:?}");
+    }
+
+    /// ATK-C-2a: the same repo spelled with different case on case-insensitive APFS.
+    #[test]
+    fn atk_c2a_case_variant_spelling_of_the_repo_is_still_inside() {
+        let base = scratch("case");
+        let repo = base.join("Repo");
+        let marker = base.join("ran");
+        script(&repo.join("devmap"), &marker);
+        let lower = PathBuf::from(repo.to_string_lossy().to_lowercase());
+        if !lower.join("devmap").exists() {
+            let _ = fs::remove_dir_all(&base);
+            return; // case-sensitive volume: nothing to attack
+        }
+        assert_refused(&lower.join("devmap"), &repo, &base, &marker, "case variant exe");
+    }
+
+    /// ATK-C-2b: repo root passed through a symlink, binary by the real path.
+    #[test]
+    fn atk_c2b_root_through_symlink_exe_by_real_path() {
+        let base = scratch("rootlink");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        script(&repo.join("bin/devmap"), &marker);
+        let via = base.join("via");
+        std::os::unix::fs::symlink(&repo, &via).unwrap();
+        assert_refused(&repo.join("bin/devmap"), &via, &base, &marker, "root via symlink");
+    }
+
+    /// ATK-C-2c: `..`/`.` spellings, trailing slash on the root, binary under `.git`.
+    #[test]
+    fn atk_c2c_dotdot_trailing_slash_and_dot_git() {
+        let base = scratch("dots");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        script(&repo.join(".git/hooks/devmap"), &marker);
+        fs::create_dir_all(base.join("other")).unwrap();
+        let sneaky = base.join("other/../repo/./.git/hooks/devmap");
+        let slash_root = PathBuf::from(format!("{}/", repo.display()));
+        assert_refused(&sneaky, &slash_root, &base, &marker, "dotdot + trailing slash");
+    }
+
+    /// ATK-C-2d: exe in a nested repo inside the hooked repo.
+    #[test]
+    fn atk_c2d_nested_repo_binary_inside_hooked_repo() {
+        let base = scratch("nested");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        fs::create_dir_all(repo.join("sub/.git")).unwrap();
+        script(&repo.join("sub/target/debug/devmap"), &marker);
+        assert_refused(&repo.join("sub/target/debug/devmap"), &repo, &base, &marker, "nested");
+    }
+
+    /// ATK-C-2e: /tmp firmlink spelling vs /private/tmp (macOS) for the same repo.
+    #[test]
+    fn atk_c2e_firmlink_tmp_vs_private_tmp() {
+        let base = scratch("firm");
+        let s = base.to_string_lossy().to_string();
+        let Some(rest) = s.strip_prefix("/private") else {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        };
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        script(&repo.join("devmap"), &marker);
+        let alias_exe = PathBuf::from(format!("{rest}/repo/devmap"));
+        assert_refused(&alias_exe, &repo, &base, &marker, "firmlink alias exe");
+    }
+
+    /// ATK-C-2f (HIGH): docs/SECURITY_BOUNDARIES.md says "inside the repository" means
+    /// inside its TOP (nearest `.git`), not the root a command was handed. A hook whose
+    /// selected root is `repo/sub` (own store) must refuse `repo/tools/devmap`.
+    #[test]
+    fn atk_c2f_binary_in_repo_top_outside_the_selected_subroot_is_refused() {
+        let base = scratch("top");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        script(&repo.join("tools/devmap"), &marker);
+        assert_refused(
+            &repo.join("tools/devmap"),
+            &repo.join("sub"),
+            &base,
+            &marker,
+            "exe in repo top, root is a subdirectory",
+        );
+    }
+
+    /// ATK-C-5b (MEDIUM): a refused in-repo executable must not take the SessionStart
+    /// context down with it: the agent must still be told, in additionalContext, that
+    /// DevMap hooks were refused (today the hook errors out with empty stdout).
+    #[test]
+    fn atk_c5b_session_start_with_in_repo_exe_still_reports_to_the_agent() {
+        let base = scratch("ssrefuse");
+        let repo = base.join("repo");
+        let marker = base.join("ran");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        script(&repo.join("devmap"), &marker);
+        let selection = RootSelection::whole(vec![repo.clone()]);
+        let result = session_start_sync(&repo.join("devmap"), &selection);
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(!ran);
+        let value = result.expect("a refused probe must degrade to a notice, not an Err");
+        let text = value.to_string();
+        assert!(text.contains("refus"), "{text}");
+    }
+
+    /// ATK-C-7: hostile hooks paths must neither hang, panic, nor write.
+    #[test]
+    fn atk_c7_marker_dir_refusal_hostile_inputs_terminate_and_do_not_write() {
+        let base = scratch("hostile");
+        let root = base.join("repo");
+        let hooks = root.join(".devcouncil/codeintel/hooks");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let cases: Vec<(&str, Box<dyn Fn()>)> = vec![
+            ("symlink to /", Box::new({ let h = hooks.clone(); move || { let _ = std::os::unix::fs::symlink("/", &h); } })),
+            ("symlink loop", Box::new({ let h = hooks.clone(); move || { let _ = std::os::unix::fs::symlink(&h, &h); } })),
+            ("fifo", Box::new({ let h = hooks.clone(); move || { let _ = Command::new("mkfifo").arg(&h).status(); } })),
+            ("mode 000 dir", Box::new({ let h = hooks.clone(); move || { fs::create_dir(&h).unwrap(); fs::set_permissions(&h, fs::Permissions::from_mode(0)).unwrap(); } })),
+        ];
+        for (name, make) in cases {
+            let _ = fs::set_permissions(&hooks, fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_file(&hooks);
+            let _ = fs::remove_dir(&hooks);
+            make();
+            let (tx, rx) = mpsc::channel();
+            let r = root.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(marker_dir_refusal(&r));
+            });
+            let got = rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{name}: marker_dir_refusal hung"));
+            assert!(got.is_some(), "{name}: hostile hooks path was not reported");
+        }
+        let _ = fs::set_permissions(&hooks, fs::Permissions::from_mode(0o755));
+        assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// ATK-C-5a: the printed refusal escapes ESC, newline and bidi controls in the path.
+    #[test]
+    fn atk_c5a_refusal_escapes_esc_newline_and_bidi_in_the_path() {
+        let base = scratch("esc");
+        let root = base.join("re\u{1b}[31mpo\nX\u{202e}evil");
+        let hooks = root.join(".devcouncil/codeintel/hooks");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+        let notice = marker_dir_refusal(&root).expect("linked hooks dir is refused");
+        let _ = fs::remove_dir_all(&base);
+        assert!(!notice.chars().any(|c| c.is_control()), "raw control: {notice:?}");
+        assert!(
+            !notice.contains('\u{202e}'),
+            "raw bidi override in hook context: {notice:?}"
+        );
+    }
+}
