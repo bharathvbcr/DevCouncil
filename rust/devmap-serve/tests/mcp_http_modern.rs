@@ -1778,3 +1778,166 @@ async fn contradictory_body_framing_is_resolved_below_this_server_and_never_spli
     assert_eq!(status, 200, "an unambiguous repeat is still one framing");
     assert_eq!(parsed["id"], json!(2));
 }
+
+// ---------------------------------------------------------------------------
+// Read-only pages: GET /map_preview.html and GET /code_graph.html
+//
+// A GET is CORS-simple, so the "POST + JSON forces a preflight" property does
+// not cover these paths. Each property that does is pinned below.
+// ---------------------------------------------------------------------------
+
+/// A repository on disk (store, repo map, code graph) served by a pinned slot.
+/// `artifacts` false leaves the store but not the two artifacts.
+async fn start_pages(artifacts: bool) -> (String, Scratch) {
+    let root = std::env::temp_dir().join(format!(
+        "devmap-http-pages-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let db = devmap_extract::paths::store_path(&root);
+    std::fs::create_dir_all(db.parent().expect("state dir")).expect("state dir");
+    let store = Store::open(&db).expect("file store");
+    populate(&store);
+    if artifacts {
+        let map = devmap_extract::paths::repo_map_path(&root);
+        std::fs::create_dir_all(map.parent().expect("map dir")).expect("map dir");
+        std::fs::write(&map, r#"{"subsystems":[{"area":"src/app"}],"files":[]}"#).expect("map");
+        let graph = devmap_extract::paths::code_graph_path(&root);
+        std::fs::create_dir_all(graph.parent().expect("graph dir")).expect("graph dir");
+        std::fs::write(&graph, r#"{"nodes":[],"edges":[]}"#).expect("graph");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    tokio::spawn(devmap_serve::mcp_http::serve_http_on(
+        Arc::new(StoreSlot::ready(db, Arc::new(store))),
+        listener,
+    ));
+    (address, Scratch { dir: root })
+}
+
+fn get(path: &str, extra: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n")
+}
+
+#[tokio::test]
+async fn the_two_pages_are_served_as_html_with_the_hardening_headers() {
+    let (address, _scratch) = start_pages(true).await;
+    for path in ["/map_preview.html", "/code_graph.html"] {
+        let (status, head, body) = exchange(&address, &get(path, "")).await;
+        assert_eq!(status, 200, "{path}: {head}\n{body}");
+        let lowered = head.to_ascii_lowercase();
+        assert!(
+            lowered.contains("content-type: text/html; charset=utf-8"),
+            "{head}"
+        );
+        assert!(
+            lowered.contains("content-security-policy: default-src 'none'"),
+            "{head}"
+        );
+        assert!(lowered.contains("connect-src 'none'"), "{head}");
+        assert!(lowered.contains("frame-ancestors 'none'"), "{head}");
+        assert!(lowered.contains("x-frame-options: deny"), "{head}");
+        assert!(
+            lowered.contains("x-content-type-options: nosniff"),
+            "{head}"
+        );
+        assert!(lowered.contains("cache-control: no-store"), "{head}");
+        assert!(lowered.contains("referrer-policy: no-referrer"), "{head}");
+        assert!(
+            !lowered.contains("access-control-"),
+            "a CORS header would make the page readable cross-origin: {head}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_missing_artifact_is_an_explicit_404_not_an_empty_page() {
+    let (address, _scratch) = start_pages(false).await;
+    for path in ["/map_preview.html", "/code_graph.html"] {
+        let (status, head, body) = exchange(&address, &get(path, "")).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(head.to_ascii_lowercase().contains("text/plain"), "{head}");
+        assert!(
+            body.contains("devmap build"),
+            "the message names the fix: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cross_origin_or_rebound_get_never_reaches_a_page() {
+    let (address, _scratch) = start_pages(true).await;
+    for path in ["/map_preview.html", "/code_graph.html"] {
+        let (status, _, body) =
+            exchange(&address, &get(path, "Origin: https://evil.example\r\n")).await;
+        assert_eq!(
+            status, 403,
+            "a site Origin is refused, even the page's own: {path}"
+        );
+        assert!(!body.contains("<html"), "{body}");
+        let (status, _, body) = exchange(
+            &address,
+            &format!("GET {path} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 403, "a rebound Host is refused: {path}");
+        assert!(!body.contains("<html"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn only_the_exact_paths_and_only_get_are_pages() {
+    let (address, _scratch) = start_pages(true).await;
+    // Anything but the two exact GET paths keeps the POST-only answer.
+    for (verb, path) in [
+        ("GET", "/"),
+        ("GET", "/map_preview.html/"),
+        ("GET", "/map_preview.htm"),
+        ("GET", "/../map_preview.html"),
+        ("GET", "/%2e%2e/map_preview.html"),
+        ("GET", "//map_preview.html"),
+        ("HEAD", "/map_preview.html"),
+        ("OPTIONS", "/map_preview.html"),
+        ("PUT", "/code_graph.html"),
+        ("DELETE", "/code_graph.html"),
+    ] {
+        let (status, head, _) = exchange(
+            &address,
+            &format!("{verb} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 405, "{verb} {path}");
+        assert!(
+            head.to_ascii_lowercase().contains("allow: post"),
+            "{verb} {path}: {head}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_query_string_selects_nothing() {
+    let (address, _scratch) = start_pages(true).await;
+    let (_, _, plain) = exchange(&address, &get("/map_preview.html", "")).await;
+    let (status, _, queried) = exchange(
+        &address,
+        &get("/map_preview.html?repo_path=/etc&root=/", ""),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(plain, queried, "no query parameter is honoured");
+}
+
+#[tokio::test]
+async fn the_post_endpoint_is_unchanged_by_the_pages() {
+    let (address, _scratch) = start_pages(true).await;
+    let (status, _, body) = exchange(
+        &address,
+        &post(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(!body.contains("<html"), "{body}");
+}

@@ -554,6 +554,13 @@ and select with repo_path.",
         self.open_for_call(None).map(|(store, _)| store)
     }
 
+    /// The repository an MCP call without `repo_path` would answer from, or the
+    /// reason there is none. The read-only HTTP pages use this and nothing
+    /// else, so they can never reach a repository the slot would not.
+    pub fn repository(&self) -> Result<RepositoryRef, String> {
+        self.open_for_call(None).map(|(_, attribution)| attribution)
+    }
+
     /// Why this server must not answer, when the executable it was started
     /// from has been replaced on disk since.
     ///
