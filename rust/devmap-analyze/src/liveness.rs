@@ -2920,6 +2920,33 @@ fn partial_parse_reason(ext: &Extraction) -> String {
     sentence
 }
 
+/// What a dead row says about its own file when that file is charged as
+/// partially parsed: the call that would keep the symbol alive may be among
+/// the bytes the parse lost. `None` for a file that is not charged.
+fn charged_partial_note(ext: &Extraction) -> Option<String> {
+    if !partial_parse_charged(ext) {
+        return None;
+    }
+    let ParseOutcome::Partial { error_ranges, .. } = &ext.parse_outcome else {
+        return None;
+    };
+    Some(format!(
+        "{} is charged as partially parsed ({}), so a call that would keep this symbol alive may \
+         be among the bytes lost",
+        ext.file_path,
+        partial_parse_lost(error_ranges)
+    ))
+}
+
+/// `reason`, with the note about the row's own file appended when there is one.
+/// Appended, so a reason that is matched by its prefix still is.
+fn with_file_note(reason: String, note: &Option<String>) -> String {
+    match note {
+        Some(note) => format!("{reason}; {note}"),
+        None => reason,
+    }
+}
+
 /// How bad a stored `partial_parse` reason is, for ordering a capped listing:
 /// whether the file is charged against the ceiling, and how many bytes the
 /// tree lost. Reads back exactly what [`partial_parse_reason`] writes; a reason
@@ -3721,6 +3748,9 @@ pub fn analyze_liveness_with_coverage(
         // `trace` refuse an empty answer with, so the two surfaces cannot
         // disagree about which files were never looked at.
         let file_is_call_blind = ext.is_call_blind();
+        // Once per file: a dead verdict for a symbol of a file that lost bytes to
+        // a parse says so on the row, whatever the corpus-wide reason is.
+        let own_file_note = charged_partial_note(ext);
 
         // Every finding about a symbol in this file, priced against the
         // blindness that actually bears on it.
@@ -4001,7 +4031,10 @@ pub fn analyze_liveness_with_coverage(
                         file_path: ext.file_path.clone(),
                         confidence: UNPROVEN_TIER_CONFIDENCE,
                         is_exempt: false,
-                        exemption_reason: Some(confident_tier_unproven_reason(language)),
+                        exemption_reason: Some(with_file_note(
+                            confident_tier_unproven_reason(language),
+                            &own_file_note,
+                        )),
                         evidence: Some(DeadEvidence::none()),
                     });
                 } else {
@@ -4021,7 +4054,10 @@ pub fn analyze_liveness_with_coverage(
                         } else if coverage.is_complete_for(language) {
                             None
                         } else {
-                            Some(COVERAGE_LOSS_REASON.to_string())
+                            Some(with_file_note(
+                                COVERAGE_LOSS_REASON.to_string(),
+                                &own_file_note,
+                            ))
                         },
                         evidence: None,
                     });
@@ -4609,5 +4645,26 @@ mod tests {
         assert!(is_charged, "{reason}");
         assert!(lost > 0, "{reason}");
         assert_eq!(partial_parse_severity("unrelated text"), (false, 0));
+    }
+
+    /// A dead verdict for a symbol of a file that lost bytes to a parse says
+    /// so on the row, not only in the corpus-wide sentence.
+    #[test]
+    fn a_dead_row_in_a_charged_partial_file_names_that_file() {
+        let ext = devmap_extract::extract_file(
+            "src/Cap.svelte",
+            "<script>function lonely(){}</script>\n<button onclick={() => broken(}>x</button>\n",
+        );
+        assert!(partial_parse_charged(&ext), "{:?}", ext.parse_outcome);
+        let rows = reports_with(ext, Vec::new());
+        let lonely = rows
+            .iter()
+            .find(|row| row.symbol_name.contains("lonely"))
+            .expect("the unused function is reported");
+        let reason = lonely.exemption_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("src/Cap.svelte is charged as partially parsed"),
+            "{lonely:?}"
+        );
     }
 }
