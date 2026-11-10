@@ -378,23 +378,77 @@ pub fn open_mcp_store_classified(path: &Path) -> Result<Store, OpenFailure> {
         })?;
         return Ok(base);
     }
+    // A failed open is a schema the binary cannot read, damage to the file, or
+    // anything else. (A closure, not a function: the error type is the store's
+    // SQLite error, which this crate does not depend on by name.)
+    let classify = |err| {
+        if Store::is_unsupported_schema(&err) {
+            OpenFailure::other(format!(
+                "rebuild_required: the DevMap store at {} is not this binary's schema and \
+will not be migrated in-place. Run `devmap build` in that repository. {err}",
+                path.display()
+            ))
+        } else if Store::sqlite_error_is_corrupt(&err) {
+            let raw = error_chain(&err);
+            OpenFailure {
+                message: corrupt_store_message(path, &raw, CorruptContext::Reopened),
+                corrupt: true,
+                raw,
+            }
+        } else {
+            OpenFailure::other(format!(
+                "devmap index at {} could not be opened: {err}",
+                path.display()
+            ))
+        }
+    };
     match Store::open_read_only_with(path, MCP_READER_MEMORY) {
         Ok(store) => Ok(store),
-        Err(err) if Store::is_unsupported_schema(&err) => Err(OpenFailure::other(format!(
-            "rebuild_required: the DevMap store at {} is not this binary's schema and \
-will not be migrated in-place. Run `devmap build` in that repository. {err}",
-            path.display()
-        ))),
-        Err(err) if Store::sqlite_error_is_corrupt(&err) => Err(OpenFailure {
-            message: corrupt_store_message(path, &err, CorruptContext::Reopened),
-            corrupt: true,
-            raw: err.to_string(),
-        }),
-        Err(err) => Err(OpenFailure::other(format!(
-            "devmap index at {} could not be opened: {err}",
-            path.display()
-        ))),
+        // The strict open found the full-text index to be the only fault. The
+        // rest of the store is sound, so open it degraded: tools that do not
+        // read the index answer, and search is refused by the same typed error
+        // a handle that met the damage later produces. Anything the degraded
+        // open finds beyond the index fails as whole-file damage.
+        Err(err) if Store::sqlite_error_is_full_text_damage(&err) => {
+            Store::open_read_only_with(path, MCP_READER_MEMORY.tolerating_full_text_damage())
+                .map_err(classify)
+        }
+        Err(err) => Err(classify(err)),
     }
+}
+
+/// `error` and everything it wraps, outermost first, as one line. Consecutive
+/// links that print the same text (a wrapper that forwards its source's
+/// message) are named once.
+pub fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut link: Option<&dyn std::error::Error> = Some(error);
+    while let Some(current) = link {
+        let text = current.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        link = current.source();
+    }
+    parts.join(": ")
+}
+
+/// The stacked lane at `attr_root`, opened for one call, if the worktree holds
+/// a lease.
+///
+/// A lane call opens its own base and delta and never queries the cached
+/// `base.sqlite` handle, so the server's reader memory is applied to the base
+/// connection the call actually reads through.
+pub fn open_lane_for_call(
+    attr_root: &Path,
+) -> anyhow::Result<Option<devmap_query::stacked::StackedStore>> {
+    let Some(stacked) = devmap_query::stacked::StackedStore::open_if_leased(attr_root)? else {
+        return Ok(None);
+    };
+    stacked
+        .base_store()
+        .apply_reader_memory(MCP_READER_MEMORY)?;
+    Ok(Some(stacked))
 }
 
 /// Why a tool call is reporting `SQLITE_CORRUPT`, which decides what it can
@@ -1014,6 +1068,37 @@ mod tests {
             .recall(&file, DamageKind::File, DamageStamp::of(&file))
             .is_none());
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    /// A remembered cause keeps every link of the error, not the outermost
+    /// message; links that repeat their source's text are named once.
+    #[test]
+    fn a_cause_keeps_its_whole_chain() {
+        #[derive(Debug)]
+        struct Link(&'static str, Option<Box<Link>>);
+        impl std::fmt::Display for Link {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Link {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|inner| inner as &(dyn std::error::Error + 'static))
+            }
+        }
+        let chain = Link(
+            "full-text index unreadable",
+            Some(Box::new(Link(
+                "full-text index unreadable",
+                Some(Box::new(Link("database disk image is malformed", None))),
+            ))),
+        );
+        assert_eq!(
+            super::error_chain(&chain),
+            "full-text index unreadable: database disk image is malformed"
+        );
     }
 
     #[test]

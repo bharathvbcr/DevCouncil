@@ -63,11 +63,52 @@ struct Lane {
     anchor: PathBuf,
     worktree: PathBuf,
     delta: PathBuf,
+    /// Why provisioning the lane failed, when it did.
+    provision_error: Option<String>,
 }
 
 /// An anchor checkout with a store, and a stacked worktree over it whose delta
 /// holds one synced edit.
 fn lane(name: &str) -> Lane {
+    lane_over(name, false)
+}
+
+/// Overwrite the root pages of the full-text index's tables in place.
+fn damage_full_text_index(db: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let bytes = std::fs::read(db).unwrap();
+    let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page = if raw == 1 { 65_536 } else { raw as usize };
+    let roots: Vec<i64> = {
+        let conn =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT rootpage FROM sqlite_master WHERE name LIKE 'nodes_fts%' AND rootpage > 1",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert!(!roots.is_empty(), "precondition: the index has root pages");
+    let mut file = std::fs::OpenOptions::new().write(true).open(db).unwrap();
+    for root in roots {
+        file.seek(SeekFrom::Start((root as u64 - 1) * page as u64))
+            .unwrap();
+        file.write_all(&vec![0xFF; page]).unwrap();
+    }
+    file.sync_all().unwrap();
+}
+
+/// [`lane`], with the anchor store's full-text index damaged BEFORE the lane is
+/// provisioned. The base is a byte copy of the donor, so a damaged donor would
+/// give a damaged base if provisioning admitted it; whether it does is what the
+/// test reads from `provision_error`. A lane that was not provisioned has no
+/// delta.
+fn lane_over(name: &str, damaged_index: bool) -> Lane {
     let root = scratch(name);
     let anchor = root.join("anchor");
     let worktree = root.join("lane-wt");
@@ -116,23 +157,33 @@ fn lane(name: &str) -> Lane {
             .unwrap();
         let _ = store.write_latest_csr_sidecar().unwrap();
     }
-    devmap_query::stacked::provision_stacked_worktree(&anchor, &worktree).unwrap();
-    std::fs::write(
-        worktree.join("lib.rs"),
-        "pub fn shared_target() -> i32 { 1 }\npub fn delta_caller() -> i32 { shared_target() }\n",
-    )
-    .unwrap();
-    {
-        let mut stacked = devmap_query::stacked::StackedStore::open(&worktree).unwrap();
-        stacked.sync_file_from_disk("lib.rs").unwrap();
+    if damaged_index {
+        damage_full_text_index(&anchor_db);
+    }
+    let provisioned = devmap_query::stacked::provision_stacked_worktree(&anchor, &worktree);
+    let provision_error = provisioned.as_ref().err().map(|error| format!("{error:#}"));
+    if !damaged_index {
+        provisioned.unwrap();
     }
     let delta = devmap_extract::paths::stack_delta_path(&worktree);
-    assert!(delta.is_file(), "the fixture must hold a delta");
+    if !damaged_index {
+        std::fs::write(
+            worktree.join("lib.rs"),
+            "pub fn shared_target() -> i32 { 1 }\npub fn delta_caller() -> i32 { shared_target() }\n",
+        )
+        .unwrap();
+        {
+            let mut stacked = devmap_query::stacked::StackedStore::open(&worktree).unwrap();
+            stacked.sync_file_from_disk("lib.rs").unwrap();
+        }
+        assert!(delta.is_file(), "the fixture must hold a delta");
+    }
     Lane {
         root,
         anchor,
         worktree,
         delta,
+        provision_error,
     }
 }
 
@@ -238,6 +289,61 @@ async fn a_damaged_delta_is_named_and_the_healthy_base_is_never_remembered_as_da
         healed["result"]["isError"],
         json!(false),
         "a repaired delta is answered from at once: {healed}"
+    );
+    remove(&lane.root);
+}
+
+/// A lane call opens its own `StackedStore` per call and never reads the cached
+/// `base.sqlite` handle, so the server's reader memory has to be on the
+/// connection that call actually uses.
+#[test]
+fn the_base_connection_a_lane_call_reads_through_has_the_servers_smaller_cache() {
+    let lane = lane("served");
+    let stacked = devmap_serve::repo_scope::open_lane_for_call(&lane.worktree)
+        .expect("the lane opens")
+        .expect("the worktree holds a lease");
+    assert_eq!(
+        stacked.base_store().memory_settings().unwrap(),
+        MCP_READER_MEMORY,
+        "the connection the lane call queries must carry the server's setting"
+    );
+    drop(stacked);
+    remove(&lane.root);
+}
+
+/// A donor whose full-text index is damaged cannot become a lane's base:
+/// publishing the base opens the donor with the strict reader, which refuses it.
+/// So a lane whose sealed base has a damaged index cannot be provisioned, and
+/// the refusal names the donor store and the repair that applies to it.
+///
+/// (The premise that seeding copies the donor byte for byte and admits it on its
+/// generation id alone does not hold for `provision_stacked_worktree`: the
+/// donor is opened and its schema validated first. A base damaged after
+/// provisioning trips the lease seal before SQLite is asked, so the only lane
+/// base a server can meet damaged is one the seal missed.)
+#[test]
+fn a_donor_with_a_damaged_full_text_index_is_refused_as_a_lane_base_naming_the_repair() {
+    let lane = lane_over("base-fts", true);
+    let refusal = lane
+        .provision_error
+        .as_deref()
+        .expect("a donor with a damaged index must not be provisioned as a base");
+    assert!(
+        refusal.contains("cannot read donor store")
+            && refusal.contains(
+                &devmap_extract::paths::store_path(&lane.anchor)
+                    .display()
+                    .to_string()
+            ),
+        "must name the donor store: {refusal}"
+    );
+    assert!(
+        refusal.contains("devmap repair --fts"),
+        "must name the repair for the donor's index, not only SQLite's words: {refusal}"
+    );
+    assert!(
+        !devmap_extract::paths::stack_lease_path(&lane.worktree).exists(),
+        "no lease is left behind by a refused provision"
     );
     remove(&lane.root);
 }

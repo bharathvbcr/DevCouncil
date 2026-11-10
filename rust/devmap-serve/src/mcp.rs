@@ -60,7 +60,7 @@ use crate::repo_scope::{
     canonicalize_path, corrupt_store_message, infer_root_from_store, open_mcp_store_classified,
     store_for_repo_path, CacheLookup, CorruptContext, DamageKind, DamageMemory, DamageStamp,
     IdleSweeper, OpenFailure, RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin,
-    STORE_IDLE_SWEEP,
+    DAMAGE_MEMORY_TTL, STORE_IDLE_SWEEP,
 };
 use crate::root_resolve::{file_uri_to_path, roots_with_stores, RootResolveInput, MAX_ROOTS};
 
@@ -643,7 +643,10 @@ with an absolute repository path."
     /// earlier call, is the same file in the same state, and the verdict is
     /// young enough to stand.
     fn known_damage(&self, key: &Path, kind: DamageKind) -> Option<String> {
-        crate::lock_recover(&self.damaged).recall(key, kind, DamageStamp::of(key))
+        // Stat the file before taking the lock: the lock guards a small table,
+        // and two `stat`s must not be held under it on every call.
+        let current = DamageStamp::of(key);
+        crate::lock_recover(&self.damaged).recall(key, kind, current)
     }
 
     /// Open `store_path` without caching it, for a caller that will keep it
@@ -3406,10 +3409,13 @@ async fn recover_from_damage(
                 return report(format!("{lane} (raw: {second:#})"));
             }
             slot.evict_cached(db_path);
-            slot.remember_damage(db_path, DamageKind::File, stamp_before, &second.to_string());
+            // The whole chain, not the outermost message: the cause is what the
+            // next refusal quotes.
+            let cause = format!("{second:#}");
+            slot.remember_damage(db_path, DamageKind::File, stamp_before, &cause);
             report(format!(
                 "{} (the first failure on this call was: {first:#})",
-                corrupt_store_message(db_path, &second, CorruptContext::Reopened)
+                corrupt_store_message(db_path, &cause, CorruptContext::Reopened)
             ))
         }
         other => other,
@@ -3421,9 +3427,18 @@ fn full_text_damage_message(db_path: &Path, cause: &dyn std::fmt::Display) -> St
     format!(
         "the full-text index of the devmap store at {} is damaged ({cause}). Search is \
 refused; every other tool still answers from this store. Run `devmap repair --fts` in that \
-repository to rebuild the index, which does not need a full rebuild.",
-        db_path.display()
+repository to rebuild the index, which does not need a full rebuild. This refusal is \
+remembered, so a repeated search is not read again: it clears when the file changes, or after \
+{} seconds.",
+        db_path.display(),
+        DAMAGE_MEMORY_TTL.as_secs()
     )
+}
+
+/// `message`, with the failure the call first met kept beside the one that
+/// replaced it.
+fn with_first_failure(message: String, first: &anyhow::Error) -> String {
+    format!("{message} (the first failure on this call was: {first:#})")
 }
 
 /// A query met damage in the full-text index.
@@ -3450,7 +3465,7 @@ async fn recover_from_full_text_damage(
     let key = StoreSlot::damage_key(db_path);
     // A store handed in already open is reported on and left as it is.
     if slot.holds_caller_owned(db_path) {
-        return report(full_text_damage_message(db_path, &first));
+        return report(full_text_damage_message(db_path, &format!("{first:#}")));
     }
     if let Some(cause) = slot.known_damage(&key, DamageKind::FullText) {
         return report(full_text_damage_message(db_path, &cause));
@@ -3460,11 +3475,14 @@ async fn recover_from_full_text_damage(
     };
     let candidate = match slot.open_candidate(db_path) {
         Ok(candidate) => candidate,
+        // The index is not all that is damaged: the fresh open met damage the
+        // index does not account for, so this is damage to the file.
         Err(failure) if failure.corrupt => {
-            remember(&failure.raw);
-            return report(full_text_damage_message(db_path, &first));
+            slot.evict_cached(db_path);
+            slot.remember_damage(db_path, DamageKind::File, stamp_before, &failure.raw);
+            return report(with_first_failure(failure.message, &first));
         }
-        Err(failure) => return report(failure.message),
+        Err(failure) => return report(with_first_failure(failure.message, &first)),
     };
     let command = match to_ipc_command(tool, arguments) {
         Ok(command) => command,
@@ -3487,8 +3505,23 @@ async fn recover_from_full_text_damage(
             Ok(Ok(Ok(value)))
         }
         Ok(Ok(Err(second))) if Store::is_full_text_damage(&second) => {
-            remember(&second.to_string());
-            report(full_text_damage_message(db_path, &second))
+            let cause = format!("{second:#}");
+            remember(&cause);
+            report(with_first_failure(
+                full_text_damage_message(db_path, &cause),
+                &first,
+            ))
+        }
+        // Corrupt, and not in the index: the first attempt's verdict that only
+        // the index was damaged was wrong, and the fresh handle says the file is.
+        Ok(Ok(Err(second))) if Store::is_database_corrupt(&second) => {
+            slot.evict_cached(db_path);
+            let cause = format!("{second:#}");
+            slot.remember_damage(db_path, DamageKind::File, stamp_before, &cause);
+            report(with_first_failure(
+                corrupt_store_message(db_path, &cause, CorruptContext::Reopened),
+                &first,
+            ))
         }
         other => other,
     }
@@ -3527,7 +3560,7 @@ fn dispatch_with_stacked_overlay(
     // The lane opens its own base and delta, never the cached `engine`, and the
     // open reads both files: damage met there (a corrupt delta fails the open)
     // is attributed like damage met later, so the open is inside the naming.
-    let stacked = match devmap_query::stacked::StackedStore::open_if_leased(attr_root) {
+    let stacked = match crate::repo_scope::open_lane_for_call(attr_root) {
         Ok(Some(stacked)) => stacked,
         Ok(None) => return dispatch(engine, request, cancel, unapplied),
         Err(error) => return Err(name_lane_damage(attr_root, error)),
