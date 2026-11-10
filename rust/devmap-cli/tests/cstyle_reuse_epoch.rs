@@ -134,6 +134,17 @@ fn warm_store_from_the_base_resolver(label: &str) -> std::path::PathBuf {
     root
 }
 
+/// The resolving build removes every `resolution-reuse-<other epoch>` directory
+/// (`remove_old_reuse_epochs`), so the pre-split `resolution-reuse-1` is gone.
+fn assert_legacy_reuse_dir_removed(root: &std::path::Path) {
+    let legacy = devmap_extract::paths::state_dir(root).join("resolution-reuse-1");
+    assert!(
+        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH == "1" || !legacy.exists(),
+        "{} was not removed by the resolving build",
+        legacy.display()
+    );
+}
+
 fn edit_unrelated_file(root: &std::path::Path) {
     std::fs::write(root.join("util/other.py"), "def f():\n    return 2\n").unwrap();
 }
@@ -147,6 +158,7 @@ fn an_unrelated_edit_then_a_normal_build_drops_the_stale_cross_group_edge() {
         !has_stale_edge(&root),
         "a pre-split cross-group edge survived an unrelated edit; build said:\n{out}"
     );
+    assert_legacy_reuse_dir_removed(&root);
 }
 
 #[test]
@@ -158,6 +170,7 @@ fn an_affected_build_drops_the_stale_cross_group_edge() {
         !has_stale_edge(&root),
         "a pre-split cross-group edge survived --affected; build said:\n{out}"
     );
+    assert_legacy_reuse_dir_removed(&root);
 }
 
 /// `--full` never reads reuse blobs, so it drops the edge at either epoch. This

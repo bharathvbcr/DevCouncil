@@ -88,9 +88,10 @@ fn lane_over(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
 }
 
 /// Resolved `Calls` edges of `symbol` as the merged (base + delta) index holds
-/// them, `(target_file, target_symbol)`. `edges_for_symbol` is not used: it
-/// returns the delta's raw, name-keyed call records, which carry no family.
-fn call_targets(lane: &Path, file: &str, symbol: &str) -> Vec<(String, String)> {
+/// them, `(target_file, target_symbol, resolution)`. `edges_for_symbol` is not
+/// used: it returns the delta's raw, name-keyed call records, which carry no
+/// family.
+fn call_targets(lane: &Path, file: &str, symbol: &str) -> Vec<(String, String, String)> {
     let store = StackedStore::open(lane).unwrap();
     let edges = store
         .file_edges(file, 0.0, &Cancel::new())
@@ -100,56 +101,104 @@ fn call_targets(lane: &Path, file: &str, symbol: &str) -> Vec<(String, String)> 
     edges
         .into_iter()
         .filter(|e| e.edge_kind == "Calls" && e.source_symbol == format!("{file}::{symbol}"))
-        .map(|e| (e.target_file, e.target_symbol))
+        .map(|e| (e.target_file, e.target_symbol, e.resolution.unwrap_or_default()))
         .collect()
 }
 
-#[cfg(unix)]
-#[test]
-fn a_delta_call_binds_a_base_declaration_only_inside_its_own_group() {
+fn write(lane: &Path, rel: &str, text: &str) {
+    let path = lane.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+}
+
+/// The stacked resolver binds `ImportScoped` when exactly one candidate sits in
+/// the caller's own directory, whatever its family, so a caller placed beside
+/// its target would pass with or without the split. Every caller here lives in
+/// a directory of its own, so the only rung that can bind is the global one:
+/// before the split three cross-group namesakes made it ambiguous (no edge) or
+/// admitted a wrong-group target; after it, one same-group candidate is a
+/// `UniqueGlobal`.
+///
+/// Two sites compare families: the delta-to-delta loop (`other_ext` in
+/// `added_extractions`) and the base loop (`base_symbols_for_callee`). The
+/// first four callers exercise the base site, the `dd_*` pair the delta site.
+fn staged_lane(tag: &str) -> (PathBuf, PathBuf) {
     let (root, lane) = lane_over(
-        "delta",
+        tag,
         &[
-            ("c/lib.c", "int only_c(int x) { return x; }\nint shared_name(int x) { return x; }\n"),
-            ("java/Sh.java", "class Sh { static int shared_name(int x) { return x; } }\n"),
-            ("cs/Sh.cs", "class Sh2 { static int shared_name(int x) { return x; } }\n"),
+            ("lib/lib.c", "int only_c(int x) { return x; }\nint shared_name(int x) { return x; }\n"),
+            ("jv/Sh.java", "class Sh { static int shared_name(int x) { return x; } }\n"),
+            ("cs0/Sh.cs", "class Sh2 { static int shared_name(int x) { return x; } }\n"),
         ],
     );
-    // Three delta callers: a C call whose name three groups declare, a Java
-    // call of a C function, and a C# call of a Java method.
-    fs::create_dir_all(lane.join("c")).unwrap();
-    fs::write(
-        lane.join("c/ns.c"),
-        "int c_uses_shared(int v) { return shared_name(v); }\n",
-    )
-    .unwrap();
-    fs::write(
-        lane.join("java/Use.java"),
-        "class U { int go() { return only_c(1); } }\n",
-    )
-    .unwrap();
-    fs::write(
-        lane.join("cs/Use.cs"),
-        "class V { static int go() { return shared_name(1); } }\n",
-    )
-    .unwrap();
+    // Base-site callers, each in its own directory.
+    write(&lane, "app/ns.c", "int c_uses_shared(int v) { return shared_name(v); }\n");
+    write(&lane, "app2/Use.cs", "class V { static int go() { return shared_name(1); } }\n");
+    write(&lane, "app3/Use.java", "class U { int go() { return shared_name(1); } }\n");
+    write(&lane, "app4/JC.java", "class JC { int go() { return only_c(1); } }\n");
+    // Delta-to-delta: a delta Java declaration, a delta C caller (negative), a
+    // delta Java caller (positive), and a delta C declaration with a C caller.
+    write(&lane, "d1/Decl.java", "class Decl { static int dd_name(int x) { return x; } }\n");
+    write(&lane, "d2/Call.c", "int c_calls_dd(int v) { return dd_name(v); }\n");
+    write(&lane, "d3/Call.java", "class JD { int go() { return dd_name(1); } }\n");
+    write(&lane, "d4/Decl2.c", "int dd_c(int x) { return x; }\n");
+    write(&lane, "d5/Call2.c", "int c_calls_ddc(int v) { return dd_c(v); }\n");
     let mut store = StackedStore::open(&lane).unwrap();
     store.sync_worktree().unwrap();
-    drop(store);
+    (root, lane)
+}
 
-    let c = call_targets(&lane, "c/ns.c", "c_uses_shared");
+fn assert_unique(lane: &Path, file: &str, sym: &str, target_file: &str, target_sym: &str) {
     assert_eq!(
-        c,
-        vec![("c/lib.c".to_string(), "c/lib.c::shared_name".to_string())],
-        "the C call binds only the C-like declaration"
+        call_targets(lane, file, sym),
+        vec![(target_file.to_string(), target_sym.to_string(), "UniqueGlobal".to_string())],
+        "{file}::{sym}"
     );
-    let java = call_targets(&lane, "java/Use.java", "U.go");
-    assert!(java.is_empty(), "Java must not bind a C function: {java:?}");
-    let cs = call_targets(&lane, "cs/Use.cs", "V.go");
-    assert_eq!(
-        cs,
-        vec![("cs/Sh.cs".to_string(), "cs/Sh.cs::Sh2.shared_name".to_string())],
-        "the C# call binds only the C# declaration"
-    );
+}
+
+fn assert_none(lane: &Path, file: &str, sym: &str) {
+    let got = call_targets(lane, file, sym);
+    assert!(got.is_empty(), "{file}::{sym} must bind nothing: {got:?}");
+}
+
+/// Base site, C caller: three namesakes, one in its group.
+#[cfg(unix)]
+#[test]
+fn a_delta_c_call_binds_the_c_like_base_declaration_uniquely() {
+    let (root, lane) = staged_lane("c");
+    assert_unique(&lane, "app/ns.c", "c_uses_shared", "lib/lib.c", "lib/lib.c::shared_name");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Base site, C# caller.
+#[cfg(unix)]
+#[test]
+fn a_delta_csharp_call_binds_the_csharp_base_declaration_uniquely() {
+    let (root, lane) = staged_lane("cs");
+    assert_unique(&lane, "app2/Use.cs", "V.go", "cs0/Sh.cs", "cs0/Sh.cs::Sh2.shared_name");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Base site, Java callers: the namesake call binds Java's own, and a Java call
+/// of a name only C declares binds nothing.
+#[cfg(unix)]
+#[test]
+fn a_delta_java_call_binds_the_java_base_declaration_and_never_a_c_one() {
+    let (root, lane) = staged_lane("java");
+    assert_unique(&lane, "app3/Use.java", "U.go", "jv/Sh.java", "jv/Sh.java::Sh.shared_name");
+    assert_none(&lane, "app4/JC.java", "JC.go");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Delta-to-delta site: a delta C call of a name only a delta Java file
+/// declares binds nothing; a delta Java call of it, and a delta C call of a
+/// delta C declaration, bind uniquely.
+#[cfg(unix)]
+#[test]
+fn a_delta_call_binds_another_delta_files_declaration_only_inside_its_group() {
+    let (root, lane) = staged_lane("dd");
+    assert_none(&lane, "d2/Call.c", "c_calls_dd");
+    assert_unique(&lane, "d3/Call.java", "JD.go", "d1/Decl.java", "d1/Decl.java::Decl.dd_name");
+    assert_unique(&lane, "d5/Call2.c", "c_calls_ddc", "d4/Decl2.c", "d4/Decl2.c::dd_c");
     let _ = fs::remove_dir_all(root);
 }
