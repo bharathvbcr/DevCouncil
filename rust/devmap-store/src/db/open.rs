@@ -232,6 +232,28 @@ impl Store {
         Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref(), memory))
     }
 
+    /// The page cache and file mapping this connection is using now, read back
+    /// from SQLite rather than from what was asked for.
+    pub fn memory_settings(&self) -> Result<ReaderMemory> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache: i64 = conn.query_row("PRAGMA cache_size", [], |row| row.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let mmap: i64 = conn.query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
+        // A negative cache_size is KiB; a positive one is pages.
+        let cache_kib = if cache < 0 {
+            cache.unsigned_abs()
+        } else {
+            cache as u64 * page_size as u64 / 1024
+        };
+        Ok(ReaderMemory {
+            cache_kib: u32::try_from(cache_kib).unwrap_or(u32::MAX),
+            mmap_bytes: mmap.max(0) as u64,
+        })
+    }
+
     fn open_read_only_once(db_path: &Path, memory: ReaderMemory) -> Result<Self> {
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
