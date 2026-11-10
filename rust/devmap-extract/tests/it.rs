@@ -162,6 +162,8 @@ mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
 #[cfg(feature = "parse")]
+mod svelte_template_scope;
+#[cfg(feature = "parse")]
 mod svelte_template_text;
 #[cfg(feature = "parse")]
 mod svelte_snippets_and_stores;

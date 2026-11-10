@@ -239,7 +239,7 @@ fn a_second_snippet_of_one_name_is_declared_beside_the_first() {
     let mut qualified: Vec<&str> = e
         .symbols
         .iter()
-        .filter(|s| s.name == "a")
+        .filter(|s| s.name == "a" || s.name == "a#2")
         .map(|s| s.qualified_name.as_str())
         .collect();
     qualified.sort_unstable();
