@@ -200,10 +200,16 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         // would read as another commit's, and one stamped "unavailable" as no
         // commit's. Only `devmap seed` refuses. `build --seed-from` and a plain
         // `devmap build` keep the "unavailable" fallback (build.rs), because a
-        // build must still index a tree whose HEAD cannot be read. Whether
-        // `--seed-from` should refuse too is an owner decision: the SessionStart
-        // hook runs it (hook.rs:2153-2170), and a refusal there would stop a
-        // session's first build.
+        // build must still index a tree whose HEAD cannot be read.
+        // Ruling (2026-11-10): `build --seed-from` and a plain build keep the
+        // "unavailable" stamp rather than refuse, because the SessionStart hook
+        // runs `--seed-from` automatically (hook.rs:2153-2170), often where `git`
+        // does not resolve, and a refusal would leave no store; the graph is
+        // correct and only the head is unknown. `devmap status` does not report
+        // it: on a fixture (a lane with a corrupt HEAD, seeded by
+        // `build --seed-from`) the generations row holds head "unavailable" while
+        // `status --json` has no head field and reports `is_fresh: true` and
+        // `degraded_reason: null`, so the unknown head is invisible there.
         let lane_head = devmap_store::current_git_head(&root).with_context(|| {
             format!(
                 "cannot read the HEAD of {} to stamp the seeded store",
