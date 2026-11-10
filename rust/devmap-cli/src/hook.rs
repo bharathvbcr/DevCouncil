@@ -2561,8 +2561,31 @@ pub(crate) fn shell_quote_hook_executable(text: &str) -> anyhow::Result<String> 
     Ok(shell_single_quote(text))
 }
 
+/// What to do about a hook executable that sits inside the repository it
+/// serves. One text for every refusal message and notice; the commands are the
+/// ones `docs/cli-reference.md` (lines 81-87) documents for installing DevMap.
+const INSIDE_REPO_REMEDY: &str = "Remedy: install devmap outside the repository \
+     (`bash scripts/install.sh --only=devmap` from a checkout, or `cargo install --git \
+     https://github.com/bharathvbcr/DevCouncil.git --tag <release tag> --locked devmap-cli`) \
+     and point the hooks at that binary";
+
+/// The repository top for `canonical_root`: the nearest enclosing git worktree
+/// root (a `.git` directory or gitlink file), found by the one shared walk,
+/// [`devmap_extract::git_worktree_root`]; the root itself when none exists.
+fn repository_top(canonical_root: &Path) -> PathBuf {
+    devmap_extract::git_worktree_root(canonical_root)
+        .unwrap_or_else(|| canonical_root.to_path_buf())
+}
+
 /// Canonical executable a hook may spawn for `root`, or an error when the path
-/// cannot be resolved or is inside `root`. `action` ("probe", "detach") names
+/// cannot be resolved or is inside the repository.
+///
+/// "Inside the repository" is inside its top, as `docs/SECURITY_BOUNDARIES.md`
+/// (lines 25-33) defines it: run from `repo/backend`, a planted
+/// `repo/tools/bin/devmap` is still refused. The top is the nearest git
+/// worktree root above `root` ([`repository_top`]), else `root`. The document's
+/// further `.devcouncil` fallback is not implemented here: it would be a second
+/// walk beside `git_worktree_root`. `action` ("probe", "detach") names
 /// the refused operation in the diagnostic.
 ///
 /// This is the one owner of the containment check: `probe` and every detached
@@ -2591,11 +2614,17 @@ fn canonical_hook_executable(
             root.display()
         )
     })?;
-    if executable_is_inside_repo(executable, &canonical_exe, root, &canonical_root) {
+    // The repository top, not only the root this hook was handed: a hook whose
+    // root is `repo/sub` must still refuse `repo/tools/devmap`.
+    let top = repository_top(&canonical_root);
+    if executable_is_inside_repo(executable, &canonical_exe, root, &canonical_root)
+        || executable_is_inside_repo(executable, &canonical_exe, &top, &top)
+    {
         bail!(
-            "refusing to {action}: executable {} is inside repository {}",
+            "refusing to {action}: executable {} is inside repository {} (top {}). {INSIDE_REPO_REMEDY}",
             executable.display(),
-            canonical_root.display()
+            canonical_root.display(),
+            top.display()
         );
     }
     Ok(canonical_exe)
