@@ -1722,12 +1722,26 @@ mod tests {
             );
         }
         for rune in [
-            "$state", "$derived", "$effect", "$props", "$bindable", "$inspect", "$host",
+            "$state",
+            "$derived",
+            "$effect",
+            "$props",
+            "$bindable",
+            "$inspect",
+            "$host",
         ] {
-            assert_eq!(host_global_environment(LangFamily::JsTs, rune), Some("svelte"), "{rune}");
+            assert_eq!(
+                host_global_environment(LangFamily::JsTs, rune),
+                Some("svelte"),
+                "{rune}"
+            );
         }
         for not_a_rune in ["$markers", "$$props", "$", "$stateful"] {
-            assert_eq!(host_global_environment(LangFamily::JsTs, not_a_rune), None, "{not_a_rune}");
+            assert_eq!(
+                host_global_environment(LangFamily::JsTs, not_a_rune),
+                None,
+                "{not_a_rune}"
+            );
         }
         assert_eq!(host_global_environment(LangFamily::Python, "$state"), None);
     }
