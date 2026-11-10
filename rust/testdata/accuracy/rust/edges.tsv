@@ -262,3 +262,9 @@ rs.s36a	E nearer glob	scopes/src/c36.rs::enum_glob	scopes/src/c36.rs::Mk	forbid_
 rs.s37a	E statement macro	scopes/src/c37.rs::std_macro_then_outer	scopes/src/c37.rs::h37a	edge	must		println! and vec! emit no items or imports: the outer declaration answers
 rs.s37b	E statement macro	scopes/src/c37.rs::unknown_macro_then_name	scopes/src/c37.rs::h37b	forbid_any_tier	must		a crate macro may declare h37b in the block
 rs.s38a	E statement macro	scopes/src/c38.rs::shadowed_dbg	scopes/src/c38.rs::h38	forbid_any_tier	must		a crate macro named dbg is not the std dbg: it may declare h38
+rs.s40	F macro rebinding	scopes/src/c40.rs::imported_info	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`use dep::info;` brings the dependency's macro, which emits a block-level `use` of the other Dup
+rs.s41	F macro rebinding	macrouse/src/user.rs::via_macro_use	macrouse/src/mda.rs::Dup.mk16	forbid_any_tier	must		`#[macro_use] extern crate dep;` makes `vec!` the dependency's macro
+rs.s42	F macro rebinding	scopes/src/c42.rs::aliased_log	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`extern crate dep as log;` makes `log::info!` the dependency's
+rs.s43	F macro rebinding	scopes/src/c43.rs::attr_use	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		an attribute macro on a block item emits a `use` into the block
+rs.s44a	F declared by macro	scopes/src/c44.rs::after_thread_local	scopes/src/c44.rs::h44	edge	must		`thread_local!` declares only the statics it names, so h44 is still the module's
+rs.s44b	F declared by macro	scopes/src/c44.rs::after_bail	scopes/src/c44.rs::h44b	edge	must		`anyhow::bail!` is an expression macro that declares nothing

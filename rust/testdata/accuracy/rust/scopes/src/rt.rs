@@ -23,4 +23,18 @@ mod tests {
         assert_eq!(crate::c38::shadowed_dbg(), 1);
         assert_eq!(crate::c37::std_macro_then_outer(), 2);
     }
+
+    #[test]
+    fn a_dependency_macro_or_attribute_can_rebind_the_type() {
+        assert_eq!(crate::c40::imported_info(), 1);
+        assert_eq!(crate::c42::aliased_log(), 1);
+        assert_eq!(crate::c43::attr_use(), 1);
+    }
+
+    #[test]
+    fn thread_local_and_bail_declare_no_other_name() {
+        assert_eq!(crate::c44::after_thread_local(), 2);
+        assert_eq!(crate::c44::after_bail(false), Ok(3));
+        assert_eq!(crate::c44::after_bail(true), Err("no".to_string()));
+    }
 }

@@ -7,3 +7,8 @@ edition = "2021"
 # oracle: every call site returns `u8`, every wrong namesake `u16`, so the crate
 # only compiles when each name means the callee the rows expect. Keep it passing
 # `cargo check`.
+
+[dependencies]
+dep = { path = "../dep" }
+pm = { path = "../pm" }
+anyhow = { path = "../anyhow_stub" }
