@@ -102,6 +102,15 @@ fn store_stamped(dir: &Path, python_grammar: &str) -> PathBuf {
          VALUES (1, 1, 1, NULL), (2, 2, 1, NULL);",
     )
     .unwrap();
+    // The resolver stamp the store's own write path puts into every generation
+    // (`$.resolver_epoch`). A generation without one reads as resolved by an
+    // unknown resolver, which is not current, so a fixture standing for a
+    // current store carries this binary's epoch.
+    conn.execute(
+        "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', ?1)",
+        [devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH],
+    )
+    .unwrap();
     db
 }
 
@@ -143,4 +152,43 @@ fn a_store_stamped_by_another_grammar_is_stale_to_a_reader_without_grammars() {
     let status = reader.status(&db.to_string_lossy()).unwrap();
     assert_eq!(status.analyzer_freshness, Some(false));
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// The resolver half of the same question, for a reader that cannot build: a
+/// generation resolved under another epoch, or written before the stamp existed,
+/// is not current, and status says why under its own reason.
+#[test]
+fn a_store_resolved_by_another_resolver_is_stale_to_a_reader_without_grammars() {
+    let (python_grammar, _) = devmap_extract::cache::current_payload_identity("python");
+    for (label, sql) in [
+        (
+            "older",
+            "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', '1')",
+        ),
+        (
+            "unstamped",
+            "UPDATE generations SET analysis_json = json_remove(analysis_json, '$.resolver_epoch')",
+        ),
+    ] {
+        let dir = tmp_dir(label);
+        let db = store_stamped(&dir, &python_grammar);
+        Connection::open(&db).unwrap().execute(sql, []).unwrap();
+        let reader = Store::open_read_only(&db).unwrap();
+
+        assert!(
+            !reader.latest_generation_payload_is_current().unwrap(),
+            "{label}: edges from another resolver are not current"
+        );
+        let status = reader.status(&db.to_string_lossy()).unwrap();
+        assert_eq!(status.analyzer_freshness, Some(false), "{label}");
+        assert!(
+            status
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resolver epoch")),
+            "{label}: {:?}",
+            status.degraded_reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
