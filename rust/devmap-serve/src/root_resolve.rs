@@ -424,6 +424,17 @@ fn store_for_root(root: &Path) -> PathBuf {
     paths::store_path(root)
 }
 
+/// Longest path an error repeats, in bytes, before it is cut with a marker.
+/// Matches the 200 bytes `stacked::lease_text` allows a lease value.
+const ERROR_ECHO_BYTES: usize = 200;
+
+/// A path made safe to put in an MCP error: control, bidi, zero-width and tag
+/// characters escaped, cut at [`ERROR_ECHO_BYTES`]. A directory name is
+/// attacker-controlled text, and the error is read by an agent.
+fn shown(path: &Path) -> String {
+    devmap_query::bounded_text(&path.display().to_string(), ERROR_ECHO_BYTES)
+}
+
 /// Resolve `devmap.sqlite` at `root`, or when absent check `stack_lease.json`
 /// for a stacked zero-copy worktree's shared immutable base snapshot.
 ///
@@ -441,10 +452,13 @@ pub fn effective_store_for_root(root: &Path) -> Result<Option<PathBuf>, String> 
     }
     let lease = devmap_query::stacked::StackLease::read_from(&lease_path).map_err(|err| {
         format!(
-            "stacked worktree lease {} is corrupt or unreadable: {err}. \
+            "stacked worktree lease {} is corrupt or unreadable: {}. \
 Run `devmap seed --stacked` or `devmap build --manifest` in {} to repair it.",
-            lease_path.display(),
-            root.display()
+            shown(&lease_path),
+            // The error already escapes the lease's own text but repeats the
+            // lease path (a directory name) as written: one pass over all of it.
+            devmap_query::bounded_reason(&err.to_string()),
+            shown(root)
         )
     })?;
     let base_sqlite = lease.base_sqlite_path();
@@ -452,9 +466,9 @@ Run `devmap seed --stacked` or `devmap build --manifest` in {} to repair it.",
         return Err(format!(
             "stacked worktree lease {} points to missing base snapshot {}. \
 Run `devmap seed --stacked` or `devmap build --manifest` in {} to repair it.",
-            lease_path.display(),
-            base_sqlite.display(),
-            root.display()
+            shown(&lease_path),
+            shown(&base_sqlite),
+            shown(root)
         ));
     }
     Ok(Some(base_sqlite))
@@ -994,8 +1008,15 @@ mod tests {
     /// Characters a terminal or a bidirectional renderer would act on, or that
     /// hide text: none may reach the MCP error text raw.
     const HOSTILE: &[char] = &[
-        '\u{202e}', '\u{2066}', '\u{200f}', '\u{200d}', '\u{200b}', '\u{2028}', '\u{feff}',
-        '\u{e0041}', '\u{1b}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{200f}',
+        '\u{200d}',
+        '\u{200b}',
+        '\u{2028}',
+        '\u{feff}',
+        '\u{e0041}',
+        '\u{1b}',
     ];
 
     fn hostile_lane(name: &str) -> PathBuf {
@@ -1006,9 +1027,16 @@ mod tests {
 
     fn assert_clean(err: &str) {
         for c in HOSTILE {
-            assert!(!err.contains(*c), "U+{:04X} reached the error raw: {err:?}", *c as u32);
+            assert!(
+                !err.contains(*c),
+                "U+{:04X} reached the error raw: {err:?}",
+                *c as u32
+            );
         }
-        assert!(err.contains("\\u{202e}"), "the escape names what was there: {err:?}");
+        assert!(
+            err.contains("\\u{202e}"),
+            "the escape names what was there: {err:?}"
+        );
     }
 
     /// F3: the corrupt-lease arm repeated the lease path and the root raw.

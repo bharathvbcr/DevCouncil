@@ -639,15 +639,12 @@ fn string_path(payload: &Value, key: &str) -> Option<PathBuf> {
     payload.get(key).and_then(Value::as_str).map(PathBuf::from)
 }
 
-/// A character that would open another line, or otherwise act as a control,
-/// inside hook context. Tab is spacing, not a new line, and stays.
+/// A character that would open another line, reorder, hide text or otherwise
+/// act as a control inside hook context: the shared agent-visible set
+/// ([`devmap_query::bounded::is_agent_unsafe`]). Tab is spacing, not a new
+/// line, and stays.
 fn context_breaks_a_line(c: char) -> bool {
-    c == '\n'
-        || c == '\r'
-        || c == '\u{0085}'
-        || c == '\u{2028}'
-        || c == '\u{2029}'
-        || (c.is_control() && c != '\t')
+    c != '\t' && devmap_query::bounded::is_agent_unsafe(c)
 }
 
 /// `text` as one hook-context line. Line breaks and other controls are written
@@ -662,7 +659,7 @@ fn context_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
     for c in text.chars() {
         if context_breaks_a_line(c) {
-            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            out.push_str(&crate::presentation::unicode_escape(c));
         } else {
             out.push(c);
         }
@@ -4214,18 +4211,29 @@ mod tests {
     #[test]
     fn context_line_escapes_exactly_the_agent_visible_set_over_every_code_point() {
         let set: &[(u32, u32)] = &[
-            (0x0000, 0x001f), (0x007f, 0x009f), (0x061c, 0x061c), (0x200b, 0x200f),
-            (0x2028, 0x202e), (0x2060, 0x2060), (0x2066, 0x2069), (0xfeff, 0xfeff),
+            (0x0000, 0x001f),
+            (0x007f, 0x009f),
+            (0x061c, 0x061c),
+            (0x200b, 0x200f),
+            (0x2028, 0x202e),
+            (0x2060, 0x2060),
+            (0x2066, 0x2069),
+            (0xfeff, 0xfeff),
             (0xe0000, 0xe007f),
         ];
         for cp in 0..=0x10ffffu32 {
-            let Some(c) = char::from_u32(cp) else { continue };
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
             let text = format!("a{c}b");
             let out = context_line(&text);
             let escaped = set.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp)) && c != '\t';
             if escaped {
                 assert!(!out.contains(c), "U+{cp:04X} survived: {out:?}");
-                assert!(out.starts_with("a\\u") && out.ends_with('b'), "U+{cp:04X}: {out:?}");
+                assert!(
+                    out.starts_with("a\\u") && out.ends_with('b'),
+                    "U+{cp:04X}: {out:?}"
+                );
             } else {
                 assert_eq!(out, text, "U+{cp:04X} changed but is outside the set");
             }
@@ -4234,7 +4242,10 @@ mod tests {
             assert_eq!(context_line(text), *text);
         }
         let persian = context_line("می\u{200c}خواهم");
-        assert!(persian.contains("\\u200c") && persian.contains("خواهم"), "{persian}");
+        assert!(
+            persian.contains("\\u200c") && persian.contains("خواهم"),
+            "{persian}"
+        );
     }
 
     /// Every breaking character is escaped, and every other character is kept.
@@ -4767,7 +4778,10 @@ mod tests {
             note.contains("devmap seed --stacked --from <donor checkout>"),
             "the note must name the recovery command: {note}"
         );
-        assert!(!note.contains("could not be opened; list is empty"), "{note}");
+        assert!(
+            !note.contains("could not be opened; list is empty"),
+            "{note}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4785,7 +4799,10 @@ mod tests {
             .unwrap();
         // The interrupted state: the store is placed, the lease is back.
         std::fs::write(&lease_path, &lease_bytes).unwrap();
-        assert!(matches!(HookStore::open(&lane), Ok(Some(HookStore::Plain(_)))));
+        assert!(matches!(
+            HookStore::open(&lane),
+            Ok(Some(HookStore::Plain(_)))
+        ));
         assert!(lease_path.is_file(), "the hook's read left the lease alone");
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -19,7 +19,7 @@ pub const MAX_REASON_COMPONENT_BYTES: usize = 4096;
 pub fn bounded_text(text: &str, max_bytes: usize) -> String {
     let mut escaped = String::with_capacity(text.len().min(max_bytes + 8));
     for ch in text.chars() {
-        if ch.is_control() || is_bidi_format(ch) {
+        if is_agent_unsafe(ch) {
             escaped.extend(ch.escape_default());
         } else {
             escaped.push(ch);
@@ -37,10 +37,31 @@ pub fn bounded_text(text: &str, max_bytes: usize) -> String {
     format!("{escaped}…[{omitted} bytes]")
 }
 
-/// Bidirectional formatting characters (marks, embeddings, overrides, isolates):
-/// not `is_control`, but able to reorder the text around them on a terminal.
-fn is_bidi_format(ch: char) -> bool {
-    matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+/// Bidirectional formatting characters (the Unicode `Bidi_Control` property:
+/// marks, embeddings, overrides, isolates): not `is_control`, but able to
+/// reorder the text around them on a terminal. This is the subset that
+/// *validation* may reject (claude.rs); display sinks escape the wider
+/// [`is_agent_unsafe`] set, so validation never narrows when the set grows.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether `c` is escaped wherever text from outside is shown to an agent or a
+/// terminal. The one definition of the set; each sink keeps its own spelling.
+///
+/// - every control (Cc, tab and U+0085 included) and the line separators
+///   U+2028/U+2029;
+/// - [`is_bidi_control`];
+/// - invisible format characters: U+200B-200D (zero-width space, ZWNJ, ZWJ),
+///   U+2060, U+FEFF;
+/// - the tag block U+E0000-U+E007F, which renders as nothing.
+///
+/// ZWNJ and ZWJ are escaped, not rejected: they are ordinary in Persian, Indic
+/// text and emoji, and a display escape is visible and reversible.
+pub fn is_agent_unsafe(c: char) -> bool {
+    c.is_control()
+        || is_bidi_control(c)
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Right-to-left letters that no escaper may touch: Hebrew, Arabic, Persian
@@ -83,7 +104,12 @@ mod tests {
         ];
         for ch in controls {
             let out = bounded_text(&format!("a{ch}b"), 64);
-            assert_eq!(out, format!("a{}b", ch.escape_default()), "U+{:04X}", ch as u32);
+            assert_eq!(
+                out,
+                format!("a{}b", ch.escape_default()),
+                "U+{:04X}",
+                ch as u32
+            );
             assert!(!out.contains(ch), "U+{:04X} survived", ch as u32);
         }
     }
@@ -118,7 +144,9 @@ mod tests {
     ];
 
     fn in_definition(cp: u32) -> bool {
-        ESCAPED_RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
+        ESCAPED_RANGES
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&cp))
     }
 
     /// Walk every scalar value: the text changes iff the code point is in the
@@ -126,14 +154,35 @@ mod tests {
     #[test]
     fn bounded_text_escapes_exactly_the_defined_set_over_every_code_point() {
         for cp in 0..=0x10ffffu32 {
-            let Some(c) = char::from_u32(cp) else { continue };
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
             let text = format!("a{c}b");
             let out = bounded_text(&text, 64);
             if in_definition(cp) {
-                assert_eq!(out, format!("a{}b", c.escape_default()), "U+{cp:04X} not escaped");
+                assert_eq!(
+                    out,
+                    format!("a{}b", c.escape_default()),
+                    "U+{cp:04X} not escaped"
+                );
             } else {
                 assert_eq!(out, text, "U+{cp:04X} escaped but outside the set");
             }
+        }
+    }
+
+    /// The owner agrees with the independent definition over every scalar,
+    /// and the validation subset is exactly the `Bidi_Control` code points.
+    #[test]
+    fn the_owner_matches_the_definition_over_every_code_point() {
+        for cp in 0..=0x10ffffu32 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            assert_eq!(is_agent_unsafe(c), in_definition(cp), "U+{cp:04X}");
+            let bidi = matches!(cp, 0x61c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069);
+            assert_eq!(is_bidi_control(c), bidi, "U+{cp:04X}");
+            assert!(!is_bidi_control(c) || is_agent_unsafe(c), "U+{cp:04X}");
         }
     }
 
