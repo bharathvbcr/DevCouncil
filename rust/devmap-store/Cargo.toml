@@ -86,6 +86,12 @@ required-features = ["parse"]
 name = "head_stamp"
 required-features = ["parse"]
 
+# Builds its generation from extracted source, and asks the working-tree check
+# that only exists with the parsing frontend.
+[[test]]
+name = "resolver_epoch_stamp"
+required-features = ["parse"]
+
 [[test]]
 name = "kernel_defects_from_source"
 required-features = ["parse"]

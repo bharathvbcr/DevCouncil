@@ -2840,6 +2840,44 @@ mod tests {
         assert!(summarize_status(&raw).starts_with("ready (source moved)"));
     }
 
+    /// A store whose edges were resolved by another resolver is queryable and
+    /// needs no SessionStart rebuild, but its tree has not moved: "source moved"
+    /// would be false, and would send the agent looking at its own edits.
+    #[test]
+    fn a_resolver_mismatch_is_not_called_a_moved_tree() {
+        let raw = serde_json::json!({
+            "query_ready": true,
+            "is_fresh": false,
+            "rebuild_required": false,
+            "source_freshness": true,
+            "analyzer_freshness": false,
+            "degraded_reason": "stored edges were resolved under resolver epoch 1; \
+                this binary resolves under 2; run `devmap build`",
+            "node_count": 1,
+            "edge_count": 2,
+            "generation_id": 7,
+        })
+        .to_string();
+        let summary = summarize_status(&raw);
+        assert!(!summary.contains("source moved"), "{summary}");
+        assert!(summary.starts_with("ready (older resolver"), "{summary}");
+        assert!(summary.contains("devmap build"), "{summary}");
+        assert!(summary.contains("1 symbols/2 edges (gen 7)"), "{summary}");
+    }
+
+    #[test]
+    fn a_moved_tree_over_a_current_analyzer_still_says_source_moved() {
+        let raw = serde_json::json!({
+            "query_ready": true,
+            "is_fresh": false,
+            "rebuild_required": false,
+            "source_freshness": false,
+            "analyzer_freshness": true,
+        })
+        .to_string();
+        assert!(summarize_status(&raw).starts_with("ready (source moved)"));
+    }
+
     #[test]
     fn unparseable_status_never_pastes_a_raw_fragment() {
         // A panic message, a truncated write, a host that swallowed stdout.

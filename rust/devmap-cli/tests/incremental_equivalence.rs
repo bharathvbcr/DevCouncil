@@ -1223,3 +1223,87 @@ fn a_corrupt_budget_receipt_resolves_every_file() {
     assert_matches_cold(&root);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Every blob of the current epoch, copied to `resolution-reuse-<other>` with
+/// its edges emptied: what a store left by a resolver of another epoch holds, if
+/// that resolver found nothing. Returns the directory and how many edges it hid.
+fn plant_blobs_of_another_epoch(
+    root: &std::path::Path,
+    other: &str,
+) -> (std::path::PathBuf, usize) {
+    let planted = devmap_extract::paths::state_dir(root).join(format!("resolution-reuse-{other}"));
+    std::fs::create_dir_all(&planted).unwrap();
+    let mut hidden = 0;
+    for entry in std::fs::read_dir(reuse_dir(root)).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == "budget.json" {
+            std::fs::copy(entry.path(), planted.join(&name)).unwrap();
+            continue;
+        }
+        let mut blob: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+        hidden += blob["edges"].as_array().unwrap().len();
+        blob["edges"] = serde_json::json!([]);
+        std::fs::write(planted.join(&name), serde_json::to_vec(&blob).unwrap()).unwrap();
+    }
+    (planted, hidden)
+}
+
+/// Criterion 7 of ft-c1d8cb8e, first half: the epoch directory is the only door
+/// to a reuse blob. After an epoch move (the old blobs sit under another epoch's
+/// name and the current directory is gone) a build reads none of them: it
+/// resolves every file, equals a cold build, and removes the old directory.
+///
+/// This is a guard that the door holds, so it passes on a tree that never had
+/// the stale-edge defect. It does not catch a resolver rules change made
+/// WITHOUT moving the epoch; that needs the edge-set digest pin.
+#[test]
+fn an_epoch_move_discards_every_older_blob() {
+    let root = scratch("epoch-move");
+    write_independent_tree(&root);
+    build_text(&root);
+    let (planted, hidden) = plant_blobs_of_another_epoch(&root, "0-older");
+    assert!(
+        hidden > 0,
+        "fixture precondition: the doctored blobs hide real edges"
+    );
+    std::fs::remove_dir_all(reuse_dir(&root)).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "no blob outside the current epoch directory may be read; output was:\n{edited}"
+    );
+    assert!(!planted.exists(), "the older epoch's directory is removed");
+    assert!(
+        reuse_dir(&root).is_dir(),
+        "the build wrote the current epoch's blobs"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Same door, other direction: an older epoch's directory sitting BESIDE an
+/// intact current one is never consulted either. The current blobs are reused
+/// (only the edited file is resolved), the doctored ones are not, and the graph equals cold.
+#[test]
+fn a_blob_beside_the_current_epoch_directory_is_never_read() {
+    let root = scratch("epoch-beside");
+    write_independent_tree(&root);
+    build_text(&root);
+    let (planted, hidden) = plant_blobs_of_another_epoch(&root, "0-older");
+    assert!(
+        hidden > 0,
+        "fixture precondition: the doctored blobs hide real edges"
+    );
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 1 of 21 files"),
+        "the current epoch's blobs are reused (only the edited file is resolved); output was:\n{edited}"
+    );
+    assert!(!planted.exists(), "the older epoch's directory is removed");
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
