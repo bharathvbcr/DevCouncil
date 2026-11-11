@@ -1,0 +1,12 @@
+pub fn h10() -> u8 { 1 }
+pub fn h11() -> u8 { 1 }
+pub fn h12() -> u8 { 1 }
+pub fn h13() -> u8 { 1 }
+pub fn h14() -> u8 { 1 }
+pub fn h15() -> u8 { 1 }
+pub fn h18() -> u8 { 1 }
+pub fn h24() -> u8 { 1 }
+pub fn h19() -> u16 { 2 }
+pub fn h20() -> u16 { 2 }
+pub fn h31() -> u8 { 1 }
+pub fn anc32() -> u8 { 1 }

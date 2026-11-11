@@ -51,8 +51,8 @@ pub use devmap_extract::paths;
 pub use devmap_store;
 
 pub use artifacts::{
-    should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
-    ArtifactStamp,
+    should_regenerate, write_atomic, writer_identity, ArtifactCurrency, ArtifactFingerprint,
+    ArtifactRecord, ArtifactStamp,
 };
 pub use ask::*;
 pub use bounded::{

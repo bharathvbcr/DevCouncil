@@ -39,6 +39,8 @@ mod attack_build_cancel;
 #[cfg(feature = "parse")]
 mod attack_kotlin_followups;
 #[cfg(feature = "parse")]
+mod attack_kotlin_recall;
+#[cfg(feature = "parse")]
 mod attack_recovery_residue;
 #[cfg(feature = "parse")]
 mod attack_sql_ddl;
@@ -89,8 +91,6 @@ mod js_object_facts;
 mod kotlin_followups;
 #[cfg(feature = "parse")]
 mod kotlin_node_recall;
-#[cfg(feature = "parse")]
-mod attack_kotlin_recall;
 #[cfg(feature = "parse")]
 mod kotlin_one_line_bodies;
 #[cfg(feature = "parse")]
@@ -155,12 +155,20 @@ mod reliability_source_reads;
 #[cfg(feature = "parse")]
 mod retry_phase_deadline_is_a_hard_bound;
 #[cfg(feature = "parse")]
+mod rust_prelude_facts;
+#[cfg(feature = "parse")]
+mod rust_thread_local_statics;
+#[cfg(feature = "parse")]
 mod rust_use_declarations;
 mod safe_fs_controls;
 #[cfg(feature = "parse")]
 mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
+#[cfg(feature = "parse")]
+mod svelte_snippets_and_stores;
+#[cfg(feature = "parse")]
+mod svelte_template_scope;
 #[cfg(feature = "parse")]
 mod svelte_template_text;
 #[cfg(feature = "parse")]

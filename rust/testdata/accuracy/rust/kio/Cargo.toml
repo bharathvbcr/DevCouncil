@@ -1,0 +1,7 @@
+[package]
+name = "kio"
+version = "0.1.0"
+edition = "2021"
+
+# Macro-providing dependency of the round-8 prelude fixtures: its `println`, `dbg`,
+# `vec` and `format` look like std macros and emit a `use` in the scope of the call.

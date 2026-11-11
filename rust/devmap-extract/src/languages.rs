@@ -1080,6 +1080,23 @@ pub fn is_ignored_path(rel_path: &str) -> bool {
     false
 }
 
+/// The runes Svelte 5 compiles, without the `$`: `$state`, `$derived`,
+/// `$effect`, `$props`, `$bindable`, `$inspect` and `$host` (the rune list of
+/// the Svelte documentation; `$state.raw`, `$derived.by`, `$effect.pre`,
+/// `$props.id` and the like are members of these).
+///
+/// The one list. The extractor reads it to tell a rune from a `$store` read,
+/// and the resolver's host-global table answers from it, so neither keeps a
+/// copy that can drift from the other.
+pub const SVELTE_RUNES: &[&str] = &[
+    "state", "derived", "effect", "props", "bindable", "inspect", "host",
+];
+
+/// Whether `name` (the identifier after the `$`) is a Svelte rune.
+pub fn is_svelte_rune(name: &str) -> bool {
+    SVELTE_RUNES.contains(&name)
+}
+
 /// Environment variable naming extra path prefixes to exclude from discovery.
 ///
 /// Comma-separated repo-relative prefixes (forward slashes). Empty components

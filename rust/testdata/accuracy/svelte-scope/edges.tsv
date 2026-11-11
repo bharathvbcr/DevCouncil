@@ -1,0 +1,31 @@
+# Svelte template-scope and store-read fixture. Split from ../svelte so the resolution-rate baseline of
+# that fixture keeps measuring the files it was written over; these rows are guarded by the ratchet.
+# Columns as in ../svelte/edges.tsv.
+sv.imported_store_not_read	imported store, $ spellings that are not reads	src/StoreDecoys.svelte	src/lib/storedecoys.ts::muted	forbid_any_tier	must		a regex, a string, a template-literal text part, an object key, a label and a comment spell $muted; the import is a real store target
+sv.imported_store_read	imported store, the one true read	src/StoreDecoys.svelte	src/lib/storedecoys.ts::volume	edge	must		$volume in expression position beside the decoys
+sv.imported_store_sibling	imported store read	src/StoreSibling.svelte	src/lib/storedecoys.ts::muted	edge	must		{$muted} in markup is the import's only read
+sv.scope_not_row	each item shadows a module function	src/Scopes.svelte	src/Scopes.svelte::row	forbid_any_tier	must		every use of `row` is inside the block that binds it
+sv.scope_not_first	each destructured name shadows a module function	src/Scopes.svelte	src/Scopes.svelte::first	forbid_any_tier	must		every use of `first` is inside the block that binds it
+sv.scope_not_second	each destructured name shadows a module function	src/Scopes.svelte	src/Scopes.svelte::second	forbid_any_tier	must		every use of `second` is inside the block that binds it
+sv.scope_not_index	each index, and the name its own key reads shadows a module function	src/Scopes.svelte	src/Scopes.svelte::index	forbid_any_tier	must		every use of `index` is inside the block that binds it
+sv.scope_not_cell	snippet parameter shadows a module function	src/Scopes.svelte	src/Scopes.svelte::cell	forbid_any_tier	must		every use of `cell` is inside the block that binds it
+sv.scope_not_shown	{@const} shadows a module function	src/Scopes.svelte	src/Scopes.svelte::shown	forbid_any_tier	must		every use of `shown` is inside the block that binds it
+sv.scope_not_loaded	{#await ... then} shadows a module function	src/Scopes.svelte	src/Scopes.svelte::loaded	forbid_any_tier	must		every use of `loaded` is inside the block that binds it
+sv.scope_not_failed	{:catch} shadows a module function	src/Scopes.svelte	src/Scopes.svelte::failed	forbid_any_tier	must		every use of `failed` is inside the block that binds it
+sv.scope_not_slotted	let: directive shadows a module function	src/Scopes.svelte	src/Scopes.svelte::slotted	forbid_any_tier	must		every use of `slotted` is inside the block that binds it
+sv.scope_not_renamed	let:name={local} shadows a module function	src/Scopes.svelte	src/Scopes.svelte::renamed	forbid_any_tier	must		every use of `renamed` is inside the block that binds it
+sv.scope_end_row	each item, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::row	edge	must		{row} after the block that bound it is the module function again
+sv.scope_end_first	each destructured name, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::first	edge	must		{first} after the block that bound it is the module function again
+sv.scope_end_second	each destructured name, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::second	edge	must		{second} after the block that bound it is the module function again
+sv.scope_end_index	each index, and the name its own key reads, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::index	edge	must		{index} after the block that bound it is the module function again
+sv.scope_end_cell	snippet parameter, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::cell	edge	must		{cell} after the block that bound it is the module function again
+sv.scope_end_shown	{@const}, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::shown	edge	must		{shown} after the block that bound it is the module function again
+sv.scope_end_loaded	{#await ... then}, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::loaded	edge	must		{loaded} after the block that bound it is the module function again
+sv.scope_end_failed	{:catch}, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::failed	edge	must		{failed} after the block that bound it is the module function again
+sv.scope_end_slotted	let: directive, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::slotted	edge	must		{slotted} after the block that bound it is the module function again
+sv.scope_end_renamed	let:name={local}, used after its block	src/ScopesEnd.svelte	src/ScopesEnd.svelte::renamed	edge	must		{renamed} after the block that bound it is the module function again
+sv.default_each	pattern default, {#each}	src/Defaults.svelte	src/Defaults.svelte::fromEach	edge	must		fromEach() is called only from { a = fromEach() } in the each pattern
+sv.default_const	pattern default, {@const}	src/Defaults.svelte	src/Defaults.svelte::fromConst	edge	must		fromConst() is called only from { c = fromConst() } in the {@const} pattern
+sv.default_then	pattern default, {:then}	src/Defaults.svelte	src/Defaults.svelte::fromThen	edge	must		fromThen() is called only from { d = fromThen() } in the then pattern
+sv.default_let	pattern default, let:	src/Defaults.svelte	src/Defaults.svelte::fromLet	edge	must		fromLet() is called only from { e = fromLet() } in the let: pattern
+sv.scope_not_item_comp	component tag named by a bound name	src/Scopes.svelte	src/Scopes.svelte::item	forbid_any_tier	must		<item.Comp /> inside {#each ... as item} names the block item

@@ -1,0 +1,9 @@
+[package]
+name = "callers_f"
+version = "0.1.0"
+edition = "2021"
+
+# Parse-only fixture for the 2026-11-09 Rust caller audit (cards perf1109-devmap-rust-sample):
+# one module per cause class, never compiled here.
+[dependencies]
+tauri = "2"

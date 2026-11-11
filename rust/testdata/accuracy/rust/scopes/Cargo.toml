@@ -1,0 +1,18 @@
+[package]
+name = "scopes_f"
+version = "0.1.0"
+edition = "2021"
+
+# Scope fixture for the 2026-11-10 Rust caller audit (round 3). rustc is the
+# oracle: every call site returns `u8`, every wrong namesake `u16`, so the crate
+# only compiles when each name means the callee the rows expect. Keep it passing
+# `cargo check`.
+
+[dependencies]
+dep = { path = "../dep" }
+pm = { path = "../pm" }
+anyhow = { path = "../anyhow_stub" }
+log = { path = "../log_stub" }
+
+[features]
+bail_feature = []
