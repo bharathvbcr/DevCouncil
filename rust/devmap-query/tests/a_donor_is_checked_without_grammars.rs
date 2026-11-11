@@ -184,7 +184,7 @@ fn provision_error(donor: &Path, lane: &Path) -> String {
 }
 
 fn matches(root: &Path) -> bool {
-    Store::open_read_only(&store_path(root))
+    Store::open_read_only(store_path(root))
         .unwrap()
         .latest_generation_matches_working_tree()
         .unwrap()
@@ -281,7 +281,7 @@ fn a_donor_whose_tree_cannot_be_compared_is_refused_not_trusted() {
     )
     .unwrap();
     drop(conn);
-    let store = Store::open_read_only(&store_path(&donor)).unwrap();
+    let store = Store::open_read_only(store_path(&donor)).unwrap();
     assert!(
         store.latest_generation_matches_working_tree().is_err(),
         "an unscannable root is an error, which callers must treat as do-not-skip"
