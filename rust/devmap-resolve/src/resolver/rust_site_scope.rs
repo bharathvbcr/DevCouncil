@@ -79,7 +79,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use devmap_extract::model::{
-    Extraction, RustExternCrate, RustScopeKind, SymbolKind, RUST_MACRO_FACTS_VERSION,
+    rust_mod_declaration_name, Extraction, RustExternCrate, RustScopeKind, SymbolKind,
+    RUST_MACRO_FACTS_VERSION,
 };
 use devmap_extract::{RustCrateManifest, RustDependency};
 
@@ -524,7 +525,7 @@ impl RustFileScope {
                 .push(RustDecl { scope: at, vis });
         }
         for imp in &ext.imports {
-            if imp.raw_import.trim_start().starts_with("mod ") {
+            if rust_mod_declaration_name(&imp.raw_import).is_some() {
                 continue;
             }
             let at = scope.scope_at(imp.span.start_byte);
@@ -1137,7 +1138,7 @@ impl Resolver {
                         .iter()
                         .filter(|imp| {
                             imp.alias.as_deref() == Some(".")
-                                && !imp.raw_import.trim_start().starts_with("mod ")
+                                && rust_mod_declaration_name(&imp.raw_import).is_none()
                         })
                         .map(|imp| imp.module_specifier.as_str())
                         .collect();

@@ -563,8 +563,13 @@ fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
         match sibling.kind() {
             "attribute_item" => {
                 let text = get_node_text(sibling, source);
+                // The attribute's name is the identifier after `#[`, however it
+                // is spaced: `#[cfg (x)]` and `#[ cfg(x) ]` are `cfg` too.
                 let inner = text.trim_start_matches("#[").trim_start();
-                if inner.starts_with("cfg(") || inner.starts_with("cfg_attr(") {
+                let name_end = inner
+                    .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .unwrap_or(inner.len());
+                if matches!(&inner[..name_end], "cfg" | "cfg_attr") {
                     return true;
                 }
             }

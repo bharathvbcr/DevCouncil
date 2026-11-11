@@ -1760,8 +1760,94 @@ pub struct RustMacroFacts {
 }
 
 /// The reading of [`RustMacroFacts`] the extractor writes now. A resolver that
-/// meets a lower number must not trust the absence of anything in them.
+/// meets a lower number must not trust the absence of anything in them. The
+/// comparison is `>=`, so a resolver that meets a *higher* number trusts the
+/// facts as they are: a downgraded binary reads facts newer than it understands.
 pub const RUST_MACRO_FACTS_VERSION: u32 = 1;
+
+/// The module a Rust `mod` declaration names, read from the declaration's own
+/// text (`ExtractedImport::raw_import`, which for a `mod_item` is the whole item
+/// and starts at its visibility): `mod log;`, `pub mod log;`, `pub(crate) mod
+/// log;`, `pub(in a::b) mod log;`. `None` for anything that is not a `mod`
+/// declaration, a `use` above all. The one reading every resolver rule shares, so
+/// a visibility prefix cannot turn a module into something else.
+pub fn rust_mod_declaration_name(raw_import: &str) -> Option<&str> {
+    let mut rest = raw_import.trim_start();
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        let after_pub_trimmed = after_pub.trim_start();
+        rest = if after_pub_trimmed.starts_with('(') {
+            let mut depth = 0usize;
+            let mut end = None;
+            for (at, ch) in after_pub_trimmed.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(at + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &after_pub_trimmed[end?..]
+        } else if after_pub.starts_with(char::is_whitespace) {
+            after_pub_trimmed
+        } else {
+            return None;
+        };
+    }
+    let rest = rest.trim_start().strip_prefix("mod")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name = rest.trim_start();
+    let end = name
+        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '#'))
+        .unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
+}
+
+#[cfg(test)]
+mod rust_mod_declaration_name_tests {
+    use super::rust_mod_declaration_name;
+
+    #[test]
+    fn every_visibility_form_names_the_module() {
+        for (raw, name) in [
+            ("mod log;", "log"),
+            ("  mod log ;", "log"),
+            ("pub mod log;", "log"),
+            ("pub(crate) mod log;", "log"),
+            ("pub(super) mod log;", "log"),
+            ("pub(self) mod log;", "log"),
+            ("pub(in crate::a) mod log;", "log"),
+            ("pub (crate) mod log;", "log"),
+            ("pub  mod  r#type;", "r#type"),
+            ("mod\tlog;", "log"),
+        ] {
+            assert_eq!(rust_mod_declaration_name(raw), Some(name), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_a_mod_declaration_is_none() {
+        for raw in [
+            "use log;",
+            "pub use log::mod_x;",
+            "pub(crate) use a::b;",
+            "module log;",
+            "public mod log;",
+            "pubmod log;",
+            "pub(crate mod log;",
+            "mod;",
+            "",
+        ] {
+            assert_eq!(rust_mod_declaration_name(raw), None, "{raw:?}");
+        }
+    }
+}
 
 /// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].
 ///

@@ -1088,3 +1088,65 @@ fn s6c_an_unindexed_out_of_line_mod_named_like_a_root_can_stand_for_it() {
     .resolve("s6c");
     assert!(!binds_da(&result), "an unindexed `mod log;`");
 }
+
+// ------------------------------------------- R1: a module's visibility prefix
+
+#[test]
+fn r1_an_unindexed_out_of_line_mod_named_like_a_root_stands_for_it_whatever_its_visibility() {
+    // `mod log;` is a module named `log` whether or not its file is indexed, so
+    // `log::info!` may be that module's. The visibility is a child of the same
+    // `mod_item` and must not turn the declaration into something else.
+    let edge = |tag: &str, header: &str| {
+        let result = Case {
+            deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
+            lib_header: Box::leak(header.to_string().into_boxed_str()),
+            run_body: "log::info!(\"x\");",
+            ..Case::default()
+        }
+        .resolve(tag);
+        binds_da(&result)
+    };
+    assert!(edge("r1-control", ""), "no `mod log;`: the log crate's macro");
+    for (tag, header) in [
+        ("r1a", "mod log;\n"),
+        ("r1b", "pub mod log;\n"),
+        ("r1c", "pub(crate) mod log;\n"),
+        ("r1d", "pub(super) mod log;\n"),
+        ("r1e", "pub(in crate) mod log;\n"),
+        ("r1f", "pub (crate) mod log;\n"),
+    ] {
+        assert!(!edge(tag, header), "{tag}: `{}`", header.trim());
+    }
+}
+
+// ------------------------------------------------ R2: a spaced cfg attribute
+
+#[test]
+fn r2_a_spaced_cfg_attribute_still_makes_an_explicit_import_conditional() {
+    // The attribute's name is the identifier after `#[`: `#[cfg (x)]` and
+    // `#[ cfg(x) ]` are the same `cfg` as `#[cfg(x)]`, so the import is not
+    // there with the feature off and `bail!` is the glob's (rustc, as s1a).
+    for (tag, attribute) in [
+        ("r2a", "#[cfg(feature = \"anyhow\")]"),
+        ("r2b", "#[cfg (feature = \"anyhow\")]"),
+        ("r2c", "#[ cfg(feature = \"anyhow\") ]"),
+        ("r2d", "#[cfg_attr (feature = \"anyhow\", allow(unused))]"),
+    ] {
+        let source = format!(
+            "use crate::da::Dup;\nuse dep::*;\n{attribute}\nuse anyhow::bail;\npub fn run() -> u8 {{\n    bail!(crate::db::Dup);\n    Dup::mk()\n}}\n"
+        );
+        let mut files = Case {
+            deps: "dep = { path = \"../dep\" }\nanyhow = \"1\"\n",
+            lib_header: "pub mod other;\n",
+            ..Case::default()
+        }
+        .files();
+        files.push(("app/src/other.rs".into(), source));
+        let result = resolve_workspace(tag, &files);
+        assert!(
+            !binds_da_from(&result, "app/src/other.rs::run"),
+            "{tag}: `{attribute}`: {:?}",
+            targets_from(&result, "app/src/other.rs::run")
+        );
+    }
+}

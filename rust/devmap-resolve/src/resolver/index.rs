@@ -1,4 +1,5 @@
 use super::*;
+use devmap_extract::model::rust_mod_declaration_name;
 
 impl Resolver {
     pub fn index_extractions(&mut self, extractions: &[Extraction]) {
@@ -2486,7 +2487,7 @@ impl Resolver {
             .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
         {
             for import in &ext.imports {
-                let declares_mod = import.raw_import.trim_start().starts_with("mod ");
+                let declares_mod = rust_mod_declaration_name(&import.raw_import).is_some();
                 let Some(path) = import
                     .module_specifier
                     .strip_prefix("self::")
@@ -2619,18 +2620,11 @@ impl Resolver {
             env.externs.extend(facts.extern_crates.iter().cloned());
             // An out-of-line `mod log;` is a module of that name whether or not
             // its file is indexed.
-            for imp in ext
+            for name in ext
                 .imports
                 .iter()
-                .filter(|imp| imp.raw_import.trim_start().starts_with("mod "))
+                .filter_map(|imp| rust_mod_declaration_name(&imp.raw_import))
             {
-                let name = imp
-                    .raw_import
-                    .trim_start()
-                    .trim_start_matches("mod ")
-                    .trim()
-                    .trim_end_matches(';')
-                    .trim();
                 if ROOTS.contains(&name) {
                     env.shadowed_roots.insert(name.to_string());
                 }
@@ -2654,7 +2648,7 @@ impl Resolver {
             }
             for imp in ext.imports.iter().filter(|imp| {
                 imp.alias.as_deref() != Some(".")
-                    && !imp.raw_import.trim_start().starts_with("mod ")
+                    && rust_mod_declaration_name(&imp.raw_import).is_none()
             }) {
                 for local in Self::rust_import_locals(imp) {
                     if ROOTS.contains(&local.as_str()) {
@@ -2676,7 +2670,7 @@ impl Resolver {
             };
             for imp in ext.imports.iter().filter(|imp| {
                 imp.alias.as_deref() != Some(".")
-                    && !imp.raw_import.trim_start().starts_with("mod ")
+                    && rust_mod_declaration_name(&imp.raw_import).is_none()
             }) {
                 let root = imp.module_specifier.split("::").next().unwrap_or("");
                 for (i, imported) in Self::rust_import_pairs(imp) {
@@ -2770,7 +2764,7 @@ impl Resolver {
             };
             for imp in ext.imports.iter().filter(|imp| {
                 imp.alias.as_deref() == Some(".")
-                    && !imp.raw_import.trim_start().starts_with("mod ")
+                    && rust_mod_declaration_name(&imp.raw_import).is_none()
             }) {
                 let at = imp.span.start_byte;
                 if !scope.is_known()
@@ -2833,7 +2827,7 @@ impl Resolver {
                 .collect();
             let private_glob = ext.imports.iter().any(|imp| {
                 imp.alias.as_deref() == Some(".")
-                    && !imp.raw_import.trim_start().starts_with("mod ")
+                    && rust_mod_declaration_name(&imp.raw_import).is_none()
                     && !re_exported.contains(imp.module_specifier.as_str())
             });
             if private_glob {
