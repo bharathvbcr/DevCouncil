@@ -965,6 +965,13 @@ fn summarize_status(raw: &str) -> String {
         "stale"
     } else if flag("is_fresh").unwrap_or(false) {
         "ready"
+    } else if flag("analyzer_freshness") == Some(false) {
+        // The only analyzer verdict that is false without `rebuild_required` is
+        // a resolver mismatch (an extraction-payload one asks for a rebuild).
+        // The tree has not necessarily moved, so "source moved" would be false.
+        // It stays out of `rebuild_required` because a re-resolve can outlast
+        // the SessionStart budget; the next build heals it.
+        "ready (older resolver; run `devmap build`)"
     } else {
         // Queryable, but the tree has moved since the generation was built.
         "ready (source moved)"

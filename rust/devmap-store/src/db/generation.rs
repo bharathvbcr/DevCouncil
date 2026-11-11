@@ -560,7 +560,11 @@ impl Store {
     /// be asked, which callers must treat as "do not skip".
     #[cfg(feature = "parse")]
     pub fn latest_generation_matches_working_tree(&self) -> Result<bool> {
-        if !self.latest_generation_payload_is_current()? {
+        // Extractor-only on purpose. The resolver stamp is not asked here, so
+        // seeding and stacking judge a donor (including a pre-stamp one) as they
+        // did before the stamp existed; a build or a drain that must not trust
+        // the stored edges asks `latest_generation_payload_is_current`.
+        if !self.latest_generation_extraction_is_current()? {
             return Ok(false);
         }
         let Some(root) = self.latest_repo_root()? else {
@@ -588,7 +592,53 @@ impl Store {
         Ok(crate::DiscoveryInventory::of(&scanned.report, &manifests) == stored)
     }
 
+    /// Whether the latest generation's stored edges may be trusted as they are:
+    /// the extractor that wrote its payloads AND the resolver that wrote its
+    /// edges are the ones running now.
+    ///
+    /// A store with no generation is current, as before. This is the check the
+    /// CLI no-change shortcut, `affected_closure` and the daemon drain share, so
+    /// a resolver-only change (a `RESOLUTION_REUSE_EPOCH` move) defeats all
+    /// three.
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
+        Ok(self.latest_generation_extraction_is_current()?
+            && self.latest_generation_resolver_mismatch()?.is_none())
+    }
+
+    /// The resolver epoch stamped into the latest generation, and how it
+    /// differs from this binary's.
+    ///
+    /// `None` is "no mismatch": no generation, or a stamp equal to
+    /// `RESOLUTION_REUSE_EPOCH`. `Some(stored)` is a mismatch, where `stored`
+    /// is the stamped epoch or `"unrecorded"` for a generation written before
+    /// the stamp existed. An absent stamp is not a matching one, and neither is
+    /// an `analysis_json` that is not a JSON document: a check that could not
+    /// read the stamp must not report what a check that passed reports.
+    pub fn latest_generation_resolver_mismatch(&self) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let stamp: Option<Option<String>> = conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(analysis_json)
+                        THEN CAST(json_extract(analysis_json, '$.resolver_epoch') AS TEXT)
+                        END
+                   FROM generations WHERE id = (SELECT max(id) FROM generations)",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH;
+        Ok(match stamp {
+            None => None,
+            Some(Some(stored)) if stored == current => None,
+            Some(Some(stored)) => Some(stored),
+            Some(None) => Some("unrecorded".to_string()),
+        })
+    }
+
+    /// Whether the extractor that wrote the latest generation's payloads is the
+    /// one running now. See [`Self::latest_generation_payload_is_current`] for
+    /// the check that also asks the resolver.
+    pub fn latest_generation_extraction_is_current(&self) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT language, grammar_version, analyzer_version
@@ -1112,8 +1162,19 @@ impl Store {
         if let Some(generation) = status.latest_generation {
             if status.pending_count == 0 && status.degraded_reason.is_none() {
                 let (analyzer_freshness, analyzer_reason) =
-                    match self.latest_generation_payload_is_current() {
-                        Ok(true) => (Some(true), None),
+                    match self.latest_generation_extraction_is_current() {
+                        Ok(true) => match self.latest_generation_resolver_mismatch() {
+                            Ok(None) => (Some(true), None),
+                            // Its own reason, which `rebuild_required_reason`
+                            // does not match: a re-resolve can outlast the
+                            // SessionStart budget, so it lands on the next
+                            // build instead of an automatic one.
+                            Ok(Some(stored)) => (Some(false), Some(format!(
+                                "stored edges were resolved under resolver epoch {stored}; \
+                                 this binary resolves under {}; run `devmap build`",
+                                devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH))),
+                            Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
+                        },
                         Ok(false) => (Some(false), Some(
                             "stored extraction payload is obsolete; rebuild with the current analyzer".to_string())),
                         Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
