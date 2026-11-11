@@ -345,6 +345,7 @@ devmap session-report [--last]
 devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html); see code-graph.md
 devmap html                 # Symbol graph HTML
 devmap mcp                  # DevMap MCP stdio (21 read-only tools: status, search, ask, ask_evidence, deps, impact, trace, neighbors, dead, skeleton, clones, preview, explore, literals, doc_drift, affected, suspects, blast, routes, api_impact, cypher)
+devmap mcp --http <ADDR>   # MCP 2026-07-28 over HTTP (bare port = 127.0.0.1); also serves GET /map_preview.html and GET /code_graph.html, read-only; see HOST_INTEGRATION.md
 devmap export               # GraphML
 ```
 

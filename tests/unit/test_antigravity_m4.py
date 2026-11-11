@@ -258,22 +258,44 @@ def test_on_session_end_hook():
 # ---------------------------------------------------------------------------
 # F29: Interactive Sidecars Verification
 # ---------------------------------------------------------------------------
+def _assert_devmap_sidecar_wiring(manifest: dict) -> None:
+    """The manifest launches a real `devmap` invocation and names a served path."""
+    cli_src = (REPO_ROOT / "rust" / "devmap-cli" / "src" / "commands" / "mcp.rs").read_text()
+    cmd_src = (REPO_ROOT / "rust" / "devmap-cli" / "src" / "cli.rs").read_text()
+    http_src = (REPO_ROOT / "rust" / "devmap-serve" / "src" / "mcp_http.rs").read_text()
+
+    assert manifest["command"] == "devmap"
+    args = manifest["args"]
+    # `devmap serve` is the IPC daemon and has no HTTP transport or UI flag; the
+    # HTTP transport is `devmap mcp --http <ADDR>`.
+    assert args[0] == "mcp" and re.search(r"\n\s*Mcp\(", cmd_src), "mcp is a real subcommand"
+    assert "--http" in args and re.search(r"pub\(crate\) http: Option<String>", cli_src)
+    address = args[args.index("--http") + 1]
+    host, _, port = address.rpartition(":")
+    assert host == "127.0.0.1" and port.isdigit(), "loopback bind, explicit port"
+    assert not {"--ui-sidecar", "--port"} & set(args), "flags that exist nowhere"
+    assert set(args) <= {"mcp", "--http", address}
+
+    routes = dict(re.findall(r'pub const (MAP_PREVIEW_PATH|CODE_GRAPH_PATH): &str = "([^"]+)";', http_src))
+    assert set(routes) == {"MAP_PREVIEW_PATH", "CODE_GRAPH_PATH"}
+    for view in manifest["ui_config"]["views"]:
+        assert view["path"] in routes.values(), f"{view['path']} is not a route the server serves"
+
+
 def test_sidecar_manifests_and_html_files():
     sidecars_dir = REPO_ROOT / "antigravity" / "sidecars"
 
     # DevMap sidecar
     devmap_manifest = sidecars_dir / "devmap" / "sidecar.json"
-    devmap_html = sidecars_dir / "devmap" / "map_preview.html"
     assert devmap_manifest.exists()
-    assert devmap_html.exists()
     with open(devmap_manifest) as f:
         dm_json = json.load(f)
     assert dm_json["display_name"] == "DevMap Code Graph Explorer"
-    with open(devmap_html) as f:
-        html_content = f.read()
-    assert "DevMap Code Graph Explorer" in html_content
-    assert "Blast Radius" in html_content
-    assert "Resolution Ladder" in html_content
+    # The old assertions pinned strings ("Blast Radius", "Resolution Ladder") of
+    # a hardcoded mock page. The page is now the real one, served by
+    # `devmap mcp --http`, so pin the wiring instead.
+    assert not (sidecars_dir / "devmap" / "map_preview.html").exists(), "the mock page is gone"
+    _assert_devmap_sidecar_wiring(dm_json)
 
     # GitPulse sidecar
     gitpulse_manifest = sidecars_dir / "gitpulse" / "sidecar.json"

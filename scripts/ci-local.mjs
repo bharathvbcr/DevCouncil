@@ -196,7 +196,10 @@ function releaseTagAgrees(dcrelease) {
 }
 
 function main() {
-  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs"]);
+  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs", "scripts/code-map-bundle.test.mjs"]);
+  // The page shell is TypeScript bundled by the pinned Bun; the checked-in bundle must be what it builds.
+  run("code map bundle", process.execPath, ["scripts/code-map-bundle.mjs", "check"]);
+  run("code map tests", "bun", ["test", "rust/devmap-query/assets/code-map"]);
   run("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], {
     cwd: GO_MODULE,
   });

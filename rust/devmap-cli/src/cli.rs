@@ -685,9 +685,9 @@ pub(crate) enum Commands {
 
     /// Render the graph as one self-contained HTML file.
     ///
-    /// No network and no build step: the renderer is embedded, so the page
-    /// opens from a `file://` URL on a machine that has never seen a package
-    /// manager. Capped by node count and honest about it — see `--max-nodes`.
+    /// No network: the page script and styles are embedded, so the page opens
+    /// from a `file://` URL on a machine that has never seen a package
+    /// manager. It draws with the same renderer as GitPulse's Map section. Capped by node count and honest about it — see `--max-nodes`.
     Html(commands::html::Args),
 
     /// Host-neutral hook entry point for Claude Code, Cursor, and Codex.

@@ -20,8 +20,9 @@ pub(crate) struct Args {
     pub(crate) level: HtmlLevel,
     /// Most nodes to draw, ranked by degree so the hubs survive.
     ///
-    /// A force layout stops converging in a browser tab well before a real
-    /// repository's node count, so this is a cap rather than a preference.
+    /// A canvas stops being readable, and a browser tab stops being responsive,
+    /// well before a real repository's node count, so this is a cap rather than
+    /// a preference.
     /// Whatever it cuts is stated in the payload *and* in the page header:
     /// "1,000 of 12,103 nodes", never "1,000 nodes".
     #[arg(long, default_value_t = 1_500)]

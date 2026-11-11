@@ -98,11 +98,17 @@ fn one_filesystem_provider_reads_projects_and_renders_both_artifacts() {
         provider.repo_map_payload().unwrap()["nodes"][0]["id"],
         "src"
     );
-    assert!(provider
-        .code_graph_html(&VizOptions::default())
-        .unwrap()
-        .contains("2 nodes"));
-    assert!(provider.repo_map_html().unwrap().contains("const DATA"));
+    // Retargeted: these pinned the old page's server-rendered "2 nodes" header
+    // and its inline `const DATA` script. The shared page carries its payload in
+    // one JSON element and words the counts itself, so pin the payload element
+    // (the counts it carries, the page's own renderer stamp).
+    let graph_html = provider.code_graph_html(&VizOptions::default()).unwrap();
+    assert!(graph_html.contains("id=\"devmap-payload\""));
+    assert!(graph_html.contains("\"nodes_total\":2"));
+    assert!(graph_html.contains("devmap-code-map"));
+    let map_html = provider.repo_map_html().unwrap();
+    assert!(map_html.contains("id=\"devmap-payload\""));
+    assert!(map_html.contains("\"subsystems\""));
 
     std::fs::remove_dir_all(root).ok();
 }

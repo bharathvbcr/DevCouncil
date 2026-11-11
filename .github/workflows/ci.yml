@@ -39,6 +39,21 @@ jobs:
         with:
           node-version: "20"
 
+      # The page shell for `devmap html` / `devmap map-html` is TypeScript built
+      # by Bun into one checked-in bundle. Bun is pinned by `.bun-version` (a
+      # different Bun can emit different bytes), and `check:code-map` fails when
+      # the committed bundle is not what that Bun builds from the sources.
+      # Bun does not type-check; GitPulse's tsc over its vendored copy does.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Code map bundle
+        run: |
+          npm run check:code-map
+          npm run test:code-map
+
       - name: Install actionlint
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12

@@ -24,6 +24,15 @@
 //! protocol calls. This module owns the HTTP envelope and nothing else. Three
 //! transports, one answer.
 //!
+//! # Read-only pages
+//!
+//! Two exact paths answer `GET`: [`MAP_PREVIEW_PATH`] and [`CODE_GRAPH_PATH`].
+//! They return the already-built repo map / code graph rendered by
+//! `devmap_query::host`, for the one repository the slot resolves for MCP calls
+//! (no query string, no repository selector, no other path). Every other
+//! request, `GET /` included, is still the `405` below. See
+//! [`origin_is_acceptable`] for why a GET needs more than the POST path did.
+//!
 //! # Binding
 //!
 //! Loopback by default, and the bind address is the caller's to choose. A code
@@ -194,6 +203,85 @@ Connection: close\r\n\r\n",
     response
 }
 
+/// The read-only repo map page.
+pub const MAP_PREVIEW_PATH: &str = "/map_preview.html";
+/// The read-only code graph page.
+pub const CODE_GRAPH_PATH: &str = "/code_graph.html";
+
+/// Policy on the HTML pages. The page needs its own inline script and style and
+/// nothing else: no network (`connect-src 'none'`), no framing, no forms, no
+/// `<base>`. A hostile name that somehow became markup still could not call out.
+const PAGE_CSP: &str =
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+
+fn page_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_SECURITY_POLICY, PAGE_CSP)
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+/// Render one of the read-only pages for the repository the slot resolves.
+///
+/// The repository comes from [`StoreSlot::repository`], the same resolution an
+/// MCP call without `repo_path` uses, so this cannot reach a repository the
+/// slot would not answer for. A missing index or artifact is a plain-text error
+/// with a status, never an empty page.
+async fn serve_page(store: Arc<StoreSlot>, path: &'static str) -> Response<Full<Bytes>> {
+    use devmap_query::host::{ArtifactError, ArtifactProvider, FilesystemArtifactProvider};
+    const TEXT: &str = "text/plain; charset=utf-8";
+    let rendered = tokio::time::timeout(
+        EXCHANGE_TIMEOUT,
+        tokio::task::spawn_blocking(move || -> Result<String, (StatusCode, String)> {
+            let repo = store
+                .repository()
+                .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+            let provider = FilesystemArtifactProvider::for_repo(repo.root);
+            let html = if path == MAP_PREVIEW_PATH {
+                provider.repo_map_html()
+            } else {
+                provider.code_graph_html(&devmap_query::viz::VizOptions::default())
+            };
+            html.map_err(|error| match error {
+                ArtifactError::Missing { .. } => (
+                    StatusCode::NOT_FOUND,
+                    format!("{error}. Build it with `devmap build --manifest`."),
+                ),
+                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })
+        }),
+    )
+    .await;
+    match rendered {
+        Ok(Ok(Ok(html))) => page_response(StatusCode::OK, "text/html; charset=utf-8", html),
+        Ok(Ok(Err((status, message)))) => page_response(status, TEXT, message),
+        Ok(Err(_)) => page_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            TEXT,
+            "the page renderer stopped unexpectedly".to_string(),
+        ),
+        Err(_) => page_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            TEXT,
+            format!(
+                "rendering exceeded {}s and was abandoned",
+                EXCHANGE_TIMEOUT.as_secs()
+            ),
+        ),
+    }
+}
+
 fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| {
         // Serializing a Value we just built cannot fail in practice; if it
@@ -285,6 +373,29 @@ fn rpc_error_body(id: Value, code: i64, message: impl Into<String>) -> Value {
 /// Adding an `OPTIONS` handler, any `Access-Control-Allow-*` header, or a
 /// relaxation of the content type would therefore reopen the hole this closes,
 /// which is exactly what that test fails on.
+///
+/// # The two read-only GET pages
+///
+/// A `GET` is a CORS-*simple* request, so property 1 does **not** hold for
+/// [`MAP_PREVIEW_PATH`] and [`CODE_GRAPH_PATH`]: a hostile page can send one
+/// without a preflight. What keeps it from reading the answer is the rest:
+///
+/// * **No CORS headers, ever** (property 2): a cross-origin `fetch` gets an
+///   opaque response.
+/// * **`Host` check** (property 3): a rebound `evil.example` resolving to the
+///   loopback listener is refused before routing, which is the only way a page
+///   could become same-origin with this server.
+/// * **`Origin` check**: this function runs before routing, so any request
+///   carrying a site `Origin` is refused, whichever path and verb. That includes
+///   the served page's own origin, so the page can never `POST` to MCP.
+/// * **Response hardening**, new with these pages: a `Content-Security-Policy`
+///   with `default-src 'none'` and `connect-src 'none'` (the page, and anything
+///   injected into it, can fetch nothing), `frame-ancestors 'none'` and
+///   `X-Frame-Options: DENY` (no embedding), `nosniff`, `Cache-Control:
+///   no-store` and `Referrer-Policy: no-referrer`.
+///
+/// Nothing here widens the bind address, the repository set (the slot's own
+/// resolution) or the write surface (there is none).
 fn origin_is_acceptable(request: &Request<Incoming>) -> bool {
     match request.headers().get(header::ORIGIN) {
         None => true,
@@ -683,6 +794,19 @@ and has no browser client",
 can legitimately reach 127.0.0.1 under a public name, so this is a rebound request",
             ),
         ));
+    }
+
+    // Read-only pages: exact path match, no query honoured. After the origin and
+    // host checks above, so a cross-origin or rebound GET never reaches them.
+    if request.method() == Method::GET {
+        let page = match request.uri().path() {
+            MAP_PREVIEW_PATH => Some(MAP_PREVIEW_PATH),
+            CODE_GRAPH_PATH => Some(CODE_GRAPH_PATH),
+            _ => None,
+        };
+        if let Some(page) = page {
+            return Ok(serve_page(store, page).await);
+        }
     }
 
     if request.method() != Method::POST {
