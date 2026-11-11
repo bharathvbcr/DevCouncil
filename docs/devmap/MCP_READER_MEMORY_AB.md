@@ -148,6 +148,39 @@ the daemon. Callers of `latest_generation_payload_is_current` and
 Manvi's linked one) get the same memo: a repeat within a minute returns the held
 answer unless a write moved a key.
 
+## Re-timing at the tip (`51af7891`, after the hardening)
+
+Measured 2026-11-10/11, `mcp_ab_bench` with a fresh copy of the current GitPulse
+store (same size, 389,332,992 bytes; not the same snapshot as above), base
+`c2348467` against the tip, n = 21 (23 rounds, 2 discarded), one untimed warm-up
+per arm, `--evict-wait-secs 1` (the idle-window rows of these runs mean nothing
+and are not reported). The null pair is the tip binary as both arms. 1-minute
+load: null pair 24.82 at start, 12.97 at end; real pair 12.97 at start, 18.53 at
+end (all runs below 30 at both ends). Medians; paired difference is tip minus
+base, null is B minus A.
+
+| Quantity | base | tip | paired diff (tip lower in) | null diff (B lower in) |
+|---|---|---|---|---|
+| Warm `status` (ms) | 130.31 [101.76, 191.66] | 99.27 [77.76, 207.45] | **-27.92** (18/21) | -1.24 (14/21) |
+| Footprint after 40 queries (MiB) | 217.20 [191.50, 225.90] | 156.30 [118.20, 167.40] | **-61.50** (21/21) | -0.70 (11/21) |
+| Cold first query (ms) | 184.24 [153.91, 512.13] | 184.33 [162.15, 467.19] | +6.36 (8/21) | -1.92 (11/21) |
+| Warm `impact` (ms) | 43.12 [36.23, 51.26] | 44.07 [38.36, 82.39] | +1.65 (6/21) | -0.86 (15/21) |
+
+The null pair is near zero on every row, so the runs are valid. Warm `status`
+is still about 28 ms faster than base after the hardening, and the footprint
+saving is unchanged. Cold first query (+6 ms against arm spreads of 100 ms or
+more) and warm `impact` (+1.65 ms, tip higher in 15 of 21 rounds, null -0.86)
+did not clearly move; a small `impact` slowdown is not excluded.
+
+**Not measured.** The `status` call after more than 60 s of real idle (the
+re-scan after the held answers age out), for the pair and its null pair: the
+host load stayed above 30 for the 2-hour window after the first two runs (the
+idle-gap null pair ended at load 65.9 and was invalid; its retry started at 26.6
+and was stopped at load above 50), so no valid run exists. `--aged-wait-secs` in
+`mcp_ab_bench` is committed for that run. That the held-answer path was taken is
+inferred from the 28 ms drop against base, not proven by a counter; the
+unit tests (`generation_checks_memo`) prove the path in isolation.
+
 ## Reproduce
 
 ```text

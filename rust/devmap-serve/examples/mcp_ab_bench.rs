@@ -29,7 +29,11 @@
 //!   (longer than the idle TTL plus a sweep), each process, in the same
 //!   order, has its memory read again and is sent the first target again,
 //!   timed; then it is killed. A binary with no idle eviction is simply idle.
-//! * The first `--discard` rounds are run and not reported.
+//! * With `--aged-wait-secs S` (> 0), each process sleeps S real seconds after
+//!   its footprint is read, then one timed `devmap_status` is made: the call a
+//!   server that holds answers for a bounded time must answer by reading again.
+//! * One untimed warm-up process per arm runs before round 0; the first
+//!   `--discard` rounds are run and not reported.
 //!
 //! Warm latency of a process is the median of its calls after the first four.
 
@@ -45,6 +49,9 @@ struct Config {
     discard: usize,
     seed: u64,
     evict_wait: Duration,
+    /// Idle seconds after the last query and the footprint read, before one
+    /// timed `devmap_status` (0 = not measured). Real sleep, no test clock.
+    aged_wait: Duration,
     queries: usize,
     targets: Vec<String>,
     arms: Vec<(String, String)>,
@@ -59,6 +66,7 @@ struct Sample {
     cold_first_ms: f64,
     warm_impact_ms: f64,
     warm_status_ms: f64,
+    aged_status_ms: f64,
     rss_mib: f64,
     foot_mib: f64,
     last_call: Instant,
@@ -71,6 +79,7 @@ fn parse(args: &[String]) -> Config {
         discard: 2,
         seed: 1,
         evict_wait: Duration::from_secs(660),
+        aged_wait: Duration::ZERO,
         queries: 40,
         targets: Vec::new(),
         arms: Vec::new(),
@@ -85,6 +94,9 @@ fn parse(args: &[String]) -> Config {
             "--seed" => config.seed = value.parse().expect("seed"),
             "--evict-wait-secs" => {
                 config.evict_wait = Duration::from_secs(value.parse().expect("secs"))
+            }
+            "--aged-wait-secs" => {
+                config.aged_wait = Duration::from_secs(value.parse().expect("secs"))
             }
             "--queries" => config.queries = value.parse().expect("queries"),
             "--target" => config.targets.push(value),
@@ -141,6 +153,7 @@ impl Sample {
             cold_first_ms: 0.0,
             warm_impact_ms: 0.0,
             warm_status_ms: 0.0,
+            aged_status_ms: 0.0,
             rss_mib: 0.0,
             foot_mib: 0.0,
             last_call: Instant::now(),
@@ -237,6 +250,15 @@ fn median(values: &[f64]) -> f64 {
 
 fn run(config: &Config) {
     println!("load before: {}", load_average());
+    // One untimed warm-up per arm: a spawn, a file-cache read and one query,
+    // so the first measured process of either arm is not the first of its kind.
+    for (name, binary) in &config.arms {
+        warm_file_cache(&config.store);
+        let mut sample = Sample::spawn(name, binary, &config.store);
+        sample.call("devmap_impact", json!({"target": config.targets[0]}));
+        let _ = sample.child.kill();
+        let _ = sample.child.wait();
+    }
     let mut live: Vec<(usize, usize, Sample)> = Vec::new(); // (round, arm index, sample)
                                                             // Phase 1.
     for round in 0..config.rounds {
@@ -273,6 +295,12 @@ fn run(config: &Config) {
             sample.warm_status_ms = median(&statuses);
             std::thread::sleep(Duration::from_secs(1));
             sample.memory();
+            if !config.aged_wait.is_zero() {
+                // Long enough that any answer the server holds for a bounded
+                // time has aged out; the next status must re-read it.
+                std::thread::sleep(config.aged_wait);
+                sample.aged_status_ms = sample.call("devmap_status", json!({}));
+            }
             live.push((round, arm, sample));
         }
     }
@@ -293,6 +321,7 @@ fn run(config: &Config) {
         cold_first_ms: f64,
         warm_impact_ms: f64,
         warm_status_ms: f64,
+        aged_status_ms: f64,
         rss_n: f64,
         foot_n: f64,
         rss_evicted: f64,
@@ -312,6 +341,7 @@ fn run(config: &Config) {
             cold_first_ms: sample.cold_first_ms,
             warm_impact_ms: sample.warm_impact_ms,
             warm_status_ms: sample.warm_status_ms,
+            aged_status_ms: sample.aged_status_ms,
             rss_n,
             foot_n,
             rss_evicted,
@@ -327,7 +357,7 @@ fn run(config: &Config) {
         println!(
             "{}",
             json!({"round": row.round, "arm": row.name, "cold_first_ms": row.cold_first_ms,
-                   "warm_impact_ms": row.warm_impact_ms, "warm_status_ms": row.warm_status_ms,
+                   "warm_impact_ms": row.warm_impact_ms, "warm_status_ms": row.warm_status_ms, "aged_status_ms": row.aged_status_ms,
                    "rss_after_n_mib": row.rss_n, "footprint_after_n_mib": row.foot_n,
                    "rss_after_idle_mib": row.rss_evicted,
                    "footprint_after_idle_mib": row.foot_evicted,
@@ -336,7 +366,7 @@ fn run(config: &Config) {
     }
 
     type Pick = fn(&Row) -> f64;
-    let quantities: [(&str, Pick); 8] = [
+    let mut quantities: Vec<(&str, Pick)> = vec![
         ("rss after N queries (MiB)", |r| r.rss_n),
         ("footprint after N queries (MiB)", |r| r.foot_n),
         ("rss after idle eviction window (MiB)", |r| r.rss_evicted),
@@ -350,6 +380,9 @@ fn run(config: &Config) {
         ("warm impact, median per process (ms)", |r| r.warm_impact_ms),
         ("warm status, median per process (ms)", |r| r.warm_status_ms),
     ];
+    if !config.aged_wait.is_zero() {
+        quantities.push(("status after an idle gap (ms)", |r| r.aged_status_ms));
+    }
     println!(
         "\nrounds reported: {} (of {}, first {} discarded); N = {} calls; arms: {} vs {}; seed {}",
         config.rounds - config.discard,
