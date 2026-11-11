@@ -121,9 +121,14 @@ other revision (`rust/gusset-engine/check-pin.sh`).
   `cargo fmt --all -- --check` and clippy with `-D warnings` for both package
   sets in `.github/workflows/rust.yml` and `analysis-plane.yml`, fix what the new
   release flags, and commit the bump on its own so a red CI points at it.
-- **Go:** edit `toolchain` in `backend/go_orchestrator/go.mod` (CI's `setup-go`
-  reads it) and run `govulncheck ./...` with it. The `go` line is the floor
-  consumers need; raise it only for a language or library need.
+- **Go:** the `go` line in `backend/go_orchestrator/go.mod` names the latest
+  stable Go release (check `https://go.dev/dl/?mode=json`), and the module has no
+  `toolchain` line. Move the `go` line to each new stable release, then run
+  `govulncheck ./...` with it. Every place that pins Go moves with it: CI's
+  `setup-go` steps use `go-version-file: backend/go_orchestrator/go.mod`, so CI
+  follows `go.mod`, and `goModToolchain` in `scripts/ci-local-checks.mjs` falls
+  back to the `go` line when there is no `toolchain` line. A bump also needs a
+  golangci-lint built for the new release, and `gofmt` run under it.
 - **Gusset:** move the `ref` in `.github/actions/setup-gusset/action.yml` in the
   same change as the code that needs it, and rebuild `rust/gusset-engine` with
   `--locked`.
