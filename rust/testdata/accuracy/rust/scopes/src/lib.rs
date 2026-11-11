@@ -55,6 +55,7 @@ pub mod c47b;
 pub mod c48;
 pub mod c49;
 pub mod c53;
+pub mod c54;
 pub mod c49b;
 pub mod mm;
 pub mod mm2;

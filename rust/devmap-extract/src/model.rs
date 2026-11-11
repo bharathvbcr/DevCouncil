@@ -1717,8 +1717,16 @@ pub struct RustExternCrate {
 
 /// The macros a Rust file invokes in item or statement position and the ones it
 /// defines with `macro_rules!`, plus what can rebind a macro's name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `facts_version` says which reading of these fields wrote the payload. A
+/// payload that predates it (or a field added later) reads as version 0, and
+/// absence of `macro_use_mods`, `no_std`, `no_implicit_prelude` in it is "not
+/// recorded", not "none": a reader must treat the file as unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RustMacroFacts {
+    /// [`RUST_MACRO_FACTS_VERSION`] when the extractor wrote the payload.
+    #[serde(default)]
+    pub facts_version: u32,
     pub calls: Vec<RustMacroCall>,
     pub defined: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1736,9 +1744,24 @@ pub struct RustMacroFacts {
     /// The macros such a module publishes are known only when its file is
     /// indexed, which the resolver checks. An inline module is read in place, and
     /// one with a `#[path]` is recorded in `macro_use` instead.
+    ///
+    /// A module nested in inline modules is written as the chain joined by `/`
+    /// (`outer/m` for `mod outer { #[macro_use] mod m; }`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub macro_use_mods: Vec<String>,
+    /// The file carries `#![no_std]` (or `#![cfg_attr(.., no_std)]`, which may be
+    /// on): the std prelude's macros are not all in scope for the crate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_std: bool,
+    /// A `#![no_implicit_prelude]` or `#[no_implicit_prelude]` is written in the
+    /// file. Taken as holding for the whole crate: the cautious direction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_implicit_prelude: bool,
 }
+
+/// The reading of [`RustMacroFacts`] the extractor writes now. A resolver that
+/// meets a lower number must not trust the absence of anything in them.
+pub const RUST_MACRO_FACTS_VERSION: u32 = 1;
 
 /// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].
 ///

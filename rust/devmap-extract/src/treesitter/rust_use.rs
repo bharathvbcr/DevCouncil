@@ -261,6 +261,8 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
     let mut macros_defined = BTreeSet::new();
     let mut attr_macros: Vec<RustAttrMacro> = Vec::new();
     let mut macro_use = false;
+    let mut no_std = false;
+    let mut no_implicit_prelude = false;
     let mut extern_crates: Vec<RustExternCrate> = Vec::new();
     let mut macro_use_mods: BTreeSet<String> = BTreeSet::new();
     let mut pending_derives: Vec<(Vec<String>, usize)> = Vec::new();
@@ -499,6 +501,9 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
             restricted_visibility: restricted,
             cfg_spans,
             macros: Some(RustMacroFacts {
+                facts_version: RUST_MACRO_FACTS_VERSION,
+                no_std,
+                no_implicit_prelude,
                 calls: macro_calls,
                 defined: macros_defined.into_iter().collect(),
                 attrs: attr_macros,

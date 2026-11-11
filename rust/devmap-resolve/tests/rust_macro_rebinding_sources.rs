@@ -732,3 +732,282 @@ fn r6b_a_name_imported_explicitly_in_the_chain_is_not_rebound_by_a_glob() {
         );
     }
 }
+
+// ------------------------------------------------------------- round 8
+
+fn binds_da_from(result: &ResolutionResult, caller: &str) -> bool {
+    targets_from(result, caller)
+        .iter()
+        .any(|target| target == "app/src/da.rs::Dup.mk")
+}
+
+/// A dependency that exports each of `names` as a macro that emits a `use`.
+fn dep_exporting(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| {
+            format!(
+                "#[macro_export]\nmacro_rules! {name} {{ ($($t:tt)+) => {{ use $($t)+; }}; }}\n"
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn s1_an_explicit_import_under_cfg_is_not_an_import_when_the_cfg_is_off() {
+    // rustc 1.99.1: with the feature off, `use anyhow::bail;` is not there, so
+    // `bail!` is the glob's and emits `use crate::db::Dup;`. The import counts only
+    // when its cfg also encloses the call (then the call exists only if the import
+    // does).
+    let user = |head: &str, body: &str| {
+        format!("use crate::da::Dup;\n{head}\npub fn run() -> u8 {{\n    {body}\n    Dup::mk()\n}}\n")
+    };
+    let cases: [(&str, String, bool); 3] = [
+        (
+            "s1a",
+            user(
+                "use dep::*;\n#[cfg(feature = \"anyhow\")]\nuse anyhow::bail;",
+                "bail!(crate::db::Dup);",
+            ),
+            false,
+        ),
+        (
+            "s1b",
+            user(
+                "use dep::*;\nuse anyhow::bail;",
+                "bail!(crate::db::Dup);",
+            ),
+            true,
+        ),
+        (
+            "s1c",
+            // The import and the call sit in one cfg'd function: the call is
+            // there only when the import is.
+            "use crate::da::Dup;\nuse dep::*;\n#[cfg(feature = \"anyhow\")]\npub fn run() -> u8 {\n    use anyhow::bail;\n    bail!(crate::db::Dup);\n    Dup::mk()\n}\n"
+                .to_string(),
+            true,
+        ),
+    ];
+    for (tag, source, expect_edge) in cases {
+        let mut files = Case {
+            deps: "dep = { path = \"../dep\" }\nanyhow = \"1\"\n",
+            lib_header: "pub mod other;\n",
+            ..Case::default()
+        }
+        .files();
+        files.push(("app/src/other.rs".into(), source));
+        let result = resolve_workspace(tag, &files);
+        assert_eq!(
+            binds_da_from(&result, "app/src/other.rs::run"),
+            expect_edge,
+            "{tag}: {:?}",
+            targets_from(&result, "app/src/other.rs::run")
+        );
+    }
+}
+
+#[test]
+fn s2_without_the_implicit_prelude_a_glob_can_bring_a_std_named_macro() {
+    // rustc 1.99.1, `use dep::*;` with `dep` exporting the name:
+    //   #![no_std]: print/println/eprint/eprintln/dbg/thread_local/vec/format
+    //     compile and the glob's macro is the one called; assert/assert_eq/
+    //     assert_ne/debug_assert*/panic/matches/write/writeln/todo/unreachable/
+    //     unimplemented/format_args are E0659 ("`assert` is ambiguous").
+    //     `#[macro_use] extern crate alloc;` brings vec/format back (E0659),
+    //     `#[macro_use] extern crate std;` all of them.
+    //   #![no_implicit_prelude]: only assert/panic/unreachable/format_args are
+    //     E0659; every other std macro name compiles with the glob's winning.
+    // (record: rust/testdata/accuracy/rust/compile_fail/check.sh)
+    let edge = |tag: &str, header: &str, name: &str| {
+        let result = Case {
+            dep_lib: Box::leak(dep_exporting(&[name]).into_boxed_str()),
+            lib_header: Box::leak(header.to_string().into_boxed_str()),
+            user_head: "use dep::*;",
+            run_body: Box::leak(format!("{name}!(crate::db::Dup);").into_boxed_str()),
+            ..Case::default()
+        }
+        .resolve(tag);
+        binds_da(&result)
+    };
+    let no_std = "#![no_std]\n";
+    for name in [
+        "print", "println", "eprint", "eprintln", "dbg", "thread_local", "vec", "format",
+    ] {
+        assert!(
+            !edge(&format!("s2a-{name}"), no_std, name),
+            "no_std: a glob can bring `{name}!`"
+        );
+    }
+    for name in [
+        "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+        "panic", "matches", "write", "writeln", "todo", "unreachable", "unimplemented",
+        "format_args",
+    ] {
+        assert!(
+            edge(&format!("s2b-{name}"), no_std, name),
+            "no_std: `{name}!` is a core prelude macro"
+        );
+    }
+    let alloc = "#![no_std]\n#[macro_use]\nextern crate alloc;\n";
+    assert!(edge("s2c-vec", alloc, "vec"), "macro_use alloc brings vec");
+    assert!(
+        !edge("s2c-println", alloc, "println"),
+        "macro_use alloc does not bring println"
+    );
+    let std_extern = "#![no_std]\n#[macro_use]\nextern crate std;\n";
+    assert!(edge("s2d-println", std_extern, "println"));
+    let no_prelude = "#![no_implicit_prelude]\n";
+    for name in ["println", "vec", "matches", "write", "todo", "dbg"] {
+        assert!(
+            !edge(&format!("s2e-{name}"), no_prelude, name),
+            "no_implicit_prelude: a glob can bring `{name}!`"
+        );
+    }
+    for name in ["assert", "panic", "unreachable", "format_args"] {
+        assert!(
+            edge(&format!("s2f-{name}"), no_prelude, name),
+            "no_implicit_prelude: `{name}!` is a builtin"
+        );
+    }
+    // Control: with the implicit prelude, nothing changes.
+    assert!(edge("s2g", "", "println"));
+    // A conditional `no_std` may be on, so it counts as on.
+    assert!(!edge(
+        "s2h",
+        "#![cfg_attr(not(feature = \"std\"), no_std)]\n",
+        "println"
+    ));
+}
+
+#[test]
+fn s2_a_pathed_root_in_a_no_implicit_prelude_crate_needs_an_extern_crate_item() {
+    // Without the extern prelude, `log` is whatever the module binds; only an
+    // `extern crate` item makes it the crate.
+    let pathed = |tag: &str, header: &'static str| {
+        let result = Case {
+            deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
+            lib_header: header,
+            run_body: "log::info!(\"x\");",
+            ..Case::default()
+        }
+        .resolve(tag);
+        binds_da(&result)
+    };
+    assert!(!pathed("s2i", "#![no_implicit_prelude]\n"));
+    assert!(pathed("s2j", "#![no_implicit_prelude]\nextern crate log;\n"));
+    assert!(pathed("s2k", ""));
+}
+
+#[test]
+fn s3_a_glob_cannot_rebind_the_root_of_a_pathed_call() {
+    // rustc 1.99.1: a glob that brings a module `log` while `log` is a dependency
+    // is "error[E0659]: `log` is ambiguous ... a name from a glob import and an
+    // outer scope" (crate vs glob), in a block glob as well, so a crate that
+    // builds has no such glob and the pathed call stays the crate's.
+    let result = Case {
+        deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
+        user_head: "use serde::*;",
+        run_body: "log::info!(\"x\");",
+        ..Case::default()
+    }
+    .resolve("s3");
+    assert!(binds_da(&result));
+}
+
+#[test]
+fn s4_a_payload_that_predates_the_current_facts_reads_as_unknown() {
+    // A payload written before `facts_version` existed has no such key; it reads
+    // as version 0, and absence of `macro_use_mods`, `no_std` and
+    // `no_implicit_prelude` in it is not "none".
+    let files = Case {
+        run_body: "println!(\"x\");",
+        ..Case::default()
+    }
+    .files();
+    let extractions = |stale: bool| -> Vec<Extraction> {
+        files
+            .iter()
+            .filter(|(path, _)| path.ends_with(".rs"))
+            .map(|(path, source)| {
+                let mut ext = extract_file(path, source);
+                if stale {
+                    if let Some(macros) = ext
+                        .rust_scope_facts
+                        .as_mut()
+                        .and_then(|facts| facts.macros.as_mut())
+                    {
+                        macros.facts_version = 0;
+                    }
+                }
+                ext
+            })
+            .collect()
+    };
+    for (stale, expect_edge) in [(false, true), (true, false)] {
+        let extractions = extractions(stale);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let result = resolver.resolve_all(&extractions).unwrap();
+        assert_eq!(
+            binds_da(&result),
+            expect_edge,
+            "stale={stale}: {:?}",
+            targets_from(&result, "app/src/user.rs::run")
+        );
+    }
+}
+
+#[test]
+fn s6_small_gaps() {
+    // (a) `use {std::fmt::Debug, dep::Clone};` imports dep's `Clone`.
+    let result = Case {
+        user_head: "use {std::fmt::Debug, dep::Clone};",
+        run_body: "#[derive(Clone)] struct _S;",
+        ..Case::default()
+    }
+    .resolve("s6a");
+    assert!(!binds_da(&result), "a braced import of std and dep");
+    let result = Case {
+        user_head: "use std::{fmt::Debug, clone::Clone};",
+        run_body: "#[derive(Clone)] struct _S;",
+        ..Case::default()
+    }
+    .resolve("s6a2");
+    assert!(binds_da(&result), "a braced import that is all std");
+    // (b) `#[macro_use] mod m;` inside an inline module reads `outer/m.rs`.
+    for (tag, extra, expect_edge) in [
+        (
+            "s6b1",
+            vec![("app/src/m.rs", "macro_rules! helper { () => { 1u8 }; }\n")],
+            false,
+        ),
+        (
+            "s6b2",
+            vec![("app/src/outer/m.rs", "macro_rules! helper { () => { 1u8 }; }\n")],
+            true,
+        ),
+    ] {
+        let result = Case {
+            lib_header: "mod outer {\n    #[macro_use]\n    mod m;\n}\n",
+            run_body: "println!(\"x\");",
+            extra,
+            ..Case::default()
+        }
+        .resolve(tag);
+        assert_eq!(
+            binds_da(&result),
+            expect_edge,
+            "{tag}: {:?}",
+            targets_from(&result, "app/src/user.rs::run")
+        );
+    }
+    // (c) an out-of-line `mod log;` whose file is not indexed can stand for `log`.
+    let result = Case {
+        deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
+        lib_header: "mod log;\n",
+        run_body: "log::info!(\"x\");",
+        ..Case::default()
+    }
+    .resolve("s6c");
+    assert!(!binds_da(&result), "an unindexed `mod log;`");
+}

@@ -1,0 +1,10 @@
+[package]
+name = "nopre_f"
+version = "0.1.0"
+edition = "2021"
+
+# Round-8 fixture: `#![no_implicit_prelude]` removes the macro prelude too, except
+# the builtin macros (`assert!`, `panic!`, `unreachable!`, `format_args!`).
+
+[dependencies]
+kio = { path = "../kio" }
