@@ -763,7 +763,8 @@ impl RustFileScope {
         self.known
     }
 
-    /// Whether the start byte of a function or impl sits under `#[cfg]`.
+    /// Whether the start byte of an item (a function, impl, module or `use`) sits
+    /// under `#[cfg]`.
     pub(super) fn is_under_cfg(&self, start: usize) -> bool {
         self.cfg_spans
             .iter()

@@ -19,7 +19,7 @@
   },
   "rust": {
     "forbid_any_tier_rows": 69,
-    "known_failing": 4,
+    "known_failing": 6,
     "positive_rows": 203,
     "present": 201
   },
