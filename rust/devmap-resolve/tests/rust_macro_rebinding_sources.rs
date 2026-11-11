@@ -760,7 +760,9 @@ fn s1_an_explicit_import_under_cfg_is_not_an_import_when_the_cfg_is_off() {
     // when its cfg also encloses the call (then the call exists only if the import
     // does).
     let user = |head: &str, body: &str| {
-        format!("use crate::da::Dup;\n{head}\npub fn run() -> u8 {{\n    {body}\n    Dup::mk()\n}}\n")
+        format!(
+            "use crate::da::Dup;\n{head}\npub fn run() -> u8 {{\n    {body}\n    Dup::mk()\n}}\n"
+        )
     };
     let cases: [(&str, String, bool); 3] = [
         (
@@ -817,7 +819,7 @@ fn s2_without_the_implicit_prelude_a_glob_can_bring_a_std_named_macro() {
     //     `#[macro_use] extern crate std;` all of them.
     //   #![no_implicit_prelude]: only assert/panic/unreachable/format_args are
     //     E0659; every other std macro name compiles with the glob's winning.
-    // (record: rust/testdata/accuracy/rust/compile_fail/check.sh)
+    // (record: rust/testdata/rust-compile-fail/check.sh)
     let edge = |tag: &str, header: &str, name: &str| {
         let result = Case {
             dep_lib: Box::leak(dep_exporting(&[name]).into_boxed_str()),
@@ -831,7 +833,14 @@ fn s2_without_the_implicit_prelude_a_glob_can_bring_a_std_named_macro() {
     };
     let no_std = "#![no_std]\n";
     for name in [
-        "print", "println", "eprint", "eprintln", "dbg", "thread_local", "vec", "format",
+        "print",
+        "println",
+        "eprint",
+        "eprintln",
+        "dbg",
+        "thread_local",
+        "vec",
+        "format",
     ] {
         assert!(
             !edge(&format!("s2a-{name}"), no_std, name),
@@ -839,8 +848,19 @@ fn s2_without_the_implicit_prelude_a_glob_can_bring_a_std_named_macro() {
         );
     }
     for name in [
-        "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
-        "panic", "matches", "write", "writeln", "todo", "unreachable", "unimplemented",
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "panic",
+        "matches",
+        "write",
+        "writeln",
+        "todo",
+        "unreachable",
+        "unimplemented",
         "format_args",
     ] {
         assert!(
@@ -894,7 +914,10 @@ fn s2_a_pathed_root_in_a_no_implicit_prelude_crate_needs_an_extern_crate_item() 
         binds_da(&result)
     };
     assert!(!pathed("s2i", "#![no_implicit_prelude]\n"));
-    assert!(pathed("s2j", "#![no_implicit_prelude]\nextern crate log;\n"));
+    assert!(pathed(
+        "s2j",
+        "#![no_implicit_prelude]\nextern crate log;\n"
+    ));
     assert!(pathed("s2k", ""));
 }
 
@@ -958,8 +981,8 @@ fn s4_a_payload_that_predates_the_current_facts_reads_as_unknown() {
 }
 
 #[test]
-fn s6_small_gaps() {
-    // (a) `use {std::fmt::Debug, dep::Clone};` imports dep's `Clone`.
+fn s6a_a_braced_use_of_std_and_dep_names_dep_clone() {
+    // `use {std::fmt::Debug, dep::Clone};` imports dep's `Clone`.
     let result = Case {
         user_head: "use {std::fmt::Debug, dep::Clone};",
         run_body: "#[derive(Clone)] struct _S;",
@@ -974,7 +997,11 @@ fn s6_small_gaps() {
     }
     .resolve("s6a2");
     assert!(binds_da(&result), "a braced import that is all std");
-    // (b) `#[macro_use] mod m;` inside an inline module reads `outer/m.rs`.
+}
+
+#[test]
+fn s6b_a_macro_use_mod_looks_for_its_file_where_the_module_system_does() {
+    // `#[macro_use] mod m;` inside an inline module reads `outer/m.rs`.
     for (tag, extra, expect_edge) in [
         (
             "s6b1",
@@ -983,7 +1010,10 @@ fn s6_small_gaps() {
         ),
         (
             "s6b2",
-            vec![("app/src/outer/m.rs", "macro_rules! helper { () => { 1u8 }; }\n")],
+            vec![(
+                "app/src/outer/m.rs",
+                "macro_rules! helper { () => { 1u8 }; }\n",
+            )],
             true,
         ),
     ] {
@@ -1001,7 +1031,54 @@ fn s6_small_gaps() {
             targets_from(&result, "app/src/user.rs::run")
         );
     }
-    // (c) an out-of-line `mod log;` whose file is not indexed can stand for `log`.
+}
+
+#[test]
+fn s6b_a_file_a_path_attribute_loads_keeps_its_children_in_its_own_directory() {
+    // rustc 1.99.1: `#[path = "x/y.rs"] mod y;` with `mod z;` in y.rs reads
+    // `x/z.rs`, and is E0583 for `x/y/z.rs`.
+    for (tag, extra, expect_edge) in [
+        (
+            "s6d1",
+            vec![
+                ("app/src/gen/y.rs", "#[macro_use]\nmod m;\n"),
+                (
+                    "app/src/gen/y/m.rs",
+                    "macro_rules! helper { () => { 1u8 }; }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "s6d2",
+            vec![
+                ("app/src/gen/y.rs", "#[macro_use]\nmod m;\n"),
+                (
+                    "app/src/gen/m.rs",
+                    "macro_rules! helper { () => { 1u8 }; }\n",
+                ),
+            ],
+            true,
+        ),
+    ] {
+        let result = Case {
+            lib_header: "#[path = \"gen/y.rs\"]\nmod y;\n",
+            run_body: "println!(\"x\");",
+            extra,
+            ..Case::default()
+        }
+        .resolve(tag);
+        assert_eq!(
+            binds_da(&result),
+            expect_edge,
+            "{tag}: {:?}",
+            targets_from(&result, "app/src/user.rs::run")
+        );
+    }
+}
+
+#[test]
+fn s6c_an_unindexed_out_of_line_mod_named_like_a_root_can_stand_for_it() {
     let result = Case {
         deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
         lib_header: "mod log;\n",

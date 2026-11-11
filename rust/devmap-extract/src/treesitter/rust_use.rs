@@ -336,6 +336,11 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                 let text = get_node_text(node, source);
                 let inner = rust_attribute_body(&text);
                 let leaves = rust_attribute_leaves(inner);
+                // The prelude facts: `#![no_std]` (possibly through a `cfg_attr`)
+                // and `#![no_implicit_prelude]` change which macros every module
+                // of the crate sees before any import.
+                no_std |= leaves.iter().any(|leaf| leaf.name == "no_std");
+                no_implicit_prelude |= leaves.iter().any(|leaf| leaf.name == "no_implicit_prelude");
                 let mut next = node.next_sibling();
                 while let Some(n) = next {
                     if matches!(
@@ -365,9 +370,13 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                                 let path_attr = rust_item_attribute_leaves(item, source)
                                     .iter()
                                     .any(|leaf| leaf.name == "path");
-                                match get_child_text(item, "name", source) {
-                                    Some(name) if !path_attr => {
-                                        macro_use_mods.insert(name);
+                                match (
+                                    get_child_text(item, "name", source),
+                                    rust_inline_module_chain(item, source),
+                                ) {
+                                    (Some(name), Some(mut chain)) if !path_attr => {
+                                        chain.push(name);
+                                        macro_use_mods.insert(chain.join("/"));
                                     }
                                     _ => macro_use = true,
                                 }
@@ -376,16 +385,21 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                         _ => macro_use = true,
                     }
                 }
+                // An inner attribute (`#![..]`) belongs to the module or crate that
+                // holds it, and stable Rust has no inner attribute macro, so it is
+                // never a macro on the item that follows it.
                 let eligible = || {
                     let in_block = node.parent().is_some_and(|p| p.kind() == "block");
-                    next.filter(|n| rust_node_declares_names(n.kind()))
-                        .is_some_and(|item| {
-                            in_block
-                                || matches!(
-                                    item.kind(),
-                                    "use_declaration" | "mod_item" | "extern_crate_declaration"
-                                )
-                        })
+                    node.kind() == "attribute_item"
+                        && next
+                            .filter(|n| rust_node_declares_names(n.kind()))
+                            .is_some_and(|item| {
+                                in_block
+                                    || matches!(
+                                        item.kind(),
+                                        "use_declaration" | "mod_item" | "extern_crate_declaration"
+                                    )
+                            })
                 };
                 if let Some(leaf) = leaves
                     .iter()
@@ -470,8 +484,10 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                 }
             }
         }
-        if matches!(node.kind(), "function_item" | "impl_item" | "mod_item")
-            && rust_item_has_cfg_attribute(node, source)
+        if matches!(
+            node.kind(),
+            "function_item" | "impl_item" | "mod_item" | "use_declaration"
+        ) && rust_item_has_cfg_attribute(node, source)
         {
             cfg_spans.push((node.start_byte(), node.end_byte()));
         }
@@ -604,25 +620,58 @@ fn rust_bare_derive_names(whole: &str) -> Vec<String> {
         .collect()
 }
 
+/// The inline modules (`mod outer { .. }`) that hold `item`, outermost first;
+/// `None` when it sits in a block, whose module path the file layout does not
+/// follow.
+fn rust_inline_module_chain(item: Node, source: &str) -> Option<Vec<String>> {
+    let mut chain = Vec::new();
+    let mut current = item.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "block" => return None,
+            "declaration_list" => {
+                if let Some(module) = parent.parent().filter(|m| m.kind() == "mod_item") {
+                    chain.push(get_child_text(module, "name", source)?);
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    chain.reverse();
+    Some(chain)
+}
+
 /// The std derive names a `use` declaration may bind to something that is not
-/// std's: any listed name that appears in a `use` whose path does not start at
-/// `std`, `core` or `alloc`.
+/// std's: any listed name that appears in a `use` path that does not start at
+/// `std`, `core` or `alloc`. A braced list is taken apart, so
+/// `use {std::fmt::Debug, dep::Clone};` names dep's `Clone` and not std's `Debug`.
 fn rust_foreign_derive_imports(use_text: &str) -> Vec<String> {
     let body = use_text
         .split_once("use")
         .map_or(use_text, |(_, rest)| rest)
-        .trim_start();
-    let root = body
-        .trim_start_matches("::")
-        .trim_start_matches('{')
-        .trim_start()
+        .trim()
+        .trim_end_matches(';');
+    rust_foreign_derive_tree(body)
+}
+
+fn rust_foreign_derive_tree(tree: &str) -> Vec<String> {
+    let tree = tree.trim().trim_start_matches("::").trim_start();
+    if let Some(inner) = tree.strip_prefix('{') {
+        let inner = inner.trim_end().strip_suffix('}').unwrap_or(inner);
+        return rust_split_top_level_commas(inner)
+            .into_iter()
+            .flat_map(rust_foreign_derive_tree)
+            .collect();
+    }
+    let root = tree
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .next()
         .unwrap_or("");
     if matches!(root, "std" | "core" | "alloc") {
         return Vec::new();
     }
-    body.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+    tree.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|token| STD_DERIVES.contains(token))
         .map(str::to_string)
         .collect()

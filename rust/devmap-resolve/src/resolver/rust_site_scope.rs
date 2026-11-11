@@ -35,7 +35,25 @@
 //!   [`Resolver::rust_glob_brings`]): a glob of std/core/alloc cannot, a glob of
 //!   an indexed crate can when that crate defines or exports the name, and a glob
 //!   the index cannot follow (a crate that is not indexed, an unresolved path)
-//!   can.
+//!   can. Three cases never ask, each settled with rustc 1.99.1 (the record is
+//!   `rust/testdata/rust-compile-fail/check.sh`):
+//!   - a name of the std prelude's macros, where the implicit prelude has it
+//!     ([`CrateMacros::prelude_binds`]): a glob that brings a macro of the same
+//!     name is `E0659` ("`println` is ambiguous ... a glob import and an outer
+//!     scope"), so a crate that builds has none. `#![no_std]` leaves only the core
+//!     macros in the prelude (a glob's `println!` compiles and wins), and
+//!     `#![no_implicit_prelude]` only the builtins `assert`, `panic`,
+//!     `unreachable` and `format_args`; `#[macro_use] extern crate alloc/std`
+//!     brings `vec`/`format` (all) back;
+//!   - a name the chain imports explicitly, unless a `cfg` that does not also
+//!     enclose the call sits on the import: an explicit import shadows a glob in
+//!     its scope (the glob is reported unused) and is `E0659` against one in an
+//!     inner scope;
+//!   - a pathed call (`log::info!`): it never looks the bare name up, and a glob
+//!     that brings a module or crate named like its root is `E0659` against the
+//!     extern prelude, in a block glob too. Where there is no extern prelude
+//!     (`#![no_implicit_prelude]`) the root must be bound by an `extern crate`
+//!     item.
 //! * (b) otherwise, does it hold a glob import the index cannot prove does NOT
 //!   provide the name? In a block that is `Unknown` and the walk stops; at the
 //!   module level the glob is `Glob` and the file-wide bindings say whether it
@@ -60,7 +78,9 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use devmap_extract::model::{Extraction, RustExternCrate, RustScopeKind, SymbolKind};
+use devmap_extract::model::{
+    Extraction, RustExternCrate, RustScopeKind, SymbolKind, RUST_MACRO_FACTS_VERSION,
+};
 use devmap_extract::{RustCrateManifest, RustDependency};
 
 use super::Resolver;
@@ -113,9 +133,16 @@ pub(super) struct CrateMacros {
     /// Path roots that a local item may stand for: a module of the crate, or a
     /// `use .. as` of a std/log/tracing/anyhow/eyre name.
     pub(super) shadowed_roots: BTreeSet<String>,
-    /// A `#[macro_use]` sits on something that is neither a module nor an
-    /// `extern crate` item.
+    /// A `#[macro_use]` sits on something this crate's facts cannot account for:
+    /// not an `extern crate` item, not an inline module, and not an out-of-line
+    /// module whose file is indexed (a `#[path]` module, a module in a block, or a
+    /// module whose file the index does not hold).
     pub(super) macro_use: bool,
+    /// A file of the crate carries `#![no_std]` (possibly through `cfg_attr`).
+    pub(super) no_std: bool,
+    /// A file of the crate carries `#![no_implicit_prelude]`; taken as holding for
+    /// the whole crate.
+    pub(super) no_implicit_prelude: bool,
     /// Every `extern crate` item of the crate.
     pub(super) externs: Vec<RustExternCrate>,
     /// The dependencies the crate's manifest names; `None` when no manifest
@@ -182,6 +209,49 @@ impl CrateMacros {
             out.push(None);
         }
         out
+    }
+
+    /// Whether the macro `name` is in the crate's macro prelude, so that a glob
+    /// import cannot bring a different one (rustc: `E0659`). The std macros are,
+    /// except that `#![no_std]` has only the core ones and
+    /// `#![no_implicit_prelude]` only the builtins; `#[macro_use] extern crate
+    /// std` and (for `vec`, `format`) `alloc` add theirs back in a `no_std` crate.
+    pub(super) fn prelude_binds(&self, name: &str) -> bool {
+        if !macro_owned_by(name, "std") {
+            return false;
+        }
+        if self.no_implicit_prelude {
+            return matches!(name, "assert" | "panic" | "unreachable" | "format_args");
+        }
+        if !self.no_std {
+            return true;
+        }
+        const CORE: &[&str] = &[
+            "assert",
+            "assert_eq",
+            "assert_ne",
+            "debug_assert",
+            "debug_assert_eq",
+            "debug_assert_ne",
+            "panic",
+            "matches",
+            "write",
+            "writeln",
+            "todo",
+            "unreachable",
+            "unimplemented",
+            "format_args",
+        ];
+        CORE.contains(&name)
+            || self
+                .externs
+                .iter()
+                .filter(|item| item.macro_use)
+                .any(|item| match item.name.as_str() {
+                    "std" => true,
+                    "alloc" => matches!(name, "vec" | "format"),
+                    _ => false,
+                })
     }
 
     /// Whether `root` is, everywhere in this crate, a crate that owns the macro
@@ -362,9 +432,13 @@ impl RustFileScope {
         let Some(facts) = ext.rust_scope_facts.as_ref() else {
             return scope;
         };
-        // Facts written before macros were recorded cannot say which scopes
-        // hold one, which is not the same as holding none.
-        let Some(macro_facts) = facts.macros.as_ref() else {
+        // Facts written before macros were recorded, or by an older reading of
+        // them, cannot say which scopes hold one: absence in them is not "none".
+        let Some(macro_facts) = facts
+            .macros
+            .as_ref()
+            .filter(|macros| macros.facts_version >= RUST_MACRO_FACTS_VERSION)
+        else {
             return scope;
         };
         scope.known = true;
@@ -496,14 +570,14 @@ impl RustFileScope {
     }
 
     /// Decide, for each macro invocation of the file, whether it declares
-    /// nothing the index cannot see. `silent(scope, at, path)` answers for the
-    /// invocation `path` written in scope `at`. A silent invocation declares only
+    /// nothing the index cannot see. `silent(scope, at, pos, path)` answers for the
+    /// invocation `path` written at byte `pos`, in scope `at`. A silent invocation declares only
     /// the names it is known to (`thread_local!`'s statics); any other leaves its
     /// scope unanswered for every name.
     pub(super) fn apply_macros(
         &mut self,
         ext: &Extraction,
-        silent: &dyn Fn(&RustFileScope, usize, &str) -> bool,
+        silent: &dyn Fn(&RustFileScope, usize, usize, &str) -> bool,
     ) {
         let Some(macro_facts) = ext
             .rust_scope_facts
@@ -520,7 +594,7 @@ impl RustFileScope {
             .iter()
             .map(|call| {
                 let at = self.scope_at(call.start);
-                (at, silent(self, at, &call.name))
+                (at, silent(self, at, call.start, &call.name))
             })
             .collect();
         for (call, (at, is_silent)) in macro_facts.calls.iter().zip(verdicts) {
@@ -537,15 +611,27 @@ impl RustFileScope {
         }
     }
 
+    /// Whether a `cfg` encloses the byte `from` but not the byte `to`.
+    fn cfg_separates(&self, from: usize, to: usize) -> bool {
+        self.cfg_spans
+            .iter()
+            .any(|(start, end)| *start <= from && from < *end && !(*start <= to && to < *end))
+    }
+
     /// Whether `name` is imported by name in `at` or a scope enclosing it up to
-    /// its module.
-    pub(super) fn named_import_in_chain(&self, name: &str, at: usize) -> bool {
+    /// its module, for a use written at byte `pos`. An import under a `cfg` that
+    /// does not also enclose `pos` may be absent where the call is present, so it
+    /// is not an import here.
+    pub(super) fn named_import_in_chain(&self, name: &str, at: usize, pos: usize) -> bool {
         let Some(imports) = self.named.get(name) else {
             return false;
         };
         let mut level = at;
         loop {
-            if imports.iter().any(|import| import.scope == level) {
+            if imports
+                .iter()
+                .any(|import| import.scope == level && !self.cfg_separates(import.at, pos))
+            {
                 return true;
             }
             if self.scopes[level].module {
@@ -1003,9 +1089,9 @@ impl Resolver {
 pub(super) struct MacroPass<'a> {
     /// Every glob import of each file, as written (`dep`, `crate::prelude`).
     globs: BTreeMap<&'a str, Vec<&'a str>>,
-    /// `((file, glob path), probe name, macro name)` -> whether the glob may bring
-    /// the probe name into scope.
-    memo: RefCell<BTreeMap<(String, String, String), bool>>,
+    /// `((file, glob path), macro name)` -> whether the glob may bring a macro of
+    /// that name into scope.
+    memo: RefCell<BTreeMap<(String, String), bool>>,
     /// `(crate key, extern crate name, macro name)` -> whether a `#[macro_use]`
     /// of that crate may bring the macro in.
     extern_memo: RefCell<BTreeMap<(String, String, String), bool>>,
@@ -1069,8 +1155,8 @@ impl Resolver {
             let Some(mut scope) = self.rust_site_scope.remove(&file) else {
                 continue;
             };
-            scope.apply_macros(ext, &|scope, at, path| {
-                self.rust_macro_is_silent(&pass, &file, scope, at, path)
+            scope.apply_macros(ext, &|scope, at, pos, path| {
+                self.rust_macro_is_silent(&pass, &file, scope, at, pos, path)
             });
             self.rust_site_scope.insert(file, scope);
         }
@@ -1088,6 +1174,7 @@ impl Resolver {
         file: &str,
         scope: &RustFileScope,
         at: usize,
+        pos: usize,
         path: &str,
     ) -> bool {
         let crate_key = self.rust_crate_key(file);
@@ -1113,6 +1200,16 @@ impl Resolver {
         if root.is_some_and(|root| !env.root_owns_macro(name, root)) {
             return false;
         }
+        // With no extern prelude a root is only what an `extern crate` item binds.
+        if env.no_implicit_prelude
+            && root.is_some_and(|root| {
+                !env.externs
+                    .iter()
+                    .any(|item| item.alias.as_deref().unwrap_or(&item.name) == root)
+            })
+        {
+            return false;
+        }
         if env.defined.contains(name) || env.rebound.contains(name) {
             return false;
         }
@@ -1121,19 +1218,14 @@ impl Resolver {
                 return false;
             }
         }
-        // A pathed call never looks the bare name up, so a glob that may bring
-        // the name in cannot rebind it. (A glob that brought in a module named
-        // like the path root could; that is not checked.) Nor can a glob rebind
-        // a name rustc settles another way, each confirmed with rustc 1.99.1:
-        // a name of the std prelude (`vec!`, `println!`) is E0659 ambiguous
-        // between a glob import and the prelude, so no compiling crate has a
-        // glob that brings in a different one; and a name the chain imports
-        // explicitly (`use anyhow::bail;`) shadows a glob in its scope and is
-        // E0659 against one in an inner scope.
-        let in_std_prelude = macro_owned_by(name, "std");
-        if root.is_none() && !in_std_prelude && !scope.named_import_in_chain(name, at) {
+        // A pathed call never looks the bare name up, and a glob that brings a
+        // module or crate named like its root is E0659 against the extern prelude
+        // (confirmed with rustc 1.99.1, block globs too), so a glob cannot rebind
+        // it; the module doc lists the other two cases that never ask.
+        if root.is_none() && !env.prelude_binds(name) && !scope.named_import_in_chain(name, at, pos)
+        {
             for specifier in scope.visible_globs(at) {
-                if self.rust_glob_brings(pass, file, specifier, name, name) {
+                if self.rust_glob_brings(pass, file, specifier, name) {
                     return false;
                 }
             }
@@ -1184,40 +1276,27 @@ impl Resolver {
             let Some(key) = self.rust_crate_key_of_package(&package) else {
                 return true;
             };
-            if self.rust_crate_may_publish(pass, &key, name, name, &mut BTreeSet::new()) {
+            if self.rust_crate_may_publish(pass, &key, name, &mut BTreeSet::new()) {
                 return true;
             }
         }
         false
     }
 
-    /// Whether the glob import of `specifier` written in `file` may bring `probe`
-    /// into scope. `macro_name` is the macro being asked about: a glob of a crate
-    /// that owns it brings the real one.
+    /// Whether the glob import of `specifier` written in `file` may bring a macro
+    /// named `name` into scope (a glob of a crate that owns it brings the real one).
     fn rust_glob_brings(
         &self,
         pass: &MacroPass<'_>,
         file: &str,
         specifier: &str,
-        probe: &str,
-        macro_name: &str,
+        name: &str,
     ) -> bool {
-        let key = (
-            format!("{file}\0{specifier}"),
-            probe.to_string(),
-            macro_name.to_string(),
-        );
+        let key = (format!("{file}\0{specifier}"), name.to_string());
         if let Some(known) = pass.memo.borrow().get(&key) {
             return *known;
         }
-        let answer = self.rust_glob_brings_in(
-            pass,
-            file,
-            specifier,
-            probe,
-            macro_name,
-            &mut BTreeSet::new(),
-        );
+        let answer = self.rust_glob_brings_in(pass, file, specifier, name, &mut BTreeSet::new());
         pass.memo.borrow_mut().insert(key, answer);
         answer
     }
@@ -1233,8 +1312,7 @@ impl Resolver {
         pass: &MacroPass<'_>,
         file: &str,
         specifier: &str,
-        probe: &str,
-        macro_name: &str,
+        name: &str,
         seen: &mut BTreeSet<(String, String)>,
     ) -> bool {
         if !seen.insert((file.to_string(), specifier.to_string())) {
@@ -1261,30 +1339,29 @@ impl Resolver {
                 let target_key = self.rust_crate_key(&target);
                 if target_key == key {
                     pass.globs.get(target.as_str()).is_some_and(|globs| {
-                        globs.iter().any(|next| {
-                            self.rust_glob_brings_in(pass, &target, next, probe, macro_name, seen)
-                        })
+                        globs
+                            .iter()
+                            .any(|next| self.rust_glob_brings_in(pass, &target, next, name, seen))
                     })
                 } else {
-                    self.rust_crate_may_publish(pass, &target_key, probe, macro_name, seen)
+                    self.rust_crate_may_publish(pass, &target_key, name, seen)
                 }
             }
             None => {
                 matches!(root, "crate" | "self" | "super")
                     || env.shadowed_roots.contains(root)
-                    || !env.root_owns_macro(macro_name, root)
+                    || !env.root_owns_macro(name, root)
             }
         }
     }
 
-    /// Whether the crate `key` may export `probe`: it defines or re-exports a
-    /// name that is that, or a `pub use path::*` of it may.
+    /// Whether the crate `key` may export a macro named `name`: it defines or
+    /// re-exports a name that is that, or a `pub use path::*` of it may.
     fn rust_crate_may_publish(
         &self,
         pass: &MacroPass<'_>,
         key: &str,
-        probe: &str,
-        macro_name: &str,
+        name: &str,
         seen: &mut BTreeSet<(String, String)>,
     ) -> bool {
         let Some(env) = self.rust_crate_macros.get(key) else {
@@ -1292,13 +1369,13 @@ impl Resolver {
         };
         if !env.complete
             || env.parse_gaps
-            || env.defined.contains(probe)
-            || env.exported_names.contains(probe)
+            || env.defined.contains(name)
+            || env.exported_names.contains(name)
         {
             return true;
         }
-        env.glob_reexports.iter().any(|(file, specifier)| {
-            self.rust_glob_brings_in(pass, file, specifier, probe, macro_name, seen)
-        })
+        env.glob_reexports
+            .iter()
+            .any(|(file, specifier)| self.rust_glob_brings_in(pass, file, specifier, name, seen))
     }
 }

@@ -64,7 +64,10 @@ mod tests {
         assert_eq!(crate::c49::std_glob_silent(), 2);
         assert_eq!(crate::c49b::indexed_glob_silent(), 3);
         assert_eq!(crate::c53::explicit_beats_glob(true), Ok(2));
-        assert_eq!(crate::c53::explicit_beats_glob(false), Err("no".to_string()));
+        assert_eq!(
+            crate::c53::explicit_beats_glob(false),
+            Err("no".to_string())
+        );
         assert_eq!(crate::c54::cfg_import(), 1);
     }
 }

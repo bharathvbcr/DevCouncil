@@ -97,7 +97,6 @@ impl Resolver {
                 )
             })
             .collect();
-        self.rust_crate_macros = self.compute_rust_crate_macros(extractions);
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -766,6 +765,9 @@ impl Resolver {
         self.rust_path_modules = self.compute_rust_path_modules(extractions);
         self.rust_scope_globs = self.compute_rust_scope_globs(extractions);
         self.rust_scope_named = self.compute_rust_scope_named(extractions);
+        // After `rust_path_modules`: a `#[macro_use] mod m;` looks for its file
+        // beside the declaring file, wherever that was loaded from.
+        self.rust_crate_macros = self.compute_rust_crate_macros(extractions);
         self.apply_rust_macro_facts(extractions);
         self.rust_glob_names = self.compute_rust_glob_names(extractions);
 
@@ -2528,6 +2530,7 @@ impl Resolver {
         extractions: &[Extraction],
     ) -> BTreeMap<String, super::rust_site_scope::CrateMacros> {
         use super::rust_site_scope::{rust_crate_key_in, CrateMacros, NO_MANIFEST};
+        use devmap_extract::model::RUST_MACRO_FACTS_VERSION;
         const ROOTS: &[&str] = &["std", "core", "alloc", "log", "tracing", "anyhow", "eyre"];
         let rust_files = || {
             extractions
@@ -2558,16 +2561,20 @@ impl Resolver {
                 }),
                 ..CrateMacros::default()
             });
+            // Facts of an older reading cannot say what is absent from them.
             let Some(facts) = ext
                 .rust_scope_facts
                 .as_ref()
                 .and_then(|facts| facts.macros.as_ref())
+                .filter(|facts| facts.facts_version >= RUST_MACRO_FACTS_VERSION)
             else {
                 env.complete = false;
                 continue;
             };
             env.defined.extend(facts.defined.iter().cloned());
             env.macro_use |= facts.macro_use;
+            env.no_std |= facts.no_std;
+            env.no_implicit_prelude |= facts.no_implicit_prelude;
             // A `#[macro_use] mod m;` publishes only what `m`'s file defines, and
             // that file is read only when it is indexed.
             for module in &facts.macro_use_mods {
@@ -2578,12 +2585,20 @@ impl Resolver {
                     .next()
                     .and_then(|name| name.strip_suffix(".rs"))
                     .unwrap_or_default();
+                // A crate root, a `mod.rs` and a file a `#[path]` loads keep their
+                // children in their own directory; any other file in `dir/stem`.
                 let base = if matches!(stem, "lib" | "main" | "mod")
                     || declared_roots.contains(ext.file_path.as_str())
+                    || self.rust_path_modules.contains_key(&ext.file_path)
                 {
                     dir
                 } else {
                     Self::rel_join(&dir, stem)
+                };
+                // `outer/m` is `m` inside the inline module `outer`.
+                let (base, module) = match module.rsplit_once('/') {
+                    Some((chain, last)) => (Self::rel_join(&base, chain), last),
+                    None => (base, module.as_str()),
                 };
                 let flat = Self::rel_join(&base, &format!("{module}.rs"));
                 let nested = Self::rel_join(&Self::rel_join(&base, module), "mod.rs");
@@ -2602,6 +2617,24 @@ impl Resolver {
                 env.exported_names.insert(symbol.name.clone());
             }
             env.externs.extend(facts.extern_crates.iter().cloned());
+            // An out-of-line `mod log;` is a module of that name whether or not
+            // its file is indexed.
+            for imp in ext
+                .imports
+                .iter()
+                .filter(|imp| imp.raw_import.trim_start().starts_with("mod "))
+            {
+                let name = imp
+                    .raw_import
+                    .trim_start()
+                    .trim_start_matches("mod ")
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
+                if ROOTS.contains(&name) {
+                    env.shadowed_roots.insert(name.to_string());
+                }
+            }
             env.shadowed_roots
                 .extend(ext.rust_inline_modules.iter().cloned());
             if let Some(module) =

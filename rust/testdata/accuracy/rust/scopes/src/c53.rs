@@ -3,7 +3,9 @@
 use anyhow::bail;
 use dep::*;
 
-pub fn h53() -> u16 { 2 }
+pub fn h53() -> u16 {
+    2
+}
 
 pub fn explicit_beats_glob(flag: bool) -> Result<u16, String> {
     let kept = h53();

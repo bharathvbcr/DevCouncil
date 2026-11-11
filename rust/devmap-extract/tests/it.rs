@@ -155,6 +155,8 @@ mod reliability_source_reads;
 #[cfg(feature = "parse")]
 mod retry_phase_deadline_is_a_hard_bound;
 #[cfg(feature = "parse")]
+mod rust_prelude_facts;
+#[cfg(feature = "parse")]
 mod rust_thread_local_statics;
 #[cfg(feature = "parse")]
 mod rust_use_declarations;

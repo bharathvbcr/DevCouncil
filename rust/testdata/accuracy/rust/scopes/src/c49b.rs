@@ -2,7 +2,9 @@
 //! silent (`pm` exports only attribute and derive macros of other names).
 use pm::*;
 
-pub fn h49b() -> u16 { 3 }
+pub fn h49b() -> u16 {
+    3
+}
 
 pub fn indexed_glob_silent() -> u16 {
     println!("y");

@@ -11,7 +11,9 @@ pub mod pb;
 use crate::pa::Dup;
 use kio::*;
 
-pub fn h56() -> u16 { 2 }
+pub fn h56() -> u16 {
+    2
+}
 
 pub fn nopre_println() -> u8 {
     println!(crate::pb::Dup);
