@@ -1106,7 +1106,10 @@ fn r1_an_unindexed_out_of_line_mod_named_like_a_root_stands_for_it_whatever_its_
         .resolve(tag);
         binds_da(&result)
     };
-    assert!(edge("r1-control", ""), "no `mod log;`: the log crate's macro");
+    assert!(
+        edge("r1-control", ""),
+        "no `mod log;`: the log crate's macro"
+    );
     for (tag, header) in [
         ("r1a", "mod log;\n"),
         ("r1b", "pub mod log;\n"),
