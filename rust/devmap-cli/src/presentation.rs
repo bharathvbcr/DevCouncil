@@ -149,13 +149,20 @@ pub(super) fn write_human(message: std::fmt::Arguments<'_>) -> bool {
     true
 }
 
-/// Whether a terminal or a bidirectional renderer would act on `c`: a control
-/// character, or a bidirectional override or isolate. Newline is text structure
-/// and is not one.
+/// Whether a terminal or a bidirectional renderer would act on `c`: the shared
+/// agent-visible escape set ([`devmap_query::bounded::is_agent_unsafe`]).
+/// Newline is text structure and is not one.
 pub(super) fn is_terminal_unsafe(c: char) -> bool {
-    c != '\n'
-        && (c.is_control()
-            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+    c != '\n' && devmap_query::bounded::is_agent_unsafe(c)
+}
+
+/// `c` spelled `\uXXXX`, or `\u{X}` above the BMP so the digits never run on
+/// into the text that follows. The spelling the hook line and the pipe share.
+pub(crate) fn unicode_escape(c: char) -> String {
+    match u32::from(c) {
+        bmp @ 0..=0xffff => format!("\\u{bmp:04x}"),
+        cp => format!("\\u{{{cp:x}}}"),
+    }
 }
 
 /// `text` with each character [`is_terminal_unsafe`] written as `\uXXXX`, or
@@ -169,7 +176,7 @@ pub(super) fn escape_for_pipe(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len() + 8);
     for c in text.chars() {
         if unsafe_char(c) {
-            out.push_str(&format!("\\u{:04x}", c as u32));
+            out.push_str(&unicode_escape(c));
         } else {
             out.push(c);
         }
@@ -210,5 +217,38 @@ impl Write for HumanText {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::escape_for_pipe;
+
+    /// The terminal sink escapes the same agent-visible set as the hook and
+    /// `bounded_text` (zero-width and tag characters included); newline and
+    /// tab stay, and RTL letters are untouched.
+    #[test]
+    fn escape_for_pipe_escapes_zero_width_and_tag_characters() {
+        for c in [
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{2028}',
+            '\u{E0041}',
+        ] {
+            let out = escape_for_pipe(&format!("a{c}b"))
+                .unwrap_or_else(|| panic!("U+{:04X} kept", c as u32));
+            assert!(
+                !out.contains(c) && out.starts_with("a\\u"),
+                "U+{:04X}: {out:?}",
+                c as u32
+            );
+        }
+        assert_eq!(escape_for_pipe("a\nb\tc"), None);
+        for text in devmap_query::bounded::RTL_LETTER_FIXTURES {
+            assert_eq!(escape_for_pipe(text), None);
+        }
     }
 }

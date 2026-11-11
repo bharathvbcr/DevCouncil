@@ -431,9 +431,9 @@ impl Report {
 // Hook-block validation
 // ---------------------------------------------------------------------------
 
-fn is_bidi(c: char) -> bool {
-    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-}
+/// Validation rejects bidi controls only (R2): the named subset of the shared
+/// escape set, so growing the display set never narrows what is accepted.
+use devmap_query::bounded::is_bidi_control as is_bidi;
 
 fn check_timeout(event: &str, at: &str, handler: &Map<String, Value>, out: &mut Vec<Diagnostic>) {
     let Some(raw) = handler.get("timeout") else {
@@ -2604,6 +2604,28 @@ mod tests {
                 .any(|d| d.to_string().contains("bidirectional")),
             "{manifest:?}"
         );
+    }
+
+    /// R2: validation rejects bidi controls only. ZWNJ/ZWJ are ordinary in
+    /// Persian, Indic text and emoji, so a name carrying one is not refused
+    /// (display sinks escape them instead).
+    #[test]
+    fn zero_width_joiners_are_not_refused_but_every_bidi_control_is() {
+        let ok = validate_plugin_manifest(&json!({"name": "می\u{200C}خواهم\u{200D}"}));
+        assert!(
+            !ok.iter().any(|d| d.to_string().contains("bidirectional")),
+            "{ok:?}"
+        );
+        for c in [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}',
+        ] {
+            let bad = validate_plugin_manifest(&json!({ "name": format!("dev{c}map") }));
+            assert!(
+                bad.iter().any(|d| d.to_string().contains("bidirectional")),
+                "U+{:04X}: {bad:?}",
+                c as u32
+            );
+        }
     }
 
     #[test]
