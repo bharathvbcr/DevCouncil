@@ -2588,7 +2588,7 @@ mod generation_checks_memo {
 /// read from change, the next call returns the new value. Each answer is
 /// checked against a write by another connection and a write by this store's
 /// own connection, neither of which a generation id can see.
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod generation_checks_staleness {
     use super::*;
 

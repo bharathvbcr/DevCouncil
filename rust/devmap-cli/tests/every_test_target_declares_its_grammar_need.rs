@@ -144,6 +144,15 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "a_second_open_keeps_the_first_connections_locks",
             "a_refusal_names_its_reason_not_a_parameter",
             "adversarial_store_without_grammars",
+            // The mapped-CSR reader and writer tests and the reader memory
+            // bound: store files and sidecars only. Verified with
+            // `cargo check -p devmap-store --no-default-features --all-targets`
+            // and run feature-off.
+            "csr_mapped_file_changes",
+            "csr_reader_refuses_hostile_files",
+            "csr_rewrite_keeps_mapped_readers",
+            "csr_write_keeps_mode",
+            "reader_memory",
             "embedded_reader",
             "git_head_validates",
             // Its generation row is written by SQL: a build without grammars
