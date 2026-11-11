@@ -414,7 +414,7 @@ fn status_names_a_resolver_mismatch_and_does_not_auto_rebuild_on_it() {
     let status = status_json(&root, &["--auto-rebuild"]);
     let reason = status["degraded_reason"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("resolver epoch 1") && reason.contains("devmap build"),
+        reason.contains("older resolver epoch") && reason.contains("devmap build"),
         "the resolver mismatch needs its own reason; status said: {status}"
     );
     assert!(!reason.contains("obsolete"), "{reason}");
