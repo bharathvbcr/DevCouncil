@@ -8,7 +8,9 @@
 //! file the user did not ask to upgrade.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use devmap_store::Store;
 use serde_json::{json, Value};
@@ -17,6 +19,49 @@ use crate::root_resolve::validate_repo_path;
 
 /// How many distinct stores one MCP process will hold open.
 pub const STORE_CACHE_CAP: usize = 8;
+
+/// Page cache and file mapping of the connections this server keeps open.
+///
+/// 16 MiB against the 64 MiB every other read-only connection uses, and no
+/// mmap. Measured (`examples/mcp_reader_memory_bench.rs`, 384 MB store, n=10
+/// fresh processes per arm, interleaved): physical footprint 218 MiB median
+/// at 64 MiB, 154 MiB at 16 MiB, spread within an arm 10 MiB or less. The
+/// cold-call latency cost of the smaller cache was not separable from noise
+/// at the load of that run (107-130); mmap added about 2 MiB of gain, inside
+/// the spread, and a truncated mapped file is SIGBUS, so it is not used.
+pub const MCP_READER_MEMORY: devmap_store::ReaderMemory = devmap_store::ReaderMemory {
+    cache_kib: 16_384,
+    mmap_bytes: 0,
+    tolerate_full_text_damage: false,
+};
+
+/// How long a cached store may go unused before it is dropped.
+///
+/// A dropped store releases its SQLite page cache (up to 64 MiB per
+/// connection) and its cached edge index, which together are most of what an
+/// idle `devmap mcp` holds: 27 idle servers held about 2.1 GB between them
+/// (2026-11-09 audit, F6). Ten minutes outlasts a pause inside one working
+/// session, so a store in use is not reopened mid-conversation, while a server
+/// left behind by a closed tab stops holding the memory. The next call after an
+/// eviction reopens the store and rebuilds the edge index on demand (one cold
+/// call), the same cost as the first call of a fresh server.
+///
+/// Only stores this cache opened itself expire: a [`StoreOrigin::CallerOwned`]
+/// store may exist nowhere else (an in-memory one), so dropping it would lose
+/// it rather than release it.
+pub const STORE_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How often the idle sweeper looks. A store is therefore dropped between
+/// [`STORE_IDLE_TTL`] and [`STORE_IDLE_TTL`] plus this long after its last use.
+pub const STORE_IDLE_SWEEP: Duration = Duration::from_secs(30);
+
+/// Where the cache reads the time. Injected so idle eviction is testable
+/// without sleeping.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+fn system_clock() -> Clock {
+    Arc::new(Instant::now)
+}
 
 /// Which repository a successful tool call answered from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,17 +153,87 @@ struct LruEntry {
     key: PathBuf,
     store: Arc<Store>,
     origin: StoreOrigin,
+    last_used: Instant,
 }
 
 /// Bounded LRU of open stores, keyed by canonical store path.
-#[derive(Default)]
 pub struct StoreLru {
     entries: Vec<LruEntry>,
+    clock: Clock,
+}
+
+impl Default for StoreLru {
+    fn default() -> Self {
+        Self::with_clock(system_clock())
+    }
 }
 
 impl StoreLru {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_clock(clock: Clock) -> Self {
+        Self {
+            entries: Vec::new(),
+            clock,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Take out the store this cache opened under `key`. A caller-owned store
+    /// is never taken: it may exist nowhere else, so it is reported on and
+    /// kept, not dropped and lost.
+    ///
+    /// The evicted handles are returned, not dropped here: closing a SQLite
+    /// connection and freeing an edge index must not happen while the caller
+    /// holds the cache lock and other calls wait on it. The caller drops them
+    /// after releasing it.
+    #[must_use = "drop the evicted stores after releasing the cache lock"]
+    pub fn evict_opened(&mut self, key: &Path) -> Vec<Arc<Store>> {
+        self.take_where(|entry| entry.key == key && matches!(entry.origin, StoreOrigin::Opened(_)))
+    }
+
+    /// Take out every store this cache opened that has gone [`STORE_IDLE_TTL`]
+    /// without a lookup. Returned for the caller to drop outside the lock, as
+    /// [`Self::evict_opened`] explains.
+    #[must_use = "drop the evicted stores after releasing the cache lock"]
+    pub fn evict_idle(&mut self) -> Vec<Arc<Store>> {
+        let now = (self.clock)();
+        self.take_where(|entry| match entry.origin {
+            StoreOrigin::CallerOwned => false,
+            StoreOrigin::Opened(_) => {
+                now.saturating_duration_since(entry.last_used) >= STORE_IDLE_TTL
+            }
+        })
+    }
+
+    /// Whether the entry under `key` was handed in by the caller.
+    pub fn holds_caller_owned(&self, key: &Path) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.key == key && matches!(entry.origin, StoreOrigin::CallerOwned))
+    }
+
+    fn take_where(&mut self, mut selected: impl FnMut(&LruEntry) -> bool) -> Vec<Arc<Store>> {
+        let mut taken = Vec::new();
+        let mut kept = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.drain(..) {
+            if selected(&entry) {
+                taken.push(entry.store);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.entries = kept;
+        taken
     }
 
     pub fn last_store_path(&self) -> Option<PathBuf> {
@@ -151,7 +266,8 @@ impl StoreLru {
                 return CacheLookup::Evicted;
             }
         }
-        let entry = self.entries.remove(pos);
+        let mut entry = self.entries.remove(pos);
+        entry.last_used = (self.clock)();
         let store = Arc::clone(&entry.store);
         self.entries.push(entry);
         CacheLookup::Hit(store)
@@ -164,7 +280,43 @@ impl StoreLru {
         if self.entries.len() >= STORE_CACHE_CAP {
             self.entries.remove(0);
         }
-        self.entries.push(LruEntry { key, store, origin });
+        let last_used = (self.clock)();
+        self.entries.push(LruEntry {
+            key,
+            store,
+            origin,
+            last_used,
+        });
+    }
+}
+
+/// Keeps a background thread sweeping idle stores out of one cache.
+///
+/// Sweeping only on lookup would never run in the case it exists for: a server
+/// nobody is calling. The thread holds the cache weakly and ends as soon as the
+/// owner of this value is dropped.
+pub struct IdleSweeper {
+    _stop: Sender<()>,
+}
+
+impl IdleSweeper {
+    /// `None` when the thread could not be started; the cache is then swept
+    /// only when a store is opened, which still bounds a busy server.
+    pub fn start(cache: Weak<Mutex<StoreLru>>, every: Duration) -> Option<Self> {
+        let (stop, stopped) = mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("devmap-store-idle-sweep".into())
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                    let Some(cache) = cache.upgrade() else {
+                        return;
+                    };
+                    let idle = crate::lock_recover(&cache).evict_idle();
+                    drop(idle);
+                }
+            })
+            .ok()?;
+        Some(Self { _stop: stop })
     }
 }
 
@@ -179,27 +331,307 @@ pub fn canonicalize_path(path: &Path) -> PathBuf {
 /// a file the user did not ask this binary to write, from a host whose cwd may
 /// not even be that repository.
 pub fn open_mcp_store(path: &Path) -> Result<Store, String> {
+    open_mcp_store_classified(path).map_err(|failure| failure.message)
+}
+
+/// Why an open failed, with the one distinction a caller acts on kept as a
+/// field rather than recovered from the text.
+#[derive(Debug)]
+pub struct OpenFailure {
+    pub message: String,
+    /// SQLite reported `SQLITE_CORRUPT` (or a re-worded full-text corruption)
+    /// while opening: the file is damaged, and a caller may remember that.
+    pub corrupt: bool,
+    /// The error itself, without the wording around it, for a caller that
+    /// records it.
+    pub raw: String,
+}
+
+impl OpenFailure {
+    fn other(message: String) -> Self {
+        Self {
+            raw: message.clone(),
+            message,
+            corrupt: false,
+        }
+    }
+}
+
+/// [`open_mcp_store`], saying whether the failure was damage.
+pub fn open_mcp_store_classified(path: &Path) -> Result<Store, OpenFailure> {
     if path.file_name().and_then(|n| n.to_str()) == Some("base.sqlite") {
         // A lane's private base: opened through its lease and recorded identity,
         // the same checks `StackedStore::open` makes.
-        return devmap_query::stacked::open_lane_base_store(path).map_err(|err| {
-            format!(
+        let base = devmap_query::stacked::open_lane_base_store(path).map_err(|err| {
+            OpenFailure::other(format!(
                 "immutable base snapshot at {} could not be opened: {err}",
                 path.display()
-            )
+            ))
+        })?;
+        // The lane opener takes no memory setting; the lane base is held open
+        // for as long as the cache holds it, like any other store here.
+        base.apply_reader_memory(MCP_READER_MEMORY).map_err(|err| {
+            OpenFailure::other(format!(
+                "immutable base snapshot at {} could not be configured: {err}",
+                path.display()
+            ))
+        })?;
+        return Ok(base);
+    }
+    // A failed open is a schema the binary cannot read, damage to the file, or
+    // anything else. (A closure, not a function: the error type is the store's
+    // SQLite error, which this crate does not depend on by name.)
+    let classify = |err| {
+        if Store::is_unsupported_schema(&err) {
+            OpenFailure::other(format!(
+                "rebuild_required: the DevMap store at {} is not this binary's schema and \
+will not be migrated in-place. Run `devmap build` in that repository. {err}",
+                path.display()
+            ))
+        } else if Store::sqlite_error_is_corrupt(&err) {
+            let raw = error_chain(&err);
+            OpenFailure {
+                message: corrupt_store_message(path, &raw, CorruptContext::Reopened),
+                corrupt: true,
+                raw,
+            }
+        } else {
+            OpenFailure::other(format!(
+                "devmap index at {} could not be opened: {err}",
+                path.display()
+            ))
+        }
+    };
+    match Store::open_read_only_with(path, MCP_READER_MEMORY) {
+        Ok(store) => Ok(store),
+        // The strict open found the full-text index to be the only fault. The
+        // rest of the store is sound, so open it degraded: tools that do not
+        // read the index answer, and search is refused by the same typed error
+        // a handle that met the damage later produces. Anything the degraded
+        // open finds beyond the index fails as whole-file damage.
+        Err(err) if Store::sqlite_error_is_full_text_damage(&err) => {
+            Store::open_read_only_with(path, MCP_READER_MEMORY.tolerating_full_text_damage())
+                .map_err(classify)
+        }
+        Err(err) => Err(classify(err)),
+    }
+}
+
+/// `error` and everything it wraps, outermost first, as one line. Consecutive
+/// links that print the same text (a wrapper that forwards its source's
+/// message) are named once.
+pub fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut link: Option<&dyn std::error::Error> = Some(error);
+    while let Some(current) = link {
+        let text = current.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        link = current.source();
+    }
+    parts.join(": ")
+}
+
+/// The stacked lane at `attr_root`, opened for one call, if the worktree holds
+/// a lease.
+///
+/// A lane call opens its own base and delta and never queries the cached
+/// `base.sqlite` handle, so the server's reader memory is applied to the base
+/// connection the call actually reads through.
+pub fn open_lane_for_call(
+    attr_root: &Path,
+) -> anyhow::Result<Option<devmap_query::stacked::StackedStore>> {
+    let Some(stacked) = devmap_query::stacked::StackedStore::open_if_leased(attr_root)? else {
+        return Ok(None);
+    };
+    stacked
+        .base_store()
+        .apply_reader_memory(MCP_READER_MEMORY)?;
+    Ok(Some(stacked))
+}
+
+/// Why a tool call is reporting `SQLITE_CORRUPT`, which decides what it can
+/// honestly say about the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptContext {
+    /// A connection opened afresh reported it too: the file, not a stale handle.
+    Reopened,
+    /// This file was found damaged on an earlier call and has not changed
+    /// (same identity, size and modification time, `-wal` included) since, so
+    /// it was not opened and queried again.
+    KnownUnchanged,
+    /// A store the caller handed in already open reported it. It is not
+    /// evicted or reopened: it may exist nowhere else.
+    CallerOwned,
+}
+
+/// What a tool call says when SQLite reports `SQLITE_CORRUPT`.
+///
+/// The raw SQLite text ("database disk image is malformed") names no store and
+/// offers no way forward, and an agent that receives only that falls back to
+/// grep. This names the file, what is known about the cause, and the two
+/// commands that act on it.
+pub fn corrupt_store_message(
+    store: &Path,
+    error: &dyn std::fmt::Display,
+    context: CorruptContext,
+) -> String {
+    let cause = match context {
+        CorruptContext::Reopened => {
+            "including on a connection opened afresh, so this is the file and not a stale handle"
+                .to_string()
+        }
+        CorruptContext::KnownUnchanged => format!(
+            "on an earlier call, and the file has not changed since, so it was not read again \
+(this clears when the file changes, or after {} seconds)",
+            DAMAGE_MEMORY_TTL.as_secs()
+        ),
+        CorruptContext::CallerOwned => {
+            "on a store this server was handed already open, which it does not reopen".to_string()
+        }
+    };
+    format!(
+        "the devmap store at {} is damaged: SQLite reported SQLITE_CORRUPT ({error}), {cause}. \
+No answer is given, because a read that failed is not a statement that nothing was found. Run \
+`devmap doctor` in that repository to inspect the store, and `devmap build` to rebuild it.",
+        store.display()
+    )
+}
+
+/// How many damaged files one server remembers.
+pub const DAMAGE_MEMORY_CAP: usize = 32;
+
+/// A store file's identity and state, as far as the filesystem shows it:
+/// identity, length and modification time of the file and of its `-wal`.
+///
+/// A rebuild, a repair, a checkpoint or a restore changes at least one of
+/// them; an unchanged stamp is the evidence for "still the file that was
+/// damaged".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageStamp {
+    identity: StoreFileIdentity,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    wal: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+impl DamageStamp {
+    pub fn of(store: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(store)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        let mut wal_name = store.as_os_str().to_owned();
+        wal_name.push("-wal");
+        let wal = std::fs::metadata(PathBuf::from(wal_name))
+            .ok()
+            .map(|wal| (wal.len(), wal.modified().ok()));
+        Some(Self {
+            identity: StoreFileIdentity::of(&metadata),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            wal,
+        })
+    }
+}
+
+/// How long a remembered verdict stands before one real open is tried again.
+///
+/// Thirty seconds, the scale of the ref cache's own freshness bounds. A burst
+/// of calls (an agent retrying a failed search a few times in a few seconds)
+/// costs one failing open between them; a verdict that was wrong, or a repair
+/// that leaves the stamp unchanged, clears itself within half a minute instead
+/// of needing the server restarted.
+pub const DAMAGE_MEMORY_TTL: Duration = Duration::from_secs(30);
+
+/// What was found damaged. Damage confined to the full-text index leaves every
+/// question that does not read it answerable, so it is remembered apart from
+/// damage to the file as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageKind {
+    File,
+    FullText,
+}
+
+struct DamageEntry {
+    key: PathBuf,
+    kind: DamageKind,
+    stamp: DamageStamp,
+    remembered_at: Instant,
+    cause: String,
+}
+
+/// Files found damaged, so a damaged store costs one stat per call and not an
+/// open and a failing query (twice) on every call, across every server.
+///
+/// A verdict stands only while the file is the one it was found in (identity,
+/// length, modification time, `-wal`) and only for [`DAMAGE_MEMORY_TTL`].
+pub struct DamageMemory {
+    entries: Vec<DamageEntry>,
+    clock: Clock,
+}
+
+impl Default for DamageMemory {
+    fn default() -> Self {
+        Self::with_clock(system_clock())
+    }
+}
+
+impl DamageMemory {
+    pub fn with_clock(clock: Clock) -> Self {
+        Self {
+            entries: Vec::new(),
+            clock,
+        }
+    }
+
+    pub fn remember(&mut self, key: PathBuf, kind: DamageKind, stamp: DamageStamp, cause: String) {
+        self.entries
+            .retain(|known| !(known.key == key && known.kind == kind));
+        if self.entries.len() >= DAMAGE_MEMORY_CAP {
+            self.entries.remove(0);
+        }
+        let remembered_at = (self.clock)();
+        self.entries.push(DamageEntry {
+            key,
+            kind,
+            stamp,
+            remembered_at,
+            cause,
         });
     }
-    match Store::open_read_only(path) {
-        Ok(store) => Ok(store),
-        Err(err) if Store::is_unsupported_schema(&err) => Err(format!(
-            "rebuild_required: the DevMap store at {} is not this binary's schema and \
-will not be migrated in-place. Run `devmap build` in that repository. {err}",
-            path.display()
-        )),
-        Err(err) => Err(format!(
-            "devmap index at {} could not be opened: {err}",
-            path.display()
-        )),
+
+    /// The cause recorded for `key` if it is remembered as damaged in this way,
+    /// `current` is still the file that was, and the verdict has not outlived
+    /// [`DAMAGE_MEMORY_TTL`]. Otherwise the entry is forgotten (the file has
+    /// changed, cannot be seen, or the verdict is old) and the file is read
+    /// again.
+    pub fn recall(
+        &mut self,
+        key: &Path,
+        kind: DamageKind,
+        current: Option<DamageStamp>,
+    ) -> Option<String> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|known| known.key == key && known.kind == kind)?;
+        let now = (self.clock)();
+        let entry = &self.entries[pos];
+        let fresh = now.saturating_duration_since(entry.remembered_at) < DAMAGE_MEMORY_TTL;
+        if fresh && current == Some(entry.stamp) {
+            return Some(entry.cause.clone());
+        }
+        self.entries.remove(pos);
+        None
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -244,11 +676,18 @@ pub fn infer_root_from_store(store_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheLookup, StoreFileIdentity, StoreLru, StoreOrigin};
+    use super::{
+        CacheLookup, Clock, DamageKind, DamageMemory, DamageStamp, IdleSweeper, StoreFileIdentity,
+        StoreLru, StoreOrigin, DAMAGE_MEMORY_CAP, DAMAGE_MEMORY_TTL, STORE_IDLE_TTL,
+    };
+
+    include!("../../testsupport/timing.rs");
     use devmap_store::Store;
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn scratch_file(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -332,6 +771,356 @@ mod tests {
             cache.get_verified(&file, |path: &Path| std::fs::metadata(path)),
             CacheLookup::Evicted
         ));
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    /// A clock the test moves by hand: `advance` is the only thing that passes
+    /// time, so no test here sleeps.
+    fn manual_clock() -> (Clock, Arc<AtomicU64>) {
+        let base = Instant::now();
+        let offset_ms = Arc::new(AtomicU64::new(0));
+        let reader = Arc::clone(&offset_ms);
+        let clock: Clock =
+            Arc::new(move || base + Duration::from_millis(reader.load(Ordering::SeqCst)));
+        (clock, offset_ms)
+    }
+
+    fn advance(offset_ms: &AtomicU64, by: Duration) {
+        offset_ms.fetch_add(by.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    const A_MOMENT: Duration = Duration::from_millis(1);
+
+    fn opened_entry(cache: &mut StoreLru, tag: &str) -> (PathBuf, Arc<Store>) {
+        let file = scratch_file(tag);
+        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        cache.insert(
+            file.clone(),
+            Arc::clone(&store),
+            StoreOrigin::Opened(identity),
+        );
+        (file, store)
+    }
+
+    #[test]
+    fn a_store_unused_for_the_idle_ttl_is_dropped_and_its_memory_released() {
+        let (clock, offset) = manual_clock();
+        let mut cache = StoreLru::with_clock(clock);
+        let (file, store) = opened_entry(&mut cache, "idle");
+        assert_eq!(Arc::strong_count(&store), 2, "the cache holds one handle");
+
+        advance(&offset, STORE_IDLE_TTL - A_MOMENT);
+        assert!(
+            cache.evict_idle().is_empty(),
+            "just inside the ttl is still in use"
+        );
+        assert_eq!(cache.len(), 1);
+
+        advance(&offset, A_MOMENT);
+        let idle = cache.evict_idle();
+        assert_eq!(idle.len(), 1, "at the ttl it is taken out");
+        assert!(cache.is_empty());
+        assert_eq!(
+            Arc::strong_count(&store),
+            2,
+            "the cache hands the store back instead of dropping it under its lock"
+        );
+        drop(idle);
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "the cache released its handle, so the connection and edge index can be freed"
+        );
+        assert!(matches!(
+            cache.get_verified(&file, |path: &Path| std::fs::metadata(path)),
+            CacheLookup::Miss
+        ));
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_hit_restarts_the_idle_clock() {
+        let (clock, offset) = manual_clock();
+        let mut cache = StoreLru::with_clock(clock);
+        let (file, _store) = opened_entry(&mut cache, "touched");
+
+        advance(&offset, STORE_IDLE_TTL - A_MOMENT);
+        assert!(matches!(
+            cache.get_verified(&file, |path: &Path| std::fs::metadata(path)),
+            CacheLookup::Hit(_)
+        ));
+        advance(&offset, STORE_IDLE_TTL - A_MOMENT);
+        assert!(
+            cache.evict_idle().is_empty(),
+            "the ttl runs from the last use, not from the open"
+        );
+        advance(&offset, A_MOMENT);
+        assert_eq!(cache.evict_idle().len(), 1);
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_caller_owned_store_never_expires() {
+        let (clock, offset) = manual_clock();
+        let mut cache = StoreLru::with_clock(clock);
+        cache.insert(
+            PathBuf::from("in-memory"),
+            Arc::new(Store::open_in_memory().unwrap()),
+            StoreOrigin::CallerOwned,
+        );
+        advance(&offset, STORE_IDLE_TTL * 100);
+        assert!(
+            cache.evict_idle().is_empty(),
+            "dropping it would lose it, not free it"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_caller_owned_store_is_never_evicted_by_name() {
+        let mut cache = StoreLru::new();
+        cache.insert(
+            PathBuf::from("in-memory"),
+            Arc::new(Store::open_in_memory().unwrap()),
+            StoreOrigin::CallerOwned,
+        );
+        assert!(
+            cache.evict_opened(Path::new("in-memory")).is_empty(),
+            "a corrupt in-memory store is reported, not dropped and lost"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn evict_opened_takes_only_the_named_entry() {
+        let mut cache = StoreLru::new();
+        let (first, _a) = opened_entry(&mut cache, "evict-a");
+        let (second, _b) = opened_entry(&mut cache, "evict-b");
+        assert_eq!(cache.evict_opened(&first).len(), 1);
+        assert!(cache.evict_opened(&first).is_empty(), "already gone");
+        assert_eq!(cache.len(), 1);
+        assert!(matches!(
+            cache.get_verified(&second, |path: &Path| std::fs::metadata(path)),
+            CacheLookup::Hit(_)
+        ));
+        std::fs::remove_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(second.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_sweeper_drops_an_idle_store_with_no_call_arriving() {
+        let (clock, offset) = manual_clock();
+        let cache = Arc::new(Mutex::new(StoreLru::with_clock(clock)));
+        let (file, _store) = opened_entry(&mut cache.lock().unwrap(), "sweeper");
+        advance(&offset, STORE_IDLE_TTL);
+        let _sweeper = IdleSweeper::start(Arc::downgrade(&cache), Duration::from_millis(5))
+            .expect("the sweeper thread starts");
+        // Polls for the thread's effect, one millisecond apart, under a
+        // deadline scaled the way the repo's other load-tolerant tests are.
+        let deadline = Instant::now() + coverage_relaxed(Duration::from_secs(30));
+        while !cache.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the sweeper never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_mcp_open_uses_the_smaller_cache_and_no_mapping() {
+        let file = scratch_file("memory");
+        let store_path = file.with_file_name("devmap.sqlite");
+        drop(Store::open(&store_path).expect("create store"));
+        let opened = super::open_mcp_store(&store_path).expect("the mcp open");
+        assert_eq!(
+            opened.memory_settings().unwrap(),
+            super::MCP_READER_MEMORY,
+            "the MCP server's connections use their own setting"
+        );
+        assert_eq!(super::MCP_READER_MEMORY.cache_kib, 16_384);
+        assert_eq!(super::MCP_READER_MEMORY.mmap_bytes, 0);
+        let plain = Store::open_read_only(&store_path).expect("a plain read-only open");
+        assert_eq!(plain.memory_settings().unwrap().cache_kib, 65_536);
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    fn damaged_file(tag: &str) -> PathBuf {
+        let file = scratch_file(tag);
+        std::fs::write(&file, b"damaged").unwrap();
+        file
+    }
+
+    #[test]
+    fn a_damaged_file_is_remembered_until_it_changes() {
+        let file = damaged_file("damage-memory");
+        let mut memory = DamageMemory::default();
+        let file_kind = DamageKind::File;
+        assert!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_none(),
+            "nothing known yet"
+        );
+
+        memory.remember(
+            file.clone(),
+            file_kind,
+            DamageStamp::of(&file).unwrap(),
+            "page 7 is corrupt".to_string(),
+        );
+        assert_eq!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .as_deref(),
+            Some("page 7 is corrupt"),
+            "the recorded cause is what is recalled"
+        );
+        assert!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_some(),
+            "stays known"
+        );
+        assert!(
+            memory
+                .recall(&file, DamageKind::FullText, DamageStamp::of(&file))
+                .is_none(),
+            "a verdict about the file is not a verdict about its full-text index"
+        );
+
+        // A new length and a modification time set explicitly later: no sleeping,
+        // and no assumption about the timestamp resolution of this filesystem.
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, b"repaired").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(before + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_none(),
+            "a changed file is read again"
+        );
+        assert!(memory.is_empty(), "and forgotten");
+
+        memory.remember(
+            file.clone(),
+            file_kind,
+            DamageStamp::of(&file).unwrap(),
+            "again".to_string(),
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            memory
+                .recall(&file, file_kind, DamageStamp::of(&file))
+                .is_none(),
+            "a file that cannot be seen is not vouched for"
+        );
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_remembered_verdict_expires_after_its_ttl_without_the_file_changing() {
+        let (clock, offset) = manual_clock();
+        let file = damaged_file("damage-ttl");
+        let mut memory = DamageMemory::with_clock(clock);
+        memory.remember(
+            file.clone(),
+            DamageKind::File,
+            DamageStamp::of(&file).unwrap(),
+            "cause".to_string(),
+        );
+        advance(&offset, DAMAGE_MEMORY_TTL - A_MOMENT);
+        assert!(
+            memory
+                .recall(&file, DamageKind::File, DamageStamp::of(&file))
+                .is_some(),
+            "just inside the ttl it stands"
+        );
+        advance(&offset, A_MOMENT);
+        assert!(
+            memory
+                .recall(&file, DamageKind::File, DamageStamp::of(&file))
+                .is_none(),
+            "at the ttl an unchanged file is read again: a wrong verdict clears itself"
+        );
+        assert!(memory.is_empty());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_change_to_the_wal_alone_clears_a_remembered_damage() {
+        let file = damaged_file("damage-wal");
+        let mut memory = DamageMemory::default();
+        memory.remember(
+            file.clone(),
+            DamageKind::File,
+            DamageStamp::of(&file).unwrap(),
+            "cause".to_string(),
+        );
+        let mut wal = file.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::write(PathBuf::from(wal), b"frames").unwrap();
+        assert!(memory
+            .recall(&file, DamageKind::File, DamageStamp::of(&file))
+            .is_none());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    /// A remembered cause keeps every link of the error, not the outermost
+    /// message; links that repeat their source's text are named once.
+    #[test]
+    fn a_cause_keeps_its_whole_chain() {
+        #[derive(Debug)]
+        struct Link(&'static str, Option<Box<Link>>);
+        impl std::fmt::Display for Link {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Link {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|inner| inner as &(dyn std::error::Error + 'static))
+            }
+        }
+        let chain = Link(
+            "full-text index unreadable",
+            Some(Box::new(Link(
+                "full-text index unreadable",
+                Some(Box::new(Link("database disk image is malformed", None))),
+            ))),
+        );
+        assert_eq!(
+            super::error_chain(&chain),
+            "full-text index unreadable: database disk image is malformed"
+        );
+    }
+
+    #[test]
+    fn damage_memory_is_bounded() {
+        let mut memory = DamageMemory::default();
+        let file = damaged_file("damage-cap");
+        let stamp = DamageStamp::of(&file).unwrap();
+        for index in 0..DAMAGE_MEMORY_CAP * 3 {
+            memory.remember(
+                PathBuf::from(format!("store-{index}")),
+                DamageKind::File,
+                stamp,
+                "cause".to_string(),
+            );
+        }
+        assert_eq!(memory.len(), DAMAGE_MEMORY_CAP);
+        assert!(
+            memory
+                .recall(Path::new("store-0"), DamageKind::File, Some(stamp))
+                .is_none(),
+            "the oldest is the one forgotten"
+        );
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
