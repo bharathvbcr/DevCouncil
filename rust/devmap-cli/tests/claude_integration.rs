@@ -99,10 +99,15 @@ fn emitted_hooks_are_shell_form_absolute_hook_commands() {
                     !command.contains("${CLAUDE_PROJECT_DIR}"),
                     "{event}: placeholder must not appear; discovery is inside hook: {command}"
                 );
-                // Leading quoted absolute path.
-                let trimmed = command.trim_start_matches('"');
-                let path_end = trimmed.find('"').unwrap_or(0);
-                let path = &trimmed[..path_end];
+                // Leading single-quoted absolute path. Double quotes would still
+                // expand `$(...)` and backticks when the host shell runs it.
+                assert!(
+                    command.starts_with('\''),
+                    "{event}: executable must be single-quoted: {command}"
+                );
+                let rest = command.strip_prefix('\'').unwrap_or(command);
+                let path_end = rest.find('\'').unwrap_or(0);
+                let path = &rest[..path_end];
                 assert!(
                     Path::new(path).is_absolute(),
                     "{event}: command must start with an absolute path: {command}"
