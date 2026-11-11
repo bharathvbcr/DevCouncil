@@ -1491,8 +1491,14 @@ fn external_terminal_thread_binding_is_owned_immutable_and_preserved_across_fini
     // Managed runs must use `runs.protocol` and are refused by `runs.bind_thread`.
     let managed_prep = PREPARE
         .replace(r#""id":"run""#, r#""id":"run-managed""#)
-        .replace(r#""request_id":"prepare""#, r#""request_id":"prep-managed""#)
-        .replace(r#""provider":"codex""#, r#""kind":"managed","provider":"agy""#);
+        .replace(
+            r#""request_id":"prepare""#,
+            r#""request_id":"prep-managed""#,
+        )
+        .replace(
+            r#""provider":"codex""#,
+            r#""kind":"managed","provider":"agy""#,
+        );
     call(&store, "runs.prepare", &managed_prep);
     call(
         &store,
