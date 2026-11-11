@@ -93,6 +93,10 @@ name = "resolver_epoch_stamp"
 required-features = ["parse"]
 
 [[test]]
+name = "resolver_epoch_attack"
+required-features = ["parse"]
+
+[[test]]
 name = "kernel_defects_from_source"
 required-features = ["parse"]
 
