@@ -965,6 +965,23 @@ fn summarize_status(raw: &str) -> String {
         "stale"
     } else if flag("is_fresh").unwrap_or(false) {
         "ready"
+    } else if flag("analyzer_freshness") == Some(false) {
+        // The only analyzer verdict that is false without `rebuild_required` is
+        // a resolver mismatch (an extraction-payload one asks for a rebuild).
+        // The tree has not necessarily moved, so "source moved" would be false.
+        // It stays out of `rebuild_required` because a re-resolve can outlast
+        // the SessionStart budget; the next build heals it.
+        //
+        // A store a NEWER devmap wrote is the exception: a build here would
+        // replace its edges with this older resolver's, so the agent is told to
+        // update devmap and is not sent to rebuild.
+        if text("degraded_reason")
+            .is_some_and(|reason| reason.contains(devmap_store::RESOLVER_NEWER_REASON))
+        {
+            "ready (store written by a newer devmap; do not rebuild with this one)"
+        } else {
+            "ready (older resolver; run `devmap build`)"
+        }
     } else {
         // Queryable, but the tree has moved since the generation was built.
         "ready (source moved)"
@@ -2835,6 +2852,86 @@ mod tests {
             "rebuild_required": false,
             "node_count": 1,
             "edge_count": 2,
+        })
+        .to_string();
+        assert!(summarize_status(&raw).starts_with("ready (source moved)"));
+    }
+
+    /// A store whose edges were resolved by another resolver is queryable and
+    /// needs no SessionStart rebuild, but its tree has not moved: "source moved"
+    /// would be false, and would send the agent looking at its own edits.
+    #[test]
+    fn a_resolver_mismatch_is_not_called_a_moved_tree() {
+        let raw = serde_json::json!({
+            "query_ready": true,
+            "is_fresh": false,
+            "rebuild_required": false,
+            "source_freshness": true,
+            "analyzer_freshness": false,
+            "degraded_reason": devmap_store::ResolverStamp::Older.reason(),
+            "node_count": 1,
+            "edge_count": 2,
+            "generation_id": 7,
+        })
+        .to_string();
+        let summary = summarize_status(&raw);
+        assert!(!summary.contains("source moved"), "{summary}");
+        assert!(summary.starts_with("ready (older resolver"), "{summary}");
+        assert!(summary.contains("devmap build"), "{summary}");
+        assert!(summary.contains("1 symbols/2 edges (gen 7)"), "{summary}");
+    }
+
+    /// A store a newer devmap wrote must not send the agent to `devmap build`,
+    /// which would replace its edges with this older resolver's.
+    #[test]
+    fn a_newer_resolver_store_is_not_told_to_rebuild() {
+        let raw = serde_json::json!({
+            "query_ready": true,
+            "is_fresh": false,
+            "rebuild_required": false,
+            "source_freshness": true,
+            "analyzer_freshness": false,
+            "degraded_reason": devmap_store::ResolverStamp::Newer.reason(),
+            "node_count": 1,
+            "edge_count": 2,
+        })
+        .to_string();
+        let summary = summarize_status(&raw);
+        let clause = summary.split(';').next().unwrap_or_default();
+        assert!(clause.contains("newer devmap"), "{summary}");
+        assert!(!clause.contains("run `devmap build`"), "{summary}");
+        assert!(!clause.contains("older resolver"), "{summary}");
+        assert!(!clause.contains("source moved"), "{summary}");
+    }
+
+    /// Every non-current stamp keeps a readable clause: none reads as a moved
+    /// tree, and only the newer one withholds the rebuild advice.
+    #[test]
+    fn every_resolver_stamp_category_reads_correctly() {
+        use devmap_store::ResolverStamp::*;
+        for stamp in [Unrecorded, Unreadable, Malformed, Older, Different] {
+            let raw = serde_json::json!({
+                "query_ready": true, "is_fresh": false, "rebuild_required": false,
+                "source_freshness": true, "analyzer_freshness": false,
+                "degraded_reason": stamp.reason(),
+            })
+            .to_string();
+            let summary = summarize_status(&raw);
+            assert!(
+                summary.starts_with("ready (older resolver; run `devmap build`)"),
+                "{stamp:?}: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_moved_tree_over_a_current_analyzer_still_says_source_moved() {
+        let raw = serde_json::json!({
+            "query_ready": true,
+            "is_fresh": false,
+            "rebuild_required": false,
+            "source_freshness": false,
+            "analyzer_freshness": true,
         })
         .to_string();
         assert!(summarize_status(&raw).starts_with("ready (source moved)"));

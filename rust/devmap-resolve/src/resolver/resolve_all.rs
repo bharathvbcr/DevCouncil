@@ -2,11 +2,18 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-/// Cache identity for per-file resolution reuse.
+/// Identity of the resolver rules that produced a resolution.
 ///
-/// The blobs live in the repository state directory, not in sqlite. A resolver
-/// change that alters a file's edges without changing its content hash bumps
-/// this; a mismatch is a miss, and the file is resolved again.
+/// It does two things. It names the per-file reuse directory
+/// (`resolution-reuse-<epoch>`, in the repository state directory, not in
+/// sqlite), so blobs written under another epoch are never read. And the store
+/// stamps it into every generation it writes (`$.resolver_epoch` in
+/// `generations.analysis_json`), so a stored generation from another epoch, or
+/// from before the stamp, is not current: the no-change shortcut, `--affected`
+/// and the daemon drain re-resolve it instead of trusting its edges. It never
+/// looks at the rules themselves. It is moved by hand, and a resolver change
+/// that alters any file's edges without moving it is reused as if current.
+/// Moving it costs each store one full resolve (no re-parse) on its next build.
 pub const RESOLUTION_REUSE_EPOCH: &str = "2";
 
 /// One file's resolution before the whole-tree post-pass.

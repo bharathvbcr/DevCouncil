@@ -27,10 +27,10 @@ pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
     FileSymbolsPage, GenerationWriteOpts, KeywordNarrowing, LiteralPage, PageSizeConversion,
     PendingClaim, PendingEnqueueReport, PendingReconcile, PendingSupersede, PendingWatermark,
-    QuerySourceFreshness, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
+    QuerySourceFreshness, ResolverStamp, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
     StoredEdge, StoredFile, StoredLiteral, StoredSymbol, UnresolvedSiteRow, UnresolvedSitesByName,
     UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
-    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
+    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS, RESOLVER_NEWER_REASON,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

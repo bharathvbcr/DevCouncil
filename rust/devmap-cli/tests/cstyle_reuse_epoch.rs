@@ -49,13 +49,20 @@ fn build(root: &std::path::Path, extra: &[&str]) -> String {
 }
 
 fn scratch(label: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("devmap-cstyle-epoch-{label}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "devmap-cstyle-epoch-{label}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("c")).unwrap();
     std::fs::create_dir_all(root.join("java")).unwrap();
     std::fs::create_dir_all(root.join("util")).unwrap();
     std::fs::write(root.join("c/lib.c"), "int only_c(int x) { return x; }\n").unwrap();
-    std::fs::write(root.join("java/Cls.java"), "class Cls { void h() { only_c(1); } }\n").unwrap();
+    std::fs::write(
+        root.join("java/Cls.java"),
+        "class Cls { void h() { only_c(1); } }\n",
+    )
+    .unwrap();
     std::fs::write(root.join("util/other.py"), "def f():\n    return 1\n").unwrap();
     root
 }
@@ -68,7 +75,11 @@ const STALE: &str = "java/Cls.java::Cls.h>c/lib.c::only_c:Calls:0.90000";
 
 fn has_stale_edge(root: &std::path::Path) -> bool {
     let store = devmap_store::Store::open(db_path(root)).unwrap();
-    store.latest_edges_for_test().unwrap().iter().any(|row| row == STALE)
+    store
+        .latest_edges_for_test()
+        .unwrap()
+        .iter()
+        .any(|row| row == STALE)
 }
 
 /// A store the pre-split resolver would have left behind: the stale cross-group
@@ -101,7 +112,9 @@ fn stamp_older_extractor(root: &std::path::Path) {
     assert!(!languages.is_empty(), "the store carries payloads");
     for language in languages {
         let (_, current) = devmap_extract::cache::current_payload_identity(&language);
-        let (prefix, n) = current.rsplit_once("extract-v").expect("an extract-vNN identity");
+        let (prefix, n) = current
+            .rsplit_once("extract-v")
+            .expect("an extract-vNN identity");
         let older = format!("{prefix}extract-v{}", n.parse::<u32>().unwrap() - 1);
         let stored: String = conn
             .query_row(
@@ -110,13 +123,54 @@ fn stamp_older_extractor(root: &std::path::Path) {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, current, "{language}: the store was built by this binary");
+        assert_eq!(
+            stored, current,
+            "{language}: the store was built by this binary"
+        );
         conn.execute(
             "UPDATE file_payloads SET analyzer_version = ?1 WHERE language = ?2",
             [&older, &language],
         )
         .unwrap();
     }
+}
+
+/// Overwrite (or, with `None`, remove) the resolver identity the store's own
+/// write path stamped into the latest generation's `analysis_json`. This is the
+/// store as an older binary left it: `Some("1")` is a generation resolved under
+/// epoch 1, `None` one written before the stamp existed.
+fn stamp_resolver(root: &std::path::Path, epoch: Option<&str>) {
+    let conn = rusqlite::Connection::open(db_path(root)).unwrap();
+    let changed = match epoch {
+        Some(epoch) => conn.execute(
+            "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', ?1)
+              WHERE id = (SELECT max(id) FROM generations)",
+            [epoch],
+        ),
+        None => conn.execute(
+            "UPDATE generations SET analysis_json = json_remove(analysis_json, '$.resolver_epoch')
+              WHERE id = (SELECT max(id) FROM generations)",
+            [],
+        ),
+    }
+    .unwrap();
+    assert_eq!(changed, 1);
+}
+
+fn status_json(root: &std::path::Path, extra: &[&str]) -> serde_json::Value {
+    let mut args = vec!["--json", "status"];
+    args.extend_from_slice(extra);
+    let out = Command::new(devmap())
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .expect("devmap status");
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("status prints one JSON document")
 }
 
 fn stage_store(label: &str, older_extractor: bool) -> std::path::PathBuf {
@@ -153,7 +207,8 @@ fn stage_store(label: &str, older_extractor: bool) -> std::path::PathBuf {
     .unwrap();
     use sha2::{Digest, Sha256};
     let blob = legacy.join(format!("{:x}.json", Sha256::digest(b"java/Cls.java")));
-    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
     value["edges"].as_array_mut().unwrap().push(stale);
     std::fs::write(&blob, serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -175,7 +230,10 @@ fn stage_store(label: &str, older_extractor: bool) -> std::path::PathBuf {
         .unwrap();
     assert_eq!(added, 1, "the stale edge was staged");
     drop(conn);
-    assert!(has_stale_edge(&root), "the staged store carries the stale edge");
+    assert!(
+        has_stale_edge(&root),
+        "the staged store carries the stale edge"
+    );
     if older_extractor {
         stamp_older_extractor(&root);
     }
@@ -233,20 +291,6 @@ fn a_full_build_drops_the_stale_cross_group_edge() {
     );
 }
 
-/// Documents today's behaviour, which is NOT a defect of the split: a build with
-/// no source change is the pre-existing no-change shortcut ("generation still
-/// current"), accepted 2026-10-20, so it neither re-resolves nor reads the reuse
-/// epoch. A store built before the split keeps its cross-group edges until any
-/// file changes or `--full` runs.
-#[test]
-#[ignore = "pre-existing no-change shortcut has no resolver-version input; see ft-c1d8cb8e"]
-fn a_zero_edit_build_keeps_the_stale_edge_by_the_no_change_shortcut() {
-    let root = warm_store_from_the_base_resolver("zero");
-    let out = build(&root, &[]);
-    assert!(out.contains("No source changes"), "expected the shortcut; build said:\n{out}");
-    assert!(has_stale_edge(&root));
-}
-
 /// The forcing step the no-change shortcut does have: a store stamped by an
 /// older extractor is not "still current", so a ZERO-EDIT build re-extracts and
 /// re-resolves instead of returning early. Combined with the epoch (the reuse
@@ -268,19 +312,148 @@ fn a_zero_edit_build_over_an_older_extractor_store_drops_the_stale_edge() {
     assert_legacy_reuse_dir_removed(&root);
 }
 
-/// The paired control that makes the test above discriminate: the SAME staged
-/// store and the same zero-edit build, with the extractor stamp EQUAL to this
-/// binary's (nothing stamped), takes the shortcut and keeps the stale edge.
-/// Only the version stamp differs between the two tests.
+/// The paired control that makes the older-extractor and older-resolver tests
+/// discriminate: the SAME staged store and the same zero-edit build, with the
+/// extractor stamp AND the resolver stamp equal to this binary's, takes the
+/// shortcut and keeps the stale edge. `stage_store` builds with this binary, so
+/// both stamps are current, and the staged edge is a forgery under a matching
+/// stamp: the shortcut trusts the stamp, by design. Only the stamps differ
+/// between this test and the ones that re-resolve.
 #[test]
-fn a_zero_edit_build_over_a_current_extractor_store_keeps_the_stale_edge() {
+fn a_zero_edit_build_over_a_current_resolver_store_trusts_the_stamp() {
     let root = stage_store("zero-current", false);
     let out = build(&root, &[]);
-    assert!(out.contains("No source changes"), "expected the shortcut; build said:\n{out}");
+    assert!(
+        out.contains("No source changes"),
+        "expected the shortcut; build said:\n{out}"
+    );
     assert!(has_stale_edge(&root), "the stale edge must still be there");
     assert!(
-        devmap_extract::paths::state_dir(&root).join("resolution-reuse-1").exists()
+        devmap_extract::paths::state_dir(&root)
+            .join("resolution-reuse-1")
+            .exists()
             || devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH == "1",
         "the shortcut returns before the reuse directories are pruned"
+    );
+}
+
+/// The zero-edit build over a store resolved under an OLDER resolver epoch. The
+/// extractor identity is current (the staged store was built by this binary), so
+/// only the resolver stamp can defeat the no-change shortcut. This replaces the
+/// ignored pin `a_zero_edit_build_keeps_the_stale_edge_by_the_no_change_shortcut`,
+/// which recorded the defect (ft-c1d8cb8e) instead of failing on it.
+#[test]
+fn a_zero_edit_build_over_an_older_resolver_store_drops_the_stale_edge() {
+    let root = stage_store("zero-older-resolver", false);
+    stamp_resolver(&root, Some("1"));
+    let out = build(&root, &[]);
+    assert!(
+        !out.contains("No source changes"),
+        "an older resolver epoch must defeat the no-change shortcut; build said:\n{out}"
+    );
+    assert!(
+        !has_stale_edge(&root),
+        "a base-era cross-group edge survived a zero-edit build over an older resolver; build said:\n{out}"
+    );
+    assert_legacy_reuse_dir_removed(&root);
+    let again = build(&root, &[]);
+    assert!(
+        again.contains("No source changes"),
+        "the re-resolve stamps this binary's epoch, so the next zero-edit build is the shortcut; build said:\n{again}"
+    );
+}
+
+/// A generation written before the stamp existed has no resolver identity, and
+/// an unknown identity is not a matching one. It re-resolves once (no re-parse),
+/// and the second zero-edit build is the shortcut again.
+#[test]
+fn a_zero_edit_build_over_an_unstamped_store_re_resolves_once() {
+    let root = stage_store("zero-unstamped", false);
+    stamp_resolver(&root, None);
+    let out = build(&root, &[]);
+    assert!(
+        !out.contains("No source changes"),
+        "an unstamped generation must defeat the no-change shortcut; build said:\n{out}"
+    );
+    assert!(
+        !has_stale_edge(&root),
+        "a stale edge survived a zero-edit build over an unstamped store; build said:\n{out}"
+    );
+    let again = build(&root, &[]);
+    assert!(
+        again.contains("No source changes"),
+        "the unstamped store re-resolves ONCE; the second build said:\n{again}"
+    );
+}
+
+/// The `--affected` row of the card's table: no edit, `--affected <file>`.
+#[test]
+fn an_affected_build_with_no_edit_over_an_older_resolver_store_drops_the_stale_edge() {
+    let root = stage_store("affected-older-resolver", false);
+    stamp_resolver(&root, Some("1"));
+    let out = build(&root, &["--affected", "util/other.py"]);
+    assert!(
+        !out.contains("No source changes"),
+        "an older resolver epoch must defeat the no-change shortcut under --affected; build said:\n{out}"
+    );
+    assert!(
+        !has_stale_edge(&root),
+        "a base-era cross-group edge survived --affected with no edit over an older resolver; build said:\n{out}"
+    );
+}
+
+/// `devmap status` names a resolver mismatch with its own reason, reports the
+/// analyzer as not fresh, and does NOT ask SessionStart for an auto-rebuild: a
+/// re-resolve can outlast the hook budget, so it lands on the next detached or
+/// manual build. The older-extractor store beside it is the contrast, which does
+/// ask for one.
+#[test]
+fn status_names_a_resolver_mismatch_and_does_not_auto_rebuild_on_it() {
+    let root = stage_store("status-older-resolver", false);
+    stamp_resolver(&root, Some("1"));
+    let status = status_json(&root, &["--auto-rebuild"]);
+    let reason = status["degraded_reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("older resolver epoch") && reason.contains("devmap build"),
+        "the resolver mismatch needs its own reason; status said: {status}"
+    );
+    assert!(!reason.contains("obsolete"), "{reason}");
+    assert_eq!(
+        status["analyzer_freshness"],
+        serde_json::json!(false),
+        "{status}"
+    );
+    assert_eq!(status["is_fresh"], serde_json::json!(false), "{status}");
+    assert_eq!(
+        status["rebuild_required"],
+        serde_json::json!(false),
+        "{status}"
+    );
+    assert!(
+        status["auto_rebuilt"].is_null(),
+        "auto-rebuild fired on a resolver mismatch: {status}"
+    );
+    assert!(
+        has_stale_edge(&root),
+        "status must not have rebuilt the store"
+    );
+
+    stamp_resolver(&root, None);
+    let unrecorded = status_json(&root, &[]);
+    assert!(
+        unrecorded["degraded_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unrecorded"),
+        "an unstamped generation reads as unrecorded; status said: {unrecorded}"
+    );
+    assert_eq!(unrecorded["rebuild_required"], serde_json::json!(false));
+
+    let aged = stage_store("status-older-extractor", true);
+    let contrast = status_json(&aged, &[]);
+    assert_eq!(
+        contrast["rebuild_required"],
+        serde_json::json!(true),
+        "{contrast}"
     );
 }

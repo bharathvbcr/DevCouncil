@@ -138,6 +138,65 @@ pub(super) fn keyed_ledger_sql(
     )
 }
 
+/// How a generation's resolver stamp relates to this binary's
+/// `RESOLUTION_REUSE_EPOCH`. The stored bytes never leave the store: each
+/// variant has fixed, bounded text, so a hostile or oversized stamp can neither
+/// bloat a status field nor spell a phrase `rebuild_required_reason` matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolverStamp {
+    /// Equal to this binary's epoch, or there is no generation to judge.
+    Current,
+    /// No `resolver_epoch` key: a generation written before the stamp existed.
+    Unrecorded,
+    /// `analysis_json` is not a JSON document, so the stamp cannot be read.
+    Unreadable,
+    /// More than one `resolver_epoch` key, or a value that is not JSON text.
+    Malformed,
+    /// An unsigned integer lower than this binary's.
+    Older,
+    /// An unsigned integer higher than this binary's: a newer devmap wrote it.
+    Newer,
+    /// Text that is neither equal nor an ordered pair of unsigned integers.
+    Different,
+}
+
+/// What a status reason for a newer-resolver store begins with; the hook keys
+/// its wording on it so it never advises a rebuild that would roll edges back.
+pub const RESOLVER_NEWER_REASON: &str = "stored edges were written by a newer devmap";
+
+impl ResolverStamp {
+    /// The fixed status text for a stamp that is not current.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Current => "stored edges were resolved by this resolver",
+            Self::Unrecorded => "stored edges carry an unrecorded resolver epoch (no stamp: written before it existed); run `devmap build`",
+            Self::Unreadable => "stored analysis document is unreadable, so the resolver that wrote the edges is unknown; run `devmap build`",
+            Self::Malformed => "stored resolver epoch stamp is malformed; run `devmap build`",
+            Self::Older => "stored edges were resolved by an older resolver epoch than this binary's; run `devmap build`",
+            Self::Newer => "stored edges were written by a newer devmap (a newer resolver epoch than this binary's); rebuilding with this binary would replace them with an older resolver's edges, so update devmap instead",
+            Self::Different => "stored edges were resolved under a different resolver epoch than this binary's; run `devmap build`",
+        }
+    }
+}
+
+/// `(json_valid, stamp key count, stamp JSON type, stamp prefix, stamp length)`.
+type StampRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// An epoch as an unsigned integer, only when it is plain digits (no sign, no
+/// padding) and short enough to be one; anything else is not orderable.
+fn unsigned_epoch(text: &str) -> Option<u64> {
+    if text.is_empty() || text.len() > 18 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
 impl Store {
     /// Re-measure a build's `build_ms` once all of its work is done.
     ///
@@ -563,7 +622,11 @@ impl Store {
     /// `collect_project_manifests` and the payload identities answer without
     /// a grammar, so a query-only embedder gets the same verdict.
     pub fn latest_generation_matches_working_tree(&self) -> Result<bool> {
-        if !self.latest_generation_payload_is_current()? {
+        // Extractor-only on purpose. The resolver stamp is not asked here, so
+        // seeding and stacking judge a donor (including a pre-stamp one) as they
+        // did before the stamp existed; a build or a drain that must not trust
+        // the stored edges asks `latest_generation_payload_is_current`.
+        if !self.latest_generation_extraction_is_current()? {
             return Ok(false);
         }
         let Some(root) = self.latest_repo_root()? else {
@@ -591,8 +654,93 @@ impl Store {
         Ok(crate::DiscoveryInventory::of(&scanned.report, &manifests) == stored)
     }
 
+    /// Whether the latest generation's stored edges may be trusted as they are:
+    /// the extractor that wrote its payloads AND the resolver that wrote its
+    /// edges are the ones running now.
+    ///
+    /// A store with no generation is current, as before. This is the check the
+    /// CLI no-change shortcut, `affected_closure` and the daemon drain share, so
+    /// a resolver-only change (a `RESOLUTION_REUSE_EPOCH` move) defeats all
+    /// three. One lock covers both questions, so they read one snapshot.
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
+        Ok(Self::extraction_is_current_on(&conn)?
+            && Self::resolver_stamp_on(&conn)? == ResolverStamp::Current)
+    }
+
+    /// How the resolver stamp in the latest generation relates to this
+    /// binary's `RESOLUTION_REUSE_EPOCH`. Read-only; see [`ResolverStamp`].
+    pub fn latest_generation_resolver_stamp(&self) -> Result<ResolverStamp> {
+        let conn = lock_conn(&self.conn)?;
+        Self::resolver_stamp_on(&conn)
+    }
+
+    fn resolver_stamp_on(conn: &rusqlite::Connection) -> Result<ResolverStamp> {
+        // `json_each` lists a duplicated key once per occurrence, so the count
+        // sees what `json_extract` would silently resolve. Only a bounded prefix
+        // of a text stamp is fetched: a hostile stamp must cost no more to read
+        // than a real one. Any other JSON type is malformed, never coerced.
+        let row: Option<StampRow> = conn
+            .query_row(
+                "SELECT json_valid(analysis_json),
+                        CASE WHEN json_valid(analysis_json) THEN
+                             (SELECT count(*) FROM json_each(analysis_json)
+                               WHERE key = 'resolver_epoch') END,
+                        CASE WHEN json_valid(analysis_json) THEN
+                             json_type(analysis_json, '$.resolver_epoch') END,
+                        CASE WHEN json_valid(analysis_json) THEN
+                             substr(json_extract(analysis_json, '$.resolver_epoch'), 1, 24) END,
+                        CASE WHEN json_valid(analysis_json) THEN
+                             length(json_extract(analysis_json, '$.resolver_epoch')) END
+                   FROM generations WHERE id = (SELECT max(id) FROM generations)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((valid, keys, kind, prefix, length)) = row else {
+            return Ok(ResolverStamp::Current);
+        };
+        if valid != Some(1) {
+            return Ok(ResolverStamp::Unreadable);
+        }
+        Ok(match (keys.unwrap_or(0), kind.as_deref()) {
+            (0, _) => ResolverStamp::Unrecorded,
+            (1, Some("text")) => {
+                let current = devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH;
+                let stored = prefix.unwrap_or_default();
+                if usize::try_from(length.unwrap_or(0)).ok() == Some(stored.chars().count())
+                    && stored == current
+                {
+                    ResolverStamp::Current
+                } else {
+                    match (unsigned_epoch(&stored), unsigned_epoch(current)) {
+                        (Some(stored), Some(current)) if stored < current => ResolverStamp::Older,
+                        (Some(stored), Some(current)) if stored > current => ResolverStamp::Newer,
+                        _ => ResolverStamp::Different,
+                    }
+                }
+            }
+            _ => ResolverStamp::Malformed,
+        })
+    }
+
+    /// Whether the extractor that wrote the latest generation's payloads is the
+    /// one running now. See [`Self::latest_generation_payload_is_current`] for
+    /// the check that also asks the resolver.
+    pub fn latest_generation_extraction_is_current(&self) -> Result<bool> {
+        let conn = lock_conn(&self.conn)?;
+        Self::extraction_is_current_on(&conn)
+    }
+
+    fn extraction_is_current_on(conn: &rusqlite::Connection) -> Result<bool> {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT language, grammar_version, analyzer_version
              FROM generation_files
@@ -1114,13 +1262,24 @@ impl Store {
         let mut status = self.status_snapshot(db_path)?;
         if let Some(generation) = status.latest_generation {
             if status.pending_count == 0 && status.degraded_reason.is_none() {
-                let (analyzer_freshness, analyzer_reason) =
-                    match self.latest_generation_payload_is_current() {
-                        Ok(true) => (Some(true), None),
-                        Ok(false) => (Some(false), Some(
-                            "stored extraction payload is obsolete; rebuild with the current analyzer".to_string())),
-                        Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
-                    };
+                // One lock for both analyzer questions: they read one snapshot.
+                let (analyzer_freshness, analyzer_reason) = match lock_conn(&self.conn)
+                    .and_then(|conn| {
+                        Ok((
+                            Self::extraction_is_current_on(&conn)?,
+                            Self::resolver_stamp_on(&conn)?,
+                        ))
+                    }) {
+                    Ok((true, ResolverStamp::Current)) => (Some(true), None),
+                    // A resolver mismatch has its own reason, which
+                    // `rebuild_required_reason` does not match: a re-resolve can
+                    // outlast the SessionStart budget, so it lands on the next
+                    // build instead of an automatic one.
+                    Ok((true, stamp)) => (Some(false), Some(stamp.reason().to_string())),
+                    Ok((false, _)) => (Some(false), Some(
+                        "stored extraction payload is obsolete; rebuild with the current analyzer".to_string())),
+                    Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
+                };
                 let (source_freshness, source_reason, source_delta) =
                     self.source_snapshot_mismatch(generation, cancel)?;
                 status.source_freshness = source_freshness;
