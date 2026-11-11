@@ -11,7 +11,7 @@ use devmap_analyze::analyze;
 use devmap_extract::extract_tree_with_report;
 use devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH;
 use devmap_resolve::Resolver;
-use devmap_store::{GenerationWriteOpts, Store};
+use devmap_store::{GenerationWriteOpts, ResolverStamp, Store};
 
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -103,9 +103,15 @@ fn a_numeric_stamp_equal_to_the_epoch_text_is_not_current() {
 #[test]
 fn a_boolean_or_nested_or_padded_stamp_is_not_current() {
     for (label, value) in [
-        ("padded", format!("json_quote(' {RESOLUTION_REUSE_EPOCH} ')")),
+        (
+            "padded",
+            format!("json_quote(' {RESOLUTION_REUSE_EPOCH} ')"),
+        ),
         ("bool", "json('true')".to_string()),
-        ("object", format!("json('{{\"v\":\"{RESOLUTION_REUSE_EPOCH}\"}}')")),
+        (
+            "object",
+            format!("json('{{\"v\":\"{RESOLUTION_REUSE_EPOCH}\"}}')"),
+        ),
         ("array", format!("json('[\"{RESOLUTION_REUSE_EPOCH}\"]')")),
         ("null", "json('null')".to_string()),
     ] {
@@ -129,11 +135,15 @@ fn a_duplicate_stamp_key_never_reads_as_current() {
     for (label, doc) in [
         (
             "dup-current-first",
-            format!("'{{\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\",\"resolver_epoch\":\"0\"}}'"),
+            format!(
+                "'{{\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\",\"resolver_epoch\":\"0\"}}'"
+            ),
         ),
         (
             "dup-current-last",
-            format!("'{{\"resolver_epoch\":\"0\",\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\"}}'"),
+            format!(
+                "'{{\"resolver_epoch\":\"0\",\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\"}}'"
+            ),
         ),
     ] {
         let (root, db, store) = indexed(label);
@@ -207,14 +217,18 @@ fn a_newer_stamp_is_reported_as_newer_and_reading_does_not_rewrite() {
 fn a_rewrite_restores_current_and_restamp_does_not_launder_a_stale_stamp() {
     let (root, db, store) = indexed("heal");
     set_analysis(&db, "json_set(analysis_json, '$.resolver_epoch', '1')");
-    store.restamp_latest_head_keeping_seed_rebind("abc123").unwrap();
+    store
+        .restamp_latest_head_keeping_seed_rebind("abc123")
+        .unwrap();
     assert!(
         !store.latest_generation_payload_is_current().unwrap(),
         "restamping the head must not make stale edges current"
     );
     write_generation(&root, &store);
     assert!(store.latest_generation_payload_is_current().unwrap());
-    store.restamp_latest_head_keeping_seed_rebind("def456").unwrap();
+    store
+        .restamp_latest_head_keeping_seed_rebind("def456")
+        .unwrap();
     assert!(store.latest_generation_payload_is_current().unwrap());
     store.prune_generations_except_latest(1).unwrap();
     assert!(store.latest_generation_payload_is_current().unwrap());
@@ -239,7 +253,159 @@ fn reopening_a_store_does_not_launder_a_missing_stamp() {
 fn the_stamped_document_reads_back_as_an_analysis_summary() {
     let (root, db, store) = indexed("backcompat");
     let doc: serde_json::Value = serde_json::from_str(&analysis(&db)).unwrap();
-    assert_eq!(doc["resolver_epoch"], serde_json::json!(RESOLUTION_REUSE_EPOCH));
+    assert_eq!(
+        doc["resolver_epoch"],
+        serde_json::json!(RESOLUTION_REUSE_EPOCH)
+    );
     assert!(store.latest_analysis().unwrap().is_some());
     let _ = fs::remove_dir_all(&root);
+}
+
+fn reason_of(store: &Store) -> String {
+    store
+        .status("test")
+        .unwrap()
+        .degraded_reason
+        .expect("a reason is named")
+}
+
+/// An `analysis_json` that is not a JSON document is "unreadable", not
+/// "unrecorded" (round-2 MINOR 4): a store that could not be read is not one
+/// that predates the stamp.
+#[test]
+fn a_non_json_analysis_document_is_unreadable_not_unrecorded() {
+    let (root, db, store) = indexed("unreadable");
+    set_analysis(&db, "'{not json'");
+    assert_eq!(
+        store.latest_generation_resolver_stamp().unwrap(),
+        ResolverStamp::Unreadable
+    );
+    assert!(!store.latest_generation_payload_is_current().unwrap());
+    let reason = reason_of(&store);
+    assert!(reason.contains("unreadable"), "{reason}");
+    assert!(!reason.contains("unrecorded"), "{reason}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Each way a stamp can fail to be current lands in its own category.
+#[test]
+fn stamps_are_classified_without_echoing_them() {
+    let cases: [(&str, String, ResolverStamp); 8] = [
+        (
+            "older",
+            "json_set(analysis_json, '$.resolver_epoch', '0')".into(),
+            ResolverStamp::Older,
+        ),
+        (
+            "newer",
+            "json_set(analysis_json, '$.resolver_epoch', '999')".into(),
+            ResolverStamp::Newer,
+        ),
+        (
+            "word",
+            "json_set(analysis_json, '$.resolver_epoch', 'beta')".into(),
+            ResolverStamp::Different,
+        ),
+        (
+            "signed",
+            "json_set(analysis_json, '$.resolver_epoch', '+1')".into(),
+            ResolverStamp::Different,
+        ),
+        (
+            "missing",
+            "json_remove(analysis_json, '$.resolver_epoch')".into(),
+            ResolverStamp::Unrecorded,
+        ),
+        (
+            "number",
+            "json_set(analysis_json, '$.resolver_epoch', json('1'))".into(),
+            ResolverStamp::Malformed,
+        ),
+        (
+            "null",
+            "json_set(analysis_json, '$.resolver_epoch', json('null'))".into(),
+            ResolverStamp::Malformed,
+        ),
+        (
+            "dup",
+            "'{\"resolver_epoch\":\"1\",\"resolver_epoch\":\"1\"}'".into(),
+            ResolverStamp::Malformed,
+        ),
+    ];
+    for (label, sql, want) in cases {
+        let (root, db, store) = indexed(label);
+        set_analysis(&db, &sql);
+        assert_eq!(
+            store.latest_generation_resolver_stamp().unwrap(),
+            want,
+            "{label}"
+        );
+        let reason = reason_of(&store);
+        assert_eq!(
+            reason,
+            want.reason(),
+            "{label}: fixed text, nothing from the document"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// Two equal duplicate keys are still ambiguous, and an equal-valued nested key
+/// is not the top-level stamp.
+#[test]
+fn a_duplicate_with_equal_values_and_a_nested_stamp_are_not_current() {
+    let (root, db, store) = indexed("dup-equal");
+    set_analysis(
+        &db,
+        &format!(
+            "'{{\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\",\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\"}}'"
+        ),
+    );
+    assert!(!store.latest_generation_payload_is_current().unwrap());
+    set_analysis(
+        &db,
+        &format!("'{{\"x\":{{\"resolver_epoch\":\"{RESOLUTION_REUSE_EPOCH}\"}}}}'"),
+    );
+    assert_eq!(
+        store.latest_generation_resolver_stamp().unwrap(),
+        ResolverStamp::Unrecorded
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The newer-store text names the newer devmap and does not advise a rebuild.
+#[test]
+fn a_newer_store_status_says_newer_and_does_not_advise_a_rebuild() {
+    let (root, db, store) = indexed("newer-text");
+    set_analysis(&db, "json_set(analysis_json, '$.resolver_epoch', '999')");
+    let reason = reason_of(&store);
+    assert!(
+        reason.starts_with(devmap_store::RESOLVER_NEWER_REASON),
+        "{reason}"
+    );
+    assert!(!reason.contains("run `devmap build`"), "{reason}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// No category's text can be matched by `rebuild_required_reason` (SessionStart
+/// auto-rebuild), and each is short. The matcher lives in devmap-serve, which
+/// this crate cannot depend on, so its three phrases are asserted here and the
+/// function itself is called in devmap-serve's `daemon_resolver_epoch` test.
+#[test]
+fn no_stamp_category_text_matches_a_rebuild_trigger() {
+    use ResolverStamp::*;
+    for stamp in [
+        Current, Unrecorded, Unreadable, Malformed, Older, Newer, Different,
+    ] {
+        let reason = stamp.reason();
+        assert!(reason.len() < 400, "{stamp:?}");
+        for phrase in [
+            "stored extraction payload is obsolete",
+            "run `devmap build` to migrate",
+            "migrate",
+            "store schema is",
+        ] {
+            assert!(!reason.contains(phrase), "{stamp:?} contains {phrase:?}");
+        }
+    }
 }

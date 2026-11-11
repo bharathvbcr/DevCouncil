@@ -13,6 +13,7 @@ use rusqlite::{params_from_iter, Connection, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod generation;
+pub use generation::{ResolverStamp, RESOLVER_NEWER_REASON};
 mod integrity;
 mod maintenance;
 mod migrate;

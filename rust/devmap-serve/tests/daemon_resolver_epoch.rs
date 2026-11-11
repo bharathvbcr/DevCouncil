@@ -268,3 +268,18 @@ fn a_same_bytes_rewrite_drained_over_a_current_resolver_store_trusts_the_stamp()
         "a current stamp is trusted: the staged edge is a forgery under it"
     );
 }
+
+/// SessionStart auto-rebuilds on whatever `rebuild_required_reason` matches. A
+/// resolver-stamp reason must never be one of those, whatever the stored stamp
+/// held: each category has fixed text.
+#[test]
+fn no_resolver_stamp_reason_asks_for_an_automatic_rebuild() {
+    use devmap_store::ResolverStamp::*;
+    for stamp in [Unrecorded, Unreadable, Malformed, Older, Newer, Different] {
+        assert_eq!(
+            devmap_serve::root_resolve::rebuild_required_reason(Some(stamp.reason()), false),
+            None,
+            "{stamp:?}"
+        );
+    }
+}

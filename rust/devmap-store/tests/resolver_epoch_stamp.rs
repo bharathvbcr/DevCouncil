@@ -127,9 +127,7 @@ fn an_older_resolver_stamp_is_not_current_and_status_says_why() {
     assert!(!status.is_fresh());
     let reason = status.degraded_reason.expect("a reason is named");
     assert!(
-        reason.contains("resolver epoch 1")
-            && reason.contains(&format!("resolves under {RESOLUTION_REUSE_EPOCH}"))
-            && reason.contains("devmap build"),
+        reason.contains("older resolver epoch") && reason.contains("devmap build"),
         "{reason}"
     );
     assert!(

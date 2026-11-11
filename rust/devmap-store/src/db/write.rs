@@ -60,7 +60,7 @@ const PAYLOAD_WINDOW_PER_THREAD: usize = 2;
 
 /// What `generations.analysis_json` holds: the analysis summary, flattened, and
 /// the epoch of the resolver that produced the generation's edges. See
-/// `Store::latest_generation_resolver_epoch` for the reader.
+/// `Store::latest_generation_resolver_stamp` for the reader.
 #[cfg(feature = "parse")]
 #[derive(serde::Serialize)]
 struct StampedAnalysis<'a> {
