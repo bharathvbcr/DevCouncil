@@ -937,6 +937,22 @@ fn take_expression(
                 }
                 return;
             }
+            // A lone identifier in Svelte markup (`{size}`, `value={size}`,
+            // `onclick={save}`, `on:click={save}`) is a value read, never a
+            // call: nothing in the template invokes it. The TypeScript and
+            // TSX extractor records an identifier in value position (an
+            // argument, a JSX attribute value, a JSX text expression) as a
+            // `Name` reference and a call only at a callee position
+            // (`treesitter/references.rs`), and Svelte follows the same rule.
+            extraction.references.push(ExtractedReference {
+                name,
+                kind: ReferenceKind::Name,
+                span,
+                enclosing_symbol: Some(file_path.to_string()),
+                assigned_to: None,
+                receiver_expr: None,
+            });
+            return;
         }
         extraction.calls.push(ExtractedCall {
             caller_symbol: Some(file_path.to_string()),

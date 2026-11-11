@@ -11,3 +11,9 @@ export function priorityLabel(card: { priority: number }): string {
 // svelte/transition's name, local to nothing: a directive that names the imported one
 // must not reach this.
 export function fade(): void {}
+
+// A same-named neighbour: Handlers.svelte imports savePost from posts.ts, so no edge of any
+// tier may reach this one.
+export function savePost(id: string): string {
+  return id + "!";
+}

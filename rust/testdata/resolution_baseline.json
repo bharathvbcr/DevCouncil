@@ -2,7 +2,7 @@
   "_comment": "W4.2 — per-language net call-resolution rate over the labelled fixtures, in permille. Frozen so a grammar bump that silently stops matching a node kind fails CI on the language it broke, which no golden identity fixture can catch. Regenerate with DEVMAP_UPDATE_RESOLUTION_BASELINE=1 cargo test -p devmap-analyze --test resolution_rate_baseline, and only after reading why the number moved.",
   "_null_means": "The language extracts calls but this fixture contains no call site, so no rate was attempted. Not zero: a baseline of null and a current of 0 are different facts, and the test refuses to read either as the other.",
   "_tolerance_permille": 10,
-  "_svelte_note": "accuracy/svelte is Board.svelte, Directives.svelte and Stores.svelte only (its floor was 923 before Stores.svelte arrived; it is 750 now). The drop is not the runes: $state, $derived, $effect and $props are explained host globals and do not count against the rate. It is six lone markup identifiers that name script variables, recorded as Calls and classed local_binding (unattributed): Stores.svelte {pattern}{template}{member}{renamed}{size} and Board.svelte {cards}. Whether a lone identifier is a Call or a Reference is the owner's decision; until then 750 is what these files measure. The scope and store-read fixtures live in accuracy/svelte-scope so that easy resolutions there cannot dilute this floor.",
+  "_svelte_note": "accuracy/svelte is Board.svelte, Directives.svelte, Stores.svelte and Handlers.svelte. A lone identifier in Svelte markup ({size}, value={size}, onclick={save}, on:click={save}) is a value read, so it is a Name reference, not a Call, the same rule the TypeScript and TSX extractor applies to an identifier in value position. Its floor was 923, fell to 750 while the six lone identifiers naming script variables (Stores.svelte {pattern}{template}{member}{renamed}{size}, Board.svelte {cards}) were recorded as Calls classed local_binding (unattributed), and is 1000 now that they are references and leave the call denominator; the runes ($state, $derived, $effect, $props) are explained host globals and never counted. The scope and store-read fixtures live in accuracy/svelte-scope so that easy resolutions there cannot dilute this floor.",
   "fixtures": {
     "accuracy/go": {
       "go": 795
@@ -42,7 +42,7 @@
       "rust": 714
     },
     "accuracy/svelte": {
-      "svelte": 750,
+      "svelte": 1000,
       "typescript": 1000
     },
     "accuracy/svelte-scope": {

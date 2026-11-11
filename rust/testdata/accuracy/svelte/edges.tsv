@@ -31,3 +31,7 @@ sv.directive_out	out: directive	src/Directives.svelte	src/lib/actions.ts::shrink
 sv.directive_animate	animate: directive	src/Directives.svelte	src/lib/actions.ts::reorder	edge	must		animate:reorder names the imported function
 sv.directive_transition_external	transition: of an imported name	src/Directives.svelte	src/lib/decoy.ts::fade	forbid_any_tier	must		transition:fade is svelte/transition's fade, not a local namesake
 sv.directive_transition	transition: directive	src/Directives.svelte	src/lib/actions.ts::slide	edge	must		transition:slide names the imported function
+sv.handler_attr	onclick={f} handler attribute	src/Handlers.svelte	src/lib/posts.ts::savePost	edge	must		onclick={savePost}: a function handed over is a use (a reference, not a call)
+sv.handler_directive	on:click={f} handler directive	src/Handlers.svelte	src/lib/posts.ts::archivePost	edge	must		on:click={archivePost}
+sv.handler_local	onclick={f} of a script function	src/Handlers.svelte	src/Handlers.svelte::reset	edge	must		onclick={reset} reaches the declaration in the same script
+sv.handler_decoy	namesake	src/Handlers.svelte	src/lib/decoy.ts::savePost	forbid_any_tier	must		decoy.ts is never imported by Handlers.svelte

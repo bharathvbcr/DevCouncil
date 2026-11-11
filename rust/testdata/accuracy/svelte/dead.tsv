@@ -23,3 +23,7 @@ live	src/lib/actions.ts::grow	named only by a directive
 live	src/lib/actions.ts::shrink	named only by a directive
 live	src/lib/actions.ts::reorder	named only by a directive
 live	src/lib/actions.ts::slide	named only by a directive
+live	src/lib/posts.ts::savePost	named only as onclick={savePost}
+live	src/lib/posts.ts::archivePost	named only as on:click={archivePost}
+live	src/Handlers.svelte::reset	named only as onclick={reset}
+exported_unreferenced	src/lib/decoy.ts::savePost	never imported; the decoy for a same-named import

@@ -40,6 +40,22 @@ fn call_references(e: &Extraction, name: &str) -> usize {
         .count()
 }
 
+/// Plain `Name` references (a value read, not a call) to `name`: what a lone
+/// markup identifier such as `{item}` or `onclick={item}` records.
+fn name_refs(e: &Extraction, name: &str) -> usize {
+    e.references
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Name && r.name == name && r.receiver_expr.is_none())
+        // A site that carries a local binding is the template's own name, which
+        // the resolver never binds to a namesake.
+        .filter(|r| {
+            !e.local_bindings
+                .iter()
+                .any(|b| b.start_byte == r.span.start_byte && b.name == name)
+        })
+        .count()
+}
+
 /// The leading identifier of an expression: `item.sub[0]` -> `item`.
 fn root_of(expr: &str) -> &str {
     let end = expr
@@ -93,11 +109,17 @@ fn an_each_item_is_not_a_call_to_its_namesake() {
     assert!(is_clean(&e), "{:?}", e.parse_outcome);
     assert_eq!(
         bare_calls(&e, "item"),
-        1,
-        "only the use after the block: {:?}",
+        0,
+        "{{item}} is a read: {:?}",
         e.calls
     );
-    assert_eq!(call_references(&e, "item"), 1, "{:?}", e.references);
+    assert_eq!(call_references(&e, "item"), 0, "{:?}", e.references);
+    assert_eq!(
+        name_refs(&e, "item"),
+        1,
+        "only the use after the block: {:?}",
+        e.references
+    );
 }
 
 #[test]
@@ -111,9 +133,15 @@ fn an_each_pattern_an_index_and_nesting_bind_inside_the_block_only() {
     for bound in ["a", "c", "i", "inner"] {
         assert_eq!(
             bare_calls(&e, bound),
+            0,
+            "a lone identifier is a read: {:?}",
+            e.calls
+        );
+        assert_eq!(
+            name_refs(&e, bound),
             1,
             "{bound}: only the use after the block: {:?}",
-            e.calls
+            e.references
         );
     }
     // `b` is a property key, not a binding: nothing else is affected by it.
@@ -125,11 +153,12 @@ fn the_else_branch_of_an_each_does_not_see_the_item() {
     let e = ex(&format!(
         "{HEAD}{{#each rows as item}}{{item}}{{:else}}{{item}}{{/each}}\n"
     ));
+    assert_eq!(bare_calls(&e, "item"), 0, "{:?}", e.calls);
     assert_eq!(
-        bare_calls(&e, "item"),
+        name_refs(&e, "item"),
         1,
         "only the else branch: {:?}",
-        e.calls
+        e.references
     );
 }
 
@@ -142,9 +171,15 @@ fn a_snippet_parameter_is_bound_in_the_snippet_only() {
     assert!(is_clean(&e), "{:?}", e.parse_outcome);
     assert_eq!(
         bare_calls(&e, "item"),
+        0,
+        "a lone identifier is a read: {:?}",
+        e.calls
+    );
+    assert_eq!(
+        name_refs(&e, "item"),
         1,
         "only the use after the snippet: {:?}",
-        e.calls
+        e.references
     );
     assert_eq!(bare_calls(&e, "other"), 0, "{:?}", e.calls);
     assert_eq!(
@@ -164,9 +199,15 @@ fn a_const_tag_binds_for_the_rest_of_its_block() {
     assert!(is_clean(&e), "{:?}", e.parse_outcome);
     assert_eq!(
         bare_calls(&e, "item"),
+        0,
+        "a lone identifier is a read: {:?}",
+        e.calls
+    );
+    assert_eq!(
+        name_refs(&e, "item"),
         1,
         "only the use after the block: {:?}",
-        e.calls
+        e.references
     );
     assert_eq!(
         bare_calls(&e, "row"),
@@ -187,9 +228,15 @@ fn an_await_result_is_bound_in_its_branch_only() {
     for bound in ["w", "v", "e"] {
         assert_eq!(
             bare_calls(&e, bound),
+            0,
+            "a lone identifier is a read: {:?}",
+            e.calls
+        );
+        assert_eq!(
+            name_refs(&e, bound),
             1,
             "{bound}: only the use after the block: {:?}",
-            e.calls
+            e.references
         );
     }
     assert_eq!(
@@ -209,13 +256,20 @@ fn a_let_directive_binds_for_the_children_of_its_element() {
     for bound in ["item", "row", "v", "e"] {
         assert_eq!(
             bare_calls(&e, bound),
+            0,
+            "a lone identifier is a read: {:?}",
+            e.calls
+        );
+        assert_eq!(
+            name_refs(&e, bound),
             1,
             "{bound}: only the use after the element: {:?}",
-            e.calls
+            e.references
         );
     }
     // `foo` is the slot prop's name and `z` is destructured away: only `z` is read.
-    assert_eq!(bare_calls(&e, "z"), 1, "{:?}", e.calls);
+    assert_eq!(bare_calls(&e, "z"), 0, "{:?}", e.calls);
+    assert_eq!(name_refs(&e, "z"), 1, "{:?}", e.references);
     assert_eq!(bare_calls(&e, "foo"), 0, "{:?}", e.calls);
 }
 
@@ -329,10 +383,94 @@ fn a_component_tag_named_by_a_bound_name_records_nothing_of_that_name() {
 }
 
 #[test]
-fn a_name_the_template_does_not_bind_is_still_a_call() {
+fn a_name_the_template_does_not_bind_is_a_reference_not_a_call() {
     let e = ex(&format!(
         "{HEAD}{{#each rows as item}}{{row}}{{/each}}<button onclick={{row}}>x</button>\n"
     ));
-    assert_eq!(bare_calls(&e, "row"), 2, "{:?}", e.calls);
-    assert_eq!(unshadowed(&e, "row").len(), 4, "{:?}", e.local_bindings);
+    assert_eq!(bare_calls(&e, "row"), 0, "{:?}", e.calls);
+    assert_eq!(call_references(&e, "row"), 0, "{:?}", e.references);
+    assert_eq!(name_refs(&e, "row"), 2, "{:?}", e.references);
+    assert_eq!(unshadowed(&e, "row").len(), 2, "{:?}", e.local_bindings);
+}
+
+/// A lone identifier in Svelte markup is a value read, the way a TSX identifier
+/// in value position is: `{size}`, `value={size}`, `onclick={save}` and
+/// `on:click={save}` each record one `Name` reference and no call.
+#[test]
+fn a_lone_markup_identifier_is_a_reference_in_every_position() {
+    for (position, markup, name) in [
+        ("text", "<p>{size}</p>", "size"),
+        ("attribute", "<input value={size} />", "size"),
+        (
+            "handler attribute",
+            "<button onclick={save}>x</button>",
+            "save",
+        ),
+        (
+            "handler directive",
+            "<button on:click={save}>x</button>",
+            "save",
+        ),
+    ] {
+        let e = ex(&format!("{HEAD}{markup}\n"));
+        assert_eq!(bare_calls(&e, name), 0, "{position}: {:?}", e.calls);
+        assert_eq!(
+            call_references(&e, name),
+            0,
+            "{position}: {:?}",
+            e.references
+        );
+        assert_eq!(name_refs(&e, name), 1, "{position}: {:?}", e.references);
+    }
+}
+
+/// A call stays a call: `onclick={save()}` runs `save` when the markup renders.
+#[test]
+fn a_call_in_markup_is_still_a_call() {
+    let e = ex(&format!("{HEAD}<p>{{size()}}</p>\n"));
+    assert_eq!(bare_calls(&e, "size"), 1, "{:?}", e.calls);
+}
+
+/// The six lone markup identifiers of the `accuracy/svelte` fixture that name
+/// script variables: each is a value read, so each records one `Name` reference
+/// and no call. They were Calls classed `local_binding` before the owner ruled a
+/// lone markup identifier a Reference.
+#[test]
+fn the_fixtures_lone_identifiers_that_name_script_variables_are_references() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/accuracy/svelte/src");
+    for (file, names) in [
+        (
+            "Stores.svelte",
+            &["pattern", "template", "member", "renamed", "size"][..],
+        ),
+        ("Board.svelte", &["cards"][..]),
+    ] {
+        let source = std::fs::read_to_string(root.join(file)).expect("fixture file");
+        let e = extract_file_with_budget(&format!("src/{file}"), &source, Duration::from_secs(600));
+        for name in names {
+            let markup = e
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Name && r.name == *name)
+                .count();
+            assert!(
+                markup >= 1,
+                "{file}: {name} is a reference: {:?}",
+                e.references
+            );
+            assert_eq!(
+                bare_calls(&e, name),
+                0,
+                "{file}: {name} is not called: {:?}",
+                e.calls
+            );
+            assert_eq!(
+                call_references(&e, name),
+                0,
+                "{file}: {name}: {:?}",
+                e.references
+            );
+        }
+    }
 }

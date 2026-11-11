@@ -68,3 +68,65 @@ fn each_render_of_a_duplicate_snippet_reaches_the_snippet_in_its_own_branch() {
         "neither snippet is dead: {dead:?}"
     );
 }
+
+/// Every edge from `FILE`, as `(kind, target symbol)`, for a source.
+fn edges_of(source: &str) -> Vec<(EdgeKind, String)> {
+    let extractions = vec![extract_file(FILE, source)];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    resolution
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.source_file == FILE
+                && !matches!(
+                    edge.edge_kind,
+                    EdgeKind::Contains | EdgeKind::MemberOf | EdgeKind::Imports | EdgeKind::Defines
+                )
+        })
+        .map(|edge| (edge.edge_kind, edge.target_symbol.clone()))
+        .collect()
+}
+
+/// `onclick={save}` and `on:click={save}` hand `save` over; nothing calls it. The
+/// use is a `References` edge to the script's `save` (a Calls edge would be a
+/// claim that the template runs it), and the function is not dead.
+#[test]
+fn a_function_used_only_as_a_handler_is_referenced_not_called_and_is_live() {
+    let source = "<script lang=\"ts\">\n  function save() {}\n  function drop() {}\n</script>\n\
+                  <button onclick={save}>a</button><button on:click={drop}>b</button>\n";
+    let edges = edges_of(source);
+    for target in ["src/Dup.svelte::save", "src/Dup.svelte::drop"] {
+        assert!(
+            edges
+                .iter()
+                .any(|(kind, to)| *kind == EdgeKind::References && to == target),
+            "{target} is referenced: {edges:?}"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(kind, to)| *kind == EdgeKind::Calls && to == target),
+            "{target} is not called: {edges:?}"
+        );
+    }
+    let (_, dead, _) = reached_and_dead(source);
+    assert!(
+        !dead.iter().any(|name| name == "save" || name == "drop"),
+        "a handler is live: {dead:?}"
+    );
+}
+
+/// A call stays a call: `{save()}` is a Calls edge.
+#[test]
+fn a_called_function_in_markup_is_still_a_calls_edge() {
+    let edges =
+        edges_of("<script lang=\"ts\">\n  function save() {}\n</script>\n<p>{save()}</p>\n");
+    assert!(
+        edges
+            .iter()
+            .any(|(kind, to)| *kind == EdgeKind::Calls && to == "src/Dup.svelte::save"),
+        "{edges:?}"
+    );
+}
