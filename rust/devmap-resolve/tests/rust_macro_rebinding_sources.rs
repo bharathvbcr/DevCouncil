@@ -1150,3 +1150,35 @@ fn r2_a_spaced_cfg_attribute_still_makes_an_explicit_import_conditional() {
         );
     }
 }
+
+// ------------------------------- R3: a recorded limit, pinned as what it is
+
+#[test]
+fn r3_known_limit_a_conditional_extern_crate_std_restores_the_std_macros_for_every_target() {
+    // KNOWN LIMIT, recorded rather than fixed. In a `#![no_std]` crate the only
+    // thing that puts the std macros back is `#[macro_use] extern crate std;` (or
+    // `alloc`, for vec/format). The crate's `extern crate` items are merged per
+    // manifest directory with no cfg and no module scope, so one such item under
+    // `#[cfg(test)]` restores the silence of `println` for the non-test
+    // configuration too, where rustc would take the glob's `println!`.
+    //
+    // It cannot produce a wrong edge in a crate that compiles under both
+    // configurations: with `cfg(test)` on, `use dep::*;` plus `println!` is
+    // E0659 (rust/testdata/rust-compile-fail/check.sh, nostd_println_with_macro_use_std),
+    // so the call exists only in the configuration where the glob loses. The
+    // assertion pins today's behaviour so a change to it is a decision; the
+    // TRUE expectation for the non-test configuration is "no edge".
+    let result = Case {
+        dep_lib: Box::leak(dep_exporting(&["println"]).into_boxed_str()),
+        lib_header: "#![no_std]\n#[cfg(test)]\n#[macro_use]\nextern crate std;\n",
+        user_head: "use dep::*;",
+        run_body: "println!(crate::db::Dup);",
+        ..Case::default()
+    }
+    .resolve("r3");
+    assert!(
+        binds_da(&result),
+        "the limit holds today: {:?}",
+        targets_from(&result, "app/src/user.rs::run")
+    );
+}

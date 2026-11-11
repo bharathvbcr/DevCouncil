@@ -5,7 +5,10 @@
 # fails with the first `error` line quoted below; the script says PASS when
 # rustc still agrees with the record.
 #
-# Recorded with rustc 1.99.1 (58cf8f9c3 2026-10-13), edition 2021.
+# Recorded with rustc 1.99.1 (58cf8f9c3 2026-10-13); last run under the
+# toolchain rust-toolchain.toml pins (see the PASS count the run prints).
+# Edition 2021. `cargo test -p devmap-resolve --test compile_fail_record -- --ignored`
+# runs it (an #[ignore]d test: it needs rustc and is not part of the default suite).
 #
 # Which rule relies on which case (`rust_macro_is_silent` in
 # rust/devmap-resolve/src/resolver/rust_site_scope.rs):
@@ -22,7 +25,7 @@ rustc --version
 fail=0
 
 # kio exports a macro under the names of the std ones; each emits a harmless item.
-names="println print dbg vec format assert panic matches write todo unreachable thread_local"
+names="println print eprint eprintln dbg vec format format_args assert assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne panic matches write writeln todo unimplemented unreachable thread_local"
 : > kio.rs
 for n in $names; do
   printf '#[macro_export] macro_rules! %s { ($($t:tt)*) => { pub fn from_kio() {} }; }\n' "$n" >> kio.rs
@@ -66,6 +69,10 @@ case_ std_prelude_vec 'error[E0659]: `vec` is ambiguous' 'use kio::*;
 vec!{}'
 case_ std_prelude_assert 'error[E0659]: `assert` is ambiguous' 'use kio::*;
 assert!{}'
+for n in print eprint eprintln dbg format format_args assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne panic matches write writeln todo unimplemented unreachable thread_local; do
+  case_ "std_prelude_$n" "error[E0659]: \`$n\` is ambiguous" "use kio::*;
+$n!{}"
+done
 
 # --- ... unless the implicit prelude is absent --------------------------------------
 case_ nostd_println ok '#![no_std]
@@ -80,6 +87,19 @@ thread_local!{}'
 case_ nostd_vec ok '#![no_std]
 use kio::*;
 vec!{}'
+for n in print eprint eprintln format; do
+  case_ "nostd_$n" ok "#![no_std]
+use kio::*;
+$n!{}"
+done
+case_ nostd_format_with_macro_use_alloc 'error[E0659]: `format` is ambiguous' '#![no_std]
+#[macro_use] extern crate alloc;
+use kio::*;
+format!{}'
+case_ nostd_println_with_macro_use_alloc ok '#![no_std]
+#[macro_use] extern crate alloc;
+use kio::*;
+println!{}'
 case_ nostd_vec_with_macro_use_alloc 'error[E0659]: `vec` is ambiguous' '#![no_std]
 #[macro_use] extern crate alloc;
 use kio::*;
@@ -88,7 +108,7 @@ case_ nostd_println_with_macro_use_std 'error[E0659]: `println` is ambiguous' '#
 #[macro_use] extern crate std;
 use kio::*;
 println!{}'
-for core_macro in assert panic matches write todo unreachable; do
+for core_macro in assert assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne panic matches write writeln todo unimplemented unreachable format_args; do
   case_ "nostd_core_$core_macro" "error[E0659]: \`$core_macro\` is ambiguous" "#![no_std]
 use kio::*;
 $core_macro!{}"
@@ -117,6 +137,16 @@ case_ noprel_builtin_unreachable 'error[E0659]: `unreachable` is ambiguous' '#![
 extern crate kio;
 use kio::*;
 unreachable!{}'
+for n in print eprint eprintln format dbg thread_local write writeln assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne todo unimplemented; do
+  case_ "noprel_$n" ok "#![no_implicit_prelude]
+extern crate kio;
+use kio::*;
+$n!{}"
+done
+case_ noprel_builtin_format_args 'error[E0659]: `format_args` is ambiguous' '#![no_implicit_prelude]
+extern crate kio;
+use kio::*;
+format_args!{}'
 case_ noprel_has_no_extern_prelude 'error[E0432]: unresolved import `kio`' '#![no_implicit_prelude]
 use kio::*;'
 

@@ -310,3 +310,4 @@ mod corpus_dump_attack;
 mod attack_swift_residue;
 #[cfg(feature = "parse")]
 mod attack_tsj_edges;
+mod rust_compile_fail_record;

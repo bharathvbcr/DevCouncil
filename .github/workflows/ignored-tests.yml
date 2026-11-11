@@ -43,6 +43,8 @@ jobs:
         run: cargo test --locked -p devmap-store --test ledger_write -- --ignored --nocapture
       - name: Workbench search profile (100,000 tasks)
         run: cargo test --locked -p dc-store --lib stress_search_profile -- --ignored --nocapture
+      - name: Rust macro-silence record against rustc
+        run: cargo test --locked -p devmap-resolve --test it -- rust_compile_fail_record:: --ignored --nocapture
 
   browser:
     name: tooltip inertness in a real browser
