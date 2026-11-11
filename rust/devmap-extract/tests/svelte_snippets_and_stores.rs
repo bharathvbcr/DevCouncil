@@ -42,13 +42,18 @@ const SCRIPT: &str = "<script lang=\"ts\">\n  import { label } from './format';\
 
 #[test]
 fn a_snippet_ahead_of_three_hundred_expressions_is_still_read() {
-    let mut source = format!("{SCRIPT}{{#snippet title(s: string)}}\n  <h2>{{label(s)}}</h2>\n{{/snippet}}\n");
+    let mut source =
+        format!("{SCRIPT}{{#snippet title(s: string)}}\n  <h2>{{label(s)}}</h2>\n{{/snippet}}\n");
     for index in 0..300 {
         source.push_str(&format!("<li>{{label({index})}}</li>\n"));
     }
     let e = ex(&source);
     assert!(is_clean(&e), "outcome: {:?}", e.parse_outcome);
-    let first = e.calls.iter().find(|c| c.callee_name == "label").expect("a label call");
+    let first = e
+        .calls
+        .iter()
+        .find(|c| c.callee_name == "label")
+        .expect("a label call");
     assert!(
         source[first.span.start_byte..].starts_with("label(s)"),
         "the call inside the snippet is the first one read: {first:?}"
@@ -90,7 +95,9 @@ fn typed_optional_and_multiline_snippet_parameters_parse_clean_and_call_nothing(
 
 #[test]
 fn a_default_value_in_a_snippet_parameter_is_still_a_call() {
-    let e = ex(&format!("{SCRIPT}{{#snippet a(s = label(1))}}x{{/snippet}}\n"));
+    let e = ex(&format!(
+        "{SCRIPT}{{#snippet a(s = label(1))}}x{{/snippet}}\n"
+    ));
     assert!(is_clean(&e), "outcome: {:?}", e.parse_outcome);
     assert!(callees(&e).contains(&"label"), "{:?}", callees(&e));
 }
@@ -116,10 +123,19 @@ fn a_snippet_given_to_a_component_is_reached_by_the_runtime() {
 fn a_store_read_is_a_reference_to_the_store_not_a_call() {
     let e = ex("<script lang=\"ts\">\n  import { markers } from './stores';\n  let a = $state(1);\n  const n = $markers.length;\n</script>\n\
                 <p title={$markers.join(',')}>{$markers.length}</p>\n{$markers}\n");
-    let reads = name_references(&e).iter().filter(|n| **n == "markers").count();
-    assert_eq!(reads, 4, "script, attribute, text and lone read: {:?}", e.references);
+    let reads = name_references(&e)
+        .iter()
+        .filter(|n| **n == "markers")
+        .count();
+    assert_eq!(
+        reads, 4,
+        "script, attribute, text and lone read: {:?}",
+        e.references
+    );
     assert!(
-        !callees(&e).iter().any(|c| c.starts_with('$') && *c != "$state"),
+        !callees(&e)
+            .iter()
+            .any(|c| c.starts_with('$') && *c != "$state"),
         "{:?}",
         callees(&e)
     );
@@ -160,7 +176,11 @@ fn only_an_identifier_in_expression_position_is_a_store_read() {
     let e = ex(PROBE);
     let names = name_references(&e);
     for local in ["foo", "bar", "item", "zap", "state"] {
-        assert!(!names.contains(&local), "{local} read as a store: {:?}", e.references);
+        assert!(
+            !names.contains(&local),
+            "{local} read as a store: {:?}",
+            e.references
+        );
     }
 }
 
@@ -217,7 +237,11 @@ fn a_store_read_never_binds_a_function_of_the_component() {
 fn a_shorthand_property_and_an_assignment_are_store_reads() {
     let e = ex("<script lang=\"ts\">\n  import { a, b } from './stores';\n  const o = { $a };\n  $b = 1;\n</script>\n");
     let names = name_references(&e);
-    assert!(names.contains(&"a") && names.contains(&"b"), "{:?}", e.references);
+    assert!(
+        names.contains(&"a") && names.contains(&"b"),
+        "{:?}",
+        e.references
+    );
 }
 
 #[test]
@@ -233,7 +257,9 @@ fn a_snippet_passed_as_a_prop_is_a_reference_not_a_call() {
 
 #[test]
 fn a_second_snippet_of_one_name_is_declared_beside_the_first() {
-    let source = format!("{SCRIPT}{{#snippet a()}}x{{/snippet}}\n<div>{{#snippet a()}}y{{/snippet}}</div>\n");
+    let source = format!(
+        "{SCRIPT}{{#snippet a()}}x{{/snippet}}\n<div>{{#snippet a()}}y{{/snippet}}</div>\n"
+    );
     let e = ex(&source);
     assert!(is_clean(&e), "{:?}", e.parse_outcome);
     let mut qualified: Vec<&str> = e
@@ -255,12 +281,18 @@ fn a_directive_names_the_function_it_runs() {
         assert!(names.contains(&used), "{used}: {:?}", e.references);
     }
     for not_a_function in ["active", "value", "click"] {
-        assert!(!names.contains(&not_a_function), "{not_a_function}: {:?}", e.references);
+        assert!(
+            !names.contains(&not_a_function),
+            "{not_a_function}: {:?}",
+            e.references
+        );
     }
 }
 
 fn vue_with(count: usize) -> String {
-    let mut source = String::from("<script setup lang=\"ts\">\nfunction f(n: number) { return n; }\n</script>\n<template>\n");
+    let mut source = String::from(
+        "<script setup lang=\"ts\">\nfunction f(n: number) { return n; }\n</script>\n<template>\n",
+    );
     for index in 0..count {
         source.push_str(&format!("  <li>{{{{ f({index}) }}}}</li>\n"));
     }
@@ -272,11 +304,17 @@ fn vue_with(count: usize) -> String {
 fn vue_reads_the_same_below_the_old_bound_and_all_of_it_above() {
     let small = extract_file_with_budget("src/A.vue", &vue_with(50), Duration::from_secs(600));
     assert!(is_clean(&small), "{:?}", small.parse_outcome);
-    assert_eq!(small.calls.iter().filter(|c| c.callee_name == "f").count(), 50);
+    assert_eq!(
+        small.calls.iter().filter(|c| c.callee_name == "f").count(),
+        50
+    );
     // Between the old bound (256) and the new one: now read whole.
     let large = extract_file_with_budget("src/A.vue", &vue_with(300), Duration::from_secs(600));
     assert!(is_clean(&large), "{:?}", large.parse_outcome);
-    assert_eq!(large.calls.iter().filter(|c| c.callee_name == "f").count(), 300);
+    assert_eq!(
+        large.calls.iter().filter(|c| c.callee_name == "f").count(),
+        300
+    );
 }
 
 /// Astro's grammar hands its `{...}` expressions back as text, which this walk
@@ -294,6 +332,10 @@ fn astro_is_untouched_by_the_template_expression_bound() {
     };
     let (small, large) = (build(50), build(300));
     assert!(is_clean(&small) && is_clean(&large));
-    assert_eq!(small.calls.len(), large.calls.len(), "template expressions are not walked");
+    assert_eq!(
+        small.calls.len(),
+        large.calls.len(),
+        "template expressions are not walked"
+    );
     assert!(small.symbols.iter().any(|s| s.name == "f"));
 }

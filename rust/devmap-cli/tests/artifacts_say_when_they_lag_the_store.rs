@@ -111,7 +111,10 @@ fn a_plain_build_leaves_the_artifacts_reported_as_older_than_the_store() {
     run(&root, &["build", "."]);
     let lagging = json(&root, &["status", "--json"]);
     let advanced = lagging["generation_id"].as_u64().unwrap();
-    assert!(advanced > generation, "the plain build must add a generation");
+    assert!(
+        advanced > generation,
+        "the plain build must add a generation"
+    );
     let report = artifacts(&lagging);
     assert_eq!(report["current"], false, "{report}");
     assert_eq!(report["written_from_generation"], generation, "{report}");
@@ -146,7 +149,10 @@ fn artifacts_with_no_stamp_are_never_reported_current() {
     let report = artifacts(&status);
     assert_eq!(report["current"], false, "{report}");
     assert!(
-        report["reason"].as_str().unwrap().contains("no artifact stamp"),
+        report["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no artifact stamp"),
         "{report}"
     );
     let _ = std::fs::remove_dir_all(&root);

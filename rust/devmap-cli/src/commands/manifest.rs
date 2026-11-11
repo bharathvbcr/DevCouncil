@@ -10,9 +10,9 @@ use devmap_query::{
 use devmap_store::Store;
 
 use crate::cli::{default_root_hint, root_parser, Cli, InventoryFlags, StampFlags};
+use crate::diagnostic;
 use crate::output::{emit_json, ensure_parent, open_for_read};
 use crate::reporter::ProgressReporter;
-use crate::diagnostic;
 
 #[derive(clap::Args)]
 #[group(id = "Manifest")]

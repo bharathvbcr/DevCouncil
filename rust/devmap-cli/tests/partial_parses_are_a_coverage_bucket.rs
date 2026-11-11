@@ -308,7 +308,9 @@ fn the_capped_partial_parse_listing_keeps_the_biggest_hole() {
     // Sorts after every file above, and loses far more.
     let mut big = String::from(erasure);
     for index in 0..60 {
-        big.push_str(&format!("export function lost{index}() {{ return {index}; }}\n"));
+        big.push_str(&format!(
+            "export function lost{index}() {{ return {index}; }}\n"
+        ));
     }
     std::fs::write(root.join("z_big.tsx"), big).unwrap();
     let _ = json(&root, &["--json", "build", "."]);

@@ -50,11 +50,10 @@ pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
 use self::traversal::{
-    component_note,
-    bare_callee_name, blast_radius_from_edges, family_of_path, indexed_traversal_starts,
-    indexed_traversed_edges, node_id_of, reached_by, BlastBand, BlastWalk, NamesakeRead,
-    AFFECTED_SYMBOL_SAMPLE, DEAD_SYMBOL_TOKENS, EDGE_TOKENS, EXPLORE_DEFINITION_OVERHEAD_TOKENS,
-    TRAVERSAL_MAX_NODES,
+    bare_callee_name, blast_radius_from_edges, component_note, family_of_path,
+    indexed_traversal_starts, indexed_traversed_edges, node_id_of, reached_by, BlastBand,
+    BlastWalk, NamesakeRead, AFFECTED_SYMBOL_SAMPLE, DEAD_SYMBOL_TOKENS, EDGE_TOKENS,
+    EXPLORE_DEFINITION_OVERHEAD_TOKENS, TRAVERSAL_MAX_NODES,
 };
 pub use self::traversal::{traversal_starts, traversed_resolution_edges};
 

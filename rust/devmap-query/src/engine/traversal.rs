@@ -330,8 +330,7 @@ pub(super) fn component_note(
     reverse: bool,
     cancel: &Cancel,
 ) -> anyhow::Result<Option<String>> {
-    let crate::query_match::StartQuery::Symbol(name) = crate::query_match::classify(target)
-    else {
+    let crate::query_match::StartQuery::Symbol(name) = crate::query_match::classify(target) else {
         return Ok(None);
     };
     let mut symbol_hit = false;

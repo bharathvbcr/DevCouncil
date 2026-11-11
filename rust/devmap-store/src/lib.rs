@@ -11,7 +11,9 @@ pub(crate) mod payload_codec;
 pub mod schema;
 pub mod seed;
 
-pub use delta::{DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore, DeltaSymbolRecord};
+pub use delta::{
+    DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore, DeltaSymbolRecord,
+};
 
 pub use coverage::{
     add_manifest_refusals, discovery_refusals, over_limit_inventory, refusal_inventory,

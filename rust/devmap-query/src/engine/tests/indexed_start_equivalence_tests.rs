@@ -475,7 +475,8 @@ fn a_component_is_found_by_its_file_stem() {
     assert!(
         starts
             .iter()
-            .all(|(symbol, file)| symbol == "ui/MarkdownBody.svelte" && file == "ui/MarkdownBody.svelte"),
+            .all(|(symbol, file)| symbol == "ui/MarkdownBody.svelte"
+                && file == "ui/MarkdownBody.svelte"),
         "only the component's file node starts the walk: {starts:?}"
     );
 
@@ -492,9 +493,11 @@ fn a_component_is_found_by_its_file_stem() {
     );
 
     // A stem is the whole stem, and a non-component file is not a component.
-    assert!(indexed_traversal_starts(&index, "Markdown", true, 0.0, &cancel)
-        .expect("starts")
-        .is_empty());
+    assert!(
+        indexed_traversal_starts(&index, "Markdown", true, 0.0, &cancel)
+            .expect("starts")
+            .is_empty()
+    );
 }
 
 /// The two silences of a component lookup are named in the answer's note.
@@ -534,7 +537,13 @@ fn a_component_passed_over_or_missed_by_case_is_named() {
     assert!(passed_over.contains("ui/Real.svelte"), "{passed_over}");
     let case_only = note("markdownbody").expect("a case-only miss");
     assert!(case_only.contains("ui/MarkdownBody.svelte"), "{case_only}");
-    assert!(note("MarkdownBody").is_none(), "an exact component needs no note");
+    assert!(
+        note("MarkdownBody").is_none(),
+        "an exact component needs no note"
+    );
     assert!(note("nothing_here").is_none());
-    assert!(note("ui/Real.svelte").is_none(), "a path is not a bare name");
+    assert!(
+        note("ui/Real.svelte").is_none(),
+        "a path is not a bare name"
+    );
 }

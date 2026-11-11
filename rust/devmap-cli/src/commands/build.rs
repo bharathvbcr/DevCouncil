@@ -1564,9 +1564,10 @@ fn build_manifest_payload(
     // The store's own view, so a caller does not need a third process to learn
     // whether the generation it just built is fresh, degraded or backed up
     // behind a pending queue.
-    payload["status"] = serde_json::Value::Object(progress.timed("artifacts:store_status", || {
-        store_status_fields(store, &cli.db())
-    })?);
+    payload["status"] =
+        serde_json::Value::Object(progress.timed("artifacts:store_status", || {
+            store_status_fields(store, &cli.db())
+        })?);
     Ok(Some(BuildManifestPayload {
         json: payload,
         outcome,
