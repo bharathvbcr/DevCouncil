@@ -212,3 +212,23 @@ impl Write for HumanText {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod escape_tests {
+    use super::escape_for_pipe;
+
+    /// The terminal sink escapes the same agent-visible set as the hook and
+    /// `bounded_text` (zero-width and tag characters included); newline and
+    /// tab stay, and RTL letters are untouched.
+    #[test]
+    fn escape_for_pipe_escapes_zero_width_and_tag_characters() {
+        for c in ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{2028}', '\u{E0041}'] {
+            let out = escape_for_pipe(&format!("a{c}b")).unwrap_or_else(|| panic!("U+{:04X} kept", c as u32));
+            assert!(!out.contains(c) && out.starts_with("a\\u"), "U+{:04X}: {out:?}", c as u32);
+        }
+        assert_eq!(escape_for_pipe("a\nb\tc"), None);
+        for text in devmap_query::bounded::RTL_LETTER_FIXTURES {
+            assert_eq!(escape_for_pipe(text), None);
+        }
+    }
+}

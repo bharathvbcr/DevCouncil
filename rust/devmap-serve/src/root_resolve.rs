@@ -990,4 +990,81 @@ mod tests {
         assert_eq!(effective_store_for_root(&root), Ok(Some(store)));
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// Characters a terminal or a bidirectional renderer would act on, or that
+    /// hide text: none may reach the MCP error text raw.
+    const HOSTILE: &[char] = &[
+        '\u{202e}', '\u{2066}', '\u{200f}', '\u{200d}', '\u{200b}', '\u{2028}', '\u{feff}',
+        '\u{e0041}', '\u{1b}',
+    ];
+
+    fn hostile_lane(name: &str) -> PathBuf {
+        let root = scratch(name).join("lane\u{202e}evil\u{2066}x\u{200f}\u{200d}\u{e0041}");
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn assert_clean(err: &str) {
+        for c in HOSTILE {
+            assert!(!err.contains(*c), "U+{:04X} reached the error raw: {err:?}", *c as u32);
+        }
+        assert!(err.contains("\\u{202e}"), "the escape names what was there: {err:?}");
+    }
+
+    /// F3: the corrupt-lease arm repeated the lease path and the root raw.
+    #[test]
+    fn a_corrupt_lease_error_carries_no_raw_format_characters() {
+        let root = hostile_lane("f3");
+        let lease = paths::stack_lease_path(&root);
+        fs::create_dir_all(lease.parent().unwrap()).unwrap();
+        fs::write(&lease, b"{not json").unwrap();
+        let err = effective_store_for_root(&root).expect_err("a corrupt lease fails closed");
+        assert!(err.contains("corrupt or unreadable"), "{err}");
+        assert_clean(&err);
+    }
+
+    /// F4: the missing-base arm repeated lease path, base path and root raw.
+    #[test]
+    fn a_missing_base_error_carries_no_raw_format_characters() {
+        let root = hostile_lane("f4");
+        let lease = paths::stack_lease_path(&root);
+        fs::create_dir_all(lease.parent().unwrap()).unwrap();
+        let record = serde_json::json!({
+            "sha256": "0".repeat(64), "len": 1, "mtime_ns": 1, "ctime_ns": 1, "ino": 1, "dev": 1
+        });
+        let body = serde_json::json!({
+            "format_version": devmap_query::stacked::STACK_FORMAT_VERSION,
+            "generation_id": 1,
+            "head_sha": "a".repeat(40),
+            "source_repo_root": "/nowhere",
+            "base": record,
+            "worktree_root": root.to_str().unwrap(),
+            "leased_at_unix_ms": 1,
+            "rebases_after_dirty_files": 1,
+            "rebases_after_delta_bytes": 1,
+        });
+        fs::write(&lease, serde_json::to_vec(&body).unwrap()).unwrap();
+        let err = effective_store_for_root(&root).expect_err("a missing base fails closed");
+        assert!(err.contains("missing base snapshot"), "{err}");
+        assert_clean(&err);
+    }
+
+    /// A deep root is cut with a marker, not echoed whole.
+    #[test]
+    fn a_missing_base_error_bounds_a_long_root() {
+        let root = scratch("f4-long").join("d".repeat(240));
+        fs::create_dir_all(&root).unwrap();
+        let lease = paths::stack_lease_path(&root);
+        fs::create_dir_all(lease.parent().unwrap()).unwrap();
+        let body = serde_json::json!({
+            "format_version": devmap_query::stacked::STACK_FORMAT_VERSION,
+            "generation_id": 1, "head_sha": "a".repeat(40), "source_repo_root": "/nowhere",
+            "base": {"sha256": "0".repeat(64), "len": 1, "mtime_ns": 1, "ctime_ns": 1, "ino": 1, "dev": 1},
+            "worktree_root": root.to_str().unwrap(), "leased_at_unix_ms": 1,
+            "rebases_after_dirty_files": 1, "rebases_after_delta_bytes": 1,
+        });
+        fs::write(&lease, serde_json::to_vec(&body).unwrap()).unwrap();
+        let err = effective_store_for_root(&root).expect_err("fails closed");
+        assert!(err.contains("bytes]"), "a cut names itself: {err}");
+    }
 }

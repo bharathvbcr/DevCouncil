@@ -4208,6 +4208,35 @@ mod tests {
         );
     }
 
+    /// The agent-visible escape set, walked over every code point: `context_line`
+    /// changes a character iff it is in the set and is not a tab, and RTL letters
+    /// pass through unchanged. Persian ZWNJ is escaped, its letters are not.
+    #[test]
+    fn context_line_escapes_exactly_the_agent_visible_set_over_every_code_point() {
+        let set: &[(u32, u32)] = &[
+            (0x0000, 0x001f), (0x007f, 0x009f), (0x061c, 0x061c), (0x200b, 0x200f),
+            (0x2028, 0x202e), (0x2060, 0x2060), (0x2066, 0x2069), (0xfeff, 0xfeff),
+            (0xe0000, 0xe007f),
+        ];
+        for cp in 0..=0x10ffffu32 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let text = format!("a{c}b");
+            let out = context_line(&text);
+            let escaped = set.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp)) && c != '\t';
+            if escaped {
+                assert!(!out.contains(c), "U+{cp:04X} survived: {out:?}");
+                assert!(out.starts_with("a\\u") && out.ends_with('b'), "U+{cp:04X}: {out:?}");
+            } else {
+                assert_eq!(out, text, "U+{cp:04X} changed but is outside the set");
+            }
+        }
+        for text in devmap_query::bounded::RTL_LETTER_FIXTURES {
+            assert_eq!(context_line(text), *text);
+        }
+        let persian = context_line("می\u{200c}خواهم");
+        assert!(persian.contains("\\u200c") && persian.contains("خواهم"), "{persian}");
+    }
+
     /// Every breaking character is escaped, and every other character is kept.
     /// A fixed set stands in for a fuzzer: the function is total over `char`.
     #[test]

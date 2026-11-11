@@ -43,6 +43,18 @@ fn is_bidi_format(ch: char) -> bool {
     matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Right-to-left letters that no escaper may touch: Hebrew, Arabic, Persian
+/// (with a ZWNJ, which is escaped, so it is not here), Devanagari and mixed
+/// text. Every sink that escapes agent- or terminal-visible text asserts these
+/// come through unchanged.
+pub const RTL_LETTER_FIXTURES: &[&str] = &[
+    "שלום עולם",
+    "مرحبا بالعالم",
+    "a שלום b مرحبا",
+    "नमस्ते दुनिया",
+    "فارسی",
+];
+
 /// A component reason made safe to put in a status sentence; see
 /// [`bounded_text`] with [`MAX_REASON_COMPONENT_BYTES`].
 pub fn bounded_reason(text: &str) -> String {
@@ -89,5 +101,47 @@ mod tests {
             bounded_text("a\u{202e}b\u{2066}", 64),
             "a\\u{202e}b\\u{2066}"
         );
+    }
+
+    /// The escape set as ranges, written out independently of the owner
+    /// function so a drift in either shows up as a difference.
+    const ESCAPED_RANGES: &[(u32, u32)] = &[
+        (0x0000, 0x001f),
+        (0x007f, 0x009f),
+        (0x061c, 0x061c),
+        (0x200b, 0x200f),
+        (0x2028, 0x202e),
+        (0x2060, 0x2060),
+        (0x2066, 0x2069),
+        (0xfeff, 0xfeff),
+        (0xe0000, 0xe007f),
+    ];
+
+    fn in_definition(cp: u32) -> bool {
+        ESCAPED_RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
+    }
+
+    /// Walk every scalar value: the text changes iff the code point is in the
+    /// definition, and then it is its `escape_default` spelling.
+    #[test]
+    fn bounded_text_escapes_exactly_the_defined_set_over_every_code_point() {
+        for cp in 0..=0x10ffffu32 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let text = format!("a{c}b");
+            let out = bounded_text(&text, 64);
+            if in_definition(cp) {
+                assert_eq!(out, format!("a{}b", c.escape_default()), "U+{cp:04X} not escaped");
+            } else {
+                assert_eq!(out, text, "U+{cp:04X} escaped but outside the set");
+            }
+        }
+    }
+
+    #[test]
+    fn rtl_letters_and_a_persian_zwnj_word() {
+        for text in RTL_LETTER_FIXTURES {
+            assert_eq!(bounded_text(text, 256), *text);
+        }
+        assert_eq!(bounded_text("می\u{200c}خواهم", 64), "می\\u{200c}خواهم");
     }
 }
