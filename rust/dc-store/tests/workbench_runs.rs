@@ -1373,3 +1373,140 @@ fn a_task_creation_decided_from_a_stale_scan_is_refused() {
         ),
     );
 }
+
+#[test]
+fn external_terminal_thread_binding_is_owned_immutable_and_preserved_across_finish() {
+    let (store, _) = fixture();
+    let agy_prepare = PREPARE.replace(r#""provider":"codex""#, r#""provider":"agy""#);
+    call(&store, "runs.prepare", &agy_prepare);
+    // Cannot bind before launch claim (`prepared` has no owner/session).
+    assert_eq!(
+        request(
+            &store,
+            "runs.bind_thread",
+            r#"{"id":"run","request_id":"bind-early","expected_revision":1,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":"conv-123"}"#
+        )
+        .unwrap_err()
+        .code,
+        "invalid_state"
+    );
+    call(&store, "runs.claim", CLAIM);
+    // Reject wrong owner, wrong session, blank, control chars, or path traversal.
+    assert_eq!(
+        request(
+            &store,
+            "runs.bind_thread",
+            r#"{"id":"run","request_id":"bind-wrong-owner","expected_revision":2,"owner_id":"host-two","session_id":"terminal-one","provider_thread_id":"conv-123"}"#
+        )
+        .unwrap_err()
+        .code,
+        "owner_mismatch"
+    );
+    for (idx, bad) in [
+        r#""""#,
+        r#""   ""#,
+        r#""../escape""#,
+        r#""sub/dir""#,
+        r#""back\\slash""#,
+        r#""bad\u0007id""#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let raw = format!(
+            r#"{{"id":"run","request_id":"bind-bad-{idx}","expected_revision":2,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":{bad}}}"#
+        );
+        assert_eq!(
+            request(&store, "runs.bind_thread", &raw).unwrap_err().code,
+            "invalid_input",
+            "accepted invalid thread id {bad}"
+        );
+    }
+    // Bind while `starting` (e.g. SessionStart hook arriving concurrently with process receipt).
+    let bound = call(
+        &store,
+        "runs.bind_thread",
+        r#"{"id":"run","request_id":"bind-1","expected_revision":2,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":"a8e5196c-6065-4303-8ab8-792084f40fe2"}"#,
+    );
+    assert_eq!(
+        text(&store, &bound, "$.item.provider_thread_id"),
+        "a8e5196c-6065-4303-8ab8-792084f40fe2"
+    );
+    // Exact request replay returns identical receipt.
+    assert_eq!(
+        call(
+            &store,
+            "runs.bind_thread",
+            r#"{"id":"run","request_id":"bind-1","expected_revision":2,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":"a8e5196c-6065-4303-8ab8-792084f40fe2"}"#,
+        ),
+        bound
+    );
+    call(
+        &store,
+        "runs.started",
+        r#"{"id":"run","request_id":"started","expected_revision":3,"owner_id":"host-one","session_id":"terminal-one","process_id":42,"process_start":"boot:birth"}"#,
+    );
+    // Re-binding the exact same thread ID in `running` succeeds; a different ID is refused.
+    call(
+        &store,
+        "runs.bind_thread",
+        r#"{"id":"run","request_id":"bind-same","expected_revision":4,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":"a8e5196c-6065-4303-8ab8-792084f40fe2"}"#,
+    );
+    assert_eq!(
+        request(
+            &store,
+            "runs.bind_thread",
+            r#"{"id":"run","request_id":"bind-other","expected_revision":5,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":"different-thread-id"}"#
+        )
+        .unwrap_err()
+        .code,
+        "revision_conflict"
+    );
+    // Finish preserves `provider_thread_id` in both `runs.get` and `runs.list`, and cannot be mutated post-exit.
+    let finished = call(
+        &store,
+        "runs.finish",
+        r#"{"id":"run","request_id":"finish","expected_revision":5,"owner_id":"host-one","session_id":"terminal-one","outcome":"exited","exit_code":0,"reason":"Process exited normally"}"#,
+    );
+    assert_eq!(
+        text(&store, &finished, "$.item.provider_thread_id"),
+        "a8e5196c-6065-4303-8ab8-792084f40fe2"
+    );
+    let listed = call(&store, "runs.list", r#"{"task_id":"t"}"#);
+    assert_eq!(
+        text(&store, &listed, "$.items[0].provider_thread_id"),
+        "a8e5196c-6065-4303-8ab8-792084f40fe2"
+    );
+    assert_eq!(
+        request(
+            &store,
+            "runs.bind_thread",
+            r#"{"id":"run","request_id":"bind-after-exit","expected_revision":6,"owner_id":"host-one","session_id":"terminal-one","provider_thread_id":"a8e5196c-6065-4303-8ab8-792084f40fe2"}"#
+        )
+        .unwrap_err()
+        .code,
+        "invalid_state"
+    );
+
+    // Managed runs must use `runs.protocol` and are refused by `runs.bind_thread`.
+    let managed_prep = PREPARE
+        .replace(r#""id":"run""#, r#""id":"run-managed""#)
+        .replace(r#""request_id":"prepare""#, r#""request_id":"prep-managed""#)
+        .replace(r#""provider":"codex""#, r#""kind":"managed","provider":"agy""#);
+    call(&store, "runs.prepare", &managed_prep);
+    call(
+        &store,
+        "runs.claim",
+        r#"{"id":"run-managed","request_id":"claim-managed","expected_revision":1,"kind":"managed","owner_id":"host-one","session_id":"terminal-two"}"#,
+    );
+    assert_eq!(
+        request(
+            &store,
+            "runs.bind_thread",
+            r#"{"id":"run-managed","request_id":"bind-managed","expected_revision":2,"owner_id":"host-one","session_id":"terminal-two","provider_thread_id":"conv-managed"}"#
+        )
+        .unwrap_err()
+        .code,
+        "run_kind_mismatch"
+    );
+}

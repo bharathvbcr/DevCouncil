@@ -153,6 +153,11 @@ GITPULSE_TOOLS = [
     "gitpulse_worktree_isolate",
     "gitpulse_worktree_prune",
     "gitpulse_worktree_merge",
+    "gitpulse_agent_register",
+    "gitpulse_agent_peers",
+    "gitpulse_agent_send",
+    "gitpulse_agent_inbox",
+    "gitpulse_agent_wait",
 ]
 
 
