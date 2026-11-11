@@ -60,7 +60,16 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "workspaces_collect",
         ],
     ),
-    ("devmap-resolve", &["resolution_kind_is_one_owner"]),
+    (
+        "devmap-resolve",
+        &[
+            "resolution_kind_is_one_owner",
+            // Runs `testdata/rust-compile-fail/check.sh` with `rustc`; uses only
+            // `std`. Verified with `cargo check -p devmap-resolve
+            // --no-default-features --all-targets`.
+            "rust_compile_fail_record",
+        ],
+    ),
     (
         // `dc-regress` has no `parse` feature to gate on: it answers from a
         // graph it is handed and from git, and never builds one. Listing it
