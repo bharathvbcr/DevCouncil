@@ -120,6 +120,7 @@ fn an_each_item_is_not_a_call_to_its_namesake() {
         "only the use after the block: {:?}",
         e.references
     );
+    assert_eq!(unshadowed(&e, "item").len(), 1, "{:?}", e.local_bindings);
 }
 
 #[test]
@@ -143,6 +144,7 @@ fn an_each_pattern_an_index_and_nesting_bind_inside_the_block_only() {
             "{bound}: only the use after the block: {:?}",
             e.references
         );
+        assert_eq!(unshadowed(&e, bound).len(), 1, "{:?}", e.local_bindings);
     }
     // `b` is a property key, not a binding: nothing else is affected by it.
     assert_eq!(bare_calls(&e, "b"), 0, "{:?}", e.calls);
@@ -160,6 +162,7 @@ fn the_else_branch_of_an_each_does_not_see_the_item() {
         "only the else branch: {:?}",
         e.references
     );
+    assert_eq!(unshadowed(&e, "item").len(), 1, "{:?}", e.local_bindings);
 }
 
 #[test]
@@ -181,6 +184,7 @@ fn a_snippet_parameter_is_bound_in_the_snippet_only() {
         "only the use after the snippet: {:?}",
         e.references
     );
+    assert_eq!(unshadowed(&e, "item").len(), 1, "{:?}", e.local_bindings);
     assert_eq!(bare_calls(&e, "other"), 0, "{:?}", e.calls);
     assert_eq!(
         bare_calls(&e, "row"),
@@ -209,6 +213,7 @@ fn a_const_tag_binds_for_the_rest_of_its_block() {
         "only the use after the block: {:?}",
         e.references
     );
+    assert_eq!(unshadowed(&e, "item").len(), 1, "{:?}", e.local_bindings);
     assert_eq!(
         bare_calls(&e, "row"),
         1,
@@ -238,6 +243,7 @@ fn an_await_result_is_bound_in_its_branch_only() {
             "{bound}: only the use after the block: {:?}",
             e.references
         );
+        assert_eq!(unshadowed(&e, bound).len(), 1, "{:?}", e.local_bindings);
     }
     assert_eq!(
         bare_calls(&e, "load"),
@@ -266,10 +272,12 @@ fn a_let_directive_binds_for_the_children_of_its_element() {
             "{bound}: only the use after the element: {:?}",
             e.references
         );
+        assert_eq!(unshadowed(&e, bound).len(), 1, "{:?}", e.local_bindings);
     }
     // `foo` is the slot prop's name and `z` is destructured away: only `z` is read.
     assert_eq!(bare_calls(&e, "z"), 0, "{:?}", e.calls);
     assert_eq!(name_refs(&e, "z"), 1, "{:?}", e.references);
+    assert_eq!(unshadowed(&e, "z").len(), 1, "{:?}", e.local_bindings);
     assert_eq!(bare_calls(&e, "foo"), 0, "{:?}", e.calls);
 }
 
@@ -411,6 +419,13 @@ fn a_lone_markup_identifier_is_a_reference_in_every_position() {
             "<button on:click={save}>x</button>",
             "save",
         ),
+        ("shorthand attribute", "<input {size} />", "size"),
+        ("bind directive", "<input bind:value={x} />", "x"),
+        ("class directive", "<i class:active={flag}>x</i>", "flag"),
+        ("action argument", "<i use:act={arg}>x</i>", "arg"),
+        ("each collection", "{#each list as item}x{/each}", "list"),
+        ("await expression", "{#await promise}x{/await}", "promise"),
+        ("each key", "{#each rows as item (id)}x{/each}", "id"),
     ] {
         let e = ex(&format!("{HEAD}{markup}\n"));
         assert_eq!(bare_calls(&e, name), 0, "{position}: {:?}", e.calls);
@@ -421,14 +436,21 @@ fn a_lone_markup_identifier_is_a_reference_in_every_position() {
             e.references
         );
         assert_eq!(name_refs(&e, name), 1, "{position}: {:?}", e.references);
+        assert_eq!(unshadowed(&e, name).len(), 1, "{:?}", e.local_bindings);
     }
 }
 
-/// A call stays a call: `onclick={save()}` runs `save` when the markup renders.
+/// A call stays a call: `{size()}` runs `size` when the markup renders, and so
+/// does `onclick={save()}`.
 #[test]
 fn a_call_in_markup_is_still_a_call() {
-    let e = ex(&format!("{HEAD}<p>{{size()}}</p>\n"));
-    assert_eq!(bare_calls(&e, "size"), 1, "{:?}", e.calls);
+    for (markup, name) in [
+        ("<p>{size()}</p>", "size"),
+        ("<b onclick={save()}>x</b>", "save"),
+    ] {
+        let e = ex(&format!("{HEAD}{markup}\n"));
+        assert_eq!(bare_calls(&e, name), 1, "{markup}: {:?}", e.calls);
+    }
 }
 
 /// The six lone markup identifiers of the `accuracy/svelte` fixture that name
@@ -454,8 +476,8 @@ fn the_fixtures_lone_identifiers_that_name_script_variables_are_references() {
                 .iter()
                 .filter(|r| r.kind == ReferenceKind::Name && r.name == *name)
                 .count();
-            assert!(
-                markup >= 1,
+            assert_eq!(
+                markup, 1,
                 "{file}: {name} is a reference: {:?}",
                 e.references
             );
@@ -472,5 +494,114 @@ fn the_fixtures_lone_identifiers_that_name_script_variables_are_references() {
                 e.references
             );
         }
+    }
+}
+
+/// What one extractor records for a word: `"reference"`, `"call"` or `"nothing"`.
+fn outcome(e: &Extraction, word: &str) -> &'static str {
+    if bare_calls(e, word) > 0 {
+        "call"
+    } else if e.references.iter().any(|r| r.name == word) {
+        "reference"
+    } else {
+        "nothing"
+    }
+}
+
+/// A literal keyword names nothing. `disabled={false}`, `{null}`, `value={this}`
+/// and `checked={true}` record no call and no reference in Svelte, and `:disabled="false"`
+/// and `{{ null }}` record no call in Vue, where `{{ size }}` is still a call.
+#[test]
+fn a_literal_keyword_in_markup_records_nothing() {
+    for (markup, word) in [
+        ("<input disabled={false} />", "false"),
+        ("<p>{null}</p>", "null"),
+        ("<input value={this} />", "this"),
+        ("<input checked={true} />", "true"),
+        ("<p>{undefined}</p>", "undefined"),
+    ] {
+        let e = ex(&format!("{HEAD}{markup}\n"));
+        assert_eq!(
+            outcome(&e, word),
+            "nothing",
+            "svelte {markup}: {:?} {:?}",
+            e.calls,
+            e.references
+        );
+    }
+}
+
+/// The same words in Vue: no call, where `{{ size }}` is still a call.
+#[test]
+fn a_literal_keyword_in_vue_markup_records_no_call() {
+    for (markup, word) in [
+        (
+            "<template><input :disabled=\"false\" /></template>",
+            "false",
+        ),
+        ("<template><p>{{ null }}</p></template>", "null"),
+        ("<template><p>{{ this }}</p></template>", "this"),
+    ] {
+        let e = extract_file_with_budget("src/V.vue", markup, Duration::from_secs(600));
+        assert_eq!(
+            outcome(&e, word),
+            "nothing",
+            "vue {markup}: {:?} {:?}",
+            e.calls,
+            e.references
+        );
+    }
+    let control = extract_file_with_budget(
+        "src/V.vue",
+        "<template><p>{{ size }}</p></template>",
+        Duration::from_secs(600),
+    );
+    assert_eq!(outcome(&control, "size"), "call", "{:?}", control.calls);
+}
+
+/// The TSX extractor and the template extractors agree on every word that is
+/// shaped like an identifier: what TSX records for `W` in value position
+/// (`run(W)`, `<A v={W}>{W}</A>`), Svelte records for `{W}` (a reference or
+/// nothing) and Vue records as a call or nothing. A word one side records and the
+/// other does not is the drift this pins.
+#[test]
+fn the_template_extractors_agree_with_tsx_on_every_keyword_shaped_word() {
+    for word in [
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "this",
+        "NaN",
+        "Infinity",
+        "arguments",
+        "globalThis",
+        "other",
+    ] {
+        let tsx = extract_file_with_budget(
+            "src/a.tsx",
+            &format!(
+                "export function f() {{ run({word}); return <A v={{{word}}}>{{{word}}}</A>; }}\n"
+            ),
+            Duration::from_secs(600),
+        );
+        let expected = if tsx.references.iter().any(|r| r.name == word) {
+            "reference"
+        } else {
+            "nothing"
+        };
+        let svelte = ex(&format!("{HEAD}<p>{{{word}}}</p>\n"));
+        assert_eq!(outcome(&svelte, word), expected, "svelte {word}");
+        let vue = extract_file_with_budget(
+            "src/V.vue",
+            &format!("<template><p>{{{{ {word} }}}}</p></template>"),
+            Duration::from_secs(600),
+        );
+        let vue_expected = if expected == "reference" {
+            "call"
+        } else {
+            "nothing"
+        };
+        assert_eq!(outcome(&vue, word), vue_expected, "vue {word}");
     }
 }

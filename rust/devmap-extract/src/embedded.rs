@@ -374,7 +374,9 @@ pub(crate) fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
 
 /// Template expressions the outer grammar keeps as unparsed text.
 ///
-/// A lone identifier (`onclick={publishRelease}`) is a Call. Anything else
+/// A lone identifier (`onclick={publishRelease}`) is a `Name` reference in
+/// Svelte, a value read, and a Call in Vue. A literal keyword (`false`, `null`,
+/// `this`) is neither: it names nothing. Anything else
 /// that is still JavaScript — `onclick={() => copyText(name)}` — is parsed
 /// with the same embedded language the `<script>` block uses, so the inner
 /// call is visible to liveness. Svelte `{#if}` / `{@html}` blocks are not JS
@@ -877,7 +879,8 @@ fn push_block<'t>(
     inside
 }
 
-/// One template expression: a lone identifier is a Call, and anything else is
+/// One template expression: a lone identifier is a `Name` reference in Svelte
+/// and a Call in Vue, a literal keyword records nothing, and anything else is
 /// parsed or recorded. `node` is the expression text, not the surrounding
 /// braces or quotes.
 fn take_template_expression(
@@ -1547,6 +1550,15 @@ fn js_expression_body(node: Node, source: &str) -> Option<JsExpr> {
     })
 }
 
+/// The identifier a template expression consists of, if it is exactly one.
+///
+/// Literal keywords are not identifiers: the TypeScript and TSX grammar gives
+/// `true`, `false`, `null`, `undefined`, `this` and `super` node kinds of their
+/// own, so the TSX extractor records nothing for them in value position
+/// (`treesitter/references.rs` matches only `identifier`), while `NaN`,
+/// `Infinity`, `arguments` and `globalThis` are plain identifiers and are
+/// recorded. This returns `None` for exactly those six, so both the Svelte and
+/// the Vue path hand them to the expression parser, which records nothing.
 fn lone_js_identifier(text: &str) -> Option<String> {
     let trimmed = text
         .trim()
@@ -1562,6 +1574,12 @@ fn lone_js_identifier(text: &str) -> Option<String> {
         return None;
     }
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return None;
+    }
+    if matches!(
+        trimmed,
+        "true" | "false" | "null" | "undefined" | "this" | "super"
+    ) {
         return None;
     }
     Some(trimmed.to_string())
