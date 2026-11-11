@@ -36,5 +36,31 @@ mod tests {
         assert_eq!(crate::c44::after_thread_local(), 2);
         assert_eq!(crate::c44::after_bail(false), Ok(3));
         assert_eq!(crate::c44::after_bail(true), Err("no".to_string()));
+        assert_eq!(crate::c44::after_bail_tail(true), Ok(4));
+        assert_eq!(crate::c44::after_bail_tail(false), Err("no".to_string()));
+    }
+
+    #[test]
+    fn a_glob_of_a_dependency_brings_its_macro_over_the_prelude_and_the_import() {
+        assert_eq!(crate::c45::glob_bail(), 1);
+        assert_eq!(crate::c45b::prelude_bail(), 1);
+    }
+
+    #[test]
+    fn an_attribute_macro_on_an_item_or_a_function_rebinds_the_type() {
+        assert_eq!(crate::c46::attr_module(), 1);
+        assert_eq!(crate::c46b::attr_fn(), 1);
+    }
+
+    #[test]
+    fn cfg_attr_and_a_pathed_derive_can_emit_a_use() {
+        assert_eq!(crate::c47::cfg_attr_use(), 1);
+        assert_eq!(crate::c47b::pathed_derive(), 1);
+    }
+
+    #[test]
+    fn a_glob_of_std_or_of_a_crate_without_the_macro_changes_nothing() {
+        assert_eq!(crate::c49::std_glob_silent(), 2);
+        assert_eq!(crate::c49b::indexed_glob_silent(), 3);
     }
 }

@@ -1,0 +1,8 @@
+[package]
+name = "dep_alt"
+version = "0.1.0"
+edition = "2021"
+
+# The same macros as `dep` under another package name, so a Cargo rename
+# (`log = { package = "dep_alt" }`) can point at it: Cargo refuses one package
+# under two names in one crate.

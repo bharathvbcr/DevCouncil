@@ -45,6 +45,15 @@ pub mod c40;
 pub mod c42;
 pub mod c43;
 pub mod c44;
+pub mod p_prelude;
+pub mod c45;
+pub mod c45b;
+pub mod c46;
+pub mod c46b;
+pub mod c47;
+pub mod c47b;
+pub mod c49;
+pub mod c49b;
 pub mod mm;
 pub mod mm2;
 #[cfg(test)]

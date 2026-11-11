@@ -1,0 +1,11 @@
+[package]
+name = "renames"
+version = "0.1.0"
+edition = "2021"
+
+# Names that look like a logging or error crate and are not: an `extern crate`
+# alias and a Cargo rename. rustc is the oracle (see ../scopes/Cargo.toml).
+
+[dependencies]
+dep = { path = "../dep" }
+log = { package = "dep_alt", path = "../dep_alt" }

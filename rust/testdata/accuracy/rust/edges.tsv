@@ -264,7 +264,21 @@ rs.s37b	E statement macro	scopes/src/c37.rs::unknown_macro_then_name	scopes/src/
 rs.s38a	E statement macro	scopes/src/c38.rs::shadowed_dbg	scopes/src/c38.rs::h38	forbid_any_tier	must		a crate macro named dbg is not the std dbg: it may declare h38
 rs.s40	F macro rebinding	scopes/src/c40.rs::imported_info	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`use dep::info;` brings the dependency's macro, which emits a block-level `use` of the other Dup
 rs.s41	F macro rebinding	macrouse/src/user.rs::via_macro_use	macrouse/src/mda.rs::Dup.mk16	forbid_any_tier	must		`#[macro_use] extern crate dep;` makes `vec!` the dependency's macro
-rs.s42	F macro rebinding	scopes/src/c42.rs::aliased_log	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`extern crate dep as log;` makes `log::info!` the dependency's
+rs.s42	F macro rebinding	scopes/src/c42.rs::aliased_log	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`extern crate dep as log;` makes `log::debug!` the dependency's (`debug` is imported by name nowhere in the crate, so only the alias rule can refuse it)
 rs.s43	F macro rebinding	scopes/src/c43.rs::attr_use	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		an attribute macro on a block item emits a `use` into the block
-rs.s44a	F declared by macro	scopes/src/c44.rs::after_thread_local	scopes/src/c44.rs::h44	edge	must		`thread_local!` declares only the statics it names, so h44 is still the module's
-rs.s44b	F declared by macro	scopes/src/c44.rs::after_bail	scopes/src/c44.rs::h44b	edge	must		`anyhow::bail!` is an expression macro that declares nothing
+rs.s44a	F declared by macro	scopes/src/c44.rs::after_thread_local	scopes/src/c44.rs::h44	edge	must		`thread_local!` in the call's own block declares only the statics it names, so h44 is still the module's
+rs.s44b	F declared by macro	scopes/src/c44.rs::after_bail	scopes/src/c44.rs::h44b	edge	must		`anyhow::ensure!` in the call's own block is an expression macro that declares nothing
+rs.s44c	F declared by macro	scopes/src/c44.rs::after_bail_tail	scopes/src/c44.rs::h44c	edge	must		`anyhow::bail!` as the tail expression of the call's own block declares nothing
+rs.s45a	G glob macro	scopes/src/c45.rs::glob_bail	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`use dep::*;` brings dep's `bail`, which emits a block-level `use` of the other Dup
+rs.s45b	G glob macro	scopes/src/c45b.rs::prelude_bail	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		the same through `use crate::p_prelude::*;` and the prelude's `pub use dep::*;`
+rs.s46a	H attribute macro (known limit)	scopes/src/c46.rs::attr_module	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		KNOWN LIMIT: `#[pm::with_use(crate::p_db::Dup)] struct S;` at module level emits `use crate::p_db::Dup;`, which shadows the glob; the resolver does not treat a module-level attribute macro as making the scope unknown
+rs.s46b	H attribute macro (known limit)	scopes/src/c46b.rs::attr_fn	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		KNOWN LIMIT: `#[pm::body_use(crate::p_db::Dup)]` on the enclosing fn adds a `use` to its body; the resolver does not read an attribute macro on the enclosing function
+rs.s47a	H cfg_attr	scopes/src/c47.rs::cfg_attr_use	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`#[cfg_attr(all(), pm::with_use(..))]` on a block item is the attribute macro whenever the predicate holds
+rs.s47b	H derive path	scopes/src/c47b.rs::pathed_derive	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`#[derive(pm::Clone)]` is a derive of the `pm` crate that shares a std name, and emits a `use`
+rs.s49a	G glob control	scopes/src/c49.rs::std_glob_silent	scopes/src/c49.rs::h49	edge	must		control: `use std::collections::*;` cannot bring a different `println!`, so it stays silent
+rs.s49b	G glob control	scopes/src/c49b.rs::indexed_glob_silent	scopes/src/c49b.rs::h49b	edge	must		control: `use pm::*;` (an indexed crate that exports no `println!`) leaves it silent
+rs.s50a	I crate alias	renames/src/c1.rs::aliased_bail	renames/src/rda.rs::Dup.mk16	forbid_any_tier	must		`extern crate dep as anyhow; use anyhow::bail;`: the imported `bail` is dep's, whatever the name says
+rs.s50b	I cargo rename	renames/src/c2.rs::renamed_log	renames/src/rda.rs::Dup.mk16	forbid_any_tier	must		`log = { package = "dep_alt", path = "../dep_alt" }` makes `log::trace!` dep's macro, not the log crate's
+rs.s51	F macro rebinding	cfgmu/src/user.rs::via_cfg_attr	cfgmu/src/mda.rs::Dup.mk16	forbid_any_tier	must		`#[cfg_attr(all(), macro_use)] extern crate dep;` is `#[macro_use]`: `vec!` is the dependency's
+rs.s52a	J macro_use scope	mumod/src/user.rs::mod_silent	mumod/src/user.rs::h52a	edge	must		`#[macro_use] mod macros;` only publishes the module's own macro_rules!, so `println!` stays the std macro
+rs.s52b	J macro_use scope	muext/src/user.rs::ext_silent	muext/src/user.rs::h52b	edge	must		`#[macro_use] extern crate pm;` of an indexed crate that exports no `println` leaves `println!` the std macro

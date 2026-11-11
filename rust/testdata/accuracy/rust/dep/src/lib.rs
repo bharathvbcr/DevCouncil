@@ -1,7 +1,7 @@
-//! Macros that look like `log::info!` and `vec!` and emit a `use` in the scope of
-//! the call. They are defined under other names and re-exported, as a dependency
-//! the index never sees would define them: no `macro_rules! info` is in the
-//! corpus.
+//! Macros that look like `log::info!`, `log::debug!`, `log::trace!`, `anyhow::bail!`
+//! and `vec!` and emit a `use` in the scope of the call. They are defined under
+//! another name and re-exported, as a dependency the index never sees would
+//! define them: no `macro_rules! info` is in the corpus.
 #[macro_export]
 macro_rules! __emit_use {
     ($($t:tt)+) => {
@@ -10,4 +10,7 @@ macro_rules! __emit_use {
 }
 
 pub use __emit_use as info;
+pub use __emit_use as debug;
+pub use __emit_use as trace;
+pub use __emit_use as bail;
 pub use __emit_use as vec;
