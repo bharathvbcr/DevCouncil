@@ -23,3 +23,9 @@ pub fn body_use(args: TokenStream, item: TokenStream) -> TokenStream {
 pub fn not_clone(_item: TokenStream) -> TokenStream {
     "use crate::p_db::Dup;".parse().unwrap()
 }
+
+/// A function-like macro named like anyhow's `bail!`: it emits `use <input>;`.
+#[proc_macro]
+pub fn bail(input: TokenStream) -> TokenStream {
+    format!("use {};", input).parse().unwrap()
+}

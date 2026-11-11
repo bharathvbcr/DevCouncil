@@ -44,6 +44,7 @@ mod tests {
     fn a_glob_of_a_dependency_brings_its_macro_over_the_prelude_and_the_import() {
         assert_eq!(crate::c45::glob_bail(), 1);
         assert_eq!(crate::c45b::prelude_bail(), 1);
+        assert_eq!(crate::c48::pm_bail(), 1);
     }
 
     #[test]
@@ -62,5 +63,7 @@ mod tests {
     fn a_glob_of_std_or_of_a_crate_without_the_macro_changes_nothing() {
         assert_eq!(crate::c49::std_glob_silent(), 2);
         assert_eq!(crate::c49b::indexed_glob_silent(), 3);
+        assert_eq!(crate::c53::explicit_beats_glob(true), Ok(2));
+        assert_eq!(crate::c53::explicit_beats_glob(false), Err("no".to_string()));
     }
 }

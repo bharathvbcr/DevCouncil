@@ -12,3 +12,4 @@ edition = "2021"
 dep = { path = "../dep" }
 pm = { path = "../pm" }
 anyhow = { path = "../anyhow_stub" }
+log = { path = "../log_stub" }

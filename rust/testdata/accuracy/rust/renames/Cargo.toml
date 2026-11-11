@@ -9,3 +9,4 @@ edition = "2021"
 [dependencies]
 dep = { path = "../dep" }
 log = { package = "dep_alt", path = "../dep_alt" }
+anyhow = { path = "../anyhow_stub" }
