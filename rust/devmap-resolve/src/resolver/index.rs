@@ -83,7 +83,7 @@ impl Resolver {
         self.rust_cfg_bodies.clear();
         self.rust_deref_targets.clear();
         self.rust_blanket_methods.clear();
-        self.rust_crate_macros = Self::compute_rust_crate_macros(extractions);
+        self.rust_crate_macros = self.compute_rust_crate_macros(extractions);
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -336,11 +336,7 @@ impl Resolver {
                 }
             }
             if ext.language == "rust" {
-                let scope = super::rust_site_scope::RustFileScope::build(
-                    ext,
-                    self.rust_crate_macros
-                        .get(super::rust_site_scope::crate_key(&ext.file_path)),
-                );
+                let scope = super::rust_site_scope::RustFileScope::build(ext);
                 for sym in &ext.symbols {
                     if scope.is_under_cfg(sym.span.start_byte) {
                         self.rust_cfg_bodies
@@ -756,6 +752,7 @@ impl Resolver {
         self.rust_path_modules = self.compute_rust_path_modules(extractions);
         self.rust_scope_globs = self.compute_rust_scope_globs(extractions);
         self.rust_scope_named = self.compute_rust_scope_named(extractions);
+        self.apply_rust_macro_facts(extractions);
         self.rust_glob_names = self.compute_rust_glob_names(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
@@ -2506,22 +2503,37 @@ impl Resolver {
 
     /// What could rebind a macro name, per crate. A crate in which some Rust file
     /// does not record its macros is incomplete, and none of its macros is silent.
+    ///
+    /// A crate is the directory of the nearest `Cargo.toml` above its files, and
+    /// its dependencies are that manifest's: the manifest pass is the one owner of
+    /// both. Files no manifest governs form one crate with unknown dependencies
+    /// (see `rust_site_scope::NO_MANIFEST`), so a macro of a dependency crate is
+    /// never silent in them.
     pub(super) fn compute_rust_crate_macros(
+        &self,
         extractions: &[Extraction],
     ) -> BTreeMap<String, super::rust_site_scope::CrateMacros> {
-        use super::rust_site_scope::{crate_key, CrateMacros};
+        use super::rust_site_scope::{rust_crate_key_in, CrateMacros, NO_MANIFEST};
         const ROOTS: &[&str] = &["std", "core", "alloc", "log", "tracing", "anyhow", "eyre"];
+        let rust_files = || {
+            extractions
+                .iter()
+                .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        };
         let mut crates: BTreeMap<String, CrateMacros> = BTreeMap::new();
-        for ext in extractions
-            .iter()
-            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
-        {
-            let env = crates
-                .entry(crate_key(&ext.file_path).to_string())
-                .or_insert_with(|| CrateMacros {
-                    complete: true,
-                    ..CrateMacros::default()
-                });
+        for ext in rust_files() {
+            let key = rust_crate_key_in(&self.rust_manifest_crates, &ext.file_path);
+            let env = crates.entry(key.clone()).or_insert_with(|| CrateMacros {
+                complete: true,
+                dependencies: (key != NO_MANIFEST).then(|| {
+                    self.rust_manifest_crates
+                        .iter()
+                        .find(|manifest| manifest.dir == key)
+                        .map(|manifest| manifest.dependencies.clone())
+                        .unwrap_or_default()
+                }),
+                ..CrateMacros::default()
+            });
             let Some(facts) = ext
                 .rust_scope_facts
                 .as_ref()
@@ -2532,8 +2544,7 @@ impl Resolver {
             };
             env.defined.extend(facts.defined.iter().cloned());
             env.macro_use |= facts.macro_use;
-            env.shadowed_roots
-                .extend(facts.extern_aliases.iter().cloned());
+            env.externs.extend(facts.extern_crates.iter().cloned());
             env.shadowed_roots
                 .extend(ext.rust_inline_modules.iter().cloned());
             if let Some(module) =
@@ -2541,37 +2552,104 @@ impl Resolver {
             {
                 env.shadowed_roots.insert(module.to_string());
             }
+            for export in &ext.exports {
+                if export.exported_name == "*" {
+                    if let Some(specifier) = export.module_specifier.as_deref() {
+                        env.glob_reexports
+                            .push((ext.file_path.clone(), specifier.to_string()));
+                    }
+                } else if !export.exported_name.is_empty() {
+                    env.exported_names.insert(export.exported_name.clone());
+                }
+            }
+            for imp in ext.imports.iter().filter(|imp| {
+                imp.alias.as_deref() != Some(".")
+                    && !imp.raw_import.trim_start().starts_with("mod ")
+            }) {
+                for local in Self::rust_import_locals(imp) {
+                    if ROOTS.contains(&local.as_str()) {
+                        env.shadowed_roots.insert(local.clone());
+                    }
+                    // Whether the `use` is public is not told apart here; a
+                    // name any `use` binds counts as one the crate may export.
+                    env.exported_names.insert(local);
+                }
+            }
+        }
+        // What names a silent macro is bound by: needs every `extern crate` item
+        // of the crate read first, so it is a second pass.
+        let mut rebound: Vec<(String, String)> = Vec::new();
+        for ext in rust_files() {
+            let key = rust_crate_key_in(&self.rust_manifest_crates, &ext.file_path);
+            let Some(env) = crates.get(&key) else {
+                continue;
+            };
             for imp in ext.imports.iter().filter(|imp| {
                 imp.alias.as_deref() != Some(".")
                     && !imp.raw_import.trim_start().starts_with("mod ")
             }) {
                 let root = imp.module_specifier.split("::").next().unwrap_or("");
-                for (i, imported) in imp.imported_names.iter().enumerate() {
-                    let local = imp
-                        .local_names
-                        .get(i)
-                        .filter(|local| !local.is_empty())
-                        .cloned()
-                        .or_else(|| {
-                            imp.alias
-                                .clone()
-                                .filter(|a| imp.imported_names.len() == 1 && a != "_")
-                        })
-                        .unwrap_or_else(|| imported.clone());
-                    if ROOTS.contains(&local.as_str()) {
-                        env.shadowed_roots.insert(local.clone());
-                    }
-                    // The name of a silent macro, bound by anything but that
-                    // macro's own crate under its own name.
-                    let owned =
-                        imported == &local && super::rust_site_scope::macro_owned_by(&local, root);
+                for (i, imported) in Self::rust_import_pairs(imp) {
+                    let local = Self::rust_import_local_name(imp, i, &imported);
+                    // The name of a silent macro, bound by anything but a crate
+                    // that owns that macro, under its own name.
+                    let owned = imported == local && env.root_owns_macro(&local, root);
                     if super::rust_site_scope::is_silent_macro_name(&local) && !owned {
-                        env.rebound.insert(local);
+                        rebound.push((key.clone(), local));
                     }
                 }
             }
         }
+        for (key, name) in rebound {
+            if let Some(env) = crates.get_mut(&key) {
+                env.rebound.insert(name);
+            }
+        }
         crates
+    }
+
+    /// `(index, imported name)` of what `imp` binds. `use a as b;` of a single
+    /// segment records no imported name, only the alias: its name is the path.
+    fn rust_import_pairs(imp: &devmap_extract::model::ExtractedImport) -> Vec<(usize, String)> {
+        if imp.imported_names.is_empty() {
+            let binds_alias = imp
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias != "." && alias != "_");
+            return if binds_alias {
+                vec![(0, imp.module_specifier.clone())]
+            } else {
+                Vec::new()
+            };
+        }
+        imp.imported_names.iter().cloned().enumerate().collect()
+    }
+
+    /// The names `imp` binds in the importing module.
+    fn rust_import_locals(imp: &devmap_extract::model::ExtractedImport) -> Vec<String> {
+        Self::rust_import_pairs(imp)
+            .into_iter()
+            .map(|(i, imported)| Self::rust_import_local_name(imp, i, &imported))
+            .collect()
+    }
+
+    /// The name the `i`-th imported name of `imp` is bound to in the importing
+    /// module.
+    fn rust_import_local_name(
+        imp: &devmap_extract::model::ExtractedImport,
+        i: usize,
+        imported: &str,
+    ) -> String {
+        imp.local_names
+            .get(i)
+            .filter(|local| !local.is_empty())
+            .cloned()
+            .or_else(|| {
+                imp.alias
+                    .clone()
+                    .filter(|a| imp.imported_names.len() <= 1 && a != "_")
+            })
+            .unwrap_or_else(|| imported.to_string())
     }
 
     /// For each glob import written inside a block of a file's own module, the

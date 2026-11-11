@@ -1682,13 +1682,37 @@ pub struct RustMacroCall {
 /// that can hold or bring in names. It can emit items and `use`s beside the item.
 ///
 /// Recorded only where that matters to a reader today: on an item inside a
-/// block, and on a `use`, `mod` or `extern crate` item at any depth. A module
-/// level `#[tauri::command] fn` is not recorded.
+/// block, and on a `use`, `mod` or `extern crate` item at any depth. The
+/// attributes inside a `cfg_attr(pred, ..)` count as written (the predicate is
+/// not evaluated), and a `derive` is inert only when every path it names is a
+/// std/core one.
+///
+/// Known limit, deliberately not closed: an attribute macro on a module-level
+/// item (`#[pm::with_use(crate::db::Dup)] struct S;`) or on the function that
+/// encloses the call (`#[pm::rewrite] fn run() { .. }`) can emit a `use` or
+/// rewrite the body, and is not recorded, so the resolver does not take that
+/// scope as unknown. Taking every such attribute (`#[test]`, `#[tokio::main]`,
+/// `#[tauri::command]`, `#[instrument]`) as unknown would leave nearly every
+/// function without an edge. The `rs.s46*` rows of the accuracy fixture state
+/// the true expectation and are known-failing for this reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RustAttrMacro {
     /// The attribute path as written (`pm::with_use`).
     pub name: String,
     pub start: usize,
+}
+
+/// One `extern crate name [as alias];` item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustExternCrate {
+    /// The crate as written (`dep`, `self`).
+    pub name: String,
+    /// The name it binds when that is not its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// A `#[macro_use]` (or a `cfg_attr(.., macro_use)`) is on the item.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub macro_use: bool,
 }
 
 /// The macros a Rust file invokes in item or statement position and the ones it
@@ -1699,12 +1723,15 @@ pub struct RustMacroFacts {
     pub defined: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attrs: Vec<RustAttrMacro>,
-    /// A `#[macro_use]` attribute sits somewhere in the file.
+    /// A `#[macro_use]` sits on something that is neither a module nor an
+    /// `extern crate` item. On a module it only makes that module's own
+    /// `macro_rules!` (already in `defined`) visible after it; on an `extern
+    /// crate` it is in [`RustExternCrate::macro_use`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub macro_use: bool,
-    /// The names `extern crate x as name;` binds.
+    /// Every `extern crate` item of the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extern_aliases: Vec<String>,
+    pub extern_crates: Vec<RustExternCrate>,
 }
 
 /// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].

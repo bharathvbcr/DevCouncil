@@ -24,6 +24,33 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
     resolver.resolve_all(&extractions).unwrap()
 }
 
+/// The same, for a crate whose manifest (at the root) names `log` and `anyhow` as
+/// dependencies: a dependency's macro is silent only where a manifest says the
+/// name is the crate that owns it.
+fn resolve_in_crate_with_logging_deps(files: &[(&str, &str)]) -> ResolutionResult {
+    let extractions: Vec<Extraction> = files
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let dependency = |name: &str| devmap_extract::RustDependency {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    let manifests = devmap_extract::ProjectManifests {
+        rust_crates: vec![devmap_extract::RustCrateManifest {
+            dir: String::new(),
+            names: vec!["app".to_string()],
+            dependencies: vec![dependency("log"), dependency("anyhow")],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut resolver = Resolver::new();
+    resolver.index_project_manifests(&manifests);
+    resolver.index_extractions(&extractions);
+    resolver.resolve_all(&extractions).unwrap()
+}
+
 /// `(target_symbol, tier)` of each Calls edge out of `caller`.
 fn calls_from(result: &ResolutionResult, caller: &str) -> Vec<(String, &'static str)> {
     result
@@ -192,7 +219,7 @@ fn dup_caller(header: &str, before_call: &str) -> Vec<(String, &'static str)> {
         header.replace("#[macro_use]", ""),
         before_call
     );
-    let result = resolve(&[
+    let files = [
         ("src/lib.rs", lib),
         (
             "src/da.rs",
@@ -203,7 +230,13 @@ fn dup_caller(header: &str, before_call: &str) -> Vec<(String, &'static str)> {
             "pub struct Dup;\nimpl Dup { pub fn mk() -> u8 { 1 } }\n",
         ),
         ("src/user.rs", user.as_str()),
-    ]);
+    ];
+    // A header that imports from `log` runs in a crate whose manifest names it.
+    let result = if header.contains("use log::") {
+        resolve_in_crate_with_logging_deps(&files)
+    } else {
+        resolve(&files)
+    };
     calls_from(&result, "src/user.rs::run")
 }
 
@@ -303,7 +336,7 @@ fn bail_declares_nothing_when_it_is_anyhows() {
         let user = format!(
             "pub fn h() -> u16 {{ 2 }}\npub fn run(f: bool) -> u16 {{\n    if f {{\n        {root}::bail!(\"no\");\n        return h();\n    }}\n    0\n}}\n"
         );
-        let result = resolve(&[
+        let result = resolve_in_crate_with_logging_deps(&[
             ("src/lib.rs", "pub mod user;\n"),
             ("src/user.rs", user.as_str()),
         ]);

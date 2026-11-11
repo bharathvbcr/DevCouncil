@@ -261,7 +261,7 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
     let mut macros_defined = BTreeSet::new();
     let mut attr_macros: Vec<RustAttrMacro> = Vec::new();
     let mut macro_use = false;
-    let mut extern_aliases = BTreeSet::new();
+    let mut extern_crates: Vec<RustExternCrate> = Vec::new();
     let mut restricted: Vec<(usize, String)> = Vec::new();
     let mut cfg_spans: Vec<(usize, usize)> = Vec::new();
     let mut derefs = BTreeSet::new();
@@ -315,7 +315,7 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                             macros.insert(name.clone());
                         }
                         let declares = if name.rsplit("::").next() == Some("thread_local") {
-                            rust_thread_local_statics(&get_node_text(node, source))
+                            rust_thread_local_statics(node, source)
                         } else {
                             Vec::new()
                         };
@@ -327,32 +327,38 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                     }
                 }
             }
-            "attribute_item" => {
+            "attribute_item" | "inner_attribute_item" => {
                 let text = get_node_text(node, source);
-                let inner = text
-                    .trim()
-                    .trim_start_matches("#[")
-                    .trim_end_matches(']')
-                    .trim();
-                let end = inner
-                    .find(|c: char| c == '(' || c == '=' || c.is_whitespace())
-                    .unwrap_or(inner.len());
-                let name = inner[..end].trim().to_string();
-                if name == "macro_use" {
-                    macro_use = true;
-                }
-                if !rust_attribute_is_inert(&name, inner) {
-                    let mut next = node.next_sibling();
-                    while let Some(n) = next {
-                        if matches!(
-                            n.kind(),
-                            "attribute_item" | "line_comment" | "block_comment"
-                        ) {
-                            next = n.next_sibling();
-                        } else {
-                            break;
-                        }
+                let inner = rust_attribute_body(&text);
+                let leaves = rust_attribute_leaves(inner);
+                let mut next = node.next_sibling();
+                while let Some(n) = next {
+                    if matches!(
+                        n.kind(),
+                        "attribute_item" | "line_comment" | "block_comment"
+                    ) {
+                        next = n.next_sibling();
+                    } else {
+                        break;
                     }
+                }
+                // `#[macro_use]` on a module only publishes that module's own
+                // `macro_rules!`, which the file's `defined` already names; on an
+                // `extern crate` it is recorded with the item. Anywhere else (or
+                // with no item after it) it is not understood.
+                if leaves.iter().any(|leaf| leaf.name == "macro_use") {
+                    let understood = node.kind() == "attribute_item"
+                        && next.is_some_and(|item| {
+                            matches!(item.kind(), "mod_item" | "extern_crate_declaration")
+                        });
+                    if !understood {
+                        macro_use = true;
+                    }
+                }
+                if let Some(leaf) = leaves
+                    .iter()
+                    .find(|leaf| !rust_attribute_is_inert(&leaf.name, &leaf.whole))
+                {
                     let in_block = node.parent().is_some_and(|p| p.kind() == "block");
                     if let Some(item) = next.filter(|n| rust_node_declares_names(n.kind())) {
                         let on_import = matches!(
@@ -361,7 +367,7 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                         );
                         if in_block || on_import {
                             attr_macros.push(RustAttrMacro {
-                                name,
+                                name: leaf.name.clone(),
                                 start: node.start_byte(),
                             });
                         }
@@ -369,8 +375,28 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                 }
             }
             "extern_crate_declaration" => {
-                if let Some(alias) = get_child_text(node, "alias", source) {
-                    extern_aliases.insert(alias);
+                if let Some(name) = get_child_text(node, "name", source) {
+                    // The attributes written directly above the item.
+                    let mut macro_use_here = false;
+                    let mut previous = node.prev_sibling();
+                    while let Some(sibling) = previous {
+                        match sibling.kind() {
+                            "attribute_item" => {
+                                let text = get_node_text(sibling, source);
+                                macro_use_here |= rust_attribute_leaves(rust_attribute_body(&text))
+                                    .iter()
+                                    .any(|leaf| leaf.name == "macro_use");
+                            }
+                            "line_comment" | "block_comment" => {}
+                            _ => break,
+                        }
+                        previous = sibling.prev_sibling();
+                    }
+                    extern_crates.push(RustExternCrate {
+                        name,
+                        alias: get_child_text(node, "alias", source),
+                        macro_use: macro_use_here,
+                    });
                 }
             }
             "macro_definition" => {
@@ -442,7 +468,7 @@ pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts
                 defined: macros_defined.into_iter().collect(),
                 attrs: attr_macros,
                 macro_use,
-                extern_aliases: extern_aliases.into_iter().collect(),
+                extern_crates,
             }),
         }),
         deref_targets: derefs.into_iter().collect(),
@@ -493,12 +519,103 @@ fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
     false
 }
 
+/// What sits between `#[` and `]` (or `#![` and `]`) of an attribute item.
+fn rust_attribute_body(text: &str) -> &str {
+    text.trim()
+        .trim_start_matches("#!")
+        .trim_start_matches("#")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+}
+
+/// One attribute as the compiler will see it: its path and its whole text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttributeLeaf {
+    name: String,
+    whole: String,
+}
+
+/// The attributes an attribute body stands for. `cfg_attr(pred, a, b(..))` is
+/// `a` and `b(..)` whenever `pred` holds; the predicate is not evaluated, so each
+/// inner attribute counts as possibly present. Nesting is followed to a bounded
+/// depth; a `cfg_attr` that cannot be taken apart is itself returned, and it is
+/// not inert.
+fn rust_attribute_leaves(body: &str) -> Vec<AttributeLeaf> {
+    let mut leaves = Vec::new();
+    rust_attribute_leaves_into(body, 0, &mut leaves);
+    leaves
+}
+
+fn rust_attribute_leaves_into(body: &str, depth: usize, out: &mut Vec<AttributeLeaf>) {
+    let body = body.trim();
+    let end = body
+        .find(|c: char| c == '(' || c == '=' || c.is_whitespace())
+        .unwrap_or(body.len());
+    let name = body[..end].trim();
+    if name != "cfg_attr" {
+        out.push(AttributeLeaf {
+            name: name.to_string(),
+            whole: body.to_string(),
+        });
+        return;
+    }
+    let args = body[end..]
+        .trim_start()
+        .strip_prefix('(')
+        .and_then(|rest| rest.trim_end().strip_suffix(')'));
+    match args {
+        Some(args) if depth < 8 => {
+            // The first argument is the predicate; the rest are attributes.
+            for attribute in rust_split_top_level_commas(args).into_iter().skip(1) {
+                if !attribute.trim().is_empty() {
+                    rust_attribute_leaves_into(attribute, depth + 1, out);
+                }
+            }
+        }
+        _ => out.push(AttributeLeaf {
+            name: name.to_string(),
+            whole: body.to_string(),
+        }),
+    }
+}
+
+/// `text` split at the commas that are not inside brackets or a string literal.
+fn rust_split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for (at, c) in text.char_indices() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
 /// Attributes that cannot emit an item or a `use`. A `derive` is inert only when
-/// every trait it names is a std one that emits an `impl` and nothing else.
+/// every trait it names is a std one that emits an `impl` and nothing else: a bare
+/// std name, or a path rooted at `std`, `core` or `alloc`.
 fn rust_attribute_is_inert(name: &str, whole: &str) -> bool {
     const INERT: &[&str] = &[
         "cfg",
-        "cfg_attr",
         "allow",
         "warn",
         "deny",
@@ -544,44 +661,53 @@ fn rust_attribute_is_inert(name: &str, whole: &str) -> bool {
         let args = whole
             .split_once('(')
             .map_or("", |(_, rest)| rest.trim_end_matches(')'));
-        return args
-            .split(',')
-            .map(|t| t.trim().rsplit("::").next().unwrap_or("").trim())
+        return rust_split_top_level_commas(args)
+            .into_iter()
+            .map(|t| t.trim().trim_start_matches("::").trim())
             .filter(|t| !t.is_empty())
-            .all(|t| STD_DERIVES.contains(&t));
+            .all(|t| {
+                let mut segments = t.split("::").map(str::trim);
+                let first = segments.next().unwrap_or("");
+                let last = t.rsplit("::").next().unwrap_or("").trim();
+                let rooted_in_std = t.contains("::") && matches!(first, "std" | "core" | "alloc");
+                (!t.contains("::") || rooted_in_std) && STD_DERIVES.contains(&last)
+            });
     }
     false
 }
 
 /// The names a `thread_local!` invocation declares: the identifier after each
-/// `static` keyword (not the `'static` lifetime).
-fn rust_thread_local_statics(invocation: &str) -> Vec<String> {
-    let bytes: Vec<char> = invocation.chars().collect();
+/// `static` keyword among the invocation's own tokens. Strings, comments and the
+/// `'static` lifetime are nodes of their own and never read as the keyword, and
+/// what sits inside a nested token tree (an initializer) declares nothing here.
+fn rust_thread_local_statics(invocation: Node, source: &str) -> Vec<String> {
+    let mut cursor = invocation.walk();
+    let Some(tokens) = invocation
+        .children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return Vec::new();
+    };
     let mut names = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_alphanumeric() || bytes[i] == '_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
-                i += 1;
-            }
-            let word: String = bytes[start..i].iter().collect();
-            let quoted = start > 0 && bytes[start - 1] == '\'';
-            if word == "static" && !quoted {
-                while i < bytes.len() && bytes[i].is_whitespace() {
-                    i += 1;
-                }
-                let name_start = i;
-                while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
-                    i += 1;
-                }
-                if i > name_start {
-                    names.push(bytes[name_start..i].iter().collect());
-                }
-            }
-        } else {
-            i += 1;
+    let mut after_static = false;
+    let mut cursor = tokens.walk();
+    for token in tokens.children(&mut cursor) {
+        if matches!(token.kind(), "line_comment" | "block_comment") {
+            continue;
         }
+        let text = get_node_text(token, source);
+        if after_static {
+            after_static = false;
+            if token.kind() == "identifier" {
+                names.push(text);
+                continue;
+            }
+        }
+        after_static = text == "static"
+            && !matches!(
+                token.kind(),
+                "string_literal" | "raw_string_literal" | "token_tree"
+            );
     }
     names
 }

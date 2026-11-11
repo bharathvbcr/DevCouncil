@@ -30,7 +30,12 @@
 //!   only macros taken to emit nothing, and only while nothing in the crate
 //!   could have rebound the name or its path (see [`CrateMacros`]). An attribute
 //!   macro on a block item, or on a `use`, `mod` or `extern crate` item, counts
-//!   as a macro in the scope that holds it.
+//!   as a macro in the scope that holds it. A macro is silent only when no glob
+//!   import visible at the call may bring a macro of that name into scope (see
+//!   [`Resolver::rust_glob_brings`]): a glob of std/core/alloc cannot, a glob of
+//!   an indexed crate can when that crate defines or exports the name, and a glob
+//!   the index cannot follow (a crate that is not indexed, an unresolved path)
+//!   can.
 //! * (b) otherwise, does it hold a glob import the index cannot prove does NOT
 //!   provide the name? In a block that is `Unknown` and the walk stops; at the
 //!   module level the glob is `Glob` and the file-wide bindings say whether it
@@ -52,9 +57,11 @@
 //! existed, or a walk cut short) is `Unknown`, and Unknown never yields a
 //! confident edge.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use devmap_extract::model::{Extraction, RustScopeKind, SymbolKind};
+use devmap_extract::model::{Extraction, RustExternCrate, RustScopeKind, SymbolKind};
+use devmap_extract::{RustCrateManifest, RustDependency};
 
 use super::Resolver;
 
@@ -87,6 +94,13 @@ pub(super) fn macro_owned_by(name: &str, root: &str) -> bool {
     macro_providers(name).is_some_and(|providers| providers.contains(&root))
 }
 
+/// The key of the Rust files no manifest governs. They are one crate for the
+/// purpose of "what could rebind a macro", which merges what a real split would
+/// keep apart (more names defined, more imports, more `#[macro_use]`: the
+/// cautious direction), and their dependencies are unknown, so no macro of a
+/// dependency crate (`log`, `tracing`, `anyhow`, `eyre`) is silent in them.
+pub(super) const NO_MANIFEST: &str = "<no-manifest>";
+
 /// What could rebind a macro name inside one crate. A crate whose files do not
 /// all record their macros is `complete: false`, and no macro of it is silent.
 #[derive(Debug, Clone, Default)]
@@ -94,45 +108,104 @@ pub(super) struct CrateMacros {
     pub(super) complete: bool,
     /// Every `macro_rules!` name of the crate.
     pub(super) defined: BTreeSet<String>,
-    /// Names a `use` imports from anywhere but the one crate that owns the macro.
+    /// Names a `use` imports from anywhere but the crate that owns the macro.
     pub(super) rebound: BTreeSet<String>,
-    /// Path roots that are not the crate they look like: an `extern crate .. as`
-    /// alias, a module of the crate, a `use .. as` of the name.
+    /// Path roots that a local item may stand for: a module of the crate, or a
+    /// `use .. as` of a std/log/tracing/anyhow/eyre name.
     pub(super) shadowed_roots: BTreeSet<String>,
-    /// A `#[macro_use]` sits somewhere in the crate.
+    /// A `#[macro_use]` sits on something that is neither a module nor an
+    /// `extern crate` item.
     pub(super) macro_use: bool,
+    /// Every `extern crate` item of the crate.
+    pub(super) externs: Vec<RustExternCrate>,
+    /// The dependencies the crate's manifest names; `None` when no manifest
+    /// governs it (see [`NO_MANIFEST`]), which is "unknown", not "none".
+    pub(super) dependencies: Option<Vec<RustDependency>>,
+    /// Every name the crate's files export (`pub use a::b as name`).
+    pub(super) exported_names: BTreeSet<String>,
+    /// Every `pub use path::*` of the crate, as `(file, path)`.
+    pub(super) glob_reexports: Vec<(String, String)>,
 }
 
-/// The crate a file belongs to, as the path before its first `src`, `tests`,
-/// `benches` or `examples` directory.
-pub(super) fn crate_key(file: &str) -> &str {
-    ["/src/", "/tests/", "/benches/", "/examples/"]
+impl CrateMacros {
+    /// The packages the crate's manifest says `local` is; `None` when the name
+    /// is not a dependency or the package is not known.
+    fn dependency_packages(&self, local: &str) -> Vec<Option<String>> {
+        let Some(dependencies) = &self.dependencies else {
+            return vec![None];
+        };
+        let found: Vec<Option<String>> = dependencies
+            .iter()
+            .filter(|dependency| dependency.name == local)
+            .map(|dependency| dependency.package_name().map(str::to_string))
+            .collect();
+        if found.is_empty() {
+            vec![None]
+        } else {
+            found
+        }
+    }
+
+    /// The packages an `extern crate original;` item names.
+    pub(super) fn extern_packages(&self, original: &str) -> Vec<Option<String>> {
+        match original {
+            "std" | "core" | "alloc" => vec![Some(original.to_string())],
+            "self" => vec![None],
+            other => self.dependency_packages(other),
+        }
+    }
+
+    /// The packages a path root may stand for in this crate: what its manifest
+    /// and its `extern crate` items say, and "unknown" when a local item may
+    /// stand for it. Every candidate counts, because one crate's files are
+    /// read together. Empty is never returned.
+    pub(super) fn root_packages(&self, root: &str) -> Vec<Option<String>> {
+        let mut out: Vec<Option<String>> = Vec::new();
+        for item in self
+            .externs
+            .iter()
+            .filter(|item| item.alias.as_deref().unwrap_or(&item.name) == root)
+        {
+            out.extend(self.extern_packages(&item.name));
+        }
+        if out.is_empty() {
+            if matches!(root, "std" | "core" | "alloc") {
+                out.push(Some(root.to_string()));
+            } else {
+                out.extend(self.dependency_packages(root));
+            }
+        }
+        if self.shadowed_roots.contains(root) {
+            out.push(None);
+        }
+        out
+    }
+
+    /// Whether `root` is, everywhere in this crate, a crate that owns the macro
+    /// `name`. A crate in the workspace that bears the owner's package name is
+    /// taken to be it; a renamed dependency, an alias of another crate and a
+    /// name no manifest declares are not.
+    pub(super) fn root_owns_macro(&self, name: &str, root: &str) -> bool {
+        self.root_packages(root)
+            .iter()
+            .all(|package| package.as_deref().is_some_and(|p| macro_owned_by(name, p)))
+    }
+}
+
+/// The key of the crate a file belongs to: the directory of the nearest
+/// manifest above it, or [`NO_MANIFEST`]. The manifest pass is the one owner of
+/// crate membership and dependency names.
+pub(super) fn rust_crate_key_in(manifests: &[RustCrateManifest], file: &str) -> String {
+    manifests
         .iter()
-        .filter_map(|dir| file.find(dir))
-        .min()
-        .map_or("", |at| &file[..at])
-}
-
-/// Whether the macro invoked as `path` is the real std/log/tracing/anyhow macro
-/// and emits nothing the index cannot see. Nothing in the crate may rebind its
-/// name or its path root.
-fn macro_is_silent(path: &str, env: Option<&CrateMacros>) -> bool {
-    let Some(env) = env.filter(|env| env.complete && !env.macro_use) else {
-        return false;
-    };
-    let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
-    let Some(name) = segments.pop() else {
-        return false;
-    };
-    let Some(providers) = macro_providers(name) else {
-        return false;
-    };
-    let path_ok = match segments.as_slice() {
-        [] => true,
-        [root] => providers.contains(root) && !env.shadowed_roots.contains(*root),
-        _ => false,
-    };
-    path_ok && !env.defined.contains(name) && !env.rebound.contains(name)
+        .filter(|manifest| {
+            manifest.dir.is_empty()
+                || file
+                    .strip_prefix(manifest.dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|manifest| manifest.dir.len())
+        .map_or_else(|| NO_MANIFEST.to_string(), |manifest| manifest.dir.clone())
 }
 
 /// Where a use of a name inside a file comes from, as far as that file's own
@@ -204,6 +277,8 @@ struct GlobImport {
     in_file_supers: Option<usize>,
     /// Start byte of the import, the key of what it provides in the resolver.
     at: usize,
+    /// The module path as written (`dep`, `crate::prelude`, `super`).
+    specifier: String,
 }
 
 #[derive(Debug, Clone)]
@@ -267,9 +342,10 @@ fn leading_supers(raw_import: &str) -> usize {
 }
 
 impl RustFileScope {
-    /// `macros` is what could rebind a macro name in the file's crate, `None`
-    /// when that is not known.
-    pub(super) fn build(ext: &Extraction, macros: Option<&CrateMacros>) -> Self {
+    /// The structure of the file: its scopes, declarations and imports. Whether
+    /// the macro invocations in it can declare names is decided afterwards by
+    /// [`Self::apply_macros`], which needs every file and manifest indexed.
+    pub(super) fn build(ext: &Extraction) -> Self {
         let mut scope = Self {
             scopes: vec![Scope {
                 module: true,
@@ -314,26 +390,10 @@ impl RustFileScope {
                 parent,
             });
         }
-        let mut declared_by_macro: Vec<(usize, String)> = Vec::new();
-        for call in &macro_facts.calls {
-            if macro_is_silent(&call.name, macros) {
-                let at = scope.scope_at(call.start);
-                declared_by_macro.extend(call.declares.iter().map(|n| (at, n.clone())));
-            } else {
-                let at = scope.scope_at(call.start);
-                scope.macro_scopes.insert(at);
-            }
-        }
         // An attribute macro can emit items and `use`s beside its item.
         for attr in &macro_facts.attrs {
             let at = scope.scope_at(attr.start);
             scope.macro_scopes.insert(at);
-        }
-        for (at, name) in declared_by_macro {
-            scope.decls.entry(name).or_default().push(RustDecl {
-                scope: at,
-                vis: RustVis::Private,
-            });
         }
         let kinds: BTreeMap<&str, SymbolKind> = ext
             .symbols
@@ -404,6 +464,7 @@ impl RustFileScope {
                     scope: at,
                     in_file_supers,
                     at: imp.span.start_byte,
+                    specifier: imp.module_specifier.clone(),
                 });
                 continue;
             }
@@ -429,6 +490,92 @@ impl RustFileScope {
             }
         }
         scope
+    }
+
+    /// Decide, for each macro invocation of the file, whether it declares
+    /// nothing the index cannot see. `silent(scope, at, path)` answers for the
+    /// invocation `path` written in scope `at`. A silent invocation declares only
+    /// the names it is known to (`thread_local!`'s statics); any other leaves its
+    /// scope unanswered for every name.
+    pub(super) fn apply_macros(
+        &mut self,
+        ext: &Extraction,
+        silent: &dyn Fn(&RustFileScope, usize, &str) -> bool,
+    ) {
+        let Some(macro_facts) = ext
+            .rust_scope_facts
+            .as_ref()
+            .and_then(|facts| facts.macros.as_ref())
+        else {
+            return;
+        };
+        if !self.known {
+            return;
+        }
+        let verdicts: Vec<(usize, bool)> = macro_facts
+            .calls
+            .iter()
+            .map(|call| {
+                let at = self.scope_at(call.start);
+                (at, silent(self, at, &call.name))
+            })
+            .collect();
+        for (call, (at, is_silent)) in macro_facts.calls.iter().zip(verdicts) {
+            if is_silent {
+                for name in &call.declares {
+                    self.decls.entry(name.clone()).or_default().push(RustDecl {
+                        scope: at,
+                        vis: RustVis::Private,
+                    });
+                }
+            } else {
+                self.macro_scopes.insert(at);
+            }
+        }
+    }
+
+    /// The glob imports that name another file and can reach a use written in
+    /// scope `at`: those of its blocks up to its module, and those of the
+    /// modules a `use super::*` of that module climbs to inside this file.
+    pub(super) fn visible_globs(&self, at: usize) -> Vec<&str> {
+        let mut scopes: Vec<usize> = Vec::new();
+        let mut level = at;
+        loop {
+            scopes.push(level);
+            if self.scopes[level].module {
+                break;
+            }
+            match self.scopes[level].parent {
+                Some(parent) => level = parent,
+                None => break,
+            }
+        }
+        let mut modules = vec![self.module_of(at)];
+        let mut next = 0;
+        while next < modules.len() && modules.len() < 16 {
+            let module = modules[next];
+            for glob in self.globs.iter().filter(|g| g.scope == module) {
+                if let Some(target) = glob
+                    .in_file_supers
+                    .and_then(|supers| self.climb(module, supers))
+                {
+                    if !modules.contains(&target) {
+                        modules.push(target);
+                    }
+                }
+            }
+            next += 1;
+        }
+        for module in modules {
+            if !scopes.contains(&module) {
+                scopes.push(module);
+            }
+        }
+        self.globs
+            .iter()
+            .filter(|g| g.in_file_supers.is_none() && scopes.contains(&g.scope))
+            .map(|g| g.specifier.as_str())
+            .collect()
     }
 
     /// The innermost scope whose body contains `pos`; 0 is the file itself.
@@ -824,5 +971,264 @@ impl Resolver {
             && self
                 .rust_origin_at(file, name, site)
                 .is_some_and(|origin| origin != RustOrigin::Own)
+    }
+}
+
+/// What one pass over every Rust file's macro invocations reads: each file's glob
+/// imports, and the answers already worked out.
+pub(super) struct MacroPass<'a> {
+    /// Every glob import of each file, as written (`dep`, `crate::prelude`).
+    globs: BTreeMap<&'a str, Vec<&'a str>>,
+    /// `((file, glob path), probe name, macro name)` -> whether the glob may bring
+    /// the probe name into scope.
+    memo: RefCell<BTreeMap<(String, String, String), bool>>,
+}
+
+impl Resolver {
+    /// The key of the crate `file` belongs to: the directory of its nearest
+    /// manifest, or [`NO_MANIFEST`].
+    pub(super) fn rust_crate_key(&self, file: &str) -> String {
+        rust_crate_key_in(&self.rust_manifest_crates, file)
+    }
+
+    /// The crate whose manifest names `package` as its package or library name.
+    fn rust_crate_key_of_package(&self, package: &str) -> Option<String> {
+        self.rust_manifest_crates
+            .iter()
+            .find(|manifest| manifest.names.iter().any(|name| name == package))
+            .map(|manifest| manifest.dir.clone())
+    }
+
+    /// Decide, for every Rust file, which macro invocations declare nothing the
+    /// index cannot see. It runs after every file, manifest and module glob is
+    /// indexed, because whether a glob import may bring a macro into scope asks
+    /// about other files and other crates.
+    pub(super) fn apply_rust_macro_facts(&mut self, extractions: &[Extraction]) {
+        let by_file: BTreeMap<&str, &Extraction> = extractions
+            .iter()
+            .filter(|ext| ext.language == "rust")
+            .map(|ext| (ext.file_path.as_str(), ext))
+            .collect();
+        let pass = MacroPass {
+            globs: by_file
+                .iter()
+                .map(|(file, ext)| {
+                    let globs = ext
+                        .imports
+                        .iter()
+                        .filter(|imp| {
+                            imp.alias.as_deref() == Some(".")
+                                && !imp.raw_import.trim_start().starts_with("mod ")
+                        })
+                        .map(|imp| imp.module_specifier.as_str())
+                        .collect();
+                    (*file, globs)
+                })
+                .collect(),
+            memo: RefCell::new(BTreeMap::new()),
+        };
+        let files: Vec<String> = self.rust_site_scope.keys().cloned().collect();
+        for file in files {
+            let Some(ext) = by_file.get(file.as_str()) else {
+                continue;
+            };
+            let Some(mut scope) = self.rust_site_scope.remove(&file) else {
+                continue;
+            };
+            scope.apply_macros(ext, &|scope, at, path| {
+                self.rust_macro_is_silent(&pass, &file, scope, at, path)
+            });
+            self.rust_site_scope.insert(file, scope);
+        }
+    }
+
+    /// Whether the macro invoked as `path` in scope `at` of `file` is the real
+    /// std/log/tracing/anyhow macro and emits nothing the index cannot see.
+    /// Nothing may rebind its name or its path root: not a `macro_rules!` or a
+    /// `use` of the crate, not an `extern crate` item or a manifest name that is
+    /// another crate, not a `#[macro_use]` crate that may export it, and not a glob
+    /// import visible at the call that may bring it in.
+    fn rust_macro_is_silent(
+        &self,
+        pass: &MacroPass<'_>,
+        file: &str,
+        scope: &RustFileScope,
+        at: usize,
+        path: &str,
+    ) -> bool {
+        let Some(env) = self
+            .rust_crate_macros
+            .get(&self.rust_crate_key(file))
+            .filter(|env| env.complete && !env.macro_use)
+        else {
+            return false;
+        };
+        let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
+        let Some(name) = segments.pop() else {
+            return false;
+        };
+        if macro_providers(name).is_none() {
+            return false;
+        }
+        let root = match segments.as_slice() {
+            [] => None,
+            [root] => Some(*root),
+            _ => return false,
+        };
+        if root.is_some_and(|root| !env.root_owns_macro(name, root)) {
+            return false;
+        }
+        if env.defined.contains(name) || env.rebound.contains(name) {
+            return false;
+        }
+        for item in env.externs.iter().filter(|item| item.macro_use) {
+            if self.rust_extern_may_publish(pass, env, &item.name, name) {
+                return false;
+            }
+        }
+        for specifier in scope.visible_globs(at) {
+            if self.rust_glob_brings(pass, file, specifier, name, name)
+                || root.is_some_and(|root| self.rust_glob_brings(pass, file, specifier, root, name))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether `#[macro_use] extern crate original;` may bring a macro named
+    /// `name` into scope: unless the crate is std, the crate that owns the macro,
+    /// or an indexed crate that provably exports nothing of that name.
+    fn rust_extern_may_publish(
+        &self,
+        pass: &MacroPass<'_>,
+        env: &CrateMacros,
+        original: &str,
+        name: &str,
+    ) -> bool {
+        for package in env.extern_packages(original) {
+            let Some(package) = package else {
+                return true;
+            };
+            if matches!(package.as_str(), "std" | "core" | "alloc")
+                || macro_owned_by(name, &package)
+            {
+                continue;
+            }
+            let Some(key) = self.rust_crate_key_of_package(&package) else {
+                return true;
+            };
+            if self.rust_crate_may_publish(pass, &key, name, name, &mut BTreeSet::new()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the glob import of `specifier` written in `file` may bring `probe`
+    /// into scope. `macro_name` is the macro being asked about: a glob of a crate
+    /// that owns it brings the real one.
+    fn rust_glob_brings(
+        &self,
+        pass: &MacroPass<'_>,
+        file: &str,
+        specifier: &str,
+        probe: &str,
+        macro_name: &str,
+    ) -> bool {
+        let key = (
+            format!("{file}\0{specifier}"),
+            probe.to_string(),
+            macro_name.to_string(),
+        );
+        if let Some(known) = pass.memo.borrow().get(&key) {
+            return *known;
+        }
+        let answer = self.rust_glob_brings_in(
+            pass,
+            file,
+            specifier,
+            probe,
+            macro_name,
+            &mut BTreeSet::new(),
+        );
+        pass.memo.borrow_mut().insert(key, answer);
+        answer
+    }
+
+    /// The walk behind [`Self::rust_glob_brings`]. A glob that names a module of
+    /// this crate may bring what that module's own globs bring (public or not: a
+    /// descendant sees both); one that names another indexed crate, what that crate
+    /// exports; one from std/core/alloc nothing but std; one from a crate that is
+    /// not indexed only the macros its owner defines. Whatever the index cannot
+    /// follow may bring anything.
+    fn rust_glob_brings_in(
+        &self,
+        pass: &MacroPass<'_>,
+        file: &str,
+        specifier: &str,
+        probe: &str,
+        macro_name: &str,
+        seen: &mut BTreeSet<(String, String)>,
+    ) -> bool {
+        if !seen.insert((file.to_string(), specifier.to_string())) {
+            return false;
+        }
+        let key = self.rust_crate_key(file);
+        let Some(env) = self.rust_crate_macros.get(&key) else {
+            return true;
+        };
+        let root = specifier
+            .trim_start_matches("::")
+            .split("::")
+            .next()
+            .unwrap_or("");
+        let std_only = env
+            .root_packages(root)
+            .iter()
+            .all(|package| matches!(package.as_deref(), Some("std" | "core" | "alloc")));
+        if std_only {
+            return false;
+        }
+        match self.resolve_import_path(file, "rust", specifier) {
+            Some(target) => {
+                let target_key = self.rust_crate_key(&target);
+                if target_key == key {
+                    pass.globs.get(target.as_str()).is_some_and(|globs| {
+                        globs.iter().any(|next| {
+                            self.rust_glob_brings_in(pass, &target, next, probe, macro_name, seen)
+                        })
+                    })
+                } else {
+                    self.rust_crate_may_publish(pass, &target_key, probe, macro_name, seen)
+                }
+            }
+            None => {
+                matches!(root, "crate" | "self" | "super")
+                    || env.shadowed_roots.contains(root)
+                    || !env.root_owns_macro(macro_name, root)
+            }
+        }
+    }
+
+    /// Whether the crate `key` may export `probe`: it defines or re-exports a
+    /// name that is that, or a `pub use path::*` of it may.
+    fn rust_crate_may_publish(
+        &self,
+        pass: &MacroPass<'_>,
+        key: &str,
+        probe: &str,
+        macro_name: &str,
+        seen: &mut BTreeSet<(String, String)>,
+    ) -> bool {
+        let Some(env) = self.rust_crate_macros.get(key) else {
+            return true;
+        };
+        if !env.complete || env.defined.contains(probe) || env.exported_names.contains(probe) {
+            return true;
+        }
+        env.glob_reexports.iter().any(|(file, specifier)| {
+            self.rust_glob_brings_in(pass, file, specifier, probe, macro_name, seen)
+        })
     }
 }
