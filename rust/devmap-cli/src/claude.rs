@@ -2952,7 +2952,7 @@ mod tests {
             format!("/tmp/{tick}/devmap"),
             format!("/tmp/o'{subst}/devmap"),
             format!("/tmp/'{subst}'/devmap"),
-            format!("/tmp/foo'; touch \"$MARKER\"; echo '/devmap"),
+            "/tmp/foo'; touch \"$MARKER\"; echo '/devmap".to_string(),
             format!("'{subst}"),
             format!("{subst}'"),
             format!("/tmp/my bin/{subst}/devmap"),
