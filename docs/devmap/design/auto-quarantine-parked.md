@@ -78,11 +78,10 @@ Order of operations on open and build once the rule is met: prove ownership
 
 ## Resuming
 
-Prerequisites: F3 (`ft-6bcae99cd8aea8538b677a3660c18cbe`), and F2, the daemon
-comparing the store's file (device and inode) and not its name
-(`ft-3b886056`, test `daemon::tests::a_daemon_whose_store_was_replaced_at_the_same_path_exits`,
-`#[ignore]`), because a set-aside followed by a fresh store at the same path is
-exactly what the daemon does not see.
+Prerequisites: F3 (`ft-6bcae99cd8aea8538b677a3660c18cbe`). F2
+(`ft-3b886056`, test `daemon::tests::a_daemon_whose_store_was_replaced_at_the_same_path_exits`)
+is met: the daemon compares the store's file (device and inode) via
+`StoreFileIdentity` and exits when that file is replaced at the same path.
 
 Acceptance: every test of `attack/dsr` passes on the resumed head, and one
 independent round finds 0 BLOCKs in "moves a store that is not ours". Stop at one

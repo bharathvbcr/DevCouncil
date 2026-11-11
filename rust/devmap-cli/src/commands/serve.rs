@@ -73,9 +73,9 @@ pub(crate) async fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     ensure_parent(&cli.db())?;
     let store = Store::open(cli.db())?;
     let daemon = Daemon::new(store, root)
-        // So the daemon can notice its own store being deleted and
-        // exit, instead of serving a removed inode until its idle bound
-        // expires half an hour later.
+        // So the daemon can notice its own store being deleted or
+        // replaced at the same path and exit, instead of serving a
+        // removed inode until its idle bound expires half an hour later.
         .with_store_path(cli.db())
         .with_ipc_path(ipc_path);
     daemon.run_loop().await?;

@@ -12,6 +12,8 @@ use devmap_resolve::Resolver;
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
 use crate::binary_identity::{executable_identity, should_retire_for_new_binary};
+#[cfg(unix)]
+use crate::repo_scope::StoreFileIdentity;
 use crate::watcher::{start_file_watcher_observed, WatchBacklog};
 
 const STABLE_READ_ATTEMPTS: usize = 3;
@@ -260,6 +262,16 @@ pub struct Daemon {
     /// say — and the store half of [`Daemon::vanished_reason`] is then skipped
     /// rather than guessed at. A guess here retires a working daemon.
     store_path: Option<std::path::PathBuf>,
+    /// Device and inode of `store_path` at [`Self::with_store_path`].
+    ///
+    /// `None` when that path was not a regular file then. There is nothing to
+    /// compare, so [`Self::vanished_reason`] checks absence only.
+    ///
+    /// Unix only. [`StoreFileIdentity`] has no stable file id elsewhere, and
+    /// its size-and-mtime stand-in changes on every write. Using that to
+    /// retire would exit a daemon for writing its own store.
+    #[cfg(unix)]
+    opened_store: Option<StoreFileIdentity>,
     /// Bytes per second of disk writes the drain loop paces itself to. See
     /// [`DEFAULT_DRAIN_WRITE_BUDGET`].
     drain_write_budget: u64,
@@ -500,6 +512,8 @@ impl Daemon {
             // way.
             serving: Arc::new(tokio::sync::watch::channel(false).0),
             store_path: None,
+            #[cfg(unix)]
+            opened_store: None,
             drain_write_budget: DEFAULT_DRAIN_WRITE_BUDGET,
             freshness_settle: DEFAULT_FRESHNESS_SETTLE,
             watch_backlog: WatchBacklog::default(),
@@ -550,11 +564,21 @@ impl Daemon {
     }
 
     /// Tell the daemon which file its store lives in, so it can notice the file
-    /// being deleted out from under it.
+    /// being deleted or replaced out from under it.
     ///
     /// Passed in rather than read back off the `Store`, which does not expose
-    /// the path it was opened from.
+    /// the path it was opened from. On Unix the file's device and inode are
+    /// recorded here, before [`Self::run_loop`], via [`StoreFileIdentity`].
+    /// Recorded on the first tick instead, a replacement that landed before
+    /// that tick would be stored as the file this daemon opened.
     pub fn with_store_path(mut self, store_path: std::path::PathBuf) -> Self {
+        #[cfg(unix)]
+        {
+            self.opened_store = std::fs::metadata(&store_path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| StoreFileIdentity::of(&metadata));
+        }
         self.store_path = Some(store_path);
         self
     }
@@ -725,7 +749,18 @@ impl Daemon {
     ///
     /// Both halves are checked because either can go alone: `rm -rf` of the
     /// tree takes the store with it, but `rm` of the database leaves a live
-    /// tree behind a daemon answering from a deleted inode.
+    /// tree behind a daemon answering from a deleted inode. A third case is
+    /// the path still existing and naming a different file: the store moved
+    /// aside and recreated in its place. `path.exists()` is true again, and
+    /// the connection this process holds is the file that was moved.
+    ///
+    /// On Unix that case is [`StoreFileIdentity`], device and inode against
+    /// the record from [`Self::with_store_path`]. A write to the same file
+    /// does not change it. A full `VACUUM` does rewrite the file, and that
+    /// is treated as a replacement too: this process exits and the next
+    /// client opens the file now at the path, rather than this one keeping
+    /// an identity that no longer matches it. Elsewhere there is no stable
+    /// file id, so only absence is checked.
     ///
     /// `None` is returned whenever the question cannot be answered — an
     /// in-memory store has no path — rather than a guess, because a false
@@ -749,10 +784,28 @@ impl Daemon {
         // Not stated (an in-memory store, or a caller that did not say): there
         // is nothing on disk this daemon claims, so there is nothing to check.
         let path = self.store_path.as_ref()?;
-        if !path.exists() {
-            return Some(format!("store {path:?} no longer exists"));
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                #[cfg(unix)]
+                if let Some(opened) = self.opened_store {
+                    let current = StoreFileIdentity::of(&metadata);
+                    if opened != current {
+                        return Some(format!(
+                            "store {path:?} was replaced by a different file \
+                             (opened {opened:?}, now {current:?})"
+                        ));
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = metadata;
+                }
+                None
+            }
+            // Missing, not a file, or unstatable. `Path::exists` is false in
+            // every one of those, which is the check this replaces.
+            _ => Some(format!("store {path:?} no longer exists")),
         }
-        None
     }
 
     /// Reconcile the durable generation against disk before serving queries.
@@ -5081,18 +5134,16 @@ mod tests {
         assert!(!lock.exists(), "a vanished daemon left its lock behind");
     }
 
-    /// F2 (attack round on `damaged-store-recovery`): a store set aside (a rename
-    /// of the file and its sidecars) and replaced by a fresh one at the same path
-    /// within milliseconds. `path.exists()` is true again by the time the daemon
-    /// looks, so the daemon keeps its connection to the renamed inode, drains
-    /// into it and never sees the store that now answers queries. The store half
-    /// of `vanished_reason` must compare the file, not the name. Nothing in this
-    /// repository sets a store aside any more (the mover is parked), but an
-    /// operator's `mv` and a restore do exactly this.
+    /// F2 (attack round on `damaged-store-recovery`): a fresh store renamed onto
+    /// the live path in one step. The path is never missing, so `path.exists()`
+    /// stays true and the daemon keeps its connection to the inode that was
+    /// replaced, drains into it, and never sees the store now at that path.
+    /// The store half of `vanished_reason` must compare the file, not the name,
+    /// and the text it returns is what the run loop logs when it exits.
+    /// Nothing in this repository sets a store aside any more (the mover is
+    /// parked), but an operator's `mv` and a restore do exactly this.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "F2, card ft-3b886056: the daemon compares the store's name, not its file \
-                (device and inode), so it keeps serving a store replaced at the same path"]
     async fn a_daemon_whose_store_was_replaced_at_the_same_path_exits() {
         let root = std::env::temp_dir().join(format!(
             "devmap-daemon-replaced-{}",
@@ -5126,28 +5177,108 @@ mod tests {
             "the daemon exited before anything changed"
         );
 
-        // A set-aside, then a fresh `Store::open`: the name is never absent for
-        // longer than the two calls take.
-        for ext in ["", "-wal", "-shm"] {
-            let from = root.join(format!("devmap.sqlite{ext}"));
-            if from.exists() {
-                fs::rename(&from, root.join(format!("devmap.sqlite.corrupt-1{ext}"))).unwrap();
+        // Staged beside the live file and renamed onto it. `rename` replaces
+        // the directory entry in one step, so the path is never missing and
+        // the old `path.exists()` check cannot be what ends the loop. Sidecars
+        // are not the file the daemon opened; they move with the main file so
+        // the fresh store still opens.
+        let staged = root.join("devmap.sqlite.fresh");
+        drop(Store::open(&staged).unwrap());
+        for ext in ["-wal", "-shm"] {
+            let live = root.join(format!("devmap.sqlite{ext}"));
+            if live.exists() {
+                fs::rename(&live, root.join(format!("devmap.sqlite.corrupt-1{ext}"))).unwrap();
+            }
+        }
+        fs::rename(&staged, &db).unwrap();
+        for ext in ["-wal", "-shm"] {
+            let staged_side = root.join(format!("devmap.sqlite.fresh{ext}"));
+            if staged_side.exists() {
+                fs::rename(&staged_side, root.join(format!("devmap.sqlite{ext}"))).unwrap();
             }
         }
         let fresh = Store::open(&db).unwrap();
+        // The path exists and is a different file. This is the string the run
+        // loop logs at both exit sites (`{reason}; releasing the IPC endpoint`).
+        let reason = watching.vanished_reason().unwrap_or_else(|| {
+            panic!(
+                "the path exists and names a different file; vanished_reason \
+                 returned nothing"
+            )
+        });
+        assert!(
+            reason.contains("replaced by a different file")
+                && reason.contains("dev:")
+                && reason.contains("ino:"),
+            "the text the run loop logs must name the old and new file: {reason}"
+        );
 
-        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
-        let exited = outcome.is_ok();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .expect(
+                "a daemon whose store file was replaced at the same path kept \
+                 serving the renamed inode",
+            );
+        let joined = outcome.expect("the run loop task must not panic");
         let _ = fs::remove_file(&socket);
         let _ = fs::remove_file(&lock);
-        task.abort();
         drop(fresh);
         let _ = fs::remove_dir_all(&root);
+        assert!(joined.is_ok(), "exit reported an error: {joined:?}");
+    }
+
+    /// A write to the open store changes its size and mtime. Those are not a
+    /// different file: device and inode stay, and the daemon must keep serving.
+    /// Replacing the directory entry is a different file, and the reason names
+    /// both identities — the same text the run loop logs.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_to_the_open_store_file_does_not_count_as_a_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-samefile-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("devmap.sqlite");
+        let daemon =
+            Daemon::new(Store::open(&db).unwrap(), root.clone()).with_store_path(db.clone());
         assert!(
-            exited,
-            "a daemon whose store file was replaced at the same path kept serving the \
-             renamed inode"
+            daemon.vanished_reason().is_none(),
+            "the file just opened is the file at the path: {:?}",
+            daemon.vanished_reason()
         );
+
+        let mut same = fs::OpenOptions::new().append(true).open(&db).unwrap();
+        use std::io::Write;
+        same.write_all(b"same inode").unwrap();
+        same.sync_all().unwrap();
+        drop(same);
+        assert!(
+            daemon.vanished_reason().is_none(),
+            "a longer mtime and size are still the opened file: {:?}",
+            daemon.vanished_reason()
+        );
+
+        let staged = root.join("devmap.sqlite.fresh");
+        drop(Store::open(&staged).unwrap());
+        fs::rename(&staged, &db).unwrap();
+        let reason = daemon.vanished_reason().unwrap_or_else(|| {
+            panic!("a renamed-onto path is a different file; vanished_reason returned nothing")
+        });
+        assert!(
+            reason.contains("replaced by a different file")
+                && reason.contains("dev:")
+                && reason.contains("ino:"),
+            "the logged reason must name both identities: {reason}"
+        );
+        assert!(
+            db.exists(),
+            "the replacement is in place; absence must not be the reason"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The store file is the other half: the root can survive a `rm` of the
