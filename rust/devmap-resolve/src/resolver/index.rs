@@ -23,6 +23,7 @@ impl Resolver {
         self.rust_module_globs.clear();
         self.rust_opaque_publishers.clear();
         self.rust_crate_macros.clear();
+        self.rust_crate_of_file.clear();
         self.rust_glob_names.clear();
         self.rust_path_modules.clear();
         self.rust_scope_globs.clear();
@@ -83,6 +84,19 @@ impl Resolver {
         self.rust_cfg_bodies.clear();
         self.rust_deref_targets.clear();
         self.rust_blanket_methods.clear();
+        self.rust_crate_of_file = extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+            .map(|ext| {
+                (
+                    ext.file_path.clone(),
+                    super::rust_site_scope::rust_crate_key_in(
+                        &self.rust_manifest_crates,
+                        &ext.file_path,
+                    ),
+                )
+            })
+            .collect();
         self.rust_crate_macros = self.compute_rust_crate_macros(extractions);
         self.max_indexed_path_depth = extractions
             .iter()
@@ -2520,6 +2534,16 @@ impl Resolver {
                 .iter()
                 .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
         };
+        let indexed: BTreeSet<&str> = extractions
+            .iter()
+            .map(|ext| ext.file_path.as_str())
+            .collect();
+        let declared_roots: BTreeSet<&str> = self
+            .rust_manifest_crates
+            .iter()
+            .flat_map(|manifest| manifest.lib_path.iter().chain(&manifest.bin_paths))
+            .map(String::as_str)
+            .collect();
         let mut crates: BTreeMap<String, CrateMacros> = BTreeMap::new();
         for ext in rust_files() {
             let key = rust_crate_key_in(&self.rust_manifest_crates, &ext.file_path);
@@ -2544,6 +2568,39 @@ impl Resolver {
             };
             env.defined.extend(facts.defined.iter().cloned());
             env.macro_use |= facts.macro_use;
+            // A `#[macro_use] mod m;` publishes only what `m`'s file defines, and
+            // that file is read only when it is indexed.
+            for module in &facts.macro_use_mods {
+                let dir = Self::parent_dir(&ext.file_path);
+                let stem = ext
+                    .file_path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.strip_suffix(".rs"))
+                    .unwrap_or_default();
+                let base = if matches!(stem, "lib" | "main" | "mod")
+                    || declared_roots.contains(ext.file_path.as_str())
+                {
+                    dir
+                } else {
+                    Self::rel_join(&dir, stem)
+                };
+                let flat = Self::rel_join(&base, &format!("{module}.rs"));
+                let nested = Self::rel_join(&Self::rel_join(&base, module), "mod.rs");
+                if !indexed.contains(flat.as_str()) && !indexed.contains(nested.as_str()) {
+                    env.macro_use = true;
+                }
+            }
+            // What the crate exports by name: every exported item too, which
+            // covers a `#[proc_macro]` function. A file the parser could not read
+            // whole may hold more.
+            env.parse_gaps |= !matches!(
+                ext.parse_outcome,
+                devmap_extract::model::ParseOutcome::Clean
+            );
+            for symbol in ext.symbols.iter().filter(|symbol| symbol.is_exported) {
+                env.exported_names.insert(symbol.name.clone());
+            }
             env.externs.extend(facts.extern_crates.iter().cloned());
             env.shadowed_roots
                 .extend(ext.rust_inline_modules.iter().cloned());

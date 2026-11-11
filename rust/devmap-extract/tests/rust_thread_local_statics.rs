@@ -41,3 +41,12 @@ fn what_an_initializer_holds_declares_nothing_here() {
     let source = "thread_local! {\n    static OUTER: u8 = { static INNER: u8 = 1; INNER };\n}\n";
     assert_eq!(declared(source), vec!["OUTER"]);
 }
+
+#[test]
+fn a_type_after_a_static_lifetime_is_not_a_declaration() {
+    let source =
+        "thread_local! {\n    static CFG: Cell<Option<&'static Config>> = Cell::new(None);\n    \
+                  static MUT: Cell<&'static mut Other> = Cell::new(None);\n    \
+                  static DYN: Box<dyn Handler + 'static> = Box::new(H);\n}\n";
+    assert_eq!(declared(source), vec!["CFG", "MUT", "DYN"]);
+}

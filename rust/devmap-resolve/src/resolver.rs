@@ -394,8 +394,12 @@ pub struct Resolver {
     /// holds whole: an item-position macro invocation, a partial parse, or a
     /// `pub use m::*;` whose source is not indexed.
     rust_opaque_publishers: BTreeSet<String>,
-    /// What could rebind a macro name, per crate (see `rust_site_scope::crate_key`).
+    /// What could rebind a macro name, per crate (see `rust_site_scope::NO_MANIFEST`
+    /// and `rust_site_scope::rust_crate_key_in` for what a crate is).
     rust_crate_macros: BTreeMap<String, rust_site_scope::CrateMacros>,
+    /// The crate key of every indexed Rust file, so a call site's crate is one
+    /// lookup rather than a scan of the manifests.
+    rust_crate_of_file: BTreeMap<String, String>,
     /// For a glob import written in a block of a file's own module, keyed by
     /// `(file, import start byte)`: every name the glob might provide, with the
     /// one declaration it comes from (`None` when that is not one declaration).
@@ -823,6 +827,7 @@ impl Resolver {
             rust_module_globs: BTreeMap::new(),
             rust_opaque_publishers: BTreeSet::new(),
             rust_crate_macros: BTreeMap::new(),
+            rust_crate_of_file: BTreeMap::new(),
             rust_glob_names: BTreeMap::new(),
             rust_path_modules: BTreeMap::new(),
             rust_scope_globs: BTreeMap::new(),

@@ -202,9 +202,13 @@ fn f1_a_glob_reached_through_a_prelude_chain_counts_the_same() {
 
 #[test]
 fn f1_a_glob_of_a_crate_that_is_not_indexed_cannot_be_proven() {
+    // `bail` is in no prelude, so a glob can bring in another one. (With
+    // `println!` this case is a compile error: rustc reports E0659, a glob import
+    // against the std prelude, so a crate that builds has no such glob. See
+    // `r6a_*` below.)
     let result = Case {
         user_head: "use serde::*;",
-        run_body: "println!(\"x\");",
+        run_body: "bail!(crate::db::Dup);",
         ..Case::default()
     }
     .resolve("f1c");
@@ -532,4 +536,199 @@ fn f7_macro_use_extern_crate_that_is_not_indexed_still_disables_it() {
         "{:?}",
         targets_from(&result, "app/src/user.rs::run")
     );
+}
+
+// ------------------------------------------------------------- round 7
+
+#[test]
+fn r3_a_pathed_call_ignores_a_glob_but_a_bare_call_does_not() {
+    let pathed = Case {
+        deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
+        user_head: "use serde::*;",
+        run_body: "log::info!(\"x\");",
+        ..Case::default()
+    }
+    .resolve("r3a");
+    assert!(
+        binds_da(&pathed),
+        "{:?}",
+        targets_from(&pathed, "app/src/user.rs::run")
+    );
+    let bare = Case {
+        deps: "dep = { path = \"../dep\" }\nlog = \"0.4\"\n",
+        user_head: "use serde::*;",
+        run_body: "bail!(\"x\");",
+        ..Case::default()
+    }
+    .resolve("r3b");
+    assert!(
+        !binds_da(&bare),
+        "{:?}",
+        targets_from(&bare, "app/src/user.rs::run")
+    );
+}
+
+#[test]
+fn r4_macro_use_on_a_module_whose_file_is_not_indexed_disables_silence() {
+    for (tag, header) in [
+        ("r4a", "#[macro_use]\nmod gen;\n"),
+        (
+            "r4b",
+            "#[macro_use]\n#[path = \"gen/macros.rs\"]\nmod gen;\n",
+        ),
+    ] {
+        let result = Case {
+            lib_header: header,
+            run_body: "println!(\"x\");",
+            ..Case::default()
+        }
+        .resolve(tag);
+        assert!(
+            !binds_da(&result),
+            "{header}: {:?}",
+            targets_from(&result, "app/src/user.rs::run")
+        );
+    }
+    // Control: the same declaration with the file indexed is understood.
+    let result = Case {
+        lib_header: "#[macro_use]\nmod gen;\n",
+        run_body: "println!(\"x\");",
+        extra: vec![("app/src/gen.rs", "macro_rules! helper { () => { 1u8 }; }\n")],
+        ..Case::default()
+    }
+    .resolve("r4c");
+    assert!(
+        binds_da(&result),
+        "{:?}",
+        targets_from(&result, "app/src/user.rs::run")
+    );
+}
+
+#[test]
+fn r5_two_manifests_claiming_one_package_name_abstain() {
+    let result = Case {
+        dep_lib: "#[macro_export]\nmacro_rules! helper { () => { 1u8 }; }\n",
+        lib_header: "#[macro_use]\nextern crate dep;\n",
+        root_cargo: "[workspace]\nmembers = [\"app\", \"dep\", \"other/dep\"]\n",
+        run_body: "println!(crate::db::Dup);",
+        extra: vec![
+            (
+                "other/dep/Cargo.toml",
+                "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "other/dep/src/lib.rs",
+                "#[macro_export]\nmacro_rules! println { ($($t:tt)+) => { use $($t)+; }; }\n",
+            ),
+        ],
+        ..Case::default()
+    }
+    .resolve("r5");
+    assert!(
+        !binds_da(&result),
+        "{:?}",
+        targets_from(&result, "app/src/user.rs::run")
+    );
+}
+
+#[test]
+fn r6c_a_crate_exporting_the_name_as_a_proc_macro_or_a_decl_macro_is_not_silent() {
+    for (tag, dep_lib) in [
+        (
+            "r6c1",
+            "#[proc_macro]\npub fn bail(input: TokenStream) -> TokenStream { input }\n",
+        ),
+        ("r6c2", "pub macro bail($($t:tt)+) { use $($t)+; }\n"),
+    ] {
+        let result = Case {
+            dep_lib,
+            user_head: "use dep::*;",
+            run_body: "bail!(crate::db::Dup);",
+            ..Case::default()
+        }
+        .resolve(tag);
+        assert!(
+            !binds_da(&result),
+            "{dep_lib}: {:?}",
+            targets_from(&result, "app/src/user.rs::run")
+        );
+    }
+}
+
+#[test]
+fn r7_a_bare_std_derive_rebound_by_a_use_of_another_crate_is_not_inert() {
+    let derive = |tag: &str, import: &str| {
+        let result = Case {
+            user_head: import,
+            run_body: "#[derive(Clone)] struct _S;",
+            ..Case::default()
+        }
+        .resolve(tag);
+        binds_da(&result)
+    };
+    assert!(!derive("r7a", "use dep::Clone;"), "a derive of dep");
+    assert!(
+        !derive("r7b", "use dep::{Debug, Clone as C};"),
+        "a braced import of dep"
+    );
+    assert!(
+        derive("r7c", "use std::clone::Clone;"),
+        "the std derive imported"
+    );
+    assert!(derive("r7d", ""), "no import at all");
+}
+
+#[test]
+fn r6a_a_glob_cannot_rebind_a_std_prelude_macro_but_can_rebind_another() {
+    // rustc 1.99.1: `use dep::*;` with `dep` exporting `vec` or `println` and a
+    // use of `vec!`/`println!` is "error[E0659]: `vec` is ambiguous ... conflict
+    // between a name from a glob import and an outer scope".
+    let std_name = Case {
+        user_head: "use serde::*;",
+        run_body: "println!(\"x\");",
+        ..Case::default()
+    }
+    .resolve("r6a1");
+    assert!(
+        binds_da(&std_name),
+        "{:?}",
+        targets_from(&std_name, "app/src/user.rs::run")
+    );
+    let other = Case {
+        user_head: "use serde::*;",
+        run_body: "bail!(\"x\");",
+        ..Case::default()
+    }
+    .resolve("r6a2");
+    assert!(
+        !binds_da(&other),
+        "{:?}",
+        targets_from(&other, "app/src/user.rs::run")
+    );
+}
+
+#[test]
+fn r6b_a_name_imported_explicitly_in_the_chain_is_not_rebound_by_a_glob() {
+    // rustc 1.99.1: `use anyhow::bail; use dep::*;` compiles and the glob is
+    // reported unused (the explicit import wins whatever the order); a glob in an
+    // inner scope against an outer explicit import is E0659 (probe `pb3`), so
+    // that shape does not compile and is not a case here (an unproven block glob
+    // would leave `Dup` itself unplaced anyway).
+    for (tag, head, body) in [
+        ("r6b1", "use anyhow::bail;\nuse serde::*;", "bail!(\"x\");"),
+        ("r6b2", "use serde::*;\nuse anyhow::bail;", "bail!(\"x\");"),
+    ] {
+        let result = Case {
+            deps: "dep = { path = \"../dep\" }\nanyhow = \"1\"\n",
+            user_head: head,
+            run_body: body,
+            ..Case::default()
+        }
+        .resolve(tag);
+        assert!(
+            binds_da(&result),
+            "{tag}: {:?}",
+            targets_from(&result, "app/src/user.rs::run")
+        );
+    }
 }

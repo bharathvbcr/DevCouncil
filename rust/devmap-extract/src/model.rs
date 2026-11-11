@@ -1723,15 +1723,21 @@ pub struct RustMacroFacts {
     pub defined: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attrs: Vec<RustAttrMacro>,
-    /// A `#[macro_use]` sits on something that is neither a module nor an
-    /// `extern crate` item. On a module it only makes that module's own
-    /// `macro_rules!` (already in `defined`) visible after it; on an `extern
-    /// crate` it is in [`RustExternCrate::macro_use`].
+    /// A `#[macro_use]` sits on something this file cannot account for: not an
+    /// inline module, an out-of-line module without a `#[path]` (those are in
+    /// `macro_use_mods`), or an `extern crate` item (that is in
+    /// [`RustExternCrate::macro_use`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub macro_use: bool,
     /// Every `extern crate` item of the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extern_crates: Vec<RustExternCrate>,
+    /// The names of the out-of-line modules (`mod name;`) a `#[macro_use]` is on.
+    /// The macros such a module publishes are known only when its file is
+    /// indexed, which the resolver checks. An inline module is read in place, and
+    /// one with a `#[path]` is recorded in `macro_use` instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_use_mods: Vec<String>,
 }
 
 /// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].

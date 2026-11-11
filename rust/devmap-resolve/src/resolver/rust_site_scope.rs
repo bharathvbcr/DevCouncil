@@ -125,6 +125,9 @@ pub(super) struct CrateMacros {
     pub(super) exported_names: BTreeSet<String>,
     /// Every `pub use path::*` of the crate, as `(file, path)`.
     pub(super) glob_reexports: Vec<(String, String)>,
+    /// A file of the crate did not parse cleanly, so it may export names (a
+    /// declarative `macro`, which the grammar does not read) the index never saw.
+    pub(super) parse_gaps: bool,
 }
 
 impl CrateMacros {
@@ -530,6 +533,27 @@ impl RustFileScope {
                 }
             } else {
                 self.macro_scopes.insert(at);
+            }
+        }
+    }
+
+    /// Whether `name` is imported by name in `at` or a scope enclosing it up to
+    /// its module.
+    pub(super) fn named_import_in_chain(&self, name: &str, at: usize) -> bool {
+        let Some(imports) = self.named.get(name) else {
+            return false;
+        };
+        let mut level = at;
+        loop {
+            if imports.iter().any(|import| import.scope == level) {
+                return true;
+            }
+            if self.scopes[level].module {
+                return false;
+            }
+            match self.scopes[level].parent {
+                Some(parent) => level = parent,
+                None => return false,
             }
         }
     }
@@ -982,21 +1006,30 @@ pub(super) struct MacroPass<'a> {
     /// `((file, glob path), probe name, macro name)` -> whether the glob may bring
     /// the probe name into scope.
     memo: RefCell<BTreeMap<(String, String, String), bool>>,
+    /// `(crate key, extern crate name, macro name)` -> whether a `#[macro_use]`
+    /// of that crate may bring the macro in.
+    extern_memo: RefCell<BTreeMap<(String, String, String), bool>>,
 }
 
 impl Resolver {
     /// The key of the crate `file` belongs to: the directory of its nearest
     /// manifest, or [`NO_MANIFEST`].
     pub(super) fn rust_crate_key(&self, file: &str) -> String {
-        rust_crate_key_in(&self.rust_manifest_crates, file)
+        self.rust_crate_of_file
+            .get(file)
+            .cloned()
+            .unwrap_or_else(|| rust_crate_key_in(&self.rust_manifest_crates, file))
     }
 
     /// The crate whose manifest names `package` as its package or library name.
     fn rust_crate_key_of_package(&self, package: &str) -> Option<String> {
-        self.rust_manifest_crates
+        let mut claimants = self
+            .rust_manifest_crates
             .iter()
-            .find(|manifest| manifest.names.iter().any(|name| name == package))
-            .map(|manifest| manifest.dir.clone())
+            .filter(|manifest| manifest.names.iter().any(|name| name == package));
+        let first = claimants.next()?;
+        // Two manifests that claim one name abstain, as the crate-root mapping does.
+        claimants.next().is_none().then(|| first.dir.clone())
     }
 
     /// Decide, for every Rust file, which macro invocations declare nothing the
@@ -1026,6 +1059,7 @@ impl Resolver {
                 })
                 .collect(),
             memo: RefCell::new(BTreeMap::new()),
+            extern_memo: RefCell::new(BTreeMap::new()),
         };
         let files: Vec<String> = self.rust_site_scope.keys().cloned().collect();
         for file in files {
@@ -1056,9 +1090,10 @@ impl Resolver {
         at: usize,
         path: &str,
     ) -> bool {
+        let crate_key = self.rust_crate_key(file);
         let Some(env) = self
             .rust_crate_macros
-            .get(&self.rust_crate_key(file))
+            .get(&crate_key)
             .filter(|env| env.complete && !env.macro_use)
         else {
             return false;
@@ -1082,15 +1117,25 @@ impl Resolver {
             return false;
         }
         for item in env.externs.iter().filter(|item| item.macro_use) {
-            if self.rust_extern_may_publish(pass, env, &item.name, name) {
+            if self.rust_extern_may_publish(pass, &crate_key, env, &item.name, name) {
                 return false;
             }
         }
-        for specifier in scope.visible_globs(at) {
-            if self.rust_glob_brings(pass, file, specifier, name, name)
-                || root.is_some_and(|root| self.rust_glob_brings(pass, file, specifier, root, name))
-            {
-                return false;
+        // A pathed call never looks the bare name up, so a glob that may bring
+        // the name in cannot rebind it. (A glob that brought in a module named
+        // like the path root could; that is not checked.) Nor can a glob rebind
+        // a name rustc settles another way, each confirmed with rustc 1.99.1:
+        // a name of the std prelude (`vec!`, `println!`) is E0659 ambiguous
+        // between a glob import and the prelude, so no compiling crate has a
+        // glob that brings in a different one; and a name the chain imports
+        // explicitly (`use anyhow::bail;`) shadows a glob in its scope and is
+        // E0659 against one in an inner scope.
+        let in_std_prelude = macro_owned_by(name, "std");
+        if root.is_none() && !in_std_prelude && !scope.named_import_in_chain(name, at) {
+            for specifier in scope.visible_globs(at) {
+                if self.rust_glob_brings(pass, file, specifier, name, name) {
+                    return false;
+                }
             }
         }
         true
@@ -1100,6 +1145,27 @@ impl Resolver {
     /// `name` into scope: unless the crate is std, the crate that owns the macro,
     /// or an indexed crate that provably exports nothing of that name.
     fn rust_extern_may_publish(
+        &self,
+        pass: &MacroPass<'_>,
+        crate_key: &str,
+        env: &CrateMacros,
+        original: &str,
+        name: &str,
+    ) -> bool {
+        let memo_key = (
+            crate_key.to_string(),
+            original.to_string(),
+            name.to_string(),
+        );
+        if let Some(known) = pass.extern_memo.borrow().get(&memo_key) {
+            return *known;
+        }
+        let answer = self.rust_extern_may_publish_in(pass, env, original, name);
+        pass.extern_memo.borrow_mut().insert(memo_key, answer);
+        answer
+    }
+
+    fn rust_extern_may_publish_in(
         &self,
         pass: &MacroPass<'_>,
         env: &CrateMacros,
@@ -1224,7 +1290,11 @@ impl Resolver {
         let Some(env) = self.rust_crate_macros.get(key) else {
             return true;
         };
-        if !env.complete || env.defined.contains(probe) || env.exported_names.contains(probe) {
+        if !env.complete
+            || env.parse_gaps
+            || env.defined.contains(probe)
+            || env.exported_names.contains(probe)
+        {
             return true;
         }
         env.glob_reexports.iter().any(|(file, specifier)| {
