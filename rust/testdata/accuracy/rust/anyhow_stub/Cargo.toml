@@ -1,0 +1,6 @@
+[package]
+name = "anyhow"
+version = "0.1.0"
+edition = "2021"
+
+# A stand-in for the real crate of this name, so the fixture needs no download.
