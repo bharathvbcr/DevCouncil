@@ -71,7 +71,12 @@
         "gitpulse_worktree_switch",
         "gitpulse_worktree_isolate",
         "gitpulse_worktree_prune",
-        "gitpulse_worktree_merge"
+        "gitpulse_worktree_merge",
+        "gitpulse_agent_register",
+        "gitpulse_agent_peers",
+        "gitpulse_agent_send",
+        "gitpulse_agent_inbox",
+        "gitpulse_agent_wait"
       ],
       "description": "GitPulse multi-agent worktree concurrency, line-level collision detection, and append-only ledger"
     }

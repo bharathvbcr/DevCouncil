@@ -107,6 +107,15 @@ def test_python_local_agent_config():
     assert "devcouncil_checkout_task" in tools
     assert "devmap_search" in tools
     assert "gitpulse_collision_risk" in tools
+    for a2a_tool in (
+        "gitpulse_agent_register",
+        "gitpulse_agent_peers",
+        "gitpulse_agent_send",
+        "gitpulse_agent_inbox",
+        "gitpulse_agent_wait",
+    ):
+        assert a2a_tool in GITPULSE_TOOLS
+        assert a2a_tool in tools
     assert len(config.policies) > 0
 
 
