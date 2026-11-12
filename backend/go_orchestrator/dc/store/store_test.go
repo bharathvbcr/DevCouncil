@@ -22,9 +22,15 @@ func binary(t *testing.T) string {
 	return testsupport.DCStore(t)
 }
 
+// client builds a client over the real store binary and closes it when the test
+// ends. The close is the helper's, not each caller's: a fixture that hands out
+// a client and leaves closing it to every caller is how a Manvi test binary came
+// to hold 7,517 store processes (see serveIdleTTL).
 func client(t *testing.T) *Client {
 	t.Helper()
-	return New(binary(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	c := New(binary(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(c.Close)
+	return c
 }
 
 func TestAcquireReleaseRoundTrip(t *testing.T) {

@@ -78,6 +78,26 @@ const (
 	// serveWaitDelay bounds how long descendants may keep holding the stdio
 	// pipes after the child itself is gone, before Wait stops waiting on them.
 	serveWaitDelay = 3 * time.Second
+
+	// serveIdleTTL is how long a child may sit idle in the pool before it is
+	// ended. It is what bounds the processes of a client nobody closed.
+	//
+	// Before it, an idle child lived until Close or until this process exited,
+	// and the second was taken as a guarantee: "closing this process's ends of
+	// the pipes lets each child read EOF". It is not one in a process that
+	// outlives its clients. A Manvi test binary built a client per test case,
+	// never closed one, and ran `-count=200` for three hours: it held 7,517
+	// `dcstore serve` processes, each with its deleted test database still
+	// open, and the account came within ~900 processes of its per-user limit.
+	//
+	// Both bounds on the value:
+	//   - Lower: longer than any gap between calls the warm path is meant to
+	//     cover, including a harness turn and a test under host load. A call
+	//     after a longer gap pays one process start (~2ms), not an error.
+	//   - Upper: a caller leaking clients at rate r holds about r × TTL
+	//     processes. At the ~115 leaked clients a minute measured on that run,
+	//     one minute holds ~115, far below a per-user process limit of ~10,000.
+	serveIdleTTL = time.Minute
 )
 
 // errStoreFatal marks a served reply the child reported as a failure.
@@ -114,6 +134,10 @@ type servedChild struct {
 
 	mu     sync.Mutex
 	stderr proc.CappedBuffer
+
+	// idleSince is when the pool last parked this child. Written by put and
+	// read by take and reap, all under the pool's mutex.
+	idleSince time.Time
 
 	closeOnce sync.Once
 }
@@ -381,8 +405,63 @@ type servePool struct {
 	lifetime context.Context
 	stop     context.CancelFunc
 
+	// idleTTL overrides serveIdleTTL when positive. Tests set it before the
+	// first call; nothing writes it afterwards.
+	idleTTL time.Duration
+
 	mu   sync.Mutex
 	idle []*servedChild
+	// reaper ends idle children that outlive the TTL. It is armed only while
+	// something is idle, so a pool with nothing parked holds no timer, and
+	// nothing keeps an abandoned client's pool reachable once it is empty.
+	reaper *time.Timer
+	// closed makes the pool terminal: put ends a child returned after Close
+	// instead of parking it, and the reaper is not re-armed.
+	closed bool
+}
+
+func (p *servePool) ttl() time.Duration {
+	if p.idleTTL > 0 {
+		return p.idleTTL
+	}
+	return serveIdleTTL
+}
+
+// armReaperLocked schedules the reaper for the oldest idle child's expiry.
+//
+// put appends and take pops the newest, so p.idle is ordered oldest first and
+// the expired children are always a prefix of it. A timer already armed is
+// left alone: it fires no later than the current oldest expiry, and reap
+// re-arms for whatever is oldest then.
+func (p *servePool) armReaperLocked() {
+	if p.closed || p.reaper != nil || len(p.idle) == 0 {
+		return
+	}
+	wait := max(time.Until(p.idle[0].idleSince.Add(p.ttl())), 0)
+	p.reaper = time.AfterFunc(wait, p.reap)
+}
+
+// reap ends every idle child past the TTL and re-arms for the rest.
+//
+// The children are closed outside the mutex: close waits for the process, up
+// to serveWaitDelay, and a borrower must not queue behind that. An idle child
+// holds no semaphore slot, so reaping one releases nothing.
+func (p *servePool) reap() {
+	now := time.Now()
+	ttl := p.ttl()
+	p.mu.Lock()
+	p.reaper = nil
+	n := 0
+	for n < len(p.idle) && now.Sub(p.idle[n].idleSince) >= ttl {
+		n++
+	}
+	expired := append([]*servedChild(nil), p.idle[:n]...)
+	p.idle = append([]*servedChild(nil), p.idle[n:]...)
+	p.armReaperLocked()
+	p.mu.Unlock()
+	for _, child := range expired {
+		child.close()
+	}
 }
 
 // init prepares the pool, deriving its lifetime from the first caller.
@@ -427,8 +506,12 @@ func (p *servePool) take(ctx context.Context, binary, db string) (*servedChild, 
 		}
 		child := p.idle[n-1]
 		p.idle = p.idle[:n-1]
+		// The newest idle child is popped first, so one past the TTL means
+		// every child still parked is too. It is ended rather than reused, even
+		// if the reaper has not reached it yet: no child serves past the TTL.
+		fresh := time.Since(child.idleSince) < p.ttl()
 		p.mu.Unlock()
-		if child.dbIsCurrent(db) {
+		if fresh && child.dbIsCurrent(db) {
 			return child, nil
 		}
 		child.close()
@@ -480,10 +563,19 @@ func (p *servePool) take(ctx context.Context, binary, db string) (*servedChild, 
 	}
 }
 
-// put returns a healthy child and releases its slot.
+// put returns a healthy child and releases its slot. It parks the child for
+// reuse and arms the reaper, or ends it if the pool was closed meanwhile.
 func (p *servePool) put(child *servedChild) {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		child.close()
+		<-p.sem
+		return
+	}
+	child.idleSince = time.Now()
 	p.idle = append(p.idle, child)
+	p.armReaperLocked()
 	p.mu.Unlock()
 	<-p.sem
 }
@@ -506,6 +598,11 @@ func (p *servePool) closeAll() {
 	p.mu.Lock()
 	idle, stop := p.idle, p.stop
 	p.idle = nil
+	p.closed = true
+	if p.reaper != nil {
+		p.reaper.Stop()
+		p.reaper = nil
+	}
 	p.mu.Unlock()
 
 	// A pool nothing ever borrowed from has no lifetime to cancel and no
@@ -571,7 +668,8 @@ func (c *Client) runServed(ctx context.Context, command string, args []string) (
 
 // Close ends the persistent store processes this client is holding.
 //
-// It is not required for correctness — closing this process's ends of the
-// pipes lets each child read EOF and exit on its own — but a caller that is
-// done with a client should not have to exit to release them.
+// Call it when done with a client. Without it, an idle child is still ended
+// after serveIdleTTL, and every child reads EOF and exits when this process
+// does — but a long-lived process that builds clients and drops them holds one
+// process per client until the TTL passes, and a test binary is such a process.
 func (c *Client) Close() { c.pool.closeAll() }
