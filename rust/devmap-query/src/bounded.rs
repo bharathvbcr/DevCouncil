@@ -71,7 +71,12 @@ mod tests {
         ];
         for ch in controls {
             let out = bounded_text(&format!("a{ch}b"), 64);
-            assert_eq!(out, format!("a{}b", ch.escape_default()), "U+{:04X}", ch as u32);
+            assert_eq!(
+                out,
+                format!("a{}b", ch.escape_default()),
+                "U+{:04X}",
+                ch as u32
+            );
             assert!(!out.contains(ch), "U+{:04X} survived", ch as u32);
         }
     }
