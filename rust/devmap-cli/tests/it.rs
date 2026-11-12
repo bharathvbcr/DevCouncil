@@ -43,6 +43,7 @@ mod a_seeded_worktree_store_is_a_cold_builds_graph;
 mod a_v94_python_extraction_is_not_served_after_the_bump;
 mod a_v96_swift_extraction_is_not_served_after_the_bump;
 mod a_v97_extraction_is_not_served_after_the_bump;
+mod a_v98_extraction_is_not_served_after_the_bump;
 mod agents_install;
 mod an_ignore_file_binds_the_daemon;
 mod api_views_are_honest;
