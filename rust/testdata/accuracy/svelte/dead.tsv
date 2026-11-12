@@ -1,0 +1,29 @@
+# Dead-code truth for this fixture, read by devmap-analyze/tests/accuracy_fixtures.rs.
+# verdict<TAB>symbol_id<TAB>why
+live	src/lib/format.ts::columnLabel	called only from inside a top-level snippet
+live	src/lib/format.ts::priorityLabel	called only from inside a top-level snippet
+live	src/lib/format.ts::cardTone	called only from inside a top-level snippet
+live	src/lib/format.ts::padCell	called from the template
+live	src/Board.svelte::columnTitle	rendered with {@render}
+live	src/Board.svelte::cardRow	rendered with {@render}
+live	src/lib/stores.ts::previewMarkers	read only as $previewMarkers
+exported_unreferenced	src/lib/decoy.ts::columnLabel	never imported; the decoy for a same-named import
+exported_unreferenced	src/lib/decoy.ts::priorityLabel	never imported; the decoy for a same-named import
+exempt	src/Stores.svelte::foo	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::bar	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::item	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::zap	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::state	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::derived	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::effect	module-script export of a component: not a dead candidate
+exempt	src/Stores.svelte::props	module-script export of a component: not a dead candidate
+exported_unreferenced	src/lib/decoy.ts::fade	never imported
+live	src/lib/actions.ts::focusTrap	named only by a directive
+live	src/lib/actions.ts::grow	named only by a directive
+live	src/lib/actions.ts::shrink	named only by a directive
+live	src/lib/actions.ts::reorder	named only by a directive
+live	src/lib/actions.ts::slide	named only by a directive
+live	src/lib/posts.ts::savePost	named only as onclick={savePost}
+live	src/lib/posts.ts::archivePost	named only as on:click={archivePost}
+live	src/Handlers.svelte::reset	named only as onclick={reset}
+exported_unreferenced	src/lib/decoy.ts::savePost	never imported; the decoy for a same-named import

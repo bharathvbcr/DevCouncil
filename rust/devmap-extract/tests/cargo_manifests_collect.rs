@@ -64,9 +64,50 @@ fn target_paths_and_names_are_read_relative_to_the_manifest() {
                 names: vec!["ecore".to_string(), "engine_core".to_string()],
                 lib_path: Some("crates/engine/lib/core.rs".to_string()),
                 bin_paths: vec!["crates/tools/cli/entry.rs".to_string()],
+                dependencies: Vec::new(),
             }),
             workspace_members: Vec::new(),
+            workspace_dependencies: Vec::new(),
         }
+    );
+}
+
+/// A dependency is spelled by its key and is the package its `package` key
+/// names; `workspace = true` takes the package from the nearest workspace table,
+/// and stays unresolved when none has the name.
+#[test]
+fn dependency_names_are_told_apart_from_the_packages_they_stand_for() {
+    let parsed = parse_cargo_manifest(
+        "app",
+        "[package]\nname = \"app\"\n\n[dependencies]\nserde = \"1\"\n\
+         log = { package = \"dep-crate\", path = \"../dep\" }\n\
+         anyhow = { workspace = true }\n\n\
+         [dev-dependencies]\ntracing = { version = \"0.1\" }\n\n\
+         [target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n",
+    )
+    .unwrap();
+    let dependencies = parsed.package.unwrap().dependencies;
+    let by_name = |name: &str| {
+        dependencies
+            .iter()
+            .find(|dependency| dependency.name == name)
+    };
+    assert_eq!(by_name("serde").unwrap().package_name(), Some("serde"));
+    assert_eq!(by_name("log").unwrap().package_name(), Some("dep_crate"));
+    assert_eq!(by_name("tracing").unwrap().package_name(), Some("tracing"));
+    assert_eq!(by_name("libc").unwrap().package_name(), Some("libc"));
+    assert_eq!(by_name("anyhow").unwrap().package_name(), None);
+
+    let workspace = parse_cargo_manifest(
+        "",
+        "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\n\
+         anyhow = { package = \"renamed\", version = \"1\" }\n",
+    )
+    .unwrap();
+    assert_eq!(workspace.workspace_dependencies.len(), 1);
+    assert_eq!(
+        workspace.workspace_dependencies[0].package_name(),
+        Some("renamed")
     );
 }
 
@@ -109,6 +150,40 @@ fn a_virtual_workspace_is_not_a_parse_failure() {
         let error = parse_cargo_manifest("pkg", source).unwrap_err();
         assert!(error.contains(expected), "{source:?}: {error}");
     }
+}
+
+/// `name = { workspace = true }` takes its package from the workspace table the
+/// walk found; with no table that has the name it stays unknown.
+#[test]
+fn an_inherited_dependency_takes_its_package_from_the_workspace_table() {
+    let root = scratch("inherited");
+    write(
+        &root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nlog = { package = \"dep\", path = \"dep\" }\n",
+    );
+    write(
+        &root,
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\n\n[dependencies]\nlog = { workspace = true }\nlost = { workspace = true }\n",
+    );
+    write(&root, "app/src/lib.rs", "pub fn f() {}\n");
+    let manifests = collect_project_manifests(&root).unwrap();
+    let app = manifests
+        .rust_crates
+        .iter()
+        .find(|krate| krate.dir == "app")
+        .unwrap();
+    let package_of = |name: &str| {
+        app.dependencies
+            .iter()
+            .find(|dependency| dependency.name == name)
+            .unwrap()
+            .package_name()
+    };
+    assert_eq!(package_of("log"), Some("dep"));
+    assert_eq!(package_of("lost"), None);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

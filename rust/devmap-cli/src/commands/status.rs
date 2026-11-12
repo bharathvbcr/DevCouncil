@@ -470,6 +470,15 @@ pub(crate) fn store_status_fields(
         // recomputed. `null` when absent (no generation, or a summary written
         // before the field existed) — unexplained is not zero.
         "resolution_rate": store.latest_resolution_rate()?,
+        // Whether `repo_map.json` / `code_graph.json` were written from this
+        // generation. A plain `build` advances the store and writes neither,
+        // so a consumer reading the files directly needs this to tell an older
+        // artifact from a current one. Read from the sidecar, never the files.
+        "artifacts": devmap_query::ArtifactCurrency::of(
+            devmap_query::ArtifactStamp::read(&crate::commands::manifest::artifact_stamp_path(db))
+                .as_ref(),
+            status.latest_generation,
+        ),
     }) else {
         unreachable!("json! of an object literal is an object")
     };

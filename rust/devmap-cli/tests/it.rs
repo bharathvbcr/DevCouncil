@@ -46,6 +46,7 @@ mod a_v97_extraction_is_not_served_after_the_bump;
 mod agents_install;
 mod an_ignore_file_binds_the_daemon;
 mod api_views_are_honest;
+mod artifacts_say_when_they_lag_the_store;
 mod ast_reports_its_own_totals;
 mod attack_ah_damaged_store;
 mod attack_build_cancel;

@@ -1,0 +1,7 @@
+[package]
+name = "cfgglob"
+version = "0.1.0"
+edition = "2021"
+
+# Round-8 fixture: the shape of wry's platform modules. Two cfg alternatives each hold an
+# item-position macro and a type of one name, and only one holds the method called.

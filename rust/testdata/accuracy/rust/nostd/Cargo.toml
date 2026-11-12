@@ -1,0 +1,10 @@
+[package]
+name = "nostd_f"
+version = "0.1.0"
+edition = "2021"
+
+# Round-8 fixture: a `#![no_std]` crate has no `println!` in its macro prelude, so
+# a glob can bring one (rustc is the oracle; see compile_fail/).
+
+[dependencies]
+kio = { path = "../kio" }

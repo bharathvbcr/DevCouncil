@@ -1,0 +1,7 @@
+[package]
+name = "log"
+version = "0.1.0"
+edition = "2021"
+
+# A stand-in for the real log crate, so a fixture can depend on a crate of this
+# name without a download.

@@ -291,3 +291,36 @@ fn an_extension_function_beside_a_kotlin_error_region_is_emitted_or_covered() {
     eprintln!("AC4 branch: COVERED-BY-PARTIAL ({reason})");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The listing is capped, and the cap drops the least damaged rows, not the
+/// last paths: the file with the biggest hole is the one an agent has to see.
+#[test]
+fn the_capped_partial_parse_listing_keeps_the_biggest_hole() {
+    let root = scratch("cap-order");
+    let erasure = "type R<T> = import('m').Ref<T>;\n";
+    for index in 0..(devmap_store::COVERAGE_GAP_SAMPLE + 5) {
+        std::fs::write(
+            root.join(format!("a{index:02}.tsx")),
+            format!("{erasure}export function tail{index}() {{ return 1; }}\n"),
+        )
+        .unwrap();
+    }
+    // Sorts after every file above, and loses far more.
+    let mut big = String::from(erasure);
+    for index in 0..60 {
+        big.push_str(&format!(
+            "export function lost{index}() {{ return {index}; }}\n"
+        ));
+    }
+    std::fs::write(root.join("z_big.tsx"), big).unwrap();
+    let _ = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    let gap = &status["coverage_gaps"]["partial_parse"];
+    assert_eq!(gap["truncated"], true, "{gap}");
+    let rows = partial_rows(&status);
+    assert_eq!(rows.len(), devmap_store::COVERAGE_GAP_SAMPLE, "{gap}");
+    assert_eq!(
+        rows[0].0, "z_big.tsx",
+        "the biggest hole is listed first: {rows:?}"
+    );
+}

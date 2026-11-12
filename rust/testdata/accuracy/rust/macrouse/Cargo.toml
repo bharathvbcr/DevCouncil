@@ -1,0 +1,7 @@
+[package]
+name = "macrouse"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dep = { path = "../dep" }

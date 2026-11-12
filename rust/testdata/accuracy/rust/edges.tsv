@@ -129,3 +129,166 @@ rs.c44g	C44	libnamed/tests/it.rs::it_c44	libnamed/src/engine.rs::only_from_bin_c
 rs.c48a	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_a_c48	edge	must		let-pattern shadowing its own initializer callee
 rs.c48b	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_b_c48	edge	must		
 rs.c48c	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_c_c48	edge	must		
+rs.f8a	F8	callers/src/fieldname.rs::Recorder.attended	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		self.attended.lock() reads a field; no self-edge to the method of the same name
+rs.f8b	F8	callers/src/fieldname.rs::Recorder.flip_f8	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		let v = self.attended.lock(): a field read is not a call of the method
+rs.f8c	F8	callers/src/fieldname.rs::Recorder.flip_f8	callers/src/fieldname.rs::Observer.attended	forbid_any_tier	must		nor a call of another type's namesake method
+rs.f8d	F8	callers/src/fieldname.rs::Recorder.attended	callers/src/fieldname.rs::Observer.attended	forbid_any_tier	must		field read does not reach another type's namesake method
+rs.f8e	F8	callers/src/fieldname.rs::Recorder.check_f8	callers/src/fieldname.rs::Recorder.attended	edge	must		self.attended() IS a method call (control: must keep its edge)
+rs.f8f	F8	callers/src/fieldname.rs::use_f8	callers/src/fieldname.rs::Observer.attended	edge	must		typed receiver call (control)
+rs.f4a	F4	callers/src/pathmod_tests.rs::path_test_f4	callers/src/pathmod.rs::Quarantine.new_f4	edge	must		#[path] test module: use super::* is the declaring module
+rs.f4b	F4	callers/src/pathmod_tests.rs::path_test_f4	callers/src/otherq.rs::Quarantine.new_f4	forbid	must		a namesake type in another module is not reachable from the test module
+rs.f4c	F4	callers/src/pathmod_tests.rs	callers/src/pathmod.rs	import	must		use super::* in a #[path] module imports the declaring file
+rs.f4d	F4	callers/src/plainmod/tests.rs::plain_test_f4c	callers/src/plainmod.rs::Vault.new_f4c	edge	must		control: the conventional plainmod/tests.rs resolves super correctly
+rs.f4e	F4	callers/src/pathmod.rs::make_f4	callers/src/pathmod.rs::Quarantine.new_f4	edge	must		control: same-file path call
+rs.f4b1	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob/tests.rs::helper_f4b	edge	must		a same-file item wins over the glob-imported namesake
+rs.f4b2	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob.rs::helper_f4b	forbid_any_tier	must		the glob-imported namesake is shadowed by the module's own item
+rs.f4b3	F4b	callers/src/sameglob.rs::parent_f4b	callers/src/sameglob.rs::helper_f4b	edge	must		control
+rs.f3a	F3	callers/src/runner.rs::run_f3	callers/src/handlers/alpha.rs::cmd_alpha_f3	edge	must		bare handler item through use handlers::* and pub use alpha::*
+rs.f3b	F3	callers/src/runner.rs::run_f3	callers/src/handlers/beta.rs::cmd_beta_f3	edge	must		second glob of the same chain
+rs.f3c	F3	callers/src/runner.rs::run_f3	callers/src/handlers/gamma.rs::cmd_twice_f3	forbid_any_tier	must		two globs publish cmd_twice_f3: a bare name that names two symbols resolves to neither
+rs.f3d	F3	callers/src/runner.rs::run_f3	callers/src/handlers/delta.rs::cmd_twice_f3	forbid_any_tier	must		same, the other symbol
+rs.f2a	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::RealHost.attended_f2	edge	must		Arc<dyn Host> call reaches impl Host for RealHost
+rs.f2b	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::StubHost.attended_f2	edge	must		and every other impl
+rs.f2c	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::RealHost.attended_f2	edge	must		&dyn Host call reaches the impl
+rs.f2d	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::StubHost.attended_f2	edge	must		and every other impl
+rs.f2e	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::Unrelated.attended_f2	forbid_any_tier	must		a type that does not implement Host is never a target
+rs.f2f	F2	callers/src/dynd.rs::flush_f2	callers/src/dynd.rs::Host.attended_f2	edge	must		control: the trait declaration keeps its edge
+rs.f2g	F2	callers/src/dynd.rs::flush_ref_f2	callers/src/dynd.rs::Host.attended_f2	edge	must		control: &dyn Host keeps the trait declaration edge
+rs.f2h	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Door.open_f2n	edge	must		Arc<dyn Gate> reaches the impl although a struct Gate exists elsewhere
+rs.f2i	F2	callers/src/dyngate.rs::pass_f2n	callers/src/dyngate.rs::Gate.open_f2n	edge	must		control: the trait declaration
+rs.f2j	F2	callers/src/dyngate.rs::pass_f2n	callers/src/gateother.rs::Gate.open_f2n	forbid_any_tier	must		the namesake struct's method is never a target
+rs.f8g	F8	callers/src/fieldname.rs::peek_f8	callers/src/fieldname.rs::Recorder.attended	forbid_any_tier	must		param.field and a.b.field reads are not calls of the method of the same name
+rs.f4f	F4	callers/src/otherq.rs::make_other_f4	callers/src/otherq.rs::Quarantine.new_f4	edge	must		a type declared in the calling file wins over a namesake elsewhere
+rs.f4g	F4	callers/src/otherq.rs::make_other_f4	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		and never reaches the namesake
+rs.f4h	F4	callers/src/lib.rs::anon_f4	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		no declaration and no import of Quarantine in the file: neither namesake is the answer
+rs.f4i	F4	callers/src/lib.rs::anon_f4	callers/src/otherq.rs::Quarantine.new_f4	forbid_any_tier	must		same, the other namesake
+rs.f4b4	F4b	callers/src/sameglob/tests.rs::child_f4b	callers/src/sameglob.rs::parent_f4b	edge	must		control: a name the glob publishes and the module does not declare still binds through it
+rs.f2k	F2	callers/src/dyntwin_a.rs::call_a_f2t	callers/src/dyntwin_a.rs::Twin.go_f2t	edge	must		control: the trait declaration the file names
+rs.f2l	F2	callers/src/dyntwin_a.rs::call_a_f2t	callers/src/dyntwin_b.rs::SideB.go_f2t	forbid_any_tier	must		an impl of a namesake trait in another file is never a target
+rs.f4r1	F4b	callers/src/inlinemod.rs::call_f4r	callers/src/inlinemod.rs::shared_f4r	edge	must		regression shape: a fn of an inline test module wins over a name the file's glob chain publishes
+rs.f4r2	F4b	callers/src/inlinemod.rs::call_f4r	callers/src/handlers/alpha.rs::shared_f4r	forbid_any_tier	must		and never reaches the published namesake
+rs.f4r3	F4b	callers/src/inlinemod.rs::outer_f4r	callers/src/handlers/alpha.rs::cmd_alpha_f3	edge	must		control: a name the glob chain publishes still binds in a file that declares others
+rs.f4s1	F4	callers/src/scopemod/leaf_f4s.rs::leaf_f4s	callers/src/scopemod.rs::Scoped.new_f4s	edge	must		a #[path] leaf under a conventional child: use super::* reaches what the child's own use super::* brought in
+rs.f4s2	F4	callers/src/scopemod/mid.rs::mid_f4s	callers/src/scopemod.rs::Scoped.new_f4s	edge	must		control: the conventional child
+rs.f4s3	F4	callers/src/scopemod/leaf_f4s.rs::leaf_named_f4s	callers/src/otherq.rs::Quarantine.new_f4	edge	must		the leaf also sees the name its parent imports by name (use crate::otherq::Quarantine)
+rs.f4s4	F4	callers/src/scopemod/leaf_f4s.rs::leaf_named_f4s	callers/src/pathmod.rs::Quarantine.new_f4	forbid_any_tier	must		and not the namesake type of another module
+rs.f4s5	F4	callers/src/scopemod/mid.rs::mid_f4s	callers/src/otherq.rs::Quarantine.new_f4	edge	must		control: the parent's own named import
+rs.g1a	F4	callers/src/g1.rs::top_g1	callers/src/g1da.rs::Dup.new_g1	edge	must		regression test: the top-level caller imports Dup from g1da; the namesake is only inside mod inner
+rs.g1b	F4	callers/src/g1.rs::top_g1	callers/src/g1.rs::Dup.new_g1	forbid_any_tier	must		regression test: the inline-module namesake is not in scope at top_g1
+rs.g1c	F4	callers/src/g1.rs::inner_g1	callers/src/g1.rs::Dup.new_g1	edge	must		guard: inside mod inner the namesake IS in scope
+rs.g2a	F4	callers/src/g2.rs::t_g2	callers/src/g2db.rs::Dup.new_g2	edge	must		regression test: mod tests imports Dup from g2db, over the file-level Dup
+rs.g2b	F4	callers/src/g2.rs::t_g2	callers/src/g2.rs::Dup.new_g2	forbid_any_tier	must		regression test: the file-level Dup is shadowed by the module's own import
+rs.g2c	F4	callers/src/g2.rs::outer_g2	callers/src/g2.rs::Dup.new_g2	edge	must		guard: outside mod tests the file-level Dup is the one
+rs.g3a	F4	callers/src/g3.rs::imported_g3	callers/src/g3db.rs::Dup.new_g3	edge	must		regression test: the function-local Dup does not reach imported_g3
+rs.g3b	F4	callers/src/g3.rs::imported_g3	callers/src/g3.rs::local_g3.Dup.new_g3	forbid_any_tier	must		regression test: a function-local type is not in scope outside its function
+rs.g3c	F4	callers/src/g3.rs::local_g3	callers/src/g3.rs::local_g3.Dup.new_g3	edge	should		guard: inside local_g3 the local Dup shadows the import
+rs.g3d	F4	callers/src/g3.rs::local_g3	callers/src/g3db.rs::Dup.new_g3	forbid_any_tier	must		guard: and not the imported one
+rs.g4a	F4b	callers/src/g4.rs::top_g4	callers/src/util_g4.rs::helper_g4	edge	must		regression test: the glob brings helper_g4 to top_g4; the only local declaration is inside mod tests
+rs.g4b	F4b	callers/src/g4.rs::top_g4	callers/src/g4.rs::helper_g4	forbid_any_tier	must		regression test: a declaration inside mod tests is not in scope at top_g4
+rs.g4c	F4b	callers/src/g4.rs::t_g4	callers/src/g4.rs::helper_g4	edge	must		guard: inside mod tests its own helper_g4 is in scope
+rs.g5a	F3	callers/src/g5.rs::read_g5	callers/src/g5mod.rs::stdin	forbid_any_tier	must		regression test: a private fn stdin is not published by the glob chain; the named std import wins
+rs.g5b	F3	callers/src/g5.rs::read_g5	callers/src/g5mod.rs::open_g5	edge	must		guard: the pub item the chain does publish still binds
+rs.g5c	F3	callers/src/g5mod.rs::open_g5	callers/src/g5mod.rs::stdin	edge	must		guard: inside its own module the private fn is in scope
+rs.g5d	F3	callers/src/g5c.rs::call_made_g5	callers/src/g5v.rs::made_g5	edge	should		regression test (tier asserted in devmap-resolve rust_glob_publication): a chain with an item-position macro cannot claim made_g5 at the import tier; the one visible declaration still lands, as the corpus-unique rung's 0.9
+rs.g6a	F4	callers/src/g6use.rs::conv_g6	callers/src/g6src.rs::CmdErr.from	edge	must		regression test: the true impl (From<SrcErr>) is in a file other than the type's
+rs.g6b	F4	callers/src/g6use.rs::conv_g6	callers/src/g6err.rs::CmdErr.from	forbid	must		regression test: CmdErr has two From impls; the type's own file is not the answer
+rs.g6c	F4	callers/src/g6err.rs::conv_one_g6	callers/src/g6err.rs::CmdOne.from	edge	must		guard: a type with exactly one From impl still binds
+rs.g6d	F4	callers/src/g6two.rs::conv_two_g6	callers/src/g6two.rs::Twice.from	forbid	must		regression test: two From impls in one file; the first is not the answer
+rs.g6e	F4	callers/src/g6two.rs::conv_two_g6	callers/src/g6two.rs::Twice.from@232	forbid	must		regression test: nor is the second chosen by position
+
+rs.s10	B ancestor	scopes/src/c10.rs::call_c10	scopes/src/p_ext.rs::h10	edge	must		a namesake in the ancestor module is not visible to the child that imports the real one
+rs.s10.not	B ancestor	scopes/src/c10.rs::call_c10	scopes/src/c10.rs::h10	forbid_any_tier	must		the wrong namesake
+rs.s11	B ancestor	scopes/src/c11.rs::call_c11	scopes/src/p_ext.rs::h11	edge	must		three modules deep, ancestors' namesakes are not visible
+rs.s11.not	B ancestor	scopes/src/c11.rs::call_c11	scopes/src/c11.rs::h11	forbid_any_tier	must		the wrong namesake
+rs.s12	child module	scopes/src/c12.rs::call_c12	scopes/src/p_ext.rs::h12	edge	must		a namesake inside a child module is not visible to its parent
+rs.s12.not	child module	scopes/src/c12.rs::call_c12	scopes/src/c12.rs::h12	forbid_any_tier	must		the wrong namesake
+rs.s13	sibling module	scopes/src/c13.rs::call_c13	scopes/src/p_ext.rs::h13	edge	must		a namesake in a sibling module is not visible
+rs.s13.not	sibling module	scopes/src/c13.rs::call_c13	scopes/src/c13.rs::h13	forbid_any_tier	must		the wrong namesake
+rs.s14	glob	scopes/src/c14.rs::call_c14	scopes/src/p_ext.rs::h14	edge	must		a glob reaches the file it names, not an unrelated namesake
+rs.s14.not	glob	scopes/src/c14.rs::call_c14	scopes/src/p_dec.rs::h14	forbid_any_tier	must		the wrong namesake
+rs.s15a	C block use	scopes/src/c15.rs::call_c15	scopes/src/p_ext.rs::h15	edge	must		a use inside a function shadows the module's item in that function
+rs.s15a.not	C block use	scopes/src/c15.rs::call_c15	scopes/src/c15.rs::h15	forbid_any_tier	must		the wrong namesake
+rs.s15b	C block use	scopes/src/c15.rs::other_c15	scopes/src/c15.rs::h15	edge	must		and does not leak to the function beside it
+rs.s15b.not	C block use	scopes/src/c15.rs::other_c15	scopes/src/p_ext.rs::h15	forbid_any_tier	must		the wrong namesake
+rs.s16a	C block use of a type	scopes/src/c16.rs::fl_c16	scopes/src/p_db.rs::Dup.mk16	edge	must		a block-level use of a type shadows the module-level one in that block
+rs.s16a.not	C block use of a type	scopes/src/c16.rs::fl_c16	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		the wrong namesake
+rs.s16b	C block use of a type	scopes/src/c16.rs::other_c16	scopes/src/p_da.rs::Dup.mk16	edge	must		and does not leak to the function beside it
+rs.s16b.not	C block use of a type	scopes/src/c16.rs::other_c16	scopes/src/p_db.rs::Dup.mk16	forbid_any_tier	must		the wrong namesake
+rs.s17	A verify_status shape	scopes/src/c17.rs::evidence_store17	scopes/src/p_gt.rs::record17	edge	must		the function imports a record of its own; the module's two-argument record is not the callee
+rs.s17.not	A verify_status shape	scopes/src/c17.rs::evidence_store17	scopes/src/c17.rs::record17	forbid_any_tier	must		the wrong namesake
+rs.s17b	A verify_status shape	scopes/src/c17.rs::plain17	scopes/src/c17.rs::record17	edge	must		guard: outside the function the module's own record is the callee
+rs.s18	block glob	scopes/src/c18.rs::call_c18	scopes/src/p_ext.rs::h18	edge	must		a glob in a block shadows the enclosing module's item
+rs.s18.not	block glob	scopes/src/c18.rs::call_c18	scopes/src/c18.rs::h18	forbid_any_tier	must		the wrong namesake
+rs.s19	declaration over glob	scopes/src/c19.rs::call_c19	scopes/src/c19.rs::h19	edge	must		a declared item shadows a glob import of the same name
+rs.s19.not	declaration over glob	scopes/src/c19.rs::call_c19	scopes/src/p_ext.rs::h19	forbid_any_tier	must		the wrong namesake
+rs.s20	named over glob	scopes/src/c20.rs::call_c20	scopes/src/p_ext2.rs::h20	edge	must		a named import shadows a glob import of the same name
+rs.s20.not	named over glob	scopes/src/c20.rs::call_c20	scopes/src/p_ext.rs::h20	forbid_any_tier	must		the wrong namesake
+rs.s21	use super::*	scopes/src/c21.rs::call_c21	scopes/src/c21.rs::h21	edge	must		guard: `use super::*` brings the parent module's names in
+rs.s22	use super::name	scopes/src/c22.rs::call_c22	scopes/src/c22.rs::h22	edge	must		guard: a named use of a parent module's item
+rs.s24	full path	scopes/src/c24.rs::call_c24	scopes/src/p_ext.rs::h24	edge	must		a full path names its module, not the same-file namesake
+rs.s24.not	full path	scopes/src/c24.rs::call_c24	scopes/src/c24.rs::h24	forbid_any_tier	must		the wrong namesake
+rs.s25	super path	scopes/src/c25.rs::call_c25	scopes/src/c25.rs::h25	edge	must		guard: super:: names the parent module's item
+rs.s27a	recall: use checkout::{..}	scopes/src/c27.rs::call_c27a	scopes/src/c27.rs::pay27	edge	must		recall: a name reached through an inline module's use path
+rs.s27b	recall: use checkout::{..}	scopes/src/c27.rs::call_c27b	scopes/src/c27.rs::pay27	edge	must		recall: a name reached through an inline module's use path
+rs.s27c	recall: use checkout::{..}	scopes/src/c27.rs::call_c27c	scopes/src/c27.rs::pay27	edge	must		recall: a name reached through an inline module's use path
+rs.s27d	recall: use checkout::{..}	scopes/src/c27.rs::call_c27a	scopes/src/c27.rs::refund27	edge	must		recall: the second name of the same use group
+rs.s28	recall: cfg twins	scopes/src/c28.rs::call_c28	scopes/src/c28.rs::StatKey.of	edge	must		recall: two #[cfg] bodies of one method are one method
+rs.s29	recall: Type::from	scopes/src/c29.rs::call_c29	scopes/src/p_e29b.rs::E29.from	edge	must		recall: an explicit Type::from names a type with exactly one impl
+rs.s30	recall: path child through a re-export	scopes/src/p30_kid.rs::call_c30	scopes/src/p30_decl.rs::helper30	edge	must		recall: a #[path] child inherits a name its parent imports through a re-export
+rs.sv_priv_v1	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/pubs.rs::priv_v1	edge	must		a glob publishes only what is visible to the importer
+rs.sv_priv_v1.not	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::priv_v1	forbid_any_tier	must		the wrong namesake
+rs.sv_sup_v2	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/pubs.rs::sup_v2	edge	must		a glob publishes only what is visible to the importer
+rs.sv_sup_v2.not	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::sup_v2	forbid_any_tier	must		the wrong namesake
+rs.sv_inp_v3	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/pubs.rs::inp_v3	edge	must		a glob publishes only what is visible to the importer
+rs.sv_inp_v3.not	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::inp_v3	forbid_any_tier	must		the wrong namesake
+rs.sv_cr_v4	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::cr_v4	edge	must		guard: pub(crate) is visible everywhere
+rs.sv_pub_v5	D visibility	scopes/src/vis_user.rs::run_v	scopes/src/vis/inner.rs::pub_v5	edge	must		guard: pub is visible everywhere
+rs.sv_sup_w2	D visibility	scopes/src/vis/within.rs::call_within	scopes/src/vis/inner.rs::sup_w2	edge	must		guard: pub(super) is visible to the parent's descendants
+rs.sv_inp_w3	D visibility	scopes/src/vis/within.rs::call_within	scopes/src/vis/inner.rs::inp_w3	edge	must		guard: pub(in path) is visible inside that module
+rs.sv_priv_k	D visibility	scopes/src/vis/inner/kid.rs::call_kid	scopes/src/vis/inner.rs::priv_k	edge	must		guard: a private item is visible to its module's descendants
+rs.s31	B ancestor glob	scopes/src/c31.rs::call_c31	scopes/src/p_ext.rs::h31	edge	must		glob in a deep child module: the ancestors' namesakes are not visible
+rs.s31.not	B ancestor glob	scopes/src/c31.rs::call_c31	scopes/src/c31.rs::h31	forbid_any_tier	must		the ancestors' namesake
+rs.s32	B ancestor glob	scopes/src/c32.rs::child_calls32	scopes/src/p_ext.rs::anc32	edge	must		glob in a tests module: the parent's namesake is not visible
+rs.s32.not	B ancestor glob	scopes/src/c32.rs::child_calls32	scopes/src/c32.rs::anc32	forbid_any_tier	must		the parent's namesake
+rs.s33a	E macro scope	scopes/src/c33.rs::mac_block	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		a macro in the block emits `use crate::p_db::Dup;`; the module-level import of p_da::Dup is shadowed there
+rs.s33b	E macro scope	scopes/src/c33.rs::mac_block2_value	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		the same, in a nested value block
+rs.s34a	E nearer glob	scopes/src/c34.rs::macro_glob	scopes/src/c34.rs::gm	forbid_any_tier	must		a block glob of a module whose `gm` is macro-made is nearer than the module's own gm
+rs.s34b	E nearer glob	scopes/src/c34.rs::std_glob	scopes/src/c34.rs::swap	forbid_any_tier	must		a block `use std::mem::*;` provides swap
+rs.s34c	E nearer glob	scopes/src/c34.rs::std_glob2	scopes/src/c34.rs::swap	forbid_any_tier	must		the same, second caller
+rs.s35a	E nearer glob	scopes/src/c35.rs::ext_glob	scopes/src/c35.rs::max	forbid_any_tier	must		a block glob of an unindexed external module (std::cmp) provides max
+rs.s35b	E nearer glob	scopes/src/c35.rs::macro_item_glob	scopes/src/c35.rs::made2	forbid_any_tier	must		a block glob of a module with an item macro that makes made2
+rs.s35c	E nearer glob	scopes/src/c35.rs::plain_via_glob	scopes/src/mm2.rs::plain2	edge	must		a plainly declared name of a module that also holds an item macro: the corpus-unique tier still finds it
+rs.s36a	E nearer glob	scopes/src/c36.rs::enum_glob	scopes/src/c36.rs::Mk	forbid_any_tier	must		a block glob of an enum's variants provides Mk (the variant, not the function)
+rs.s37a	E statement macro	scopes/src/c37.rs::std_macro_then_outer	scopes/src/c37.rs::h37a	edge	must		println! and vec! emit no items or imports: the outer declaration answers
+rs.s37b	E statement macro	scopes/src/c37.rs::unknown_macro_then_name	scopes/src/c37.rs::h37b	forbid_any_tier	must		a crate macro may declare h37b in the block
+rs.s38a	E statement macro	scopes/src/c38.rs::shadowed_dbg	scopes/src/c38.rs::h38	forbid_any_tier	must		a crate macro named dbg is not the std dbg: it may declare h38
+rs.s40	F macro rebinding	scopes/src/c40.rs::imported_info	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`use dep::info;` brings the dependency's macro, which emits a block-level `use` of the other Dup
+rs.s41	F macro rebinding	macrouse/src/user.rs::via_macro_use	macrouse/src/mda.rs::Dup.mk16	forbid_any_tier	must		`#[macro_use] extern crate dep;` makes `vec!` the dependency's macro
+rs.s42	F macro rebinding	scopes/src/c42.rs::aliased_log	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`extern crate dep as log;` makes `log::debug!` the dependency's (`debug` is imported by name nowhere in the crate and the manifest declares the genuine `log` stub, so only the alias rule stands between this row and a false edge)
+rs.s43	F macro rebinding	scopes/src/c43.rs::attr_use	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		an attribute macro on a block item emits a `use` into the block
+rs.s44a	F declared by macro	scopes/src/c44.rs::after_thread_local	scopes/src/c44.rs::h44	edge	must		`thread_local!` in the call's own block declares only the statics it names, so h44 is still the module's
+rs.s44b	F declared by macro	scopes/src/c44.rs::after_bail	scopes/src/c44.rs::h44b	edge	must		`anyhow::ensure!` in the call's own block is an expression macro that declares nothing
+rs.s44c	F declared by macro	scopes/src/c44.rs::after_bail_tail	scopes/src/c44.rs::h44c	edge	must		`anyhow::bail!` as the tail expression of the call's own block declares nothing
+rs.s45a	G glob macro	scopes/src/c45.rs::glob_bail	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`use dep::*;` brings dep's `bail`, which emits a block-level `use` of the other Dup
+rs.s45b	G glob macro	scopes/src/c45b.rs::prelude_bail	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		the same through `use crate::p_prelude::*;` and the prelude's `pub use dep::*;`
+rs.s46a	H attribute macro (known limit)	scopes/src/c46.rs::attr_module	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		KNOWN LIMIT: `#[pm::with_use(crate::p_db::Dup)] struct S;` at module level emits `use crate::p_db::Dup;`, which shadows the glob; the resolver does not treat a module-level attribute macro as making the scope unknown
+rs.s46b	H attribute macro (known limit)	scopes/src/c46b.rs::attr_fn	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		KNOWN LIMIT: `#[pm::body_use(crate::p_db::Dup)]` on the enclosing fn adds a `use` to its body; the resolver does not read an attribute macro on the enclosing function
+rs.s47a	H cfg_attr	scopes/src/c47.rs::cfg_attr_use	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`#[cfg_attr(all(), pm::with_use(..))]` on a block item is the attribute macro whenever the predicate holds
+rs.s47b	H derive path	scopes/src/c47b.rs::pathed_derive	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`#[derive(pm::Clone)]` is a derive of the `pm` crate that shares a std name, and emits a `use`
+rs.s49a	G glob control	scopes/src/c49.rs::std_glob_silent	scopes/src/c49.rs::h49	edge	must		control: `use std::collections::*;` cannot bring a different `println!`, so it stays silent
+rs.s49b	G glob control	scopes/src/c49b.rs::indexed_glob_silent	scopes/src/c49b.rs::h49b	edge	must		control: `use pm::*;` (an indexed crate that exports no `println!`) leaves it silent
+rs.s50a	I crate alias	renames/src/c1.rs::aliased_bail	renames/src/rda.rs::Dup.mk16	forbid_any_tier	must		`extern crate dep as anyhow; use anyhow::bail;`: the imported `bail` is dep's, whatever the name says (the manifest declares the genuine `anyhow` stub, so only the alias rule refuses it)
+rs.s50b	I cargo rename	renames/src/c2.rs::renamed_log	renames/src/rda.rs::Dup.mk16	forbid_any_tier	must		`log = { package = "dep_alt", path = "../dep_alt" }` makes `log::trace!` dep's macro, not the log crate's
+rs.s51	F macro rebinding	cfgmu/src/user.rs::via_cfg_attr	cfgmu/src/mda.rs::Dup.mk16	forbid_any_tier	must		`#[cfg_attr(all(), macro_use)] extern crate dep;` is `#[macro_use]`: `vec!` is the dependency's
+rs.s52a	J macro_use scope	mumod/src/user.rs::mod_silent	mumod/src/user.rs::h52a	edge	must		`#[macro_use] mod macros;` only publishes the module's own macro_rules!, so `println!` stays the std macro
+rs.s52b	J macro_use scope	muext/src/user.rs::ext_silent	muext/src/user.rs::h52b	edge	must		`#[macro_use] extern crate pm;` of an indexed crate that exports no `println` leaves `println!` the std macro
+rs.s48a	G glob macro	scopes/src/c48.rs::pm_bail	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`use pm::*;` brings pm's `#[proc_macro] bail`, which emits a block-level `use` of the other Dup
+rs.s53a	G glob control	scopes/src/c53.rs::explicit_beats_glob	scopes/src/c53.rs::h53	edge	must		an explicit `use anyhow::bail;` shadows `use dep::*;` (rustc reports the glob unused), so `bail!` stays anyhow's and the module's own h53 answers
+rs.s54a	G glob control	scopes/src/c54.rs::cfg_import	scopes/src/p_da.rs::Dup.mk16	forbid_any_tier	must		`#[cfg(feature = "bail_feature")] use anyhow::bail;` is not an import while the feature is off, so `use dep::*;` brings dep's `bail!`, which emits a block-level `use` of the other Dup
+rs.s55a	K no_std prelude	nostd/src/c1.rs::nostd_println	nostd/src/na.rs::Dup.mk16	forbid_any_tier	must		`#![no_std]` has no `println!` in its macro prelude (rustc: no E0659), so `use kio::*;` brings kio's, which emits a block-level `use` of the other Dup
+rs.s55b	K no_std prelude	nostd/src/c1.rs::core_assert_silent	nostd/src/c1.rs::h55	edge	must		control: `assert!` is a core macro and stays in a no_std prelude (rustc: E0659 against a glob), so it is the real one and the module's own h55 answers
+rs.s56a	K no_implicit_prelude	nopre/src/lib.rs::nopre_println	nopre/src/pa.rs::Dup.mk16	forbid_any_tier	must		`#![no_implicit_prelude]` removes `println!` from the macro prelude (rustc: no E0659), so `use kio::*;` brings kio's, which emits a block-level `use` of the other Dup
+rs.s56b	K no_implicit_prelude	nopre/src/lib.rs::builtin_assert_silent	nopre/src/lib.rs::h56	edge	must		control: `assert!` is a builtin that `no_implicit_prelude` keeps (rustc: E0659 against a glob), so it is the real one and the module's own h56 answers
+rs.s57	G cfg alternatives	cfgglob/src/lib.rs::only_unix	cfgglob/src/unixy.rs::Inner.unix_only	edge	must		two cfg alternatives each glob a module with an item-position macro; only the unix one defines `unix_only`, so the crate compiling means that is the call (the shape of wry's `InnerWebView::new_gtk`)
+rs.s70a	J cfg alternative imports (known gap)	scopes/src/c55.rs::alternative_imports	scopes/src/p_da.rs::Dup.mk16	forbid	must		KNOWN GAP: `#[cfg(unix)] use p_da::Dup; #[cfg(windows)] use p_db::Dup;` has two live-in-one-configuration bindings of one name; the true expectation is no single 1.0 edge (both p_da and p_db are candidates). Today: the first in source order gets an ImportScoped edge at 1.0
+rs.s70b	J cfg alternative globs (known gap)	scopes/src/c56.rs::alternative_globs	scopes/src/p_da.rs::Dup.mk16	forbid	must		KNOWN GAP: `#[cfg(unix)] use p_da::*; #[cfg(windows)] use p_db::*;` are cfg alternatives for the name `Dup`; the true expectation is no single 1.0 edge. Today: the first glob in source order gets the edge at 1.0

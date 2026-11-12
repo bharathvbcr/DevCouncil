@@ -52,11 +52,13 @@ pub use devmap_extract::paths;
 pub use devmap_store;
 
 pub use artifacts::{
-    should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
-    ArtifactStamp,
+    should_regenerate, write_atomic, writer_identity, ArtifactCurrency, ArtifactFingerprint,
+    ArtifactRecord, ArtifactStamp,
 };
 pub use ask::*;
-pub use bounded::{bounded_reason, bounded_text, MAX_REASON_COMPONENT_BYTES};
+pub use bounded::{
+    bounded_reason, bounded_text, is_agent_unsafe, is_bidi_control, MAX_REASON_COMPONENT_BYTES,
+};
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     build_code_graph_value, build_graph_core_value, decode_compact, encode_compact,

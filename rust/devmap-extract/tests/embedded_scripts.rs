@@ -11,7 +11,7 @@
 //!
 //! Every test here fails against that code.
 
-use devmap_extract::model::{ParseOutcome, SymbolKind};
+use devmap_extract::model::{ParseOutcome, ReferenceKind, SymbolKind};
 use devmap_extract::{extract_file, Extraction};
 
 const SVELTE: &str = r#"<script lang="ts">
@@ -260,7 +260,7 @@ fn a_svelte_script_block_declares_symbols_imports_calls_and_exports() {
 }
 
 #[test]
-fn a_svelte_template_identifier_is_a_call() {
+fn a_svelte_template_identifier_is_a_reference_not_a_call() {
     const SOURCE: &str = r#"<script lang="ts">
   function publishRelease() {}
 </script>
@@ -268,9 +268,19 @@ fn a_svelte_template_identifier_is_a_call() {
 "#;
     let extraction = extract_file("src/Ops.svelte", SOURCE);
     assert!(
-        callees(&extraction).contains(&"publishRelease"),
-        "onclick={{publishRelease}} must be a call, or the handler stays a dead-symbol cluster: {:?}",
+        !callees(&extraction).contains(&"publishRelease"),
+        "onclick={{publishRelease}} hands the function over, nothing calls it: {:?}",
         callees(&extraction)
+    );
+    assert!(
+        extraction
+            .references
+            .iter()
+            .any(|r| r.name == "publishRelease"
+                && r.kind == ReferenceKind::Name
+                && r.receiver_expr.is_none()),
+        "the handler must stay a use, or it is a dead-symbol cluster: {:?}",
+        extraction.references
     );
     assert_every_span_is_inside(&extraction, SOURCE);
 }

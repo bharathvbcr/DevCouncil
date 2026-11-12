@@ -18,21 +18,21 @@
     "present": 74
   },
   "rust": {
-    "forbid_any_tier_rows": 1,
-    "known_failing": 0,
-    "positive_rows": 115,
-    "present": 115
+    "forbid_any_tier_rows": 69,
+    "known_failing": 6,
+    "positive_rows": 203,
+    "present": 201
   },
   "swift": {
     "forbid_any_tier_rows": 9,
-    "known_failing": 6,
+    "known_failing": 4,
     "positive_rows": 117,
-    "present": 111
+    "present": 113
   },
   "typescript": {
-    "forbid_any_tier_rows": 7,
+    "forbid_any_tier_rows": 31,
     "known_failing": 0,
-    "positive_rows": 80,
-    "present": 80
+    "positive_rows": 111,
+    "present": 111
   }
 }
