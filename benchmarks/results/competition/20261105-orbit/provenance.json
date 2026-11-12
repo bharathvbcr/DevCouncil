@@ -1,0 +1,44 @@
+{
+  "bins": {
+    "devmap": {
+      "path": "/private/tmp/devmap-bench-20261105/target-current/release/devmap",
+      "version": "devmap 0.2.5 (store schema 29, code graph schema 2, extract schema 98, build 5a4a15e7a6ff)",
+      "sha256": "3a08b29f29199fb95c47a2f3463c0c2604ca44688c5808f41be5a28d8a85b6ac",
+      "bytes": 73626112
+    },
+    "devmap_old": {
+      "path": "/private/tmp/devmap-bench-20261105/target-old/release/devmap",
+      "version": "devmap 0.2.5 (store schema 27, code graph schema 2, extract schema 98, build 782b9f168833)",
+      "sha256": "e2cb168590b3bddb797d7d1042548037a7c87e0bc8de1b0b666430ce8d47989e",
+      "bytes": 72695600
+    },
+    "orbit": {
+      "path": "/Users/bharath/.local/bin/orbit",
+      "version": "orbit 0.163.0-38-g3d379c2",
+      "sha256": "6ed6b09e548afe866e7a85a6cf7bda5528f436d9f8767b1492076992f586afdb",
+      "bytes": 141148640
+    }
+  },
+  "corpora": {
+    "DevPrism": {
+      "commit": "348d14f8f5a116cbacd4cdeed69b1113131d401c",
+      "tracked_files": 933
+    },
+    "DevCouncil": {
+      "commit": "5a4a15e7a6ff2c9a21b67348cb8901b2696d8550",
+      "tracked_files": 3057
+    },
+    "GitPulse": {
+      "commit": "5394f4d3e1f8a891e39935d9a89fd82783a1549f",
+      "tracked_files": 3322
+    },
+    "orbit-knowledge-graph": {
+      "commit": "ecfa552d0349e1e16a185930a9be52d03d0ced77",
+      "tracked_files": 3331
+    },
+    "scholarlm": {
+      "commit": "982f43a19c93f6f0b8c5bc431abe16d79c234b28",
+      "tracked_files": 6479
+    }
+  }
+}
