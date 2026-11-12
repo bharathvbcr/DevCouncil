@@ -117,9 +117,525 @@ const EMPTY_BODIES: &[&str] = &[
 /// The gate an allow-stub marker moves a finding to. See [`apply_allow_stub`].
 pub const GATE_STUB_ALLOWED: &str = "stub_allowed";
 
+/// The gate that blocks test-runner hijacks (`conftest.py` `os._exit(0)`,
+/// `TestMain` without `m.Run()`, `pytest_sessionfinish` forcing `exitstatus = 0`,
+/// etc.). Never suppressed by [`ALLOW_STUB_MARKER`].
+pub use crate::stub_ast::GATE_RUNNER_HIJACK;
+
+/// The gate that blocks Lean 4 (`.lean`) Trusted Computing Base (TCB) soundness
+/// holes (`sorry`, `sorryAx`, `admit`, `native_decide`, `Lean.ofReduceBool`,
+/// `Lean.trustCompiler`, `axiom`, `opaque`, `constant`, `unsafe`, `@[extern]`,
+/// `@[implemented_by]`, `@[csimp]`, unclosed lexical constructs, or cap truncation).
+/// Never suppressed by [`ALLOW_STUB_MARKER`].
+pub const GATE_LEAN_TCB: &str = "lean_tcb";
+
+/// Summary of a Lean 4 TCB rigor check across a diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeanTcbCheckReport {
+    pub findings: Vec<Finding>,
+    /// Number of non-deleted `.lean` files with added lines examined by the gate.
+    pub checked_files: usize,
+}
+
+/// Runs the Lean 4 TCB gate over a diff with no post-change working-tree source.
+pub fn detect_lean_tcb(files: &[FileDiff]) -> Vec<Finding> {
+    detect_lean_tcb_report(files, &|_| None).findings
+}
+
+/// Runs the Lean 4 TCB gate over a diff with post-change working-tree sources.
+pub fn detect_lean_tcb_with(
+    files: &[FileDiff],
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+) -> Vec<Finding> {
+    detect_lean_tcb_report(files, source).findings
+}
+
+/// Runs the Lean 4 TCB gate and reports how many `.lean` files were audited.
+pub fn detect_lean_tcb_report(
+    files: &[FileDiff],
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+) -> LeanTcbCheckReport {
+    detect_lean_tcb_report_with_root(files, source, None)
+}
+
+fn parse_env_lean_kernel_mode() -> Result<dc_evidence::lean_tcb::LeanKernelMode, String> {
+    use dc_evidence::lean_tcb::LeanKernelMode;
+    let Ok(raw) = std::env::var("DC_VERIFY_LEAN_KERNEL") else {
+        return Ok(LeanKernelMode::Off);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "lexical"
+        )
+    {
+        Ok(LeanKernelMode::Off)
+    } else if trimmed.eq_ignore_ascii_case("auto") {
+        Ok(LeanKernelMode::Auto)
+    } else if trimmed.eq_ignore_ascii_case("require") {
+        Ok(LeanKernelMode::Require)
+    } else {
+        Err(format!(
+            "unsupported DC_VERIFY_LEAN_KERNEL={trimmed:?} (expected `auto` or `require`); failing closed"
+        ))
+    }
+}
+
+/// Runs the Lean 4 TCB gate with an optional repository `root` for external
+/// `lean` + `lean4checker --fresh` resolution when `DC_VERIFY_LEAN_KERNEL=auto|require`.
+pub fn detect_lean_tcb_report_with_root(
+    files: &[FileDiff],
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+    root: Option<&std::path::Path>,
+) -> LeanTcbCheckReport {
+    use dc_evidence::lean_tcb::{
+        LeanKernelMode, LeanTcbHoleKind, LeanTcbRole, MAX_LEAN_BYTES, analyze_lean_tcb,
+        byte_to_line_1based, render_lean_axiom_driver, verify_lean_axioms_output,
+    };
+
+    let kernel_mode = parse_env_lean_kernel_mode();
+    let mut findings = Vec::new();
+    let mut checked_files = 0usize;
+
+    for file in files {
+        if file.status == ChangeStatus::Deleted
+            || !file.path.ends_with(".lean")
+            || file.added_lines.is_empty()
+        {
+            continue;
+        }
+        checked_files += 1;
+        let first_added_line = file.added_lines[0].0;
+        let file_findings_start = findings.len();
+
+        let (src, line_remap): (String, Option<Vec<u32>>) = match post_image(file, source) {
+            Ok(text) => (text, None),
+            Err(PostImageMiss::TooLarge) => {
+                let first_ev = &file.added_lines[0].1;
+                findings.push(Finding {
+                    gate: GATE_LEAN_TCB,
+                    severity: Severity::Blocking,
+                    strength: Strength::Proven,
+                    path: file.path.clone(),
+                    line: first_added_line,
+                    evidence: safe_evidence(first_ev),
+                    message: format!(
+                        "Lean 4 specification exceeds {} byte verification cap; failing closed on unverified trailing proof text",
+                        MAX_LEAN_BYTES
+                    ),
+                });
+                continue;
+            }
+            Err(PostImageMiss::Unknown | PostImageMiss::Stale) => {
+                let mut synth = String::new();
+                let mut map = Vec::with_capacity(file.added_lines.len());
+                for (ln, text) in &file.added_lines {
+                    synth.push_str(text);
+                    synth.push('\n');
+                    map.push(*ln);
+                }
+                (synth, Some(map))
+            }
+        };
+
+        let src_lines: Vec<&str> = src.lines().collect();
+        let added_set: HashSet<u32> = file.added_lines.iter().map(|(n, _)| *n).collect();
+        let map_line = |raw_line_1based: u32| -> u32 {
+            if let Some(remap) = &line_remap {
+                let idx = (raw_line_1based as usize).saturating_sub(1);
+                remap.get(idx).copied().unwrap_or(first_added_line)
+            } else {
+                raw_line_1based
+            }
+        };
+        let evidence_for_raw = |raw_line_1based: u32| -> &str {
+            src_lines
+                .get((raw_line_1based as usize).saturating_sub(1))
+                .copied()
+                .unwrap_or("")
+        };
+
+        let report = analyze_lean_tcb(&src);
+
+        if report.unread_bytes > 0 {
+            findings.push(Finding {
+                gate: GATE_LEAN_TCB,
+                severity: Severity::Blocking,
+                strength: Strength::Proven,
+                path: file.path.clone(),
+                line: first_added_line,
+                evidence: safe_evidence(&file.added_lines[0].1),
+                message: format!(
+                    "Lean 4 specification exceeds {MAX_LEAN_BYTES} byte TCB scan cap ({} unread bytes); failing closed",
+                    report.unread_bytes
+                ),
+            });
+        }
+
+        for hole in &report.holes {
+            let start_raw = byte_to_line_1based(&src, hole.span.start_byte);
+            let end_raw = byte_to_line_1based(
+                &src,
+                hole.span
+                    .end_byte
+                    .saturating_sub(1)
+                    .max(hole.span.start_byte),
+            );
+            let is_lexical = hole.kind == LeanTcbHoleKind::UnclosedLexicalConstruct;
+            let touched_raw = if line_remap.is_some() {
+                Some(start_raw)
+            } else if is_lexical {
+                (start_raw..=end_raw)
+                    .find(|ln| added_set.contains(ln))
+                    .or_else(|| {
+                        file.added_lines
+                            .iter()
+                            .map(|(n, _)| *n)
+                            .find(|&n| n >= start_raw)
+                    })
+                    .or(Some(first_added_line))
+            } else {
+                (start_raw..=end_raw).find(|ln| added_set.contains(ln))
+            };
+
+            let Some(chosen_raw) = touched_raw else {
+                continue;
+            };
+            let line = map_line(chosen_raw);
+            let ev_text = if is_lexical && line_remap.is_none() && !added_set.contains(&start_raw) {
+                evidence_for_raw(chosen_raw)
+            } else {
+                evidence_for_raw(start_raw)
+            };
+            let where_sym = hole
+                .enclosing_symbol
+                .as_deref()
+                .map(|s| format!(" in `{s}`"))
+                .unwrap_or_default();
+            let message = match hole.kind {
+                LeanTcbHoleKind::Sorry => format!(
+                    "Lean 4 proof hole `{}`{where_sym} bypasses kernel verification via sorry axiom",
+                    hole.token
+                ),
+                LeanTcbHoleKind::Admit => format!(
+                    "Lean 4 tactic `{}`{where_sym} leaves proof obligation unproven",
+                    hole.token
+                ),
+                LeanTcbHoleKind::NativeDecide => format!(
+                    "Lean 4 `{}`{where_sym} trusts native compiler evaluation outside the Lean kernel TCB",
+                    hole.token
+                ),
+                LeanTcbHoleKind::UnsafeDecl => format!(
+                    "Lean 4 `unsafe` declaration{where_sym} bypasses kernel termination and soundness checks"
+                ),
+                LeanTcbHoleKind::MetaprogrammingEscape => format!(
+                    "Lean 4 elaboration-time metaprogramming/syntax escape `{}`{where_sym} can synthesize axioms outside lexical TCB bounds",
+                    hole.token
+                ),
+                LeanTcbHoleKind::UnclosedLexicalConstruct => format!(
+                    "Lean 4 source has unclosed `{}` delimiter; failing closed against comment/string masking",
+                    hole.token
+                ),
+                LeanTcbHoleKind::KernelRejected => format!(
+                    "Lean 4 kernel rejected specification{where_sym}: {}",
+                    hole.token
+                ),
+                LeanTcbHoleKind::NonStandardAxiom => format!(
+                    "Lean 4 declaration{where_sym} depends on non-standard axiom(s): {}",
+                    hole.token
+                ),
+                LeanTcbHoleKind::Lean4CheckerRejected => format!(
+                    "lean4checker --fresh rejected environment{where_sym}: {}",
+                    hole.token
+                ),
+                LeanTcbHoleKind::KernelUnavailable => format!(
+                    "Lean 4 kernel / lean4checker unavailable under required policy: {}",
+                    hole.token
+                ),
+            };
+            findings.push(Finding {
+                gate: GATE_LEAN_TCB,
+                severity: Severity::Blocking,
+                strength: Strength::Proven,
+                path: file.path.clone(),
+                line,
+                evidence: safe_evidence(ev_text),
+                message,
+            });
+        }
+
+        for decl in &report.declarations {
+            if !matches!(
+                decl.role,
+                LeanTcbRole::TrustedAxiom | LeanTcbRole::ExternHook
+            ) {
+                continue;
+            }
+            let start_raw = byte_to_line_1based(&src, decl.span.start_byte);
+            let end_raw = byte_to_line_1based(
+                &src,
+                decl.span
+                    .end_byte
+                    .saturating_sub(1)
+                    .max(decl.span.start_byte),
+            );
+            let touched_raw = if line_remap.is_some() {
+                Some(start_raw)
+            } else {
+                (start_raw..=end_raw).find(|ln| added_set.contains(ln))
+            };
+            let Some(chosen_raw) = touched_raw else {
+                continue;
+            };
+            let line = map_line(chosen_raw);
+            let message = match decl.role {
+                LeanTcbRole::TrustedAxiom => format!(
+                    "Lean 4 `{}` declaration `{}` introduces an unverified axiom/opaque assumption into the TCB",
+                    decl.keyword, decl.qualified_name
+                ),
+                LeanTcbRole::ExternHook => format!(
+                    "Lean 4 external/runtime hook ({}) on `{}` substitutes unverified code outside the Lean kernel",
+                    decl.attributes.join(", "),
+                    decl.qualified_name
+                ),
+                _ => unreachable!(),
+            };
+            findings.push(Finding {
+                gate: GATE_LEAN_TCB,
+                severity: Severity::Blocking,
+                strength: Strength::Proven,
+                path: file.path.clone(),
+                line,
+                evidence: safe_evidence(evidence_for_raw(chosen_raw)),
+                message,
+            });
+        }
+
+        let lexically_blocked = findings.len() > file_findings_start;
+
+        match &kernel_mode {
+            Err(cfg_err) => {
+                findings.push(Finding {
+                    gate: GATE_LEAN_TCB,
+                    severity: Severity::Blocking,
+                    strength: Strength::Proven,
+                    path: file.path.clone(),
+                    line: first_added_line,
+                    evidence: safe_evidence(&file.added_lines[0].1),
+                    message: cfg_err.clone(),
+                });
+            }
+            Ok(LeanKernelMode::Off) => {}
+            Ok(_) if lexically_blocked => {}
+            Ok(mode @ (LeanKernelMode::Auto | LeanKernelMode::Require)) => {
+                let boundary_root = root.unwrap_or_else(|| std::path::Path::new("."));
+                let on_disk_spec = root.map(|r| r.join(&file.path));
+                let (driver, expected_decls) = render_lean_axiom_driver(
+                    dc_proc::lean_kernel::target_module_name(),
+                    &src,
+                    &report.declarations,
+                );
+                let outcome = dc_proc::lean_kernel::run_lean_kernel_check(
+                    boundary_root,
+                    on_disk_spec.as_deref(),
+                    &src,
+                    &driver,
+                    *mode == LeanKernelMode::Require,
+                    dc_proc::lean_kernel::configured_lean_kernel_timeout(),
+                );
+                if let Some(stdout) = &outcome.print_axioms_stdout
+                    && let Err(violations) = verify_lean_axioms_output(stdout, &expected_decls)
+                {
+                    for v in violations {
+                        findings.push(Finding {
+                            gate: GATE_LEAN_TCB,
+                            severity: Severity::Blocking,
+                            strength: Strength::Proven,
+                            path: file.path.clone(),
+                            line: first_added_line,
+                            evidence: safe_evidence(&file.added_lines[0].1),
+                            message: format!("Lean 4 kernel axiom audit failed: {}", v.detail),
+                        });
+                    }
+                }
+                if let Some(fail) = outcome.failure {
+                    let msg = match fail {
+                        dc_proc::lean_kernel::LeanKernelFailure::Unavailable(m) => {
+                            format!("Lean 4 kernel/checker unavailable: {m}")
+                        }
+                        dc_proc::lean_kernel::LeanKernelFailure::KernelRejected(m) => m,
+                        dc_proc::lean_kernel::LeanKernelFailure::Lean4CheckerRejected(m) => m,
+                    };
+                    findings.push(Finding {
+                        gate: GATE_LEAN_TCB,
+                        severity: Severity::Blocking,
+                        strength: Strength::Proven,
+                        path: file.path.clone(),
+                        line: first_added_line,
+                        evidence: safe_evidence(&file.added_lines[0].1),
+                        message: msg,
+                    });
+                }
+            }
+        }
+    }
+
+    LeanTcbCheckReport {
+        findings,
+        checked_files,
+    }
+}
+
 /// The marker that declares a stub intentional. It must carry a reason:
 /// `// allow-stub: waiting on the v2 API`. A bare marker suppresses nothing.
 pub const ALLOW_STUB_MARKER: &str = "allow-stub";
+
+/// Runs the runner-hijack gate over a diff with no post-change working-tree source.
+pub fn detect_runner_hijack(files: &[FileDiff]) -> Vec<Finding> {
+    detect_runner_hijack_with(files, &|_| None)
+}
+
+/// Runs the runner-hijack gate, using tree-sitter (`Strength::Proven`) whenever
+/// [`stub_ast`] parses the post-change source, and a conservative line-based
+/// check (`Strength::Derived`) for JavaScript/bootstrap files or unparseable diffs.
+pub fn detect_runner_hijack_with(
+    files: &[FileDiff],
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for file in files {
+        if file.status == ChangeStatus::Deleted || file.added_lines.is_empty() {
+            continue;
+        }
+        let lang = stub_ast::Lang::for_path(&file.path);
+        let post = post_image(file, source).ok();
+        let lines: Option<Vec<&str>> = post.as_deref().map(|s| s.lines().collect());
+        if let (Some(lang), Some(src)) = (lang, post.as_deref()) {
+            let added: HashSet<u32> = file.added_lines.iter().map(|(n, _)| *n).collect();
+            if let Ok(ast) = stub_ast::analyze_runner_hijack(lang, &file.path, src, &added) {
+                for f in ast {
+                    let evidence = lines
+                        .as_ref()
+                        .and_then(|l| l.get(f.line as usize - 1))
+                        .copied()
+                        .unwrap_or("");
+                    findings.push(Finding {
+                        gate: f.gate,
+                        severity: f.severity,
+                        strength: f.strength,
+                        path: file.path.clone(),
+                        line: f.line,
+                        evidence: safe_evidence(evidence),
+                        message: f.message,
+                    });
+                }
+                continue;
+            }
+        }
+        findings.extend(fallback_runner_hijack(file));
+    }
+    findings
+}
+
+fn fallback_runner_hijack(file: &FileDiff) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let path = file.path.as_str();
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let is_js_test = dc_glob::is_test_path(path)
+        && matches!(
+            path.rsplit_once('.').map_or("", |(_, e)| e),
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts"
+        );
+    let is_py_boot_or_test = matches!(
+        base,
+        "conftest.py" | "sitecustomize.py" | "usercustomize.py"
+    ) || (path.ends_with(".py") && dc_glob::is_test_path(path));
+    let is_pth = path.ends_with(".pth");
+
+    for (line_no, raw) in &file.added_lines {
+        let trimmed = raw.trim();
+        if is_pth
+            && trimmed.starts_with("import ")
+            && (trimmed.contains("_exit") || trimmed.contains("exit(0)"))
+        {
+            out.push(Finding {
+                gate: GATE_RUNNER_HIJACK,
+                severity: Severity::Blocking,
+                strength: Strength::Derived,
+                path: file.path.clone(),
+                line: *line_no,
+                evidence: safe_evidence(raw),
+                message: "added executable `.pth` startup hook invoking process exit".to_string(),
+            });
+            continue;
+        }
+        if is_js_test {
+            for pat in ["process.exit(0)", "process.exit()"] {
+                if let Some(at) = raw.find(pat)
+                    && is_code_at(raw, at)
+                {
+                    out.push(Finding {
+                        gate: GATE_RUNNER_HIJACK,
+                        severity: Severity::Blocking,
+                        strength: Strength::Derived,
+                        path: file.path.clone(),
+                        line: *line_no,
+                        evidence: safe_evidence(raw),
+                        message: "test file calls `process.exit(0)`, terminating the test runner with exit code 0".to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+        if path.ends_with(".py") && !trimmed.starts_with('#') {
+            if is_py_boot_or_test
+                && let Some(at) = raw.find("os._exit(")
+                && is_code_at(raw, at)
+            {
+                out.push(Finding {
+                    gate: GATE_RUNNER_HIJACK,
+                    severity: Severity::Blocking,
+                    strength: Strength::Derived,
+                    path: file.path.clone(),
+                    line: *line_no,
+                    evidence: safe_evidence(raw),
+                    message: "`os._exit` inside test/bootstrap module bypasses test teardown and exits immediately".to_string(),
+                });
+            } else if !is_py_boot_or_test
+                && let Some(at) = raw.find("os._exit(0)")
+                && is_code_at(raw, at)
+            {
+                out.push(Finding {
+                    gate: GATE_RUNNER_HIJACK,
+                    severity: Severity::Blocking,
+                    strength: Strength::Derived,
+                    path: file.path.clone(),
+                    line: *line_no,
+                    evidence: safe_evidence(raw),
+                    message: "production module calls `os._exit(0)`, terminating any importing test runner with exit code 0".to_string(),
+                });
+            } else if is_py_boot_or_test
+                && let Some(at) = raw.find(".exitstatus")
+                && is_code_at(raw, at)
+                && raw[at..].contains('=')
+                && (raw[at..].contains('0') || raw[at..].contains("ExitCode.OK"))
+            {
+                out.push(Finding {
+                    gate: GATE_RUNNER_HIJACK,
+                    severity: Severity::Blocking,
+                    strength: Strength::Derived,
+                    path: file.path.clone(),
+                    line: *line_no,
+                    evidence: safe_evidence(raw),
+                    message: "pytest hook overrides `exitstatus` to 0, masking failures"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
+}
 
 /// Runs the stub and test-rigor checks over a diff with no post-change source.
 ///

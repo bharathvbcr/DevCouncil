@@ -140,10 +140,19 @@ jobs:
       # sqlite3 is not optional: the requirements suite plants a task row with
       # it, and testsupport.Unavailable *fails* by default rather than skipping,
       # which is the intended behaviour and would take the job red without this.
-      - name: Install sqlite3
+      - name: Install sqlite3 and Linux bubblewrap sandbox
+        shell: bash
         run: |
+          set -euo pipefail
           if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y sqlite3
+            sudo apt-get update
+            sudo apt-get install -y sqlite3 bubblewrap
+            if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && \
+               [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" != "0" ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            fi
+            bwrap --ro-bind / / --dev /dev --proc /proc --unshare-user --unshare-pid -- /bin/true
+            echo "REQUIRE_BWRAP_SANDBOX=1" >> "$GITHUB_ENV"
           else
             sqlite3 --version
           fi
@@ -249,6 +258,47 @@ jobs:
             echo "::error::TestDevmapGlobalFlagTablesMatchTheRealBinary did not run"; exit 1; }
           echo "$out" | grep -q -- '--- PASS: TestStateDirAgreesWithDevmapOnEveryRung' || {
             echo "::error::TestStateDirAgreesWithDevmapOnEveryRung did not run"; exit 1; }
+
+      - name: Install pinned Lean 4 kernel and lean4checker (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ELAN_TAR="/tmp/elan-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz" -o "$ELAN_TAR"
+          echo "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63  $ELAN_TAR" | sha256sum -c -
+          mkdir -p /tmp/elan-bin
+          tar -xzf "$ELAN_TAR" -C /tmp/elan-bin
+          /tmp/elan-bin/elan-init -y --default-toolchain leanprover/lean4:v4.16.0
+          export PATH="$HOME/.elan/bin:$PATH"
+          lean --version
+          LEAN4CHECKER_COMMIT="803320ef4a0948d44e56927b2d1c60c3e8c6e4e4"
+          git init /tmp/lean4checker
+          git -C /tmp/lean4checker remote add origin https://github.com/leanprover/lean4checker.git
+          git -C /tmp/lean4checker fetch --depth 1 origin "$LEAN4CHECKER_COMMIT"
+          git -C /tmp/lean4checker checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/lean4checker rev-parse HEAD)" = "$LEAN4CHECKER_COMMIT"
+          (cd /tmp/lean4checker && lake build)
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          echo "/tmp/lean4checker/.lake/build/bin" >> "$GITHUB_PATH"
+
+      - name: Live Lean 4 kernel and lean4checker TCB gates (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          spec_dir="$(mktemp -d)"
+          trap 'rm -rf "$spec_dir"' EXIT
+          cat > "$spec_dir/SoundSpec.lean" <<'EOF'
+          namespace SoundSpec
+          theorem refl_nat (n : Nat) : n = n := rfl
+          end SoundSpec
+          EOF
+          out="$(devmap --json --root "$spec_dir" lean-tcb --require-kernel)"
+          echo "$out"
+          grep -Eq '"verification_tier":[[:space:]]*"kernel_and_lean4checker"' <<<"$out"
+          grep -Eq '"sound":[[:space:]]*true' <<<"$out"
+          DC_VERIFY_LEAN_KERNEL=require cargo test --locked --manifest-path rust/Cargo.toml -p dc-verify --test lean_tcb
 
   # The Go host on Windows. Windows-only paths (quoted path handling in hook
   # cleanup, integrate writes, separators in reported paths) never ran in CI:

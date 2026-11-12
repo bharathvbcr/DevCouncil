@@ -29,6 +29,13 @@ var HardSafetyGapTypes = map[string]struct{}{
 	// warn must not report the run verified because the proof is absent.
 	"acceptance_criteria_unproven": {},
 	"llm_review_unproven":          {},
+	// Anti-reward-hacking hard safety gaps: test-runner hijacks, unverified
+	// Lean TCB axioms, unattested exit-0 test runs, and held-out oracle
+	// tampering must never be demoted to advisory under warn/advisory gate modes.
+	"runner_hijack":       {},
+	"lean_tcb":            {},
+	"unattested_test_run": {},
+	"oracle_tampering":    {},
 }
 
 // IsHardSafetyGap reports whether a gap type is in the hard-safety set.

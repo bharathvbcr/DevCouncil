@@ -631,3 +631,22 @@ func TestBlockingReadsTheSeverityTheGateAssigned(t *testing.T) {
 		t.Error("a finding with no severity must not be treated as blocking")
 	}
 }
+
+func TestLeanKernelModeExpandsDefaultClientTimeoutForLean4CheckerReplay(t *testing.T) {
+	t.Setenv("DC_VERIFY_LEAN_KERNEL", "")
+	t.Setenv("DC_LEAN_KERNEL_TIMEOUT_MS", "")
+	base := New("/bin/dcverify", t.TempDir())
+	if base.effectiveTimeout() != defaultTimeout {
+		t.Fatalf("effectiveTimeout() without lean kernel = %v, want %v", base.effectiveTimeout(), defaultTimeout)
+	}
+
+	t.Setenv("DC_VERIFY_LEAN_KERNEL", "require")
+	kern := &Client{Binary: "/bin/dcverify", Root: t.TempDir()}
+	if kern.effectiveTimeout() < 210*time.Second {
+		t.Fatalf("effectiveTimeout() under DC_VERIFY_LEAN_KERNEL=require = %v, want >= 210s so 180s lean4checker --fresh is not killed prematurely", kern.effectiveTimeout())
+	}
+	kernFromNew := New("/bin/dcverify", t.TempDir())
+	if kernFromNew.effectiveTimeout() < 210*time.Second {
+		t.Fatalf("New() effectiveTimeout() under DC_VERIFY_LEAN_KERNEL=require = %v, want >= 210s", kernFromNew.effectiveTimeout())
+	}
+}

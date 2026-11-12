@@ -452,7 +452,7 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		// True when the write is allowed here but verification will raise the
 		// path as an unplanned file: it is lent by a planned file's
 		// neighbourhood, or its scope refusal was demoted by the posture.
-		"would_block_verification": policy.WouldBlockVerification(d, task) && !(op == dc.OpCreate && verify.IsTestPath(path)),
+		"would_block_verification": policy.WouldBlockVerification(d, task) && !(op == dc.OpCreate && verify.IsAdvisoryNewTestPath(path)),
 		"decision":                 d,
 	}
 }

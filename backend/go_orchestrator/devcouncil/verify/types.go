@@ -160,7 +160,10 @@ type Input struct {
 	EnvPolicy EnvPolicy
 
 	// ChangedFiles and DiffContent come from git (or a test double).
+	// AddedFiles records newly added/untracked paths so DetectOrphanDiffGaps
+	// distinguishes advisory new unit tests from modified files or bootstrap hooks.
 	ChangedFiles []string
+	AddedFiles   map[string]struct{}
 	DiffContent  string
 	DiffEmpty    bool
 	WorkPresent  bool
@@ -214,6 +217,21 @@ type Input struct {
 	// means neither. It can only add advisory, non-blocking gaps.
 	Lappi *lappi.Asker
 
+	// Sandbox names the resolved command execution sandbox ("local" by default,
+	// or "seatbelt-ro" on darwin when requested and validated by ParseSandbox).
+	Sandbox string
+
+	// OracleSnapshot is an optional pre-captured held-out oracle commitment
+	// verified outside the agent sandbox after verification commands complete.
+	// When OracleSnapshot is nil and OraclePaths is non-empty, Run captures a
+	// snapshot before running verification commands and verifies it afterward.
+	OracleSnapshot *OracleSnapshot
+	OraclePaths    []string
+
+	// DevMapCone carries optional symbol-impact cone evidence evaluated at
+	// StrengthDerived (failing closed into DegradedReasons on incomplete walks).
+	DevMapCone *DevMapConeEvidence
+
 	// RunCommand executes one verification command. Nil means commands are
 	// skipped with reason "command runner unavailable".
 	RunCommand func(command string) CommandOutcome
@@ -225,6 +243,7 @@ type Input struct {
 // cannot forget part of it.
 func (in *Input) WithGitState(state GitState) {
 	in.ChangedFiles = state.Changed
+	in.AddedFiles = state.Added
 	in.DiffContent = state.Diff
 	in.DiffEmpty = state.Empty
 	in.WorkPresent = !state.Empty
@@ -245,7 +264,15 @@ type CommandOutcome struct {
 	// Skipped is set when the runner refused to start the command (missing
 	// tooling, not applicable). Never treat as pass.
 	Skipped bool
-	Reason  string
+	// SandboxUnavailable marks a Skipped outcome caused by an unavailable or
+	// kernel-blocked OS read-only verification sandbox (`ORACLE-SANDBOX-UNAVAILABLE`),
+	// which must emit a critical hard-safety `rigor_check_unavailable` gap.
+	SandboxUnavailable bool
+	Reason             string
+	// OutputCaptured marks an outcome collected from a real process pipe
+	// (runCommandWithPolicy), distinguishing an genuinely empty exit-0 test
+	// stream (e.g. os._exit(0)) from a bare unit-test stub CommandOutcome{ExitCode: 0}.
+	OutputCaptured bool
 }
 
 // strPtr helpers keep JSON nulls for unset optional fields.

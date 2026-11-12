@@ -9,11 +9,13 @@
 //! result: an empty finding list means "these gates ran and found nothing", and
 //! a caller cannot be allowed to read "could not run" as that.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use dc_verify::bounded::{MAX_CHECK_BYTES, decode_lossy, read_bounded};
 use dc_verify::rigor::{
-    Finding, Severity, Strength, detect_stubs_report, intersect_coverage, scan_secrets,
+    Finding, Severity, Strength, detect_lean_tcb_report_with_root, detect_runner_hijack_with,
+    detect_stubs_report, intersect_coverage, scan_secrets,
 };
 use dc_verify::{classify_scope, normalize_candidate, parse_unified};
 
@@ -275,6 +277,16 @@ fn check(
         }
     }
     findings.extend(stubs.findings);
+    findings.extend(detect_runner_hijack_with(&files, &|file| {
+        read_post_image(root, &file.path).ok()
+    }));
+    let lean_tcb = detect_lean_tcb_report_with_root(
+        &files,
+        &|file| read_post_image(root, &file.path).ok(),
+        root,
+    );
+    findings.extend(lean_tcb.findings);
+    let mut lean_checked_files = lean_tcb.checked_files;
     // A binary marker with no hunk carries none of the file's bytes. A text
     // hunk elsewhere in the same diff does not make that path scanned.
     let mut binary_degraded = Vec::new();
@@ -285,6 +297,7 @@ fn check(
         root,
         &mut findings,
         &mut binary_degraded,
+        &mut lean_checked_files,
     );
 
     // Coverage measurements, when the caller supplied them. A missing file is
@@ -313,7 +326,7 @@ fn check(
     let substance = dc_verify::substance::measure(&files);
 
     Ok(format!(
-        "{{\"ok\":true,\"files\":{},\"stub_ast_parsed_files\":{},\"in_scope\":{},\"orphans\":{},\
+        "{{\"ok\":true,\"files\":{},\"stub_ast_parsed_files\":{},\"runner_hijack_checked\":true,\"lean_tcb_checked\":{},\"in_scope\":{},\"orphans\":{},\
          \"untouched_planned\":{},\"findings\":{},\"coverage_unmeasured\":{},\"coverage_gaps\":{},\
          \"coverage_skipped_by_type\":{},\"substance\":{},\"stub_ast_degraded\":{}}}",
         // Changed paths, not diff entries: a rename is two, and scope
@@ -322,6 +335,7 @@ fn check(
         // The skipped- and assert-free-test checks run only on parsed files;
         // the host names them as applied only when this is above zero.
         stubs.parsed_files,
+        lean_checked_files > 0,
         string_array(&scope.in_scope),
         string_array(&scope.orphans),
         string_array(&scope.untouched_planned),
@@ -429,6 +443,7 @@ fn scan_binary_paths(
     root: Option<&std::path::Path>,
     findings: &mut Vec<Finding>,
     degraded: &mut Vec<String>,
+    lean_checked_files: &mut usize,
 ) {
     for section in binary_sections_without_hunks(diff) {
         // The diff parser makes one entry per `diff --git` line, in order, and
@@ -456,7 +471,7 @@ fn scan_binary_paths(
         }
         match read_binary_post_image(root, spelled) {
             Ok(text) => {
-                scan_binary_text(spelled, &text, findings, degraded);
+                scan_binary_text(root, spelled, &text, findings, degraded, lean_checked_files);
             }
             Err(reason) => degraded.push(binary_scan_skipped(spelled, &reason)),
         }
@@ -465,10 +480,12 @@ fn scan_binary_paths(
 
 /// Secret-scans, and for a source file stub-scans, the bytes of one binary-marked path.
 fn scan_binary_text(
+    root: Option<&Path>,
     path: &str,
     text: &str,
     findings: &mut Vec<Finding>,
     degraded: &mut Vec<String>,
+    lean_checked_files: &mut usize,
 ) {
     let mut line_no = 0u32;
     for line in text.split_inclusive('\n') {
@@ -490,7 +507,8 @@ fn scan_binary_text(
             });
         }
     }
-    if dc_verify::stub_ast::Lang::for_path(path).is_none() {
+    let is_lean = path.ends_with(".lean");
+    if dc_verify::stub_ast::Lang::for_path(path).is_none() && !is_lean {
         return;
     }
     if text.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES {
@@ -511,8 +529,19 @@ fn scan_binary_text(
             .collect(),
         removed_lines: Vec::new(),
     };
-    let report = detect_stubs_report(&[whole], &|_| None);
+    if is_lean {
+        let lean_rep =
+            detect_lean_tcb_report_with_root(std::slice::from_ref(&whole), &|_| None, root);
+        *lean_checked_files += lean_rep.checked_files;
+        findings.extend(lean_rep.findings);
+        return;
+    }
+    let report = detect_stubs_report(std::slice::from_ref(&whole), &|_| None);
     findings.extend(report.findings);
+    findings.extend(detect_runner_hijack_with(
+        std::slice::from_ref(&whole),
+        &|_| None,
+    ));
     degraded.extend(
         report
             .unparsed

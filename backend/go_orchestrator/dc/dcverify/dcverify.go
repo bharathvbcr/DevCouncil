@@ -39,7 +39,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -76,6 +78,15 @@ const (
 	// and an added test that is unconditionally skipped.
 	GateAssertFreeTest = "assert_free_test"
 	GateSkippedTest    = "skipped_test"
+	// GateRunnerHijack blocks test-runner hijacks (`conftest.py` `os._exit`,
+	// `TestMain` omitting `m.Run()` or calling `os.Exit(0)`, `exitstatus = 0`,
+	// stack-frame inspection for `pytest`/`unittest`, etc.).
+	GateRunnerHijack = "runner_hijack"
+	// GateLeanTCB blocks Lean 4 (`.lean`) Trusted Computing Base soundness holes
+	// (`sorry`, `sorryAx`, `admit`, `native_decide`, `Lean.ofReduceBool`,
+	// `Lean.trustCompiler`, `axiom`, `opaque`, `unsafe`, `@[extern]`,
+	// `@[implemented_by]`, `@[csimp]`, unclosed lexical constructs, or cap truncation).
+	GateLeanTCB = "lean_tcb"
 	// GateStubAllowed is not a check that runs. It is where a stub-family
 	// finding lands when an `allow-stub: <reason>` marker covers it: advisory,
 	// carrying the reason, so the report records the decision instead of
@@ -172,9 +183,35 @@ type Client struct {
 // New builds a client with defaults.
 func New(binary, root string) *Client {
 	return &Client{
-		Binary: binary, Root: root, Timeout: defaultTimeout,
+		Binary: binary, Root: root,
 		maxOutput: maxOutput, maxStderr: maxStderr,
 	}
+}
+
+func (c *Client) effectiveTimeout() time.Duration {
+	if c != nil && c.Timeout > 0 {
+		return c.Timeout
+	}
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("DC_VERIFY_LEAN_KERNEL")))
+	if mode == "auto" || mode == "require" || mode == "1" || mode == "true" {
+		step := 180 * time.Second
+		if raw := strings.TrimSpace(os.Getenv("DC_LEAN_KERNEL_TIMEOUT_MS")); raw != "" {
+			if ms, err := strconv.ParseUint(raw, 10, 64); err == nil {
+				if ms < 50 {
+					ms = 50
+				} else if ms > 600_000 {
+					ms = 600_000
+				}
+				step = time.Duration(ms) * time.Millisecond
+			}
+		}
+		expanded := step + 60*time.Second
+		if expanded < 240*time.Second {
+			expanded = 240 * time.Second
+		}
+		return expanded
+	}
+	return defaultTimeout
 }
 
 // Request is one rigor check.
@@ -320,6 +357,13 @@ type Result struct {
 	// GatesRun names the test-rigor gates only when it is above zero. An older verifier sends
 	// no count, which reads as zero: it parsed nothing.
 	StubASTParsedFiles int `json:"stub_ast_parsed_files"`
+	// RunnerHijackChecked reports whether the verifier ran the runner_hijack
+	// gate on this invocation. Older verifiers or synthetic test replies omit
+	// the key, leaving it false so GatesRun never claims a gate that did not run.
+	RunnerHijackChecked bool `json:"runner_hijack_checked"`
+	// LeanTCBChecked reports whether the verifier audited at least one `.lean`
+	// file in this diff with the Lean 4 TCB soundness gate.
+	LeanTCBChecked bool `json:"lean_tcb_checked"`
 
 	// StubASTDegraded lists changed files, as "path: reason", that the stub
 	// checks could not analyse from the syntax tree (a syntax error, a source
@@ -359,6 +403,8 @@ type wireResult struct {
 	CoverageGaps          []CoverageGap `json:"coverage_gaps"`
 	CoverageSkippedByType []string      `json:"coverage_skipped_by_type"`
 	StubASTParsedFiles    int           `json:"stub_ast_parsed_files"`
+	RunnerHijackChecked   bool          `json:"runner_hijack_checked"`
+	LeanTCBChecked        bool          `json:"lean_tcb_checked"`
 	StubASTDegraded       []string      `json:"stub_ast_degraded"`
 	// A pointer so its ABSENCE is detectable. A verifier built before the
 	// substance gate existed emits no `substance` key, which decodes into a
@@ -445,6 +491,12 @@ func (r *Result) GatesRun() []string {
 	// lists the gates it applied does not leave out the one measurement that
 	// ran on every pass.
 	gates := []string{GateSecretScan, GateStubDetection, GateSubstance}
+	if r.RunnerHijackChecked {
+		gates = append(gates, GateRunnerHijack)
+	}
+	if r.LeanTCBChecked {
+		gates = append(gates, GateLeanTCB)
+	}
 	// The test-rigor checks run only on files the verifier parsed in a
 	// language they exist for (Rust, Go, Python, TypeScript with a source that
 	// matched the diff; Java and C# are parsed for placeholders only). A diff with
@@ -502,6 +554,8 @@ func (c *Client) Check(ctx context.Context, req Request) (*Result, error) {
 		UntouchedPlanned:      wire.UntouchedPlanned,
 		Findings:              wire.Findings,
 		StubASTParsedFiles:    wire.StubASTParsedFiles,
+		RunnerHijackChecked:   wire.RunnerHijackChecked,
+		LeanTCBChecked:        wire.LeanTCBChecked,
 		StubASTDegraded:       wire.StubASTDegraded,
 		coverageGaps:          wire.CoverageGaps,
 		coverageUnmeasured:    wire.CoverageUnmeasured,
@@ -549,10 +603,7 @@ func encodePlanned(planned []string) (string, error) {
 // and — most of all — the refusal to read a reply as an answer unless it says
 // ok cannot be present at one call site and missing at the other.
 func (c *Client) run(ctx context.Context, args []string, stdin string, out any) error {
-	timeout := c.Timeout
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
+	timeout := c.effectiveTimeout()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -634,7 +685,7 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 func validate(out *Result) error {
 	for _, finding := range out.Findings {
 		switch finding.Gate {
-		case GateStubDetection, GateSecretScan, GateAssertFreeTest, GateSkippedTest, GateStubAllowed:
+		case GateStubDetection, GateSecretScan, GateAssertFreeTest, GateSkippedTest, GateRunnerHijack, GateLeanTCB, GateStubAllowed:
 		default:
 			return fmt.Errorf(
 				"verifier reported a finding from gate %q, which this client cannot map to a gap; "+

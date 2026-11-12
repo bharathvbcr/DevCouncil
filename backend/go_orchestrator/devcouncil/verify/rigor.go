@@ -407,6 +407,16 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 			gapType = "skipped_test"
 			severity = "medium"
 			fix = "Remove the unconditional skip, or make the skip conditional on what the test needs."
+		case dcverify.GateRunnerHijack:
+			gapType = "runner_hijack"
+			severity = "critical"
+			fix = "Remove the test-runner bypass (os._exit, os.Exit(0), TestMain omitting m.Run(), " +
+				"exitstatus = 0, or test-frame stack inspection) so the real test harness executes every assertion."
+		case dcverify.GateLeanTCB:
+			gapType = "lean_tcb"
+			severity = "critical"
+			fix = "Discharge the Lean 4 proof obligation inside the kernel without sorry, admit, " +
+				"native_decide, axiom, opaque, unsafe, @[extern], @[implemented_by], or @[csimp]."
 		default:
 			// Unreachable: dc/dcverify refuses a reply carrying a gate it
 			// cannot map, so this cannot be a finding silently dropped. The

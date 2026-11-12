@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -50,10 +51,22 @@ func AllowedNextToolsForVerify() []string {
 	}
 }
 
-// SandboxLocal is the only isolation verify provides: none. Verification
-// commands run on the host, through /bin/sh -c in the project root
-// (DefaultRunCommand).
+// SandboxLocal runs verification commands directly on the host through /bin/sh -c.
 const SandboxLocal = "local"
+
+// SandboxSeatbeltRO runs verification commands on darwin inside /usr/bin/sandbox-exec
+// denying file-write* inside the repository root while allowing scratch TMPDIR writes.
+const SandboxSeatbeltRO = "seatbelt-ro"
+
+// SandboxBwrapRO runs verification commands on linux inside bubblewrap (`bwrap`)
+// mounting the root filesystem and repository read-only while binding an isolated
+// writable scratch TMPDIR.
+const SandboxBwrapRO = "bwrap-ro"
+
+// SandboxReadOnly selects the host OS's read-only verification sandbox
+// (SandboxSeatbeltRO on darwin, SandboxBwrapRO on linux) and fails closed if
+// neither OS-enforced read-only backend is operational on this host.
+const SandboxReadOnly = "readonly"
 
 // ParseSandbox resolves a requested sandbox to the one verify will actually
 // run in, or refuses it.
@@ -65,13 +78,58 @@ const SandboxLocal = "local"
 // asked for a container is relying on it, and running their commands on the
 // host anyway is exactly the outcome they asked to avoid.
 func ParseSandbox(requested string) (string, error) {
-	switch strings.TrimSpace(requested) {
+	return ParseSandboxWithOSAndBin(requested, runtime.GOOS, "/usr/bin/sandbox-exec", "")
+}
+
+// ParseSandboxWithOSAndBin is the deterministic, cross-platform testable core of
+// ParseSandbox. When bwrapBin is empty on linux, "bwrap" is resolved on PATH and
+// verified with a bounded live namespace probe so environments where user/mount
+// namespaces are disabled fail closed upfront rather than silently downgrading.
+func ParseSandboxWithOSAndBin(requested, goos, seatbeltBin, bwrapBin string) (string, error) {
+	trimmed := strings.TrimSpace(requested)
+	switch trimmed {
 	case "", SandboxLocal:
 		return SandboxLocal, nil
+	case SandboxSeatbeltRO:
+		if goos != "darwin" {
+			return "", fmt.Errorf("sandbox %q requires darwin /usr/bin/sandbox-exec", requested)
+		}
+		if seatbeltBin == "" {
+			seatbeltBin = "/usr/bin/sandbox-exec"
+		}
+		if _, err := os.Stat(seatbeltBin); err != nil {
+			return "", fmt.Errorf("sandbox %q is unavailable on this host: %w", requested, err)
+		}
+		return SandboxSeatbeltRO, nil
+	case SandboxBwrapRO:
+		if goos != "linux" {
+			return "", fmt.Errorf("sandbox %q requires linux bwrap", requested)
+		}
+		resolved := strings.TrimSpace(bwrapBin)
+		if resolved == "" {
+			found, err := exec.LookPath("bwrap")
+			if err != nil {
+				return "", fmt.Errorf("sandbox %q is unavailable on this host (bwrap missing): %w", requested, err)
+			}
+			resolved = found
+		}
+		if err := ProbeLinuxBwrapWithBin(context.Background(), resolved); err != nil {
+			return "", fmt.Errorf("sandbox %q is unavailable or blocked on this host: %w", requested, err)
+		}
+		return SandboxBwrapRO, nil
+	case SandboxReadOnly:
+		switch goos {
+		case "darwin":
+			return ParseSandboxWithOSAndBin(SandboxSeatbeltRO, goos, seatbeltBin, bwrapBin)
+		case "linux":
+			return ParseSandboxWithOSAndBin(SandboxBwrapRO, goos, seatbeltBin, bwrapBin)
+		default:
+			return "", fmt.Errorf("sandbox %q requires darwin sandbox-exec or linux bwrap (got %s)", requested, goos)
+		}
 	default:
 		return "", fmt.Errorf(
 			"sandbox %q is not implemented: verification commands run on the host "+
-				"(/bin/sh -c in the project root), so the only sandbox is %q",
+				"(/bin/sh -c in the project root), so the only default sandbox is %q",
 			requested, SandboxLocal)
 	}
 }
@@ -86,10 +144,21 @@ func ParseSandbox(requested string) (string, error) {
 // ctx bounds the subprocess work — the rigor gates are a dcverify child — so a
 // cancelled verify does not leave one running.
 func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
-	// What ran, not what was asked for. Input has no sandbox field: the
-	// request is validated by ParseSandbox at the entry points, and the only
-	// value that survives it is the one this function executes in.
+	// What ran, not what was asked for. Entry points validate Sandbox with
+	// ParseSandbox before calling Run.
 	meta.Sandbox = SandboxLocal
+	var sandboxInitErr error
+	if in.Sandbox == SandboxSeatbeltRO || in.Sandbox == SandboxBwrapRO || in.Sandbox == SandboxReadOnly {
+		if resolved, err := ParseSandbox(in.Sandbox); err == nil {
+			meta.Sandbox = resolved
+		} else {
+			meta.Sandbox = in.Sandbox
+			sandboxInitErr = err
+		}
+		if in.RunCommand == nil && in.Root != "" {
+			in.RunCommand = RunSandboxedCommandWithEnv(ctx, in.Root, in.EnvPolicy)
+		}
+	}
 	meta.GateMode = in.GateMode
 	if meta.GateMode == "" {
 		meta.GateMode = "off"
@@ -123,10 +192,31 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 		gaps = append(gaps, *g)
 	}
 	gaps = append(gaps, DetectPlannedFileGaps(taskID, planned, in.ChangedFiles)...)
-	gaps = append(gaps, DetectOrphanDiffGaps(taskID, planned, in.ChangedFiles, nil)...)
+	gaps = append(gaps, DetectOrphanDiffGaps(taskID, planned, in.ChangedFiles, in.AddedFiles)...)
 	gaps = append(gaps, DetectDependencyRiskGaps(taskID, planned, in.ChangedFiles)...)
 	if in.GitErr != nil {
 		gaps = append(gaps, gitStateGap(taskID, in.GitErr))
+	}
+
+	var oracleSnap *OracleSnapshot
+	if in.OracleSnapshot != nil {
+		oracleSnap = in.OracleSnapshot
+	} else if len(in.OraclePaths) > 0 && in.Root != "" {
+		snap, snapErr := CaptureOracleSnapshot(in.Root, in.OraclePaths)
+		if snapErr != nil {
+			gaps = append(gaps, Gap{
+				ID:             StableGapID(taskID, "ORACLE-CAPTURE"),
+				Severity:       "critical",
+				GapType:        "oracle_tampering",
+				TaskID:         taskID,
+				Description:    "Held-out oracle snapshot could not be captured prior to running verification commands: " + snapErr.Error(),
+				Evidence:       []string{snapErr.Error()},
+				RecommendedFix: "Ensure all declared held-out oracle files exist as regular repo-contained files before running verification.",
+				Blocking:       true,
+			})
+		} else {
+			oracleSnap = &snap
+		}
 	}
 
 	commands := in.Commands
@@ -137,6 +227,23 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 		}
 	}
 	commandGaps, commandRecords := runVerificationCommands(taskID, commands, in.RunCommand)
+	if sandboxInitErr != nil && len(commands) == 0 {
+		commandGaps = append(commandGaps, Gap{
+			ID:             StableGapID(taskID, "ORACLE-SANDBOX-UNAVAILABLE"),
+			Severity:       "critical",
+			GapType:        "rigor_check_unavailable",
+			TaskID:         taskID,
+			Description:    "Read-only verification sandbox unavailable (ORACLE-SANDBOX-UNAVAILABLE): " + sandboxInitErr.Error() + ".",
+			Evidence:       []string{"ORACLE-SANDBOX-UNAVAILABLE", sandboxInitErr.Error()},
+			RecommendedFix: "Install and enable the OS read-only verification sandbox (`bwrap` with user/mount namespaces on Linux, or `/usr/bin/sandbox-exec` on macOS) before re-running verification.",
+			Blocking:       true,
+		})
+	}
+	if oracleSnap != nil {
+		if oracleGaps := VerifyOracleSnapshot(taskID, in.Root, *oracleSnap); len(oracleGaps) > 0 {
+			commandGaps = append(commandGaps, oracleGaps...)
+		}
+	}
 	if in.Reviews.Recheck != nil && in.Reviews.SubjectErr == nil && in.Reviews.Subject != "" {
 		after, err := in.Reviews.Recheck()
 		switch {
@@ -149,6 +256,12 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	}
 	gaps = append(gaps, commandGaps...)
 	meta.Commands = commandRecords
+
+	if in.DevMapCone != nil {
+		cone := VerifyDevMapCone(taskID, *in.DevMapCone)
+		gaps = append(gaps, cone.Gaps...)
+		meta.DegradedReasons = append(meta.DegradedReasons, cone.DegradedReasons...)
+	}
 
 	// Each claimed acceptance criterion, dispatched on its verification
 	// method. Commands count as passing only if at least one ran and none
@@ -433,8 +546,10 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 type GitState struct {
 	// Changed, Diff and Empty are CollectGitState's three results.
 	Changed []string
-	Diff    string
-	Empty   bool
+	// Added holds newly added or untracked non-tool-state paths in Changed.
+	Added map[string]struct{}
+	Diff  string
+	Empty bool
 	// MovedGitlinks is every submodule gitlink the change adds, deletes, moves
 	// or retypes, tool-state paths included. The diff shows a move as one
 	// `Subproject commit` line, so nothing in Diff says what the submodule's
@@ -524,12 +639,16 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	// which carries none of the new bytes, so the diff is asked to leave it out
 	// and the file is read from disk like any untracked one.
 	tracked := map[string]struct{}{}
+	addedSet := map[string]struct{}{}
 	var recreated []string
 	for _, entry := range entries {
 		if policy.IsToolState(entry.path) {
 			continue
 		}
 		add(entry.path)
+		if entry.added {
+			addedSet[entry.path] = struct{}{}
+		}
 		if entry.deleted {
 			info, serr := rootFS.Lstat(entry.path)
 			switch {
@@ -559,6 +678,9 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 		}
 		if name != "" {
 			untrackedNames = append(untrackedNames, name)
+			if !policy.IsToolState(name) {
+				addedSet[name] = struct{}{}
+			}
 		}
 		add(name)
 	}
@@ -597,7 +719,7 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	}
 	state.ToolStateDiff, state.ToolStateIndexDiff = toolState.Diff, toolState.IndexDiff
 	state.ToolStateBinaryPaths, state.ToolStateUnscanned = toolState.BinaryPaths, toolState.Unscanned
-	state.Changed, state.Diff = changed, diff
+	state.Changed, state.Added, state.Diff = changed, addedSet, diff
 	state.Empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
 	return state, nil
 }
@@ -605,6 +727,7 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 // nameStatus is one path of `git diff --name-status -z`.
 type nameStatus struct {
 	path    string
+	added   bool
 	deleted bool
 }
 
@@ -636,7 +759,7 @@ func parseNameStatus(listing []byte) ([]nameStatus, error) {
 		if path == "" {
 			return nil, fmt.Errorf("git diff --name-status named a %q change with no path", status)
 		}
-		out = append(out, nameStatus{path: path, deleted: status[0] == 'D'})
+		out = append(out, nameStatus{path: path, added: status[0] == 'A', deleted: status[0] == 'D'})
 	}
 	return out, nil
 }
@@ -846,7 +969,8 @@ func shortHash(s string) string {
 // sandbox is refused unless ParseSandbox accepts it, before anything runs or
 // is persisted.
 func VerifyTask(ctx context.Context, root string, client *store.Client, taskID string, gate GateState, sandbox, coveragePath string) (MCPResult, []Gap, error) {
-	if _, err := ParseSandbox(sandbox); err != nil {
+	resolvedSandbox, err := ParseSandbox(sandbox)
+	if err != nil {
 		return MCPResult{}, nil, err
 	}
 	if client == nil {
@@ -887,12 +1011,29 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		}
 	}
 	envPolicy := LoadEnvPolicy(root)
+	runCmd := RunCommandWithEnv(ctx, root, envPolicy)
+	if resolvedSandbox == SandboxSeatbeltRO || resolvedSandbox == SandboxBwrapRO {
+		runCmd = RunSandboxedCommandWithEnv(ctx, root, envPolicy)
+	}
+	// Pass every declared ChangeReadOnly file unconditionally into OraclePaths
+	// without pre-filtering by existence or regular-file mode. Pre-filtering
+	// failed open if an agent deleted a ChangeReadOnly oracle file or swapped it
+	// for a symlink prior to verification; unconditional forwarding ensures
+	// CaptureOracleSnapshot fails closed with a blocking ORACLE-CAPTURE gap.
+	var readOnlyOracles []string
+	for _, pf := range task.PlannedFiles {
+		if pf.AllowedChange == dc.ChangeReadOnly {
+			readOnlyOracles = append(readOnlyOracles, pf.Path)
+		}
+	}
 	in := Input{
 		Requirements:    linked,
 		RequirementsErr: linkedErr,
 		Reviews:         reviews,
 		Root:            root,
 		Task:            task,
+		Sandbox:         resolvedSandbox,
+		OraclePaths:     readOnlyOracles,
 		GateMode:        gate.Mode,
 		GateOrigin:      gate.Origin,
 		GateConfigPath:  gate.ConfigPath,
@@ -901,7 +1042,7 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		Difficulty:      task.Difficulty,
 		GitErr:          gitErr,
 		AllowNoRigor:    allowNoRigor(),
-		RunCommand:      RunCommandWithEnv(ctx, root, envPolicy),
+		RunCommand:      runCmd,
 		Rigor:           RigorClient(root),
 		CoveragePath:    coveragePath,
 		Lappi:           LappiAsker(),

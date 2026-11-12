@@ -35,6 +35,7 @@ use crate::rigor::{STUB_MARKERS, Severity, Strength, thrown_placeholder};
 /// The gate names this module reports under, beside `stub_detection`.
 pub const GATE_ASSERT_FREE_TEST: &str = "assert_free_test";
 pub const GATE_SKIPPED_TEST: &str = "skipped_test";
+pub const GATE_RUNNER_HIJACK: &str = "runner_hijack";
 
 /// A source larger than this is not parsed; the substring gate covers it.
 pub const MAX_SOURCE_BYTES: usize = 2 << 20;
@@ -1953,6 +1954,678 @@ fn asserting_name(name: &str) -> bool {
         .iter()
         .any(|p| lowered.contains(p))
         || matches!(name, "unwrap" | "unwrap_err" | "fatal")
+}
+
+/// Parses `source` and reports test-runner hijacks introduced on `added` lines.
+///
+/// Separate from [`analyze`] on purpose:
+/// - `allow-stub` markers must never suppress a runner hijack; and
+/// - stub/placeholder confusion-matrix gates measure [`analyze`] alone.
+///
+/// Catches test-runner hijack and early-exit reward-hacking vectors:
+/// - Go `TestMain(m *testing.M)` omitting `m.Run()` or unconditionally calling
+///   `os.Exit(0)` / `syscall.Exit(0)` at top level (while permitting guarded
+///   re-executed subprocess helpers such as `if strings.HasPrefix(os.Args[1], ...)`),
+///   plus unconditional top-level `os.Exit(0)` in `Test*`/`Benchmark*`/`Fuzz*`
+///   and `*_test.go` `init()` functions;
+/// - Python `os._exit(...)` in test/bootstrap files (`conftest.py`,
+///   `sitecustomize.py`, `usercustomize.py`, or `dc_glob::is_test_path`),
+///   `pytest_sessionfinish` / `pytest_cmdline_main` overriding `exitstatus = 0`,
+///   and production functions inspecting call stacks (`sys._getframe`,
+///   `inspect.stack`, `inspect.currentframe`) for `pytest` / `unittest`;
+/// - Rust `#[test]` functions or `.init_array` / `__mod_init_func` constructors
+///   calling `process::exit(0)` unconditionally;
+/// - TypeScript/TSX test files calling `process.exit(0)` at module or test-body
+///   top level.
+pub fn analyze_runner_hijack(
+    lang: Lang,
+    path: &str,
+    source: &str,
+    added: &HashSet<u32>,
+) -> Result<Vec<AstFinding>, Unparsed> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(Unparsed::TooLarge);
+    }
+    // Sound necessary-token prefilter: every AST rule below matches an explicit
+    // ASCII identifier in `source` (`TestMain`/`Exit` in Go, `_exit`/`exitstatus`/
+    // `pytest_cmdline_main`/`_getframe`/`inspect.` in Python, `exit` in Rust, and
+    // `exit` inside a test path in TypeScript). Skipping a duplicate tree-sitter
+    // parse when none of those tokens exist keeps multi-megabyte torture files
+    // within `PARSE_BUDGET` without dropping any AST match.
+    let may_contain_hijack = match lang {
+        Lang::Go => source.contains("TestMain") || source.contains("Exit"),
+        Lang::Python => [
+            "_exit",
+            "exitstatus",
+            "pytest_cmdline_main",
+            "_getframe",
+            "inspect.",
+        ]
+        .iter()
+        .any(|tok| source.contains(tok)),
+        Lang::Rust => {
+            source.contains("exit")
+                || ((path == "build.rs" || path.ends_with("/build.rs"))
+                    && source.contains("cargo:"))
+        }
+        Lang::TypeScript | Lang::Tsx => dc_glob::is_test_path(path) && source.contains("exit"),
+        Lang::Java | Lang::CSharp => false,
+    };
+    if !may_contain_hijack {
+        return Ok(Vec::new());
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&lang.grammar())
+        .map_err(|_| Unparsed::NoTree)?;
+    let deadline = std::time::Instant::now() + PARSE_BUDGET;
+    let mut over_budget = false;
+    let tree = {
+        let mut cancel = |_: &tree_sitter::ParseState| -> bool {
+            if std::time::Instant::now() >= deadline {
+                over_budget = true;
+                return true;
+            }
+            false
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut cancel);
+        let bytes = source.as_bytes();
+        parser.parse_with_options(
+            &mut |offset: usize, _| {
+                if offset < bytes.len() {
+                    &bytes[offset..]
+                } else {
+                    &[][..]
+                }
+            },
+            None,
+            Some(options),
+        )
+    };
+    if over_budget {
+        return Err(Unparsed::OverBudget);
+    }
+    let tree = tree.ok_or(Unparsed::NoTree)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return Err(Unparsed::SyntaxError);
+    }
+    let mut out = Vec::new();
+    let src = source.as_bytes();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match lang {
+            Lang::Go => visit_go_hijack(node, src, added, &mut out),
+            Lang::Python => visit_python_hijack(node, root, path, src, added, &mut out),
+            Lang::Rust => visit_rust_hijack(node, path, src, added, &mut out),
+            Lang::TypeScript | Lang::Tsx => visit_ts_hijack(node, path, src, added, &mut out),
+            Lang::Java | Lang::CSharp => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Ok(out)
+}
+
+fn push_hijack(out: &mut Vec<AstFinding>, line: u32, message: impl Into<String>) {
+    out.push(AstFinding {
+        gate: GATE_RUNNER_HIJACK,
+        severity: Severity::Blocking,
+        strength: Strength::Proven,
+        line,
+        scope_line: None,
+        message: message.into(),
+    });
+}
+
+fn node_text<'a>(node: Node<'_>, src: &'a [u8]) -> &'a str {
+    node.utf8_text(src).unwrap_or("")
+}
+
+fn any_added_in(node: Node<'_>, added: &HashSet<u32>) -> bool {
+    let start = line_of(node);
+    let end = u32::try_from(node.end_position().row + 1).unwrap_or(start);
+    (start..=end).any(|l| added.contains(&l))
+}
+
+fn go_param_for_type<'a>(func: Node<'_>, src: &'a [u8], wanted_ty: &str) -> Option<&'a str> {
+    let params = func.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    for p in params.named_children(&mut cursor) {
+        let ty = p
+            .child_by_field_name("type")
+            .map(|t| node_text(t, src))
+            .unwrap_or("");
+        if ty.replace(' ', "") == wanted_ty {
+            return p.child_by_field_name("name").map(|n| node_text(n, src));
+        }
+    }
+    None
+}
+
+fn go_is_exit_zero_call(node: Node<'_>, src: &[u8]) -> bool {
+    if node.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let is_exit = if callee.kind() == "selector_expression" {
+        let op = callee
+            .child_by_field_name("operand")
+            .map(|n| node_text(n, src))
+            .unwrap_or("");
+        let field = callee
+            .child_by_field_name("field")
+            .map(|n| node_text(n, src))
+            .unwrap_or("");
+        matches!((op, field), ("os" | "syscall", "Exit"))
+    } else {
+        false
+    };
+    if !is_exit {
+        return false;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let mut named = args.named_children(&mut cursor);
+    let Some(first) = named.next() else {
+        return false;
+    };
+    named.next().is_none() && node_text(first, src).trim() == "0"
+}
+
+fn go_top_level_exit_zero<'t>(body: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
+    let mut cursor = body.walk();
+    for stmt in body.named_children(&mut cursor) {
+        if go_is_exit_zero_call(stmt, src) {
+            return Some(stmt);
+        }
+        if stmt.kind() == "expression_statement"
+            && let Some(inner) = stmt.named_child(0)
+            && go_is_exit_zero_call(inner, src)
+        {
+            return Some(inner);
+        }
+        if stmt.kind() == "block"
+            && let Some(hit) = go_top_level_exit_zero(stmt, src)
+        {
+            return Some(hit);
+        }
+        if stmt.kind() == "if_statement" {
+            let cond = stmt
+                .child_by_field_name("condition")
+                .map(|c| node_text(c, src).trim().trim_matches(['(', ')']).trim())
+                .unwrap_or("");
+            if cond == "true"
+                && let Some(conseq) = stmt.child_by_field_name("consequence")
+                && let Some(hit) = go_top_level_exit_zero(conseq, src)
+            {
+                return Some(hit);
+            }
+        }
+        if stmt.kind() == "defer_statement"
+            && descendants(stmt)
+                .into_iter()
+                .any(|d| go_is_exit_zero_call(d, src))
+        {
+            return Some(stmt);
+        }
+    }
+    None
+}
+
+fn visit_go_hijack(node: Node<'_>, src: &[u8], added: &HashSet<u32>, out: &mut Vec<AstFinding>) {
+    if node.kind() != "function_declaration" {
+        return;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(n, src))
+        .unwrap_or("");
+
+    if name == "TestMain"
+        && let Some(m_name) = go_param_for_type(node, src, "*testing.M")
+    {
+        if let Some(exit_call) = go_top_level_exit_zero(body, src)
+            && (added.contains(&line_of(exit_call)) || added.contains(&line_of(node)))
+        {
+            push_hijack(
+                out,
+                line_of(exit_call),
+                "TestMain calls os.Exit(0) unconditionally, discarding m.Run() status",
+            );
+            return;
+        }
+        let calls_m_run = descendants(body).into_iter().any(|d| {
+            if d.kind() != "call_expression" {
+                return false;
+            }
+            let Some(f) = d.child_by_field_name("function") else {
+                return false;
+            };
+            if f.kind() != "selector_expression" {
+                return false;
+            }
+            let op = f
+                .child_by_field_name("operand")
+                .map(|n| node_text(n, src))
+                .unwrap_or("");
+            let field = f
+                .child_by_field_name("field")
+                .map(|n| node_text(n, src))
+                .unwrap_or("");
+            op == m_name && field == "Run"
+        });
+        if !calls_m_run && any_added_in(node, added) {
+            push_hijack(
+                out,
+                line_of(node),
+                format!(
+                    "TestMain omits `{m_name}.Run()`; go test marks the binary ok without running any tests"
+                ),
+            );
+        }
+        return;
+    }
+
+    // `func init()` in ANY `.go` file (including non-test package files) runs inside
+    // the `go test` binary before `testing.M`; calling `os.Exit(0)` there causes
+    // `go test` to report `ok` without executing a single test!
+    let is_go_test_or_init_fn = (name.starts_with("Test")
+        && go_param_for_type(node, src, "*testing.T").is_some())
+        || (name.starts_with("Benchmark") && go_param_for_type(node, src, "*testing.B").is_some())
+        || (name.starts_with("Fuzz") && go_param_for_type(node, src, "*testing.F").is_some())
+        || (name == "init"
+            && node
+                .child_by_field_name("parameters")
+                .is_some_and(|p| p.named_child_count() == 0));
+    if is_go_test_or_init_fn
+        && let Some(exit_call) = go_top_level_exit_zero(body, src)
+        && (added.contains(&line_of(exit_call)) || added.contains(&line_of(node)))
+    {
+        push_hijack(
+            out,
+            line_of(exit_call),
+            format!(
+                "`{name}` calls os.Exit(0) unconditionally, terminating `go test` with exit 0 before tests run"
+            ),
+        );
+    }
+}
+
+fn is_python_bootstrap_or_test(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        base,
+        "conftest.py" | "sitecustomize.py" | "usercustomize.py"
+    ) || dc_glob::is_test_path(path)
+}
+
+fn python_is_exit_zero_call(node: Node<'_>, src: &[u8]) -> bool {
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let mut named = args.named_children(&mut cursor);
+    let Some(first) = named.next() else {
+        return false;
+    };
+    if named.next().is_some() {
+        return false;
+    }
+    let arg_text = if first.kind() == "keyword_argument" {
+        first
+            .child_by_field_name("value")
+            .map(|v| node_text(v, src).trim())
+            .unwrap_or("")
+    } else {
+        node_text(first, src).trim()
+    };
+    matches!(arg_text, "0" | "os.EX_OK" | "EX_OK")
+}
+
+fn python_is_positive_child_cond(cond: Node<'_>, src: &[u8]) -> bool {
+    if cond.kind() != "comparison_operator" {
+        return false;
+    }
+    let raw = node_text(cond, src);
+    // Reject any negated, inequality, None-check, or disjunctive condition such as
+    // `os.getenv("NOPE") is None` or `os.getenv("X") != "1"`.
+    if raw.contains("!=") || raw.contains("None") || raw.contains(" not ") || raw.contains(" is ") {
+        return false;
+    }
+    let Some((lhs, rhs)) = raw.split_once("==") else {
+        return false;
+    };
+    if rhs.contains("==") {
+        return false;
+    }
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
+    let is_fork_zero = ((lhs.contains("fork") || lhs == "pid" || lhs.ends_with("_pid"))
+        && rhs == "0")
+        || ((rhs.contains("fork") || rhs == "pid" || rhs.ends_with("_pid")) && lhs == "0");
+    if is_fork_zero {
+        return true;
+    }
+    let is_nonempty_str = |s: &str| -> bool {
+        (s.starts_with('"') && s.ends_with('"') && s.len() >= 3)
+            || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 3)
+    };
+    let is_env_lookup = |s: &str| -> bool { s.contains("getenv(") || s.contains("environ.get(") };
+    (is_env_lookup(lhs) && is_nonempty_str(rhs)) || (is_env_lookup(rhs) && is_nonempty_str(lhs))
+}
+
+fn inside_python_child_fork_guard(node: Node<'_>, src: &[u8]) -> bool {
+    let mut cur = node.parent();
+    let mut prev = node;
+    while let Some(p) = cur {
+        if p.kind() == "if_statement"
+            && let Some(conseq) = p.child_by_field_name("consequence")
+            && conseq.id() == prev.id()
+            && let Some(cond) = p.child_by_field_name("condition")
+            && python_is_positive_child_cond(cond, src)
+        {
+            return true;
+        }
+        prev = p;
+        cur = p.parent();
+    }
+    false
+}
+
+fn visit_python_hijack(
+    node: Node<'_>,
+    root: Node<'_>,
+    path: &str,
+    src: &[u8],
+    added: &HashSet<u32>,
+    out: &mut Vec<AstFinding>,
+) {
+    match node.kind() {
+        "call" => {
+            if !added.contains(&line_of(node)) {
+                return;
+            }
+            let callee = node
+                .child_by_field_name("function")
+                .map(|f| node_text(f, src).trim())
+                .unwrap_or("");
+            if matches!(callee, "os._exit" | "_exit" | "posix._exit")
+                && !inside_python_child_fork_guard(node, src)
+            {
+                if is_python_bootstrap_or_test(path) {
+                    push_hijack(
+                        out,
+                        line_of(node),
+                        format!(
+                            "`{callee}` inside test/bootstrap module bypasses test teardown and exits immediately"
+                        ),
+                    );
+                } else if python_is_exit_zero_call(node, src) {
+                    push_hijack(
+                        out,
+                        line_of(node),
+                        format!(
+                            "production module calls `{callee}(0)`, terminating any importing test runner with exit code 0"
+                        ),
+                    );
+                }
+            } else if matches!(
+                callee,
+                "sys._getframe" | "_getframe" | "inspect.stack" | "inspect.currentframe"
+            ) && !is_python_bootstrap_or_test(path)
+            {
+                let file_mentions_runner = descendants(root).into_iter().any(|d| {
+                    d.kind() == "string" && {
+                        let s = node_text(d, src).to_ascii_lowercase();
+                        s.contains("pytest") || s.contains("unittest")
+                    }
+                });
+                if file_mentions_runner {
+                    push_hijack(
+                        out,
+                        line_of(node),
+                        format!(
+                            "production code calls `{callee}` alongside pytest/unittest frame strings"
+                        ),
+                    );
+                }
+            }
+        }
+        "function_definition" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, src))
+                .unwrap_or("");
+            let Some(body) = node.child_by_field_name("body") else {
+                return;
+            };
+            if matches!(
+                name,
+                "pytest_sessionfinish" | "pytest_cmdline_main" | "pytest_unconfigure"
+            ) {
+                for d in descendants(body) {
+                    if !added.contains(&line_of(d)) && !added.contains(&line_of(node)) {
+                        continue;
+                    }
+                    if d.kind() == "assignment" {
+                        let left = d
+                            .child_by_field_name("left")
+                            .map(|l| node_text(l, src))
+                            .unwrap_or("");
+                        let right = d
+                            .child_by_field_name("right")
+                            .map(|r| node_text(r, src).trim())
+                            .unwrap_or("");
+                        if left.ends_with(".exitstatus") && (right == "0" || right == "ExitCode.OK")
+                        {
+                            push_hijack(
+                                out,
+                                line_of(d),
+                                format!(
+                                    "`{name}` forces `{left} = {right}`, masking pytest failures"
+                                ),
+                            );
+                        }
+                    } else if name == "pytest_cmdline_main" && d.kind() == "return_statement" {
+                        let val = d.named_child(0).map(|v| node_text(v, src).trim());
+                        if matches!(val, Some("0" | "ExitCode.OK")) {
+                            push_hijack(
+                                out,
+                                line_of(d),
+                                "`pytest_cmdline_main` returns 0 directly, bypassing pytest execution",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rust_is_exit_zero_call(node: Node<'_>, src: &[u8]) -> bool {
+    if node.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let path = node_text(callee, src).replace(' ', "");
+    let is_process_exit = matches!(
+        path.as_str(),
+        "std::process::exit"
+            | "::std::process::exit"
+            | "process::exit"
+            | "libc::_exit"
+            | "libc::exit"
+    );
+    if !is_process_exit {
+        return false;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let mut named = args.named_children(&mut cursor);
+    let Some(first) = named.next() else {
+        return false;
+    };
+    named.next().is_none() && node_text(first, src).trim() == "0"
+}
+
+fn rust_block_exit_zero<'t>(body: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        let candidate = if child.kind() == "expression_statement" {
+            child.named_child(0).unwrap_or(child)
+        } else {
+            child
+        };
+        if rust_is_exit_zero_call(candidate, src) {
+            return Some(candidate);
+        }
+        if candidate.kind() == "block"
+            && let Some(hit) = rust_block_exit_zero(candidate, src)
+        {
+            return Some(hit);
+        }
+        if candidate.kind() == "if_expression" {
+            let cond = candidate
+                .child_by_field_name("condition")
+                .map(|c| node_text(c, src).trim())
+                .unwrap_or("");
+            if cond == "true"
+                && let Some(conseq) = candidate.child_by_field_name("consequence")
+                && let Some(hit) = rust_block_exit_zero(conseq, src)
+            {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+fn visit_rust_hijack(
+    node: Node<'_>,
+    path: &str,
+    src: &[u8],
+    added: &HashSet<u32>,
+    out: &mut Vec<AstFinding>,
+) {
+    let is_build_rs = path == "build.rs" || path.ends_with("/build.rs");
+    if is_build_rs && matches!(node.kind(), "string_literal" | "raw_string_literal") {
+        if !added.contains(&line_of(node)) {
+            return;
+        }
+        let lit = node_text(node, src);
+        let has_linker_hijack = (lit.contains("cargo:rustc-link-arg")
+            || lit.contains("cargo:rustc-cdylib-link-arg"))
+            && (lit.contains("-init")
+                || lit.contains("_exit")
+                || lit.contains("--defsym")
+                || lit.contains("-Wl,"));
+        let has_preload_hijack = lit.contains("cargo:rustc-env=")
+            && (lit.contains("LD_PRELOAD=") || lit.contains("DYLD_INSERT_LIBRARIES="));
+        if has_linker_hijack || has_preload_hijack {
+            push_hijack(
+                out,
+                line_of(node),
+                "`build.rs` injects linker init/symbol override or dynamic-loader preload into cargo test binaries",
+            );
+        }
+        return;
+    }
+
+    if node.kind() != "function_item" {
+        return;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut attrs: Vec<&str> = Vec::new();
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                attrs.push(
+                    node_text(p, src)
+                        .trim_start_matches("#[")
+                        .trim_end_matches(']')
+                        .trim(),
+                );
+            }
+            k if is_comment_kind(k) => {}
+            _ => break,
+        }
+        prev = p.prev_named_sibling();
+    }
+    let is_test = attrs.iter().any(|inner| {
+        let p = inner.split(['(', '=']).next().unwrap_or("").trim();
+        last_segment(p) == "test"
+    });
+    let is_ctor = attrs.iter().any(|inner| {
+        let p = inner.split(['(', '=']).next().unwrap_or("").trim();
+        last_segment(p) == "ctor"
+            || inner.contains("init_array")
+            || inner.contains("__mod_init_func")
+    });
+    if !is_test && !is_ctor {
+        return;
+    }
+    if let Some(hit) = rust_block_exit_zero(body, src)
+        && (added.contains(&line_of(hit)) || added.contains(&line_of(node)))
+    {
+        push_hijack(
+            out,
+            line_of(hit),
+            "test/constructor calls `process::exit(0)` unconditionally, terminating `cargo test` with exit 0",
+        );
+    }
+}
+
+fn visit_ts_hijack(
+    node: Node<'_>,
+    path: &str,
+    src: &[u8],
+    added: &HashSet<u32>,
+    out: &mut Vec<AstFinding>,
+) {
+    if node.kind() != "call_expression" || !dc_glob::is_test_path(path) {
+        return;
+    }
+    if !added.contains(&line_of(node)) {
+        return;
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return;
+    };
+    if node_text(callee, src).replace(' ', "") != "process.exit" {
+        return;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    let mut named = args.named_children(&mut cursor);
+    let is_zero = match named.next() {
+        None => true,
+        Some(first) => named.next().is_none() && node_text(first, src).trim() == "0",
+    };
+    if is_zero {
+        push_hijack(
+            out,
+            line_of(node),
+            "test file calls `process.exit(0)`, terminating the test runner with exit code 0",
+        );
+    }
 }
 
 #[cfg(test)]

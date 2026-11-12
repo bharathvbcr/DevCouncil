@@ -68,19 +68,46 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 	return gaps
 }
 
-// DetectOrphanDiffGaps flags files changed outside the planned set.
+// DetectOrphanDiffGaps flags files changed outside the editable planned set,
+// and emits hard-safety `oracle_tampering` gaps if any `read_only` planned file
+// was modified.
 func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
-	plannedSet := make(map[string]struct{}, len(planned))
+	editableSet := make(map[string]struct{}, len(planned))
+	readOnlySet := make(map[string]struct{})
 	for _, pf := range planned {
-		plannedSet[pf.Path] = struct{}{}
+		if pf.AllowedChange == dc.ChangeReadOnly {
+			readOnlySet[pf.Path] = struct{}{}
+			delete(editableSet, pf.Path)
+			continue
+		}
+		if _, ro := readOnlySet[pf.Path]; !ro {
+			editableSet[pf.Path] = struct{}{}
+		}
 	}
 	var gaps []Gap
 	for _, cf := range changed {
-		if _, ok := plannedSet[cf]; ok || policy.IsToolState(cf) {
+		if policy.IsToolState(cf) {
+			continue
+		}
+		if _, ro := readOnlySet[cf]; ro {
+			gaps = append(gaps, Gap{
+				ID:             StableGapID(taskID, "READONLY-"+cf),
+				Severity:       "critical",
+				GapType:        "oracle_tampering",
+				TaskID:         taskID,
+				Description:    "Read-only planned file " + cf + " was modified during task execution.",
+				Evidence:       []string{cf + " (allowed_change: read_only)"},
+				RecommendedFix: "Revert unauthorized edits to read-only file " + cf + ", then re-verify.",
+				Blocking:       true,
+				File:           filePtr(cf),
+			})
+			continue
+		}
+		if _, ok := editableSet[cf]; ok {
 			continue
 		}
 		_, isAdded := orphanAdded[cf]
-		newTest := isAdded && isTestPath(cf)
+		newTest := isAdded && IsAdvisoryNewTestPath(cf)
 		if newTest {
 			gaps = append(gaps, Gap{
 				ID:       StableGapID(taskID, "ORPHAN-"+cf),
@@ -117,7 +144,9 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	plannedSet := make(map[string]struct{}, len(planned))
 	for _, pf := range planned {
-		plannedSet[pf.Path] = struct{}{}
+		if pf.AllowedChange != dc.ChangeReadOnly {
+			plannedSet[pf.Path] = struct{}{}
+		}
 	}
 	var gaps []Gap
 	for _, path := range changed {
@@ -143,8 +172,52 @@ func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed [
 }
 
 // IsTestPath is isTestPath for callers outside the package: the preflight asks
-// it to say whether an unplanned new file would be advisory or blocking.
+// it to say whether an unplanned new file matches the shared test-path fixture.
 func IsTestPath(path string) bool { return isTestPath(path) }
+
+// IsRunnerBootstrapPath reports whether a path is a test-runner bootstrap,
+// plugin, startup hook, or build/harness configuration file whose creation or
+// modification can alter test discovery, exit status, or compilation globally
+// (e.g. `tests/conftest.py`, `sitecustomize.py`, `*.pth`, `pytest.ini`,
+// `build.rs`, `vitest.config.ts`). Unplanned creation inside a test directory
+// must NEVER be downgraded to advisory even when IsTestPath(path) is true.
+func IsRunnerBootstrapPath(path string) bool {
+	norm := strings.ToLower(strings.ReplaceAll(path, "\\", "/"))
+	norm = strings.TrimPrefix(norm, "./")
+	if norm == ".cargo/config" || norm == ".cargo/config.toml" || strings.HasSuffix(norm, "/.cargo/config") || strings.HasSuffix(norm, "/.cargo/config.toml") {
+		return true
+	}
+	base := norm
+	if i := strings.LastIndexByte(norm, '/'); i >= 0 {
+		base = norm[i+1:]
+	}
+	switch base {
+	case "conftest.py", "sitecustomize.py", "usercustomize.py",
+		"pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+		"build.rs", "cargo.toml", "package.json", "go.mod", ".gitattributes":
+		return true
+	}
+	if strings.HasSuffix(base, ".pth") {
+		return true
+	}
+	for _, prefix := range []string{
+		"jest.config.", "vitest.config.", "playwright.config.", ".mocharc.", "karma.conf.",
+	} {
+		if strings.HasPrefix(base, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAdvisoryNewTestPath reports whether an unplanned newly added path may be
+// treated as an advisory test addition rather than a blocking orphan. It holds
+// isTestPath to protocols/test-paths/v1.json while excluding runner bootstrap
+// files (`tests/conftest.py`, `tests/sitecustomize.py`, `tests/*.pth`, etc.)
+// that execute hooks across the entire suite.
+func IsAdvisoryNewTestPath(path string) bool {
+	return isTestPath(path) && !IsRunnerBootstrapPath(path)
+}
 
 // isTestPath reports whether a path names a test file. It is the Go reading of
 // the one rule protocols/test-paths/v1.json pins (devmap-query's is_test_path):

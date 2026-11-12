@@ -37,6 +37,10 @@ var categoryByGapType = map[string]string{
 	"unsupported_verification_method": "fix_verification",
 	"llm_review_unproven":             "review",
 	"llm_review_findings":             "review",
+	"runner_hijack":                   "security",
+	"lean_tcb":                        "security",
+	"unattested_test_run":             "fix_verification",
+	"oracle_tampering":                "security",
 	GateConfigInvalid:                 "fix_config",
 	VerifyEnvConfigInvalid:            "fix_config",
 }
@@ -168,6 +172,17 @@ func actionText(g Gap, file *string) string {
 			"accepted."
 	case "stale_map":
 		return "Run `dev map` to regenerate the repository map, then re-verify."
+	case "runner_hijack":
+		return "Remove the test-runner hijack in " + target + " so the real test harness executes and reports failures honestly."
+	case "lean_tcb":
+		return "Replace the Lean 4 TCB soundness hole, metaprogramming escape, or non-standard axiom/extern hook in " + target + " with a kernel- and lean4checker-verified proof, then re-verify."
+	case "unattested_test_run":
+		if g.SuggestedCommand != nil && *g.SuggestedCommand != "" {
+			return "Ensure the test command executes at least one attested test and emits its runner summary without early process exit: " + *g.SuggestedCommand
+		}
+		return "Ensure the verification test command executes at least one attested test and emits its runner summary."
+	case "oracle_tampering":
+		return "Revert unauthorized edits to held-out oracle or test-closure files in " + target + ", then re-verify."
 	default:
 		return g.RecommendedFix
 	}
