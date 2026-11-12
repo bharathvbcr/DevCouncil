@@ -118,6 +118,9 @@ mod langimports_specifier_names_a_file;
 #[cfg(feature = "parse")]
 mod language_capabilities;
 #[cfg(feature = "parse")]
+#[cfg(feature = "parse")]
+mod lean_tcb_extract;
+#[cfg(feature = "parse")]
 mod liquid_script_scanner_limits;
 #[cfg(feature = "parse")]
 mod markup_and_style;

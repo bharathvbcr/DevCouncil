@@ -21,6 +21,7 @@ name = "a_deadline_reaches_the_children_the_child_started"
 dc-proc = { path = "../dc-proc" }
 dc-glob = { path = "../dc-glob" }
 dc-redact = { path = "../dc-redact" }
+dc-evidence = { path = "../dc-evidence" }
 serde.workspace = true
 serde_json.workspace = true
 rayon.workspace = true

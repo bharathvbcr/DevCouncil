@@ -230,7 +230,7 @@ def main():
             ["workspace", "list"], ["savings"], ["clones"], ["freshness"], ["status"],
             ["doctor"], ["session-report"], ["paths"], ["history"], ["snapshots"],
             ["pdg", str(root / "example.py")], ["cypher", "MATCH (a) RETURN a.name LIMIT 5"],
-            ["ast", "needle"], ["routes"], ["shape-check"], ["api-impact", "GET /x"],
+            ["ast", "needle"], ["routes"], ["shape-check"], ["lean-tcb"], ["api-impact", "GET /x"],
             ["claude", "events"], ["manifest"], ["map-html", "--force"], ["html"],
             ["export", "--out", str(root / "graph.graphml")],
             ["skills", "install", "--dry-run", "--project-root", str(root)],

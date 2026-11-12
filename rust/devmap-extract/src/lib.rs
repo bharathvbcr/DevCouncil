@@ -35,6 +35,8 @@ pub mod langfields;
 #[cfg(feature = "parse")]
 pub mod langimports;
 pub mod languages;
+/// Dedicated reader and Trusted Computing Base boundary auditor for Lean 4 (`.lean`).
+pub mod lean;
 /// The markup and stylesheet halves of a template, HTML or CSS file.
 ///
 /// Ungated: its stylesheet and text scanners are pure string readers that the

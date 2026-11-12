@@ -25,6 +25,7 @@ pub mod guides;
 pub mod host;
 pub mod hygiene;
 pub mod inventory;
+pub mod lean_tcb;
 pub mod linguist;
 pub mod manifest;
 pub mod map_preview;
@@ -73,6 +74,12 @@ pub use engine::{
 };
 pub use escape::{html_escape, render_symbol_label};
 pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};
+pub use lean_tcb::{
+    analyze_lean_tcb, audit_lean_tcb_tree, audit_lean_tcb_tree_with_mode, LeanKernelMode,
+    LeanTcbDeclaration, LeanTcbFileAudit, LeanTcbFileDeclaration, LeanTcbFileHole, LeanTcbHole,
+    LeanTcbHoleKind, LeanTcbReport, LeanTcbRole, LeanTcbSkippedPath, LeanTcbTreeReport,
+    LeanVerificationTier, DEFAULT_MAX_LEAN_FILES,
+};
 pub use linguist::{palette, swatch, Swatch, LINGUIST_VERSION, NEUTRAL_COLOR};
 pub use manifest::{
     generate_lean_manifest_json, generate_manifest, generate_manifest_with_edges,

@@ -115,6 +115,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Export(_) => ("Graph export", "Packing the graph"),
         Commands::Routes(_) => ("Routes", "Following the routes"),
         Commands::ShapeCheck(_) => ("Shape check", "Checking the fit"),
+        Commands::LeanTcb(_) => ("Lean TCB audit", "Auditing proof boundaries"),
         Commands::ApiImpact(_) => ("API impact", "Tracing the API ripples"),
         Commands::Claude(_) => ("Claude integration", "Checking the connections"),
         Commands::Skills(_) => ("Skills", "Packing your toolkit"),

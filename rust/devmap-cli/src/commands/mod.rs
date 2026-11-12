@@ -27,6 +27,7 @@ pub(crate) mod hook;
 pub(crate) mod html;
 pub(crate) mod impact;
 pub(crate) mod integrate;
+pub(crate) mod lean_tcb;
 pub(crate) mod literals;
 pub(crate) mod manifest;
 pub(crate) mod map_html;
@@ -93,6 +94,7 @@ pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyho
         Commands::Export(args) => export::run(cli, args),
         Commands::Routes(args) => routes::run(cli, args),
         Commands::ShapeCheck(args) => shape_check::run(cli, args),
+        Commands::LeanTcb(args) => lean_tcb::run(cli, args),
         Commands::ApiImpact(args) => api_impact::run(cli, args),
         Commands::Html(args) => html::run(cli, args),
         Commands::Hook(args) => hook::run(cli, args),

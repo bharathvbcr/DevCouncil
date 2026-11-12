@@ -683,6 +683,10 @@ pub(crate) enum Commands {
     #[command(name = "api-impact")]
     ApiImpact(commands::api_impact::Args),
 
+    /// Audit Lean 4 (`.lean`) Trusted Computing Base (TCB) boundaries and soundness holes.
+    #[command(name = "lean-tcb")]
+    LeanTcb(commands::lean_tcb::Args),
+
     /// Render the graph as one self-contained HTML file.
     ///
     /// No network: the page script and styles are embedded, so the page opens
@@ -969,6 +973,12 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         Commands::History(commands::history::Args { last }) => {
             if *last == 0 {
                 return Err("--last must be at least 1".to_string());
+            }
+            Ok(())
+        }
+        Commands::LeanTcb(commands::lean_tcb::Args { max_files, .. }) => {
+            if *max_files == 0 {
+                return Err("--max-files must be at least 1".to_string());
             }
             Ok(())
         }

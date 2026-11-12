@@ -4,6 +4,7 @@
 //! Digests establish byte identity, not authenticity of an observation producer.
 //! Callers own that trust boundary; replay proves recorded consistency only.
 
+pub mod lean_tcb;
 mod strict_json;
 mod types;
 
