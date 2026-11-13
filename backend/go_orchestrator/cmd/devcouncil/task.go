@@ -22,7 +22,7 @@ store refuses (an invalid scope is refused with code invalid_scope).
 Usage:
   devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [--priority 1-3]
                          [--scope-json JSON | --scope-file PATH] [--project-root DIR]
-  devcouncil task status ID --to inbox|backlog|ready|in_progress|review|done [--project-root DIR]
+  devcouncil task status ID --to backlog|ready|in_progress|review|done [--project-root DIR]
   devcouncil task show ID [--json] [--project-root DIR]
 
 Checking a task out sets it in_progress; a verify that passes sets it to review.
@@ -33,9 +33,28 @@ Closing it to done is a person's decision: ` + "`devcouncil task status ID --to 
    "expected_tests":["go test ./..."],"requirement_ids":["REQ-1"]}
 `
 
+// taskStatusWant is the vocabulary an error message offers. Keep it in step
+// with the help text above; the store validates the same set.
+const taskStatusWant = "backlog, ready, in_progress, review or done"
+
 // taskStatuses is the workbench vocabulary; the store validates it too.
 var taskStatuses = map[string]bool{
-	"inbox": true, "backlog": true, "ready": true, "in_progress": true, "review": true, "done": true,
+	"backlog": true, "ready": true, "in_progress": true, "review": true, "done": true,
+}
+
+// legacyInboxStatus is the name the Inbox column had before it was merged into
+// Backlog. It is still accepted, as an alias, and never advertised.
+const legacyInboxStatus = "inbox"
+
+// canonicalTaskStatus is the one place a status typed on a command line is
+// read: the legacy "inbox" means "backlog", and a name outside the vocabulary
+// is reported as not valid. The exact word only: no trimming, no case folding,
+// as in the store.
+func canonicalTaskStatus(status string) (string, bool) {
+	if status == legacyInboxStatus {
+		status = "backlog"
+	}
+	return status, taskStatuses[status]
 }
 
 func runTask(args []string) int {
@@ -153,8 +172,9 @@ func runTaskCreate(args []string) int {
 	if status == "" {
 		status = "ready"
 	}
-	if !taskStatuses[status] {
-		console.Errorf("unknown status %q (want inbox, backlog, ready, in_progress, review or done)\n", status)
+	status, valid := canonicalTaskStatus(status)
+	if !valid {
+		console.Errorf("unknown status %q (want %s)\n", f.named["--status"], taskStatusWant)
 		return 2
 	}
 	put := map[string]any{
@@ -245,8 +265,9 @@ func runTaskStatus(args []string) int {
 		console.Errorln("usage: devcouncil task status ID --to STATUS")
 		return 2
 	}
-	if !taskStatuses[to] {
-		console.Errorf("unknown status %q (want inbox, backlog, ready, in_progress, review or done)\n", to)
+	to, valid := canonicalTaskStatus(to)
+	if !valid {
+		console.Errorf("unknown status %q (want %s)\n", f.named["--to"], taskStatusWant)
 		return 2
 	}
 	client, _, err := taskClient(f.root, false)

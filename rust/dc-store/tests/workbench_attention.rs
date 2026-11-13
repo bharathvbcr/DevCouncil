@@ -160,7 +160,7 @@ fn reading_dismissing_and_snoozing_never_accepts_a_proposal_or_task() {
     );
     assert_eq!(
         text(&s, &call(&s, "items.get", r#"{"id":"t"}"#), "$.item.status"),
-        "inbox"
+        "backlog"
     );
 }
 
@@ -324,7 +324,7 @@ fn native_run_outcome_is_a_notice_and_does_not_mean_task_completion() {
     assert_eq!(text(&s, &page, "$.items[0].target_type"), "run");
     assert_eq!(
         text(&s, &call(&s, "items.get", r#"{"id":"t"}"#), "$.item.status"),
-        "inbox"
+        "backlog"
     );
 }
 
