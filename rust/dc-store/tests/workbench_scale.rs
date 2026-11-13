@@ -382,7 +382,7 @@ fn a_profile_holding_short_receipts_is_stamped_past_what_schema_twelve_accepts()
         .unwrap();
     assert!(json::<Option<String>>(&s, &stored, "$.replay").is_some());
     assert!(json::<Option<String>>(&s, &stored, "$.item").is_none());
-    assert_eq!(dc_store::workbench::WORKBENCH_SCHEMA, 15);
+    assert_eq!(dc_store::workbench::WORKBENCH_SCHEMA, 16);
     assert_ne!(
         stored_version(&s),
         12,
@@ -406,6 +406,6 @@ fn an_upgraded_schema_twelve_profile_still_replays_its_full_receipts() {
         .execute_batch("UPDATE work_meta SET version=12 WHERE id=1")
         .unwrap();
     s.upgrade_workbench_profile().unwrap();
-    assert_eq!(stored_version(&s), 15);
+    assert_eq!(stored_version(&s), 16);
     assert_eq!(call(&s, "items.put", raw), original);
 }

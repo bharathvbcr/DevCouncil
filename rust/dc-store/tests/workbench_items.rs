@@ -129,7 +129,7 @@ fn schema_10_profiles_migrate_with_done_archived_and_completion_recovered_from_h
     clock.store(9000, Ordering::SeqCst);
     s.upgrade_workbench_profile().unwrap();
     let streak = get(&s, "streak");
-    assert_eq!(version(&s), 15);
+    assert_eq!(version(&s), 16);
     assert_eq!(json::<i64>(&s, &streak, "$.item.archived"), 1);
     assert_eq!(json::<i64>(&s, &streak, "$.item.completed_at"), 4000);
     let born = get(&s, "born");
@@ -193,7 +193,7 @@ fn schema_10_profiles_migrate_with_done_archived_and_completion_recovered_from_h
 fn a_profile_newer_than_this_build_is_refused() {
     let (s, _) = fixture();
     s.connection()
-        .execute_batch("UPDATE work_meta SET version=16 WHERE id=1")
+        .execute_batch("UPDATE work_meta SET version=17 WHERE id=1")
         .unwrap();
     refuse(&s, "items.list", "{}", "schema_unsupported");
 }
@@ -461,15 +461,15 @@ fn links_are_validated_kept_on_omission_and_read_from_both_ends() {
     let markdown = brief(&s, "a");
     assert!(markdown.contains("## Linked tasks\n"), "{markdown}");
     assert!(
-        markdown.contains("- Parent: Task epic [epic] (inbox)\n"),
+        markdown.contains("- Parent: Task epic [epic] (backlog)\n"),
         "{markdown}"
     );
     assert!(
-        markdown.contains("- Blocks: Task b [b] (inbox)\n"),
+        markdown.contains("- Blocks: Task b [b] (backlog)\n"),
         "{markdown}"
     );
     assert!(
-        markdown.contains("- Duplicated by: Task dup [dup] (inbox)\n"),
+        markdown.contains("- Duplicated by: Task dup [dup] (backlog)\n"),
         "{markdown}"
     );
     let blocked = brief(&s, "b");

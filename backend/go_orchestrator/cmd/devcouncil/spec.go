@@ -229,8 +229,9 @@ func runSpecExportTasks(args []string) int {
 		console.Errorln("spec export-tasks requires a feature name or directory")
 		return 2
 	}
-	if !taskStatuses[targetStatus] {
-		console.Errorf("unknown status %q (want inbox, backlog, ready, in_progress, review or done)\n", targetStatus)
+	targetStatus, validStatus := canonicalTaskStatus(targetStatus)
+	if !validStatus {
+		console.Errorf("unknown status %q (want %s)\n", targetStatus, taskStatusWant)
 		return 2
 	}
 

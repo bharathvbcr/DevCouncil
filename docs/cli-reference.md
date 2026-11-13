@@ -97,10 +97,12 @@ A task is a workbench item in the repository's task store. These commands wrap
 ```bash
 devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [--priority 1-3] \
                        [--scope-json JSON | --scope-file PATH] [--project-root DIR]
-devcouncil task status ID --to inbox|backlog|ready|in_progress|review|done
+devcouncil task status ID --to backlog|ready|in_progress|review|done
 devcouncil task show ID [--json]
 devcouncil doctor [--json] [--project-root DIR]
 ```
+
+The task board has five statuses. `inbox`, the name the Backlog column had before the two were merged, is still accepted wherever a status is read and means `backlog`; no task is stored or shown as `inbox`.
 
 - `--scope-json` / `--scope-file` is the item's `scope`: `planned_files` (paths or
   `{path, allowed_change, reason}` with `allowed_change` one of `create`, `modify`,

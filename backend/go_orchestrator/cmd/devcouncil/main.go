@@ -132,7 +132,7 @@ Usage:
   devcouncil gate set --mode off|advisory|enforce
   devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [--priority 1-3]
                               [--scope-json JSON | --scope-file PATH] [--project-root DIR]
-  devcouncil task status ID --to inbox|backlog|ready|in_progress|review|done [--project-root DIR]
+  devcouncil task status ID --to backlog|ready|in_progress|review|done [--project-root DIR]
   devcouncil task show ID [--json] [--project-root DIR]
                                    Tasks are workbench items; these wrap ` + "`dcstore work`" + `
   devcouncil review subject [--json] [--project-root DIR]

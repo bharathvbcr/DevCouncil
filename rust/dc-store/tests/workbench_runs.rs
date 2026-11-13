@@ -724,7 +724,7 @@ fn only_the_claim_owner_can_report_process_lifecycle_and_exit_never_accepts_a_ta
     assert_eq!(text(&store, &result, "$.item.state"), "exited");
     assert_eq!(number(&store, &result, "$.item.exit_code"), 0);
     let task = call(&store, "items.get", r#"{"id":"t"}"#);
-    assert_eq!(text(&store, &task, "$.item.status"), "inbox");
+    assert_eq!(text(&store, &task, "$.item.status"), "backlog");
     assert_eq!(number(&store, &task, "$.item.revision"), 1);
 }
 
@@ -850,7 +850,7 @@ fn schema_four_upgrade_rolls_back_on_conflict_and_preserves_existing_tasks() {
             .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
 }
 
