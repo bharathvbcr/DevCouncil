@@ -60,7 +60,7 @@ func TestWarmMCPHelperProcess(t *testing.T) {
 	if !isMCP {
 		appendLine("cli")
 		if len(args) >= 2 && args[1] == "status" {
-			_, _ = fmt.Fprintf(os.Stdout, `{"db_path":%q,"generation_id":1,"node_count":5,"edge_count":3,"is_fresh":true}`+"\n", filepath.Join(repoRoot, "db.sqlite"))
+			_, _ = fmt.Fprintf(os.Stdout, `{"db_path":%q,"generation_id":3,"node_count":42,"edge_count":19,"is_fresh":true,"host_contract_version":1,"schema_version":19,"expected_schema_version":19,"schema_relation":"current","reader_ready":true,"query_ready":true,"capabilities":{"explore":true,"impact":true,"trace":true,"affected":true}}`+"\n", filepath.Join(repoRoot, "db.sqlite"))
 			os.Exit(0)
 		}
 		if len(args) >= 2 && args[1] == "search" {
@@ -216,6 +216,140 @@ func TestWarmMCPHelperProcess(t *testing.T) {
 					"hidden":     0,
 					"total":      1,
 					"truncated":  false,
+					"repository": repoAttr,
+				}
+			case "devmap_explore":
+				query, _ := toolArgs["query"].(string)
+				structured = map[string]any{
+					"query": query,
+					"limit": 20,
+					"definitions": map[string]any{
+						"items": []map[string]any{
+							{"symbol_name": query, "file_path": "pkga/a.go"},
+						},
+						"resolution":  "Available",
+						"shown":       1,
+						"total":       1,
+						"hidden":      0,
+						"truncated":   false,
+						"tokens_used": 12,
+					},
+					"blast_radius": map[string]any{
+						"layers": map[string]any{
+							"items":       []any{},
+							"resolution":  "Available",
+							"shown":       0,
+							"total":       0,
+							"hidden":      0,
+							"truncated":   false,
+							"tokens_used": 0,
+						},
+					},
+					"budget":     map[string]any{},
+					"repository": repoAttr,
+				}
+			case "devmap_impact":
+				target, _ := toolArgs["target"].(string)
+				structured = map[string]any{
+					"items": []map[string]any{
+						{
+							"source_file":   "pkgb/b.go",
+							"source_symbol": "Caller",
+							"target_file":   "pkga/a.go",
+							"target_symbol": target,
+							"edge_kind":     "calls",
+							"confidence":    1.0,
+						},
+					},
+					"resolution":  "Available",
+					"shown":       1,
+					"total":       1,
+					"hidden":      0,
+					"truncated":   false,
+					"tokens_used": 10,
+					"repository":  repoAttr,
+				}
+			case "devmap_trace":
+				from, _ := toolArgs["from"].(string)
+				to, _ := toolArgs["to"].(string)
+				structured = map[string]any{
+					"items": []map[string]any{
+						{
+							"source_file":   "pkgb/b.go",
+							"source_symbol": from,
+							"target_file":   "pkga/a.go",
+							"target_symbol": to,
+							"edge_kind":     "calls",
+							"confidence":    1.0,
+						},
+					},
+					"resolution":  "Available",
+					"shown":       1,
+					"total":       1,
+					"hidden":      0,
+					"truncated":   false,
+					"tokens_used": 10,
+					"repository":  repoAttr,
+				}
+			case "devmap_affected_tests":
+				targets, _ := toolArgs["targets"].([]any)
+				structured = map[string]any{
+					"targets": targets,
+					"tests": map[string]any{
+						"items": []map[string]any{
+							{"file_path": "pkga/a_test.go"},
+						},
+						"resolution":  "Available",
+						"shown":       1,
+						"total":       1,
+						"hidden":      0,
+						"truncated":   false,
+						"tokens_used": 8,
+					},
+					"blast_radius": map[string]any{
+						"layers": map[string]any{
+							"items":       []any{},
+							"resolution":  "Available",
+							"shown":       0,
+							"total":       0,
+							"hidden":      0,
+							"truncated":   false,
+							"tokens_used": 0,
+						},
+					},
+					"repository": repoAttr,
+				}
+			case "devmap_neighbors":
+				targets, _ := toolArgs["targets"].([]any)
+				first := "Alpha"
+				if len(targets) > 0 {
+					if s, ok := targets[0].(string); ok {
+						first = s
+					}
+				}
+				structured = map[string]any{
+					"neighbors": []map[string]any{
+						{
+							"target": first,
+							"callers": map[string]any{
+								"items": []map[string]any{
+									{
+										"source_file":   "pkgb/b.go",
+										"source_symbol": "Beta",
+										"target_file":   "pkga/a.go",
+										"target_symbol": first,
+										"edge_kind":     "calls",
+										"confidence":    1.0,
+									},
+								},
+								"hidden": 0,
+							},
+							"callees": map[string]any{
+								"items":  []any{},
+								"hidden": 0,
+							},
+						},
+					},
 					"repository": repoAttr,
 				}
 			}
@@ -551,5 +685,53 @@ func TestWarmMCPSessionDeathCarriesStderr(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "exit status 3") {
 		t.Fatalf("error must carry the exit status and the stderr tail, got %v", err)
+	}
+}
+
+func TestWarmMCPAdvancedQueriesUseWarmSession(t *testing.T) {
+	root := t.TempDir()
+	countFile := filepath.Join(t.TempDir(), "spawns.log")
+	bin := writeWarmHelperWrapper(t, "ok", root, countFile)
+
+	c := NewWarm(bin, root)
+	defer c.Close()
+
+	ctx := context.Background()
+	for _, q := range []AdvancedQuery{
+		{Kind: QueryExplore, Query: "Alpha", Depth: 2, Budget: 1500, MinConfidence: 0.25},
+		{Kind: QueryImpact, Query: "Alpha", Depth: 3, Budget: 1500, MinRung: "high"},
+		{Kind: QueryTrace, Query: "Beta", To: "Alpha", Depth: 3, Budget: 1500, MinRung: "deterministic"},
+		{Kind: QueryAffected, Targets: []string{"pkga/a.go", "Alpha"}, Depth: 2, Budget: 1500, MinConfidence: 0.5},
+	} {
+		res, err := c.Advanced(ctx, q)
+		if err != nil {
+			t.Fatalf("warm Advanced(%s) failed: %v", q.Kind, err)
+		}
+		if err := ValidateAdvancedResult(q.Kind, res); err != nil {
+			t.Fatalf("ValidateAdvancedResult(%s): %v", q.Kind, err)
+		}
+	}
+
+	neighbors, err := c.Neighbors(WithCall(ctx), 2, "Alpha")
+	if err != nil {
+		t.Fatalf("warm Neighbors failed: %v", err)
+	}
+	if len(neighbors.Items) != 1 || neighbors.Items[0].Target != "Alpha" || len(neighbors.Items[0].Callers.Items) != 1 {
+		t.Fatalf("unexpected warm Neighbors: %+v", neighbors.Items)
+	}
+
+	deps, err := c.Deps(WithCall(ctx), "pkgb/b.go")
+	if err != nil || len(deps.Items) != 1 {
+		t.Fatalf("warm Deps = %+v, err = %v", deps, err)
+	}
+
+	counts := countSpawns(t, countFile)
+	if counts["mcp"] != 1 {
+		t.Fatalf("expected exactly 1 warm mcp process across Explore+Impact+Trace+Affected+Neighbors+Deps, got %v", counts)
+	}
+	// Each Advanced() performs 2 CLI-only status checks (before & after snapshot qualification);
+	// Neighbors + Deps under WithCall use warm MCP status, so cli spawns must equal 8 (never query fallbacks).
+	if counts["cli"] != 8 {
+		t.Fatalf("expected 8 CLI status spawns and 0 query CLI fallbacks, got %v", counts)
 	}
 }

@@ -358,6 +358,20 @@ type deadResult struct {
 	Hidden int          `json:"hidden"`
 }
 
+// NeighborEntry is one target's inbound (Callers) and outbound (Callees) edges
+// returned by `devmap neighbors`.
+type NeighborEntry struct {
+	Target  string     `json:"target"`
+	Callers edgeResult `json:"callers"`
+	Callees edgeResult `json:"callees"`
+}
+
+func (n NeighborEntry) identified() bool { return n.Target != "" }
+
+type neighborsResult struct {
+	Neighbors []NeighborEntry `json:"neighbors"`
+}
+
 // Result wraps any answer with what the caller needs to judge it.
 type Result[T any] struct {
 	Items []T
@@ -837,6 +851,32 @@ func (c *Client) Deps(ctx context.Context, file string) (Result[Edge], error) {
 	return runQuery[Edge, edgeResult](ctx, c,
 		func(r edgeResult) ([]Edge, int) { return r.Items, r.Hidden },
 		"deps", "--budget", strconv.Itoa(c.Budget), "--", file)
+}
+
+// Neighbors returns inbound and outbound call edges for 1..16 targets in a
+// single exchange.
+func (c *Client) Neighbors(ctx context.Context, depth int, targets ...string) (Result[NeighborEntry], error) {
+	if depth < 1 || depth > 64 {
+		return Result[NeighborEntry]{}, fmt.Errorf("depth must be in 1..64, got %d", depth)
+	}
+	if len(targets) == 0 || len(targets) > 16 {
+		return Result[NeighborEntry]{}, fmt.Errorf("neighbors requires 1..16 targets, got %d", len(targets))
+	}
+	for _, target := range targets {
+		if target == "" || len(target) > mcpMaxTargetBytes {
+			return Result[NeighborEntry]{}, fmt.Errorf("neighbors targets must be 1..%d bytes each", mcpMaxTargetBytes)
+		}
+	}
+	args := append([]string{"neighbors", "--budget", strconv.Itoa(c.Budget), "--depth", strconv.Itoa(depth), "--"}, targets...)
+	return runQuery[NeighborEntry, neighborsResult](ctx, c,
+		func(r neighborsResult) ([]NeighborEntry, int) {
+			hidden := 0
+			for _, entry := range r.Neighbors {
+				hidden += entry.Callers.Hidden + entry.Callees.Hidden
+			}
+			return r.Neighbors, hidden
+		},
+		args...)
 }
 
 // Build indexes the repository. It is separate from the query path and carries

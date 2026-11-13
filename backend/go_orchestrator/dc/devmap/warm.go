@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -36,10 +37,12 @@ var (
 )
 
 const (
-	warmHandshakeTimeout = 10 * time.Second
-	warmMinMaxFrameBytes = 16 << 20
-	mcpMaxBudget         = 100_000
-	mcpMaxTargetBytes    = 4096
+	warmHandshakeTimeout  = 10 * time.Second
+	warmMinMaxFrameBytes  = 16 << 20
+	mcpMaxBudget          = 100_000
+	mcpMaxTargetBytes     = 4096
+	mcpMaxTraversalDepth  = 64
+	mcpMaxNeighborTargets = 16
 )
 
 // EnableWarmMCP switches this client onto a persistent `devmap mcp` stdio
@@ -755,9 +758,185 @@ func (c *Client) mapWarmToolArgs(ctx context.Context, args []string) (string, ma
 			"budget":    budget,
 		}, true
 
+	case "explore":
+		// Expected CLI shape: ["explore", "--budget", "<N>", "--depth", "<D>", "--min-confidence", "<F>", "--", "<query>"]
+		if len(args) != 9 || args[1] != "--budget" || args[3] != "--depth" || args[5] != "--min-confidence" || args[7] != "--" {
+			return "", nil, false
+		}
+		budget, depth, ok := parseWarmBudgetDepth(args[2], args[4])
+		if !ok || args[8] == "" || len(args[8]) > mcpMaxTargetBytes {
+			return "", nil, false
+		}
+		minConf, ok := parseWarmConfidence(args[6])
+		if !ok {
+			return "", nil, false
+		}
+		return "devmap_explore", map[string]any{
+			"repo_path":      c.Root,
+			"query":          args[8],
+			"budget":         budget,
+			"depth":          depth,
+			"min_confidence": minConf,
+		}, true
+
+	case "impact":
+		// Expected CLI shape: ["impact", "--budget", "<N>", "--depth", "<D>", ("--min-rung", "<R>",)? "--", "<target>"]
+		if len(args) < 6 || args[1] != "--budget" || args[3] != "--depth" {
+			return "", nil, false
+		}
+		budget, depth, ok := parseWarmBudgetDepth(args[2], args[4])
+		if !ok {
+			return "", nil, false
+		}
+		idx := 5
+		var minRung string
+		if idx+2 < len(args) && args[idx] == "--min-rung" {
+			if !validWarmRung(args[idx+1]) {
+				return "", nil, false
+			}
+			minRung = args[idx+1]
+			idx += 2
+		}
+		if idx+2 != len(args) || args[idx] != "--" || args[idx+1] == "" || len(args[idx+1]) > mcpMaxTargetBytes {
+			return "", nil, false
+		}
+		toolArgs := map[string]any{
+			"repo_path": c.Root,
+			"target":    args[idx+1],
+			"budget":    budget,
+			"depth":     depth,
+		}
+		if minRung != "" {
+			toolArgs["min_rung"] = minRung
+		}
+		return "devmap_impact", toolArgs, true
+
+	case "trace":
+		// Expected CLI shape: ["trace", "--budget", "<N>", "--depth", "<D>", ("--min-rung", "<R>",)? "--", "<from>", ("<to>")?]
+		if len(args) < 6 || args[1] != "--budget" || args[3] != "--depth" {
+			return "", nil, false
+		}
+		budget, depth, ok := parseWarmBudgetDepth(args[2], args[4])
+		if !ok {
+			return "", nil, false
+		}
+		idx := 5
+		var minRung string
+		if idx+2 < len(args) && args[idx] == "--min-rung" {
+			if !validWarmRung(args[idx+1]) {
+				return "", nil, false
+			}
+			minRung = args[idx+1]
+			idx += 2
+		}
+		if idx >= len(args) || args[idx] != "--" {
+			return "", nil, false
+		}
+		endpoints := args[idx+1:]
+		if len(endpoints) < 1 || len(endpoints) > 2 || endpoints[0] == "" || len(endpoints[0]) > mcpMaxTargetBytes {
+			return "", nil, false
+		}
+		toolArgs := map[string]any{
+			"repo_path": c.Root,
+			"from":      endpoints[0],
+			"budget":    budget,
+			"depth":     depth,
+		}
+		if len(endpoints) == 2 {
+			if endpoints[1] == "" || len(endpoints[1]) > mcpMaxTargetBytes {
+				return "", nil, false
+			}
+			toolArgs["to"] = endpoints[1]
+		}
+		if minRung != "" {
+			toolArgs["min_rung"] = minRung
+		}
+		return "devmap_trace", toolArgs, true
+
+	case "affected":
+		// Expected CLI shape: ["affected", "--budget", "<N>", "--depth", "<D>", "--min-confidence", "<F>", "--", "<t1>", ...]
+		if len(args) < 9 || args[1] != "--budget" || args[3] != "--depth" || args[5] != "--min-confidence" || args[7] != "--" {
+			return "", nil, false
+		}
+		budget, depth, ok := parseWarmBudgetDepth(args[2], args[4])
+		if !ok {
+			return "", nil, false
+		}
+		minConf, ok := parseWarmConfidence(args[6])
+		if !ok {
+			return "", nil, false
+		}
+		targets := args[8:]
+		if !validWarmTargets(targets) {
+			return "", nil, false
+		}
+		return "devmap_affected_tests", map[string]any{
+			"repo_path":      c.Root,
+			"targets":        targets,
+			"budget":         budget,
+			"depth":          depth,
+			"min_confidence": minConf,
+		}, true
+
+	case "neighbors":
+		// Expected CLI shape: ["neighbors", "--budget", "<N>", "--depth", "<D>", "--", "<t1>", ...]
+		if len(args) < 7 || args[1] != "--budget" || args[3] != "--depth" || args[5] != "--" {
+			return "", nil, false
+		}
+		budget, depth, ok := parseWarmBudgetDepth(args[2], args[4])
+		if !ok {
+			return "", nil, false
+		}
+		targets := args[6:]
+		if !validWarmTargets(targets) {
+			return "", nil, false
+		}
+		return "devmap_neighbors", map[string]any{
+			"repo_path": c.Root,
+			"targets":   targets,
+			"budget":    budget,
+			"depth":     depth,
+		}, true
+
 	default:
 		return "", nil, false
 	}
+}
+
+func parseWarmBudgetDepth(rawBudget, rawDepth string) (int, int, bool) {
+	budget, err := strconv.Atoi(rawBudget)
+	if err != nil || budget < 1 || budget > mcpMaxBudget {
+		return 0, 0, false
+	}
+	depth, err := strconv.Atoi(rawDepth)
+	if err != nil || depth < 1 || depth > mcpMaxTraversalDepth {
+		return 0, 0, false
+	}
+	return budget, depth, true
+}
+
+func parseWarmConfidence(raw string) (float64, bool) {
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+func validWarmRung(r string) bool {
+	return r == "deterministic" || r == "high" || r == "speculative"
+}
+
+func validWarmTargets(targets []string) bool {
+	if len(targets) < 1 || len(targets) > mcpMaxNeighborTargets {
+		return false
+	}
+	for _, t := range targets {
+		if t == "" || len(t) > mcpMaxTargetBytes {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) callWarmTool(
