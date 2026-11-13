@@ -222,8 +222,8 @@ the new build is broken.
 
 ### Requirements
 
-- **Rust 1.99.** `rust-toolchain.toml` pins channel 1.99.0 and `rust-version` in
-  `rust/Cargo.toml` is 1.99; `dc-grep` inherits it (it uses standard-library file
+- **Rust 1.100.** `rust-toolchain.toml` pins channel 1.100.0 and `rust-version` in
+  `rust/Cargo.toml` is 1.100; `dc-grep` inherits it (it uses standard-library file
   locking, which needs 1.89 or newer).
 - **A C compiler.** `dc-store` takes `rusqlite` with `bundled` and compiles
   SQLite from source rather than linking whatever `libsqlite3` the host ships.

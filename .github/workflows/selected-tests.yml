@@ -27,7 +27,7 @@ name: selected tests (DevMap)
 # built with all of its workspace dependents gets the feature set the full
 # suite's `--workspace` gives it; built alone (`-p a`, or `--workspace
 # --exclude b`) it would not. Cargo's `resolver.feature-unification =
-# "workspace"` would make any set agree, but it is unstable on the pinned 1.99.0
+# "workspace"` would make any set agree, but it is unstable on the pinned 1.100.0
 # (it needs `-Z feature-unification`, nightly only; tracking issue
 # rust-lang/cargo#14774), so it is not set. Go is the same shape: one
 # `go test -json <pkgs...>` over the changed packages and the packages that

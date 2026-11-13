@@ -250,7 +250,7 @@ fn named_or_found(out: &str) {
     assert!(
         degraded || found,
         "the changed source was neither read nor named: {}",
-        out.split("stub_ast_degraded").nth(1).unwrap_or(&out)
+        out.split("stub_ast_degraded").nth(1).unwrap_or(out)
     );
 }
 

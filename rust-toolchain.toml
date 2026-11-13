@@ -7,10 +7,11 @@
 # Bump deliberately, in its own change: edit `channel`, run
 # `cargo fmt --all -- --check` and the clippy commands from
 # .github/workflows/rust.yml and analysis-plane.yml, fix what the new release
-# flags, then update `rust-version` in rust/Cargo.toml and
-# rust/dc-sparse-encode/Cargo.toml to the same minor. See the release
+# flags, then update `rust-version` in rust/Cargo.toml,
+# rust/dc-sparse-encode/Cargo.toml, rust/rank-eval/Cargo.toml and
+# rust/gusset-engine/Cargo.toml to the same minor. See the release
 # checklist in docs/workflow.md ("Bumping the pinned toolchains").
 [toolchain]
-channel = "1.99.0"
+channel = "1.100.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

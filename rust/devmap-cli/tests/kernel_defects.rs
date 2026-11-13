@@ -10,12 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn devmap() -> String {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("devmap").to_string_lossy().into_owned()
+    env!("CARGO_BIN_EXE_devmap").to_string()
 }
 
 /// Unique per-test scratch root. Same shape as `store_hardening::tmp_dir`: a

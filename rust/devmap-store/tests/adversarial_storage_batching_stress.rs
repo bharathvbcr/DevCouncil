@@ -243,15 +243,15 @@ fn test_unresolved_call_chunked_batching_remainders() {
         for i in 0..count {
             unresolved.push(UnresolvedReference {
                 source_file: "hub.py".into(),
-                source_symbol: format!("hub.py::caller_{i}").into(),
-                callee_name: format!("missing_fn_{i}").into(),
+                source_symbol: format!("hub.py::caller_{i}"),
+                callee_name: format!("missing_fn_{i}"),
                 kind: UnresolvedKind::Call,
                 resolution: Resolution::Unresolved {
                     reason: "no matching candidate found".into(),
                 },
                 class: UnresolvedClass::Unresolved,
                 receiver: if i % 2 == 0 {
-                    Some(format!("receiver_{i}").into())
+                    Some(format!("receiver_{i}"))
                 } else {
                     None
                 },
@@ -331,7 +331,7 @@ fn test_unresolved_call_chunked_batching_remainders() {
                 assert_eq!(callee, format!("missing_fn_{idx}"));
                 assert_eq!(reason, expected_reason);
                 assert_eq!(class, "unresolved");
-                if idx % 2 == 0 {
+                if idx.is_multiple_of(2) {
                     assert_eq!(receiver, Some(format!("receiver_{idx}")));
                 } else {
                     assert_eq!(receiver, None);
@@ -359,8 +359,8 @@ fn test_unresolved_call_reconciliation_across_batches() {
     for i in 0..65 {
         unres1.push(UnresolvedReference {
             source_file: "main.py".into(),
-            source_symbol: format!("main.py::fn_{i}").into(),
-            callee_name: format!("call_{i}").into(),
+            source_symbol: format!("main.py::fn_{i}"),
+            callee_name: format!("call_{i}"),
             kind: UnresolvedKind::Call,
             resolution: Resolution::Unresolved { reason: "r1".into() },
             class: UnresolvedClass::Unresolved,
@@ -386,8 +386,8 @@ fn test_unresolved_call_reconciliation_across_batches() {
     for i in 0..64 {
         unres2.push(UnresolvedReference {
             source_file: "main.py".into(),
-            source_symbol: format!("main.py::fn_{i}").into(),
-            callee_name: format!("call_{i}").into(),
+            source_symbol: format!("main.py::fn_{i}"),
+            callee_name: format!("call_{i}"),
             kind: UnresolvedKind::Call,
             resolution: Resolution::Unresolved { reason: "r1".into() },
             class: UnresolvedClass::Unresolved,
@@ -398,8 +398,8 @@ fn test_unresolved_call_reconciliation_across_batches() {
     for i in 65..=66 {
         unres2.push(UnresolvedReference {
             source_file: "main.py".into(),
-            source_symbol: format!("main.py::fn_{i}").into(),
-            callee_name: format!("call_{i}").into(),
+            source_symbol: format!("main.py::fn_{i}"),
+            callee_name: format!("call_{i}"),
             kind: UnresolvedKind::Call,
             resolution: Resolution::Unresolved { reason: "r1".into() },
             class: UnresolvedClass::Unresolved,
@@ -999,11 +999,11 @@ fn test_unresolved_statement_cache_churn_across_sizes() {
         for i in 0..size {
             unresolved.push(UnresolvedReference {
                 source_file: "root.py".into(),
-                source_symbol: format!("root.py::root_{i}").into(),
-                callee_name: format!("callee_{i}").into(),
+                source_symbol: format!("root.py::root_{i}"),
+                callee_name: format!("callee_{i}"),
                 kind: UnresolvedKind::Call,
                 resolution: Resolution::Unresolved {
-                    reason: format!("reason_for_{size}").into(),
+                    reason: format!("reason_for_{size}"),
                 },
                 class: UnresolvedClass::Unresolved,
                 receiver: None,

@@ -26,7 +26,7 @@ fn names(text: &str, path: &std::path::Path) -> bool {
         return false;
     };
     let shown = canonical.display().to_string();
-    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+    text.contains(shown.trim_prefix(r"\\?\"))
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -44,12 +44,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn devmap() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("devmap")
+    PathBuf::from(env!("CARGO_BIN_EXE_devmap"))
 }
 
 fn run_in(root: &Path, args: &[&str], home: Option<&Path>) -> Output {

@@ -37,7 +37,7 @@ fn names(text: &str, path: &std::path::Path) -> bool {
         return false;
     };
     let shown = canonical.display().to_string();
-    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+    text.contains(shown.trim_prefix(r"\\?\"))
 }
 
 /// K3: a store this binary cannot open must say what to do about it.

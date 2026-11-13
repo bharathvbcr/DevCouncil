@@ -11,12 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn devmap() -> String {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("devmap").to_string_lossy().into_owned()
+    env!("CARGO_BIN_EXE_devmap").to_string()
 }
 
 fn scratch(name: &str) -> PathBuf {

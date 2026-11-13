@@ -1,0 +1,7 @@
+# Hold back crate versions published less than three days ago, so a freshly
+# yanked or hijacked release is not resolved into a build the day it appears.
+# One file at the repo root covers every Cargo workspace here (rust/,
+# rust/gusset-engine, rust/dc-sparse-encode, rust/rank-eval), whichever
+# directory CI runs cargo from.
+[registry]
+global-min-publish-age = "3 days"

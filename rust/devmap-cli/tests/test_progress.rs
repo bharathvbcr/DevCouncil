@@ -1480,7 +1480,7 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
 fn fixture_roots_are_unique_under_concurrent_construction() {
     let roots: Vec<std::path::PathBuf> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..16)
-            .map(|_| scope.spawn(|| (0..16).map(|_| temp_root()).collect::<Vec<_>>()))
+            .map(|_| scope.spawn(|| Vec::from_fn(16, |_| temp_root())))
             .collect();
         handles
             .into_iter()

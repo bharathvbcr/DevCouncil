@@ -500,10 +500,7 @@ pub fn build_index(request: &IndexRequest) -> Result<IndexResponse, String> {
 /// is not valid UTF-8 and so has no exact spelling. An absolute path here would
 /// put the caller's directory layout into a report that is otherwise portable.
 fn root_relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    path.trim_prefix(root).to_string_lossy().into_owned()
 }
 
 /// How much of an oversized file is read to tell text from a binary asset.

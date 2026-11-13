@@ -125,7 +125,7 @@ fn adv_key_past_the_probe_is_not_clean() {
     let root = Root::new();
     let key = secret();
     let mut body = vec![0u8];
-    body.extend(std::iter::repeat(b'B').take(9000));
+    body.extend(std::iter::repeat_n(b'B', 9000));
     body.push(b'\n');
     body.extend(format!("let aws_key = \"{key}\";\n").into_bytes());
     std::fs::write(root.0.join("src/ok.rs"), "pub fn ok() -> u8 { 1 }\n").unwrap();

@@ -150,7 +150,7 @@ fn concurrent_writes_never_split_a_search_answer() {
         let mut wide = true;
         while !writer_stop.load(Ordering::Relaxed) {
             generation_of(&writer_store, if wide { 40 } else { 1 });
-            wide = !wide;
+            wide.toggle();
         }
     });
 

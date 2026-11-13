@@ -211,14 +211,13 @@ fn write_guides_if_requested(
 
     let relative = |absolute: &std::path::Path| -> String {
         let text = absolute
-            .strip_prefix(tree)
-            .unwrap_or(absolute)
+            .trim_prefix(tree)
             .to_string_lossy()
             .replace('\\', "/");
         // `--db` defaults to a CWD-relative path, so stripping the tree prefix
         // can leave `./.devmap/...`. The guide is prose an agent reads and
         // copies; a stray `./` is noise in every line that quotes a path.
-        text.strip_prefix("./").unwrap_or(&text).to_string()
+        text.trim_prefix("./").to_string()
     };
     Ok(devmap_query::guides::agent_guides(
         tree,

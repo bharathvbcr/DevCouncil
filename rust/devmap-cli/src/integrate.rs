@@ -1737,8 +1737,8 @@ pub fn merge_opencode_plugin(
 fn is_our_plugin_ref(entry: &str, ours: &str) -> bool {
     let normalize = |text: &str| {
         let text = text.replace('\\', "/");
-        let text = text.strip_prefix("file://").unwrap_or(&text).to_string();
-        let text = text.strip_prefix("./").unwrap_or(&text).to_string();
+        let text = text.trim_prefix("file://").to_string();
+        let text = text.trim_prefix("./").to_string();
         text.trim_start_matches('/').to_string()
     };
     normalize(entry) == normalize(ours)

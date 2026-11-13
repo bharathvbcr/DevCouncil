@@ -753,7 +753,7 @@ fn note_of(e: &Extraction) -> String {
 /// candidate in the first pass (the whole body is one flat ERROR), so the
 /// separator count is `k + 2` without needing more than one pass.
 fn lambda_body_class(k: usize, one_line: bool) -> String {
-    let body = (0..k).map(|_| "a { b() };").collect::<Vec<_>>().join(" ");
+    let body = Vec::from_fn(k, |_| "a { b() };").join(" ");
     if one_line {
         format!("class K {{ val x = 1 }}\nclass A {{ fun f() {{ {body} }} }}\n{SUFFIX}")
     } else {

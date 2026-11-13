@@ -343,7 +343,7 @@ const MAX_USE_SEGMENTS: usize = 256;
 
 /// A name as it is written, without the `r#` of a raw identifier.
 fn strip_raw(name: &str) -> &str {
-    name.strip_prefix("r#").unwrap_or(name)
+    name.trim_prefix("r#")
 }
 
 fn node_name(node: Node<'_>, src: &[u8]) -> String {

@@ -633,8 +633,7 @@ fn an_open_that_could_not_convert_a_payload_says_so_in_status_and_stays_usable()
     );
     assert!(store
         .latest_extraction_for_path("checks.py")
-        .err()
-        .expect("and the bad one is refused by name")
+        .expect_err("and the bad one is refused by name")
         .to_string()
         .contains("checks.py"));
     drop(store);
@@ -729,8 +728,7 @@ fn status_states_its_scope_and_does_not_examine_a_damaged_frame_that_has_its_wir
     assert!(Store::open_read_only(&db)
         .unwrap()
         .latest_extraction_for_path("checks.py")
-        .err()
-        .expect("the reader refuses it")
+        .expect_err("the reader refuses it")
         .to_string()
         .contains("checks.py"));
 

@@ -70,7 +70,7 @@ fn code_spans(text: &str) -> Vec<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
+            fenced.toggle();
             continue;
         }
         if fenced {

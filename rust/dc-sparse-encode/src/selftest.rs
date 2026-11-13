@@ -80,12 +80,7 @@ pub fn self_test() -> Result<(), String> {
     std::os::unix::fs::symlink(room.join("src/a.rs"), &link).map_err(|e| e.to_string())?;
     let found: std::collections::HashSet<String> = walk(&room, 200_000)?
         .iter()
-        .map(|path| {
-            path.strip_prefix(&room)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
+        .map(|path| path.trim_prefix(&room).to_string_lossy().replace('\\', "/"))
         .collect();
     check(
         "walk takes source and skips the rest",
@@ -188,11 +183,7 @@ fn end_to_end() -> Result<(), String> {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let weight = if name == "alpha.rs" { 0.9 } else { 0.1 };
         docs.push(DocLine {
-            path: path
-                .strip_prefix(&repo)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/"),
+            path: path.trim_prefix(&repo).to_string_lossy().replace('\\', "/"),
             total_terms: 12,
             terms: vec![(2, weight)],
         });

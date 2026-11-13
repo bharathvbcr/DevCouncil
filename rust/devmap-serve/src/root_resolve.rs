@@ -332,7 +332,7 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     // `file://localhost/C:/…` names the same file as `file:///C:/…`; any other
     // authority is a remote host.
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let rest = rest.trim_prefix("localhost");
     let path = rest.strip_prefix('/')?;
     let decoded = percent_decode_strict(path)?;
     let bytes = decoded.as_bytes();
@@ -624,7 +624,7 @@ mod tests {
             return false;
         };
         let shown = canonical.display().to_string();
-        text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+        text.contains(shown.trim_prefix(r"\\?\"))
     }
 
     fn scratch(name: &str) -> PathBuf {

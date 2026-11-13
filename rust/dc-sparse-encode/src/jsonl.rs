@@ -88,7 +88,7 @@ pub fn lines_from_pooled(
             continue;
         }
         let ids = document_ids(&texts[i], prepared.vocab, prepared.max_positions)?;
-        let rel = path.strip_prefix(root).unwrap_or(path);
+        let rel = path.trim_prefix(root);
         lines.push(DocLine {
             path: rel.to_string_lossy().replace('\\', "/"),
             total_terms: u32::try_from(ids.len()).unwrap_or(u32::MAX),

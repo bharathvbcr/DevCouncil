@@ -1,0 +1,7 @@
+go 1.27.4
+
+use (
+	./backend/go_orchestrator
+	./benchmarks/plots
+	./tools/accuracy
+)

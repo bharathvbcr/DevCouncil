@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// `db_path` in plain form while the fixture root is canonical (verbatim on
 /// Windows); both name the same file, and elsewhere this is the identity.
 fn plain(path: Option<&str>) -> Option<&str> {
-    path.map(|p| p.strip_prefix(r"\\?\").unwrap_or(p))
+    path.map(|p| p.trim_prefix(r"\\?\"))
 }
 
 struct Fixture(PathBuf);

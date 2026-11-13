@@ -279,11 +279,10 @@ fn integrate_map_context(
     let graph_path = devmap_extract::paths::code_graph_path(project_root);
     let relative = |absolute: &Path| -> String {
         let text = absolute
-            .strip_prefix(project_root)
-            .unwrap_or(absolute)
+            .trim_prefix(project_root)
             .to_string_lossy()
             .replace('\\', "/");
-        text.strip_prefix("./").unwrap_or(&text).to_string()
+        text.trim_prefix("./").to_string()
     };
     let map_rel = relative(&map_path);
     let graph_rel = relative(&graph_path);

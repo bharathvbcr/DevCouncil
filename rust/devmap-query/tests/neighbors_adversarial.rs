@@ -1028,13 +1028,9 @@ fn a_composed_read_racing_a_commit_never_straddles_silently() {
             let undisclosed = Arc::clone(&undisclosed);
             std::thread::spawn(move || {
                 // Decrements on exit, panic included.
-                struct Exit(Arc<AtomicUsize>);
-                impl Drop for Exit {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-                let _exit = Exit(alive);
+                let _exit = std::mem::DropGuard::new(alive, |alive| {
+                    alive.fetch_sub(1, Ordering::SeqCst);
+                });
                 let engine = StoreQueryEngine::new(&store);
                 let targets = vec!["core.py::helper".to_string(), "caller.py".to_string()];
                 while stop.load(Ordering::SeqCst) < GENERATIONS - 1 {

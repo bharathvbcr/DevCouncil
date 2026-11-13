@@ -42,7 +42,6 @@
 //! cross-origin browser requests regardless, because those are the ones the user
 //! never intended to make.
 
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -771,7 +770,7 @@ async fn handle_request(
     store: Arc<StoreSlot>,
     local: Option<SocketAddr>,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<Full<Bytes>>, !> {
     if !origin_is_acceptable(&request) {
         return Ok(json_response(
             StatusCode::FORBIDDEN,

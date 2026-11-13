@@ -650,3 +650,29 @@ func TestLeanKernelModeExpandsDefaultClientTimeoutForLean4CheckerReplay(t *testi
 		t.Fatalf("New() effectiveTimeout() under DC_VERIFY_LEAN_KERNEL=require = %v, want >= 210s", kernFromNew.effectiveTimeout())
 	}
 }
+
+func TestLeanKernelTimeoutMillisStayInsideTheContract(t *testing.T) {
+	t.Setenv("DC_VERIFY_LEAN_KERNEL", "require")
+	client := New("/bin/dcverify", t.TempDir())
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{raw: "50", want: 240 * time.Second},
+		{raw: "180000", want: 240 * time.Second},
+		{raw: "200000", want: 260 * time.Second},
+		{raw: "600000", want: 660 * time.Second},
+		{raw: "600001", want: 660 * time.Second},
+		{raw: "18446744073709551615", want: 660 * time.Second},
+		{raw: "18446744073709551616", want: 240 * time.Second},
+		{raw: "-5", want: 240 * time.Second},
+		{raw: "+250", want: 240 * time.Second},
+		{raw: "nope", want: 240 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Setenv("DC_LEAN_KERNEL_TIMEOUT_MS", tc.raw)
+		if got := client.effectiveTimeout(); got != tc.want {
+			t.Errorf("DC_LEAN_KERNEL_TIMEOUT_MS=%s: effectiveTimeout() = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}

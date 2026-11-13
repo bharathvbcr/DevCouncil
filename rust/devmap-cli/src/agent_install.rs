@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn the_document_bound_matches_the_skill_library_and_not_the_server_cap() {
         assert_eq!(MAX_DOCUMENT_BYTES, MAX_LIBRARY_BYTES);
-        assert!(MAX_DOCUMENT_BYTES > 64 * 1024);
+        const { assert!(MAX_DOCUMENT_BYTES > 64 * 1024) };
         let mut oversized = vec![b' '; MAX_DOCUMENT_BYTES + 1];
         oversized[0] = b'{';
         let err = parse_document(&oversized).unwrap_err();

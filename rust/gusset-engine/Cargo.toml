@@ -2,6 +2,7 @@
 name = "devcouncil-gusset-engine"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100" # the pin in ../../rust-toolchain.toml
 license = "MIT OR Apache-2.0"
 description = "Umbrella staticlib: Gusset plus the dc-glob engine. One archive per Go binary (R14)."
 publish = false

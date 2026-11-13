@@ -24,7 +24,7 @@ fn names(text: &str, path: &std::path::Path) -> bool {
         return false;
     };
     let shown = canonical.display().to_string();
-    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+    text.contains(shown.trim_prefix(r"\\?\"))
 }
 
 /// `path` as a `file://` URI in this platform's form: `file:///C:/…` on
@@ -33,7 +33,7 @@ fn names(text: &str, path: &std::path::Path) -> bool {
 fn file_uri(path: &std::path::Path) -> String {
     let shown = path.display().to_string();
     if cfg!(windows) {
-        let bare = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+        let bare = shown.trim_prefix(r"\\?\");
         format!("file:///{}", bare.replace('\\', "/"))
     } else {
         format!("file://{shown}")

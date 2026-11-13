@@ -21,12 +21,7 @@ use devmap_store::{Store, COVERAGE_GAP_SAMPLE};
 const SRC: &str = "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n";
 
 fn devmap() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("devmap")
+    PathBuf::from(env!("CARGO_BIN_EXE_devmap"))
 }
 
 fn scratch(name: &str) -> PathBuf {

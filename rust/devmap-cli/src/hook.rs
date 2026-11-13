@@ -4822,13 +4822,9 @@ mod tests {
                 .as_nanos()
         ));
         let _ = fs::remove_dir_all(&parent);
-        struct Tidy(PathBuf);
-        impl Drop for Tidy {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let _tidy = Tidy(parent.clone());
+        let _tidy = std::mem::DropGuard::new(parent.clone(), |dir| {
+            let _ = fs::remove_dir_all(dir);
+        });
 
         let main = parent.join("main");
         let gitdir = main.join(".git/worktrees/lane");

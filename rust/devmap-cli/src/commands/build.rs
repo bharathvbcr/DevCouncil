@@ -692,7 +692,7 @@ fn run_build(
                 .iter()
                 .map(|gap| {
                     serde_json::json!({
-                        "limit": gap.path.strip_prefix("resolve:").unwrap_or(&gap.path),
+                        "limit": gap.path.trim_prefix("resolve:"),
                         "reason": gap.reason,
                         "carried_from_generation": generation,
                     })
@@ -907,7 +907,7 @@ fn run_build(
             path,
             extractions.iter().map(|ext| ext.file_path.as_str()),
         ));
-        Ok::<(), std::convert::Infallible>(())
+        Ok::<(), !>(())
     })?;
     progress.stage(
         2,
@@ -1834,9 +1834,7 @@ fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = dest.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = dest.with_file_name(tmp_name);
-    if let Err(error) = std::fs::write(&tmp, bytes) {
-        return Err(error);
-    }
+    std::fs::write(&tmp, bytes)?;
     match std::fs::remove_file(dest) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

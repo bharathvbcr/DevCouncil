@@ -196,13 +196,15 @@ func (c *Client) effectiveTimeout() time.Duration {
 	if mode == "auto" || mode == "require" || mode == "1" || mode == "true" {
 		step := 180 * time.Second
 		if raw := strings.TrimSpace(os.Getenv("DC_LEAN_KERNEL_TIMEOUT_MS")); raw != "" {
-			if ms, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			// ParseUint's result is uint64. time.Duration is int64, so the
+			// conversion is only reached inside a constant upper bound.
+			if ms, err := strconv.ParseUint(raw, 10, 64); err == nil && ms <= 600_000 {
 				if ms < 50 {
 					ms = 50
-				} else if ms > 600_000 {
-					ms = 600_000
 				}
 				step = time.Duration(ms) * time.Millisecond
+			} else if err == nil {
+				step = 600_000 * time.Millisecond
 			}
 		}
 		expanded := step + 60*time.Second

@@ -105,7 +105,7 @@ fn emitted_hooks_are_shell_form_absolute_hook_commands() {
                     command.starts_with('\''),
                     "{event}: executable must be single-quoted: {command}"
                 );
-                let rest = command.strip_prefix('\'').unwrap_or(command);
+                let rest = command.trim_prefix('\'');
                 let path_end = rest.find('\'').unwrap_or(0);
                 let path = &rest[..path_end];
                 assert!(

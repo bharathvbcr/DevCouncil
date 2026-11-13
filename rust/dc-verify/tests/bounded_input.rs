@@ -131,6 +131,7 @@ fn adv_coverage_one_past_the_cap_does_not_echo_the_tail() {
     let marker = b"COVERAGE-TAIL-MARKER";
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&profile)
         .unwrap();

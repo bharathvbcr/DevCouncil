@@ -70,7 +70,7 @@ fn has_a_hole(line: &str) -> bool {
     while index < bytes.len() {
         let byte = bytes[index];
         if byte == b'"' && previous != Some(b'\\') {
-            in_literal = !in_literal;
+            in_literal.toggle();
             previous = Some(byte);
             index += 1;
             continue;
@@ -116,7 +116,7 @@ fn no_message_literal_in_the_kernel_carries_a_run_of_spaces() {
             if has_a_hole(line) {
                 holes.push(format!(
                     "{}:{}: {}",
-                    path.strip_prefix(&root).unwrap_or(path).display(),
+                    path.trim_prefix(&root).display(),
                     number + 1,
                     line.trim()
                 ));

@@ -7,20 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-struct Cleanup(Arc<AtomicBool>);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cleaned = Arc::new(AtomicBool::new(false));
     let worker_cleaned = Arc::clone(&cleaned);
     let failed = tokio::task::spawn_blocking(move || {
-        let _cleanup = Cleanup(worker_cleaned);
+        let _cleanup = std::mem::DropGuard::new(worker_cleaned, |flag| {
+            flag.store(true, Ordering::SeqCst);
+        });
         panic!("intentional worker recovery probe");
     });
     match tokio::time::timeout(Duration::from_secs(5), failed).await? {

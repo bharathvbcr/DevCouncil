@@ -13,12 +13,7 @@ use devmap_store::{GenerationWriteOpts, Store};
 use serde_json::{json, Value};
 
 fn devmap() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("devmap")
+    PathBuf::from(env!("CARGO_BIN_EXE_devmap"))
 }
 
 fn scratch(label: &str) -> PathBuf {

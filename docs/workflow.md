@@ -116,8 +116,9 @@ other revision (`rust/gusset-engine/check-pin.sh`).
 ### Bumping the pinned toolchains
 
 - **Rust:** edit `channel` in the root `rust-toolchain.toml` and nothing else
-  names a version except `rust-version` (`rust/Cargo.toml` and
-  `rust/dc-sparse-encode/Cargo.toml`), which moves to the same minor. Run
+  names a version except `rust-version` (`rust/Cargo.toml`,
+  `rust/dc-sparse-encode/Cargo.toml`, `rust/rank-eval/Cargo.toml` and
+  `rust/gusset-engine/Cargo.toml`), which moves to the same minor. Run
   `cargo fmt --all -- --check` and clippy with `-D warnings` for both package
   sets in `.github/workflows/rust.yml` and `analysis-plane.yml`, fix what the new
   release flags, and commit the bump on its own so a red CI points at it.

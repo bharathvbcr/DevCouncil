@@ -177,7 +177,7 @@ fn grant_gap(text: &str) -> Option<String> {
 
 /// The `---`-delimited block a definition opens with, or `None` without one.
 fn frontmatter(text: &str) -> Option<&str> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = text.trim_prefix('\u{feff}');
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
@@ -223,7 +223,7 @@ fn list_field(frontmatter: &str, key: &str) -> Option<Vec<String>> {
         .iter()
         .flat_map(|part| {
             let part = part.trim();
-            let part = part.strip_prefix("- ").unwrap_or(part);
+            let part = part.trim_prefix("- ");
             part.split(',').map(str::to_string).collect::<Vec<_>>()
         })
         .map(|entry| {
@@ -241,7 +241,7 @@ fn list_field(frontmatter: &str, key: &str) -> Option<Vec<String>> {
 
 /// The bare `mcp__<server>` an entry grants whole, if it is a server grant.
 fn whole_server(entry: &str) -> Option<&str> {
-    let stem = entry.strip_suffix("__*").unwrap_or(entry);
+    let stem = entry.trim_suffix("__*");
     (stem.starts_with("mcp__") && !stem[5..].contains("__")).then_some(stem)
 }
 

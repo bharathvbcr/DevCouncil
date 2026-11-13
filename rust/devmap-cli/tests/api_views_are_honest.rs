@@ -12,12 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn devmap() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("devmap")
+    PathBuf::from(env!("CARGO_BIN_EXE_devmap"))
 }
 
 /// A repository with one Flask route, its handler, and one client that calls it.
