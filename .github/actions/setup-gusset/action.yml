@@ -25,12 +25,13 @@ runs:
         # Pinned to the sibling revision this tree was linked against, and the
         # one rust/gusset-engine builds --locked against (gusset v0.0.3: the I1
         # WaitBuffer fix, ErrBadArg refusals; needs libc 0.2.191 for Apple
-        # F_SETNOSIGPIPE). Bump deliberately, in the same change as the
+        # F_SETNOSIGPIPE; since 2026-11-12 a Rust 1.100 floor with the
+        # allocator API always on). Bump deliberately, in the same change as the
         # code that needs it: tracking main would let a Gusset push fail a
         # DevCouncil release without a DevCouncil commit. ci:local and
         # rust/verify.sh fail when ../gusset is at another revision
         # (rust/gusset-engine/check-pin.sh).
-        ref: e561435afaf6cbfc0331108a14dda4d9595dae54
+        ref: 19383ad19a3d8ace3b205ce35ebe433a64fae3e2
         path: third_party/gusset
         persist-credentials: false
 
