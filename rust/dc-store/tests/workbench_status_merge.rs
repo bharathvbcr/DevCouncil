@@ -287,7 +287,7 @@ fn a_schema_15_profile_with_inbox_tasks_is_rewritten_to_backlog() {
     clock.store(9000, Ordering::SeqCst);
     s.upgrade_workbench_profile().unwrap();
 
-    assert_eq!(version(&s), 16);
+    assert_eq!(version(&s), 17);
     assert_eq!(version(&s), dc_store::workbench::WORKBENCH_SCHEMA);
     assert_eq!(status_everywhere(&s), Vec::<(String, String)>::new());
     for (id, want) in [
@@ -387,7 +387,7 @@ fn an_idle_profile_without_inbox_tasks_upgrades_untouched() {
         .execute_batch("UPDATE work_meta SET version=15 WHERE id=1")
         .unwrap();
     s.upgrade_workbench_profile().unwrap();
-    assert_eq!(version(&s), 16);
+    assert_eq!(version(&s), 17);
     let after: String = s
         .connection()
         .query_row("SELECT body FROM work_items WHERE id='a'", [], |r| r.get(0))

@@ -278,7 +278,7 @@ fn profile_with_ci_signal() -> (Scratch, PathBuf) {
 }
 
 #[test]
-fn a_schema_14_profile_with_a_task_and_a_ci_signal_upgrades_to_16_after_a_backup() {
+fn a_schema_14_profile_with_a_task_and_a_ci_signal_upgrades_to_17_after_a_backup() {
     let (_dir, path) = profile_with_ci_signal();
     let store = Store::open(&path).unwrap();
 
@@ -295,13 +295,13 @@ fn a_schema_14_profile_with_a_task_and_a_ci_signal_upgrades_to_16_after_a_backup
 
     let reply = call(&store, "store.upgrade", "{}");
     assert_eq!(field(&store, &reply, "$.item.from"), "14", "{reply}");
-    assert_eq!(field(&store, &reply, "$.item.to"), "16", "{reply}");
+    assert_eq!(field(&store, &reply, "$.item.to"), "17", "{reply}");
     assert_eq!(field(&store, &reply, "$.item.upgraded"), "1", "{reply}");
     assert!(
         field(&store, &reply, "$.item.backup").ends_with(".pre-schema-14.bak"),
         "{reply}"
     );
-    assert_eq!(version(&path), 16);
+    assert_eq!(version(&path), 17);
     assert_eq!(version(&path), dc_store::workbench::WORKBENCH_SCHEMA);
 
     // The backup is the whole profile at the old version, data included.
@@ -339,20 +339,38 @@ fn a_schema_14_profile_with_a_task_and_a_ci_signal_upgrades_to_16_after_a_backup
 }
 
 #[test]
-fn a_schema_16_profile_is_current_and_a_newer_one_is_refused_as_unsupported() {
+fn a_schema_17_profile_is_current_and_a_newer_one_is_refused_as_unsupported() {
     let (_dir, path) = profile_with_ci_signal();
     set_version(&path, 16);
+    let store = Store::open(&path).unwrap();
+    let err = store.workbench_request("attention.list", "{}").unwrap_err();
+    assert_eq!(err.code, "schema_upgrade_required");
+    let reply = call(&store, "store.upgrade", "{}");
+    assert_eq!(field(&store, &reply, "$.item.from"), "16", "{reply}");
+    assert_eq!(field(&store, &reply, "$.item.to"), "17", "{reply}");
+    assert_eq!(version(&path), 17);
+    let queue_tables: i64 = store
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('work_queue','work_queue_members','work_issue_sync','work_outbox')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_tables, 4);
+    drop(store);
+
     let store = Store::open(&path).unwrap();
     // Current: read and written without an upgrade or a backup.
     let page = call(&store, "attention.list", "{}");
     assert_eq!(field(&store, &page, "$.total"), "2", "{page}");
     put_workspace(&store, "five").unwrap();
-    assert_eq!(version(&path), 16);
+    assert_eq!(version(&path), 17);
     drop(store);
 
     // One schema ahead of this build: an older host must not touch it, and a
     // host cannot upgrade down.
-    set_version(&path, 17);
+    set_version(&path, 18);
     let store = Store::open(&path).unwrap();
     for result in [
         store.workbench_request("attention.list", "{}"),
@@ -361,11 +379,12 @@ fn a_schema_16_profile_is_current_and_a_newer_one_is_refused_as_unsupported() {
     ] {
         assert_eq!(result.unwrap_err().code, "schema_unsupported");
     }
-    assert_eq!(version(&path), 17, "a newer profile was rewritten");
+    assert_eq!(version(&path), 18, "a newer profile was rewritten");
     let backups = std::fs::read_dir(path.parent().unwrap())
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+        .filter(|e| e.file_name().to_string_lossy().contains("pre-schema-17"))
         .count();
     assert_eq!(backups, 0, "a refused profile was backed up");
 }
