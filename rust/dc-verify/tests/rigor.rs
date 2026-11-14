@@ -453,7 +453,8 @@ fn sibling_prefixes_of_the_vendors_already_listed_are_detected() {
     }
 }
 
-/// A Google OAuth token printed bare — no `access_token=`, no `Bearer` in
+/// A Google OAuth token or client secret printed bare — no `access_token=`,
+/// no `client_secret`, no `Bearer` in
 /// front — in a log line a commit adds. Only the vendor prefix names it, so
 /// the gate must block on the prefix alone. The fixtures are split so this
 /// file is not itself a credential to the gate.
@@ -461,7 +462,12 @@ fn sibling_prefixes_of_the_vendors_already_listed_are_detected() {
 fn a_bare_google_oauth_token_in_an_added_line_is_blocking() {
     let access = concat!("ya", "29.", "a0FAKEfake-Token_notReal.0123456789abcdef");
     let refresh = concat!("1/", "/", "0gFAKEfakeRefresh-Token_notReal0123456789ab");
-    for (name, token) in [("access", access), ("refresh", refresh)] {
+    let client_secret = concat!("GOC", "SPX-", "FAKEfake-Secret_notReal01234");
+    for (name, token) in [
+        ("access", access),
+        ("refresh", refresh),
+        ("client secret", client_secret),
+    ] {
         let line = format!("log.Printf(\"retrying after %s\", \"{token}\")");
         let files = vec![diff_of("src/a.go", &[(1, &line)])];
         let findings = scan_secrets(&files);

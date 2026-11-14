@@ -12,6 +12,7 @@ fn every_family_checks_later_candidates_and_redacts_distinct_values() {
         "AIza",
         concat!("ya", "29."),
         concat!("1/", "/"),
+        concat!("GOC", "SPX-"),
         "ghp_",
         "gho_",
         "ghs_",

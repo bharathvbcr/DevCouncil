@@ -174,8 +174,9 @@ fn a_long_dotted_or_slashed_run_after_ya29_is_redacted_on_purpose() {
     assert!(!redact_secrets(run).contains("example.com"));
 }
 
-/// A Google OAuth client secret: `GOCSPX-` and a URL-safe body. Real secrets
-/// are 35 characters; the fixture is too, `FAKE`-marked.
+/// A Google OAuth client secret: `GOCSPX-` and a URL-safe body. Secret
+/// scanners expect 35 characters in all; the fixture is that length,
+/// `FAKE`-marked.
 const CLIENT_SECRET: &str = concat!("GOC", "SPX-", "FAKEfake-Secret_notReal01234");
 const CLIENT_SECRET_NAME: &str = "google oauth client secret";
 
@@ -204,16 +205,16 @@ fn a_bare_google_client_secret_is_redacted_wherever_it_appears() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Google publishes no length for the body, and scanners disagree (24 and 28
-/// characters both appear), so the floor sits under both: a real secret one
-/// shape shorter than expected must not pass whole. Under the floor, in a
-/// word, or in another case, it is not one.
+/// Google publishes no length for the body. Its codelab placeholder has 26
+/// characters and secret scanners expect 28, so the floor sits under both,
+/// with room for a real secret shorter than either: it must not pass whole.
+/// Under the floor, in a word, or in another case, it is not one.
 #[test]
 fn the_client_secret_floor_admits_every_published_shape() {
     for body in [
-        "FAKEfake-Secret_notReal0",        // 24
+        "FAKEfake-Secret_notReal0",        // 24, headroom under both
         "FAKEfake-Secret_notReal012",      // 26, Google's codelab placeholder length
-        "FAKEfake-Secret_notReal01234",    // 28
+        "FAKEfake-Secret_notReal01234",    // 28, what secret scanners expect
         "FAKEfake-Secret_notReal01234567", // longer
     ] {
         let secret = format!("{}{body}", concat!("GOC", "SPX-"));
