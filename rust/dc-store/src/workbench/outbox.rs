@@ -61,10 +61,12 @@ fn sha256_hex(data: &[u8]) -> String {
         padded.push(0);
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in padded.chunks_exact(64) {
+    // The padding above makes `padded` a whole number of 64-byte blocks, so
+    // both `as_chunks` remainders are empty.
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -768,6 +770,19 @@ fn sync_dismiss(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<
     put_body(input.conn, Entity::IssueSync, id, revision, &next_body)
 }
 
+/// What [`build_outbound_payload`] resolved for one outbound operation.
+struct OutboundPayload {
+    /// The issue-sync record, absent for `create_issue`.
+    sync_id: Option<String>,
+    outbound_opt_in: bool,
+    repo_slug: String,
+    issue_number: Option<i64>,
+    payload_json: String,
+    digest: String,
+    conflict_fields: Vec<String>,
+    conflicts_json: String,
+}
+
 fn build_outbound_payload(
     conn: &Connection,
     task_id: &str,
@@ -775,17 +790,7 @@ fn build_outbound_payload(
     repo_slug_input: Option<String>,
     fields_input: Vec<String>,
     remote_override: Option<&IssueSnapshot>,
-) -> Result<(
-    Option<String>,
-    bool,
-    String,
-    Option<i64>,
-    Vec<String>,
-    String,
-    String,
-    Vec<String>,
-    String,
-)> {
+) -> Result<OutboundPayload> {
     let (_, task_body) = require_live_task(conn, task_id)?;
     let local = IssueSnapshot::from_task_body(conn, &task_body)?;
     let existing_sync = load_sync_for_task(conn, task_id)?;
@@ -820,17 +825,16 @@ fn build_outbound_payload(
             |r| r.get(0),
         )?;
         let digest = sha256_hex(payload_json.as_bytes());
-        return Ok((
-            None,
-            true,
+        return Ok(OutboundPayload {
+            sync_id: None,
+            outbound_opt_in: true,
             repo_slug,
-            None,
-            selected,
+            issue_number: None,
             payload_json,
             digest,
-            Vec::new(),
-            "[]".into(),
-        ));
+            conflict_fields: Vec::new(),
+            conflicts_json: "[]".into(),
+        });
     }
 
     // update_issue
@@ -897,17 +901,16 @@ fn build_outbound_payload(
         |r| r.get(0),
     )?;
     let digest = sha256_hex(payload_json.as_bytes());
-    Ok((
-        Some(sync_id),
-        opt_in,
-        link_slug,
-        Some(issue_number),
-        selected,
+    Ok(OutboundPayload {
+        sync_id: Some(sync_id),
+        outbound_opt_in: opt_in,
+        repo_slug: link_slug,
+        issue_number: Some(issue_number),
         payload_json,
         digest,
         conflict_fields,
         conflicts_json,
-    ))
+    })
 }
 
 /// Pure read-only preview of an outbound GitHub issue operation. Writes nothing.
@@ -934,17 +937,16 @@ pub(super) fn preview(input: &Input<'_>) -> Result<String> {
         _ => return Err(Error::invalid("remote must be an object")),
     };
 
-    let (
+    let OutboundPayload {
         sync_id,
         outbound_opt_in,
-        resolved_slug,
+        repo_slug: resolved_slug,
         issue_number,
-        _,
         payload_json,
         digest,
         conflict_fields,
         conflicts_json,
-    ) = build_outbound_payload(
+    } = build_outbound_payload(
         input.conn,
         &task_id,
         &op,
@@ -1025,17 +1027,16 @@ fn outbox_enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
         return Err(Error::invalid("max_attempts must be at least 1"));
     }
 
-    let (
+    let OutboundPayload {
         sync_id,
-        link_opt_in,
-        resolved_slug,
+        outbound_opt_in: link_opt_in,
+        repo_slug: resolved_slug,
         issue_number,
-        _,
         payload_json,
         digest,
         conflict_fields,
-        _,
-    ) = build_outbound_payload(input.conn, &task_id, &op, repo_slug, fields, None)?;
+        conflicts_json: _,
+    } = build_outbound_payload(input.conn, &task_id, &op, repo_slug, fields, None)?;
 
     if op == "update_issue" && !link_opt_in {
         return Err(refuse(
@@ -1043,13 +1044,13 @@ fn outbox_enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
             "outbound GitHub sync is disabled on this link; opt in explicitly before enqueueing updates",
         ));
     }
-    if let Some(expected) = confirm_digest {
-        if expected != digest {
-            return Err(refuse(
-                "payload_changed",
-                "the task changed after preview; re-preview and re-confirm before sending",
-            ));
-        }
+    if let Some(expected) = confirm_digest
+        && expected != digest
+    {
+        return Err(refuse(
+            "payload_changed",
+            "the task changed after preview; re-preview and re-confirm before sending",
+        ));
     }
     if !conflict_fields.is_empty() {
         return Err(refuse(
@@ -1727,10 +1728,10 @@ pub(super) fn list_outbox(input: &Input<'_>, now: i64) -> Result<String> {
     input.fields(&["limit", "cursor", "state", "task_id", "due_only"])?;
     let p = page(input)?;
     let state = input.text("state", 32)?;
-    if let Some(s) = &state {
-        if !OUTBOX_STATES.contains(&s.as_str()) {
-            return Err(Error::invalid("unknown outbox state"));
-        }
+    if let Some(s) = &state
+        && !OUTBOX_STATES.contains(&s.as_str())
+    {
+        return Err(Error::invalid("unknown outbox state"));
     }
     let task_id = input.optional_id("task_id")?;
     let due_only = input.boolean("due_only", false)?;
