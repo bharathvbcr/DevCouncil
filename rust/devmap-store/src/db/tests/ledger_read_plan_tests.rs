@@ -295,13 +295,19 @@ fn every_keyed_read_returns_what_the_statement_it_replaced_returned() {
                     "{name} at generation {generation}, cap {cap}: the store's answer \
                      disagrees with the statement it replaced"
                 );
-                non_empty += oracle.values().filter(|(sites, _)| !sites.is_empty()).count();
+                non_empty += oracle
+                    .values()
+                    .filter(|(sites, _)| !sites.is_empty())
+                    .count();
                 truncated_somewhere += oracle.values().filter(|(_, cut)| *cut).count();
             }
         }
     }
     // A parity test over an empty or never-truncated answer proves nothing.
-    assert!(non_empty >= 40, "the fixture produced almost no rows: {non_empty}");
+    assert!(
+        non_empty >= 40,
+        "the fixture produced almost no rows: {non_empty}"
+    );
     assert!(
         truncated_somewhere >= 8,
         "the fixture never exercised the per-key cap: {truncated_somewhere}"
@@ -377,7 +383,8 @@ fn a_keyed_ledger_read_scans_the_ledger_once_and_not_per_key_and_label() {
             let first_loop = plan
                 .iter()
                 .find(|(_, level, detail)| {
-                    level == parent && (detail.starts_with("SCAN ") || detail.starts_with("SEARCH "))
+                    level == parent
+                        && (detail.starts_with("SCAN ") || detail.starts_with("SEARCH "))
                 })
                 .expect("the scan's own level has a loop");
             assert!(

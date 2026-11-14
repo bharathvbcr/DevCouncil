@@ -175,13 +175,18 @@ fn is_active_member_state(state: &str) -> bool {
 }
 
 fn is_terminal_member_state(state: &str) -> bool {
-    matches!(state, "passed" | "failed" | "blocked" | "cancelled" | "timed_out")
+    matches!(
+        state,
+        "passed" | "failed" | "blocked" | "cancelled" | "timed_out"
+    )
 }
 
 fn member_active_at(m: &MemberRow, now: i64) -> i64 {
     if is_active_member_state(&m.state) {
         if let Some(last) = m.last_active_at {
-            return m.active_seconds.saturating_add(now.saturating_sub(last).max(0));
+            return m
+                .active_seconds
+                .saturating_add(now.saturating_sub(last).max(0));
         }
     }
     m.active_seconds
@@ -409,7 +414,17 @@ pub(super) fn attach_run(
         [queue_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    sync_queue_body(conn, queue_id, rev, now, &state, leased_at, finished_at, None, None)
+    sync_queue_body(
+        conn,
+        queue_id,
+        rev,
+        now,
+        &state,
+        leased_at,
+        finished_at,
+        None,
+        None,
+    )
 }
 
 fn validate_dag(members: &[(String, Vec<String>)]) -> Result<()> {
@@ -435,7 +450,10 @@ fn validate_dag(members: &[(String, Vec<String>)]) -> Result<()> {
                 )));
             }
             *indegree.get_mut(id.as_str()).unwrap() += 1;
-            dependents.entry(dep.as_str()).or_default().push(id.as_str());
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(id.as_str());
         }
     }
     let mut ready = VecDeque::new();
@@ -504,8 +522,11 @@ fn enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         ));
     }
     let title = input.required_text("title", 300)?;
-    let concurrency_limit =
-        input.integer("concurrency_limit", Some(DEFAULT_CONCURRENCY), MAX_CONCURRENCY)?;
+    let concurrency_limit = input.integer(
+        "concurrency_limit",
+        Some(DEFAULT_CONCURRENCY),
+        MAX_CONCURRENCY,
+    )?;
     if concurrency_limit < MIN_CONCURRENCY {
         return Err(Error::invalid(format!(
             "concurrency_limit must be between {MIN_CONCURRENCY} and {MAX_CONCURRENCY}"
@@ -567,9 +588,7 @@ fn enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         ])?;
         let member_id = m_in.id("member_id")?;
         if !seen_member_ids.insert(member_id.clone()) {
-            return Err(Error::invalid(format!(
-                "duplicate member_id {member_id}"
-            )));
+            return Err(Error::invalid(format!("duplicate member_id {member_id}")));
         }
         let repository_id = m_in.id("repository_id")?;
         let repo_exists: bool = input.conn.query_row(
@@ -676,7 +695,9 @@ fn enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             ],
         )?;
     }
-    sync_queue_body(input.conn, id, revision, now, "queued", None, None, None, None)
+    sync_queue_body(
+        input.conn, id, revision, now, "queued", None, None, None, None,
+    )
 }
 
 fn acquire(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
@@ -698,10 +719,8 @@ fn acquire(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         ));
     }
     let members = load_members(input.conn, id)?;
-    let by_id: HashMap<&str, &MemberRow> = members
-        .iter()
-        .map(|m| (m.member_id.as_str(), m))
-        .collect();
+    let by_id: HashMap<&str, &MemberRow> =
+        members.iter().map(|m| (m.member_id.as_str(), m)).collect();
     let active_count = i64::try_from(
         members
             .iter()
@@ -765,7 +784,17 @@ fn acquire(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         )?;
     }
     let next_leased_at = leased_at.or(Some(now));
-    sync_queue_body(input.conn, id, revision, now, "leased", next_leased_at, None, None, None)
+    sync_queue_body(
+        input.conn,
+        id,
+        revision,
+        now,
+        "leased",
+        next_leased_at,
+        None,
+        None,
+        None,
+    )
 }
 
 fn member_update(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
@@ -990,7 +1019,13 @@ fn member_update(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result
 }
 
 fn verify(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
-    input.fields(&["request_id", "id", "expected_revision", "results", "publication"])?;
+    input.fields(&[
+        "request_id",
+        "id",
+        "expected_revision",
+        "results",
+        "publication",
+    ])?;
     if let Some(publication) = input.text("publication", 64)? {
         if publication != "manual_per_repository" {
             return Err(Error::invalid(
@@ -1040,10 +1075,8 @@ fn verify(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         verification_json: String,
     }
 
-    let by_id: HashMap<&str, &MemberRow> = members
-        .iter()
-        .map(|m| (m.member_id.as_str(), m))
-        .collect();
+    let by_id: HashMap<&str, &MemberRow> =
+        members.iter().map(|m| (m.member_id.as_str(), m)).collect();
     let mut stmt = input
         .conn
         .prepare("SELECT type, value FROM json_each(?1,'$.results')")?;
@@ -1059,7 +1092,14 @@ fn verify(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             conn: input.conn,
             raw: &raw_entry,
         };
-        r_in.fields(&["member_id", "ok", "head_oid", "command", "exit_code", "summary"])?;
+        r_in.fields(&[
+            "member_id",
+            "ok",
+            "head_oid",
+            "command",
+            "exit_code",
+            "summary",
+        ])?;
         let member_id = r_in.id("member_id")?;
         if !by_id.contains_key(member_id.as_str()) {
             return Err(Error::invalid(format!(

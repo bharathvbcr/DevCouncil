@@ -332,7 +332,10 @@ fn production_spawn_lines(text: &str) -> Vec<usize> {
             .find('{')
             .is_some_and(|brace| !item[..brace].contains(';'));
         if item.starts_with("mod ") && opens_a_body {
-            depth = line.matches('{').count().saturating_sub(line.matches('}').count());
+            depth = line
+                .matches('{')
+                .count()
+                .saturating_sub(line.matches('}').count());
             continue;
         }
         if line.contains("Command::new(") {

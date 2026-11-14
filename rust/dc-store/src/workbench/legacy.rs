@@ -20,11 +20,11 @@
 //! migration, naming the task, instead of being skipped or truncated.
 
 use super::{
-    backup_profile, ensure_schema, ensure_schema_within, local_repository_request, mutate,
-    work_meta_version, Error, Input, Result, LOCAL_REPOSITORY_ID, WORKBENCH_SCHEMA,
+    Error, Input, LOCAL_REPOSITORY_ID, Result, WORKBENCH_SCHEMA, backup_profile, ensure_schema,
+    ensure_schema_within, local_repository_request, mutate, work_meta_version,
 };
-use crate::{json, Store};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::{Store, json};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 
 /// What a migration did, for a caller that wants to report it.

@@ -89,7 +89,10 @@ fn kotlinsemi_get_after_a_local_val_in_a_body_is_not_an_accessor() {
     let extraction = extract_file("C.kt", source);
     assert!(clean(&extraction), "{:?}", extraction.parse_outcome);
     assert!(
-        extraction.calls.iter().any(|call| call.callee_name == "get"),
+        extraction
+            .calls
+            .iter()
+            .any(|call| call.callee_name == "get"),
         "the call get(k) is gone: {:?}",
         extraction.diagnostics
     );
@@ -111,7 +114,10 @@ fn kotlinsemi_two_vals_on_one_line_and_an_accessor() {
     assert!(clean(&extraction), "{:?}", extraction.parse_outcome);
     let found = names(&extraction);
     for expected in ["C.kt::C.a", "C.kt::C.b", "C.kt::C.m", "C.kt::C.f"] {
-        assert!(found.contains(&expected.to_string()), "{expected} in {found:?}");
+        assert!(
+            found.contains(&expected.to_string()),
+            "{expected} in {found:?}"
+        );
     }
 }
 
@@ -119,15 +125,25 @@ fn kotlinsemi_two_vals_on_one_line_and_an_accessor() {
 fn kotlinsemi_val_with_an_inline_getter_after_a_semicolon() {
     let source = "class C {\n    val x = 1; get() = field + 1\n    fun f() = 1\n}\nfun g() = 2\n";
     let extraction = extract_file("C.kt", source);
-    assert!(names(&extraction).contains(&"C.kt::g".to_string()), "{:?}", names(&extraction));
+    assert!(
+        names(&extraction).contains(&"C.kt::g".to_string()),
+        "{:?}",
+        names(&extraction)
+    );
     assert_spans_are_the_originals("C.kt", source);
 }
 
 #[test]
 fn kotlinsemi_crlf_line_endings() {
-    let source = "class C {\r\n    var m: Int = 0; private set\r\n    fun f() = 1\r\n}\r\nfun g() = 2\r\n";
+    let source =
+        "class C {\r\n    var m: Int = 0; private set\r\n    fun f() = 1\r\n}\r\nfun g() = 2\r\n";
     let extraction = extract_file("C.kt", source);
-    assert!(clean(&extraction), "{:?} {:?}", extraction.parse_outcome, extraction.diagnostics);
+    assert!(
+        clean(&extraction),
+        "{:?} {:?}",
+        extraction.parse_outcome,
+        extraction.diagnostics
+    );
     assert!(names(&extraction).contains(&"C.kt::g".to_string()));
     assert_spans_are_the_originals("C.kt", source);
 }
@@ -136,7 +152,11 @@ fn kotlinsemi_crlf_line_endings() {
 fn kotlinsemi_cr_only_line_endings() {
     let source = "class C {\r    var m: Int = 0; private set\r    fun f() = 1\r}\rfun g() = 2\r";
     let extraction = extract_file("C.kt", source);
-    assert!(names(&extraction).contains(&"C.kt::g".to_string()), "{:?}", names(&extraction));
+    assert!(
+        names(&extraction).contains(&"C.kt::g".to_string()),
+        "{:?}",
+        names(&extraction)
+    );
 }
 
 #[test]
@@ -172,7 +192,8 @@ fn kotlinsemi_the_edit_cap_is_reported_not_silent() {
     source.push_str("    fun f() = 1\n}\nfun g() = 2\n");
     let extraction = extract_file("C.kt", &source);
     let found = names(&extraction);
-    let outcome_is_honest = clean(&extraction) || matches!(extraction.parse_outcome, ParseOutcome::Partial { .. });
+    let outcome_is_honest =
+        clean(&extraction) || matches!(extraction.parse_outcome, ParseOutcome::Partial { .. });
     assert!(outcome_is_honest, "{:?}", extraction.parse_outcome);
     // At the cap the class and `g` should not simply vanish without a Partial.
     if !found.contains(&"C.kt::g".to_string()) {
@@ -217,7 +238,11 @@ fn kotlinsemi_exactly_512_accessor_semicolons_still_repair() {
 fn kotlinsemi_a_one_line_class_and_an_accessor_and_a_second_property() {
     let source = "class A { var x = 1; private set; var y = 2 }\nfun top() {}\n";
     let extraction = extract_file("A.kt", source);
-    assert!(names(&extraction).contains(&"A.kt::top".to_string()), "{:?}", names(&extraction));
+    assert!(
+        names(&extraction).contains(&"A.kt::top".to_string()),
+        "{:?}",
+        names(&extraction)
+    );
 }
 
 // ---- property rule (P2) ------------------------------------------------------
@@ -289,7 +314,10 @@ fn property_shapes_are_fields_with_the_owner_a_call_would_name() {
 #[test]
 fn property_an_extension_property_is_a_callable_not_a_field() {
     let extraction = extract_file("S.kt", SHAPES);
-    assert_ne!(kind_of(&extraction, "S.kt::Shapes.ext"), Some(SymbolKind::Field));
+    assert_ne!(
+        kind_of(&extraction, "S.kt::Shapes.ext"),
+        Some(SymbolKind::Field)
+    );
 }
 
 #[test]
@@ -312,7 +340,10 @@ fn property_withholding_is_not_silent() {
     let source = "class A { class Inner { val x = 1 } }\nclass B { class Inner { val x = 2 } }\n";
     let extraction = extract_file("N.kt", source);
     assert!(
-        extraction.diagnostics.iter().any(|d| d.contains("property id withheld")),
+        extraction
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("property id withheld")),
         "{:?}",
         extraction.diagnostics
     );
@@ -327,7 +358,10 @@ fn property_a_class_and_a_property_of_one_name_in_one_owner() {
         .filter(|(n, _)| n.ends_with("Foo"))
         .collect::<Vec<_>>();
     // The class keeps `O.Foo`; the property is withheld, with a diagnostic.
-    assert!(class.iter().any(|(_, k)| *k == SymbolKind::Class), "{class:?}");
+    assert!(
+        class.iter().any(|(_, k)| *k == SymbolKind::Class),
+        "{class:?}"
+    );
     assert!(
         !class.iter().any(|(_, k)| *k == SymbolKind::Field),
         "a Field and a Class share an id: {class:?}"
@@ -358,7 +392,12 @@ fn property_with_a_comment_between_val_and_name_is_still_settled_against_a_funct
         .iter()
         .filter(|s| s.qualified_name == "C.kt::C.size")
         .count();
-    assert_eq!(n, 1, "two symbols share C.kt::C.size: {:?}", kinds(&extraction));
+    assert_eq!(
+        n,
+        1,
+        "two symbols share C.kt::C.size: {:?}",
+        kinds(&extraction)
+    );
 }
 
 #[test]
@@ -366,7 +405,11 @@ fn property_with_an_annotation_between_val_and_name_is_settled() {
     let source = "class C {\n    val size = 1\n    fun size() = 2\n    @get:JvmName(\"q\") val q = 1\n    fun q() = 3\n}\n";
     let extraction = extract_file("C.kt", source);
     for id in ["C.kt::C.size", "C.kt::C.q"] {
-        let n = extraction.symbols.iter().filter(|s| s.qualified_name == id).count();
+        let n = extraction
+            .symbols
+            .iter()
+            .filter(|s| s.qualified_name == id)
+            .count();
         assert_eq!(n, 1, "{id}: {:?}", kinds(&extraction));
     }
 }
@@ -385,12 +428,34 @@ fn property_constructor_parameter_with_val_and_a_function_of_the_same_name() {
 
 #[test]
 fn property_expect_actual_files_each_own_their_property() {
-    let common = extract_file("common/P.kt", "expect val platform: String\nexpect class Q { val x: Int }\n");
-    let jvm = extract_file("jvm/P.kt", "actual val platform: String = \"j\"\nactual class Q { actual val x: Int = 1 }\n");
-    assert!(names(&common).contains(&"common/P.kt::platform".to_string()), "{:?}", names(&common));
-    assert!(names(&jvm).contains(&"jvm/P.kt::platform".to_string()), "{:?}", names(&jvm));
-    assert!(names(&common).contains(&"common/P.kt::Q.x".to_string()), "{:?}", names(&common));
-    assert!(names(&jvm).contains(&"jvm/P.kt::Q.x".to_string()), "{:?}", names(&jvm));
+    let common = extract_file(
+        "common/P.kt",
+        "expect val platform: String\nexpect class Q { val x: Int }\n",
+    );
+    let jvm = extract_file(
+        "jvm/P.kt",
+        "actual val platform: String = \"j\"\nactual class Q { actual val x: Int = 1 }\n",
+    );
+    assert!(
+        names(&common).contains(&"common/P.kt::platform".to_string()),
+        "{:?}",
+        names(&common)
+    );
+    assert!(
+        names(&jvm).contains(&"jvm/P.kt::platform".to_string()),
+        "{:?}",
+        names(&jvm)
+    );
+    assert!(
+        names(&common).contains(&"common/P.kt::Q.x".to_string()),
+        "{:?}",
+        names(&common)
+    );
+    assert!(
+        names(&jvm).contains(&"jvm/P.kt::Q.x".to_string()),
+        "{:?}",
+        names(&jvm)
+    );
 }
 
 #[test]
@@ -406,12 +471,16 @@ fn property_private_nested_owner_members_are_still_nodes_but_a_private_class_par
 #[test]
 #[ignore = "ft-4617a335: a local class property is a node, same family as the local class at base"]
 fn property_a_property_in_a_local_class_or_an_anonymous_object_is_not_a_node() {
-    let source = "fun f() {\n    class Local { val inLocal = 1 }\n    val o = object { val anon = 2 }\n}\n";
+    let source =
+        "fun f() {\n    class Local { val inLocal = 1 }\n    val o = object { val anon = 2 }\n}\n";
     let extraction = extract_file("L.kt", source);
     let found = names(&extraction);
     assert!(!found.iter().any(|n| n.ends_with(".anon")), "{found:?}");
     // A local class's member is not reachable from outside: not a node either.
-    assert!(!found.iter().any(|n| n.ends_with("Local.inLocal")), "{found:?}");
+    assert!(
+        !found.iter().any(|n| n.ends_with("Local.inLocal")),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -461,7 +530,11 @@ fn typealias_inside_a_class_or_function_body_is_not_a_node_or_not_a_crash() {
     // Kotlin forbids a nested typealias, but a parser may still produce it.
     let source = "class C {\n    typealias Inner = Int\n    fun f() = 1\n}\nfun g() = 2\n";
     let extraction = extract_file("A.kt", source);
-    assert!(names(&extraction).contains(&"A.kt::g".to_string()), "{:?}", names(&extraction));
+    assert!(
+        names(&extraction).contains(&"A.kt::g".to_string()),
+        "{:?}",
+        names(&extraction)
+    );
 }
 
 #[test]
@@ -473,5 +546,10 @@ fn typealias_same_name_as_a_function_in_one_file_is_one_node() {
         .iter()
         .filter(|s| s.qualified_name == "A.kt::Pt")
         .count();
-    assert_eq!(n, 1, "alias and factory share one id: {:?}", kinds(&extraction));
+    assert_eq!(
+        n,
+        1,
+        "alias and factory share one id: {:?}",
+        kinds(&extraction)
+    );
 }

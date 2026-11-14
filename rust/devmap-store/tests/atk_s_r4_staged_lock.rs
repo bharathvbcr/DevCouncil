@@ -123,7 +123,10 @@ fn r4_case_variant_path_on_apfs() {
     touch(&lock);
     let variant = tmp.join("lANE").join(staged_name());
     remove_staged_writer_lock(&variant).unwrap();
-    assert!(!lock.exists(), "variant-case path removes the canonical private lock");
+    assert!(
+        !lock.exists(),
+        "variant-case path removes the canonical private lock"
+    );
     // case-variant staging name
     let upper = dir.join(format!("x.sqlite.SEED-{}", std::process::id()));
     assert!(remove_staged_writer_lock(&upper).is_err());
@@ -171,5 +174,8 @@ fn r4_staged_name_becomes_symlink_after_the_check() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     flipper.join().unwrap();
     eprintln!("toctou: shared lock unlinked {unlinked_shared} times, refused {refused} / 20000");
-    assert_eq!(unlinked_shared, 0, "a lock of a store that is not this process's was unlinked");
+    assert_eq!(
+        unlinked_shared, 0,
+        "a lock of a store that is not this process's was unlinked"
+    );
 }

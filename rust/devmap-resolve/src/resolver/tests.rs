@@ -108,15 +108,15 @@ fn outside() { self::helper(); }\n\
 
     let from_run = call_targets(&result, "::S.run");
     assert!(
-        from_run.iter().any(|(target, kind)| {
-            target == "src/s.rs::helper" && kind == "SameFile"
-        }),
+        from_run
+            .iter()
+            .any(|(target, kind)| { target == "src/s.rs::helper" && kind == "SameFile" }),
         "self::helper() must name the free function; got {from_run:?}"
     );
     assert!(
-        from_run.iter().any(|(target, kind)| {
-            target == "src/s.rs::S.helper" && kind == "ReceiverType"
-        }),
+        from_run
+            .iter()
+            .any(|(target, kind)| { target == "src/s.rs::S.helper" && kind == "ReceiverType" }),
         "self.helper() must stay the method; got {from_run:?}"
     );
     assert!(
@@ -131,9 +131,10 @@ fn outside() { self::helper(); }\n\
         edge.edge_kind == EdgeKind::References
             && edge.source_symbol.ends_with("::S.run")
             && edge.target_symbol == "src/s.rs::helper"
-            && edge.resolution.as_ref().is_some_and(|resolution| {
-                resolution.kind().label() == "SameFile"
-            })
+            && edge
+                .resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.kind().label() == "SameFile")
     });
     assert!(
         named,
@@ -148,9 +149,9 @@ fn outside() { self::helper(); }\n\
 
     let from_outside = call_targets(&result, "::outside");
     assert!(
-        from_outside.iter().any(|(target, kind)| {
-            target == "src/s.rs::helper" && kind == "SameFile"
-        }),
+        from_outside
+            .iter()
+            .any(|(target, kind)| { target == "src/s.rs::helper" && kind == "SameFile" }),
         "self::helper() outside an impl must keep naming the free function; got {from_outside:?}"
     );
 }
@@ -170,9 +171,9 @@ impl S {\n\
     let (_, result) = resolve_one("src/s.rs", source);
     let from_run = call_targets(&result, "::S.run");
     assert!(
-        from_run.iter().any(|(target, kind)| {
-            target == "src/s.rs::helper" && kind == "SameFile"
-        }),
+        from_run
+            .iter()
+            .any(|(target, kind)| { target == "src/s.rs::helper" && kind == "SameFile" }),
         "a path with no method homonym must still name the free function; got {from_run:?}"
     );
 }
@@ -191,9 +192,9 @@ impl S {\n\
     let (_, result) = resolve_one("src/s.rs", source);
     let from_run = call_targets(&result, "::S.run");
     assert!(
-        from_run.iter().all(|(target, kind)| {
-            !(target.ends_with("helper") && kind == "ReceiverType")
-        }),
+        from_run
+            .iter()
+            .all(|(target, kind)| { !(target.ends_with("helper") && kind == "ReceiverType") }),
         "self::helper() is not the method; got {from_run:?}"
     );
 }
@@ -230,18 +231,19 @@ impl T for S {\n\
     );
     let from_run = call_targets(&result, "::S.run");
     assert!(
-        from_run.iter().any(|(target, kind)| {
-            target == "src/配置.rs::帮助" && kind == "SameFile"
-        }),
+        from_run
+            .iter()
+            .any(|(target, kind)| { target == "src/配置.rs::帮助" && kind == "SameFile" }),
         "trait-impl self:: path must name the free function; got {from_run:?}"
     );
     assert!(
         result.edges.iter().any(|edge| {
             edge.edge_kind == EdgeKind::References
                 && edge.target_symbol == "src/配置.rs::helper"
-                && edge.resolution.as_ref().is_some_and(|resolution| {
-                    resolution.kind().label() == "SameFile"
-                })
+                && edge
+                    .resolution
+                    .as_ref()
+                    .is_some_and(|resolution| resolution.kind().label() == "SameFile")
         }),
         "a self::helper value in a unicode path must name the free function; edges {:?}",
         result
@@ -332,15 +334,15 @@ mod tests {\n\
     );
     let from_run = call_targets(&result, "::S.run");
     assert!(
-        from_run.iter().any(|(target, kind)| {
-            target == "src/s.rs::helper" && kind == "SameFile"
-        }),
+        from_run
+            .iter()
+            .any(|(target, kind)| { target == "src/s.rs::helper" && kind == "SameFile" }),
         "super::helper() inside the nested method must name the free function; got {from_run:?}"
     );
     assert!(
-        from_run.iter().all(|(target, kind)| {
-            !(target.ends_with("S.helper") && kind == "ReceiverType")
-        }),
+        from_run
+            .iter()
+            .all(|(target, kind)| { !(target.ends_with("S.helper") && kind == "ReceiverType") }),
         "super::helper() must not bind the method; got {from_run:?}"
     );
 }

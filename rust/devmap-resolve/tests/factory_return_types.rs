@@ -980,12 +980,11 @@ pub fn make_request() {
     b.header(\"Accept\", \"json\").send();
 }
 ";
-    let targets = calls_from(
-        &[("src/req.rs", builder_src)],
-        "src/req.rs::make_request",
-    );
+    let targets = calls_from(&[("src/req.rs", builder_src)], "src/req.rs::make_request");
     assert!(
-        targets.iter().any(|t| t == "src/req.rs::RequestBuilder.send"),
+        targets
+            .iter()
+            .any(|t| t == "src/req.rs::RequestBuilder.send"),
         "chained builder call .header().send() must resolve to RequestBuilder.send: {targets:?}"
     );
 }
@@ -1038,12 +1037,11 @@ function runQuery() {
     q.where('id').execute();
 }
 ";
-    let targets = calls_from(
-        &[("src/query.ts", ts_src)],
-        "src/query.ts::runQuery",
-    );
+    let targets = calls_from(&[("src/query.ts", ts_src)], "src/query.ts::runQuery");
     assert!(
-        targets.iter().any(|t| t == "src/query.ts::QueryBuilder.execute"),
+        targets
+            .iter()
+            .any(|t| t == "src/query.ts::QueryBuilder.execute"),
         "TypeScript chained method call must resolve to QueryBuilder.execute: {targets:?}"
     );
 }
@@ -1079,7 +1077,9 @@ pub fn test_deep_chain() {
         "src/chain.rs::test_deep_chain",
     );
     assert!(
-        targets.iter().any(|t| t == "src/chain.rs::ChainBuilder.finish"),
+        targets
+            .iter()
+            .any(|t| t == "src/chain.rs::ChainBuilder.finish"),
         "depth 12 chain must resolve to ChainBuilder.finish: {targets:?}"
     );
 }
@@ -1108,10 +1108,7 @@ pub fn test_cyclic() {
     a2.to_b().to_a().to_b().b_done();
 }
 ";
-    let targets = calls_from(
-        &[("src/cyclic.rs", src)],
-        "src/cyclic.rs::test_cyclic",
-    );
+    let targets = calls_from(&[("src/cyclic.rs", src)], "src/cyclic.rs::test_cyclic");
     assert!(
         targets.iter().any(|t| t == "src/cyclic.rs::TypeA.a_done"),
         "cyclic chain to A must resolve to TypeA.a_done: {targets:?}"
@@ -1149,16 +1146,17 @@ pub fn test_shadow() {
     b.step().outer_action();
 }
 ";
-    let targets = calls_from(
-        &[("src/shadow.rs", src)],
-        "src/shadow.rs::test_shadow",
-    );
+    let targets = calls_from(&[("src/shadow.rs", src)], "src/shadow.rs::test_shadow");
     assert!(
-        targets.iter().any(|t| t == "src/shadow.rs::InnerBuilder.inner_action"),
+        targets
+            .iter()
+            .any(|t| t == "src/shadow.rs::InnerBuilder.inner_action"),
         "inner shadow must resolve to InnerBuilder.inner_action: {targets:?}"
     );
     assert!(
-        targets.iter().any(|t| t == "src/shadow.rs::OuterBuilder.outer_action"),
+        targets
+            .iter()
+            .any(|t| t == "src/shadow.rs::OuterBuilder.outer_action"),
         "outer builder must resolve to OuterBuilder.outer_action: {targets:?}"
     );
 }
@@ -1192,11 +1190,15 @@ pub fn test_unrelated() {
         "src/unrelated.rs::test_unrelated",
     );
     assert!(
-        targets.iter().any(|t| t == "src/unrelated.rs::ChildWorker.work"),
+        targets
+            .iter()
+            .any(|t| t == "src/unrelated.rs::ChildWorker.work"),
         "p.get_worker().work() must resolve to ChildWorker.work: {targets:?}"
     );
     assert!(
-        targets.iter().any(|t| t == "src/unrelated.rs::ChildWorker.common_name"),
+        targets
+            .iter()
+            .any(|t| t == "src/unrelated.rs::ChildWorker.common_name"),
         "p.get_worker().common_name() must resolve to ChildWorker.common_name: {targets:?}"
     );
     assert!(
@@ -1228,11 +1230,12 @@ pub fn test_primitive_chain() {
         "src/primitive.rs::test_primitive_chain",
     );
     assert!(
-        !targets.iter().any(|t| t == "src/primitive.rs::MasterServer.shutdown"),
+        !targets
+            .iter()
+            .any(|t| t == "src/primitive.rs::MasterServer.shutdown"),
         "s.get_port().shutdown() must NOT falsely resolve to MasterServer.shutdown: {targets:?}"
     );
 }
-
 
 #[test]
 fn adversarial_chain_exceeding_max_chars() {
@@ -1257,18 +1260,22 @@ pub fn test_long_names() {
         "src/long.rs::test_long_names",
     );
     assert!(
-        targets.iter().any(|t| t == "src/long.rs::LongNameBuilder.execute"),
+        targets
+            .iter()
+            .any(|t| t == "src/long.rs::LongNameBuilder.execute"),
         "long-named chain must resolve execute(): {targets:?}"
     );
 }
 
 #[test]
 fn adversarial_builder_chain_depth_20() {
-    let mut builder_src = String::from("\
+    let mut builder_src = String::from(
+        "\
 pub struct DeepBuilder;
 impl DeepBuilder {
     pub fn new() -> Self { Self }
-");
+",
+    );
     for i in 1..=20 {
         builder_src.push_str(&format!("    pub fn s{i}(self) -> Self {{ self }}\n"));
     }
@@ -1283,7 +1290,9 @@ impl DeepBuilder {
         "src/deep20.rs::test_depth_20",
     );
     assert!(
-        targets.iter().any(|t| t == "src/deep20.rs::DeepBuilder.done"),
+        targets
+            .iter()
+            .any(|t| t == "src/deep20.rs::DeepBuilder.done"),
         "chain of depth 20 must resolve to DeepBuilder.done: {targets:?}"
     );
 }
@@ -1314,10 +1323,7 @@ function runSql() {
     q.select('*').from('users').where('active').orderBy('id').limit(10).build();
 }
 ";
-    let targets = calls_from(
-        &[("src/sql.ts", ts_src)],
-        "src/sql.ts::runSql",
-    );
+    let targets = calls_from(&[("src/sql.ts", ts_src)], "src/sql.ts::runSql");
     assert!(
         targets.iter().any(|t| t == "src/sql.ts::SqlBuilder.build"),
         "outer builder must resolve to SqlBuilder.build: {targets:?}"
@@ -1340,10 +1346,7 @@ func Make() {
     r.Header(\"a\", \"b\").Send()
 }
 ";
-    let targets = calls_from(
-        &[("builder/req.go", go_src)],
-        "builder/req.go::Make",
-    );
+    let targets = calls_from(&[("builder/req.go", go_src)], "builder/req.go::Make");
     eprintln!("Go chained targets: {targets:?}");
     assert!(
         targets.iter().any(|t| t == "builder/req.go::Request.Send"),

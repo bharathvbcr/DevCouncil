@@ -1152,7 +1152,9 @@ fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Re
             "the repository is already linked to that checkout",
         ));
     }
-    if runs::active_on_repository(input.conn, id, now)? || queue::active_on_repository(input.conn, id)? {
+    if runs::active_on_repository(input.conn, id, now)?
+        || queue::active_on_repository(input.conn, id)?
+    {
         return Err(Error {
             code: "repository_busy",
             message: "a run or queue lease is active on this repository; finish or cancel it before relinking"

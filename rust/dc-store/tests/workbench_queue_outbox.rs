@@ -163,7 +163,10 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(held_after_conflict, 0, "conflict must not leave partial leases");
+    assert_eq!(
+        held_after_conflict, 0,
+        "conflict must not leave partial leases"
+    );
 
     // Cancel external run and acquire q1 cleanly.
     call(
@@ -178,11 +181,20 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
     );
     assert_eq!(json::<String>(&s, &acq, "$.item.state"), "leased");
     // m-a and m-b leased (2 concurrent slots); m-z stays queued on depends_on=["m-a"].
-    assert_eq!(json::<String>(&s, &acq, "$.item.members[0].state"), "queued");
+    assert_eq!(
+        json::<String>(&s, &acq, "$.item.members[0].state"),
+        "queued"
+    );
     assert_eq!(json::<i64>(&s, &acq, "$.item.members[0].lease_held"), 0);
-    assert_eq!(json::<String>(&s, &acq, "$.item.members[1].state"), "leased");
+    assert_eq!(
+        json::<String>(&s, &acq, "$.item.members[1].state"),
+        "leased"
+    );
     assert_eq!(json::<i64>(&s, &acq, "$.item.members[1].lease_held"), 1);
-    assert_eq!(json::<String>(&s, &acq, "$.item.members[2].state"), "leased");
+    assert_eq!(
+        json::<String>(&s, &acq, "$.item.members[2].state"),
+        "leased"
+    );
     assert_eq!(json::<i64>(&s, &acq, "$.item.members[2].lease_held"), 1);
 
     // An unrelated run cannot hijack repo-a's leased checkout.
@@ -308,14 +320,8 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         r#"{"id":"q-timeout","request_id":"qt-sweep","expected_revision":2}"#,
     );
     assert_eq!(json::<String>(&s, &swept, "$.item.state"), "timed_out");
-    assert_eq!(
-        json::<i64>(&s, &swept, "$.item.members[0].lease_held"),
-        0
-    );
-    assert_eq!(
-        json::<i64>(&s, &swept, "$.item.members[1].lease_held"),
-        0
-    );
+    assert_eq!(json::<i64>(&s, &swept, "$.item.members[0].lease_held"), 0);
+    assert_eq!(json::<i64>(&s, &swept, "$.item.members[1].lease_held"), 0);
 
     // Queue 2: failure of m-a blocks downstream m-b instead of launching it, and elapsed timeout (7200s) works too.
     call(
@@ -390,13 +396,7 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
 fn task_blocks_and_parent_dependencies_gate_launch_and_reject_cycles() {
     let (s, _) = fixture();
     put_task(&s, "blocker", 0, "repo-a", r#","status":"ready""#);
-    put_task(
-        &s,
-        "downstream",
-        0,
-        "repo-a",
-        r#","status":"ready""#,
-    );
+    put_task(&s, "downstream", 0, "repo-a", r#","status":"ready""#);
     // blocker -> blocks -> downstream
     put_task(
         &s,
@@ -416,10 +416,7 @@ fn task_blocks_and_parent_dependencies_gate_launch_and_reject_cycles() {
 
     let r = call(&s, "items.readiness", r#"{"id":"downstream"}"#);
     assert_eq!(json::<i64>(&s, &r, "$.item.ready"), 0);
-    assert_eq!(
-        json::<String>(&s, &r, "$.item.blocked_by[0].id"),
-        "blocker"
-    );
+    assert_eq!(json::<String>(&s, &r, "$.item.blocked_by[0].id"), "blocker");
 
     // runs.prepare refuses blocked task with task_blocked.
     refuse(

@@ -1278,8 +1278,14 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
         )
         .await,
     );
-    assert!(stale_err.contains("devmap seed --sync-delta"), "{stale_err}");
-    assert!(lease_path.is_file(), "an MCP read must not delete lane state");
+    assert!(
+        stale_err.contains("devmap seed --sync-delta"),
+        "{stale_err}"
+    );
+    assert!(
+        lease_path.is_file(),
+        "an MCP read must not delete lane state"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -1299,19 +1305,31 @@ fn provisioned_stacked_lane(tag: &str) -> (PathBuf, PathBuf) {
             .current_dir(dir)
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     };
     git(&anchor, &["init", "-q", "-b", "main"]);
     git(&anchor, &["add", "."]);
     git(&anchor, &["commit", "-qm", "base"]);
-    git(&anchor, &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()]);
+    git(
+        &anchor,
+        &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()],
+    );
     let head = git(&anchor, &["rev-parse", "HEAD"]);
     let anchor_db = devmap_extract::paths::store_path(&anchor);
     std::fs::create_dir_all(anchor_db.parent().unwrap()).unwrap();
     let store = devmap_store::Store::open(&anchor_db).unwrap();
-    store.bind_repo_root(&anchor.canonicalize().unwrap()).unwrap();
-    let exts = vec![devmap_extract::extract_file("lib.rs", "pub fn base_only() -> i32 { 1 }\n")];
+    store
+        .bind_repo_root(&anchor.canonicalize().unwrap())
+        .unwrap();
+    let exts = vec![devmap_extract::extract_file(
+        "lib.rs",
+        "pub fn base_only() -> i32 { 1 }\n",
+    )];
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&exts);
     let res = resolver.resolve_all(&exts).unwrap();
@@ -1337,12 +1355,22 @@ fn provisioned_stacked_lane(tag: &str) -> (PathBuf, PathBuf) {
 async fn a_lease_that_disagrees_with_its_base_is_an_mcp_error_naming_the_field() {
     let (base, lane) = provisioned_stacked_lane("stacked-mcp-lease-claims");
     let lease_path = devmap_extract::paths::stack_lease_path(&lane);
-    let honest: serde_json::Value = serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+    let honest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
     let cases = [
-        ("generation_id", json!(honest["generation_id"].as_u64().unwrap() + 41)),
-        ("head_sha", json!("0123456789abcdef0123456789abcdef01234567")),
+        (
+            "generation_id",
+            json!(honest["generation_id"].as_u64().unwrap() + 41),
+        ),
+        (
+            "head_sha",
+            json!("0123456789abcdef0123456789abcdef01234567"),
+        ),
         ("source_repo_root", json!("/nonexistent/some/other/repo")),
-        ("source_repo_root", json!(lane.canonicalize().unwrap().to_string_lossy())),
+        (
+            "source_repo_root",
+            json!(lane.canonicalize().unwrap().to_string_lossy()),
+        ),
     ];
     let mut unguarded = Vec::new();
     for (field, forged) in cases {
@@ -1351,7 +1379,10 @@ async fn a_lease_that_disagrees_with_its_base_is_an_mcp_error_naming_the_field()
         std::fs::write(&lease_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
         let slot = Arc::new(StoreSlot::resolving(None, lane.clone(), None));
         for (tool, args) in [
-            ("devmap_status", json!({"repo_path": lane.display().to_string()})),
+            (
+                "devmap_status",
+                json!({"repo_path": lane.display().to_string()}),
+            ),
             (
                 "devmap_search",
                 json!({"repo_path": lane.display().to_string(), "query": "base_only"}),
@@ -1359,13 +1390,18 @@ async fn a_lease_that_disagrees_with_its_base_is_an_mcp_error_naming_the_field()
         ] {
             let response = call(&slot, tool, args).await;
             if response["result"]["isError"] != json!(true) {
-                unguarded.push(format!("{tool} answered over a lease with {field} = {forged}"));
+                unguarded.push(format!(
+                    "{tool} answered over a lease with {field} = {forged}"
+                ));
             } else if !tool_error_text(&response).contains(&format!("lease {field}")) {
                 unguarded.push(format!("{tool} did not name {field}: {response}"));
             }
         }
     }
-    assert!(unguarded.is_empty(), "lease claims that were not refused: {unguarded:#?}");
+    assert!(
+        unguarded.is_empty(),
+        "lease claims that were not refused: {unguarded:#?}"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -1785,13 +1821,18 @@ async fn mcp_dead_over_a_lane_drops_the_cluster_scan_when_the_delta_deletes_the_
     std::fs::write(anchor.join("cyc.py"), cycle).unwrap();
     git(&anchor, &["add", "cyc.py"]);
     git(&anchor, &["commit", "-qm", "init"]);
-    git(&anchor, &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()]);
+    git(
+        &anchor,
+        &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()],
+    );
     let head = git(&anchor, &["rev-parse", "HEAD"]);
     let anchor_db = devmap_extract::paths::store_path(&anchor);
     std::fs::create_dir_all(anchor_db.parent().unwrap()).unwrap();
     {
         let store = devmap_store::Store::open(&anchor_db).unwrap();
-        store.bind_repo_root(&anchor.canonicalize().unwrap()).unwrap();
+        store
+            .bind_repo_root(&anchor.canonicalize().unwrap())
+            .unwrap();
         let exts = vec![devmap_extract::extract_file("cyc.py", cycle)];
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&exts);
@@ -1809,13 +1850,19 @@ async fn mcp_dead_over_a_lane_drops_the_cluster_scan_when_the_delta_deletes_the_
         let _ = store.write_latest_csr_sidecar().unwrap();
     }
     devmap_query::stacked::provision_stacked_worktree(&anchor, &lane).unwrap();
-    let slot = Arc::new(StoreSlot::resolving(None, lane.clone(), Some(anchor.clone())));
+    let slot = Arc::new(StoreSlot::resolving(
+        None,
+        lane.clone(),
+        Some(anchor.clone()),
+    ));
     let repo = lane.display().to_string();
 
     let before = call(&slot, "devmap_dead_symbols", json!({"repo_path": repo})).await;
     assert_eq!(before["result"]["isError"], json!(false), "{before}");
     assert!(
-        structured(&before)["dead_clusters"].to_string().contains("cyc_one"),
+        structured(&before)["dead_clusters"]
+            .to_string()
+            .contains("cyc_one"),
         "premise: the base lists the cycle: {before}"
     );
 

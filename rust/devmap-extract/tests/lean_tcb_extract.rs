@@ -548,8 +548,5 @@ end FeatherweightGoSree
         .find(|s| s.name == "preservation")
         .expect("preservation symbol extracted");
     assert_eq!(pres.qualified_name, "FeatherweightGoSree.preservation");
-    assert_eq!(
-        pres.parent_symbol.as_deref(),
-        Some("FeatherweightGoSree")
-    );
+    assert_eq!(pres.parent_symbol.as_deref(), Some("FeatherweightGoSree"));
 }

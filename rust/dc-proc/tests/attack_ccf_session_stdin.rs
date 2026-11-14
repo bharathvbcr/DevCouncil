@@ -14,7 +14,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use dc_proc::{session_command, spawn_session, Session};
+use dc_proc::{Session, session_command, spawn_session};
 
 const SCENARIO: &str = "ATTACK_CCF_SCENARIO";
 
@@ -185,7 +185,10 @@ fn the_guard_is_not_process_wide() {
         }
         return;
     }
-    let (status, stdout) = run("the_guard_is_not_process_wide", "the_guard_is_not_process_wide");
+    let (status, stdout) = run(
+        "the_guard_is_not_process_wide",
+        "the_guard_is_not_process_wide",
+    );
     assert_eq!(
         status.signal(),
         Some(libc::SIGPIPE),

@@ -22,8 +22,6 @@ mod a_kotlin_property_is_not_a_call_target;
 #[cfg(feature = "parse")]
 mod a_kotlin_typealias_does_not_shadow_its_class;
 #[cfg(feature = "parse")]
-mod attack_kotlin_recall;
-#[cfg(feature = "parse")]
 mod a_literal_constant_is_not_a_call_target;
 #[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;
@@ -39,6 +37,8 @@ mod ambiguity_budget;
 mod attack_ccf_edges;
 #[cfg(feature = "parse")]
 mod attack_ccf_lsp;
+#[cfg(feature = "parse")]
+mod attack_kotlin_recall;
 #[cfg(feature = "parse")]
 mod audit_regressions;
 #[cfg(feature = "parse")]
@@ -305,9 +305,9 @@ mod attack_resolver_bundle4;
 #[cfg(feature = "parse")]
 mod attack_resolver_bundle5;
 #[cfg(feature = "parse")]
-mod corpus_dump_attack;
-#[cfg(feature = "parse")]
 mod attack_swift_residue;
 #[cfg(feature = "parse")]
 mod attack_tsj_edges;
+#[cfg(feature = "parse")]
+mod corpus_dump_attack;
 mod rust_compile_fail_record;

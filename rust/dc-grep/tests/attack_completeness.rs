@@ -341,7 +341,10 @@ fn the_ranked_index_at_its_own_ceiling_still_publishes() {
         .as_str()
         .unwrap_or_else(|| panic!("the ranking must name the ceiling: {ranked}"));
     assert!(closed.contains(&ranked_reason), "{ranked_reason}: {ranked}");
-    assert_eq!(ranked_reason, built_reason, "rank reads what the build wrote");
+    assert_eq!(
+        ranked_reason, built_reason,
+        "rank reads what the build wrote"
+    );
     assert!(
         ranked["files_indexed"].as_u64().unwrap() < ranked["files_seen"].as_u64().unwrap(),
         "{ranked}"

@@ -1916,14 +1916,19 @@ fn a_lease_that_disagrees_with_its_base_is_refused_by_every_lane_command() {
             if out.status.success() {
                 unguarded.push(format!("{field} = {forged}: `{args:?}` answered over a lease that disagrees with its base"));
             } else if !stderr(&out).contains(&format!("lease {field}")) {
-                unguarded.push(format!("{field}: `{args:?}` did not name the field: {}", stderr(&out)));
+                unguarded.push(format!(
+                    "{field}: `{args:?}` did not name the field: {}",
+                    stderr(&out)
+                ));
             }
         }
 
         let status = fx.devmap(&lane, &["--json", "status"]);
         let st: Value = serde_json::from_slice(&status.stdout).unwrap();
         if st["query_ready"] != Value::Bool(false) {
-            unguarded.push(format!("{field} = {forged}: status stayed query_ready: {st}"));
+            unguarded.push(format!(
+                "{field} = {forged}: status stayed query_ready: {st}"
+            ));
         }
         if !st["degraded_reason"]
             .as_str()
@@ -1938,5 +1943,8 @@ fn a_lease_that_disagrees_with_its_base_is_refused_by_every_lane_command() {
             ));
         }
     }
-    assert!(unguarded.is_empty(), "lease claims that were not refused: {unguarded:#?}");
+    assert!(
+        unguarded.is_empty(),
+        "lease claims that were not refused: {unguarded:#?}"
+    );
 }

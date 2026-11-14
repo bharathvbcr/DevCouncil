@@ -62,7 +62,10 @@ const CS_ONLY: &str = "class D { static int only_cs(int x) { return x; } }\n";
 #[test]
 fn a_c_call_with_java_and_csharp_namesakes_binds_the_c_one() {
     let result = resolve(&[
-        ("c/ns.c", "int c_uses_shared(int v) { return shared_name(v); }\n"),
+        (
+            "c/ns.c",
+            "int c_uses_shared(int v) { return shared_name(v); }\n",
+        ),
         ("c/lib.c", C_LIB),
         ("java/Sh.java", JAVA_SHARED),
         ("cs/Sh.cs", CS_SHARED),
@@ -85,9 +88,15 @@ fn a_c_call_with_java_and_csharp_namesakes_binds_the_c_one() {
 #[test]
 fn java_and_csharp_do_not_bind_each_other_by_bare_name() {
     let result = resolve(&[
-        ("java/Use.java", "class U { int go() { return only_cs(1); } }\n"),
+        (
+            "java/Use.java",
+            "class U { int go() { return only_cs(1); } }\n",
+        ),
         ("cs/D.cs", CS_ONLY),
-        ("cs/Use.cs", "class V { static int go() { return only_java(1); } }\n"),
+        (
+            "cs/Use.cs",
+            "class V { static int go() { return only_java(1); } }\n",
+        ),
         ("java/J.java", JAVA_ONLY),
     ]);
     no_call_edge_out_of(&result, "java/Use.java");
@@ -101,7 +110,10 @@ fn java_and_csharp_bare_calls_do_not_bind_a_c_function() {
     let result = resolve(&[
         ("c/lib.c", C_LIB),
         ("java/Cls.java", "class Cls { void h() { only_c(1); } }\n"),
-        ("cs/Native.cs", "class Native { static int Direct() { return only_c(2); } }\n"),
+        (
+            "cs/Native.cs",
+            "class Native { static int Direct() { return only_c(2); } }\n",
+        ),
     ]);
     no_call_edge_out_of(&result, "java/Cls.java");
     no_call_edge_out_of(&result, "cs/Native.cs");
@@ -127,17 +139,35 @@ fn the_c_like_group_still_binds_across_its_languages() {
     let result = resolve(&[
         ("c/lib.c", C_LIB),
         ("cpp/b.cpp", "int cpp_only(int a) { return a; }\n"),
-        ("cu/k.cu", "int cu_only(int a) { return a; }\nint cu_calls_c(int a) { return only_c(a); }\n"),
-        ("mm/o.mm", "int mm_only(int a) { return a; }\nint mm_calls_c(int a) { return only_c(a); }\n"),
-        ("c/user.c", "int u1(int a) { return cpp_only(a); }\nint u2(int a) { return mm_only(a); }\n"),
-        ("cpp/c.cpp", "int cpp_calls_cu(int a) { return cu_only(a); }\n"),
+        (
+            "cu/k.cu",
+            "int cu_only(int a) { return a; }\nint cu_calls_c(int a) { return only_c(a); }\n",
+        ),
+        (
+            "mm/o.mm",
+            "int mm_only(int a) { return a; }\nint mm_calls_c(int a) { return only_c(a); }\n",
+        ),
+        (
+            "c/user.c",
+            "int u1(int a) { return cpp_only(a); }\nint u2(int a) { return mm_only(a); }\n",
+        ),
+        (
+            "cpp/c.cpp",
+            "int cpp_calls_cu(int a) { return cu_only(a); }\n",
+        ),
     ]);
     let user: Vec<String> = call_targets(&result, "c/user.c")
         .into_iter()
         .map(|(_, t)| t)
         .collect();
-    assert!(user.contains(&"cpp/b.cpp".to_string()), "C -> C++: {user:?}");
-    assert!(user.contains(&"mm/o.mm".to_string()), "C -> ObjC++: {user:?}");
+    assert!(
+        user.contains(&"cpp/b.cpp".to_string()),
+        "C -> C++: {user:?}"
+    );
+    assert!(
+        user.contains(&"mm/o.mm".to_string()),
+        "C -> ObjC++: {user:?}"
+    );
     assert!(calls(&result, "cpp/c.cpp", "cu/k.cu"), "C++ -> CUDA");
     assert!(calls(&result, "cu/k.cu", "c/lib.c"), "CUDA -> C");
     assert!(calls(&result, "mm/o.mm", "c/lib.c"), ".mm -> C");
@@ -147,9 +177,18 @@ fn the_c_like_group_still_binds_across_its_languages() {
 fn java_and_csharp_still_bind_within_their_own_language() {
     let result = resolve(&[
         ("j/A.java", "class A { int go() { return helper(1); } }\n"),
-        ("j/B.java", "class B { static int helper(int x) { return x; } }\n"),
-        ("c/A.cs", "class CA { static int go() { return chelper(1); } }\n"),
-        ("c/B.cs", "class CB { static int chelper(int x) { return x; } }\n"),
+        (
+            "j/B.java",
+            "class B { static int helper(int x) { return x; } }\n",
+        ),
+        (
+            "c/A.cs",
+            "class CA { static int go() { return chelper(1); } }\n",
+        ),
+        (
+            "c/B.cs",
+            "class CB { static int chelper(int x) { return x; } }\n",
+        ),
     ]);
     assert!(calls(&result, "j/A.java", "j/B.java"), "Java -> Java");
     assert!(calls(&result, "c/A.cs", "c/B.cs"), "C# -> C#");
@@ -175,8 +214,14 @@ fn kotlin_still_binds_java_through_the_jvm_bridge() {
             "package com.fx;\npublic class Use { void go() { Registry.INSTANCE.register(1); } }\n",
         ),
     ]);
-    assert!(calls(&result, "jvm/com/fx/App.kt", "jvm/com/fx/LegacyMath.java"), "Kotlin -> Java");
-    assert!(calls(&result, "jvm/com/fx/Use.java", "jvm/com/fx/Reg.kt"), "Java -> Kotlin");
+    assert!(
+        calls(&result, "jvm/com/fx/App.kt", "jvm/com/fx/LegacyMath.java"),
+        "Kotlin -> Java"
+    );
+    assert!(
+        calls(&result, "jvm/com/fx/Use.java", "jvm/com/fx/Reg.kt"),
+        "Java -> Kotlin"
+    );
 }
 
 #[test]
@@ -194,11 +239,17 @@ fn an_extern_declaration_in_the_same_file_still_binds_same_file() {
     ]);
     assert_eq!(
         call_targets(&result, "cs/Native.cs"),
-        vec![("cs/Native.cs::Native.Run".to_string(), "cs/Native.cs".to_string())]
+        vec![(
+            "cs/Native.cs::Native.Run".to_string(),
+            "cs/Native.cs".to_string()
+        )]
     );
     assert_eq!(
         call_targets(&result, "java/Cls.java"),
-        vec![("java/Cls.java::Cls.go".to_string(), "java/Cls.java".to_string())]
+        vec![(
+            "java/Cls.java::Cls.go".to_string(),
+            "java/Cls.java".to_string()
+        )]
     );
 }
 
@@ -228,7 +279,12 @@ fn cross_group_edges(result: &ResolutionResult) -> Vec<String> {
             let (s, t) = (group_of(&e.source_file), group_of(&e.target_file));
             s != "other" && t != "other" && s != t
         })
-        .map(|e| format!("{:?} {} -> {}", e.edge_kind, e.source_symbol, e.target_symbol))
+        .map(|e| {
+            format!(
+                "{:?} {} -> {}",
+                e.edge_kind, e.source_symbol, e.target_symbol
+            )
+        })
         .collect()
 }
 
@@ -277,31 +333,80 @@ fn heritage_corpus() -> ResolutionResult {
 #[test]
 fn a_java_extends_and_its_inherited_call_bind_the_java_base() {
     let result = heritage_corpus();
-    assert!(has_edge(&result, EdgeKind::Extends, "adv/Sub.java::Sub", "adv/BaseJ.java"), "Extends");
-    assert!(has_edge(&result, EdgeKind::References, "adv/Sub.java::Sub", "adv/BaseJ.java"), "References");
-    assert!(has_edge(&result, EdgeKind::Calls, "adv/Sub.java::Sub.t", "adv/BaseJ.java"), "inherited call");
+    assert!(
+        has_edge(
+            &result,
+            EdgeKind::Extends,
+            "adv/Sub.java::Sub",
+            "adv/BaseJ.java"
+        ),
+        "Extends"
+    );
+    assert!(
+        has_edge(
+            &result,
+            EdgeKind::References,
+            "adv/Sub.java::Sub",
+            "adv/BaseJ.java"
+        ),
+        "References"
+    );
+    assert!(
+        has_edge(
+            &result,
+            EdgeKind::Calls,
+            "adv/Sub.java::Sub.t",
+            "adv/BaseJ.java"
+        ),
+        "inherited call"
+    );
 }
 
 #[test]
 fn a_java_implements_and_its_type_references_bind_the_java_interface() {
     let result = heritage_corpus();
     assert!(
-        has_edge(&result, EdgeKind::Implements, "adv/Sq.java::Sq", "adv/Shape.java"),
+        has_edge(
+            &result,
+            EdgeKind::Implements,
+            "adv/Sq.java::Sq",
+            "adv/Shape.java"
+        ),
         "Implements"
     );
-    assert!(has_edge(&result, EdgeKind::References, "adv/Sq.java::Sq", "adv/Shape.java"));
-    assert!(has_edge(&result, EdgeKind::References, "adv/Sq.java::UseShape.g", "adv/Shape.java"));
+    assert!(has_edge(
+        &result,
+        EdgeKind::References,
+        "adv/Sq.java::Sq",
+        "adv/Shape.java"
+    ));
+    assert!(has_edge(
+        &result,
+        EdgeKind::References,
+        "adv/Sq.java::UseShape.g",
+        "adv/Shape.java"
+    ));
 }
 
 #[test]
 fn a_receiver_typed_call_binds_the_member_of_its_own_groups_type() {
     let result = heritage_corpus();
     assert!(
-        has_edge(&result, EdgeKind::Calls, "adv/Sq.java::UseShape.g", "adv/Shape.java"),
+        has_edge(
+            &result,
+            EdgeKind::Calls,
+            "adv/Sq.java::UseShape.g",
+            "adv/Shape.java"
+        ),
         "Java s.area() on a Shape parameter"
     );
     assert!(
-        has_edge(&result, EdgeKind::Calls, "adv/Widget.cpp::use_widget", "adv/Widget.cpp"),
+        has_edge(
+            &result,
+            EdgeKind::Calls,
+            "adv/Widget.cpp::use_widget",
+            "adv/Widget.cpp"
+        ),
         "C++ w->run() on a Widget pointer"
     );
 }
@@ -309,8 +414,24 @@ fn a_receiver_typed_call_binds_the_member_of_its_own_groups_type() {
 #[test]
 fn a_java_bare_call_with_a_csharp_or_c_namesake_binds_the_java_method() {
     let result = heritage_corpus();
-    assert!(has_edge(&result, EdgeKind::Calls, "adv/JCall.java::JCall.go", "adv/J1.java"), "Java + C# namesake");
-    assert!(has_edge(&result, EdgeKind::Calls, "adv/JCall2.java::JCall2.go", "adv/J2.java"), "Java + C namesake");
+    assert!(
+        has_edge(
+            &result,
+            EdgeKind::Calls,
+            "adv/JCall.java::JCall.go",
+            "adv/J1.java"
+        ),
+        "Java + C# namesake"
+    );
+    assert!(
+        has_edge(
+            &result,
+            EdgeKind::Calls,
+            "adv/JCall2.java::JCall2.go",
+            "adv/J2.java"
+        ),
+        "Java + C namesake"
+    );
 }
 
 #[test]
@@ -361,9 +482,16 @@ fn the_split_families_keep_no_builtins_and_no_host_globals() {
             "len", "print", "println", "append", "Some", "echo", "printf", "malloc", "String",
             "Console", "System", "require", "range", "map", "min", "max", "panic", "assert",
         ] {
-            assert!(!is_builtin(family, name), "{lang}: {name} must not be a builtin");
+            assert!(
+                !is_builtin(family, name),
+                "{lang}: {name} must not be a builtin"
+            );
         }
-        assert_eq!(host_global_environment(family, "setTimeout"), None, "{lang}");
+        assert_eq!(
+            host_global_environment(family, "setTimeout"),
+            None,
+            "{lang}"
+        );
         assert_eq!(host_global_environment(family, "require"), None, "{lang}");
     }
 }

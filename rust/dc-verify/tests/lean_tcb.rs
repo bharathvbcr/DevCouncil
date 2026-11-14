@@ -421,7 +421,10 @@ fn dcverify_cli_real_lean_kernel_and_lean4checker_when_required() {
         .write_all(derived_diff.as_bytes())
         .unwrap();
     let sib_out = sib_child.wait_with_output().expect("wait dcverify sibling");
-    assert!(sib_out.status.success(), "dcverify sibling failed: {sib_out:?}");
+    assert!(
+        sib_out.status.success(),
+        "dcverify sibling failed: {sib_out:?}"
+    );
     let sib_json: serde_json::Value = serde_json::from_slice(&sib_out.stdout).unwrap();
     assert_eq!(
         sib_json["findings"].as_array().unwrap().len(),
@@ -431,7 +434,11 @@ fn dcverify_cli_real_lean_kernel_and_lean4checker_when_required() {
 
     // Case D: `private theorem` smuggling a custom `axiom` from an imported sibling module
     // must be convicted by the real Lean 4 Environment audit!
-    fs::write(repo_dir.join("specs/SmuggleAx.lean"), "axiom hiddenBadAx : False\n").unwrap();
+    fs::write(
+        repo_dir.join("specs/SmuggleAx.lean"),
+        "axiom hiddenBadAx : False\n",
+    )
+    .unwrap();
     let priv_smuggle = "import SmuggleAx\nprivate theorem secret_false : False := hiddenBadAx\ntheorem public_true : 1 = 1 := rfl\n";
     fs::write(repo_dir.join("specs/PrivateSmuggle.lean"), priv_smuggle).unwrap();
     let priv_diff = added_lean_diff("specs/PrivateSmuggle.lean", priv_smuggle);

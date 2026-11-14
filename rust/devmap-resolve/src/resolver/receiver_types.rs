@@ -730,12 +730,8 @@ impl Resolver {
             return None;
         }
         let root = Self::path_root(prefix);
-        let base_type = self.receiver_type_for(
-            file,
-            scope,
-            prefix,
-            binding.filter(|b| b.name == root),
-        )?;
+        let base_type =
+            self.receiver_type_for(file, scope, prefix, binding.filter(|b| b.name == root))?;
 
         // 1. Check if member is a declared field on base_type
         if let Some(field_type) = self.field_type_through(file, scope, &base_type, member) {
@@ -764,7 +760,9 @@ impl Resolver {
                 [(target_file, target_sym)] => (target_file.clone(), target_sym.clone()),
                 _ => return None, // ambiguous methods abstain
             }
-        } else if let Some((found_file, found, _)) = self.inherited_method(family, base_type, method) {
+        } else if let Some((found_file, found, _)) =
+            self.inherited_method(family, base_type, method)
+        {
             (found_file, found)
         } else if family == LangFamily::Rust {
             let (target_file, target_sym) = self.rust_blanket_method(method)?;
@@ -773,7 +771,9 @@ impl Resolver {
             return None;
         };
 
-        let written = self.return_types.get(&(callee_file.clone(), callee.clone()))?;
+        let written = self
+            .return_types
+            .get(&(callee_file.clone(), callee.clone()))?;
         let written = written.trim();
 
         // Builder pattern: method returns Self / &mut Self / this

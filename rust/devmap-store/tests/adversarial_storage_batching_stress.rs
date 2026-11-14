@@ -70,7 +70,9 @@ fn test_fts5_chunked_batching_boundary_counts() {
 
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&extraction));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&extraction)).unwrap();
+        let resolution = resolver
+            .resolve_all(std::slice::from_ref(&extraction))
+            .unwrap();
         let analysis = analyze(std::slice::from_ref(&extraction), &resolution);
 
         let gen_id = store
@@ -101,12 +103,16 @@ fn test_fts5_chunked_batching_boundary_counts() {
 
         // Verify rowid bitwise integrity: fts_rowid = (payload_id << 24) | ord_in_file
         let payload_id: i64 = conn
-            .query_row("SELECT rowid FROM file_payloads LIMIT 1", [], |row| row.get(0))
+            .query_row("SELECT rowid FROM file_payloads LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         if count > 0 {
             let mut stmt = conn
-                .prepare("SELECT rowid, name, qualified_name, path FROM nodes_fts ORDER BY rowid ASC")
+                .prepare(
+                    "SELECT rowid, name, qualified_name, path FROM nodes_fts ORDER BY rowid ASC",
+                )
                 .unwrap();
             let mut rows = stmt.query([]).unwrap();
 
@@ -155,7 +161,9 @@ fn test_fts5_chunked_batching_boundary_counts() {
 
             // Last symbol
             let last_idx = count - 1;
-            let results_last = store.search_symbols(&format!("sym_{count}_{last_idx}"), 10).unwrap();
+            let results_last = store
+                .search_symbols(&format!("sym_{count}_{last_idx}"), 10)
+                .unwrap();
             assert!(
                 !results_last.is_empty(),
                 "search for last symbol sym_{count}_{last_idx} failed"
@@ -164,9 +172,13 @@ fn test_fts5_chunked_batching_boundary_counts() {
 
             // Intermediate chunk boundaries if applicable
             if count > 50 {
-                let mid_49 = store.search_symbols(&format!("sym_{count}_49"), 10).unwrap();
+                let mid_49 = store
+                    .search_symbols(&format!("sym_{count}_49"), 10)
+                    .unwrap();
                 assert!(!mid_49.is_empty(), "search for sym_{count}_49 failed");
-                let mid_50 = store.search_symbols(&format!("sym_{count}_50"), 10).unwrap();
+                let mid_50 = store
+                    .search_symbols(&format!("sym_{count}_50"), 10)
+                    .unwrap();
                 assert!(!mid_50.is_empty(), "search for sym_{count}_50 failed");
             }
         }
@@ -198,7 +210,9 @@ fn test_fts5_chunked_batching_tokenizer_special_characters() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&extraction));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&extraction)).unwrap();
+    let resolution = resolver
+        .resolve_all(std::slice::from_ref(&extraction))
+        .unwrap();
     let analysis = analyze(std::slice::from_ref(&extraction), &resolution);
 
     store
@@ -314,9 +328,12 @@ fn test_unresolved_call_chunked_batching_remainders() {
             let mut rows = stmt.query([]).unwrap();
 
             let mut idx = 0usize;
-            let expected_reason = format!("{:?}", Resolution::Unresolved {
-                reason: "no matching candidate found".into(),
-            });
+            let expected_reason = format!(
+                "{:?}",
+                Resolution::Unresolved {
+                    reason: "no matching candidate found".into(),
+                }
+            );
 
             while let Some(row) = rows.next().unwrap() {
                 let source_sym: String = row.get(0).unwrap();
@@ -362,7 +379,9 @@ fn test_unresolved_call_reconciliation_across_batches() {
             source_symbol: format!("main.py::fn_{i}"),
             callee_name: format!("call_{i}"),
             kind: UnresolvedKind::Call,
-            resolution: Resolution::Unresolved { reason: "r1".into() },
+            resolution: Resolution::Unresolved {
+                reason: "r1".into(),
+            },
             class: UnresolvedClass::Unresolved,
             receiver: None,
             site: None,
@@ -389,7 +408,9 @@ fn test_unresolved_call_reconciliation_across_batches() {
             source_symbol: format!("main.py::fn_{i}"),
             callee_name: format!("call_{i}"),
             kind: UnresolvedKind::Call,
-            resolution: Resolution::Unresolved { reason: "r1".into() },
+            resolution: Resolution::Unresolved {
+                reason: "r1".into(),
+            },
             class: UnresolvedClass::Unresolved,
             receiver: None,
             site: None,
@@ -401,7 +422,9 @@ fn test_unresolved_call_reconciliation_across_batches() {
             source_symbol: format!("main.py::fn_{i}"),
             callee_name: format!("call_{i}"),
             kind: UnresolvedKind::Call,
-            resolution: Resolution::Unresolved { reason: "r1".into() },
+            resolution: Resolution::Unresolved {
+                reason: "r1".into(),
+            },
             class: UnresolvedClass::Unresolved,
             receiver: None,
             site: None,
@@ -443,7 +466,10 @@ fn test_unresolved_call_reconciliation_across_batches() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(view_count2, 66, "Gen 2 must have 66 active unresolved calls");
+    assert_eq!(
+        view_count2, 66,
+        "Gen 2 must have 66 active unresolved calls"
+    );
 
     // The retired call (fn_64) must have valid_to = 2
     let closed_count: i64 = conn
@@ -453,7 +479,10 @@ fn test_unresolved_call_reconciliation_across_batches() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(closed_count, 1, "Exactly 1 retired row must have valid_to = 2");
+    assert_eq!(
+        closed_count, 1,
+        "Exactly 1 retired row must have valid_to = 2"
+    );
 
     // The kept 64 calls must have valid_from = 1 and valid_to IS NULL
     let kept_count: i64 = conn
@@ -463,7 +492,10 @@ fn test_unresolved_call_reconciliation_across_batches() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(kept_count, 64, "Exactly 64 kept rows must remain open from gen 1");
+    assert_eq!(
+        kept_count, 64,
+        "Exactly 64 kept rows must remain open from gen 1"
+    );
 
     // The fresh 2 calls must have valid_from = 2 and valid_to IS NULL
     let fresh_count: i64 = conn
@@ -473,7 +505,10 @@ fn test_unresolved_call_reconciliation_across_batches() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(fresh_count, 2, "Exactly 2 fresh rows must be open from gen 2");
+    assert_eq!(
+        fresh_count, 2,
+        "Exactly 2 fresh rows must be open from gen 2"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +575,9 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
         resolver.index_extractions(&extractions);
         let res = resolver.resolve_all(&extractions).unwrap();
         let ana = analyze(&extractions, &res);
-        cold_store.save_generation(&extractions, &res, &ana).unwrap();
+        cold_store
+            .save_generation(&extractions, &res, &ana)
+            .unwrap();
         let cold_history = cold_store.build_history(1).unwrap().remove(0);
 
         assert_eq!(
@@ -558,7 +595,12 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
     let ana1 = analyze(&extractions1, &res1);
     let g1 = store.save_generation(&extractions1, &res1, &ana1).unwrap();
     assert_eq!(g1, 1);
-    assert_parity(&store, 1, "Cold build Gen 1 (6 clean py, 3 broken ipynb, 1 md)", &files);
+    assert_parity(
+        &store,
+        1,
+        "Cold build Gen 1 (6 clean py, 3 broken ipynb, 1 md)",
+        &files,
+    );
 
     // Step 2: Add a new broken notebook file (broken_new.ipynb)
     // Failures should increase: 3 -> 4
@@ -724,7 +766,12 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
         )
         .unwrap();
     assert_eq!(g7, 7);
-    assert_parity(&store, 7, "Gen 7: broken_2.ipynb edited with alternate syntax error", &files);
+    assert_parity(
+        &store,
+        7,
+        "Gen 7: broken_2.ipynb edited with alternate syntax error",
+        &files,
+    );
 
     // Step 8: Edit a clean notebook to become broken (broken_0.ipynb which was clean -> broken_nb)
     // Failures should increase: 2 -> 3
@@ -797,7 +844,12 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
         )
         .unwrap();
     assert_eq!(g9, 9);
-    assert_parity(&store, 9, "Gen 9: Simultaneous flurry across additions/deletions/edits", &files);
+    assert_parity(
+        &store,
+        9,
+        "Gen 9: Simultaneous flurry across additions/deletions/edits",
+        &files,
+    );
 
     // Step 10: Eliminate ALL remaining failures
     // Find all files that are parse failures and fix them to clean_nb
@@ -811,7 +863,10 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
             fresh_fix.push(extract_file(path, clean_nb));
         }
     }
-    assert!(!affected_fix.is_empty(), "precondition: must have had failures to fix");
+    assert!(
+        !affected_fix.is_empty(),
+        "precondition: must have had failures to fix"
+    );
 
     let all_e: Vec<_> = files.iter().map(|(p, c)| extract_file(p, c)).collect();
     let mut r = Resolver::new();
@@ -837,11 +892,19 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
     for (p, c) in &files {
         let e = extract_file(p, c);
         if e.is_parse_failure() {
-            eprintln!("FAILING FILE at gen 10: {} (engine: {:?}, outcome: {:?})", p, e.engine, e.parse_outcome);
+            eprintln!(
+                "FAILING FILE at gen 10: {} (engine: {:?}, outcome: {:?})",
+                p, e.engine, e.parse_outcome
+            );
         }
     }
     assert_eq!(g10, 10);
-    assert_parity(&store, 10, "Gen 10: Fix all remaining failures (counter reaches 0)", &files);
+    assert_parity(
+        &store,
+        10,
+        "Gen 10: Fix all remaining failures (counter reaches 0)",
+        &files,
+    );
 
     let hist10 = store.build_history(10).unwrap();
     for h in &hist10 {
@@ -849,8 +912,7 @@ fn test_incremental_parse_failure_counter_lifecycle_oracle() {
     }
     let gen10_row = hist10.iter().find(|h| h.generation_id == 10).unwrap();
     assert_eq!(
-        gen10_row.parse_failed,
-        0,
+        gen10_row.parse_failed, 0,
         "gen 10 parse_failed must be exactly 0"
     );
 }
@@ -1020,7 +1082,9 @@ fn test_unresolved_statement_cache_churn_across_sizes() {
         let ana = analyze(std::slice::from_ref(&ext), &res);
 
         let g = if gen_idx == 0 {
-            store.save_generation(std::slice::from_ref(&ext), &res, &ana).unwrap()
+            store
+                .save_generation(std::slice::from_ref(&ext), &res, &ana)
+                .unwrap()
         } else {
             store
                 .save_generation_with_opts(
@@ -1183,7 +1247,10 @@ fn test_parse_failure_30_generation_fuzz_oracle() {
         match op_choice {
             0 => {
                 // Break a clean notebook if available
-                let clean_candidate = files.iter().find(|(p, c)| p.ends_with(".ipynb") && *c == clean_nb).map(|(p, _)| p.clone());
+                let clean_candidate = files
+                    .iter()
+                    .find(|(p, c)| p.ends_with(".ipynb") && *c == clean_nb)
+                    .map(|(p, _)| p.clone());
                 if let Some(target) = clean_candidate {
                     files.insert(target.clone(), broken_nb.to_string());
                     fresh.push(extract_file(&target, broken_nb));
@@ -1192,7 +1259,10 @@ fn test_parse_failure_30_generation_fuzz_oracle() {
             }
             1 => {
                 // Fix a broken notebook if available
-                let broken_candidate = files.iter().find(|(p, c)| p.ends_with(".ipynb") && *c == broken_nb).map(|(p, _)| p.clone());
+                let broken_candidate = files
+                    .iter()
+                    .find(|(p, c)| p.ends_with(".ipynb") && *c == broken_nb)
+                    .map(|(p, _)| p.clone());
                 if let Some(target) = broken_candidate {
                     files.insert(target.clone(), clean_nb.to_string());
                     fresh.push(extract_file(&target, clean_nb));
@@ -1210,7 +1280,10 @@ fn test_parse_failure_30_generation_fuzz_oracle() {
             }
             3 => {
                 // Delete an existing notebook
-                let candidate = files.iter().find(|(p, _)| p.starts_with("dyn_nb_") || p.starts_with("nb_")).map(|(p, _)| p.clone());
+                let candidate = files
+                    .iter()
+                    .find(|(p, _)| p.starts_with("dyn_nb_") || p.starts_with("nb_"))
+                    .map(|(p, _)| p.clone());
                 if let Some(target) = candidate {
                     files.remove(&target);
                     deleted.push(target);
@@ -1262,7 +1335,10 @@ fn test_parse_failure_30_generation_fuzz_oracle() {
         // Differential Ground Truth Assertion
         let canonical_failures = all_ext.iter().filter(|e| e.is_parse_failure()).count() as u64;
         let hist = store.build_history(50).unwrap();
-        let row = hist.iter().find(|h| h.generation_id == (gen as u32)).unwrap();
+        let row = hist
+            .iter()
+            .find(|h| h.generation_id == (gen as u32))
+            .unwrap();
 
         assert_eq!(
             row.parse_failed, canonical_failures,
@@ -1271,4 +1347,3 @@ fn test_parse_failure_30_generation_fuzz_oracle() {
         );
     }
 }
-

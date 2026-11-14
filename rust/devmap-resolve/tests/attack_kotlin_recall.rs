@@ -46,11 +46,19 @@ fn alias_beside_a_same_name_factory_function_in_another_file_keeps_the_call() {
     // an ambiguous global and the edge is gone.
     let found = edges(&[
         ("a/Pt.kt", "package a\n\ntypealias Pt = Pair<Int, Int>\n"),
-        ("a/PtFactory.kt", "package a\n\nfun Pt(x: Int): Pt = Pair(x, x)\n"),
+        (
+            "a/PtFactory.kt",
+            "package a\n\nfun Pt(x: Int): Pt = Pair(x, x)\n",
+        ),
         ("a/UsePt.kt", "package a\n\nfun usePt() = Pt(3)\n"),
     ]);
     assert!(
-        has(&found, "a/UsePt.kt::usePt", "a/PtFactory.kt::Pt", EdgeKind::Calls),
+        has(
+            &found,
+            "a/UsePt.kt::usePt",
+            "a/PtFactory.kt::Pt",
+            EdgeKind::Calls
+        ),
         "{found:?}"
     );
 }
@@ -58,12 +66,23 @@ fn alias_beside_a_same_name_factory_function_in_another_file_keeps_the_call() {
 #[test]
 fn alias_beside_a_same_name_factory_function_in_the_same_package_dir_with_a_class_target() {
     let found = edges(&[
-        ("a/Box.kt", "package a\n\nclass Box<T>(val v: T)\ntypealias IntBox = Box<Int>\n"),
-        ("a/Make.kt", "package a\n\nfun IntBox(v: Int): IntBox = Box(v)\n"),
+        (
+            "a/Box.kt",
+            "package a\n\nclass Box<T>(val v: T)\ntypealias IntBox = Box<Int>\n",
+        ),
+        (
+            "a/Make.kt",
+            "package a\n\nfun IntBox(v: Int): IntBox = Box(v)\n",
+        ),
         ("a/Use.kt", "package a\n\nfun use() = IntBox(1)\n"),
     ]);
     assert!(
-        has(&found, "a/Use.kt::use", "a/Make.kt::IntBox", EdgeKind::Calls),
+        has(
+            &found,
+            "a/Use.kt::use",
+            "a/Make.kt::IntBox",
+            EdgeKind::Calls
+        ),
         "{found:?}"
     );
 }
@@ -88,13 +107,31 @@ fn alias_of_a_java_class_does_not_take_the_java_class_uses_away() {
         ),
     ]);
     assert!(
-        has(&found, "h/Use.kt::makeFoo", "h/jv/Foo.java::Foo", EdgeKind::Calls)
-            || has(&found, "h/Alias.kt::Foo", "h/jv/Foo.java::Foo", EdgeKind::References),
+        has(
+            &found,
+            "h/Use.kt::makeFoo",
+            "h/jv/Foo.java::Foo",
+            EdgeKind::Calls
+        ) || has(
+            &found,
+            "h/Alias.kt::Foo",
+            "h/jv/Foo.java::Foo",
+            EdgeKind::References
+        ),
         "the Java class is reached by neither the call nor the alias: {found:?}"
     );
     assert!(
-        has(&found, "h/Use.kt::takeFoo", "h/jv/Foo.java::Foo", EdgeKind::References)
-            || has(&found, "h/Alias.kt::Foo", "h/jv/Foo.java::Foo", EdgeKind::References),
+        has(
+            &found,
+            "h/Use.kt::takeFoo",
+            "h/jv/Foo.java::Foo",
+            EdgeKind::References
+        ) || has(
+            &found,
+            "h/Alias.kt::Foo",
+            "h/jv/Foo.java::Foo",
+            EdgeKind::References
+        ),
         "{found:?}"
     );
 }
@@ -108,11 +145,22 @@ fn alias_does_not_hand_its_name_to_an_unrelated_class_of_another_package() {
     // `class Config` lives in c.other. A use of `Config` in package c is the
     // alias, not the other package's class.
     let found = edges(&[
-        ("c/other/Config.kt", "package c.other\n\nclass Config(val a: Int)\n"),
-        ("c/Mine.kt", "package c\n\ntypealias Config = Map<String, String>\n\nfun use(c: Config) = c\n"),
+        (
+            "c/other/Config.kt",
+            "package c.other\n\nclass Config(val a: Int)\n",
+        ),
+        (
+            "c/Mine.kt",
+            "package c\n\ntypealias Config = Map<String, String>\n\nfun use(c: Config) = c\n",
+        ),
     ]);
     assert!(
-        !has(&found, "c/Mine.kt::use", "c/other/Config.kt::Config", EdgeKind::References),
+        !has(
+            &found,
+            "c/Mine.kt::use",
+            "c/other/Config.kt::Config",
+            EdgeKind::References
+        ),
         "wrong edge to the unrelated class: {found:?}"
     );
 }
@@ -123,17 +171,28 @@ fn alias_does_not_hand_its_name_to_an_unrelated_class_of_another_package() {
 fn alias_of_a_differently_named_class_references_that_class() {
     // Without it the class is reached by no use when every use spells the alias.
     let found = edges(&[
-        ("b/model/ModelId.kt", "package b.model\n\nclass ModelId(val v: Int)\n"),
+        (
+            "b/model/ModelId.kt",
+            "package b.model\n\nclass ModelId(val v: Int)\n",
+        ),
         (
             "b/Alias.kt",
             "package b\n\nimport b.model.ModelId\n\ntypealias Id = ModelId\n\nfun mk() = Id(1)\n",
         ),
     ]);
     assert!(
-        has(&found, "b/Alias.kt::Id", "b/model/ModelId.kt::ModelId", EdgeKind::References),
+        has(
+            &found,
+            "b/Alias.kt::Id",
+            "b/model/ModelId.kt::ModelId",
+            EdgeKind::References
+        ),
         "{found:?}"
     );
-    assert!(has(&found, "b/Alias.kt::mk", "b/Alias.kt::Id", EdgeKind::Calls), "{found:?}");
+    assert!(
+        has(&found, "b/Alias.kt::mk", "b/Alias.kt::Id", EdgeKind::Calls),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -142,19 +201,34 @@ fn two_aliases_to_one_class_both_reach_it() {
         "d/K.kt",
         "package d\n\nclass Kls\ntypealias A1 = Kls\ntypealias A2 = Kls\n\nfun x() = A1()\nfun y() = A2()\n",
     )]);
-    assert!(has(&found, "d/K.kt::A1", "d/K.kt::Kls", EdgeKind::References), "{found:?}");
-    assert!(has(&found, "d/K.kt::A2", "d/K.kt::Kls", EdgeKind::References), "{found:?}");
+    assert!(
+        has(&found, "d/K.kt::A1", "d/K.kt::Kls", EdgeKind::References),
+        "{found:?}"
+    );
+    assert!(
+        has(&found, "d/K.kt::A2", "d/K.kt::Kls", EdgeKind::References),
+        "{found:?}"
+    );
 }
 
 #[test]
 fn a_cross_package_alias_to_the_same_named_class_with_an_import_keeps_both_uses() {
     let found = edges(&[
         ("m/T.kt", "package m\n\nclass T(val x: Int)\n"),
-        ("u/Alias.kt", "package u\n\nimport m.T as MT\n\ntypealias T = MT\n"),
+        (
+            "u/Alias.kt",
+            "package u\n\nimport m.T as MT\n\ntypealias T = MT\n",
+        ),
         ("u/Use.kt", "package u\n\nfun f() = T(1)\nfun g(t: T) = t\n"),
     ]);
-    assert!(has(&found, "u/Use.kt::f", "m/T.kt::T", EdgeKind::Calls), "{found:?}");
-    assert!(has(&found, "u/Use.kt::g", "m/T.kt::T", EdgeKind::References), "{found:?}");
+    assert!(
+        has(&found, "u/Use.kt::f", "m/T.kt::T", EdgeKind::Calls),
+        "{found:?}"
+    );
+    assert!(
+        has(&found, "u/Use.kt::g", "m/T.kt::T", EdgeKind::References),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -174,7 +248,12 @@ fn expect_class_with_an_actual_typealias_binds_a_use_to_the_class() {
         "{found:?}"
     );
     assert!(
-        has(&found, "e/Jvm.kt::Plat", "e/Jvm.kt::PlatImpl", EdgeKind::References),
+        has(
+            &found,
+            "e/Jvm.kt::Plat",
+            "e/Jvm.kt::PlatImpl",
+            EdgeKind::References
+        ),
         "{found:?}"
     );
 }
@@ -182,11 +261,33 @@ fn expect_class_with_an_actual_typealias_binds_a_use_to_the_class() {
 #[test]
 fn the_same_alias_name_in_two_packages_binds_each_user_to_its_own() {
     let found = edges(&[
-        ("i/p1/P1.kt", "package i.p1\n\ntypealias Id = Long\n\nfun f(x: Id) = x\n"),
-        ("i/p2/P2.kt", "package i.p2\n\ntypealias Id = String\n\nfun g(x: Id) = x\n"),
+        (
+            "i/p1/P1.kt",
+            "package i.p1\n\ntypealias Id = Long\n\nfun f(x: Id) = x\n",
+        ),
+        (
+            "i/p2/P2.kt",
+            "package i.p2\n\ntypealias Id = String\n\nfun g(x: Id) = x\n",
+        ),
     ]);
-    assert!(has(&found, "i/p1/P1.kt::f", "i/p1/P1.kt::Id", EdgeKind::References), "{found:?}");
-    assert!(has(&found, "i/p2/P2.kt::g", "i/p2/P2.kt::Id", EdgeKind::References), "{found:?}");
+    assert!(
+        has(
+            &found,
+            "i/p1/P1.kt::f",
+            "i/p1/P1.kt::Id",
+            EdgeKind::References
+        ),
+        "{found:?}"
+    );
+    assert!(
+        has(
+            &found,
+            "i/p2/P2.kt::g",
+            "i/p2/P2.kt::Id",
+            EdgeKind::References
+        ),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -195,8 +296,14 @@ fn a_generic_alias_alone_under_its_name_is_still_the_target() {
         "g/L.kt",
         "package g\n\ntypealias L = List<Int>\ntypealias Handler<T> = (T) -> Unit\n\nfun sum(l: L): Int = l.size\nfun h(cb: Handler<Int>) = cb(1)\n",
     )]);
-    assert!(has(&found, "g/L.kt::sum", "g/L.kt::L", EdgeKind::References), "{found:?}");
-    assert!(has(&found, "g/L.kt::h", "g/L.kt::Handler", EdgeKind::References), "{found:?}");
+    assert!(
+        has(&found, "g/L.kt::sum", "g/L.kt::L", EdgeKind::References),
+        "{found:?}"
+    );
+    assert!(
+        has(&found, "g/L.kt::h", "g/L.kt::Handler", EdgeKind::References),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -205,9 +312,18 @@ fn an_alias_to_a_class_with_the_class_in_the_same_file_resolves_every_use_site()
         "k/K.kt",
         "package k\n\nclass Kls(val v: Int)\ntypealias Kls2 = Kls\n\nfun a(x: Kls) = x\nfun b(x: Kls2) = x\nfun c() = Kls(1)\nfun d() = Kls2(2)\n",
     )]);
-    assert!(has(&found, "k/K.kt::a", "k/K.kt::Kls", EdgeKind::References), "{found:?}");
-    assert!(has(&found, "k/K.kt::c", "k/K.kt::Kls", EdgeKind::Calls), "{found:?}");
-    assert!(has(&found, "k/K.kt::d", "k/K.kt::Kls2", EdgeKind::Calls), "{found:?}");
+    assert!(
+        has(&found, "k/K.kt::a", "k/K.kt::Kls", EdgeKind::References),
+        "{found:?}"
+    );
+    assert!(
+        has(&found, "k/K.kt::c", "k/K.kt::Kls", EdgeKind::Calls),
+        "{found:?}"
+    );
+    assert!(
+        has(&found, "k/K.kt::d", "k/K.kt::Kls2", EdgeKind::Calls),
+        "{found:?}"
+    );
 }
 
 // ---- Kotlin top-level property beside a class of the same name -----------------
@@ -216,11 +332,33 @@ fn an_alias_to_a_class_with_the_class_in_the_same_file_resolves_every_use_site()
 fn a_top_level_property_named_like_a_class_in_another_file_does_not_hide_the_class() {
     let found = edges(&[
         ("f/Typo.kt", "package f\n\nval Typography = Typo(1)\n"),
-        ("f/Types.kt", "package f\n\nclass Typography(val x: Int)\nclass Typo(val x: Int)\n"),
-        ("f/UseT.kt", "package f\n\nfun mkT() = Typography(2)\nfun takeT(t: Typography) = t\n"),
+        (
+            "f/Types.kt",
+            "package f\n\nclass Typography(val x: Int)\nclass Typo(val x: Int)\n",
+        ),
+        (
+            "f/UseT.kt",
+            "package f\n\nfun mkT() = Typography(2)\nfun takeT(t: Typography) = t\n",
+        ),
     ]);
-    assert!(has(&found, "f/UseT.kt::mkT", "f/Types.kt::Typography", EdgeKind::Calls), "{found:?}");
-    assert!(has(&found, "f/UseT.kt::takeT", "f/Types.kt::Typography", EdgeKind::References), "{found:?}");
+    assert!(
+        has(
+            &found,
+            "f/UseT.kt::mkT",
+            "f/Types.kt::Typography",
+            EdgeKind::Calls
+        ),
+        "{found:?}"
+    );
+    assert!(
+        has(
+            &found,
+            "f/UseT.kt::takeT",
+            "f/Types.kt::Typography",
+            EdgeKind::References
+        ),
+        "{found:?}"
+    );
 }
 
 // ---- the property call rule -----------------------------------------------------
@@ -276,7 +414,10 @@ fn a_member_function_still_beats_the_outer_function_when_a_property_shares_its_n
         "j/M.kt",
         "package j\n\nfun size() = 0\n\nclass C {\n    val size = 3\n    fun size() = 4\n    fun h() = size()\n}\n",
     )]);
-    assert!(has(&found, "j/M.kt::C.h", "j/M.kt::C.size", EdgeKind::Calls), "{found:?}");
+    assert!(
+        has(&found, "j/M.kt::C.h", "j/M.kt::C.size", EdgeKind::Calls),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -288,7 +429,10 @@ fn an_enum_entry_called_bare_in_its_own_enum_is_not_an_edge_lost_by_the_field_ru
         "j/E.kt",
         "package j\n\nfun A() = 1\n\nenum class E { A, B; fun f() = A() }\n",
     )]);
-    assert!(has(&found, "j/E.kt::E.f", "j/E.kt::A", EdgeKind::Calls), "{found:?}");
+    assert!(
+        has(&found, "j/E.kt::E.f", "j/E.kt::A", EdgeKind::Calls),
+        "{found:?}"
+    );
 }
 
 #[test]

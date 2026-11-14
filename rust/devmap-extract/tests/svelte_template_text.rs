@@ -12,8 +12,8 @@
 
 use std::time::Duration;
 
-use devmap_extract::model::{Extraction, ParseOutcome};
 use devmap_extract::extract_file_with_budget;
+use devmap_extract::model::{Extraction, ParseOutcome};
 
 const BUDGET: Duration = Duration::from_secs(600);
 

@@ -272,11 +272,8 @@ fn devmap_lean_tcb_skips_lakefile_on_walk_and_stages_unbuilt_sibling_imports() {
     )
     .expect("write lakefile.lean");
 
-    fs::write(
-        specs.join("Base.lean"),
-        "def baseId (n : Nat) : Nat := n\n",
-    )
-    .expect("write Base.lean");
+    fs::write(specs.join("Base.lean"), "def baseId (n : Nat) : Nat := n\n")
+        .expect("write Base.lean");
     fs::write(
         specs.join("Derived.lean"),
         "import Base\ntheorem derived_ok (n : Nat) : baseId n = n := rfl\n",

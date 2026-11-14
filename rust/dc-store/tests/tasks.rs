@@ -4,12 +4,12 @@
 //! `work_items`, `blocked` is derived from gaps, and the legacy `tasks` table is
 //! archived into items by a migration that can be repeated and interrupted.
 
-use dc_store::{schema, AcquireRequest, ReadyMode, Store, StoreError, SCHEMA_VERSION};
+use dc_store::{AcquireRequest, ReadyMode, SCHEMA_VERSION, Store, StoreError, schema};
 use rusqlite::Connection;
 use std::path::Path;
 
 mod support;
-use support::{dcstore, item_request, plant, plant_db, seeded, temp_dir, LEGACY_TASKS};
+use support::{LEGACY_TASKS, dcstore, item_request, plant, plant_db, seeded, temp_dir};
 
 fn put(store: &Store, id: &str, scope: &str) -> Result<String, dc_store::workbench::Error> {
     store.ensure_local_repository().unwrap();
@@ -313,9 +313,11 @@ fn ready_order_is_priority_then_position_then_id_and_a_bad_mode_is_refused() {
     let bad = dcstore(&db, &["ready", "--mode", "permissive"]);
     assert_ne!(bad.code, 0, "a mistyped mode was honoured: {}", bad.stdout);
     // No mode is the strict one.
-    assert!(dcstore(&db, &["ready"])
-        .stdout
-        .contains(r#""mode":"enforce""#));
+    assert!(
+        dcstore(&db, &["ready"])
+            .stdout
+            .contains(r#""mode":"enforce""#)
+    );
 }
 
 #[test]
@@ -742,11 +744,13 @@ fn an_older_reader_fails_closed_and_a_newer_one_migrates() {
     // reviews) are such builds.
     drop(Store::open(&path).unwrap());
     for older in [9, SCHEMA_VERSION - 1] {
-        assert!(schema::ensure_schema_version(&conn, older)
-            .unwrap_err()
-            .contains(&format!(
-                "unsupported DevCouncil schema version {SCHEMA_VERSION}"
-            )));
+        assert!(
+            schema::ensure_schema_version(&conn, older)
+                .unwrap_err()
+                .contains(&format!(
+                    "unsupported DevCouncil schema version {SCHEMA_VERSION}"
+                ))
+        );
     }
     // This build refuses what is newer than it, and leaves it untouched.
     conn.execute(
