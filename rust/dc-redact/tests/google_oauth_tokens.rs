@@ -173,3 +173,65 @@ fn a_long_dotted_or_slashed_run_after_ya29_is_redacted_on_purpose() {
     assert_eq!(find_secret(run).map(|m| m.name), Some(ACCESS_NAME));
     assert!(!redact_secrets(run).contains("example.com"));
 }
+
+/// A Google OAuth client secret: `GOCSPX-` and a URL-safe body. Real secrets
+/// are 35 characters; the fixture is too, `FAKE`-marked.
+const CLIENT_SECRET: &str = concat!("GOC", "SPX-", "FAKEfake-Secret_notReal01234");
+const CLIENT_SECRET_NAME: &str = "google oauth client secret";
+
+/// `client_secret.json` labels it, but `gcloud` and `firebase` errors, and a
+/// pasted `--client-secret` value, carry it bare.
+#[test]
+fn a_bare_google_client_secret_is_redacted_wherever_it_appears() {
+    assert_eq!(CLIENT_SECRET.len(), 35);
+    let marker = concat!("GOC", "SPX-… (35 chars)");
+    let mut failures = Vec::new();
+    for (place, line) in carriers(CLIENT_SECRET) {
+        let out = redact_secrets(&line);
+        if find_secret(&line).map(|m| m.name) != Some(CLIENT_SECRET_NAME) {
+            failures.push(format!("{place}: not named a client secret"));
+        }
+        if out.contains(CLIENT_SECRET) {
+            failures.push(format!("{place}: the secret survived redaction"));
+        }
+        if !out.contains(marker) {
+            failures.push(format!("{place}: no `prefix… (n chars)` marker"));
+        }
+        if redact_secrets(&out) != out || contains_secret(&out) {
+            failures.push(format!("{place}: redaction is not final"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Google publishes no length for the body, and scanners disagree (24 and 28
+/// characters both appear), so the floor sits under both: a real secret one
+/// shape shorter than expected must not pass whole. Under the floor, in a
+/// word, or in another case, it is not one.
+#[test]
+fn the_client_secret_floor_admits_every_published_shape() {
+    for body in [
+        "FAKEfake-Secret_notReal0",        // 24
+        "FAKEfake-Secret_notReal012",      // 26, Google's codelab placeholder length
+        "FAKEfake-Secret_notReal01234",    // 28
+        "FAKEfake-Secret_notReal01234567", // longer
+    ] {
+        let secret = format!("{}{body}", concat!("GOC", "SPX-"));
+        assert_eq!(
+            find_secret(&secret).map(|m| m.name),
+            Some(CLIENT_SECRET_NAME),
+            "a {}-character body",
+            body.len()
+        );
+    }
+    for ordinary in [
+        concat!("GOC", "SPX-"),
+        concat!("GOC", "SPX-short"),
+        concat!("GOC", "SPX-FAKEfake-Secret_notRea"),
+        concat!("x", "GOC", "SPX-FAKEfake-Secret_notReal01234"),
+        concat!("goc", "spx-FAKEfake-Secret_notReal01234"),
+    ] {
+        assert_eq!(find_secret(ordinary), None, "{ordinary}");
+        assert_eq!(redact_secrets(ordinary), ordinary, "{ordinary}");
+    }
+}

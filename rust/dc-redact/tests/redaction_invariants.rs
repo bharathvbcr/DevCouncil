@@ -62,6 +62,7 @@ fn vendor_key(rng: &mut Rng) -> String {
         ("AI", "za", 35),
         ("ya", "29.", 40),
         ("1/", "/", 42),
+        ("GOC", "SPX-", 28),
     ]);
     format!("{head}{tail}{}", rng.alnum(body))
 }

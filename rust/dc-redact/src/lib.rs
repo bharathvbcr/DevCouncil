@@ -295,6 +295,19 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 40,
         body: Body::UrlSafe,
     },
+    // Google OAuth 2.0 client secret: `GOCSPX-` and a URL-safe body, 35
+    // characters in the secrets Google issues. Google publishes the prefix
+    // only by example (`"client_secret": "GOCSPX-abcd1234-…"` in
+    // https://codelabs.developers.google.com/generate_creatives_google_ads) and
+    // no length; scanners use 24 and 28 body characters. The floor sits under
+    // both, and the body is left open, because a real secret refused by either
+    // check is a secret passed whole.
+    SecretPattern {
+        name: "google oauth client secret",
+        prefix: "GOCSPX-",
+        min_len: 30,
+        body: Body::Any,
+    },
     SecretPattern {
         name: "github personal access token",
         prefix: "ghp_",
