@@ -10,6 +10,8 @@ fn every_family_checks_later_candidates_and_redacts_distinct_values() {
         "sk-",
         "xai-",
         "AIza",
+        concat!("ya", "29."),
+        concat!("1/", "/"),
         "ghp_",
         "gho_",
         "ghs_",
