@@ -4,6 +4,7 @@
 
 mod attention;
 mod automation;
+mod backups;
 mod briefs;
 mod compaction;
 mod decisions;
@@ -18,7 +19,9 @@ mod refine;
 mod runs;
 mod scope;
 mod signals;
+mod vacuum;
 
+pub use backups::{BackupRetention, DEFAULT_KEPT_BACKUPS, KEEP_BACKUPS_ENV, PruneReport};
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
 pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
 pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
@@ -181,7 +184,7 @@ impl Store {
                 message: "this host does not upgrade a shared workbench profile".into(),
             });
         }
-        ensure_schema(&self.conn, true)
+        ensure_schema(&self.conn, true, self.backup_retention)
     }
 
     /// Registers [`LOCAL_REPOSITORY_ID`] if the profile does not hold it, so an
@@ -257,6 +260,7 @@ impl Store {
                 | "outbox.cancel"
                 | "store.compact"
                 | "store.upgrade"
+                | "store.vacuum"
         );
         if !writing
             && !matches!(
@@ -301,7 +305,16 @@ impl Store {
         }
         // Reads never upgrade a profile; a write upgrades it only when this
         // handle may, and only after an online backup.
-        let upgraded = ensure_schema(&self.conn, writing && self.workbench_upgrades)?;
+        //
+        // `store.vacuum` is the exception: it rewrites the whole file, so it
+        // never runs as part of a migration. An older profile is refused with
+        // `schema_upgrade_required` and upgraded (with its backup) by a request
+        // that is allowed to, then vacuumed by a later one.
+        let may_upgrade = writing && self.workbench_upgrades && method != "store.vacuum";
+        let upgraded = ensure_schema(&self.conn, may_upgrade, self.backup_retention)?;
+        if method == "store.vacuum" {
+            return vacuum::vacuum(&input);
+        }
         if method == "store.compact" {
             // Deletes commit before the WAL checkpoint. Inside this request's
             // transaction a checkpoint cannot see those pages, so the receipt
@@ -321,9 +334,10 @@ impl Store {
                 // The upgrade already ran, with its backup, above; this
                 // reports it. It commits no event, like `store.compact`.
                 input.fields(&[])?;
+                let prune = prune_json(&self.conn, &upgraded.prune)?;
                 self.conn.query_row(
-                    "SELECT json_object('ok',json('true'),'item',json_object('id','schema','revision',?1,'from',?2,'to',?1,'upgraded',json(CASE WHEN ?2>0 AND ?2<?1 THEN 'true' ELSE 'false' END),'backup',?3))",
-                    params![upgraded.to, upgraded.from, upgraded.backup],
+                    "SELECT json_object('ok',json('true'),'item',json_object('id','schema','revision',?1,'from',?2,'to',?1,'upgraded',json(CASE WHEN ?2>0 AND ?2<?1 THEN 'true' ELSE 'false' END),'backup',?3,'pruned_backups',json(?4)))",
+                    params![upgraded.to, upgraded.from, upgraded.backup, prune],
                     |r| r.get(0),
                 )?
             } else {
@@ -372,9 +386,15 @@ impl Store {
 /// own `VACUUM INTO` before the first migration step, so an upgrade — which
 /// older hosts cannot undo by refusing the profile — can be rolled back by
 /// restoring the copy. An in-memory profile has nothing to lose. A backup that
-/// cannot be made refuses the upgrade; one already made for this version (an
-/// earlier, interrupted upgrade) is kept, not overwritten.
-fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<String>> {
+/// cannot be made, or that does not read back, refuses the upgrade; one already
+/// made for this version (an earlier, interrupted upgrade) is kept, not
+/// overwritten. When this call wrote the backup, older `pre-schema` copies
+/// beyond `retention` are removed (see `backups`).
+fn backup_before_upgrade(
+    conn: &Connection,
+    version: i64,
+    retention: BackupRetention,
+) -> Result<(Option<String>, PruneReport)> {
     let refusal = |backup: &std::path::Path, detail: String| {
         format!(
             "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
@@ -382,22 +402,75 @@ fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<Strin
             backup.display()
         )
     };
-    backup_profile(conn, &format!("pre-schema-{version}"), refusal)
+    let Some(backup) = backup_profile(
+        conn,
+        &format!("pre-schema-{version}"),
+        Some(version),
+        refusal,
+    )?
+    else {
+        return Ok((None, PruneReport::default()));
+    };
+    let pruned = match (backup.created, conn.path()) {
+        (true, Some(profile)) => {
+            backups::prune(std::path::Path::new(profile), &backup.path, retention)
+        }
+        _ => PruneReport::default(),
+    };
+    Ok((Some(backup.path.display().to_string()), pruned))
+}
+
+/// `report` as the JSON `store.upgrade` returns, encoded by SQLite so names are
+/// escaped exactly as every other reply's text is.
+fn prune_json(conn: &Connection, report: &PruneReport) -> Result<String> {
+    let array = |items: &[String]| -> Result<String> {
+        let mut out = String::from("[");
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let quoted: String = conn.query_row("SELECT json_quote(?1)", [item], |r| r.get(0))?;
+            out.push_str(&quoted);
+        }
+        out.push(']');
+        Ok(out)
+    };
+    Ok(conn.query_row(
+        "SELECT json_object('removed',json(?1),'unverified',json(?2),'errors',json(?3))",
+        params![
+            array(&report.removed)?,
+            array(&report.unverified)?,
+            array(&report.errors)?
+        ],
+        |r| r.get(0),
+    )?)
+}
+
+/// A backup file, and whether this call is the one that wrote it.
+struct Backup {
+    path: std::path::PathBuf,
+    created: bool,
 }
 
 /// The shared `VACUUM INTO` copy: `<profile>.<stamp>.bak`, written beside the
-/// profile and renamed into place only when complete.
+/// profile, verified readable (and, when `expected_version` is given, at that
+/// schema) and only then renamed into place, so no file carries the `.bak` name
+/// until it has been read back.
 fn backup_profile(
     conn: &Connection,
     stamp: &str,
+    expected_version: Option<i64>,
     refusal: impl Fn(&std::path::Path, String) -> String,
-) -> Result<Option<String>> {
+) -> Result<Option<Backup>> {
     let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
         return Ok(None);
     };
     let backup = std::path::PathBuf::from(format!("{path}.{stamp}.bak"));
     if backup.exists() {
-        return Ok(Some(backup.display().to_string()));
+        return Ok(Some(Backup {
+            path: backup,
+            created: false,
+        }));
     }
     let fail = |detail: String| Error {
         code: "backup_failed",
@@ -408,10 +481,21 @@ fn backup_profile(
     let target = partial
         .to_str()
         .ok_or_else(|| fail("the path is not UTF-8".into()))?;
+    // A copy that did not complete is removed at once: left behind it would be
+    // a second profile-sized file on a disk that was already short of space.
+    let discard = |detail: String| {
+        let _ = std::fs::remove_file(&partial);
+        fail(detail)
+    };
     conn.execute("VACUUM INTO ?1", [target])
-        .map_err(|error| fail(error.to_string()))?;
-    std::fs::rename(&partial, &backup).map_err(|error| fail(error.to_string()))?;
-    Ok(Some(backup.display().to_string()))
+        .map_err(|error| discard(error.to_string()))?;
+    backups::verify(&partial, expected_version)
+        .map_err(|reason| discard(format!("the copy it wrote does not read back: {reason}")))?;
+    std::fs::rename(&partial, &backup).map_err(|error| discard(error.to_string()))?;
+    Ok(Some(Backup {
+        path: backup,
+        created: true,
+    }))
 }
 
 fn local_repository_request() -> String {
@@ -428,6 +512,8 @@ pub struct UpgradeReport {
     pub to: i64,
     /// The online backup taken before the first step, when there was one.
     pub backup: Option<String>,
+    /// Older `pre-schema` backups removed once that backup was verified.
+    pub prune: PruneReport,
 }
 
 /// The profile's schema version; `None` when the database has no workbench
@@ -577,8 +663,12 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
     Ok(())
 }
 
-fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
-    ensure_schema_in(conn, may_upgrade, true)
+fn ensure_schema(
+    conn: &Connection,
+    may_upgrade: bool,
+    retention: BackupRetention,
+) -> Result<UpgradeReport> {
+    ensure_schema_in(conn, may_upgrade, true, retention)
 }
 
 /// The same steps as [`ensure_schema`], run inside the caller's transaction.
@@ -586,18 +676,22 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
 /// so the caller does both before `BEGIN`. Migrate steps and a profile this
 /// call creates are not committed here.
 fn ensure_schema_within(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
-    ensure_schema_in(conn, may_upgrade, false)
+    // No backup is taken here (the caller took it before BEGIN), so there is
+    // nothing for a retention to prune.
+    ensure_schema_in(conn, may_upgrade, false, BackupRetention::KeepAll)
 }
 
 fn ensure_schema_in(
     conn: &Connection,
     may_upgrade: bool,
     own_transaction: bool,
+    retention: BackupRetention,
 ) -> Result<UpgradeReport> {
     let mut report = UpgradeReport {
         from: 0,
         to: WORKBENCH_SCHEMA,
         backup: None,
+        prune: PruneReport::default(),
     };
     if own_transaction {
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -639,7 +733,7 @@ fn ensure_schema_in(
         // VACUUM INTO cannot run inside a transaction. A caller that already
         // holds one took the backup before BEGIN.
         if own_transaction {
-            report.backup = backup_before_upgrade(conn, version)?;
+            (report.backup, report.prune) = backup_before_upgrade(conn, version, retention)?;
         }
     }
     // An existing profile moves one step per transaction when this call owns

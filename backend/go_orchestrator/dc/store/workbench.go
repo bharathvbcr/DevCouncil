@@ -24,6 +24,11 @@ const maxWorkbenchReply = 2 << 20
 // Manvi serve copies this list into the ops it serves, so listing it would
 // expose that write to every serve client. Access like that is opt-in. The Rust
 // dispatcher and the dcstore CLI keep the method.
+//
+// store.vacuum is excluded for the same reason: it rewrites the whole profile
+// file under the write lock for as long as that takes, which a serve client
+// must not be able to start. The owner runs it deliberately through the
+// dcstore CLI (`dcstore --db <profile> work --method store.vacuum --input {}`).
 func WorkbenchMethods() []string {
 	return []string{
 		"workspaces.list", "workspaces.get", "workspaces.put", "workspaces.delete",
