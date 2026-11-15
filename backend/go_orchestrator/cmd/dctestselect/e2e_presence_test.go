@@ -15,7 +15,11 @@ import (
 // named for the crate, which is what the audit looks for.
 func TestE2EPresenceACrateWithNothingToRunIsNotHeldAgainstTheRun(t *testing.T) {
 	root, ws := a3fixture(t, map[string]string{
-		"rust/Cargo.toml":          "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"n\"]\n",
+		// p is a bystander the change does not reach: a and n alone are the whole
+		// workspace, which the plan collapses to everything (see runsFullSuite).
+		"rust/Cargo.toml":          "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"n\", \"p\"]\n",
+		"rust/p/Cargo.toml":        "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+		"rust/p/src/lib.rs":        "",
 		"rust/a/Cargo.toml":        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
 		"rust/a/src/lib.rs":        "#[test]\nfn a_ok() {}\n",
 		"rust/a/src/bin/a-tool.rs": "fn main() {}\n#[test]\nfn tool_ok() {}\n",
