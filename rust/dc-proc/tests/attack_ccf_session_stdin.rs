@@ -14,7 +14,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use dc_proc::{Session, session_command, spawn_session};
+use dc_proc::{Session, SessionStdin, session_command, spawn_session};
+
+mod support;
 
 const SCENARIO: &str = "ATTACK_CCF_SCENARIO";
 
@@ -28,6 +30,14 @@ fn reaped_session(script: &str) -> Session {
         std::thread::sleep(Duration::from_millis(5));
     }
     session
+}
+
+/// The stdin of a reaped session, once the kernel says its reader is gone:
+/// the reap alone does not mean that (see `support`).
+fn dead_stdin(session: &mut Session) -> SessionStdin {
+    let stdin = session.take_stdin().expect("piped");
+    support::wait_until_the_reader_is_gone(&stdin, Duration::from_secs(20));
+    stdin
 }
 
 fn sigpipe_default() {
@@ -56,7 +66,7 @@ fn concurrent_writers() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         let mut session = reaped_session("exec 0<&-; exit 0");
-        let mut stdin = session.take_stdin().expect("piped");
+        let mut stdin = dead_stdin(&mut session);
         handles.push(std::thread::spawn(move || {
             let mut kinds = Vec::new();
             for _ in 0..50 {
@@ -82,7 +92,7 @@ fn concurrent_writers() {
 fn other_write_entry_points() {
     sigpipe_default();
     let mut session = reaped_session("exec 0<&-; exit 0");
-    let mut stdin = session.take_stdin().expect("piped");
+    let mut stdin = dead_stdin(&mut session);
     let fmt = write!(stdin, "Content-Length: {}\r\n\r\n", 3).map_err(|e| e.kind());
     let vectored = stdin
         .write_vectored(&[IoSlice::new(b"a"), IoSlice::new(b"b")])
@@ -101,7 +111,7 @@ fn unrelated_pipe_still_signals() {
     // First use SessionStdin on a dead child, so any global side effect would
     // already have happened.
     let mut session = reaped_session("exec 0<&-; exit 0");
-    let mut guarded = session.take_stdin().expect("piped");
+    let mut guarded = dead_stdin(&mut session);
     let _ = guarded.write_all(b"x");
     let mut child = Command::new("sh")
         .arg("-c")
@@ -114,6 +124,7 @@ fn unrelated_pipe_still_signals() {
     while child.try_wait().expect("poll").is_none() {
         std::thread::sleep(Duration::from_millis(5));
     }
+    support::wait_until_the_reader_is_gone(&plain, Duration::from_secs(20));
     let outcome = plain.write_all(b"x").map_err(|e| e.kind());
     println!("plain-write-survived={outcome:?}");
 }

@@ -13,8 +13,12 @@
 //! Rust's test harness leaves `SIGPIPE` ignored, so an in-process test of the
 //! write cannot see the bug. This test therefore re-executes itself as a child
 //! that sets `SIG_DFL` first, as the CLI does, and the parent checks how the
-//! child ended. No timing is involved: the child waits until the session child
-//! is reaped, so the read end of the pipe is certainly closed when it writes.
+//! child ended. No timing is involved: the child waits until the kernel reports
+//! the pipe's reader gone, so the write certainly meets a closed pipe. Reaping
+//! the session child is not that moment: `/bin/sh` on macOS is a trampoline that
+//! `exec`s again, and the read end of such a child stays open for up to 14 ms
+//! after the reap. Before this wait, the write succeeded in 61 of 2000 runs
+//! under load (see `support`).
 #![cfg(unix)]
 #![allow(
     unsafe_code,
@@ -28,6 +32,8 @@ use std::time::{Duration, Instant};
 
 use dc_proc::{session_command, spawn_session};
 
+mod support;
+
 const SCENARIO: &str = "DC_PROC_DEAD_STDIN_SCENARIO";
 const TEST: &str = "a_write_to_a_dead_session_stdin_is_an_error_not_a_signal";
 
@@ -40,11 +46,17 @@ fn the_scenario() {
     command.arg("-c").arg("exec 0<&-; exit 101");
     let mut session = spawn_session(&mut command, Duration::from_secs(5)).expect("sh starts");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while session.try_status().is_none() {
+    let status = loop {
+        if let Some(status) = session.try_status() {
+            break status;
+        }
         assert!(Instant::now() < deadline, "the child never exited");
         std::thread::sleep(Duration::from_millis(5));
-    }
+    };
+    // The script ran to its end, so it did close its stdin.
+    assert_eq!(status.code(), Some(101), "{status:?}");
     let mut stdin = session.take_stdin().expect("stdin was piped");
+    support::wait_until_the_reader_is_gone(&stdin, Duration::from_secs(10));
     let outcome = stdin
         .write_all(&[b'x'; 1024])
         .and_then(|()| stdin.flush())
