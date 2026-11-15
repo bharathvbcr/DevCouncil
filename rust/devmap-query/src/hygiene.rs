@@ -62,16 +62,8 @@ fn crate_name_shaped(part: &str) -> bool {
 /// Directories Cargo creates under `<profile>/`, whose children it names.
 const CARGO_LAYOUT_DIRS: [&str; 4] = ["build", "deps", ".fingerprint", "incremental"];
 
-/// Name protection over `path`, except that components from index `exempt_from`
-/// on may be crate names.
-fn protected_components(path: &str, exempt_from: usize) -> bool {
-    path.split(['/', '\\']).enumerate().any(|(index, part)| {
-        protected_name(part) && !(index >= exempt_from && crate_name_shaped(part))
-    })
-}
-
 pub fn protected_artifact(path: &str) -> bool {
-    protected_components(path, usize::MAX)
+    path.split(['/', '\\']).any(protected_name)
 }
 
 /// Whether `dir` is a Cargo target directory: Cargo's cache tag and the
@@ -82,21 +74,6 @@ pub fn is_cargo_target(dir: &Path) -> bool {
         &dir.join("CACHEDIR.TAG"),
         "Signature: 8a477f597d28d172789f06886806bc55",
     ) && dir.join(".rustc_info.json").is_file()
-}
-
-/// The index of the first component below Cargo's layout directory, for a path
-/// shaped `<profile>/<layout>/...` or `<triple>/<profile>/<layout>/...`.
-fn below_cargo_layout(relative: &Path) -> Option<usize> {
-    let text = relative.to_string_lossy();
-    let parts: Vec<&str> = text.split(['/', '\\']).collect();
-    // A path that steps sideways or is not relative is not a layout path.
-    if parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
-        return None;
-    }
-    [1, 2]
-        .into_iter()
-        .find(|&at| parts.get(at).is_some_and(|p| CARGO_LAYOUT_DIRS.contains(p)))
-        .map(|at| at + 1)
 }
 
 /// Recognized names are a discovery hint; producer evidence, the index, age,
@@ -247,35 +224,67 @@ mod hygiene_tests {
 /// protected. Use [`protected_entry_in`] when the path is inside a candidate
 /// whose root is known.
 pub fn protected_entry(relative: &Path) -> bool {
-    protected_entry_from(relative, usize::MAX)
+    protected_artifact(&relative.to_string_lossy()) || protected_file(relative)
 }
 
 /// [`protected_entry`] for `relative` inside the candidate directory
 /// `candidate_root`.
 ///
-/// Inside a recognised Cargo target ([`is_cargo_target`]), the components below
-/// `<profile>/{build,deps,.fingerprint,incremental}` (or the same under
-/// `<triple>/<profile>/`) are names crates.io chose, so a dependency called
-/// `log` or `tmp` does not protect the candidate. Everything else keeps its
-/// answer: the target's own top level and the layout directories' parents,
-/// every file name and extension protection, and every directory outside a
-/// Cargo target. A root that cannot be read is not a Cargo target.
+/// Two names are waived, each only below a recognised Cargo target
+/// ([`is_cargo_target`]: the candidate root or a nested directory with both
+/// markers, such as cargo-llvm-cov's `llvm-cov-target`):
+///
+/// - `tmp` directly inside the target. Cargo creates it itself
+///   (`CARGO_TARGET_TMPDIR`) and `cargo clean` removes it with the target.
+///   Protection resumes below it.
+/// - `log`, `logs`, `tmp` and `temp` below `<profile>/{build,deps,.fingerprint,
+///   incremental}` or `<triple>/<profile>/<same>`: there they are crate names
+///   chosen on crates.io (`target/release/build/log/<hash>/`). A profile or
+///   triple component that is itself a protected name does not open the layout.
+///
+/// Every other directory name, every file-name and extension protection and
+/// every directory outside a Cargo target keep their answer. A path with an
+/// empty, `.` or `..` component, an unreadable root and a path that is not
+/// UTF-8 fail closed.
 pub fn protected_entry_in(candidate_root: &Path, relative: &Path) -> bool {
-    if !protected_entry(relative) {
-        return false;
-    }
-    // Only the crate-name list can be waived, and only below the layout, so the
-    // filesystem is consulted only for the few entries where that decides it.
-    match below_cargo_layout(relative) {
-        Some(from) if !protected_entry_from(relative, from) => !is_cargo_target(candidate_root),
-        _ => true,
-    }
-}
-
-fn protected_entry_from(relative: &Path, exempt_from: usize) -> bool {
-    if protected_components(&relative.to_string_lossy(), exempt_from) {
+    if protected_file(relative) {
         return true;
     }
+    let text = relative.to_string_lossy();
+    let parts: Vec<&str> = text.split(['/', '\\']).collect();
+    if parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
+        return parts.iter().any(|p| protected_name(p));
+    }
+    // The filesystem is consulted only for a protected name that the structure
+    // of the path could waive, so an ordinary entry costs no syscall.
+    parts
+        .iter()
+        .enumerate()
+        .any(|(at, part)| protected_name(part) && !waived(candidate_root, &parts, at))
+}
+
+/// Whether the protected name `parts[at]` is waived by a Cargo target that
+/// encloses it. Checks the nearest enclosing candidate first.
+fn waived(root: &Path, parts: &[&str], at: usize) -> bool {
+    let is_tmp = parts[at].eq_ignore_ascii_case("tmp");
+    (0..=at).rev().any(|base| {
+        let structural = (is_tmp && base == at)
+            || (crate_name_shaped(parts[at])
+                && [base + 1, base + 2].into_iter().any(|layout| {
+                    layout < at
+                        && CARGO_LAYOUT_DIRS.contains(&parts[layout])
+                        && !parts[base..layout].iter().any(|p| protected_name(p))
+                }));
+        structural
+            && is_cargo_target(
+                &parts[..base]
+                    .iter()
+                    .fold(root.to_path_buf(), |dir, p| dir.join(p)),
+            )
+    })
+}
+
+fn protected_file(relative: &Path) -> bool {
     let Some(name) = relative.file_name().and_then(|n| n.to_str()) else {
         return true;
     };
@@ -497,9 +506,11 @@ mod cargo_target_tests {
         for path in [
             "logs",
             "logs/run.txt",
-            "tmp",
-            "tmp/build/x",
+            "temp",
             "temp/deps/x",
+            "log",
+            "tmp/build/log",
+            "tmp/log",
             "log/build/x",
             "release/log",
             "release/tmp/x",
@@ -575,6 +586,114 @@ mod cargo_target_tests {
             "CACHEDIR.TAG",
         ] {
             assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn cargos_own_tmp_directory_is_not_protected_in_a_cargo_target() {
+        let scratch = Scratch::new("cargo-tmp");
+        let root = cargo_target(&scratch);
+        for path in ["tmp", "tmp/integration-0123abcd", "tmp/x/y/out.txt"] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        // The same names without markers, and without a readable root, stay protected.
+        let plain = Scratch::new("plain-tmp");
+        let bare = plain_target(&plain);
+        assert!(protected_entry_in(&bare, Path::new("tmp")));
+        assert!(protected_entry_in(&bare, Path::new("tmp/x")));
+        assert!(protected_entry_in(
+            &plain.0.join("missing"),
+            Path::new("tmp")
+        ));
+    }
+
+    #[test]
+    fn protection_resumes_below_cargos_tmp_directory() {
+        let scratch = Scratch::new("below-tmp");
+        let root = cargo_target(&scratch);
+        for path in [
+            "tmp/x/.git",
+            "tmp/x/.git/config",
+            "tmp/node_modules",
+            "tmp/.venv/bin/python",
+            "tmp/x/.env",
+            "tmp/x/server.pem",
+            "tmp/x/model.safetensors",
+            "tmp/x/id_rsa",
+            "tmp/log",
+            "tmp/x/logs/run.txt",
+            "tmp/temp",
+            "tmp/tmp",
+            "tmp/build/log",
+            "tmp/deps/tmp",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_tmp_is_waived_at_a_targets_top_level() {
+        let scratch = Scratch::new("top-level-names");
+        let root = cargo_target(&scratch);
+        for path in [
+            "temp",
+            "log",
+            "logs",
+            ".tmp",
+            ".cache",
+            "logs/run.txt",
+            "temp/x",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_nested_cargo_target_waives_relative_to_itself() {
+        let scratch = Scratch::new("nested");
+        let root = scratch.0.join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        // The candidate is not itself a Cargo target; a directory inside it is.
+        let nested = root.join("llvm-cov-target");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        std::fs::write(nested.join(".rustc_info.json"), "{}").unwrap();
+        for path in [
+            "llvm-cov-target/tmp",
+            "llvm-cov-target/tmp/x",
+            "llvm-cov-target/debug/build/log/0123abcd/out",
+            "llvm-cov-target/aarch64-apple-darwin/debug/build/log/0123abcd/out",
+            "llvm-cov-target/aarch64-apple-darwin/release/incremental/temp/s-1",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        for path in [
+            "llvm-cov-target/logs",
+            "llvm-cov-target/tmp/x/.git",
+            "llvm-cov-target/tmp/build/log",
+            "tmp",
+            "other/tmp",
+            "other/debug/build/log/0123abcd",
+            "llvm-cov-target/x/y/z/build/log",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn sideways_paths_never_open_a_waiver() {
+        let scratch = Scratch::new("sideways");
+        let root = cargo_target(&scratch);
+        for path in [
+            "tmp/../log",
+            "./tmp",
+            "tmp//x/.git",
+            "release/build/./log/x",
+            "release/build/../tmp/x",
+            "/tmp",
+            "release//build/log/x",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
         }
     }
 }
