@@ -1,6 +1,7 @@
 //! `store.vacuum`: the explicit rewrite that returns an old profile's free
 //! pages and converts it to incremental auto-vacuum. Fixtures are scratch
 //! databases; nothing here opens a real profile.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use dc_store::Store;
 use rusqlite::Connection;
@@ -102,6 +103,7 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_vacuum_returns_an_old_profiles_free_pages_and_makes_it_incremental() {
     let (_dir, path, store) = old_profile_with_free_pages();
@@ -157,6 +159,7 @@ fn a_vacuum_returns_an_old_profiles_free_pages_and_makes_it_incremental() {
     assert!(file_len(&path) < freed, "incremental vacuum freed nothing");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_profile_that_is_already_incremental_and_compact_is_not_rewritten() {
     let dir = Scratch::new();
@@ -178,6 +181,7 @@ fn a_profile_that_is_already_incremental_and_compact_is_not_rewritten() {
     assert_eq!(file_len(&path), size);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_vacuum_the_disk_cannot_hold_is_refused_before_a_page_moves() {
     let (_dir, path, store) = old_profile_with_free_pages();
@@ -241,6 +245,7 @@ fn a_vacuum_refuses_a_transaction_unknown_fields_and_an_in_memory_profile() {
     assert!(error.message.contains("no file"), "{error}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_writer_that_holds_the_profile_blocks_the_vacuum_with_a_typed_reason() {
     let (_dir, path, store) = old_profile_with_free_pages();
@@ -257,4 +262,15 @@ fn a_writer_that_holds_the_profile_blocks_the_vacuum_with_a_typed_reason() {
     // Once the writer is gone the same request goes through.
     let reply = store.workbench_request("store.vacuum", "{}").unwrap();
     assert_eq!(text(&store, &reply, "$.item.outcome"), "vacuumed");
+}
+
+/// Free space is measured with `df`, which only unix has. Anywhere else the
+/// check cannot run, and a check that could not run is a refusal, not a pass.
+#[cfg(not(unix))]
+#[test]
+fn a_vacuum_that_cannot_measure_the_disk_is_refused() {
+    let (_dir, _path, store) = old_profile_with_free_pages();
+    let error = store.workbench_request("store.vacuum", "{}").unwrap_err();
+    assert_eq!(error.code, "disk_space_unknown", "{error}");
+    assert_eq!(pragma(store.connection(), "auto_vacuum"), 0);
 }

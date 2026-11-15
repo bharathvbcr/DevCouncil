@@ -211,19 +211,13 @@ fn a_backup_that_fails_verification_is_never_counted_and_never_removed() {
             )
             .unwrap()
     };
-    assert_eq!(
-        field("$.item.pruned_backups.removed[0]")
-            .rsplit('/')
-            .next()
-            .unwrap(),
-        backup_name(7)
+    assert!(
+        field("$.item.pruned_backups.removed[0]").ends_with(&backup_name(7)),
+        "{reply}"
     );
-    assert_eq!(
-        field("$.item.pruned_backups.removed[1]")
-            .rsplit('/')
-            .next()
-            .unwrap(),
-        backup_name(6)
+    assert!(
+        field("$.item.pruned_backups.removed[1]").ends_with(&backup_name(6)),
+        "{reply}"
     );
     assert!(
         field("$.item.pruned_backups.unverified[0]").contains("pre-schema-10"),
@@ -295,4 +289,67 @@ fn the_explicit_upgrade_reports_what_it_pruned() {
     assert_eq!(report.prune.removed.len(), 1);
     assert!(report.prune.removed[0].ends_with(&backup_name(9)));
     assert!(report.prune.unverified.is_empty() && report.prune.errors.is_empty());
+}
+
+/// Runs `store.upgrade` through the real `dcstore` binary, the way a host that
+/// cannot call `set_backup_retention` reaches the setting: the environment.
+fn upgrade_through_the_binary(path: &Path, setting: Option<&str>) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dcstore"));
+    command
+        .arg("--db")
+        .arg(path)
+        .args(["work", "--method", "store.upgrade", "--input", "{}"])
+        .env_remove(dc_store::workbench::KEEP_BACKUPS_ENV);
+    if let Some(setting) = setting {
+        command.env(dc_store::workbench::KEEP_BACKUPS_ENV, setting);
+    }
+    command.output().unwrap()
+}
+
+fn old_profile_with_three_older_backups() -> (Scratch, PathBuf) {
+    let (dir, path) = old_profile();
+    for version in [8, 9, 10] {
+        plant_backup(&dir, version);
+    }
+    (dir, path)
+}
+
+#[test]
+fn the_environment_variable_reaches_the_store_through_the_binary() {
+    let (dir, path) = old_profile_with_three_older_backups();
+    let out = upgrade_through_the_binary(&path, Some("all"));
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(present(&dir), names(&[8, 9, 10, 11]));
+
+    let (dir, path) = old_profile_with_three_older_backups();
+    let out = upgrade_through_the_binary(&path, Some("1"));
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(present(&dir), names(&[11]));
+    // Each removal is named on stderr, never on the JSON stdout.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for version in [8, 9, 10] {
+        assert!(stderr.contains(&backup_name(version)), "{stderr}");
+    }
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("removed superseded"));
+
+    // Unset: the default of two.
+    let (dir, path) = old_profile_with_three_older_backups();
+    let out = upgrade_through_the_binary(&path, None);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(present(&dir), names(&[10, 11]));
+}
+
+#[test]
+fn a_setting_that_cannot_be_read_keeps_every_backup_and_says_so() {
+    for bad in ["banana", "0", ""] {
+        let (dir, path) = old_profile_with_three_older_backups();
+        let out = upgrade_through_the_binary(&path, Some(bad));
+        assert!(out.status.success(), "{bad:?}: {out:?}");
+        assert_eq!(present(&dir), names(&[8, 9, 10, 11]), "{bad:?} deleted");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(dc_store::workbench::KEEP_BACKUPS_ENV),
+            "{bad:?}: {stderr}"
+        );
+    }
 }
