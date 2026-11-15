@@ -48,7 +48,10 @@ fn is_linear(a: Duration, b: Duration) -> bool {
 /// separator of one long line.
 #[test]
 fn repeated_credential_assignments_scale_linearly() {
-    let shapes: [(&str, &str); 14] = [
+    let shapes: [(&str, &str); 15] = [
+        // Every `:` is a credential key's, and the type after it runs to the
+        // end of the line: the annotation check reads a bounded prefix.
+        ("token: type run", "token:a:"),
         ("password=", "password=Ab12345678 "),
         ("token=", "token=Ab12345678 "),
         ("PGPASSWORD=", "PGPASSWORD=Ab12345678 "),
