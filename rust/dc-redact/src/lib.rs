@@ -1155,7 +1155,7 @@ impl ValueEnds {
     ///
     /// The hop from a comma depends only on where it is, so every comma inside
     /// a chain already walked ends at the chain's end. Walking it again from
-    /// each one made a line of `password=Ab12345678Ab12345678,` repeated
+    /// each one made a line of `password=` and a comma-joined value, repeated,
     /// quadratic — one chain, as long as the line, started at every separator.
     fn reach_past_commas(&mut self, line: &str, end: usize) -> usize {
         if !line[end..].starts_with(',') {
@@ -1697,6 +1697,20 @@ fn redact(token: &str, keep: usize) -> String {
 mod redaction_tests {
     use super::*;
 
+    /// A fixture written so that its source line is not a credential:
+    /// `masked` is the value with a `¦` placed where it breaks the shape a
+    /// detector reads — a key's separator, a URL's `://`, a client's name, a
+    /// JWT's `eyJ` — and the value under test is `masked` without it. See
+    /// `no_line_of_src_is_flagged_by_find_secret`. The string is leaked so a
+    /// fixture is a `&'static str` like the literal it stands for.
+    fn fixture(masked: &str) -> &'static str {
+        assert!(
+            masked.contains('¦'),
+            "a fixture must carry its mask: {masked}"
+        );
+        Box::leak(masked.replace('¦', "").into_boxed_str())
+    }
+
     /// A GitHub classic token shape, split so that no source line is one (see
     /// `no_line_of_this_file_is_itself_a_vendor_token`).
     const GITHUB_TOKEN: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyzA");
@@ -1798,47 +1812,47 @@ mod redaction_tests {
     fn context_detectors_find_literals_and_leave_references_alone() {
         for (line, name) in [
             (
-                r#"password = "Tr0ub4dor&3xample""#,
+                fixture(r#"password¦ = "Tr0ub4dor&3xample""#),
                 "credential assigned to a named key",
             ),
             (
-                r#"password = "pässwörd""#,
+                fixture(r#"password¦ = "pässwörd""#),
                 "credential assigned to a named key",
             ),
             (
-                "PGPASSWORD=xv9Lq2Rt7pW3 psql -h db",
+                fixture("PGPASSWORD¦=xv9Lq2Rt7pW3 psql -h db"),
                 "credential assigned to a named key",
             ),
             (
-                r#"const ADMIN_PASSWORD: &str = "Wint3r!sComing2026";"#,
+                fixture(r#"const ADMIN_PASSWORD: &str ¦= "Wint3r!sComing2026";"#),
                 "credential assigned to a named key",
             ),
             (
-                r#"val apiToken: String = "a7Hk29LmQp3ZxW8vRt5N""#,
+                fixture(r#"val apiToken: String ¦= "a7Hk29LmQp3ZxW8vRt5N""#),
                 "credential assigned to a named key",
             ),
             (
-                r#"  "apiKey": "AbC123dEf456GhI789jKl0","#,
+                fixture(r#"  "apiKey"¦: "AbC123dEf456GhI789jKl0","#),
                 "credential assigned to a named key",
             ),
             (
-                "discord_token: MTIzNDU2Nzg5MDEy.GhIjKl.MnOpQrStUvWxYz012345",
+                fixture("discord_token¦: MTIzNDU2Nzg5MDEy.GhIjKl.MnOpQrStUvWxYz012345"),
                 "credential assigned to a named key",
             ),
             (
-                "DATABASE_URL=postgres://app:s3cr3tPassw0rd@db:5432/app",
+                fixture("DATABASE_URL=postgres:¦//app:s3cr3tPassw0rd@db:5432/app"),
                 "password in a url",
             ),
             (
-                r#"{"Authorization": "Bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a0"}"#,
+                fixture(r#"{"Authorization": "Bear¦er 9f8e7d6c5b4a39281706f5e4d3c2b1a0"}"#),
                 "http authorization credential",
             ),
             (
-                r#"auth = "Basic dXNlcjpwYXNzd29yZA==""#,
+                fixture(r#"auth = "Bas¦ic dXNlcjpwYXNzd29yZA==""#),
                 "http authorization credential",
             ),
             (
-                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w",
+                fixture("eyJhbGciOiJIUzI1NiJ9.ey¦JzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w"),
                 "json web token",
             ),
         ] {
@@ -1874,11 +1888,11 @@ mod redaction_tests {
     #[test]
     fn command_line_passwords_are_found_and_prompts_are_not() {
         for line in [
-            "mysql -u root -pS3cretRootPw appdb",
-            "mysqldump --user=app -pDumpP4ss2026 shop > shop.sql",
-            "/usr/bin/mariadb -h db -pM4riaPassw0rd",
-            "sshpass -p Tr0ub4dor3x ssh deploy@host",
-            "psql --password=xv9Lq2Rt7pW3 -h db",
+            fixture("mys¦ql -u root -pS3cretRootPw appdb"),
+            fixture("mysqld¦ump --user=app -pDumpP4ss2026 shop > shop.sql"),
+            fixture("/usr/bin/mari¦adb -h db -pM4riaPassw0rd"),
+            fixture("sshp¦ass -p Tr0ub4dor3x ssh deploy@host"),
+            fixture("psql --password¦=xv9Lq2Rt7pW3 -h db"),
         ] {
             assert!(contains_secret(line), "{line}");
             let once = redact_secrets(line);
@@ -1920,13 +1934,13 @@ mod redaction_tests {
         }
         for line in [
             concat!(r#"aws_access_key_id = "AKIA"#, r#"IOSFODNN7EXAMPLE""#),
-            r#"aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#,
+            fixture(r#"aws_secret_access_key¦ = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#),
             concat!(
                 r#"WEBHOOK = "https://hooks.slack.com/services/"#,
                 r#"T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX""#
             ),
-            "postgres://app:hunter2@prod-db.internal:5432/app",
-            "amqp://app:z9@mq:5672/",
+            fixture("postgres:¦//app:hunter2@prod-db.internal:5432/app"),
+            fixture("amqp:¦//app:z9@mq:5672/"),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
         }
@@ -1935,14 +1949,20 @@ mod redaction_tests {
     #[test]
     fn context_matches_redact_their_value_and_redaction_is_idempotent() {
         for (line, value) in [
-            (r#"password = "Tr0ub4dor&3xample""#, "Tr0ub4dor&3xample"),
             (
-                "DB_PASSWORD=correcthorsebatterystaple",
+                fixture(r#"password¦ = "Tr0ub4dor&3xample""#),
+                "Tr0ub4dor&3xample",
+            ),
+            (
+                fixture("DB_PASSWORD¦=correcthorsebatterystaple"),
                 "correcthorsebatterystaple",
             ),
-            ("redis://:9xYzQ8wVu7tS6rQ5@cache:6379/0", "9xYzQ8wVu7tS6rQ5"),
             (
-                "Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b",
+                fixture("redis:¦//:9xYzQ8wVu7tS6rQ5@cache:6379/0"),
+                "9xYzQ8wVu7tS6rQ5",
+            ),
+            (
+                fixture("Authorization: Tok¦en 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"),
                 "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b",
             ),
         ] {
@@ -1962,15 +1982,15 @@ mod redaction_tests {
     #[test]
     fn no_character_at_any_position_panics_a_detector() {
         let lines = [
-            r#"password = "Tr0ub4dor&3xample""#,
-            "PGPASSWORD=xv9Lq2Rt7pW3 psql",
+            fixture(r#"password¦ = "Tr0ub4dor&3xample""#),
+            fixture("PGPASSWORD¦=xv9Lq2Rt7pW3 psql"),
             r#"const K: &str = "Wint3r!sComing2026";"#,
-            "redis://:9xYzQ8wVu7tS6rQ5@cache:6379/0",
-            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w",
+            fixture("redis:¦//:9xYzQ8wVu7tS6rQ5@cache:6379/0"),
+            fixture("Authorization: Bas¦ic dXNlcjpwYXNzd29yZA=="),
+            fixture("eyJhbGciOiJIUzI1NiJ9.ey¦JzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w"),
             "api_key: ${API_KEY:?missing}",
             concat!("-----BEGIN RSA PRIVATE", " KEY-----"),
-            "mysql -u root -p\"S3cretRootPw\" db | sshpass -p Tr0ub4dor3x ssh h",
+            fixture("mys¦ql -u root -p\"S3cretRootPw\" db | sshp¦ass -p Tr0ub4dor3x ssh h"),
         ];
         for line in lines {
             let boundaries: Vec<usize> = line
@@ -2001,7 +2021,7 @@ mod redaction_tests {
         for text in [
             "echo \"${\"\npassword = \"Tr0ub4dor3xample\"\n",
             "{{ header }}\r\napi_key: Xk29LmQp3ZxW8vRt5N\r\n",
-            "run:\n  - echo ${\n  - PGPASSWORD=xv9Lq2Rt7pW3 psql",
+            fixture("run:\n  - echo ${\n  - PGPASSWORD¦=xv9Lq2Rt7pW3 psql"),
         ] {
             assert!(contains_secret(text), "{text:?}");
             let out = redact_secrets(text);
@@ -2039,14 +2059,18 @@ mod redaction_tests {
     #[test]
     fn a_secret_value_is_redacted_whole() {
         for (line, hidden, kept) in [
-            ("api_key: Ab1234567890Xy,zzzz", vec!["Ab12", "zzzz"], ""),
             (
-                "{api_key: Ab1234567890Xy, next: 1}",
+                fixture("api_key¦: Ab1234567890Xy,zzzz"),
+                vec!["Ab12", "zzzz"],
+                "",
+            ),
+            (
+                fixture("{api_key¦: Ab1234567890Xy, next: 1}"),
                 vec!["Ab1234567890Xy"],
                 ", next: 1}",
             ),
             (
-                "mysql -u root -pS3cr3t\"x y\" appdb",
+                fixture("mys¦ql -u root -pS3cr3t\"x y\" appdb"),
                 vec!["S3cr3t", "x y"],
                 " appdb",
             ),
@@ -2065,7 +2089,7 @@ mod redaction_tests {
     /// identifier with a number on the end, a qualified type name, and a key
     /// that only begins with `password`.
     ///
-    /// The textbook `Bearer abc123def456ghi789` in a comment is *not* here: the
+    /// The textbook bearer example, `abc123def456ghi789` after the scheme, in a comment is *not* here: the
     /// corpus labels credentials by shape, published examples included, and
     /// its held-out set labels `AbC123dEf456GhI789jKl0` a secret.
     #[test]
@@ -2085,12 +2109,12 @@ mod redaction_tests {
         }
         // The same keys with literal values still are.
         for line in [
-            "secret: Tr0ub4dor-x9q",
-            "token: v1.Xk29LmQp3ZxW8vRt5N",
-            "password: Summer2024!x",
-            "auth: dXNlcjpwYXNzd29yZDEyMw==",
-            "DB_PASSWORD=correcthorsebatterystaple",
-            "// Bearer token format: Bearer abc123def456ghi789",
+            fixture("secret¦: Tr0ub4dor-x9q"),
+            fixture("token¦: v1.Xk29LmQp3ZxW8vRt5N"),
+            fixture("password¦: Summer2024!x"),
+            fixture("auth¦: dXNlcjpwYXNzd29yZDEyMw=="),
+            fixture("DB_PASSWORD¦=correcthorsebatterystaple"),
+            fixture("// Bearer token format: Bear¦er abc123def456ghi789"),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
         }
@@ -2134,6 +2158,50 @@ mod redaction_tests {
             offenders.is_empty(),
             "rust/dc-redact/src/lib.rs lines {offenders:?} carry a vendor token as written; \
              split each fixture with concat! so the source line does not"
+        );
+    }
+
+    /// No line of this crate's source is a credential by its own rules — not
+    /// only no vendor token, which the test above holds, but no assignment,
+    /// URL password, authorization header, JWT or command-line password
+    /// either. GitPulse vendors `src/` and its pre-push scan runs
+    /// [`find_secret`] on every line, so a fixture written as a literal made
+    /// it refuse its own branch. Every `src/` file is read, so a new module is
+    /// held to this too. Only line numbers are reported, never the line.
+    #[test]
+    fn no_line_of_src_is_flagged_by_find_secret() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(!files.is_empty(), "no source files under {}", src.display());
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read source file");
+            for (i, line) in text.lines().enumerate() {
+                if find_secret(line).is_some() {
+                    offenders.push(format!(
+                        "{}:{}",
+                        file.strip_prefix(&src).unwrap_or(file).display(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "{} line(s) of dc-redact/src are flagged by find_secret: {offenders:?}; \
+             write each fixture through `fixture(...)` with a `¦` breaking its shape",
+            offenders.len()
         );
     }
 
@@ -2233,7 +2301,7 @@ mod redaction_tests {
         let shapes: [(&str, &str); 16] = [
             ("type annotation", "fn f(token: Duration) "),
             ("brace slots", "https://u:{a"),
-            ("glued client", "x=curl -u a:Xk29LmQp3Zw "),
+            ("glued client", fixture("x=cu¦rl -u a:Xk29LmQp3Zw ")),
             ("prefix operator", "token=++latest "),
             ("jwt dots", "eyJ."),
             ("jwt dashes", "-eyJ"),
@@ -2242,11 +2310,11 @@ mod redaction_tests {
             ("pem header", "-----BEGIN "),
             ("nested prefix", "ghp_"),
             ("cli password", "mysql -px "),
-            ("template", "${password=Ab12345678 "),
+            ("template", fixture("${password¦=Ab12345678 ")),
             ("quoted keys", "\"a\":\""),
             ("assignment", "token=\""),
             ("separators", "a:1,"),
-            ("commas", "api_key: Ab1234567890Xy,"),
+            ("commas", fixture("api_key¦: Ab1234567890Xy,")),
         ];
         for (name, unit) in shapes {
             let line = unit.repeat(400_000 / unit.len());
@@ -2267,8 +2335,8 @@ mod redaction_tests {
     /// its own, in the clear.
     #[test]
     fn redaction_repeats_until_nothing_is_left() {
-        let first = "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.c2lnbmF0dXJlMQ";
-        let second = "eyJ0eXAiOiJKV1Qi.eyJpc3MiOiJhY21l.c2lnbmF0dXJlMg";
+        let first = fixture("eyJhbGciOiJIUzI1.ey¦JzdWIiOiIxMjM0.c2lnbmF0dXJlMQ");
+        let second = fixture("eyJ0eXAiOiJKV1Qi.ey¦Jpc3MiOiJhY21l.c2lnbmF0dXJlMg");
         // No credential-named key: an assignment detector would redact the
         // whole value in one pass and hide what this is about.
         let line = format!("seen {first}-{second} next");
@@ -2287,9 +2355,9 @@ mod redaction_tests {
     #[test]
     fn an_unclosed_template_opener_hides_nothing_after_it() {
         for line in [
-            r#"const open = "{{"; const password = "Xq9vB2mL7pZ4";"#,
-            r#"echo "${" ; DB_PASSWORD=Xq9vB2mL7pZ4"#,
-            r#"tpl = "${x"; api_key = "Xq9vB2mL7pZ4""#,
+            fixture(r#"const open = "{{"; const password¦ = "Xq9vB2mL7pZ4";"#),
+            fixture(r#"echo "${" ; DB_PASSWORD¦=Xq9vB2mL7pZ4"#),
+            fixture(r#"tpl = "${x"; api_key¦ = "Xq9vB2mL7pZ4""#),
         ] {
             assert!(contains_secret(line), "missed: {line}");
             assert!(!redact_secrets(line).contains("Xq9vB2mL7pZ4"), "{line}");
@@ -2307,7 +2375,10 @@ mod redaction_tests {
     /// `>` is a character a password may contain, and it hid the password.
     #[test]
     fn only_an_angle_bracket_slot_is_a_placeholder() {
-        for line in [r#"password = "x>y2Zq81!mN""#, r#"password = "Zq81!mN<y2x""#] {
+        for line in [
+            fixture(r#"password¦ = "x>y2Zq81!mN""#),
+            fixture(r#"password¦ = "Zq81!mN<y2x""#),
+        ] {
             assert!(contains_secret(line), "missed: {line}");
         }
         for line in [
@@ -2510,13 +2581,13 @@ mod redaction_tests {
     #[test]
     fn a_client_name_glued_to_punctuation_is_still_the_client() {
         for line in [
-            "command=curl --user alice:Xk29LmQp3Zw https://example.test",
-            "out=$(curl -u alice:Xk29LmQp3Zw https://example.test)",
-            r#"run("curl -u alice:Xk29LmQp3Zw https://example.test")"#,
-            r#"let cmd = "curl --user alice:Xk29LmQp3Zw";"#,
-            "`curl -u alice:Xk29LmQp3Zw https://example.test`",
-            r#"sh -c "mysql -u root -pS3cretRootPw appdb""#,
-            "cmd=sshpass -p Tr0ub4dor3x ssh deploy@host",
+            fixture("command=cu¦rl --user alice:Xk29LmQp3Zw https://example.test"),
+            fixture("out=$(cu¦rl -u alice:Xk29LmQp3Zw https://example.test)"),
+            fixture(r#"run("cu¦rl -u alice:Xk29LmQp3Zw https://example.test")"#),
+            fixture(r#"let cmd = "cu¦rl --user alice:Xk29LmQp3Zw";"#),
+            fixture("`cu¦rl -u alice:Xk29LmQp3Zw https://example.test`"),
+            fixture(r#"sh -c "mys¦ql -u root -pS3cretRootPw appdb""#),
+            fixture("cmd=sshp¦ass -p Tr0ub4dor3x ssh deploy@host"),
         ] {
             assert_eq!(
                 find_secret(line).map(|m| m.name),
@@ -2548,11 +2619,14 @@ mod redaction_tests {
         // a `.netrc` is not shell, and the rest is not the end of a command
         // until whitespace. Each is found and redacted whole.
         for (line, tail) in [
-            ("machine m login l password Ab1&2345678x", "2345678x"),
-            ("sshpass -p Tr0ub4dor&3xample ssh host", "3xample"),
-            ("mysql -u root -pS3cr3t;Pw99 db", "Pw99"),
-            ("docker login -p Xk29Lm|Qp3Zw registry", "Qp3Zw"),
-            ("psql --password Xk29Lm<Qp3Zw -h db", "Qp3Zw"),
+            (
+                fixture("machine m login l pass¦word Ab1&2345678x"),
+                "2345678x",
+            ),
+            (fixture("sshp¦ass -p Tr0ub4dor&3xample ssh host"), "3xample"),
+            (fixture("mys¦ql -u root -pS3cr3t;Pw99 db"), "Pw99"),
+            (fixture("dock¦er login -p Xk29Lm|Qp3Zw registry"), "Qp3Zw"),
+            (fixture("psql --pass¦word Xk29Lm<Qp3Zw -h db"), "Qp3Zw"),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
             assert!(!redact_secrets(line).contains(tail), "{line}");
@@ -2593,10 +2667,10 @@ mod redaction_tests {
         // that is a capitalised word is still a value, and so is a base64
         // value whose padding `=` is glued to it.
         for line in [
-            r#"const ADMIN_PASSWORD: &str = "Wint3r!sComing2026";"#,
-            r#"let token: String = "a7Hk29LmQp3ZxW8vRt5N".into();"#,
-            "password: Monkeyshines",
-            "token: QWxhZGRpbjpvcGVuIHNlc2FtZQ=",
+            fixture(r#"const ADMIN_PASSWORD: &str ¦= "Wint3r!sComing2026";"#),
+            fixture(r#"let token: String ¦= "a7Hk29LmQp3ZxW8vRt5N".into();"#),
+            fixture("password¦: Monkeyshines"),
+            fixture("token¦: QWxhZGRpbjpvcGVuIHNlc2FtZQ="),
         ] {
             assert_eq!(
                 find_secret(line).map(|m| m.name),
@@ -2622,12 +2696,12 @@ mod redaction_tests {
         // Leading punctuation in a literal password is still a password, a
         // letters-only one included: only `++` and `--` make an expression.
         for line in [
-            "DB_PASSWORD=!Welcomeback",
-            "sshpass -p !Welcomeback ssh h",
-            "token=+Correcthorse",
-            "password=!Xk29LmQp3Z",
-            "token = -A1b2C3d4E5f6",
-            "secret: +Zq81mNy2x7",
+            fixture("DB_PASSWORD¦=!Welcomeback"),
+            fixture("sshp¦ass -p !Welcomeback ssh h"),
+            fixture("token¦=+Correcthorse"),
+            fixture("password¦=!Xk29LmQp3Z"),
+            fixture("token¦ = -A1b2C3d4E5f6"),
+            fixture("secret¦: +Zq81mNy2x7"),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
         }
@@ -2651,9 +2725,9 @@ mod redaction_tests {
         }
         // Braces that do not form a slot are characters of the literal.
         for line in [
-            "postgres://app:s3cr}t{Passw0rd@db:5432/app",
-            "postgres://app:{s3cr3t-Passw0rd!}@db:5432/app",
-            r#"password = "Xq9{vB2mL7pZ4""#,
+            fixture("postgres:¦//app:s3cr}t{Passw0rd@db:5432/app"),
+            fixture("postgres:¦//app:{s3cr3t-Passw0rd!}@db:5432/app"),
+            fixture(r#"password¦ = "Xq9{vB2mL7pZ4""#),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
         }
