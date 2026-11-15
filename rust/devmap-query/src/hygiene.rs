@@ -13,40 +13,90 @@ fn marker(path: &Path, prefix: &str) -> bool {
     file.take(1024).read_to_string(&mut text).is_ok() && text.starts_with(prefix)
 }
 
-pub fn protected_artifact(path: &str) -> bool {
-    path.split(['/', '\\']).any(|part| {
-        matches!(
-            part.to_ascii_lowercase().as_str(),
-            ".git"
-                | ".venv"
-                | "venv"
-                | ".tox"
-                | "node_modules"
-                | "pods"
-                | ".terraform"
-                | ".devcouncil"
-                | ".devmap"
-                | ".gitnexus"
-                | ".claude"
-                | ".cursor"
-                | ".agents"
-                | ".gemini"
-                | ".antigravity"
-                | ".opencode"
-                | ".gopath"
-                | ".gomodcache"
-                | ".gradle"
-                | ".pnpm-store"
-                | ".npm-cache"
-                | ".yarn-cache"
-                | ".cache"
-                | "tmp"
-                | ".tmp"
-                | "temp"
-                | "logs"
-                | "log"
-        )
+/// Directory names that are persistent state or dependencies wherever they sit.
+fn protected_name(part: &str) -> bool {
+    matches!(
+        part.to_ascii_lowercase().as_str(),
+        ".git"
+            | ".venv"
+            | "venv"
+            | ".tox"
+            | "node_modules"
+            | "pods"
+            | ".terraform"
+            | ".devcouncil"
+            | ".devmap"
+            | ".gitnexus"
+            | ".claude"
+            | ".cursor"
+            | ".agents"
+            | ".gemini"
+            | ".antigravity"
+            | ".opencode"
+            | ".gopath"
+            | ".gomodcache"
+            | ".gradle"
+            | ".pnpm-store"
+            | ".npm-cache"
+            | ".yarn-cache"
+            | ".cache"
+            | "tmp"
+            | ".tmp"
+            | "temp"
+            | "logs"
+            | "log"
+    )
+}
+
+/// Names a package author can legitimately choose. Below Cargo's own layout a
+/// directory with one of these names is a crate (`build/log/<hash>/`), not a
+/// place where someone keeps state. Dot-names cannot be crate names, so
+/// `.tmp` and the VCS, environment and agent-state names are not listed.
+fn crate_name_shaped(part: &str) -> bool {
+    matches!(
+        part.to_ascii_lowercase().as_str(),
+        "tmp" | "temp" | "log" | "logs"
+    )
+}
+
+/// Directories Cargo creates under `<profile>/`, whose children it names.
+const CARGO_LAYOUT_DIRS: [&str; 4] = ["build", "deps", ".fingerprint", "incremental"];
+
+/// Name protection over `path`, except that components from index `exempt_from`
+/// on may be crate names.
+fn protected_components(path: &str, exempt_from: usize) -> bool {
+    path.split(['/', '\\']).enumerate().any(|(index, part)| {
+        protected_name(part) && !(index >= exempt_from && crate_name_shaped(part))
     })
+}
+
+pub fn protected_artifact(path: &str) -> bool {
+    protected_components(path, usize::MAX)
+}
+
+/// Whether `dir` is a Cargo target directory: Cargo's cache tag and the
+/// compiler-info file it writes at the root. The one definition shared by
+/// producer recognition and entry protection.
+pub fn is_cargo_target(dir: &Path) -> bool {
+    marker(
+        &dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    ) && dir.join(".rustc_info.json").is_file()
+}
+
+/// The index of the first component below Cargo's layout directory, for a path
+/// shaped `<profile>/<layout>/...` or `<triple>/<profile>/<layout>/...`.
+fn below_cargo_layout(relative: &Path) -> Option<usize> {
+    let text = relative.to_string_lossy();
+    let parts: Vec<&str> = text.split(['/', '\\']).collect();
+    // A path that steps sideways or is not relative is not a layout path.
+    if parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
+        return None;
+    }
+    [1, 2]
+        .into_iter()
+        .find(|&at| parts.get(at).is_some_and(|p| CARGO_LAYOUT_DIRS.contains(p)))
+        .map(|at| at + 1)
 }
 
 /// Recognized names are a discovery hint; producer evidence, the index, age,
@@ -78,11 +128,7 @@ pub fn local_provider(repo: &Path, relative: &str) -> Result<&'static str, Strin
     let has = |marker: &str| parent.join(marker).is_file();
     match name {
         n if (n == "target" || n.starts_with("target-")) && has("Cargo.toml") => {
-            if !marker(
-                &path.join("CACHEDIR.TAG"),
-                "Signature: 8a477f597d28d172789f06886806bc55",
-            ) || !path.join(".rustc_info.json").is_file()
-            {
+            if !is_cargo_target(&path) {
                 return Err(
                     "Cargo target markers are missing; this directory requires manual review."
                         .into(),
@@ -196,8 +242,38 @@ mod hygiene_tests {
 
 /// Conservative preservation of known state, credential and data formats.
 /// This is evidence of a refusal, not proof that other files are disposable.
+///
+/// With no knowledge of what the path sits in, every directory name is
+/// protected. Use [`protected_entry_in`] when the path is inside a candidate
+/// whose root is known.
 pub fn protected_entry(relative: &Path) -> bool {
-    if protected_artifact(&relative.to_string_lossy()) {
+    protected_entry_from(relative, usize::MAX)
+}
+
+/// [`protected_entry`] for `relative` inside the candidate directory
+/// `candidate_root`.
+///
+/// Inside a recognised Cargo target ([`is_cargo_target`]), the components below
+/// `<profile>/{build,deps,.fingerprint,incremental}` (or the same under
+/// `<triple>/<profile>/`) are names crates.io chose, so a dependency called
+/// `log` or `tmp` does not protect the candidate. Everything else keeps its
+/// answer: the target's own top level and the layout directories' parents,
+/// every file name and extension protection, and every directory outside a
+/// Cargo target. A root that cannot be read is not a Cargo target.
+pub fn protected_entry_in(candidate_root: &Path, relative: &Path) -> bool {
+    if !protected_entry(relative) {
+        return false;
+    }
+    // Only the crate-name list can be waived, and only below the layout, so the
+    // filesystem is consulted only for the few entries where that decides it.
+    match below_cargo_layout(relative) {
+        Some(from) if !protected_entry_from(relative, from) => !is_cargo_target(candidate_root),
+        _ => true,
+    }
+}
+
+fn protected_entry_from(relative: &Path, exempt_from: usize) -> bool {
+    if protected_components(&relative.to_string_lossy(), exempt_from) {
         return true;
     }
     let Some(name) = relative.file_name().and_then(|n| n.to_str()) else {
@@ -301,5 +377,204 @@ mod boundary_tests {
             .iter()
             .any(|v| v.contains("node_modules/package.json")));
         assert!(violations.iter().any(|v| v.contains("keys/id_ed25519")));
+    }
+}
+
+#[cfg(test)]
+mod cargo_target_tests {
+    use super::{protected_entry, protected_entry_in};
+    use std::path::{Path, PathBuf};
+
+    const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cache dir\n";
+
+    /// A scratch directory that removes itself, so a failed assertion leaves nothing behind.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "devmap-hygiene-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cargo_target(scratch: &Scratch) -> PathBuf {
+        let root = scratch.0.join("target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        std::fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        root
+    }
+
+    fn plain_target(scratch: &Scratch) -> PathBuf {
+        let root = scratch.0.join("target");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const BUILD_SCRIPT_DIRS: [&str; 6] = [
+        "release/build/log/0123abcd/out",
+        "release/build/tmp/0123abcd/out/lib.rs",
+        "debug/build/logs/0123abcd",
+        "aarch64-apple-darwin/release/build/temp/0123abcd/out",
+        "x86_64-unknown-linux-gnu/debug/incremental/log/s-1-2",
+        "release/.fingerprint/temp/lib-temp.json",
+    ];
+
+    #[test]
+    fn current_behaviour_without_context_refuses_crate_named_build_directories() {
+        for path in BUILD_SCRIPT_DIRS {
+            assert!(protected_entry(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn crate_named_directories_below_cargo_layout_are_not_protected_in_a_cargo_target() {
+        let scratch = Scratch::new("crate-named");
+        let root = cargo_target(&scratch);
+        for path in BUILD_SCRIPT_DIRS {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        for path in [
+            "debug/deps/tmp-0123abcd.d",
+            "debug/deps/libtemp-0123abcd.rlib",
+            "release/build/log-0123abcd/out",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_same_paths_stay_protected_without_cargo_target_markers() {
+        let scratch = Scratch::new("no-markers");
+        let root = plain_target(&scratch);
+        for path in BUILD_SCRIPT_DIRS {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        // One marker is not enough: both identify a Cargo target.
+        std::fs::write(root.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("release/build/log/0123abcd")
+        ));
+        std::fs::remove_file(root.join("CACHEDIR.TAG")).unwrap();
+        std::fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("release/build/log/0123abcd")
+        ));
+        // A tag whose signature is not Cargo's does not count.
+        std::fs::write(root.join("CACHEDIR.TAG"), "Signature: other\n").unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("release/build/log/0123abcd")
+        ));
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_read_is_not_a_cargo_target() {
+        let scratch = Scratch::new("missing-root");
+        let missing = scratch.0.join("does-not-exist");
+        assert!(protected_entry_in(
+            &missing,
+            Path::new("release/build/log/0123abcd")
+        ));
+    }
+
+    #[test]
+    fn name_protection_keeps_applying_outside_the_layout_directories() {
+        let scratch = Scratch::new("outside-layout");
+        let root = cargo_target(&scratch);
+        for path in [
+            "logs",
+            "logs/run.txt",
+            "tmp",
+            "tmp/build/x",
+            "temp/deps/x",
+            "log/build/x",
+            "release/log",
+            "release/tmp/x",
+            "release/examples/log/x",
+            "release/build/../log",
+            "release/build/node_modules/x",
+            "release/build/x/.git/config",
+            "release/build/x/.venv/bin/python",
+            "release/deps/.claude/state",
+            "release/build/x/.tmp/y",
+            "release/build/x/.cache/y",
+            "x/y/z/build/log",
+            "release",
+        ] {
+            let expected = !matches!(path, "release");
+            assert_eq!(
+                protected_entry_in(&root, Path::new(path)),
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_protections_apply_everywhere_inside_a_cargo_target() {
+        let scratch = Scratch::new("file-protections");
+        let root = cargo_target(&scratch);
+        for path in [
+            "release/build/x/out/.env",
+            "release/build/x/out/.env.local",
+            "release/build/x/out/credentials.json",
+            "release/build/x/out/service-account.json",
+            "release/build/x/out/id_rsa",
+            "release/build/x/out/id_ed25519",
+            "release/build/x/out/server.pem",
+            "release/build/x/out/server.KEY",
+            "release/build/x/out/model.safetensors",
+            "release/build/x/out/model.gguf",
+            "debug/deps/weights.pt",
+            "debug/deps/weights.pth",
+            "release/build/log/0123abcd/out/server.pem",
+            "release/build/log/0123abcd/out/.env",
+            "aarch64-apple-darwin/release/build/temp/0123abcd/out/id_rsa",
+            "release/build/x/out/pyvenv.cfg",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn empty_and_non_utf8_paths_keep_their_answer() {
+        let scratch = Scratch::new("odd-paths");
+        let root = cargo_target(&scratch);
+        assert!(protected_entry(Path::new("")));
+        assert!(protected_entry_in(&root, Path::new("")));
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let odd = Path::new(OsStr::from_bytes(b"release/build/log/\xff\xfe"));
+            assert!(protected_entry(odd));
+            assert!(protected_entry_in(&root, odd));
+        }
+    }
+
+    #[test]
+    fn a_cargo_target_is_not_widened_for_unrelated_paths() {
+        let scratch = Scratch::new("unrelated");
+        let root = cargo_target(&scratch);
+        for path in [
+            "release/build/x/out/lib.rs",
+            "debug/deps/libfoo.rlib",
+            "CACHEDIR.TAG",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
     }
 }
