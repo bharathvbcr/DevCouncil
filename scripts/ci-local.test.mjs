@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import {
+  StepStop,
+  chainOf,
+  devmapAvailable,
+  exitCode,
   goModToolchain,
   gussetPin,
   gussetPinVerdict,
   localTagState,
+  parseArgs,
+  runSteps,
+  summarize,
   tagVerdict,
 } from "./ci-local-checks.mjs";
 import { GO_MODULE, STEPS } from "./ci-local.mjs";
@@ -243,5 +250,417 @@ describe("ci:local runs the DevMap test selector's tests", () => {
     for (const phase of ["plan", "--phase selected", "--phase full", "audit", "-tags e2e"]) {
       assert.ok(workflow.includes(phase), `selected-tests.yml does not run dctestselect ${phase}`);
     }
+  });
+});
+
+/**
+ * A runnable step for the runner tests. `behaviour` is what its run does:
+ * "pass", "fail" (exit 3), "cannot" (could not run, exit 2), "na", or a
+ * function of the context.
+ */
+function fake(label, needs = [], behaviour = "pass", extra = {}) {
+  return {
+    label,
+    needs,
+    ...extra,
+    run: (ctx) => {
+      ctx.header();
+      ran.push(label);
+      if (typeof behaviour === "function") return behaviour(ctx);
+      if (behaviour === "fail") throw new StepStop(3, `${label} broke`);
+      if (behaviour === "cannot") throw new StepStop(2, `${label} could not start`, { cannotRun: true });
+      if (behaviour === "na") return { na: `${label} has nothing to do` };
+      return undefined;
+    },
+  };
+}
+/** @type {string[]} */
+let ran = [];
+
+function quietRun(steps, opts) {
+  ran = [];
+  const out = [];
+  let t = 0;
+  const result = runSteps(steps, {
+    gate: "test gate",
+    baseEnv: { PATH: "/nowhere" },
+    log: (s) => out.push(s),
+    // Every step takes 1.5 s of fake time: the runner reads the clock once
+    // as a step starts and once as it ends.
+    now: () => (t += 1500),
+    ...opts,
+  });
+  return { ...result, out: out.join("\n"), ran: [...ran] };
+}
+
+const row = (rows, label) => rows.find((r) => r.label === label);
+
+describe("ci:local --continue", () => {
+  it("runs every step whose needs passed, after a failure", () => {
+    const r = quietRun(
+      [fake("a", [], "fail"), fake("b", ["a"]), fake("c"), fake("d", ["c"])],
+      { mode: "continue" },
+    );
+    assert.deepEqual(r.ran, ["a", "c", "d"]);
+    assert.deepEqual(r.rows.map((x) => [x.label, x.status]), [["a", "FAIL"], ["b", "SKIP"], ["c", "PASS"], ["d", "PASS"]]);
+  });
+
+  it("makes a dependent of a FAIL or of a SKIP a SKIP, naming the dependency", () => {
+    const r = quietRun([fake("a", [], "fail"), fake("b", ["a"]), fake("c", ["b"]), fake("d", ["c"])], { mode: "continue" });
+    assert.equal(row(r.rows, "b").note, "not run: needs a");
+    assert.equal(row(r.rows, "c").note, "not run: needs b");
+    assert.equal(row(r.rows, "d").note, "not run: needs c");
+    assert.deepEqual(r.ran, ["a"]);
+    assert.match(r.out, /^SKIP: c \(not run: needs b\)$/m);
+  });
+
+  it("names the first prerequisite that did not pass when a step needs several", () => {
+    const r = quietRun([fake("a"), fake("b", [], "fail"), fake("c", ["a", "b"])], { mode: "continue" });
+    assert.equal(row(r.rows, "c").note, "not run: needs b");
+  });
+
+  it("skips a step whose N/A producer produced nothing", () => {
+    const r = quietRun([fake("a", [], "na"), fake("b", ["a"])], { mode: "continue" });
+    assert.equal(row(r.rows, "a").status, "N/A");
+    assert.equal(row(r.rows, "b").status, "SKIP");
+  });
+
+  it("reports a step that could not start as SKIP with its reason, and its dependents as SKIP", () => {
+    const r = quietRun([fake("engine", [], "cannot"), fake("host", ["engine"]), fake("other")], { mode: "continue" });
+    assert.equal(row(r.rows, "engine").status, "SKIP");
+    assert.equal(row(r.rows, "engine").note, "not run: engine could not start");
+    assert.equal(row(r.rows, "host").note, "not run: needs engine");
+    assert.equal(r.code, 2);
+  });
+
+  it("SKIPs a step whose external requirement is missing, before running it", () => {
+    const r = quietRun([fake("e2e", [], "pass", { requires: () => "devmap not found" }), fake("next")], { mode: "continue" });
+    assert.deepEqual(r.ran, ["next"]);
+    assert.equal(row(r.rows, "e2e").note, "not run: devmap not found");
+  });
+
+  it("prints a start marker for every step, run or skipped", () => {
+    const r = quietRun([fake("a", [], "fail"), fake("b", ["a"]), fake("c")], { mode: "continue" });
+    assert.deepEqual([...r.out.matchAll(/^== (.+) ==$/gm)].map((m) => m[1]), ["a", "b", "c"]);
+  });
+});
+
+describe("ci:local step outputs go only to declared dependents", () => {
+  const producer = fake("producer", [], () => ({ env: { CGO_CFLAGS: "-DHASH=1" }, paths: { bin: "/tmp/x/bin" } }));
+  const seen = {};
+  const consumer = (label, needs) =>
+    fake(label, needs, (ctx) => {
+      seen[label] = { cflags: ctx.env.CGO_CFLAGS, paths: ctx.paths };
+    });
+
+  for (const mode of ["default", "continue"]) {
+    it(`hands env and paths to a step that needs the producer, and not to one that does not (${mode})`, () => {
+      quietRun([producer, consumer("declared", ["producer"]), consumer("undeclared", [])], { mode });
+      assert.equal(seen.declared.cflags, "-DHASH=1");
+      assert.deepEqual(seen.declared.paths, { producer: { bin: "/tmp/x/bin" } });
+      assert.equal(seen.undeclared.cflags, undefined);
+      assert.deepEqual(seen.undeclared.paths, {});
+    });
+  }
+
+  it("never writes the producer's env into process.env", () => {
+    const before = process.env.CGO_CFLAGS;
+    quietRun([producer, consumer("declared", ["producer"])], { mode: "default" });
+    assert.equal(process.env.CGO_CFLAGS, before);
+  });
+
+  it("fails loudly when release identity runs without build dcrelease's output", () => {
+    const step = STEPS.find((s) => s.label === "release identity");
+    assert.throws(
+      () => step.run({ label: step.label, mode: "default", env: {}, paths: {}, header: () => {} }),
+      /does not declare `build dcrelease` in needs/,
+    );
+  });
+});
+
+describe("ci:local --only", () => {
+  const steps = () => [fake("a"), fake("b", ["a"]), fake("c", ["b"]), fake("d"), fake("e", ["a"])];
+
+  it("runs exactly the step and its needs chain, in step order", () => {
+    assert.deepEqual(chainOf(steps(), "c"), ["a", "b", "c"]);
+    const r = quietRun(steps(), { mode: "only", only: "c" });
+    assert.deepEqual(r.ran, ["a", "b", "c"]);
+    assert.deepEqual(r.rows.map((x) => x.label), ["a", "b", "c"]);
+    assert.match(r.out, /3 passed · 0 failed · 0 skipped · 0 not applicable of 3 steps/);
+  });
+
+  it("refuses a step that does not exist, listing the steps", () => {
+    assert.throws(() => chainOf(steps(), "nope"), /no step "nope"; steps are:\n {2}a\n/);
+  });
+
+  it("chains the real steps: go host tests needs gusset engine, nothing else", () => {
+    assert.deepEqual(chainOf(STEPS, "go host tests"), ["gusset engine", "go host tests"]);
+    assert.deepEqual(chainOf(STEPS, "release identity (tag path)"), ["build dcrelease", "release identity (tag path)"]);
+    assert.deepEqual(chainOf(STEPS, "test selector end-to-end"), ["test selector end-to-end"]);
+  });
+});
+
+describe("ci:local exit codes", () => {
+  it("is 1 if any step failed, else 2 if any was skipped, else 0; N/A never changes it", () => {
+    assert.equal(exitCode([{ status: "PASS" }, { status: "N/A" }]), 0);
+    assert.equal(exitCode([{ status: "PASS" }, { status: "SKIP" }, { status: "N/A" }]), 2);
+    assert.equal(exitCode([{ status: "SKIP" }, { status: "FAIL" }]), 1);
+    assert.equal(exitCode([]), 0);
+  });
+
+  it("returns them from a --continue run", () => {
+    assert.equal(quietRun([fake("a"), fake("b", [], "na")], { mode: "continue" }).code, 0);
+    assert.equal(quietRun([fake("a"), fake("b", [], "pass", { requires: () => "absent" })], { mode: "continue" }).code, 2);
+    assert.equal(quietRun([fake("a", [], "fail"), fake("b", ["a"])], { mode: "continue" }).code, 1);
+  });
+});
+
+describe("ci:local default mode", () => {
+  it("stops at the first failure with that step's exit code, and prints no summary", () => {
+    const r = quietRun([fake("a"), fake("b", [], "fail"), fake("c")], { mode: "default" });
+    assert.equal(r.code, 3);
+    assert.deepEqual(r.ran, ["a", "b"]);
+    assert.doesNotMatch(r.out, /──|passed ·|SKIP/);
+  });
+
+  it("keeps a could-not-run stop as its exit code, not a SKIP", () => {
+    const r = quietRun([fake("a", [], "cannot"), fake("b")], { mode: "default" });
+    assert.equal(r.code, 2);
+    assert.deepEqual(r.ran, ["a"]);
+  });
+
+  it("does not consult a step's requirement: the step runs and its own failure stands", () => {
+    const r = quietRun([fake("e2e", [], "fail", { requires: () => "devmap not found" })], { mode: "default" });
+    assert.deepEqual(r.ran, ["e2e"]);
+    assert.equal(r.code, 3);
+  });
+
+  it("prints a step's header only when the step asks for it, as before", () => {
+    const r = quietRun([{ label: "quiet", needs: [], run: () => {} }, fake("loud")], { mode: "default" });
+    assert.deepEqual([...r.out.matchAll(/^== (.+) ==$/gm)].map((m) => m[1]), ["loud"]);
+  });
+});
+
+describe("ci:local arguments", () => {
+  it("parses the modes, and refuses anything else", () => {
+    assert.deepEqual(parseArgs([]), { mode: "default" });
+    assert.deepEqual(parseArgs(["--continue"]), { mode: "continue" });
+    assert.deepEqual(parseArgs(["--only", "gofmt"]), { mode: "only", only: "gofmt" });
+    assert.deepEqual(parseArgs(["--only=go host tests"]), { mode: "only", only: "go host tests" });
+    assert.deepEqual(parseArgs(["--continue", "--only", "gofmt"]), { mode: "only", only: "gofmt" });
+    assert.throws(() => parseArgs(["--only"]), /--only needs a step name/);
+    assert.throws(() => parseArgs(["--only", "a", "--only", "b"]), /--only given twice/);
+    assert.throws(() => parseArgs(["--keep-going"]), /unknown argument "--keep-going"/);
+  });
+});
+
+describe("ci:local summary block", () => {
+  const rows = [
+    { label: "script tests", status: "PASS", ms: 12340, note: "" },
+    { label: "test selector end-to-end", status: "FAIL", ms: 4000, note: "exit 1" },
+    { label: "go host tests", status: "SKIP", ms: 0, note: "not run: needs gusset engine" },
+    { label: "release identity (tag path)", status: "N/A", ms: 0, note: "not applicable: no local tag v0.2.5" },
+  ];
+
+  it("has GitPulse's ci:local shape, with N/A kept apart from SKIP", () => {
+    const expected = [
+      "",
+      `── DevCouncil ci:local ${"─".repeat(37)}`,
+      "",
+      `  PASS  script tests${" ".repeat(30)}   12.3s`,
+      `  FAIL  test selector end-to-end${" ".repeat(18)}    4.0s  (exit 1)`,
+      `  SKIP  go host tests${" ".repeat(39)}(not run: needs gusset engine)`,
+      `  N/A   release identity (tag path)${" ".repeat(25)}(not applicable: no local tag v0.2.5)`,
+      "",
+      "  1 passed · 1 failed · 1 skipped · 1 not applicable of 4 steps",
+      "",
+    ].join("\n");
+    assert.equal(summarize("DevCouncil ci:local", rows), expected);
+  });
+
+  it("matches the row and totals patterns failset reads", () => {
+    const lines = summarize("DevCouncil ci:local", rows).split("\n");
+    assert.ok(lines.some((l) => /^ {2}(PASS|FAIL) {2}(.+?)\s+\d+\.\d+s(?: {2}\(.*\))?$/.test(l)));
+    assert.ok(lines.some((l) => /^ {2}SKIP {2}(.+?)\s{2,}\(.*\)$/.test(l)));
+    assert.ok(lines.some((l) => /^\s+\d+ passed · \d+ failed · \d+ skipped · \d+ not applicable of \d+ steps$/.test(l)));
+  });
+
+  it("prints a nested block indented, with no totals line", () => {
+    const nested = summarize("rust/verify.sh", rows, { nested: true }).split("\n");
+    assert.equal(nested[1], `  ── rust/verify.sh ${"─".repeat(42)}`);
+    assert.equal(nested[3], `    PASS  script tests${" ".repeat(30)}   12.3s`);
+    assert.ok(!nested.some((l) => /passed ·/.test(l)));
+  });
+
+  it("is printed by a --continue run, after the steps", () => {
+    const r = quietRun([fake("a"), fake("b", [], "fail")], { mode: "continue" });
+    assert.match(r.out, /── test gate ─+\n\n {2}PASS {2}a {45}1\.5s\n {2}FAIL {2}b {45}1\.5s {2}\(exit 3\)\n\n {2}1 passed · 1 failed · 0 skipped · 0 not applicable of 2 steps\n$/);
+  });
+});
+
+describe("ci:local declared dependencies", () => {
+  it("pins every edge, each to an earlier step", () => {
+    const edges = Object.fromEntries(STEPS.filter((s) => s.needs.length > 0).map((s) => [s.label, s.needs]));
+    assert.deepEqual(edges, {
+      "release identity": ["build dcrelease"],
+      "release identity (tag path)": ["build dcrelease"],
+      // `go test ./...` includes ./cmd/devcouncil and ./gussetfn, which link libgusset.a.
+      "go host tests": ["gusset engine"],
+      "go orchestrator tests": ["gusset engine"],
+    });
+    const labels = STEPS.map((s) => s.label);
+    assert.equal(new Set(labels).size, labels.length);
+  });
+
+  it("asks for devmap before the selector's end-to-end tests", () => {
+    const step = STEPS.find((s) => s.label === "test selector end-to-end");
+    const empty = mkdtempSync(path.join(tmpdir(), "no-devmap-"));
+    try {
+      assert.match(step.requires({ PATH: empty }), /^devmap not found/);
+      assert.equal(step.requires({ PATH: empty, MANVI_MAP_BINARY: "/set/but/missing" }), undefined);
+      writeFileSync(path.join(empty, "devmap"), "#!/bin/sh\n", { mode: 0o755 });
+      assert.equal(step.requires({ PATH: empty }), undefined);
+      assert.equal(devmapAvailable({ PATH: `/nowhere${path.delimiter}${empty}` }), true);
+      chmodSync(path.join(empty, "devmap"), 0o644);
+      assert.equal(devmapAvailable({ PATH: empty }), false);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("rust/verify.sh --continue", { skip: process.platform === "win32" }, () => {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "rust", "verify.sh");
+  const which = (name) => spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+  const bash = which("bash");
+
+  /**
+   * verify.sh against a fake cargo, with a PATH holding only the tools it
+   * needs: no `go`, so the host fixture fails unless DEVCOUNCIL_BIN is set.
+   * The fake cargo logs every call and exits FAKE_CARGO_EXIT when its
+   * arguments contain FAKE_CARGO_FAIL.
+   */
+  function verify(args, env = {}) {
+    const dir = mkdtempSync(path.join(tmpdir(), "verify-continue-"));
+    const bin = path.join(dir, "bin");
+    mkdirSync(bin);
+    for (const tool of ["dirname", "mktemp", "rm", "date", "perl", "gdate", "cat", "sh"]) {
+      const at = which(tool);
+      if (at) symlinkSync(at, path.join(bin, tool));
+    }
+    const log = path.join(dir, "cargo.log");
+    writeFileSync(
+      path.join(bin, "cargo"),
+      '#!/bin/sh\necho "cargo $*" >> "$FAKE_LOG"\nif [ -n "${FAKE_CARGO_FAIL:-}" ]; then\n  case "$*" in *"$FAKE_CARGO_FAIL"*) exit "${FAKE_CARGO_EXIT:-1}" ;; esac\nfi\nexit 0\n',
+      { mode: 0o755 },
+    );
+    const host = path.join(dir, "devcouncil");
+    writeFileSync(host, "");
+    try {
+      const r = spawnSync(bash, [script, ...args], {
+        encoding: "utf8",
+        env: { PATH: bin, FAKE_LOG: log, HOME: dir, ...env, ...(env.DEVCOUNCIL_BIN === "host" ? { DEVCOUNCIL_BIN: host } : {}) },
+      });
+      let calls = [];
+      try {
+        calls = readFileSync(log, "utf8").trim().split("\n");
+      } catch {
+        // no cargo call
+      }
+      return { status: r.status, stdout: r.stdout, stderr: r.stderr, calls };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /** The rows of verify.sh's block, as [status, label, note]. */
+  const rowsOf = (stdout, indent = "  ") => {
+    const re = new RegExp(`^${indent}(PASS|FAIL|SKIP|N/A) +(.+?) +(?:\\d+\\.\\ds)?(?: {2}\\((.*)\\))?$`);
+    return stdout
+      .split("\n")
+      .map((l) => re.exec(l))
+      .filter(Boolean)
+      .map((m) => [m[1], m[2], m[3] ?? ""]);
+  };
+
+  it("keeps going past a failed step, runs cargo test with --no-fail-fast, and ends with the summary", () => {
+    const r = verify(["--quick", "--continue"], { DEVCOUNCIL_BIN: "host", FAKE_CARGO_FAIL: "fmt" });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.ok(r.calls.includes("cargo test --locked --workspace --no-fail-fast"), r.calls.join("\n"));
+    assert.deepEqual(rowsOf(r.stdout), [
+      ["FAIL", "1/8 format", "exit 1"],
+      ["PASS", "2/8 clippy (-D warnings)", ""],
+      ["PASS", "3/8 tests — host fixture", ""],
+      ["PASS", "3/8 tests", ""],
+      ["N/A", "release worker panic recovery (executable, not test profile)", "not applicable: quick mode"],
+      ["N/A", "4/8 determinism — two clean builds must produce identical graph digests", "not applicable: quick mode"],
+      ["N/A", "5/8 self-build gates — DevCouncil repo, release", "not applicable: quick mode"],
+      ["N/A", "6/8 growth gate — repeated builds must plateau", "not applicable: quick mode"],
+      ["N/A", "7/8 incremental-vs-cold equivalence — a rebuild must not drift", "not applicable: quick mode"],
+      ["N/A", "8/8 mutation testing (optional)", "not applicable: quick mode"],
+    ]);
+    assert.match(r.stdout, /^ {2}3 passed · 1 failed · 0 skipped · 6 not applicable of 10 steps$/m);
+  });
+
+  it("prints the same block ci-local's summarize() prints for those rows", () => {
+    const r = verify(["--quick", "--continue"], { DEVCOUNCIL_BIN: "host", FAKE_CARGO_FAIL: "clippy" });
+    const start = r.stdout.indexOf("\n── rust/verify.sh");
+    assert.ok(start >= 0, r.stdout);
+    const block = r.stdout.slice(start);
+    const rows = block
+      .split("\n")
+      .map((l) => /^ {2}(PASS|FAIL|SKIP|N\/A) {1,2} (.+?) +(?:(\d+\.\d)s)?(?: {2}\((.*)\))?$/.exec(l))
+      .filter(Boolean)
+      .map((m) => ({ status: m[1], label: m[2], ms: m[3] ? Number(m[3]) * 1000 : 0, note: m[4] ?? "" }));
+    assert.equal(rows.length, 10);
+    assert.equal(block, `${summarize("rust/verify.sh", rows)}\n`);
+  });
+
+  it("SKIPs 3/8 tests, naming the host fixture, when the fixture failed; nested prints no totals", () => {
+    const r = verify(["--quick", "--continue", "--nested"], {});
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /GATE FAIL: no `go` on PATH/);
+    assert.ok(!r.calls.some((c) => c.startsWith("cargo test")), r.calls.join("\n"));
+    const rows = rowsOf(r.stdout, "    ");
+    assert.deepEqual(rows.slice(0, 4), [
+      ["PASS", "1/8 format", ""],
+      ["PASS", "2/8 clippy (-D warnings)", ""],
+      ["FAIL", "3/8 tests — host fixture", "exit 1"],
+      ["SKIP", "3/8 tests", "not run: needs 3/8 tests — host fixture"],
+    ]);
+    assert.match(r.stdout, /^ {2}── rust\/verify\.sh ─+$/m);
+    assert.doesNotMatch(r.stdout, /passed ·/);
+  });
+
+  it("SKIPs steps 5-7 when step 4's release build failed, and still runs the steps after", () => {
+    const r = verify(["--continue"], { DEVCOUNCIL_BIN: "host", FAKE_CARGO_FAIL: "devmap-cli" });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.ok(!r.calls.some((c) => c.includes("devmap-soak")), r.calls.join("\n"));
+    assert.deepEqual(rowsOf(r.stdout).slice(4), [
+      ["PASS", "release worker panic recovery (executable, not test profile)", ""],
+      ["FAIL", "4/8 determinism — two clean builds must produce identical graph digests", "exit 1"],
+      ["SKIP", "5/8 self-build gates — DevCouncil repo, release", "not run: needs 4/8 determinism — two clean builds must produce identical graph digests"],
+      ["SKIP", "6/8 growth gate — repeated builds must plateau", "not run: needs 4/8 determinism — two clean builds must produce identical graph digests"],
+      ["SKIP", "7/8 incremental-vs-cold equivalence — a rebuild must not drift", "not run: needs 4/8 determinism — two clean builds must produce identical graph digests"],
+      ["N/A", "8/8 mutation testing (optional)", "not applicable: pass --mutants to run it"],
+    ]);
+  });
+
+  // Characterization: the default mode, unchanged. These pass against the
+  // script before --continue existed too.
+  it("without --continue, still stops at the first failure with cargo's exit code", () => {
+    const r = verify(["--quick"], { DEVCOUNCIL_BIN: "host", FAKE_CARGO_FAIL: "clippy", FAKE_CARGO_EXIT: "101" });
+    assert.equal(r.status, 101);
+    assert.deepEqual(r.calls, ["cargo fmt --all -- --check", "cargo clippy --locked --workspace --all-targets -- -D warnings"]);
+    assert.doesNotMatch(r.stdout, /host fixture|──/);
+  });
+
+  it("without --continue, runs cargo test without --no-fail-fast and ends as before", () => {
+    const r = verify(["--quick"], { DEVCOUNCIL_BIN: "host" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.ok(r.calls.includes("cargo test --locked --workspace"), r.calls.join("\n"));
+    assert.ok(!r.calls.some((c) => c.includes("--no-fail-fast")));
+    assert.match(r.stdout, /QUICK GATES GREEN; the full gate suite was NOT RUN/);
+    assert.doesNotMatch(r.stdout, /──/);
   });
 });
