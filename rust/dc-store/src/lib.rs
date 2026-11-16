@@ -367,6 +367,9 @@ pub struct Store {
     /// profile forward (a read-only server, a daemon) clears it with
     /// [`Store::refuse_workbench_upgrades`].
     workbench_upgrades: bool,
+    /// How many `pre-schema` backups an upgrade leaves. Defaults to the
+    /// process-wide `DC_STORE_KEEP_BACKUPS` setting, else the newest two.
+    backup_retention: workbench::BackupRetention,
 }
 
 impl std::fmt::Debug for Store {
@@ -462,6 +465,7 @@ impl Store {
             conn,
             now_fn: None,
             workbench_upgrades: false,
+            backup_retention: workbench::BackupRetention::from_environment(),
         })
     }
 
@@ -514,6 +518,7 @@ impl Store {
             conn,
             now_fn: None,
             workbench_upgrades: true,
+            backup_retention: workbench::BackupRetention::from_environment(),
         };
         // The legacy tasks table becomes workbench items and the version is
         // stamped in one transaction: a refusal leaves the store as found, at
@@ -544,6 +549,13 @@ impl Store {
     /// MCP server or sidecar that shares it is never locked out by a reader.
     pub fn refuse_workbench_upgrades(&mut self) {
         self.workbench_upgrades = false;
+    }
+
+    /// Sets how many `pre-schema` backups an upgrade through this handle
+    /// leaves: the newest `n` ([`workbench::BackupRetention::keep`]) or all of
+    /// them. Overrides `DC_STORE_KEEP_BACKUPS` for this handle.
+    pub fn set_backup_retention(&mut self, retention: workbench::BackupRetention) {
+        self.backup_retention = retention;
     }
 
     /// Replaces the clock. Tests use this to move past a TTL instantly.

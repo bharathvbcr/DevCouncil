@@ -33,9 +33,70 @@ never mistaken for a complete one; call again until `truncated` is false. Receip
 pruned before events in the same transaction, which is what lets an event become
 eligible. All parameters are validated; unknown fields are refused.
 
+## Schema-upgrade backups
+
+An upgrade copies the profile to `<profile>.pre-schema-<version>.bak` (`VACUUM INTO`) before
+its first step. Until this policy nothing ever removed one: a profile that crossed four
+schema versions held four extra copies of itself.
+
+- **Retention.** The newest **2** `pre-schema` backups are kept by default. Set
+  `DC_STORE_KEEP_BACKUPS` to a positive number, or to `all` to keep every backup, or call
+  `Store::set_backup_retention(BackupRetention::keep(n) | KeepAll)` on a handle (the handle's
+  setting wins over the variable). `0` is refused: it would delete the backup an upgrade has
+  just made. A value that cannot be read keeps every backup and says so on stderr: an
+  unparseable setting must not become permission to delete.
+- **When it runs.** Only right after an upgrade wrote a *new* backup and read it back
+  (`PRAGMA quick_check`, and the schema version in `work_meta` must be the one in the name).
+  A copy that fails that check is removed, never renamed to `.bak`, and the upgrade is refused.
+  A plain open, a read, a current profile, and the resumption of an interrupted upgrade (whose
+  backup already exists) delete nothing.
+- **What is kept.** The backup just written always counts and is never removed. Older ones are
+  walked newest schema first (numerically: 9 is older than 10); each must verify to count. One
+  that does not verify is not counted, **not removed**, and reported. Everything beyond the
+  count is removed. Only regular files named exactly `<profile>.pre-schema-<digits>.bak` are
+  candidates: `pre-tasks-retire`, `*.partial`, directories and symlinks are never touched.
+- **What is reported.** Each removal is written to stderr by path, and `store.upgrade` returns
+  `pruned_backups: {removed, unverified, errors}` (`UpgradeReport.prune` in Rust).
+- **Peak disk.** The new backup is written before the old ones go, so the peak is the
+  retention count plus one profile-sized copies. Pruning frees nothing until the next upgrade.
+
+## Returning free pages: `store.vacuum`
+
+`store.compact` deletes rows; the pages come back to the operating system only under
+`auto_vacuum=INCREMENTAL`, which a profile has only if it was created after that setting was
+added. An older profile (mode NONE) keeps every freed page, and SQLite cannot change the mode
+except by rewriting the file. `store.vacuum` is that rewrite, run deliberately:
+
+```
+dcstore --db <profile> work --method store.vacuum --input '{}'
+```
+
+Optional input: `reserve_bytes` (default 1 GiB), headroom required on top of the rewrite.
+It is available through the Rust dispatcher and the dcstore CLI, and is deliberately not in
+the Go `WorkbenchMethods` list: a full rewrite holds the write lock for as long as it takes.
+
+- It sets `auto_vacuum=INCREMENTAL` before the one `VACUUM`, so afterwards `store.compact`
+  returns pages itself and no second full rewrite is ever needed.
+- It never runs on open, never inside a migration (an older profile is refused with
+  `schema_upgrade_required`), and not inside a transaction (`invalid_input`).
+- It refuses before touching a page when the disk cannot hold it: `insufficient_disk_space`
+  (needs the database size again on the profile's filesystem *and* in SQLite's temporary
+  directory, summed when they are one mount, plus `reserve_bytes`), or `disk_space_unknown`
+  when free space could not be measured (`df -Pk`; there is no portable call in `std`, and
+  this crate forbids `unsafe` and takes no dependency for it). A check that could not run is
+  a refusal, not a pass. `vacuum_blocked`: another connection holds the profile.
+- It reports `bytes_before/after` (the database as SQLite counts it), `file_bytes_before/after`
+  (the file), `free_pages_before/after`, `auto_vacuum_before/after`, `required_bytes`,
+  `available_bytes` and `checkpoint` (`blocked` means a reader kept the WAL from folding in,
+  so the file shrinks at the next checkpoint). A profile that is already incremental with
+  nothing free answers `not_needed` and is not rewritten.
+- Order: run `store.compact` until nothing reports `truncated` (it frees the rows), then
+  `store.vacuum` (it returns the pages), with the profile's other writers stopped.
+
 ## Tests
 
-`rust/dc-store/tests/workbench_retention.rs` has one test per invariant (receipt in and
+`rust/dc-store/tests/workbench_backups.rs` and `workbench_vacuum.rs` cover the two sections
+above; `rust/dc-store/tests/workbench_retention.rs` has one test per invariant (receipt in and
 out of window, claim receipts, revision bound plus `expected_revision`, open decisions
 and live runs, event protection, per-pass bound, parameter refusal).
 `dc/store/workbench_test.go` covers the host client. `BenchmarkWorkbenchProfile` in

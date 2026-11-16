@@ -260,9 +260,10 @@ pub(crate) fn retire(
         // run inside the retirement transaction, so a colliding id rolls the
         // version back with the tasks table.
         if work_meta_version(conn)?.is_none() {
-            ensure_schema(conn, true)?;
+            ensure_schema(conn, true, store.backup_retention)?;
         }
-        backup_profile(conn, "pre-tasks-retire", |backup, detail| {
+        // The retire copy is not a `pre-schema` backup and is never pruned.
+        backup_profile(conn, "pre-tasks-retire", None, |backup, detail| {
             format!(
                 "the legacy tasks table cannot be retired because its backup {} could not be written: {detail}",
                 backup.display()

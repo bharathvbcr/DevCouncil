@@ -22,6 +22,20 @@ func TestWorkbenchMethodsExcludeSignalsRecord(t *testing.T) {
 	}
 }
 
+// store.vacuum rewrites the whole profile under the write lock; only the
+// dcstore CLI starts it, never a Go host's clients.
+func TestWorkbenchMethodsExcludeStoreVacuum(t *testing.T) {
+	if slices.Contains(WorkbenchMethods(), "store.vacuum") {
+		t.Fatal("WorkbenchMethods must not list store.vacuum: a Go host would let every serve client start a full rewrite of the profile")
+	}
+	c := New("/nonexistent/dcstore-must-never-run", "/nonexistent/store.db")
+	_, err := c.Workbench(context.Background(), "store.vacuum", []byte(`{}`))
+	var refusal *WorkbenchError
+	if !errors.As(err, &refusal) || refusal.Code != "unknown_method" {
+		t.Fatalf("store.vacuum must be refused by the allowlist before any spawn, got %v", err)
+	}
+}
+
 // The allowlist check runs before any process is spawned, so a client whose
 // binary does not exist still answers: an unknown_method refusal proves the
 // call never reached the spawn path (which would fail with a different error).
