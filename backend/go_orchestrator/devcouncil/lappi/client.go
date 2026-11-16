@@ -23,7 +23,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -120,11 +121,11 @@ const (
 type SlotAnswer struct {
 	// Value is null exactly when Noul. For a choice slot it is one of the
 	// slot's options; for a span slot it is {"start_line","end_line"}.
-	Value        json.RawMessage `json:"value"`
-	ConformalSet []string        `json:"conformal_set"`
-	Score        float64         `json:"score"`
-	Noul         bool            `json:"noul"`
-	Degraded     bool            `json:"degraded"`
+	Value        jsontext.Value `json:"value"`
+	ConformalSet []string       `json:"conformal_set"`
+	Score        float64        `json:"score"`
+	Noul         bool           `json:"noul"`
+	Degraded     bool           `json:"degraded"`
 }
 
 // Choice returns a choice slot's value, or false when the slot abstained or
@@ -330,6 +331,10 @@ var backendPattern = regexp.MustCompile(`^[!-~]{1,256}$`)
 
 var errUnparseable = errors.New("reply unparseable")
 
+// wireBytes encodes a slot value the way encoding/json v1 did (<, >, & and
+// U+2028/U+2029 escaped), so a value a caller recorded keeps its bytes.
+var wireBytes = json.JoinOptions(jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true))
+
 func unparseable() Result { return Result{Reading: Unavailable, Kind: UnavailableReplyUnparseable} }
 
 // parseReply reads one reply line strictly: exact key sets at every level,
@@ -355,7 +360,7 @@ func parseReply(line []byte, slots []SlotSpec) Result {
 	}
 }
 
-func checkSchemaVersion(raw json.RawMessage) error {
+func checkSchemaVersion(raw jsontext.Value) error {
 	var v int
 	if err := strictDecode(raw, &v); err != nil || v != 1 {
 		return errUnparseable
@@ -363,7 +368,7 @@ func checkSchemaVersion(raw json.RawMessage) error {
 	return nil
 }
 
-func parseFailure(top map[string]json.RawMessage, field string, reading Reading) Result {
+func parseFailure(top map[string]jsontext.Value, field string, reading Reading) Result {
 	if requireKeys(top, "status", "schema_version", field, "message") != nil {
 		return unparseable()
 	}
@@ -388,7 +393,7 @@ func parseFailure(top map[string]json.RawMessage, field string, reading Reading)
 	return Result{Reading: reading, Kind: kind}
 }
 
-func parseAnswer(top map[string]json.RawMessage, specs []SlotSpec) Result {
+func parseAnswer(top map[string]jsontext.Value, specs []SlotSpec) Result {
 	if requireKeys(top, "status", "schema_version", "backend", "degraded", "slots") != nil {
 		return unparseable()
 	}
@@ -433,7 +438,7 @@ func parseAnswer(top map[string]json.RawMessage, specs []SlotSpec) Result {
 	return Result{Reading: reading, Backend: backend, Slots: slots}
 }
 
-func parseSlot(raw json.RawMessage, spec SlotSpec) (SlotAnswer, error) {
+func parseSlot(raw jsontext.Value, spec SlotSpec) (SlotAnswer, error) {
 	obj, err := exactObject(raw)
 	if err != nil {
 		return SlotAnswer{}, err
@@ -454,7 +459,7 @@ func parseSlot(raw json.RawMessage, spec SlotSpec) (SlotAnswer, error) {
 	if math.IsNaN(ans.Score) || ans.Score < 0 || ans.Score > 1 {
 		return SlotAnswer{}, errUnparseable
 	}
-	isNull := func(r json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(r), []byte("null")) }
+	isNull := func(r jsontext.Value) bool { return bytes.Equal(bytes.TrimSpace(r), []byte("null")) }
 
 	// value is absent if and only if noul (schema-api.md, "value is absent if
 	// and only if noul"): both illegal combinations are refused.
@@ -469,7 +474,7 @@ func parseSlot(raw json.RawMessage, spec SlotSpec) (SlotAnswer, error) {
 			if err := strictDecode(obj["value"], &v); err != nil || !contains(spec.Options, v) {
 				return SlotAnswer{}, errUnparseable
 			}
-			if ans.Value, err = json.Marshal(v); err != nil {
+			if ans.Value, err = json.Marshal(v, wireBytes); err != nil {
 				return SlotAnswer{}, err
 			}
 		}
@@ -501,7 +506,7 @@ func parseSlot(raw json.RawMessage, spec SlotSpec) (SlotAnswer, error) {
 			if v.StartLine < 0 || v.EndLine < v.StartLine {
 				return SlotAnswer{}, errUnparseable
 			}
-			if ans.Value, err = json.Marshal(v); err != nil {
+			if ans.Value, err = json.Marshal(v, wireBytes); err != nil {
 				return SlotAnswer{}, err
 			}
 		}
@@ -525,8 +530,8 @@ func contains(set []string, v string) bool {
 }
 
 // exactObject decodes one JSON object with nothing after it.
-func exactObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
-	var obj map[string]json.RawMessage
+func exactObject(raw jsontext.Value) (map[string]jsontext.Value, error) {
+	var obj map[string]jsontext.Value
 	if err := strictDecode(raw, &obj); err != nil {
 		return nil, err
 	}
@@ -537,7 +542,7 @@ func exactObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 }
 
 // requireKeys refuses an object whose key set is not exactly keys.
-func requireKeys(obj map[string]json.RawMessage, keys ...string) error {
+func requireKeys(obj map[string]jsontext.Value, keys ...string) error {
 	if len(obj) != len(keys) {
 		return errUnparseable
 	}
@@ -549,22 +554,14 @@ func requireKeys(obj map[string]json.RawMessage, keys ...string) error {
 	return nil
 }
 
-// strictDecode decodes raw into v, refusing null, trailing data and, for
-// structs, unknown fields. encoding/json decodes null into a scalar as a
-// silent no-op, which would read "score": null as a score of 0; every field
-// that may be null is checked for it before this is called.
-func strictDecode(raw json.RawMessage, v any) error {
+// strictDecode decodes raw into v, refusing null, trailing data, duplicate
+// member names, invalid UTF-8 and, for structs, unknown fields. Decoding null
+// into a scalar is a silent no-op, which would read "score": null as a score
+// of 0; every field that may be null is checked for it before this is called.
+func strictDecode(raw jsontext.Value, v any) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return errUnparseable
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return errUnparseable
-	}
-	return nil
+	return json.Unmarshal(raw, v, json.RejectUnknownMembers(true))
 }

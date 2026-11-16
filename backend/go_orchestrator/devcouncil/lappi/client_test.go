@@ -145,6 +145,9 @@ func TestEveryOutcomeIsOneOfSix(t *testing.T) {
 		{"span_end_before_start", strings.Replace(answered, `{"start_line":4,"end_line":4}`, `{"start_line":4,"end_line":3}`, 1), Unavailable, UnavailableReplyUnparseable},
 		{"schema_version_2", strings.Replace(answered, `"schema_version":1`, `"schema_version":2`, 1), Unavailable, UnavailableReplyUnparseable},
 		{"trailing_data", answered + ` {}`, Unavailable, UnavailableReplyUnparseable},
+		// A repeated member name is refused, not read as its last copy.
+		{"duplicate_envelope_key", strings.Replace(answered, `"degraded":false,"slots"`, `"degraded":false,"degraded":true,"slots"`, 1), Unavailable, UnavailableReplyUnparseable},
+		{"duplicate_slot_key", strings.Replace(answered, `"score":0.91,`, `"score":0.91,"score":0.2,`, 1), Unavailable, UnavailableReplyUnparseable},
 		{"refusal_kind_not_identifier", strings.Replace(refused, `"kind":"calibration_entry_missing"`, `"kind":"file: a/b.go"`, 1), Unavailable, UnavailableReplyUnparseable},
 		{"refusal_missing_message", `{"status":"refused","schema_version":1,"refusal":{"kind":"x"}}`, Unavailable, UnavailableReplyUnparseable},
 	}
@@ -160,6 +163,23 @@ func TestEveryOutcomeIsOneOfSix(t *testing.T) {
 				t.Fatalf("slots/backend present=%v for %s", res.Slots != nil, res.Reading)
 			}
 		})
+	}
+}
+
+// A choice value keeps the bytes encoding/json v1 gave it (HTML and JS
+// characters escaped), so a recorded SlotAnswer does not change.
+func TestChoiceValueKeepsItsRecordedBytes(t *testing.T) {
+	opt := "a<b>&c\u2028"
+	raw := []byte(`{"value":"a<b>&c\u2028","conformal_set":null,"score":0.5,"noul":false,"degraded":false}`)
+	ans, err := parseSlot(raw, SlotSpec{Name: "x", Type: SlotChoice, Options: []string{opt}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(ans.Value), `"a\u003cb\u003e\u0026c\u2028"`; got != want {
+		t.Fatalf("value bytes %s, want %s", got, want)
+	}
+	if v, ok := ans.Choice(); !ok || v != opt {
+		t.Fatalf("Choice() = %q, %v", v, ok)
 	}
 }
 
