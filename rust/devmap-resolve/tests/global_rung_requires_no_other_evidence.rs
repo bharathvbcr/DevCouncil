@@ -225,3 +225,99 @@ fn an_unambiguous_bare_name_with_no_other_evidence_still_binds() {
         Some(Resolution::UniqueGlobal { .. })
     ));
 }
+
+#[test]
+fn an_external_supertype_blocks_unique_global_for_kotlin_bare_calls() {
+    let result = resolve(&[
+        (
+            "app/src/main/kotlin/gaps/Svc.kt",
+            "package gaps\nimport android.app.Service\nclass PollService : Service() {\n    fun label(): String = getString(1)\n}\n",
+        ),
+        (
+            "app/src/main/kotlin/other/Strings.kt",
+            "package other\nfun getString(i: Int): String = i.toString()\n",
+        ),
+    ]);
+    assert!(
+        call_edges_to(&result, "::getString").is_empty(),
+        "an inherited external supertype method must not bind to an unrelated top-level namesake: {:?}",
+        result.edges
+    );
+    assert_eq!(row(&result, "getString").class, UnresolvedClass::Unresolved);
+}
+
+#[test]
+fn an_external_supertype_blocks_unique_global_for_swift_bare_calls() {
+    let result = resolve(&[
+        (
+            "Sources/App/View.swift",
+            "import UIKit\nclass MyViewController : UIViewController {\n    func render() { layout() }\n}\n",
+        ),
+        (
+            "Sources/Other/Layout.swift",
+            "func layout() {}\n",
+        ),
+    ]);
+    assert!(
+        call_edges_to(&result, "::layout").is_empty(),
+        "a swift external supertype method must not bind to an in-repo namesake: {:?}",
+        result.edges
+    );
+}
+
+#[test]
+fn an_external_supertype_blocks_unique_global_for_java_bare_calls() {
+    let result = resolve(&[
+        (
+            "src/com/example/MyServlet.java",
+            "package com.example;\npublic class MyServlet extends HttpServlet {\n    public void handle() { initParam(); }\n}\n",
+        ),
+        (
+            "src/other/Util.java",
+            "package other;\npublic class Util {\n    public static void initParam() {}\n}\n",
+        ),
+    ]);
+    assert!(
+        call_edges_to(&result, "::initParam").is_empty(),
+        "a java external supertype method must not bind to an in-repo namesake: {:?}",
+        result.edges
+    );
+}
+
+#[test]
+fn a_deep_inheritance_chain_to_external_supertype_blocks_unique_global() {
+    let result = resolve(&[
+        (
+            "src/pkg/Chain.kt",
+            "package pkg\n\
+             open class Base : ExternalSdkBase()\n\
+             open class Mid : Base()\n\
+             class Child : Mid() {\n\
+                 fun test() { sdkMethod() }\n\
+             }\n",
+        ),
+        ("src/other/Lib.kt", "package other\nfun sdkMethod() {}\n"),
+    ]);
+    assert!(
+        call_edges_to(&result, "::sdkMethod").is_empty(),
+        "a deep inheritance chain reaching an external supertype must block UniqueGlobal: {:?}",
+        result.edges
+    );
+}
+
+#[test]
+fn languages_without_implicit_this_are_unaffected_by_external_supertype() {
+    let result = resolve(&[
+        (
+            "app.py",
+            "class MyHandler(ExternalBase):\n    def run(self):\n        return unique_helper()\n",
+        ),
+        ("lib.py", "def unique_helper():\n    return 42\n"),
+    ]);
+    let callers = call_edges_to(&result, "::unique_helper");
+    assert_eq!(
+        callers,
+        ["app.py::MyHandler.run"],
+        "Python bare calls are not implicit this and must bind via UniqueGlobal"
+    );
+}

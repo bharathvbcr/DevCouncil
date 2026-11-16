@@ -1429,7 +1429,7 @@ describe different graphs.",
                     "min_rung": rung_prop(),
                     "layers": {"type": "boolean", "default": false,
                         "description": "Also band the reached symbols by hop distance \
-(`blast_radius.layers`). The budget is split between the bands and the edge list."}
+            (`blast_radius.layers`). The budget is split between the bands and the edge list."}
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -1591,7 +1591,7 @@ writes nothing.",
                     "limit": {"type": "integer", "minimum": 1,
                         "maximum": crate::protocol::MAX_EXPLORE_LIMIT, "default": 20,
                         "description": "Maximum definitions to expand. Echoed in the response so a \
-short list is attributable to the cap rather than to the index."},
+            short list is attributable to the cap rather than to the index."},
                     // Not `budget_prop`: this budget is divided across four
                     // parts rather than spent once, and the shared description
                     // says it is spent once.
@@ -1599,8 +1599,8 @@ short list is attributable to the cap rather than to the index."},
                         "type": "integer", "minimum": 1, "maximum": 100_000,
                         "default": devmap_query::Budget::EXPLORE,
                         "description": "Token budget for the whole answer, divided across \
-definitions, both edge directions and the blast radius. The division actually used is reported in \
-the response's `budget`."
+            definitions, both edge directions and the blast radius. The division actually used is reported in \
+            the response's `budget`."
                     },
                     "depth": depth_prop(3),
                     "min_confidence": confidence_prop()
@@ -1622,7 +1622,7 @@ the response's `budget`."
                         // refuses a longer list rather than trimming it.
                         "maxItems": devmap_query::MAX_NEIGHBOR_TARGETS,
                         "description": "Symbols or file paths the change touches. More than the \
-maximum is refused, never silently trimmed."
+            maximum is refused, never silently trimmed."
                     },
                     "budget": budget_prop(2000),
                     "depth": depth_prop(3),
@@ -1641,7 +1641,7 @@ maximum is refused, never silently trimmed."
                         "description": "A symbol name, a `file::symbol` node id, or a file path."},
                     "since": {"type": "string", "maxLength": 4096,
                         "description": "The last known-good revision. Commits after it are the \
-candidates. An empty value is refused rather than read as all of history."},
+            candidates. An empty value is refused rather than read as all of history."},
                     "depth": depth_prop(dc_regress::DEFAULT_CONE_DEPTH)
                 },
                 "required": ["symptom", "since"],
@@ -1655,11 +1655,11 @@ candidates. An empty value is refused rather than read as all of history."},
                 "properties": {
                     "since": {"type": "string", "maxLength": 4096,
                         "description": "The revision the change is measured from; the change is \
-everything between it and the indexed head. Give this or `at`, never both."},
+            everything between it and the indexed head. Give this or `at`, never both."},
                     "at": {"type": "string", "maxLength": 4096,
                         "description": "An explicit location instead of a diff: `path:start-end`, \
-`path:line`, or a bare `path` for the whole file, read at the indexed head. For \"what depends on \
-the line I am looking at\". Give this or `since`, never both."},
+            `path:line`, or a bare `path` for the whole file, read at the indexed head. For \"what depends on \
+            the line I am looking at\". Give this or `since`, never both."},
                     "depth": depth_prop(dc_regress::DEFAULT_BLAST_DEPTH)
                 },
                 // Neither is required by the schema because exactly one is:
@@ -1677,7 +1677,7 @@ the line I am looking at\". Give this or `since`, never both."},
                 "properties": {
                     "filter": {"type": "string", "maxLength": 4096,
                         "description": "Only routes whose path or id contains this, or whose path \
-matches it with parameters normalised (`/users/:id` matches `/users/42`)."},
+            matches it with parameters normalised (`/users/:id` matches `/users/42`)."},
                     "budget": budget_prop(2000)
                 },
                 "additionalProperties": false
@@ -2478,7 +2478,7 @@ fn type_violation(what: &str, declared: Option<&Value>, value: &Value) -> Option
                 return Some(format!(
                     "{what}: `type: {unknown}` is not a type this checker implements, so nothing \
 was checked"
-                ))
+                ));
             }
         };
         if matched {
@@ -2562,7 +2562,7 @@ pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcComman
             return Err(RpcError::new(
                 codes::INVALID_PARAMS,
                 format!("tool arguments must be an object, got {}", kind_of(other)),
-            ))
+            ));
         }
     };
 
@@ -2789,14 +2789,7 @@ nothing.",
 }
 
 fn kind_of(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+    devmap_query::json_value_kind(value)
 }
 
 /// Negotiate a protocol revision against the client's request.
@@ -2974,7 +2967,7 @@ fn classify_era(params: Option<&Value>) -> Result<Era, RpcError> {
                     MODERN_PROTOCOL_VERSIONS[0],
                     kind_of(other)
                 ),
-            ))
+            ));
         }
     };
 
@@ -3392,7 +3385,7 @@ async fn recover_from_damage(
         Err(reason) => {
             return report(format!(
                 "{reason} (the first failure on this call was: {first:#})"
-            ))
+            ));
         }
     };
     let command = match to_ipc_command(tool, arguments) {
@@ -3693,7 +3686,7 @@ pub fn oversized_result_refusal(tool: &str, result: &Value) -> Option<String> {
             return Some(format!(
                 "{tool} produced a result that could not be serialized at all ({err}), so its \
 size could not be checked and it cannot be sent"
-            ))
+            ));
         }
     };
     if measured <= MAX_RESULT_BYTES {
@@ -3981,7 +3974,7 @@ server also serves {}.",
                     MODERN_PROTOCOL_VERSIONS.join(", "),
                     HANDSHAKE_PROTOCOL_VERSIONS.join(", ")
                 ),
-            ))
+            ));
         }
         "initialize" => {
             let result = initialize_result(params.as_ref());
@@ -4005,7 +3998,7 @@ server also serves {}.",
             return Err(RpcError::new(
                 codes::METHOD_NOT_FOUND,
                 format!("method '{other}' is not supported by this server"),
-            ))
+            ));
         }
     };
     Ok(complete(result))

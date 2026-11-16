@@ -162,7 +162,7 @@ func (r *Registry) Call(ctx context.Context, name string, args map[string]any) (
 	case "devcouncil_release_task":
 		return r.callRelease(ctx, args), nil
 	case "devcouncil_next_task":
-		return r.callNextTask(ctx, args), nil
+		return r.callNextTask(ctx), nil
 	case "devcouncil_verify_task":
 		return r.callVerify(ctx, args), nil
 	case "devcouncil_get_gaps":
@@ -240,8 +240,7 @@ func (r *Registry) GateState() verify.GateState {
 	return (&LeaseService{Root: r.Root}).GateState()
 }
 
-func (r *Registry) callNextTask(ctx context.Context, args map[string]any) any {
-	_ = args
+func (r *Registry) callNextTask(ctx context.Context) any {
 	if r.Store == nil {
 		return map[string]any{"ok": false, "error": "DevCouncil not initialized in this directory.", "code": "not_initialized"}
 	}
@@ -329,7 +328,9 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 	// available" — the two are opposite facts and must not share a rendering.
 	history := map[string]store.GapHistoryRow{}
 	historyAvailable := true
-	if rows, _, err := r.Store.GapHistory(ctx, taskID); err == nil {
+	historyTruncated := false
+	if rows, histTruncated, err := r.Store.GapHistory(ctx, taskID); err == nil {
+		historyTruncated = histTruncated
 		for _, h := range rows {
 			history[h.GapID] = h
 		}
@@ -387,6 +388,7 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 		// False means the recurrence annotation is missing from every gap
 		// above, not that nothing has ever recurred.
 		"recurrence_available": historyAvailable,
+		"recurrence_truncated": historyTruncated,
 		"truncated":            truncated,
 	}
 }

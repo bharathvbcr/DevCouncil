@@ -10,6 +10,9 @@
 //! identifier in markup (`{size}`, `onclick={save}`) was a Call in an early v98
 //! row and is a Name reference now.
 
+use std::path::PathBuf;
+use std::process::Command;
+
 use devmap_extract::cache::{CacheKey, ANALYZER_VERSION, EXTRACTION_SCHEMA_VERSION};
 use devmap_extract::extract_file;
 use devmap_extract::model::{Extraction, ReferenceKind};
@@ -79,4 +82,103 @@ fn the_stored_identity_names_v99() {
         key.analyzer_version
     );
     assert!(schema_version() >= 99, "{EXTRACTION_SCHEMA_VERSION}");
+}
+
+fn devmap_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_devmap"))
+}
+
+#[test]
+fn a_generation_carrying_v98_payloads_is_not_current_and_forces_rebuild() {
+    let dir = std::env::temp_dir().join(format!("devmap-v98-rebuild-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.canonicalize().unwrap();
+
+    let svelte_file = root.join("Panel.svelte");
+    std::fs::write(&svelte_file, SVELTE).unwrap();
+
+    let db = root.join("store.sqlite");
+
+    // 1. Initial build creates a v99 generation
+    let out = Command::new(devmap_bin())
+        .arg("--db")
+        .arg(&db)
+        .arg("--json")
+        .args(["build", "."])
+        .current_dir(&root)
+        .output()
+        .expect("devmap build executes");
+    assert!(
+        out.status.success(),
+        "initial build succeeded: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let store = Store::open(&db).unwrap();
+    assert!(
+        store.latest_generation_payload_is_current().unwrap(),
+        "control: fresh build generation must be current"
+    );
+    drop(store);
+
+    // 2. Simulate stale store by rewriting analyzer_version in file_payloads to end in ':extract-v98'
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE file_payloads SET analyzer_version = REPLACE(analyzer_version, ':extract-v99', ':extract-v98')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            changed >= 1,
+            "at least one file was updated to v98 identity"
+        );
+    }
+
+    // 3. Verify that store.latest_generation_payload_is_current() returns false
+    let store = Store::open(&db).unwrap();
+    assert!(
+        !store.latest_generation_payload_is_current().unwrap(),
+        "a generation holding :extract-v98 payloads must NOT be reported as current"
+    );
+    drop(store);
+
+    // 4. Running devmap build on this directory triggers rebuild
+    let out = Command::new(devmap_bin())
+        .arg("--db")
+        .arg(&db)
+        .arg("--json")
+        .args(["build", "."])
+        .current_dir(&root)
+        .output()
+        .expect("devmap build executes");
+    assert!(
+        out.status.success(),
+        "rebuild succeeded: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 5. Resulting generation is current again under v99
+    let store = Store::open(&db).unwrap();
+    assert!(
+        store.latest_generation_payload_is_current().unwrap(),
+        "rebuilt generation must be current under v99"
+    );
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let analyzer_version: String = conn
+        .query_row(
+            "SELECT analyzer_version FROM generation_files WHERE generation_id = (SELECT max(id) FROM generations) LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        analyzer_version.ends_with(":extract-v99"),
+        "rebuilt generation files must carry :extract-v99, got {analyzer_version}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

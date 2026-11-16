@@ -209,3 +209,115 @@ func TestIntegrateCursorWritesNoDevCouncilHook(t *testing.T) {
 		}
 	}
 }
+
+func TestUninstallPreservesKeyOrderEscapingAndFormatting(t *testing.T) {
+	t.Run("claude nested matcher and statusLine", func(t *testing.T) {
+		root := t.TempDir()
+		settings := filepath.Join(root, ".claude", "settings.json")
+		writeFile(t, settings, `{
+    "z_first": "keep-first",
+    "statusLine": {"type": "command", "command": "dev hook status-line"},
+    "hooks": {
+        "UserPromptSubmit": [
+            {"matcher": "x", "hooks": [
+                {"type": "command", "command": "dev hook user-prompt-submit"},
+                {"type": "command", "command": "echo hi && cat foo > bar"}
+            ]}
+        ],
+        "PreToolUse": [
+            {"matcher": "", "hooks": [{"type": "command", "command": "dev hook pre-tool-use"}]}
+        ]
+    },
+    "a_second": 42
+}
+`)
+		if _, err := Uninstall(UninstallOptions{Root: root, Client: "claude", Target: TargetHooks, Mode: ModeApply}); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+		gotBytes, err := os.ReadFile(settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(gotBytes)
+		want := `{
+    "z_first": "keep-first",
+    "hooks": {
+        "UserPromptSubmit": [
+            {"matcher": "x", "hooks": [
+                {"type": "command", "command": "echo hi && cat foo > bar"}
+            ]}
+        ]
+    },
+    "a_second": 42
+}
+`
+		if got != want {
+			t.Fatalf("claude mismatch:\nGOT:\n%s\nWANT:\n%s", got, want)
+		}
+	})
+
+	t.Run("cursor flat hooks and compact formatting", func(t *testing.T) {
+		root := t.TempDir()
+		cursorHooks := filepath.Join(root, ".cursor", "hooks.json")
+		writeFile(t, cursorHooks, `{"z_custom":"val","version":1,"hooks":{"stop":[{"command":"dev hook agent-response"},{"command":"echo ok && date > /dev/null"}],"beforeFileEdit":[{"command":"lint && format > out"}]},"a_tail":true}`)
+
+		if _, err := Uninstall(UninstallOptions{Root: root, Client: "cursor", Target: TargetHooks, Mode: ModeApply}); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+		gotBytes, err := os.ReadFile(cursorHooks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(gotBytes)
+		want := `{"z_custom":"val","version":1,"hooks":{"stop":[{"command":"echo ok && date > /dev/null"}],"beforeFileEdit":[{"command":"lint && format > out"}]},"a_tail":true}`
+		if got != want {
+			t.Fatalf("cursor mismatch:\nGOT:\n%s\nWANT:\n%s", got, want)
+		}
+	})
+
+	t.Run("opencode plugin array and scalar", func(t *testing.T) {
+		root := t.TempDir()
+		openCode := filepath.Join(root, "opencode.json")
+		writeFile(t, openCode, `{
+    "z_theme": "solarized",
+    "plugin": [
+        "`+openCodeHookPlugin+`",
+        "other-plugin && check > log"
+    ],
+    "a_other": {"nested": [1, 2]}
+}`)
+		if _, err := Uninstall(UninstallOptions{Root: root, Client: "opencode", Target: TargetHooks, Mode: ModeApply}); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+		gotBytes, err := os.ReadFile(openCode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(gotBytes)
+		want := `{
+    "z_theme": "solarized",
+    "plugin": [
+        "other-plugin && check > log"
+    ],
+    "a_other": {"nested": [1, 2]}
+}`
+		if got != want {
+			t.Fatalf("opencode array mismatch:\nGOT:\n%s\nWANT:\n%s", got, want)
+		}
+
+		// Scalar string plugin key is removed without disturbing surviving keys.
+		writeFile(t, openCode, `{"z_first":"hi > out && ok","plugin":"`+openCodeHookPlugin+`","a_last":1}`)
+		if _, err := Uninstall(UninstallOptions{Root: root, Client: "opencode", Target: TargetHooks, Mode: ModeApply}); err != nil {
+			t.Fatalf("uninstall scalar: %v", err)
+		}
+		gotBytes, err = os.ReadFile(openCode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = string(gotBytes)
+		want = `{"z_first":"hi > out && ok","a_last":1}`
+		if got != want {
+			t.Fatalf("opencode scalar mismatch:\nGOT:\n%s\nWANT:\n%s", got, want)
+		}
+	})
+}

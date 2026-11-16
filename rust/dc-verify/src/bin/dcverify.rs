@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use dc_proc::cli::{collect_args, is_version_arg, quote, version_object};
 use dc_verify::bounded::{MAX_CHECK_BYTES, decode_lossy, read_bounded};
 use dc_verify::rigor::{
     Finding, Severity, Strength, detect_lean_tcb_report_with_root, detect_runner_hijack_with,
@@ -21,19 +22,6 @@ use dc_verify::{classify_scope, normalize_candidate, parse_unified};
 
 #[path = "../evidence_cli.rs"]
 mod evidence_cli;
-
-// A disconnected consumer is a transport failure, not a Rust panic. Keep
-// diagnostics off this JSON protocol, including the error response path.
-macro_rules! respond {
-    ($($argument:tt)*) => {{
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
-            .and_then(|()| out.flush()).is_err() {
-            return ExitCode::FAILURE;
-        }
-    }};
-}
 
 /// Replaces the default panic hook, which prints the panic message.
 ///
@@ -72,40 +60,20 @@ fn main() -> ExitCode {
     let args = match collect_args() {
         Ok(args) => args,
         Err(message) => {
-            respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            dc_proc::respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
             return ExitCode::from(2);
         }
     };
     match run(&args) {
         Ok(json) => {
-            respond!("{json}");
+            dc_proc::respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(message) => {
-            respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            dc_proc::respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
             ExitCode::from(2)
         }
     }
-}
-
-/// Collects the command line, refusing an argument that is not valid Unicode
-/// rather than dying on it.
-///
-/// `std::env::args()` panics on such an argument: exit 101, a backtrace on
-/// stderr, and nothing on stdout, which the Go client can only report as a
-/// verifier that failed with no reason. A rigor check that could not run must
-/// not be indistinguishable from one that ran — and the paths this binary is
-/// handed come from a diff and from a working tree, where Unix filenames are
-/// bytes rather than Unicode.
-fn collect_args() -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    for (index, arg) in std::env::args_os().skip(1).enumerate() {
-        match arg.into_string() {
-            Ok(value) => args.push(value),
-            Err(_) => return Err(format!("argument {index} is not valid UTF-8")),
-        }
-    }
-    Ok(args)
 }
 
 const KNOWN_FLAGS: &[&str] = &["planned", "coverage", "root"];
@@ -113,33 +81,14 @@ const IDENTITY: &str = "dc-verify";
 const COMPONENT_ID: &str = "dcverify";
 const SCHEMA_VERSION: u32 = 1;
 
-fn is_version_arg(arg: &str) -> bool {
-    matches!(arg, "--version" | "-V" | "-v" | "version")
-}
-
-/// What `--version` answers.
-///
-/// `CARGO_PKG_VERSION` and never a literal: every crate in this workspace takes
-/// `version.workspace = true`, so the one number in `rust/Cargo.toml` reaches
-/// here and a release has no second place to forget. Until this existed the
-/// binary answered `--version` with `unknown flag --version`, so a deployed
-/// verifier's version was simply not observable — the package said 0.2.3 and
-/// the program could not be asked.
-///
-/// JSON, like every other outcome on this boundary: a caller that parses each
-/// line must not have to special-case this one.
-fn version_object() -> String {
-    format!(
-        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{}}}",
-        quote(COMPONENT_ID),
-        quote(IDENTITY),
-        quote(env!("CARGO_PKG_VERSION"))
-    )
-}
-
 fn run(args: &[String]) -> Result<String, String> {
     if args.iter().any(|arg| is_version_arg(arg)) {
-        return Ok(version_object());
+        return Ok(version_object(
+            COMPONENT_ID,
+            IDENTITY,
+            env!("CARGO_PKG_VERSION"),
+            &[],
+        ));
     }
     if args.first().is_some_and(|arg| arg == "evidence-check") {
         return evidence_cli::run(&args[1..]);
@@ -842,25 +791,4 @@ fn coverage_gaps(report: &dc_verify::rigor::CoverageReport) -> String {
 fn string_array(values: &[String]) -> String {
     let items: Vec<String> = values.iter().map(|v| quote(v)).collect();
     format!("[{}]", items.join(","))
-}
-
-/// Hand-rolled JSON string escaping, matching `dcstore`'s. The dependency-free
-/// stance is deliberate: these binaries ship inside the harness, and a
-/// serialisation crate is a supply-chain surface for output this simple.
-fn quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

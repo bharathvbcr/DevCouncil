@@ -31,26 +31,16 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 
+use dc_proc::cli::{collect_args_with_note, is_version_arg, quote};
 use dc_store::{AcquireRequest, Lease, LeaseCode, ReadyMode, ScopeWrite, Store, StoreError};
 
-// A disconnected consumer is a transport failure, not a Rust panic. Keep
-// diagnostics off this JSON protocol, including the error response path.
-macro_rules! respond {
-    ($($argument:tt)*) => {{
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
-            .and_then(|()| out.flush()).is_err() {
-            return ExitCode::FAILURE;
-        }
-    }};
-}
-
 fn main() -> ExitCode {
-    let args = match collect_args() {
+    let args = match collect_args_with_note(
+        "; the store cannot parse a request it cannot read, and its value is withheld here because one argument is a lease token",
+    ) {
         Ok(args) => args,
         Err(message) => {
-            respond!("{}", fatal_object(&message));
+            dc_proc::respond!("{}", fatal_object(&message));
             return ExitCode::from(2);
         }
     };
@@ -66,52 +56,20 @@ fn main() -> ExitCode {
     }
     match run(&args) {
         Ok(json) => {
-            respond!("{json}");
+            dc_proc::respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(Failure::Conflict(json)) => {
             // Contention is an outcome, not a fault: exit 0 so a caller that
             // does check the exit code does not treat a busy task as an outage.
-            respond!("{json}");
+            dc_proc::respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(Failure::Fatal(message)) => {
-            respond!("{}", fatal_object(&message));
+            dc_proc::respond!("{}", fatal_object(&message));
             ExitCode::from(2)
         }
     }
-}
-
-/// Collects the command line, refusing an argument that is not valid Unicode
-/// rather than dying on it.
-///
-/// `std::env::args()` panics on such an argument, and a panic here breaks the
-/// one property this boundary rests on and this file's own header states: every
-/// outcome is JSON on stdout. What it produced instead was exit 101, a Rust
-/// backtrace on stderr, and an empty stdout — which the Go client can only
-/// report as "failed: exit status 101", handing an operator a panic dump in
-/// place of a diagnosis. Argument vectors on Unix are bytes, and the values
-/// crossing this boundary include branch names and identifiers that reach the
-/// harness from the environment, so bytes that are not UTF-8 are reachable
-/// input, not a hypothetical.
-///
-/// The offending value is named by position and never by content: one of the
-/// arguments carries a lease token, and an error message that echoed it would
-/// copy a credential into the caller's logs.
-fn collect_args() -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    for (index, arg) in std::env::args_os().skip(1).enumerate() {
-        match arg.into_string() {
-            Ok(value) => args.push(value),
-            Err(_) => {
-                return Err(format!(
-                    "argument {index} is not valid UTF-8; the store cannot parse a request it \
-                     cannot read, and its value is withheld here because one argument is a lease token"
-                ));
-            }
-        }
-    }
-    Ok(args)
 }
 
 /// Flags this binary accepts. Kept beside the parser so adding a flag without
@@ -190,34 +148,25 @@ const KNOWN_FLAGS: &[&str] = &[
 const STORE_IDENTITY: &str = "dc-store";
 const COMPONENT_ID: &str = "dcstore";
 
-fn is_version_arg(arg: &str) -> bool {
-    matches!(arg, "--version" | "-V" | "-v" | "version")
-}
-
 /// What `--version` answers.
 ///
 /// `CARGO_PKG_VERSION` and never a literal: every crate in this workspace takes
 /// `version.workspace = true`, so the one number in `rust/Cargo.toml` is what
-/// reaches here, and there is no second place for a release to forget. Before
-/// this existed the binary answered `--version` with `unknown flag --version`,
-/// which is the reason a deployed `dcstore` could not be told apart from one
-/// three releases old: the package was 0.2.3 and the program could not say so.
-///
-/// JSON rather than a bare string because this boundary's contract is that
-/// every outcome is a JSON object on stdout — a caller that parses each line
-/// must not have to special-case this one.
+/// reaches here, and there is no second place for a release to forget.
 ///
 /// `workbench_schema` is the profile version this build opens, and the only
 /// field that tells a schema 10 build from a schema 11 one: both are 0.2.4.
 /// A host that hands its profile to whatever `dcstore` is on PATH checks it
 /// first, rather than learning from `schema_unsupported` on every request.
 fn version_object() -> String {
-    format!(
-        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{},\"workbench_schema\":{}}}",
-        quote(COMPONENT_ID),
-        quote(STORE_IDENTITY),
-        quote(env!("CARGO_PKG_VERSION")),
-        dc_store::workbench::WORKBENCH_SCHEMA
+    dc_proc::cli::version_object(
+        COMPONENT_ID,
+        STORE_IDENTITY,
+        env!("CARGO_PKG_VERSION"),
+        &[(
+            "workbench_schema",
+            &dc_store::workbench::WORKBENCH_SCHEMA.to_string(),
+        )],
     )
 }
 
@@ -302,11 +251,11 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
 /// "healthy, zero leases" from a private empty database nobody else was
 /// using, which is exactly the confident zero Available() promises never to
 /// report. A store that is not there is now an answer, not a side effect.
-fn open_for(command: &str, db: &str) -> Result<Store, Failure> {
-    if command == "health" {
-        Store::open_existing(db)
-    } else {
-        Store::open(db)
+fn open_for(command: &str, db: &str, for_serve: bool) -> Result<Store, Failure> {
+    match command {
+        "runs" | "run-get" | "handoff-get" if !for_serve => Store::open_readonly(db),
+        "health" | "runs" | "run-get" | "handoff-get" => Store::open_existing(db),
+        _ => Store::open(db),
     }
     .map_err(|e| Failure::Fatal(e.to_string()))
 }
@@ -322,7 +271,7 @@ fn run(args: &[String]) -> Result<String, Failure> {
     let command = parsed
         .command
         .ok_or_else(|| Failure::Fatal("a command is required".into()))?;
-    let store = open_for(&command, &db)?;
+    let store = open_for(&command, &db, false)?;
 
     dispatch(&store, &command, &parsed.flags)
 }
@@ -1082,10 +1031,100 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        "runs" => {
+            let (rows, truncated) = store
+                .runs_list(flag("task"))
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let items: Vec<String> = rows.iter().map(run_json).collect();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("runs", &format!("[{}]", items.join(","))),
+                ("shown", &rows.len().to_string()),
+                ("truncated", &json_bool(truncated)),
+            ]))
+        }
+
+        "run-get" => {
+            let id = required("id")?;
+            if id.trim().is_empty() {
+                return Err(Failure::Fatal("--id must not be blank".into()));
+            }
+            match store
+                .run_get(id)
+                .map_err(|e| Failure::Fatal(e.to_string()))?
+            {
+                Some(run) => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(true)),
+                    ("run", &run_json(&run)),
+                ])),
+                None => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(false)),
+                    ("run", &"null".to_string()),
+                ])),
+            }
+        }
+
+        "handoff-get" => {
+            let id = required("id")?;
+            if id.trim().is_empty() {
+                return Err(Failure::Fatal("--id must not be blank".into()));
+            }
+            match store
+                .handoff_get(id)
+                .map_err(|e| Failure::Fatal(e.to_string()))?
+            {
+                Some(handoff) => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(true)),
+                    ("handoff", &handoff_json(&handoff)),
+                ])),
+                None => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(false)),
+                    ("handoff", &"null".to_string()),
+                ])),
+            }
+        }
+
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, local-repository, evidence-append, evidence-list, requirements, review-append, reviews, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, handoff, work)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, local-repository, evidence-append, evidence-list, requirements, review-append, reviews, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, runs, run-get, handoff, handoff-get, work)"
         ))),
     }
+}
+
+fn opt_json_str(value: Option<&str>) -> String {
+    match value {
+        Some(v) => quote(v),
+        None => "null".to_string(),
+    }
+}
+
+fn run_json(run: &dc_store::records::VerificationRun) -> String {
+    object(&[
+        ("id", &quote(&run.id)),
+        ("task_id", &quote(&run.task_id)),
+        ("sandbox", &quote(&run.sandbox)),
+        ("environment_json", &quote(&run.environment_json)),
+        ("commands_json", &quote(&run.commands_json)),
+        ("status", &quote(&run.status)),
+        ("started_at", &quote(&run.started_at)),
+        ("finished_at", &opt_json_str(run.finished_at.as_deref())),
+    ])
+}
+
+fn handoff_json(handoff: &dc_store::records::AgentHandoff) -> String {
+    object(&[
+        ("id", &quote(&handoff.id)),
+        ("task_id", &quote(&handoff.task_id)),
+        ("from_agent", &quote(&handoff.from_agent)),
+        ("to_agent", &quote(&handoff.to_agent)),
+        ("run_id", &quote(&handoff.run_id)),
+        ("manifest_path", &quote(&handoff.manifest_path)),
+        ("status", &quote(&handoff.status)),
+        ("created_at", &quote(&handoff.created_at)),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,7 +1300,7 @@ fn serve_one(store: &mut Option<Store>, db: &str, args: &[String]) -> (&'static 
         return ("err", fatal_object("serve cannot be nested"));
     }
     if store.is_none() {
-        match open_for(&command, db) {
+        match open_for(&command, db, true) {
             Ok(opened) => *store = Some(opened),
             Err(failure) => return failure_reply(failure),
         }
@@ -1276,7 +1315,7 @@ fn serve_one(store: &mut Option<Store>, db: &str, args: &[String]) -> (&'static 
 /// Answers framed requests on stdin until the caller closes it.
 fn serve(parsed: &Parsed) -> ExitCode {
     let Some(db) = parsed.db.as_deref() else {
-        respond!("{}", fatal_object("--db is required"));
+        dc_proc::respond!("{}", fatal_object("--db is required"));
         return ExitCode::from(2);
     };
     let stdin = std::io::stdin();
@@ -1427,25 +1466,4 @@ fn maybe(value: Option<&str>) -> String {
 
 fn json_bool(v: bool) -> String {
     if v { "true".into() } else { "false".into() }
-}
-
-/// Escapes a string per RFC 8259. Control characters must be escaped or the
-/// output is not parseable JSON — a task title with a newline in it would
-/// otherwise produce a payload the Go side rejects.
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

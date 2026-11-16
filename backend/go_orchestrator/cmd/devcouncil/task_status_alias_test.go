@@ -2,8 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 func TestCanonicalTaskStatusReadsInboxAsBacklog(t *testing.T) {
@@ -73,6 +77,9 @@ func TestTaskStatusRefusalNamesTheFiveStatuses(t *testing.T) {
 }
 
 func TestInboxIsAcceptedAsBacklogOnTheCommandLine(t *testing.T) {
+	bin := testsupport.DCStore(t)
+	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	root := t.TempDir()
 	status := func(id string) string {
 		stdout, restoreOut := swapStdout(t)

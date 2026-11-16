@@ -36,7 +36,7 @@ DevMap build retains its measured five-stage trail and file counters.
 Optional output has bounded queues and shutdown waits. A full or disconnected
 stderr must not block an independent primary result stream. Primary stdout
 retains normal backpressure. Errors writing a result fail the command; the
-three JSON components return exit 1 for transport failure without a panic.
+four JSON components (`dcstore`, `dcverify`, `dcjsoncheck`, `dcgrep`) share `dc_proc::cli` and return exit 1 for transport failure without a panic.
 
 `devcouncil install devmap --dry-run --json` emits the planned command receipt
 without executing it. `devmap repair --fts --pending --page-size --json`
@@ -213,7 +213,7 @@ devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox loca
 
 Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work, planned-file scope, orphan diffs, dependency-risk, and expected-test / allowed-command execution. It also spawns **`dcverify`** for the rigor gates — stub detection (`stub_detected`), secret scanning (`security_risk`), and diff↔coverage (`diff_not_exercised`).
 - `--coverage`: Path to a coverage profile (Go `-coverprofile` output, or LCOV) for the same change. Without it the diff↔coverage gate does not run and `coverage_skipped_reason` says `coverage profile not supplied`; the stub and secret gates run either way. A path that names no file is an error, not an unmeasured run.
-- `rigor_applied` / `rigor_skipped_reason`: Exactly one is populated. `rigor_applied` names the gates that ran (`secret_scan`, `stub_detection`, `substance`; `assert_free_test` and `skipped_test` only when at least one changed file was parsed, since they exist only on that path; and `diff_coverage` when a profile was given). Stub detection parses Rust, Go, Python and TypeScript changed files from the working tree (falling back to a line match, labelled `derived`, elsewhere); an `allow-stub: <reason>` comment on or above a stub records it as a non-blocking `stub_declared` gap carrying the reason, and a marker without a reason is ignored. Added tests with no assertion or an unconditional skip are advisory `assert_free_test` / `skipped_test` gaps. When `dcverify` is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what to install. If `dcverify` **is** installed and fails, that is a blocking `rigor_check_unavailable` gap rather than a skip — a credential scan that could not run must not read like one that ran and found nothing.
+- `rigor_applied` / `rigor_skipped_reason`: Exactly one is populated. `rigor_applied` names the gates that ran (`secret_scan`, `stub_detection`, `substance`, `runner_hijack`, `lean_tcb`; `assert_free_test` and `skipped_test` only when at least one changed file was parsed, since they exist only on that path; and `diff_coverage` when a profile was given). Stub detection parses Rust, Go, Python and TypeScript changed files from the working tree (falling back to a line match, labelled `derived`, elsewhere); an `allow-stub: <reason>` comment on or above a stub records it as a non-blocking `stub_declared` gap carrying the reason, and a marker without a reason is ignored. Added tests with no assertion or an unconditional skip are advisory `assert_free_test` / `skipped_test` gaps. Anti-reward-hacking hard-safety checks add non-demotable `runner_hijack`, `lean_tcb` (optional Lean kernel verification controlled by `DC_VERIFY_LEAN_KERNEL` / `DC_LEAN_KERNEL_TIMEOUT_MS`), `unattested_test_run`, and `oracle_tampering` gaps. When `dcverify` is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what to install. If `dcverify` **is** installed and fails, that is a blocking `rigor_check_unavailable` gap rather than a skip — a credential scan that could not run must not read like one that ran and found nothing.
 - `dcverify` is discovered on `PATH`, excluding any candidate inside the repository under analysis (`proc.LookPathOutside`); `MANVI_VERIFY_BINARY` overrides discovery. It remains a separately installed component (`devcouncil install --only=dcverify`).
 - `--mode`: `off` (default when unset) skips quality verification and reports `status: "skipped"`, `passed: false`, and `verification_skipped: true`; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair. Skipped tasks increment `completed_without_verification`, not `verified_tasks`. Completion and verification remain separate outcomes.
@@ -293,6 +293,7 @@ High-performance multi-language code graph and symbol analysis engine (extract �
 ```bash
 # Build & Lifecycle
 devmap build --manifest     # Generate repo_map.json and code_graph.json
+devmap seed                 # Seed or stack a linked worktree's index from a registered checkout
 devmap build --full         # Cold rebuild: re-parse every source, ignore the extraction cache
 devmap build --verify-rows  # Incremental extraction, but re-derive every stored edge's validity
 devmap build --manifest --force  # Also replace a foreign repo map / code graph (`--force` requires `--manifest`)
@@ -309,14 +310,22 @@ devmap build --lsp          # Opt-in language server extraction pass (drains & r
 devmap serve                # Watcher + IPC (not `build --watch`)
 devmap status [--json]      # Generation, readiness, resolution caps, search_index_damaged probe
 devmap --version            # Prints version, store schema, code graph schema, extract schema, build hash
+devmap version              # Subcommand equivalent of --version
 devmap doctor               # No `--fix`
 devmap paths [--json]
+devmap freshness            # Working-tree head/inventory/content digests (--expect-* checks staleness)
 devmap history
+devmap snapshots
 devmap repair
+devmap workspace            # Manage workspace registry and cross-repo queries
+devmap savings              # Estimated map vs file-read token savings
 
 # Code Exploration & Navigation
 devmap search <QUERY> [--semantic]
+devmap ask "<QUERY>"        # Plain-language TF-IDF + Personalized PageRank find
 devmap explore <NAME>
+devmap skeleton <FILE>      # Signatures and spans in a file without bodies
+devmap literals <QUERY>     # String-literal search across indexed sites and consts
 devmap deps <FILE> [--min-rung deterministic|high|speculative]
 devmap trace <SRC> <DST>
 devmap impact <TARGET> [--layers]
@@ -331,24 +340,30 @@ devmap preview --file <FILE> [--content <PATH|->]
 devmap blast [--since <REV>] [--at <LOC>]   # Forward change impact (inbound edges)
 devmap suspects <SYMPTOM> --since <REV>     # Backward regression attribution (outbound edges)
 
-# Structural & Route Analysis
+# Structural, Route & Proof Analysis
 devmap cypher '<QUERY>'
 devmap pdg <FILE> [--taint]
 devmap routes [--filter <PATH>]
 devmap shape-check [--filter <PATH>]
 devmap api-impact <ROUTE>
 devmap ast <QUERY> [--kind <KIND>] [--language <LANG>]
+devmap lean-tcb             # Audit Lean 4 (.lean) Trusted Computing Base boundaries
 
 # Session Insights & Gaps
 devmap gap-record --tool <TOOL> --gap-id <ID> --reason <REASON>
 devmap session-report [--last]
 
-# Visualizers & Servers
+# Visualizers, Host Integration & Servers
 devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html); see code-graph.md
 devmap html                 # Symbol graph HTML
 devmap mcp                  # DevMap MCP stdio (21 read-only tools: status, search, ask, ask_evidence, deps, impact, trace, neighbors, dead, skeleton, clones, preview, explore, literals, doc_drift, affected, suspects, blast, routes, api_impact, cypher)
 devmap mcp --http <ADDR>   # MCP 2026-07-28 over HTTP (bare port = 127.0.0.1); also serves GET /map_preview.html and GET /code_graph.html, read-only; see HOST_INTEGRATION.md
 devmap export               # GraphML
+devmap integrate <HOST>     # Register DevMap guides, Cursor rules, skills, and MCP
+devmap skills               # Install embedded DevMap skills
+devmap agents               # Install Antigravity agents/rules from --agents-stdin
+devmap claude               # Emit/validate DevMap Claude Code plugin/hooks
+devmap hook                 # Host-neutral hook entrypoint (stdin JSON)
 ```
 
 Unknown: `query`, `view`, `demo`, `graph-html`, `doctor --fix`, `build --watch`, `build --if-stale`.
@@ -362,27 +377,50 @@ Unknown: `query`, `view`, `demo`, `graph-html`, `doctor --fix`, `build --watch`,
 Provides atomic mutual-exclusion leases and persistent SQLite task storage:
 
 ```bash
+dcstore [--version|-V|-v|version]
 dcstore --db <PATH> health
 dcstore --db <PATH> acquire --task <ID> --owner <OWNER> --client-id <CLIENT> --ttl-seconds <N>
 dcstore --db <PATH> renew --task <ID> --token <TOKEN> --ttl-seconds <N>
 dcstore --db <PATH> release --task <ID> --token <TOKEN>
+dcstore --db <PATH> diagnose
+dcstore --db <PATH> active
+dcstore --db <PATH> list
 dcstore --db <PATH> task --task <ID>
 dcstore --db <PATH> ready
+dcstore --db <PATH> scope-append --task <ID> --record <JSON>
+dcstore --db <PATH> serve
+dcstore --db <PATH> local-repository
+dcstore --db <PATH> requirements
+dcstore --db <PATH> evidence-append --task <ID> --record <JSON>
+dcstore --db <PATH> evidence-list --task <ID>
 dcstore --db <PATH> review-append --task <ID> --acceptance-criterion-id <AC> --subject-hash <SUBJECT> --record <JSON>
 dcstore --db <PATH> reviews --task <ID> [--acceptance-criterion-id <AC>]
+dcstore --db <PATH> gaps
+dcstore --db <PATH> gaps-clear
+dcstore --db <PATH> gaps-replace
+dcstore --db <PATH> gap-history
+dcstore --db <PATH> gap-upsert
+dcstore --db <PATH> run-record
+dcstore --db <PATH> runs
+dcstore --db <PATH> run-get --id <RUN_ID>
+dcstore --db <PATH> handoff
+dcstore --db <PATH> handoff-get --id <HANDOFF_ID>
+dcstore --db <PATH> work
 ```
 
-`review-append` and `reviews` are the [independent review](#independent-reviews-llm_review) record (schema 11). `review-append` refuses an unknown task, a subject hash outside `a-z0-9:-`, and a record that is not one JSON object; `reviews` embeds each record as the object it was stored as, or `null` beside a `record_error`.
+`review-append` and `reviews` store the [independent review](#independent-reviews-llm_review) record (dc-store schema 11), while `work` serves the workbench profile store (workbench schema 17). `review-append` refuses an unknown task, a subject hash outside `a-z0-9:-`, and a record that is not one JSON object; `reviews` embeds each record as the object it was stored as, or `null` beside a `record_error`.
 
-### Deterministic Verifier (`dcverify`)
+### Deterministic Verifier (`dcverify`, `dcjsoncheck`)
 
-Diff parser, scope classifier, and rigor gate evaluator:
+Diff parser, scope classifier, rigor gate evaluator, and independent evidence checker (`dcverify`), plus schema-validated JSON check runner (`dcjsoncheck`):
 
 ```bash
+dcverify [--version|-V|-v|version]
 dcverify health
 dcverify check --planned "src/service.go" --root /path/to/repo < unified.diff
 # Optional: --coverage /path/to/profile (Go coverprofile or LCOV)
 dcverify evidence-check --contract <PATH> --bundle <PATH> [options]
+dcjsoncheck [--version|-V|-v|version]
 ```
 
 ### Ripgrep Engine Search (`dcgrep`)
@@ -390,6 +428,7 @@ dcverify evidence-check --contract <PATH> --bundle <PATH> [options]
 Ignore-aware high-speed repository search with optional trigram index:
 
 ```bash
+dcgrep [--version|-V|-v|version]
 dcgrep health
 dcgrep search < request.json
 dcgrep files < request.json

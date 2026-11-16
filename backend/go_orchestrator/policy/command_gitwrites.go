@@ -51,17 +51,24 @@ func gitWrites(args []shellWord) argWrites {
 }
 
 // gitSubcommandAt is the index of the subcommand among the words after `git`,
-// stepping over the global options that take a value, or -1.
+// stepping over global options and unquoted redirections, or -1.
 func gitSubcommandAt(words []shellWord) int {
-	for i := 0; i < len(words); i++ {
-		text := words[i].text
-		if !strings.HasPrefix(text, "-") {
+	for i := 0; i < len(words); {
+		w := words[i]
+		if !w.quotedHead {
+			if targetNext, isRedirect := redirectionPrefix(w.text); isRedirect {
+				i++
+				if targetNext && i < len(words) {
+					i++
+				}
+				continue
+			}
+		}
+		if w.text == "--" || w.text == "-" || !strings.HasPrefix(w.text, "-") {
 			return i
 		}
-		name, _, hasValue := strings.Cut(text, "=")
-		if !hasValue && gitGlobalOptionsWithValue[name] {
-			i++
-		}
+		_, _, _, next := stepGitGlobalOption(words, i)
+		i = next
 	}
 	return -1
 }

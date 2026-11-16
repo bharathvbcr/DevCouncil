@@ -214,10 +214,24 @@ impl T for S {\n\
         self::帮助();\n\
         self::helper();\n\
         let named = self::helper;\n\
+        let named_unicode = self::帮助;\n\
     }\n\
 }\n\
 ";
     let (extraction, result) = resolve_one("src/配置.rs", source);
+    assert!(
+        extraction.references.iter().any(|reference| {
+            reference.kind == ReferenceKind::Name
+                && reference.name == "帮助"
+                && reference.receiver_expr.as_deref() == Some("self::")
+        }),
+        "self::帮助 must emit a Name reference; references: {:?}",
+        extraction
+            .references
+            .iter()
+            .map(|r| (&r.name, r.kind, r.receiver_expr.as_deref()))
+            .collect::<Vec<_>>()
+    );
     assert!(
         extraction.calls.iter().any(|call| {
             call.callee_name == "帮助" && call.receiver_expr.as_deref() == Some("self::")
@@ -235,6 +249,23 @@ impl T for S {\n\
             .iter()
             .any(|(target, kind)| { target == "src/配置.rs::帮助" && kind == "SameFile" }),
         "trait-impl self:: path must name the free function; got {from_run:?}"
+    );
+    assert!(
+        result.edges.iter().any(|edge| {
+            edge.edge_kind == EdgeKind::References
+                && edge.target_symbol == "src/配置.rs::帮助"
+                && edge
+                    .resolution
+                    .as_ref()
+                    .is_some_and(|resolution| resolution.kind().label() == "SameFile")
+        }),
+        "a self::帮助 value in a unicode path must name the free function; edges {:?}",
+        result
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_kind == EdgeKind::References)
+            .map(|edge| format!("{} -> {}", edge.source_symbol, edge.target_symbol))
+            .collect::<Vec<_>>()
     );
     assert!(
         result.edges.iter().any(|edge| {

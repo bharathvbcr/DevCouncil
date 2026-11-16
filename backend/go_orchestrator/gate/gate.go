@@ -232,13 +232,30 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 		return g.settle(decision, mode, modeOrigin, flags.PolicyCommandMode), nil
 	}
 
-	refusal, err := EvaluateRedirectsOps(command, taskIDOf(task), task != nil, func(target string, op dc.Operation) (policy.Decision, error) {
+	refusal, err := EvaluateRedirectsOpsInRoot(command, g.Root, taskIDOf(task), task != nil, func(target string, op dc.Operation) (policy.Decision, error) {
 		// Through EvaluateWrite, not the bare ladder: a redirect target must be
 		// judged by exactly what a direct write to the same path faces, ledger
 		// and file-mode posture included, or the two surfaces contradict each
 		// other. It also records the target decision, which is why the
 		// FromTarget branch below does not record it again.
 		return g.EvaluateWrite(target, task, op)
+	}, func(siblingRoot, target string, op dc.Operation) (policy.Decision, error) {
+		// Registered sibling `git -C <sibling>` writes face hard rules against
+		// the sibling worktree (never caller planned_files or RuleNoTask).
+		fileMode, fileOrigin, err := flags.EffectiveGateMode(g.Flags, flags.PolicyFileMode)
+		if err != nil {
+			return policy.Decision{}, err
+		}
+		d := policy.FileGate{
+			Root:       siblingRoot,
+			Subsystems: g.Subsystems,
+			HardRules:  hardRules,
+			Matcher:    g.Matcher,
+		}.EvaluateFileChange(target, nil, op, false)
+		if d.Blocked() && d.Severity == policy.Hard {
+			return g.settle(d, fileMode, fileOrigin, flags.PolicyFileMode), nil
+		}
+		return policy.Decision{Action: policy.Allow, Reason: "Sibling worktree write passed hard rules.", Target: target}, nil
 	})
 	if err != nil {
 		return policy.Decision{}, err
@@ -289,6 +306,10 @@ type WriteEvaluator func(target string) (policy.Decision, error)
 // for a file a command only removes (rm, rmdir, unlink, shred -u, git rm,
 // git clean), dc.OpWrite for everything else.
 type OperationEvaluator func(target string, op dc.Operation) (policy.Decision, error)
+
+// SiblingOperationEvaluator judges one write performed against a registered
+// sibling Git worktree (`git -C <sibling>`) in that sibling's canonical root.
+type SiblingOperationEvaluator func(siblingRoot, target string, op dc.Operation) (policy.Decision, error)
 
 // RedirectRefusal is the redirect rung's outcome.
 type RedirectRefusal struct {
@@ -355,7 +376,14 @@ func EvaluateRedirects(command, taskID string, scopeBound bool, evalWrite WriteE
 // removals as the deletes they are. A file planned for modification is not a
 // file the task may delete, and `rm` of it was judged as a write and allowed.
 func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite OperationEvaluator) (RedirectRefusal, error) {
-	set, err := policy.RedirectWrites(command)
+	return EvaluateRedirectsOpsInRoot(command, "", taskID, scopeBound, evalWrite, nil)
+}
+
+// EvaluateRedirectsOpsInRoot is EvaluateRedirectsOps with caller working tree
+// attribution, routing writes performed via `git -C <registered sibling>` to
+// evalSibling rather than evalWrite.
+func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, evalWrite OperationEvaluator, evalSibling SiblingOperationEvaluator) (RedirectRefusal, error) {
+	set, err := policy.RedirectWritesInRoot(command, root)
 	targets, opaque := set.Targets, set.Opaque
 	if err != nil {
 		return RedirectRefusal{}, err
@@ -368,41 +396,57 @@ func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite Ope
 				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
 				Reason: "A file this command writes — a redirection target or a file operand — is chosen " +
 					"by a command substitution, or the line writes more files than the gate enumerates, " +
-					"and was judged as an unverifiable write.",
+					"and was judged as an unverifiable write. Write to a literal file path or use your file editing tools instead.",
 				Target: command,
 				TaskID: taskID,
 			},
 			Refused: true,
 		}, nil
 	}
-	deleted := make(map[string]bool, len(set.Deletes))
-	for _, target := range set.Deletes {
-		deleted[target] = true
-	}
-	// Ranked like a compound command's clauses. Returning the first blocked
-	// target let `cp -t . src/calc.go` — an unplanned `./calc.go`, soft — hide
-	// the `mv calc.go .env` after it, and a posture that demotes scope then
-	// reached the credential file. A hard refusal for what a write does cannot
-	// be outranked, so judging stops there.
 	var blocked []policy.Decision
-	for _, target := range targets {
-		op := dc.OpWrite
-		if deleted[target] {
-			op = dc.OpDelete
+	judgeSet := func(paths, delPaths []string, eval func(target string, op dc.Operation) (policy.Decision, error)) (bool, error) {
+		deleted := make(map[string]bool, len(delPaths))
+		for _, target := range delPaths {
+			deleted[target] = true
 		}
-		written, err := evalWrite(target, op)
-		if err != nil {
-			return RedirectRefusal{}, err
+		for _, target := range paths {
+			op := dc.OpWrite
+			if deleted[target] {
+				op = dc.OpDelete
+			}
+			written, err := eval(target, op)
+			if err != nil {
+				return false, err
+			}
+			if !written.Blocked() {
+				continue
+			}
+			written.Reason = fmt.Sprintf("Command writes a file the write gate refuses (%s): %s",
+				target, written.Reason)
+			stop := written.Severity == policy.Hard && !policy.IsUnreadableRule(written.Rule)
+			blocked = append(blocked, written)
+			if stop {
+				return true, nil
+			}
 		}
-		if !written.Blocked() {
-			continue
-		}
-		written.Reason = fmt.Sprintf("Command writes a file the write gate refuses (%s): %s",
-			target, written.Reason)
-		stop := written.Severity == policy.Hard && !policy.IsUnreadableRule(written.Rule)
-		blocked = append(blocked, written)
-		if stop {
-			break
+		return false, nil
+	}
+	stopped, err := judgeSet(targets, set.Deletes, evalWrite)
+	if err != nil {
+		return RedirectRefusal{}, err
+	}
+	if !stopped && evalSibling != nil {
+		for _, sib := range set.SiblingWrites {
+			sibRoot := sib.Root
+			stopped, err = judgeSet(sib.Targets, sib.Deletes, func(target string, op dc.Operation) (policy.Decision, error) {
+				return evalSibling(sibRoot, target, op)
+			})
+			if err != nil {
+				return RedirectRefusal{}, err
+			}
+			if stopped {
+				break
+			}
 		}
 	}
 	if chosen, refused := policy.MostImportant(blocked); refused {
@@ -415,7 +459,8 @@ func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite Ope
 				Rule:     policy.RuleCommandSubstitution,
 				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
 				Reason: "This task has a declared scope, and this command writes files its text does not name (" +
-					set.Unjudged + "), so they cannot be checked against the scope before it runs.",
+					set.Unjudged + "), so they cannot be checked against the scope before it runs. " +
+					"Apply changes to explicit file paths or use your file editing tools instead.",
 				Target: command,
 				TaskID: taskID,
 			},

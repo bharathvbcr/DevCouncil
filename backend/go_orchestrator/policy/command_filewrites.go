@@ -31,6 +31,34 @@ type argWrites struct {
 	// a caller that has a scope bound refuses; with none, there is no fence to
 	// get past and it is left alone.
 	unjudged string
+	// siblings records writes performed against a registered sibling worktree
+	// (`git -C <sibling>`), keyed by that sibling's canonical root so the caller
+	// can enforce hard rules / that worktree's own scope rather than the
+	// caller's planned_files.
+	siblings []siblingArgWrites
+}
+
+type siblingArgWrites struct {
+	root   string
+	writes argWrites
+}
+
+func (w *argWrites) mergeSibling(root string, o argWrites) {
+	if o.opaque {
+		w.opaque = true
+	}
+	if len(o.targets) == 0 && len(o.deletes) == 0 && o.unjudged == "" {
+		return
+	}
+	for i := range w.siblings {
+		if sameWorktreePath(w.siblings[i].root, root) {
+			w.siblings[i].writes.merge(o)
+			return
+		}
+	}
+	o.opaque = false
+	o.siblings = nil
+	w.siblings = append(w.siblings, siblingArgWrites{root: root, writes: o})
 }
 
 func (w *argWrites) merge(o argWrites) {
@@ -39,6 +67,9 @@ func (w *argWrites) merge(o argWrites) {
 	w.opaque = w.opaque || o.opaque
 	if w.unjudged == "" {
 		w.unjudged = o.unjudged
+	}
+	for _, sib := range o.siblings {
+		w.mergeSibling(sib.root, sib.writes)
 	}
 }
 

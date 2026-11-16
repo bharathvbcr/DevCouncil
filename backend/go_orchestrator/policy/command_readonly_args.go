@@ -142,26 +142,44 @@ func readOnlyArgumentViolation(clause, root string) string {
 	// Global options sit between `git` and the subcommand. Whether the
 	// invocation is a read-only one is only known once the subcommand is found,
 	// so the first unsafe global is remembered and reported then.
+	effectiveRoot := root
 	unsafeGlobal := ""
 	i := at + 1
-	for ; i < len(words) && strings.HasPrefix(words[i].text, "-"); i++ {
+	for i < len(words) {
+		if !words[i].quotedHead {
+			if targetNext, isRedirect := redirectionPrefix(words[i].text); isRedirect {
+				i++
+				if targetNext && i < len(words) {
+					i++
+				}
+				continue
+			}
+		}
+		if words[i].text == "--" || words[i].text == "-" || !strings.HasPrefix(words[i].text, "-") {
+			break
+		}
 		opt := words[i].text
-		name, _, hasValue := strings.Cut(opt, "=")
-		// The directory options keep their own refusal, command.directory_change,
-		// which names them for what they do; they are stepped over here.
+		name, val, hasValue, next := stepGitGlobalOption(words, i)
+		// Directory options (-C / --git-dir / --work-tree) keep their own refusal
+		// in command.directory_change when they leave the registered worktree
+		// family; when -C resolves to a registered sibling worktree, advance
+		// effectiveRoot so read arguments are checked against that worktree.
 		isDirectory := name == "-C" || name == "--git-dir" || name == "--work-tree"
+		if name == "-C" && hasValue && effectiveRoot != "" {
+			if nextRoot, ok := SameRegisteredWorktree(effectiveRoot, val); ok {
+				effectiveRoot = nextRoot
+			}
+		}
 		safe := safeGitGlobalOptions[name] && !hasValue
-		if name == "-c" && !hasValue && i+1 < len(words) {
-			safe = safeGitConfig(words[i+1].text)
+		if name == "-c" && hasValue {
+			safe = safeGitConfig(val)
 		}
 		if !isDirectory && !safe {
 			if unsafeGlobal == "" {
 				unsafeGlobal = opt
 			}
 		}
-		if !hasValue && gitGlobalOptionsWithValue[name] {
-			i++ // the value is not the subcommand
-		}
+		i = next
 	}
 	if i >= len(words) || !readOnlyGitSubcommands[words[i].text] {
 		return ""
@@ -173,14 +191,23 @@ func readOnlyArgumentViolation(clause, root string) string {
 	}
 	for _, w := range words[:at] {
 		if name, value, ok := strings.Cut(w.text, "="); ok && strings.HasPrefix(name, "GIT_") && isAssignmentWord(w.text) &&
-			!safeGitEnvironment(name, value, root) {
+			!safeGitEnvironment(name, value, effectiveRoot) {
 			return fmt.Sprintf("`git %s` here runs with %s set, which redirects git to other "+
 				"programs, configuration or trees than the ones the gate judged.", sub, name)
 		}
 	}
 
 	endOfOptions := false
-	for _, w := range words[i+1:] {
+	for idx := i + 1; idx < len(words); idx++ {
+		w := words[idx]
+		if !w.quotedHead {
+			if targetNext, isRedirect := redirectionPrefix(w.text); isRedirect {
+				if targetNext {
+					idx++
+				}
+				continue
+			}
+		}
 		text := w.text
 		switch {
 		case !endOfOptions && text == "--":
@@ -209,7 +236,7 @@ func readOnlyArgumentViolation(clause, root string) string {
 				}
 			}
 		default:
-			if reason := readOnlyOperandViolation(text, root); reason != "" {
+			if reason := readOnlyOperandViolation(text, effectiveRoot); reason != "" {
 				return fmt.Sprintf("`git %s %s` is refused: %s", sub, text, reason)
 			}
 		}

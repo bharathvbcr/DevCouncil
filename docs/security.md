@@ -11,8 +11,8 @@ The implementation-level reference is
   or harness has its own provider and data-handling policy.
 - Task leases and write-policy results apply to participating clients. Retired
   DevCouncil hooks do not intercept every shell command or editor write.
-- Rigor includes secret and stub checks over the supplied diff, untracked files,
-  recreated files, and dirty submodule commit ranges. Git replace-refs are disabled
+- Rigor includes secret, stub, `runner_hijack`, and `lean_tcb` checks (with optional Lean kernel checking via `DC_VERIFY_LEAN_KERNEL` / `DC_LEAN_KERNEL_TIMEOUT_MS`) over the supplied diff, untracked files,
+  recreated files, and dirty submodule commit ranges, paired with `unattested_test_run` and `oracle_tampering` hard-safety gates. Git replace-refs are disabled
   at Go and Rust git seams to prevent hidden credential commits.
 - Verification errors suppress raw diff lines to prevent echoing detected secrets,
   and panic hooks suppress backtrace payload text.

@@ -18,7 +18,6 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/correction"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gating"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
@@ -1053,7 +1052,6 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	meta.StartedAt, meta.FinishedAt = began, time.Now().UTC()
 	result := ToMCP(taskID, gaps, meta)
 	persistErr := Persist(ctx, client, taskID, gaps, meta, result.Status)
-	writeBlockedCorrection(root, taskID, &result, gaps)
 	if persistErr != nil {
 		// The verdict is returned with the error so a caller can show it, but
 		// as an error: the gates and the task loop read the store, and a run
@@ -1086,41 +1084,4 @@ func allowNoRigor() bool {
 		return true
 	}
 	return false
-}
-
-// writeBlockedCorrection persists a repair brief when a check ran and
-// blocked. A write failure must not hide the verify result — gaps are already
-// in the store. A skipped or passing verify writes nothing.
-func writeBlockedCorrection(root, taskID string, result *MCPResult, gaps []Gap) {
-	if result == nil || result.Passed || result.VerificationSkipped || result.Status == "degraded" {
-		return
-	}
-	if root == "" || taskID == "" {
-		return
-	}
-	manifestGaps := make([]correction.ManifestGap, 0, len(gaps))
-	for _, g := range gaps {
-		if !g.Blocking {
-			continue
-		}
-		file := ""
-		if g.File != nil {
-			file = *g.File
-		}
-		manifestGaps = append(manifestGaps, correction.ManifestGap{
-			ID: g.ID, GapType: g.GapType, Severity: g.Severity,
-			Blocking: true, Action: g.RecommendedFix, File: file,
-		})
-	}
-	actions := make([]string, 0, len(result.NextActions))
-	for _, a := range result.NextActions {
-		actions = append(actions, a.Action)
-	}
-	_, path, err := correction.Write(correction.WriteOptions{
-		Root: root, TaskID: taskID, Gaps: manifestGaps, NextActions: actions,
-	})
-	if err != nil {
-		return
-	}
-	result.CorrectionPath = path
 }

@@ -31,58 +31,75 @@
 //! last split is the point: a manifest that could not be read must never exit 0
 //! like a manifest whose invocations all passed.
 
-use std::env;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
+use dc_proc::cli::{collect_args, is_version_arg, quote, version_object};
 use dc_verify::json_stdout::{ContractError, holds_exactly_one_value, holds_json_lines};
 
 fn main() -> ExitCode {
-    let options = match Options::from_args(env::args().skip(1)) {
-        Ok(options) => options,
-        Err(message) => return fail_hard(&message),
-    };
-
-    let manifest = match read_manifest() {
-        Ok(manifest) => manifest,
-        Err(message) => return fail_hard(&message),
-    };
-
-    let invocations = match parse_manifest(&manifest) {
-        Ok(invocations) if invocations.is_empty() => {
-            // An empty manifest is an operational failure, not a clean pass.
-            // "Nothing to check" reported as success is how a broken harness
-            // comes to mean "everything is fine".
-            return fail_hard("the manifest listed no invocations");
+    let args = match collect_args() {
+        Ok(args) => args,
+        Err(message) => {
+            dc_proc::respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            return ExitCode::from(2);
         }
-        Ok(invocations) => invocations,
-        Err(message) => return fail_hard(&message),
     };
-
-    let mut results = Vec::with_capacity(invocations.len());
-    for invocation in &invocations {
-        match run_one(invocation, options.cwd.as_deref(), options.deadline) {
-            Ok(result) => results.push(result),
-            Err(message) => return fail_hard(&message),
-        }
+    if args.iter().any(|arg| is_version_arg(arg)) {
+        dc_proc::respond!(
+            "{}",
+            version_object("dcjsoncheck", "dc-verify", env!("CARGO_PKG_VERSION"), &[])
+        );
+        return ExitCode::SUCCESS;
     }
 
-    let failed = results.iter().filter(|r| !r.passed).count();
-    println!("{}", report(&results, failed));
-    if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+    let options = match Options::from_args(args.into_iter()) {
+        Ok(options) => options,
+        Err(message) => {
+            dc_proc::respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(&options) {
+        Ok((json, 0)) => {
+            dc_proc::respond!("{json}");
+            ExitCode::SUCCESS
+        }
+        Ok((json, _)) => {
+            dc_proc::respond!("{json}");
+            ExitCode::from(1)
+        }
+        Err(message) => {
+            dc_proc::respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            ExitCode::from(2)
+        }
     }
 }
 
-/// Reports an operational failure — the run could not be carried out — as
-/// exit 2 with a payload, never as a silent success or an empty stdout.
-fn fail_hard(message: &str) -> ExitCode {
-    println!("{{\"ok\":false,\"error\":{}}}", quote(message));
-    ExitCode::from(2)
+fn run(options: &Options) -> Result<(String, usize), String> {
+    let manifest = read_manifest()?;
+    let invocations = parse_manifest(&manifest)?;
+    if invocations.is_empty() {
+        // An empty manifest is an operational failure, not a clean pass.
+        // "Nothing to check" reported as success is how a broken harness
+        // comes to mean "everything is fine".
+        return Err("the manifest listed no invocations".to_string());
+    }
+
+    let mut results = Vec::with_capacity(invocations.len());
+    for invocation in &invocations {
+        results.push(run_one(
+            invocation,
+            options.cwd.as_deref(),
+            options.deadline,
+        )?);
+    }
+
+    let failed = results.iter().filter(|r| !r.passed).count();
+    Ok((report(&results, failed), failed))
 }
 
 struct Options {
@@ -356,26 +373,6 @@ fn report(results: &[Outcome], failed: usize) -> String {
     }
     json.push_str("]}");
     json
-}
-
-/// Minimal RFC 8259 string escaping — this crate has not earned a JSON
-/// dependency, and the output it produces is its own small, fixed shape.
-fn quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]
@@ -663,12 +660,5 @@ mod tests {
         assert!(json.contains("\"checked\":2"));
         assert!(json.contains("\"failed\":1"));
         assert!(json.contains("\"ok\":false"));
-    }
-
-    #[test]
-    fn quote_escapes_what_would_otherwise_break_the_report() {
-        assert_eq!(quote("a \"b\" c"), "\"a \\\"b\\\" c\"");
-        assert_eq!(quote("line\nbreak"), "\"line\\nbreak\"");
-        assert_eq!(quote("tab\there"), "\"tab\\there\"");
     }
 }

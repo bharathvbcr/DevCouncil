@@ -291,6 +291,7 @@ version = "0.2.5"
 name = "dc-grep"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
  "grep-regex",
  "grep-searcher",
  "ignore",
@@ -337,6 +338,7 @@ dependencies = [
 name = "dc-store"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
  "rusqlite",
 ]
 
@@ -377,6 +379,7 @@ version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
+ "dc-evidence",
  "dc-regress",
  "dc-regress-store",
  "devmap-analyze",

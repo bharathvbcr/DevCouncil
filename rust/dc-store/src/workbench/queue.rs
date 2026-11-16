@@ -134,31 +134,18 @@ fn build_members_json(conn: &Connection, members: &[MemberRow]) -> Result<String
     Ok(format!("[{}]", encoded.join(",")))
 }
 
-/// The queue-level fields one transition writes into a queue's body.
-struct QueueTransition<'a> {
-    state: &'a str,
-    leased_at: Option<i64>,
-    finished_at: Option<i64>,
-    /// Written to `$.reason` when set.
-    reason: Option<&'a str>,
-    /// Written to `$.verification`, with `$.publication`, when set.
-    verification_doc: Option<&'a str>,
-}
-
+#[allow(clippy::too_many_arguments)]
 fn sync_queue_body(
     conn: &Connection,
     queue_id: &str,
     revision: i64,
     now: i64,
-    transition: QueueTransition<'_>,
+    state: &str,
+    leased_at: Option<i64>,
+    finished_at: Option<i64>,
+    reason: Option<&str>,
+    verification_doc: Option<&str>,
 ) -> Result<()> {
-    let QueueTransition {
-        state,
-        leased_at,
-        finished_at,
-        reason,
-        verification_doc,
-    } = transition;
     let members = load_members(conn, queue_id)?;
     let members_json = build_members_json(conn, &members)?;
     let mut updated: String = conn.query_row(
@@ -251,13 +238,11 @@ fn apply_timeout(conn: &Connection, queue_id: &str, revision: i64, now: i64) -> 
         queue_id,
         revision,
         now,
-        QueueTransition {
-            state: "timed_out",
-            leased_at,
-            finished_at: Some(now),
-            reason: Some("timeout exceeded"),
-            verification_doc: None,
-        },
+        "timed_out",
+        leased_at,
+        Some(now),
+        Some("timeout exceeded"),
+        None,
     )
 }
 
@@ -435,13 +420,11 @@ pub(super) fn attach_run(
         queue_id,
         rev,
         now,
-        QueueTransition {
-            state: &state,
-            leased_at,
-            finished_at,
-            reason: None,
-            verification_doc: None,
-        },
+        &state,
+        leased_at,
+        finished_at,
+        None,
+        None,
     )
 }
 
@@ -714,17 +697,7 @@ fn enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         )?;
     }
     sync_queue_body(
-        input.conn,
-        id,
-        revision,
-        now,
-        QueueTransition {
-            state: "queued",
-            leased_at: None,
-            finished_at: None,
-            reason: None,
-            verification_doc: None,
-        },
+        input.conn, id, revision, now, "queued", None, None, None, None,
     )
 }
 
@@ -817,13 +790,11 @@ fn acquire(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         id,
         revision,
         now,
-        QueueTransition {
-            state: "leased",
-            leased_at: next_leased_at,
-            finished_at: None,
-            reason: None,
-            verification_doc: None,
-        },
+        "leased",
+        next_leased_at,
+        None,
+        None,
+        None,
     )
 }
 
@@ -1040,13 +1011,11 @@ fn member_update(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result
         id,
         revision,
         now,
-        QueueTransition {
-            state: next_q_state,
-            leased_at,
-            finished_at: next_finished_at,
-            reason: None,
-            verification_doc: None,
-        },
+        next_q_state,
+        leased_at,
+        next_finished_at,
+        None,
+        None,
     )
 }
 
@@ -1220,13 +1189,11 @@ fn verify(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         id,
         revision,
         now,
-        QueueTransition {
-            state: final_state,
-            leased_at,
-            finished_at: Some(now),
-            reason: None,
-            verification_doc: Some(&verification_doc),
-        },
+        final_state,
+        leased_at,
+        Some(now),
+        None,
+        Some(&verification_doc),
     )
 }
 
@@ -1301,13 +1268,11 @@ fn cancel(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         id,
         revision,
         now,
-        QueueTransition {
-            state: "cancelled",
-            leased_at,
-            finished_at: Some(now),
-            reason: Some(&reason),
-            verification_doc: None,
-        },
+        "cancelled",
+        leased_at,
+        Some(now),
+        Some(&reason),
+        None,
     )
 }
 

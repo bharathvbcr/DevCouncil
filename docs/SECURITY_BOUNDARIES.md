@@ -256,7 +256,9 @@ operator's, not repository content.
 One bounded runner serves every process boundary in the Rust workspace, and it
 lives in `dc-proc` so `dc-verify` and `dc-regress` can use it without
 depending on the kernel — `devmap_extract::subprocess` is a re-export of that one
-implementation, not a second copy. Its properties are the ones a caller cannot
+implementation, not a second copy. `dc-proc` also owns the shared `cli`
+contract helpers (shared by `dcstore`, `dcverify`, `dcjsoncheck`, and
+`dcgrep`) and the bounded `lean_kernel` runner. Its properties are the ones a caller cannot
 reliably assemble by hand: a wall-clock deadline, a kill that reaches the
 child's whole process group, and both pipes drained concurrently on their own
 threads. That last one is load-bearing rather than tidy: a reader that takes
@@ -291,7 +293,8 @@ text.
 What the redaction does and does not cover is a property of `dc-redact`, not
 of this path: it redacts the credential shapes the table names — vendor
 prefixed keys (Anthropic, OpenAI, Stripe, GitHub, GitLab, Slack, AWS access
-key ids, Hugging Face, npm, PyPI and the others listed there), private-key PEM
+key ids, Hugging Face, npm, PyPI and the others listed there), bare Google
+OAuth tokens and client secrets (`ya29.`, `1//`, `GOCSPX-`), private-key PEM
 headers, JSON web tokens, HTTP `Authorization` credentials, passwords inline
 in a URL or on a command line, and a value assigned to a key named like a
 credential. It does not redact anything else a server may print: absolute

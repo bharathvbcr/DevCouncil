@@ -322,9 +322,11 @@ type Edge struct {
 // identified reports whether the edge carries anything usable.
 func (e Edge) identified() bool { return e.SourceFile != "" || e.TargetFile != "" }
 
-type edgeResult struct {
-	Items  []Edge `json:"items"`
-	Hidden int    `json:"hidden"`
+// page is the wire shape of a list query (`search`, `dead`, `deps`, and each
+// half of `neighbors`), including the producer's note and partial-walk mark.
+type page[T any] struct {
+	Items  []T `json:"items"`
+	Hidden int `json:"hidden"`
 	// Note is information about a complete answer: an empty list over a target
 	// that has callers, edges a min_rung floor hid, a file that shadows a symbol.
 	Note string `json:"note"`
@@ -339,24 +341,19 @@ type annotated interface {
 	annotations() (note, walkIncomplete string)
 }
 
-func (r edgeResult) annotations() (string, string) { return r.Note, r.WalkIncomplete }
+func (p page[T]) annotations() (string, string) { return p.Note, p.WalkIncomplete }
 
-// searchResult is the wire shape of a query that returns symbols.
+type (
+	edgeResult   = page[Edge]
+	searchResult = page[Symbol]
+	deadResult   = page[DeadSymbol]
+)
+
 // identified reports whether the symbol carries anything usable.
 func (s Symbol) identified() bool { return s.FilePath != "" || s.Name != "" }
 
 // identified reports whether the dead-code entry carries anything usable.
 func (d DeadSymbol) identified() bool { return d.FilePath != "" || d.Name != "" }
-
-type searchResult struct {
-	Items  []Symbol `json:"items"`
-	Hidden int      `json:"hidden"`
-}
-
-type deadResult struct {
-	Items  []DeadSymbol `json:"items"`
-	Hidden int          `json:"hidden"`
-}
 
 // NeighborEntry is one target's inbound (Callers) and outbound (Callees) edges
 // returned by `devmap neighbors`.
@@ -826,16 +823,12 @@ func (c *Client) readStatus(ctx context.Context) (*Status, error) {
 // the suppression against. An argument that reached the parser as a flag would
 // make that accounting describe a bound the harness never set.
 func (c *Client) Search(ctx context.Context, query string) (Result[Symbol], error) {
-	return runQuery[Symbol, searchResult](ctx, c,
-		func(r searchResult) ([]Symbol, int) { return r.Items, r.Hidden },
-		"search", "--budget", strconv.Itoa(c.Budget), "--", query)
+	return queryPage[Symbol](ctx, c, "search", "--", query)
 }
 
 // Dead lists symbols with no discovered callers.
 func (c *Client) Dead(ctx context.Context) (Result[DeadSymbol], error) {
-	return runQuery[DeadSymbol, deadResult](ctx, c,
-		func(r deadResult) ([]DeadSymbol, int) { return r.Items, r.Hidden },
-		"dead", "--budget", strconv.Itoa(c.Budget))
+	return queryPage[DeadSymbol](ctx, c, "dead")
 }
 
 // Deps returns the outbound edges of a file — what it depends on — or of a
@@ -848,9 +841,7 @@ func (c *Client) Dead(ctx context.Context) (Result[DeadSymbol], error) {
 // callers. An ambiguous symbol name is refused by the command, which lists the
 // candidates.
 func (c *Client) Deps(ctx context.Context, file string) (Result[Edge], error) {
-	return runQuery[Edge, edgeResult](ctx, c,
-		func(r edgeResult) ([]Edge, int) { return r.Items, r.Hidden },
-		"deps", "--budget", strconv.Itoa(c.Budget), "--", file)
+	return queryPage[Edge](ctx, c, "deps", "--", file)
 }
 
 // Neighbors returns inbound and outbound call edges for 1..16 targets in a
@@ -1026,6 +1017,14 @@ func (c *Client) checkManifestAgainstIndex(ctx context.Context, report *Manifest
 				"scope rung and the navigation tools would answer about different trees",
 			report.GenerationID, status.GenerationID))
 	}
+}
+
+// queryPage runs a budgeted page query (`search`, `dead`, `deps`).
+func queryPage[T any](ctx context.Context, c *Client, command string, extra ...string) (Result[T], error) {
+	args := append([]string{command, "--budget", strconv.Itoa(c.Budget)}, extra...)
+	return runQuery[T, page[T]](ctx, c,
+		func(p page[T]) ([]T, int) { return p.Items, p.Hidden },
+		args...)
 }
 
 // runQuery executes a query and attaches the freshness verdict to its result.

@@ -44,6 +44,15 @@ pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_
 /// C++ input.
 pub const RETRY_BUDGET_FACTOR: u32 = 5;
 
+/// Maximum declared symbols permitted for a single file before extraction is refused.
+pub const MAX_FILE_SYMBOLS: usize = 20_000;
+
+/// Maximum calls retained for a single file.
+pub const MAX_FILE_CALLS: usize = 30_000;
+
+/// Maximum references retained for a single file.
+pub const MAX_FILE_REFERENCES: usize = 40_000;
+
 /// How long the serial retry phase may run in total, measured from its first
 /// file. Once it has run this long, the files still waiting stay refused, are
 /// counted in `BudgetRetryReport::not_retried` and say so in their reason.
@@ -698,6 +707,17 @@ pub(super) fn extract_treesitter_before_deadline(
                     deadline,
                 );
                 if !walk_completed {
+                    if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+                        return refused_extraction(
+                            path,
+                            lang,
+                            source,
+                            budget_refusal_reason(format!(
+                                "file declares {} symbols, exceeding the {MAX_FILE_SYMBOLS} single-file ceiling; no symbols are claimed for this file",
+                                symbols.len().saturating_sub(1)
+                            )),
+                        );
+                    }
                     // The partial `symbols`/`calls` collected so far describe a
                     // prefix of the tree. Publishing them would be a truncated
                     // extraction wearing a clean outcome, and every consumer
@@ -738,6 +758,17 @@ pub(super) fn extract_treesitter_before_deadline(
                         &symbols,
                     );
                     symbols.extend(attributes);
+                }
+                if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        budget_refusal_reason(format!(
+                            "file declares {} symbols, exceeding the {MAX_FILE_SYMBOLS} single-file ceiling; no symbols are claimed for this file",
+                            symbols.len().saturating_sub(1)
+                        )),
+                    );
                 }
                 if !crate::entry_names::collect(
                     root,
@@ -893,6 +924,24 @@ pub(super) fn extract_treesitter_before_deadline(
                     );
                     rust_calls_through_fn_pointer_items(root, source, &mut calls);
                 }
+                if symbols.len().saturating_sub(1) > MAX_FILE_SYMBOLS {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        budget_refusal_reason(format!(
+                            "file declares {} symbols, exceeding the {MAX_FILE_SYMBOLS} single-file ceiling; no symbols are claimed for this file",
+                            symbols.len().saturating_sub(1)
+                        )),
+                    );
+                }
+                let dropped_references = if references.len() > MAX_FILE_REFERENCES {
+                    let dropped = references.len() - MAX_FILE_REFERENCES;
+                    references.truncate(MAX_FILE_REFERENCES);
+                    dropped
+                } else {
+                    0
+                };
                 // Ties on a span break by name, except for a Python base: its
                 // segments share the base's one span and their emission order
                 // (member, then the qualifier from the root down) is what says which
@@ -921,6 +970,19 @@ pub(super) fn extract_treesitter_before_deadline(
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
                 diagnostics.extend(semi_note);
+                if dropped_references > 0 {
+                    diagnostics.push(format!(
+                        "references dropped at the single-file ceiling: {dropped_references} reference(s) exceeded the {MAX_FILE_REFERENCES} ceiling"
+                    ));
+                }
+                if calls.len() > MAX_FILE_CALLS {
+                    let dropped = calls.len() - MAX_FILE_CALLS;
+                    calls.truncate(MAX_FILE_CALLS);
+                    diagnostics.push(format!(
+                        "{}{dropped} call site(s) were dropped at the single-file ceiling of {MAX_FILE_CALLS}",
+                        crate::model::CALLS_DROPPED_PREFIX
+                    ));
+                }
                 if lang == "hcl" && calls.len() > crate::model::MAX_CALL_BLIND_SITES {
                     let dropped = calls.len() - crate::model::MAX_CALL_BLIND_SITES;
                     calls.truncate(crate::model::MAX_CALL_BLIND_SITES);

@@ -279,8 +279,7 @@ func skipValue(dec *json.Decoder) error {
 // this program did not write, and nesting is the cheapest way to turn a parser
 // into a crash. Depth costs an int here.
 func consumeValue(dec *json.Decoder, first json.Token) error {
-	delim, ok := first.(json.Delim)
-	if !ok {
+	if _, ok := first.(json.Delim); !ok {
 		return nil
 	}
 	for depth := 1; depth > 0; {
@@ -288,7 +287,7 @@ func consumeValue(dec *json.Decoder, first json.Token) error {
 		if err != nil {
 			return err
 		}
-		if delim, ok = token.(json.Delim); ok {
+		if delim, ok := token.(json.Delim); ok {
 			if delim == '{' || delim == '[' {
 				depth++
 			} else {

@@ -310,4 +310,6 @@ mod attack_swift_residue;
 mod attack_tsj_edges;
 #[cfg(feature = "parse")]
 mod corpus_dump_attack;
+#[cfg(feature = "parse")]
+mod field_declared_type_leak_across_classes;
 mod rust_compile_fail_record;

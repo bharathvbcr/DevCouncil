@@ -143,6 +143,10 @@ func TestTwoDeclaredTargetsOnOnePathAreSelectedWithTheirCrateInOneCommand(t *tes
 		{Name: "ca", Kinds: []string{"lib"}, Src: "rust/ca/src/lib.rs", Test: true},
 		{Name: "one", Kinds: []string{"test"}, Src: "rust/ca/tests/shared.rs", Test: true},
 		{Name: "two", Kinds: []string{"test"}, Src: "rust/ca/tests/shared.rs", Test: true},
+	}}, {Name: "bystander", Dir: "rust/bystander", Targets: []RustTarget{
+		// Not reached by the change: a crate alone is the whole universe, which
+		// collapses to everything instead of being selected.
+		{Name: "bystander", Kinds: []string{"lib"}, Src: "rust/bystander/src/lib.rs", Test: true},
 	}}}}
 	p := BuildPlan(in)
 	if len(p.Selected) != 1 || p.Selected[0].Display != "cargo test --locked -p ca --no-fail-fast" {

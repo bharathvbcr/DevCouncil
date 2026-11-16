@@ -1829,7 +1829,12 @@ impl Resolver {
                     // to `classify_unresolved`, which names the evidence.
                     if resolution.is_none()
                         && call.receiver_expr.is_none()
-                        && !self.bare_name_has_other_evidence(&ext.file_path, family, &call.callee_name)
+                        && !self.bare_name_has_other_evidence(
+                            &ext.file_path,
+                            family,
+                            &call.callee_name,
+                            call.caller_symbol.as_deref(),
+                        )
                     {
                         let in_type = self.call_is_inside_a_type(
                             &ext.file_path,

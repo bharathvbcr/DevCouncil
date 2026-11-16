@@ -26,12 +26,22 @@ path = "src/main.rs"
 name = "it"
 
 [[test]]
+name = "an_ignore_file_binds_the_daemon"
+
+[[test]]
+name = "daemon_envelope_freshness_cycles"
+
+[[test]]
 name = "global_excludes_bind_the_daemon"
+
+[[test]]
+name = "over_limit_daemon_agrees_with_build"
 
 [[test]]
 name = "test_time_scale"
 
 [dependencies]
+dc-evidence = { path = "../dc-evidence" }
 devmap-extract = { path = "../devmap-extract" }
 devmap-resolve = { path = "../devmap-resolve" }
 devmap-analyze = { path = "../devmap-analyze" }

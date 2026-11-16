@@ -12,9 +12,8 @@ ported from the MANVI harness (`~/Code/devtools/Manvi`) into DevCouncil starting
 2026-09-01. The workspace also holds `dc-regress` and `dc-regress-store`, which
 have no MANVI counterpart, and `dc-redact` (2026-10-07): the credential table
 split out of `dc-verify` so GitPulse can vendor it without `dc-verify`'s
-tree-sitter. `dc-verify` depends on it by path, so MANVI's symlinked
-`crates/dc-verify` needs a `crates/dc-redact` symlink and workspace member
-beside it from the moment this lands on DevCouncil `main`.
+tree-sitter. `dc-verify` depends on it by path, and `dc-redact` has landed on DevCouncil
+`main` and is symlinked beside `crates/dc-verify` in MANVI.
 
 **Read this file as a dated record.** It was written on 2026-09-01, when the
 Python `src/devcouncil/` still existed and nothing called this code, and its
@@ -69,7 +68,7 @@ The Go module is `github.com/bharathvbcr/DevCouncil/backend/go_orchestrator` and
 **zero third-party dependencies** (verified: `go.mod` has no `require` block; `go build ./...`
 and `go vet ./...` both exit 0).
 
-The Rust workspace pins `rusqlite` (bundled, `0.40.2`) so `dc-store` and
+The Rust workspace pins `rusqlite` (bundled, `0.41.1`) so `dc-store` and
 `devmap-store` do not carry two SQLite builds, plus ripgrep's `grep-regex` /
 `grep-searcher` / `ignore`.
 

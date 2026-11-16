@@ -101,3 +101,56 @@ fn health_reports_version_and_id() {
         "health missing schema_version: {stdout}"
     );
 }
+
+#[test]
+fn dcjsoncheck_version_flag_reports_this_build_without_reading_stdin() {
+    let want = format!(
+        "{{\"ok\":true,\"id\":\"dcjsoncheck\",\"component\":\"dc-verify\",\"version\":\"{}\"}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for flag in ["--version", "-V", "-v", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dcjsoncheck"))
+            .arg(flag)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("dcjsoncheck must run");
+
+        assert!(
+            output.status.success(),
+            "dcjsoncheck {flag} must exit 0, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "every outcome on this boundary is one JSON object, {flag} included"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dcjsoncheck_refuses_non_utf8_arg_as_json_not_panic() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let bad = OsStr::from_bytes(b"bad-\xff-arg");
+    let output = Command::new(env!("CARGO_BIN_EXE_dcjsoncheck"))
+        .arg(bad)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("dcjsoncheck must run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stderr.is_empty(),
+        "stderr must be empty: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    assert!(
+        stdout.contains("\"ok\":false") && stdout.contains("not valid UTF-8"),
+        "unexpected stdout: {stdout}"
+    );
+}

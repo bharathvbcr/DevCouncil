@@ -792,7 +792,12 @@ impl Resolver {
         // evidence about it. This replaced a JS/TS-only import test and a
         // nine-name Python list.
         if bound_by_unfollowable_import
-            || self.bare_name_has_other_evidence(&ext.file_path, family, name)
+            || self.bare_name_has_other_evidence(
+                &ext.file_path,
+                family,
+                name,
+                reference.enclosing_symbol.as_deref(),
+            )
         {
             return None;
         }

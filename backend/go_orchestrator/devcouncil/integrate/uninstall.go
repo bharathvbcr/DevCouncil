@@ -298,84 +298,93 @@ func cleanHookJSON(data []byte, spec hookConfig) ([]byte, int, error) {
 	if err := validateHookSettings(settings, spec.client); err != nil {
 		return nil, 0, err
 	}
-	removed := 0
-	if spec.client == "opencode" {
-		if entries, ok := settings["plugin"].([]any); ok {
-			kept := make([]any, 0, len(entries))
-			for _, entry := range entries {
-				if isOpenCodeHookRef(entry, spec.root) {
-					removed++
-				} else {
-					kept = append(kept, entry)
-				}
-			}
-			if removed > 0 {
-				if len(kept) == 0 {
-					delete(settings, "plugin")
-				} else {
-					settings["plugin"] = kept
-				}
-			}
-		} else if isOpenCodeHookRef(settings["plugin"], spec.root) {
-			delete(settings, "plugin")
-			removed++
-		}
-	} else if hooks, ok := settings["hooks"].(map[string]any); ok {
-		for event, raw := range hooks {
-			entries, ok := raw.([]any)
-			if !ok {
-				continue
-			}
-			for _, rawEntry := range entries {
-				entry, ok := rawEntry.(map[string]any)
+	if spec.client != "opencode" {
+		if hooks, ok := settings["hooks"].(map[string]any); ok {
+			for _, raw := range hooks {
+				entries, ok := raw.([]any)
 				if !ok {
 					continue
 				}
-				if children, ok := entry["hooks"].([]any); ok {
-					for _, child := range children {
-						if err := checkNamedHook(child); err != nil {
-							return nil, 0, err
-						}
+				for _, rawEntry := range entries {
+					entry, ok := rawEntry.(map[string]any)
+					if !ok {
+						continue
 					}
-				} else if err := checkNamedHook(entry); err != nil {
-					return nil, 0, err
+					if children, ok := entry["hooks"].([]any); ok {
+						for _, child := range children {
+							if err := checkNamedHook(child); err != nil {
+								return nil, 0, err
+							}
+						}
+					} else if err := checkNamedHook(entry); err != nil {
+						return nil, 0, err
+					}
 				}
 			}
-			kept, n := stripHookEntries(entries)
-			removed += n
-			if n == 0 {
-				continue
-			}
-			if len(kept) == 0 {
-				delete(hooks, event)
-			} else {
-				hooks[event] = kept
-			}
-		}
-		if removed > 0 && len(hooks) == 0 {
-			delete(settings, "hooks")
 		}
 	}
-	// Legacy installs wrote a DevCouncil status line beside the hooks.
-	// isDevCouncilHookEntry holds this to our own value, so a host's own
-	// statusLine is never touched. Counting it as a removal here, before
-	// the no-op guard, keeps a file whose only DevCouncil artifact is the
-	// status line from being reported unchanged.
-	if isDevCouncilHookEntry(settings["statusLine"]) {
-		delete(settings, "statusLine")
-		removed++
+	rootSpan, err := parseJSONSpan(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	if rootSpan.kind != spanObject {
+		return nil, 0, errors.New("expected a JSON object")
+	}
+
+	removed := 0
+	keptRoot := 0
+	onlyNonNullVersion := true
+	editedRoot, _, err := spliceObject(data, rootSpan, func(m jsonMember) (bool, []byte, error) {
+		keep := true
+		var newVal []byte
+		switch {
+		case spec.client == "opencode" && m.key == "plugin":
+			k, repl, n := editOpenCodePluginSpan(data, m.val, settings["plugin"], spec.root)
+			keep, newVal = k, repl
+			removed += n
+		case spec.client != "opencode" && m.key == "hooks":
+			if hooks, ok := settings["hooks"].(map[string]any); ok && m.val.kind == spanObject {
+				k, repl, n, err := editHooksMapSpan(data, m.val, hooks)
+				if err != nil {
+					return false, nil, err
+				}
+				keep, newVal = k, repl
+				removed += n
+			}
+		// Legacy installs wrote a DevCouncil status line beside the hooks.
+		// isDevCouncilHookEntry holds this to our own value, so a host's own
+		// statusLine is never touched. Counting it as a removal here, before
+		// the no-op guard, keeps a file whose only DevCouncil artifact is the
+		// status line from being reported unchanged.
+		case m.key == "statusLine" && isDevCouncilHookEntry(settings["statusLine"]):
+			keep = false
+			removed++
+		}
+		if keep {
+			keptRoot++
+			if m.key != "version" || settings["version"] == nil {
+				onlyNonNullVersion = false
+			}
+		}
+		return keep, newVal, nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
 	if removed == 0 {
 		return data, 0, nil
 	}
-	if spec.removeEmpty && (len(settings) == 0 || (len(settings) == 1 && settings["version"] != nil)) {
+	if spec.removeEmpty && (keptRoot == 0 || (keptRoot == 1 && onlyNonNullVersion)) {
 		return nil, removed, nil
 	}
-	after, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
+	out := make([]byte, 0, rootSpan.start+len(editedRoot)+len(data)-rootSpan.end)
+	out = append(out, data[:rootSpan.start]...)
+	out = append(out, editedRoot...)
+	out = append(out, data[rootSpan.end:]...)
+	if err := validateHookJSON(out); err != nil {
 		return nil, 0, err
 	}
-	return append(after, '\n'), removed, nil
+	return out, removed, nil
 }
 
 // Validate the portions we inspect; unrelated host fields stay opaque. An
@@ -450,41 +459,109 @@ func checkNamedHook(raw any) error {
 	return nil
 }
 
-func stripHookEntries(entries []any) ([]any, int) {
-	kept := make([]any, 0, len(entries))
-	removed := 0
-	for _, raw := range entries {
-		entry, ok := raw.(map[string]any)
-		if !ok {
-			kept = append(kept, raw)
-			continue
-		}
-		if nested, ok := entry["hooks"].([]any); ok {
-			// Host schemas have one matcher-group level. Do not recurse into unknown
-			// extension data or prune an unrelated, already-empty matcher group.
-			children := make([]any, 0, len(nested))
-			n := 0
-			for _, child := range nested {
-				if isDevCouncilHookEntry(child) {
-					n++
-				} else {
-					children = append(children, child)
-				}
+func editOpenCodePluginSpan(data []byte, valSpan *jsonSpan, raw any, root string) (bool, []byte, int) {
+	if entries, ok := raw.([]any); ok && valSpan.kind == spanArray {
+		removed := 0
+		edited, kept, err := spliceArray(data, valSpan, func(i int, _ *jsonSpan) (bool, []byte, error) {
+			if isOpenCodeHookRef(entries[i], root) {
+				removed++
+				return false, nil, nil
 			}
-			removed += n
-			if n > 0 {
-				if len(children) == 0 {
-					continue
-				}
-				entry["hooks"] = children
-			}
-		} else if isDevCouncilHookEntry(entry) {
-			removed++
-			continue
+			return true, nil, nil
+		})
+		if err != nil || removed == 0 {
+			return true, nil, 0
 		}
-		kept = append(kept, raw)
+		if kept == 0 {
+			return false, nil, removed
+		}
+		return true, edited, removed
 	}
-	return kept, removed
+	if isOpenCodeHookRef(raw, root) {
+		return false, nil, 1
+	}
+	return true, nil, 0
+}
+
+func editHooksMapSpan(data []byte, hooksSpan *jsonSpan, hooks map[string]any) (bool, []byte, int, error) {
+	removed := 0
+	edited, keptEvents, err := spliceObject(data, hooksSpan, func(em jsonMember) (bool, []byte, error) {
+		entries, ok := hooks[em.key].([]any)
+		if !ok || em.val.kind != spanArray {
+			return true, nil, nil
+		}
+		eventRemoved := 0
+		editedEntries, keptEntries, err := spliceArray(data, em.val, func(i int, elem *jsonSpan) (bool, []byte, error) {
+			entry, ok := entries[i].(map[string]any)
+			if !ok {
+				return true, nil, nil
+			}
+			children, hasNested := entry["hooks"].([]any)
+			if hasNested && elem.kind == spanObject {
+				// Host schemas have one matcher-group level. Do not recurse into unknown
+				// extension data or prune an unrelated, already-empty matcher group.
+				childRemoved := 0
+				editedMatcher, _, err := spliceObject(data, elem, func(hm jsonMember) (bool, []byte, error) {
+					if hm.key != "hooks" || hm.val.kind != spanArray {
+						return true, nil, nil
+					}
+					editedChildren, keptChildren, err := spliceArray(data, hm.val, func(ci int, _ *jsonSpan) (bool, []byte, error) {
+						if isDevCouncilHookEntry(children[ci]) {
+							childRemoved++
+							return false, nil, nil
+						}
+						return true, nil, nil
+					})
+					if err != nil || childRemoved == 0 {
+						return true, nil, err
+					}
+					if keptChildren == 0 {
+						return false, nil, nil
+					}
+					return true, editedChildren, nil
+				})
+				if err != nil {
+					return false, nil, err
+				}
+				eventRemoved += childRemoved
+				if childRemoved > 0 {
+					// Check whether all children were removed (spliceObject kept count check
+					// isn't enough when other matcher fields like "matcher" remain).
+					if childRemoved == len(children) {
+						return false, nil, nil
+					}
+					return true, editedMatcher, nil
+				}
+				return true, nil, nil
+			}
+			if isDevCouncilHookEntry(entry) {
+				eventRemoved++
+				return false, nil, nil
+			}
+			return true, nil, nil
+		})
+		if err != nil {
+			return false, nil, err
+		}
+		removed += eventRemoved
+		if eventRemoved == 0 {
+			return true, nil, nil
+		}
+		if keptEntries == 0 {
+			return false, nil, nil
+		}
+		return true, editedEntries, nil
+	})
+	if err != nil {
+		return false, nil, 0, err
+	}
+	if removed == 0 {
+		return true, nil, 0, nil
+	}
+	if keptEvents == 0 {
+		return false, nil, removed, nil
+	}
+	return true, edited, removed, nil
 }
 
 func isOpenCodeHookRef(raw any, root string) bool {

@@ -95,9 +95,10 @@ supplied — `dev verify TASK-ID --coverage PATH`; the MCP tool supplies none �
 `coverage_skipped_reason` field says when it did not run. Its gap is always advisory:
 no setting promotes it to blocking.
 
-A failed verification also writes a correction manifest — the gaps and their next
-actions — beside the task. Repair from it without weakening tests or stubbing around
-a gap.
+A blocked verification records those gaps in the store and returns `blocking_gaps`
+and `next_actions` on `devcouncil_verify_task` (queryable afterward via
+`devcouncil_get_gaps`). Repair from them without weakening tests or stubbing around a
+gap.
 
 ## Repair workflow (`enforce`, or when explicitly requested)
 

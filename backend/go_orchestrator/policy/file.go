@@ -130,7 +130,7 @@ var RestrictedPathPatterns = []string{
 }
 
 // ToolStateDirs are the directories DevCouncil's own tools write state into:
-// the task store, config and correction manifests under .devcouncil, and the
+// the task store, config and verification run logs under .devcouncil, and the
 // code graph and repo map under .devmap. They are a subset of
 // RestrictedPathPatterns — the write policy refuses an agent's write there — and
 // the same list is what verification leaves out of the diff it judges: a file

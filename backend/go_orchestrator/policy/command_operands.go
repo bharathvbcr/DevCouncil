@@ -18,6 +18,7 @@ import (
 var readsOnlyCommands = map[string]bool{
 	"cat": true, "ls": true, "head": true, "tail": true, "rg": true, "grep": true,
 	"wc": true, "diff": true, "stat": true, "file": true, "sort": true, "uniq": true, "cut": true,
+	"jq": true, "tr": true, "cmp": true,
 }
 
 // inertCommands print, test or set shell state; their operands are words, not
@@ -57,6 +58,9 @@ var pathWritingCommands = map[string]bool{
 // judged here (the substitution rungs own those), nor is a URL, a stream
 // device or text with whitespace in it, which is prose rather than a path.
 func unverifiableOperand(clause, root string, mt matching) string {
+	if isBoundedShellCompoundFraming(clause) {
+		return ""
+	}
 	words := shellWords(clause)
 	at := argumentCommandWord(words)
 	if at < 0 || isGitWord(words[at].text) {
@@ -87,14 +91,14 @@ func unverifiableOperand(clause, root string, mt matching) string {
 		if !complete {
 			return fmt.Sprintf("`%s` is handed an operand that opens like a JSON document and is larger or "+
 				"more deeply nested than the gate examines, so the paths it may carry were not judged and the "+
-				"gate cannot tell a read from a write. Pass a smaller document, or use a program the gate "+
-				"understands.", name)
+				"gate cannot tell a read from a write. Pass a smaller document, or use a judged program such as "+
+				"`jq`, `cat`, `head`, `sed -n`, or the file editing tools instead.", name)
 		}
 		for _, candidate := range candidates {
 			if where := protectedOperand(candidate, root, mt); where != "" {
 				return fmt.Sprintf("`%s` is handed %s, and the gate has no model of what it does to a path, "+
-					"so it cannot tell a read from a write. Run it on paths inside the repository that are "+
-					"not protected, or use a program the gate understands.", name, where)
+					"so it cannot tell a read from a write. Use `cat`, `head`, `jq`, or `sed -n` for reads, "+
+					"file editing tools for writes, or run it on paths inside the repository that are not protected.", name, where)
 			}
 		}
 	}

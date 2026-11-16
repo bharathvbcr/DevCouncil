@@ -1577,14 +1577,7 @@ fn servers_mut<'a>(
 }
 
 fn kind_of(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
+    devmap_query::json_value_kind_article(value)
 }
 
 /// OpenCode reaches hooks through an ES module named in `opencode.json`'s

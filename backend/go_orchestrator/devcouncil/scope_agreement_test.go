@@ -68,9 +68,9 @@ func TestPreflightAndVerifierAgreeOnWhichPathsMayChange(t *testing.T) {
 
 // DevCouncil's own state is not the agent's work. In a fresh repository with no
 // ignore rules, what the tools wrote — the task store and its sidecars, the
-// config `gate set` writes, the correction manifest the previous verify wrote,
-// the DevMap files — never reaches the changed set or the diff, so a task that
-// touches only its planned file has nothing to be blamed for, on every run.
+// config `gate set` writes, verification run logs, the DevMap files — never reaches
+// the changed set or the diff, so a task that touches only its planned file has
+// nothing to be blamed for, on every run.
 func TestToolOwnedStateIsNeverBlamed(t *testing.T) {
 	root := t.TempDir()
 	run := func(args ...string) {
@@ -102,7 +102,7 @@ func TestToolOwnedStateIsNeverBlamed(t *testing.T) {
 	write(".devcouncil/state.sqlite-wal", "\x00wal")
 	write(".devcouncil/state.sqlite-shm", "\x00shm")
 	write(".devcouncil/config.yaml", "gates:\n  mode: enforce\n")
-	write(".devcouncil/corrections/TASK-1-abc.json", "{}")
+	write(".devcouncil/runs/r-1/stdout.log", "ok")
 	write(".devmap/repo_map.json", "{}")
 	write(".devmap/graph.sqlite", "\x00")
 
@@ -128,8 +128,8 @@ func TestToolOwnedStateIsNeverBlamed(t *testing.T) {
 		} else if len(firstChanged) != len(changed) {
 			t.Errorf("run %d produced a different changed set than run 0", i)
 		}
-		// What verify wrote between the runs: a new manifest.
-		write(".devcouncil/corrections/TASK-1-def.json", "{}")
+		// What verify wrote between the runs: a new run log.
+		write(".devcouncil/runs/r-2/stdout.log", "ok")
 	}
 }
 

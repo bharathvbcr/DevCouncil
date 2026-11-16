@@ -32,6 +32,33 @@ func TestE2ERealTreeChangeInAnExcludedCrateSelectsItsNonExcludedDependents(t *te
 		in.Rust, in.RustDir = ws, "rust"
 		p := BuildPlan(in)
 		t.Logf("%s: dependents=%v everything=%v selected=%v dropped=%v", crate, ws.Dependents[crate], p.Everything, cmds(p), p.Dropped)
+		// The non-excluded dependents either are every non-excluded crate or are
+		// not. When they are, selecting them is the full suite's own command, so
+		// the plan must be the collapsed everything plan (runsFullSuite); when
+		// they are not, it must stay a real selection. Both directions are
+		// asserted, from the real workspace, so neither can drift silently.
+		excluded := map[string]bool{}
+		for _, ex := range in.Excludes {
+			excluded[ex] = true
+		}
+		dependent := map[string]bool{}
+		for _, d := range ws.Dependents[crate] {
+			if !excluded[d] {
+				dependent[d] = true
+			}
+		}
+		coversUniverse := true
+		for _, pkg := range ws.Packages {
+			if !excluded[pkg.Name] && !dependent[pkg.Name] {
+				coversUniverse = false
+			}
+		}
+		if coversUniverse {
+			if !p.Everything || len(p.Selected) != 0 {
+				t.Errorf("%s changed and its non-excluded dependents are the whole full suite; want the everything plan, got everything=%v selected=%v", file, p.Everything, cmds(p))
+			}
+			continue
+		}
 		if p.Everything {
 			t.Errorf("%s changed: widened to everything: %v", file, p.Widened)
 			continue
@@ -50,11 +77,15 @@ func TestE2ERealTreeChangeInAnExcludedCrateSelectsItsNonExcludedDependents(t *te
 // the fast phase must select user, and run it against the changed dc-proc.
 func TestE2EChangeInAnExcludedCrateSelectsTheDependentTheFullSuiteFails(t *testing.T) {
 	root, ws := a3fixture(t, map[string]string{
-		"rust/Cargo.toml":         "[workspace]\nresolver = \"3\"\nmembers = [\"dc-proc\", \"user\"]\n",
-		"rust/dc-proc/Cargo.toml": "[package]\nname = \"dc-proc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-		"rust/dc-proc/src/lib.rs": "pub fn v() -> u32 { 2 }\n",
-		"rust/user/Cargo.toml":    "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndc-proc = { path = \"../dc-proc\" }\n",
-		"rust/user/src/lib.rs":    "#[test]\nfn user_bad() { assert_eq!(dc_proc::v(), 1); }\n",
+		// bystander depends on nothing: with only user outside the excluded crate,
+		// "user" is the whole universe, which the plan collapses to everything.
+		"rust/Cargo.toml":           "[workspace]\nresolver = \"3\"\nmembers = [\"dc-proc\", \"user\", \"bystander\"]\n",
+		"rust/bystander/Cargo.toml": "[package]\nname = \"bystander\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+		"rust/bystander/src/lib.rs": "",
+		"rust/dc-proc/Cargo.toml":   "[package]\nname = \"dc-proc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+		"rust/dc-proc/src/lib.rs":   "pub fn v() -> u32 { 2 }\n",
+		"rust/user/Cargo.toml":      "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndc-proc = { path = \"../dc-proc\" }\n",
+		"rust/user/src/lib.rs":      "#[test]\nfn user_bad() { assert_eq!(dc_proc::v(), 1); }\n",
 	})
 	logs := map[string]string{}
 	p := a3plan(ws, "rust/dc-proc/src/lib.rs")

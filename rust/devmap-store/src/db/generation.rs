@@ -165,12 +165,22 @@ impl ResolverStamp {
     pub fn reason(self) -> &'static str {
         match self {
             Self::Current => "stored edges were resolved by this resolver",
-            Self::Unrecorded => "stored edges carry an unrecorded resolver epoch (no stamp: written before it existed); run `devmap build`",
-            Self::Unreadable => "stored analysis document is unreadable, so the resolver that wrote the edges is unknown; run `devmap build`",
+            Self::Unrecorded => {
+                "stored edges carry an unrecorded resolver epoch (no stamp: written before it existed); run `devmap build`"
+            }
+            Self::Unreadable => {
+                "stored analysis document is unreadable, so the resolver that wrote the edges is unknown; run `devmap build`"
+            }
             Self::Malformed => "stored resolver epoch stamp is malformed; run `devmap build`",
-            Self::Older => "stored edges were resolved by an older resolver epoch than this binary's; run `devmap build`",
-            Self::Newer => "stored edges were written by a newer devmap (a newer resolver epoch than this binary's); rebuilding with this binary would replace them with an older resolver's edges, so update devmap instead",
-            Self::Different => "stored edges were resolved under a different resolver epoch than this binary's; run `devmap build`",
+            Self::Older => {
+                "stored edges were resolved by an older resolver epoch than this binary's; run `devmap build`"
+            }
+            Self::Newer => {
+                "stored edges were written by a newer devmap (a newer resolver epoch than this binary's); rebuilding with this binary would replace them with an older resolver's edges, so update devmap instead"
+            }
+            Self::Different => {
+                "stored edges were resolved under a different resolver epoch than this binary's; run `devmap build`"
+            }
         }
     }
 }
@@ -515,15 +525,19 @@ impl Store {
     ///
     /// `None` when the generation recorded no root — an older store, or one
     /// built outside a repository. Never an empty string dressed as a path.
+    fn has_any_generation(conn: &rusqlite::Connection) -> Result<bool> {
+        let has_gen: Option<i64> = conn
+            .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
+            .optional()?;
+        Ok(has_gen.is_some())
+    }
+
     pub fn latest_generation_repo_root(&self) -> Result<Option<String>> {
         if let Some(ref override_root) = self.repo_root_override {
             let conn = lock_conn(&self.conn)?;
-            let has_gen: Option<i64> = conn
-                .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
-                .optional()?;
-            return Ok(
-                has_gen.and_then(|_| (!override_root.is_empty()).then(|| override_root.clone()))
-            );
+            return Ok(Self::has_any_generation(&conn)?
+                .then(|| (!override_root.is_empty()).then(|| override_root.clone()))
+                .flatten());
         }
         self.stored_latest_generation_repo_root()
     }
@@ -535,10 +549,7 @@ impl Store {
     pub fn stored_latest_generation_repo_root(&self) -> Result<Option<String>> {
         let conn = lock_conn(&self.conn)?;
         if let Some(seeded) = Self::seeded_repo_root_in(&conn)? {
-            let has_gen: Option<i64> = conn
-                .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
-                .optional()?;
-            if has_gen.is_some() {
+            if Self::has_any_generation(&conn)? {
                 return Ok(Some(seeded));
             }
         }
@@ -635,7 +646,7 @@ impl Store {
             Err(error) => {
                 return Err(refusal(format!(
                     "working tree could not be compared to the indexed generation: {error}"
-                )))
+                )));
             }
         };
         if !scanned.matches_file_hashes(&hashes) {
@@ -955,6 +966,11 @@ impl Store {
         Ok(rows)
     }
 
+    /// Shorter alias for [`Self::latest_generation_repo_root`].
+    ///
+    /// Honours `repo_root_override` and `seed_rebind`; use
+    /// [`Self::stored_latest_generation_repo_root`] instead when you need the
+    /// root recorded in the database file regardless of caller overrides.
     pub fn latest_repo_root(&self) -> Result<Option<String>> {
         self.latest_generation_repo_root()
     }
@@ -1378,12 +1394,12 @@ impl Store {
             Ok(None) => {
                 return QuerySourceFreshness::unverified(
                     "no persisted generation is available to verify against the working tree",
-                )
+                );
             }
             Err(error) => {
                 return QuerySourceFreshness::unverified(format!(
                     "source freshness unverified: could not read the latest generation ({error})"
-                ))
+                ));
             }
         };
         // A remembered verdict describes the tree as `status` last walked it. Edits
@@ -1494,14 +1510,14 @@ generation {latest}; run `devmap status` to re-verify",
             Err(error) if error.is::<devmap_extract::BuildCancelled>() => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                     devmap_extract::BuildCancelled,
-                )))
+                )));
             }
             Err(error) => {
                 return Ok((
                     None,
                     Some(format!("source freshness unverified: {error}")),
                     None,
-                ))
+                ));
             }
         };
         let (delta, sample_paths) =
@@ -1535,7 +1551,7 @@ generation {latest}; run `devmap status` to re-verify",
                         "source freshness unverified: project manifests could not be read ({error})"
                     )),
                     None,
-                ))
+                ));
             }
         };
         let current = crate::DiscoveryInventory::of(&scanned.report, &manifests);
@@ -2950,5 +2966,58 @@ mod generation_checks_staleness {
     #[test]
     fn encoding_verdict_after_this_stores_own_write() {
         encoding_verdict_is_reread(Writer::Own);
+    }
+
+    #[test]
+    fn latest_repo_root_readers_agree_until_override_diverges() {
+        let f = fixture("repo-root");
+        let empty_db = f.dir.join("empty.sqlite");
+        let empty = Store::open(&empty_db).expect("empty store");
+        assert_eq!(empty.latest_repo_root().unwrap(), None);
+        assert_eq!(empty.latest_generation_repo_root().unwrap(), None);
+        assert_eq!(empty.stored_latest_generation_repo_root().unwrap(), None);
+        drop(empty);
+
+        assert_eq!(
+            write(
+                &f,
+                Writer::Own,
+                "UPDATE generations SET repo_root = '/stored/root'"
+            ),
+            1
+        );
+        assert_eq!(
+            f.store.latest_repo_root().unwrap().as_deref(),
+            Some("/stored/root")
+        );
+        assert_eq!(
+            f.store.latest_generation_repo_root().unwrap().as_deref(),
+            Some("/stored/root")
+        );
+        assert_eq!(
+            f.store
+                .stored_latest_generation_repo_root()
+                .unwrap()
+                .as_deref(),
+            Some("/stored/root")
+        );
+
+        let mut overridden = Store::open(&f.db).expect("reopen");
+        overridden.repo_root_override = Some("/override/root".to_string());
+        assert_eq!(
+            overridden.latest_repo_root().unwrap().as_deref(),
+            Some("/override/root")
+        );
+        assert_eq!(
+            overridden.latest_generation_repo_root().unwrap().as_deref(),
+            Some("/override/root")
+        );
+        assert_eq!(
+            overridden
+                .stored_latest_generation_repo_root()
+                .unwrap()
+                .as_deref(),
+            Some("/stored/root")
+        );
     }
 }

@@ -465,3 +465,29 @@ fn doctor_reports_a_linked_hooks_directory() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&repo);
 }
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_linked_hooks_directory_through_symlink() {
+    let home = scratch("linked-sym-home");
+    let repo = scratch("linked-sym-repo");
+    let victim = repo.join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+    let hooks = repo.join(".devcouncil/codeintel/hooks");
+    std::os::unix::fs::symlink(&victim, &hooks).unwrap();
+
+    let link = scratch("linked-sym-link");
+    let _ = fs::remove_dir_all(&link);
+    std::os::unix::fs::symlink(&repo, &link).unwrap();
+
+    let report = doctor_with_home(&home, &link);
+    let warning = report["hooks_marker_dir_warning"].as_str().unwrap_or("");
+    assert!(
+        warning.contains("hooks") && warning.contains("are refused"),
+        "{report}"
+    );
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&repo);
+}

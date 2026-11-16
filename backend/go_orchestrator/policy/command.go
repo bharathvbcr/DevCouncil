@@ -245,7 +245,7 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		// that admits it never read. Hard and ahead of the allowlists for the
 		// same reason git safety is: no lease, grant or posture negotiates it.
 		// See RuleCommandGitReadArgument.
-		if reason := readOnlyArgumentViolation(normalized, g.Root); reason != "" {
+		if reason := readOnlyArgumentViolation(command, g.Root); reason != "" {
 			return g.noteHardRules(deny(RuleCommandGitReadArgument, reason, normalized, taskID))
 		}
 		// What any command is told to read: an operand naming a credential
@@ -265,13 +265,13 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	if d, hard := g.judgeSubstitutions(&f, raw, normalized, task, taskID, depth); hard {
 		return d
 	}
-	g.noteDirectoryChanges(&f, normalized, taskID)
+	g.noteDirectoryChanges(&f, command, normalized, taskID)
 	g.noteUnverifiableOperands(&f, command, normalized, taskID)
 	if d, found := f.verdict(); found {
 		return d
 	}
 
-	return g.matchAllowlists(raw, normalized, task, taskID)
+	return g.matchAllowlists(command, raw, normalized, task, taskID)
 }
 
 // clauseFindings collects the refusals and warnings one clause's rungs find
@@ -322,7 +322,7 @@ func (g CommandGate) noteOpaqueConstructs(f *clauseFindings, raw, normalized, ta
 	if hasHeredoc(raw) {
 		f.noteUnreadable(g.noteHardRules(deny(RuleCommandHeredoc,
 			"Heredocs carry expanded data with no statically checkable end and are not allowed; "+
-				"write the content to a file instead.", normalized, taskID)))
+				"write the content directly with your file or editing tools instead.", normalized, taskID)))
 	}
 	// Checked on the raw line, beside the heredoc rung, because it is the same
 	// refusal: a construct whose meaning is not in the text being judged. It
@@ -388,7 +388,7 @@ func (g CommandGate) judgeSubstitutions(f *clauseFindings, raw, normalized strin
 
 // noteDirectoryChanges notes a clause that moves where its relative paths
 // resolve: a cd/pushd/popd, or git's own directory options.
-func (g CommandGate) noteDirectoryChanges(f *clauseFindings, normalized, taskID string) {
+func (g CommandGate) noteDirectoryChanges(f *clauseFindings, command, normalized, taskID string) {
 	// A directory change is refused, not waved through. It used to be allowed
 	// on the ground that it "cannot write" — true of the cd itself, and beside
 	// the point, because it decides where every relative path *after* it
@@ -397,17 +397,18 @@ func (g CommandGate) noteDirectoryChanges(f *clauseFindings, normalized, taskID 
 		f.noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"Changing the working directory is not allowed: every relative path in this command "+
 				"would then resolve somewhere other than where the gate judged it. Use paths "+
-				"relative to the repository root instead.", normalized, taskID)))
+				"relative to the repository root, or run `git -C <registered-worktree>` for "+
+				"another worktree of this repository, instead.", normalized, taskID)))
 	}
 
-	// git carries its own directory change, and it is the same refusal. `git -C
-	// ../elsewhere status` reads a different working tree; `--git-dir` and
-	// `--work-tree` split the two apart. A rung that refuses `cd` while these
-	// pass is a rung that refuses one spelling of the problem.
-	if opt, moved := gitDirectoryEscape(normalized); moved {
+	// git carries its own directory change, and it is the same refusal when it
+	// leaves the registered repository family (`--git-dir`, `--work-tree`, or
+	// `-C` pointing outside any registered worktree of g.Root).
+	if opt, moved := gitDirectoryEscapeInRoot(command, g.Root); moved {
 		f.noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
-			"`git "+opt+"` runs against a working tree other than the one this gate judges for, "+
-				"so nothing it does was examined. Run git from the repository root instead.",
+			"`git "+opt+"` runs against a working tree other than a registered worktree or the "+
+				"working tree this gate judges for, so nothing it does was examined. Run git from "+
+				"the repository root or pass `git -C <registered-worktree>` instead.",
 			normalized, taskID)))
 	}
 }
@@ -425,9 +426,15 @@ func (g CommandGate) noteUnverifiableOperands(f *clauseFindings, command, normal
 // matchAllowlists is the last stage of evaluateSingleCommand: the lists a
 // clause that nothing above refused is allowed by, in order, and the refusal
 // when none admits it.
-func (g CommandGate) matchAllowlists(raw, normalized string, task *dc.Task, taskID string) Decision {
-	if matcherOf(g.Matcher).any(NoTaskAllowedCommands, normalized) {
+func (g CommandGate) matchAllowlists(command, raw, normalized string, task *dc.Task, taskID string) Decision {
+	m := matcherOf(g.Matcher)
+	candidates := allowlistCandidates(command, raw, normalized, g.Root)
+
+	if matchesAnyCandidate(m, NoTaskAllowedCommands, candidates) {
 		return g.finish(allow("Bootstrap or read-only command allowed.", normalized, taskID), normalized, taskID)
+	}
+	if isBoundedShellCompoundFraming(command) {
+		return g.finish(allow("Bounded shell compound framing allowed.", normalized, taskID), normalized, taskID)
 	}
 
 	// Ordering is the rule, not a detail. Every rung below this point describes
@@ -442,22 +449,162 @@ func (g CommandGate) matchAllowlists(raw, normalized string, task *dc.Task, task
 			normalized, ""))
 	}
 
-	if matcherOf(g.Matcher).any(LeaseLifecycleAllowedCommands, normalized) {
+	if matchesAnyCandidate(m, LeaseLifecycleAllowedCommands, candidates) {
 		return g.finish(allow("Lease lifecycle or repo maintenance command allowed.", normalized, taskID), normalized, taskID)
 	}
 
-	// Allowlist entries are matched against both the raw and normalized forms,
+	// Allowlist entries are matched against both the raw and normalized forms
+	// (plus stripped compound-keyword prefixes and validated `git -C` forms),
 	// so a task listing ".venv/bin/dev *" still works while a path-prefixed
 	// "dev map" continues to hit the lifecycle patterns after normalization.
-	if matchesEither(matcherOf(g.Matcher), task.AllowedCommands, normalized, raw) {
+	if matchesAnyCandidate(m, task.AllowedCommands, candidates) {
 		return g.finish(allow("Command matches task allowed_commands.", normalized, task.ID), normalized, task.ID)
 	}
-	if matchesEither(matcherOf(g.Matcher), g.GlobalAllowedCommands, normalized, raw) {
+	if matchesAnyCandidate(m, g.GlobalAllowedCommands, candidates) {
 		return g.finish(allow("Command matches global allowed commands.", normalized, task.ID), normalized, task.ID)
 	}
 
 	return g.noteHardRules(deny(RuleCommandNotAllowed,
 		"Command is not in task or global allowlists.", normalized, task.ID))
+}
+
+func matchesAnyCandidate(m matching, patterns, candidates []string) bool {
+	for _, c := range candidates {
+		if m.any(patterns, c) {
+			return true
+		}
+	}
+	return false
+}
+
+func allowlistCandidates(command, raw, normalized, root string) []string {
+	var out []string
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		for _, have := range out {
+			if have == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	add(normalized)
+	add(raw)
+	addWithGitStripped := func(src string) {
+		add(NormalizeAllowlistCommandInRoot(src, root))
+		add(collapseSpaces(src))
+		if stripped := stripValidatedGitDirectoryOptions(src, root); stripped != "" && stripped != src {
+			add(NormalizeAllowlistCommandInRoot(stripped, root))
+			add(collapseSpaces(stripped))
+		}
+	}
+	addWithGitStripped(command)
+	spans := scanShellWords(command)
+	k := 0
+	for k < len(spans) && !spans[k].anyQuoted && (spans[k].text == "do" || spans[k].text == "then" || spans[k].text == "else" || spans[k].text == "{" || spans[k].text == "!") {
+		k++
+	}
+	if k > 0 && k < len(spans) {
+		parts := make([]string, 0, len(spans)-k)
+		for _, sp := range spans[k:] {
+			parts = append(parts, sp.raw)
+		}
+		addWithGitStripped(strings.Join(parts, " "))
+	}
+	return out
+}
+
+var boundedCompoundKeywords = map[string]bool{
+	"done": true, "fi": true, "esac": true, "}": true,
+	"do": true, "then": true, "else": true,
+}
+
+// isBoundedShellCompoundFraming reports whether clause is purely bounded
+// literal shell compound framing — either a single unquoted compound
+// delimiter/closer (`done`, `fi`, `esac`, `}`, `do`, `then`, `else`) or a
+// `for <var> in <literal...>` header with at most maxBindingValues literal
+// items (matching expandBindings's expansion cap).
+func isBoundedShellCompoundFraming(clause string) bool {
+	words := shellWords(clause)
+	if len(words) == 0 {
+		return false
+	}
+	if len(words) == 1 && !words[0].anyQuoted && boundedCompoundKeywords[words[0].text] {
+		return true
+	}
+	for len(words) > 0 && !words[0].anyQuoted && (words[0].text == "do" || words[0].text == "then" || words[0].text == "else" || words[0].text == "{") {
+		words = words[1:]
+	}
+	if len(words) < 3 || words[0].anyQuoted || words[0].text != "for" {
+		return false
+	}
+	if words[1].anyQuoted || !bindingName(words[1].text) || words[2].anyQuoted || words[2].text != "in" {
+		return false
+	}
+	items := words[3:]
+	if len(items) > maxBindingValues {
+		return false
+	}
+	for _, item := range items {
+		if item.expands || !literalBindingValue(item.text) {
+			return false
+		}
+	}
+	return true
+}
+
+func stripValidatedGitDirectoryOptions(clause, root string) string {
+	spans := scanShellWords(clause)
+	if len(spans) == 0 {
+		return ""
+	}
+	words := make([]shellWord, len(spans))
+	for i, sp := range spans {
+		words[i] = sp.shellWord
+	}
+	out := make([]string, 0, len(spans))
+	for i := 0; i < len(spans); {
+		out = append(out, spans[i].raw)
+		if !isGitWord(spans[i].text) {
+			i++
+			continue
+		}
+		if _, _, escaped := resolveGitClauseWorktree(words, i, root); escaped {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(spans) {
+			w := words[j]
+			if !w.quotedHead {
+				if targetNext, isRedir := redirectionPrefix(w.text); isRedir {
+					out = append(out, spans[j].raw)
+					j++
+					if targetNext && j < len(spans) {
+						out = append(out, spans[j].raw)
+						j++
+					}
+					continue
+				}
+			}
+			if w.text == "--" || w.text == "-" || !strings.HasPrefix(w.text, "-") {
+				break
+			}
+			name, _, _, next := stepGitGlobalOption(words, j)
+			if name == "-C" {
+				j = next
+				continue
+			}
+			for k := j; k < next && k < len(spans); k++ {
+				out = append(out, spans[k].raw)
+			}
+			j = next
+		}
+		i = j
+	}
+	return strings.Join(out, " ")
 }
 
 // ansiCQuote is the scanner state inside a $'…' span.
@@ -697,23 +844,17 @@ func gitSafety(normalized, taskID string) (Decision, bool) {
 // to skip past; this rung is what keeps skipping them from being the same as
 // ignoring them.
 func gitDirectoryEscape(command string) (string, bool) {
-	fields := strings.Fields(command)
-	for i, f := range fields {
-		if !isGitWord(f) {
+	return gitDirectoryEscapeInRoot(command, "")
+}
+
+func gitDirectoryEscapeInRoot(command, root string) (string, bool) {
+	words := shellWords(command)
+	for i, w := range words {
+		if !isGitWord(w.text) {
 			continue
 		}
-		for j := i + 1; j < len(fields) && strings.HasPrefix(fields[j], "-"); j++ {
-			opt := fields[j]
-			name := opt
-			if eq := strings.IndexByte(opt, '='); eq >= 0 {
-				name = opt[:eq]
-			} else if gitGlobalOptionsWithValue[opt] {
-				j++ // step over the value so it is not read as another option
-			}
-			switch name {
-			case "-C", "--git-dir", "--work-tree":
-				return name, true
-			}
+		if _, opt, escaped := resolveGitClauseWorktree(words, i, root); escaped {
+			return opt, true
 		}
 	}
 	return "", false
@@ -753,21 +894,24 @@ func isGitWord(word string) bool {
 // makes, and the same safe direction — while under-stripping costs a force
 // push that no rule saw.
 func stripGitGlobalOptions(command string) string {
-	fields := strings.Fields(command)
-	out := make([]string, 0, len(fields))
-	for i := 0; i < len(fields); i++ {
-		out = append(out, fields[i])
-		if !isGitWord(fields[i]) {
+	spans := scanShellWords(command)
+	words := make([]shellWord, len(spans))
+	for i, sp := range spans {
+		words[i] = sp.shellWord
+	}
+	out := make([]string, 0, len(spans))
+	for i := 0; i < len(spans); {
+		out = append(out, spans[i].raw)
+		if !isGitWord(spans[i].text) {
+			i++
 			continue
 		}
-		for i+1 < len(fields) && strings.HasPrefix(fields[i+1], "-") {
-			opt := fields[i+1]
-			i++
-			// `--git-dir=x` carries its value; `--git-dir x` and `-C x` do not.
-			if !strings.Contains(opt, "=") && gitGlobalOptionsWithValue[opt] && i+1 < len(fields) {
-				i++
-			}
+		j := i + 1
+		for j < len(spans) && strings.HasPrefix(spans[j].text, "-") {
+			_, _, _, next := stepGitGlobalOption(words, j)
+			j = next
 		}
+		i = j
 	}
 	return strings.Join(out, " ")
 }
@@ -1126,11 +1270,20 @@ type shellWord struct {
 	// `FOO="a b" eval …` as a quoted literal and stopped looking for the
 	// command word.
 	quotedHead bool
+	// anyQuoted reports whether quoting or a backslash escape appeared anywhere
+	// in the word, distinguishing shell keywords like `for` and `done` from
+	// quoted command words like `"for"` or `d\one`.
+	anyQuoted bool
 	// expands reports whether any character sh would expand — `$`, a
 	// backtick, `{`, `}`, `*`, `?`, `[` — appears where sh expands it: outside
 	// single quotes and not backslash-escaped (inside double quotes only `$`
 	// and the backtick do). `'*.go'` is a literal; `*.go` is a glob.
 	expands bool
+}
+
+type shellWordSpan struct {
+	shellWord
+	raw string
 }
 
 // shellWords splits a command line into the words sh would produce, honouring
@@ -1145,11 +1298,32 @@ type shellWord struct {
 // a shell word holds a space, so a word splitter that does not read quotes is
 // answering a different question from the one sh asks.
 func shellWords(command string) []shellWord {
-	var words []shellWord
-	var cur strings.Builder
-	started, quotedHead, expands := false, false, false
+	spans := scanShellWords(command)
+	words := make([]shellWord, len(spans))
+	for i, sp := range spans {
+		words[i] = sp.shellWord
+	}
+	return words
+}
+
+func scanShellWords(command string) []shellWordSpan {
+	var spans []shellWordSpan
+	var cur, raw strings.Builder
+	started, quotedHead, anyQuoted, expands := false, false, false, false
 	quote := rune(0)
 	runes := []rune(command)
+	flush := func() {
+		if !started {
+			return
+		}
+		spans = append(spans, shellWordSpan{
+			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands},
+			raw:       raw.String(),
+		})
+		cur.Reset()
+		raw.Reset()
+		started, quotedHead, anyQuoted, expands = false, false, false, false
+	}
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		switch {
@@ -1158,42 +1332,46 @@ func shellWords(command string) []shellWord {
 			i++
 		case quote == 0 && r == '\\' && i+1 < len(runes):
 			quotedHead = quotedHead || !started
+			anyQuoted = true
+			raw.WriteRune(r)
+			raw.WriteRune(runes[i+1])
 			cur.WriteRune(runes[i+1])
 			i++
 			started = true
 		case quote == 0 && (r == '\'' || r == '"'):
 			quotedHead = quotedHead || !started
+			anyQuoted = true
+			raw.WriteRune(r)
 			quote = r
 			started = true
 		case quote != 0 && r == quote:
+			raw.WriteRune(r)
 			quote = 0
 		case quote == '"' && r == '\\' && i+1 < len(runes) &&
 			(runes[i+1] == '"' || runes[i+1] == '\\' || runes[i+1] == '$' || runes[i+1] == '`'):
+			raw.WriteRune(r)
+			raw.WriteRune(runes[i+1])
 			cur.WriteRune(runes[i+1])
 			i++
 		case quote != 0:
 			if quote == '"' && (r == '$' || r == '`') {
 				expands = true
 			}
+			raw.WriteRune(r)
 			cur.WriteRune(r)
 		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
-			if started {
-				words = append(words, shellWord{text: cur.String(), quotedHead: quotedHead, expands: expands})
-				cur.Reset()
-				started, quotedHead, expands = false, false, false
-			}
+			flush()
 		default:
 			if strings.ContainsRune("$`{}*?[", r) {
 				expands = true
 			}
+			raw.WriteRune(r)
 			cur.WriteRune(r)
 			started = true
 		}
 	}
-	if started {
-		words = append(words, shellWord{text: cur.String(), quotedHead: quotedHead, expands: expands})
-	}
-	return words
+	flush()
+	return spans
 }
 
 // reparsingBuiltins are the command words whose arguments become shell code

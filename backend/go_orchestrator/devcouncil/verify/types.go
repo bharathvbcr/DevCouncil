@@ -79,7 +79,6 @@ type MCPResult struct {
 	NextActions      []NextAction `json:"next_actions"`
 	AdvisoryActions  []NextAction `json:"advisory_actions"`
 	AllowedNextTools []string     `json:"allowed_next_tools"`
-	CorrectionPath   string       `json:"correction_path,omitempty"`
 }
 
 // TaskCLIResult is one task entry inside the CLI verify --json envelope.

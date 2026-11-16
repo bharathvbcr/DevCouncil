@@ -22,6 +22,30 @@ fn a_closed_stdout_is_a_quiet_transport_failure_for_success_and_error() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn dcjsoncheck_closed_stdout_is_a_quiet_transport_failure() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    for args in [vec!["--version"], vec!["--unknown-flag"]] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_dcjsoncheck"))
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 // A panic prints where it happened and nothing it carried. The default hook
 // prints the panic message, and a message can hold data from the diff (a
 // string-slicing panic prints up to 256 bytes of the sliced string); the Go

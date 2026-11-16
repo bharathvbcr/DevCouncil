@@ -802,6 +802,21 @@ fn extract_file_unfiltered(path: &str, source: &str, budget: std::time::Duration
     let deadline = std::time::Instant::now() + budget;
     let mut extraction = treesitter::extract_treesitter_with_budget(path, lang, source, budget);
     sqlddl::recover_lost_relations(&mut extraction, source, deadline);
+    if std::time::Instant::now() >= deadline
+        && !matches!(
+            extraction.parse_outcome,
+            ParseOutcome::Failed { .. } | ParseOutcome::Skipped { .. }
+        )
+    {
+        return treesitter::refused_extraction(
+            path,
+            lang,
+            source,
+            treesitter::budget_refusal_reason(format!(
+                "extraction and relation recovery exceeded the {budget:?} budget; no symbols are claimed for this file"
+            )),
+        );
+    }
     extraction
 }
 

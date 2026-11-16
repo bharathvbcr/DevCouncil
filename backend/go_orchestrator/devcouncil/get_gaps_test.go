@@ -129,3 +129,83 @@ func TestGetGapsReportsAGapsOptionalFields(t *testing.T) {
 		t.Errorf("gap %q missing from %s", id, raw)
 	}
 }
+
+func TestGetGapsReportsRecurrenceTruncated(t *testing.T) {
+	ctx := context.Background()
+	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	reg := devcouncil.NewRegistry(t.TempDir(), client, nil)
+
+	callGaps := func() (avail, trunc, gapsTrunc bool) {
+		out, err := reg.Call(ctx, "devcouncil_get_gaps", map[string]any{"task_id": "TASK-1"})
+		if err != nil {
+			t.Fatalf("Call: %v", err)
+		}
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var payload struct {
+			OK                  bool `json:"ok"`
+			RecurrenceAvailable bool `json:"recurrence_available"`
+			RecurrenceTruncated bool `json:"recurrence_truncated"`
+			Truncated           bool `json:"truncated"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("unmarshal %s: %v", raw, err)
+		}
+		if !payload.OK {
+			t.Fatalf("payload not ok: %s", raw)
+		}
+		return payload.RecurrenceAvailable, payload.RecurrenceTruncated, payload.Truncated
+	}
+
+	makeBatch := func(start, count int) []store.GapRow {
+		rows := make([]store.GapRow, count)
+		for i := 0; i < count; i++ {
+			rows[i] = store.GapRow{
+				ID:             "G-" + itoaGap(start+i),
+				Severity:       "low",
+				GapType:        "lint",
+				TaskID:         "TASK-1",
+				Description:    "gap",
+				RecommendedFix: "fix",
+				EvidenceJSON:   []byte(`[]`),
+			}
+		}
+		return rows
+	}
+
+	if err := client.GapsReplace(ctx, "TASK-1", makeBatch(0, 1)); err != nil {
+		t.Fatalf("small GapsReplace: %v", err)
+	}
+	avail, recTrunc, gapsTrunc := callGaps()
+	if !avail || recTrunc || gapsTrunc {
+		t.Fatalf("small batch: avail=%v recTrunc=%v gapsTrunc=%v, want true/false/false", avail, recTrunc, gapsTrunc)
+	}
+
+	// dcstore caps gap-history at MAX_LIST_ROWS (10,000); 21 batches of 500
+	// distinct gaps leave 10,500 history rows while gaps holds only 500.
+	for batch := 0; batch < 21; batch++ {
+		if err := client.GapsReplace(ctx, "TASK-1", makeBatch(batch*store.MaxGapsPerReplace+1, store.MaxGapsPerReplace)); err != nil {
+			t.Fatalf("GapsReplace batch %d: %v", batch, err)
+		}
+	}
+	avail, recTrunc, gapsTrunc = callGaps()
+	if !avail || !recTrunc || gapsTrunc {
+		t.Fatalf("large history: avail=%v recTrunc=%v gapsTrunc=%v, want true/true/false", avail, recTrunc, gapsTrunc)
+	}
+}
+
+func itoaGap(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var digits [20]byte
+	i := len(digits)
+	for n > 0 {
+		i--
+		digits[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(digits[i:])
+}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -522,6 +524,9 @@ func TestARealThreeCommitBlastWidensTheCratesItCouldNotPlaceAndDropsTheExcludedO
 		{Name: "dc-grep", Dir: "rust/dc-grep", Targets: []RustTarget{{Name: "dc_grep", Kinds: []string{"lib"}, Src: "rust/dc-grep/src/lib.rs", Test: true}}},
 		{Name: "devmap-cli", Dir: "rust/devmap-cli", Targets: []RustTarget{{Name: "devmap", Kinds: []string{"bin"}, Src: "rust/devmap-cli/src/main.rs", Test: true}}},
 		{Name: "devmap-extract", Dir: "rust/devmap-extract", Targets: []RustTarget{{Name: "devmap_extract", Kinds: []string{"lib"}, Src: "rust/devmap-extract/src/lib.rs", Test: true}}},
+		// A crate the blast never reaches: without it the selection is the whole
+		// universe, which collapses to everything (see runsFullSuite).
+		{Name: "devmap-bystander", Dir: "rust/devmap-bystander", Targets: []RustTarget{{Name: "devmap_bystander", Kinds: []string{"lib"}, Src: "rust/devmap-bystander/src/lib.rs", Test: true}}},
 	}}
 	p := BuildPlan(in)
 	if p.Everything {
@@ -551,6 +556,9 @@ func TestARealGoBlastSelectsThePackagesItsTestFilesLiveIn(t *testing.T) {
 	in.Go = &GoWorkspace{Module: module, Packages: []GoPackage{
 		{ImportPath: module + "/cmd/devcouncil", Dir: "backend/go_orchestrator/cmd/devcouncil", TestFiles: []string{"backend/go_orchestrator/cmd/devcouncil/liveness_test.go"}},
 		{ImportPath: module + "/policy", Dir: "backend/go_orchestrator/policy", TestFiles: []string{"backend/go_orchestrator/policy/command_bindings_test.go"}},
+		// A tested package the blast never reaches: without it the selection is
+		// every tested package, which collapses to everything (see runsFullSuite).
+		{ImportPath: module + "/bystander", Dir: "backend/go_orchestrator/bystander", TestFiles: []string{"backend/go_orchestrator/bystander/b_test.go"}, Imports: []string{"strings"}},
 	}}
 	p := BuildPlan(in)
 	if p.Everything {
@@ -651,4 +659,134 @@ func TestAGoPackageIsSelectedWithEveryTestedPackageThatImportsItTransitively(t *
 	if len(p.Selected) != 1 || len(sel.Units) != 2 || !strings.Contains(sel.Why, "with importers "+module+"/top") {
 		t.Fatalf("selected %q units=%+v why=%q: top imports lib through mid, which has no tests of its own; other imports nothing selected", cmds(p), sel.Units, sel.Why)
 	}
+}
+
+// wantCollapsed fails unless the plan is the everything plan for the reason
+// that a selected command is the full suite's own command. Earlier widenings
+// stay in the plan (they say why the selection grew), so the everything entry
+// is looked for rather than assumed to be first.
+func wantCollapsed(t *testing.T, p Plan, kind string) {
+	t.Helper()
+	if !p.Everything || len(p.Selected) != 0 {
+		t.Fatalf("a %s selection that is the whole full suite must collapse to everything; everything=%t selected=%q", kind, p.Everything, cmds(p))
+	}
+	for _, w := range p.Widened {
+		if w.Scope == "everything" && strings.Contains(w.Reason, "the selected "+kind+" command runs every package of the full suite") {
+			return
+		}
+	}
+	t.Errorf("widened = %+v; want an everything entry saying the selected %s command is the full suite", p.Widened, kind)
+}
+
+// 2026-11-15, run 43657580163: the plan selected all eleven non-excluded
+// crates, the fast phase ran the whole workspace, and the full suite then ran
+// it again (1371 s, then 1157 s). A selection that is the full suite adds no
+// signal and doubles the cost, so it is the everything plan.
+func TestARustSelectionThatIsTheWholeUniverseCollapsesToEverything(t *testing.T) {
+	in := inputs(
+		withChanged("rust/ca/src/engine.rs", "rust/cb/src/lib.rs", "rust/cc/src/lib.rs", "rust/cf/src/lib.rs", "rust/devmap-cli/src/main.rs"),
+		withTests("rust/ca/src/engine.rs"))
+	wantCollapsed(t, BuildPlan(in), "rust")
+}
+
+// The same collapse reached the way the real plan reached it: one changed crate
+// whose dependents are the rest of the workspace.
+func TestARustSelectionThatReachesTheWholeUniverseThroughDependentsCollapsesToEverything(t *testing.T) {
+	in := inputs(withChanged("rust/ca/src/engine.rs"), withTests("rust/ca/src/engine.rs"))
+	in.Rust.Dependents = map[string][]string{"ca": {"cb", "cc", "cf", "devmap-cli", "dc-store"}}
+	wantCollapsed(t, BuildPlan(in), "rust")
+}
+
+// One crate short of the universe is a real selection: the fast phase still
+// runs fewer tests than the full suite.
+func TestARustSelectionOneCrateShortOfTheUniverseIsNotCollapsed(t *testing.T) {
+	in := inputs(withChanged("rust/ca/src/engine.rs"), withTests("rust/ca/src/engine.rs"))
+	in.Rust.Dependents = map[string][]string{"ca": {"cb", "cc", "cf"}}
+	p := BuildPlan(in)
+	if p.Everything {
+		t.Fatalf("four of five crates must stay a selection: %v", p.Widened)
+	}
+	wantCmd(t, p, "cargo test --locked -p ca -p cb -p cc -p cf --no-fail-fast")
+}
+
+// A Go command that is every tested package, beside a Rust selection that is a
+// proper subset: the Go rerun is the only redundant part. Collapsing the whole
+// plan would throw away the cheap Rust fast phase to save it, so only the Go
+// command is dropped, and the plan says so.
+func TestAFullGoSelectionBesideARustSubsetDropsOnlyTheGoCommand(t *testing.T) {
+	in := inputs(withChanged("rust/ca/src/engine.rs", "go/lib/l.go"), withSeed("rust/ca/src/engine.rs", "run"), withSeed("go/lib/l.go", "L"))
+	in.Go = &GoWorkspace{Module: module, Packages: []GoPackage{
+		{ImportPath: module + "/lib", Dir: "go/lib", GoFiles: []string{"go/lib/l.go"}, TestFiles: []string{"go/lib/l_test.go"}},
+		{ImportPath: module + "/top", Dir: "go/top", TestFiles: []string{"go/top/t_test.go"}, Imports: []string{module + "/lib", "testing"}},
+	}}
+	p := BuildPlan(in)
+	if p.Everything {
+		t.Fatalf("a Rust subset must keep its fast phase: widened=%v", p.Widened)
+	}
+	wantCmd(t, p, "cargo test --locked -p ca --no-fail-fast")
+	for _, c := range cmds(p) {
+		if strings.HasPrefix(c, "go test") {
+			t.Errorf("the Go command is the full suite's own and must be dropped: %q", c)
+		}
+	}
+	if !strings.Contains(strings.Join(p.Notices, "\n"), "the selected go command runs every package of the full suite") {
+		t.Errorf("the dropped Go command was not logged: %q", p.Notices)
+	}
+}
+
+// The reverse is not symmetric: a full cargo command is the expensive rerun, so
+// it collapses the plan even beside a Go subset (characterization).
+func TestAFullRustSelectionBesideAGoSubsetCollapsesToEverything(t *testing.T) {
+	in := inputs(
+		withChanged("rust/ca/src/engine.rs", "rust/cb/src/lib.rs", "rust/cc/src/lib.rs", "rust/cf/src/lib.rs", "rust/devmap-cli/src/main.rs", "go/pkga/a.go"),
+		withSeed("go/pkga/a.go", "A"))
+	wantCollapsed(t, BuildPlan(in), "rust")
+}
+
+// A collapsed plan keeps the Dropped entries that explain why a crate was not
+// run. Nothing downstream may read them as a selection: written, reloaded and
+// driven through the fast phase and the audit's readers, it is the everything
+// plan and runs nothing early.
+func TestACollapsedPlanThatCarriesDroppedEntriesRoundTripsAsEverything(t *testing.T) {
+	in := inputs(withChanged("rust/dc-store/src/lib.rs"), withTests("rust/dc-store/src/lib.rs"))
+	in.Rust.Dependents = map[string][]string{"dc-store": {"ca", "cb", "cc", "cf", "devmap-cli"}}
+	p := BuildPlan(in)
+	wantCollapsed(t, p, "rust")
+	if len(p.Dropped) == 0 {
+		t.Fatalf("fixture: the excluded crate's change must leave a Dropped entry: %+v", p)
+	}
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := writeAtomic(path, p); err != nil {
+		t.Fatal(err)
+	}
+	got, sha, err := loadPlan(path)
+	if err != nil {
+		t.Fatalf("a collapsed plan with Dropped entries must load: %v", err)
+	}
+	if !got.Everything || len(got.Selected) != 0 || len(got.Dropped) != len(p.Dropped) {
+		t.Fatalf("round trip lost the shape: everything=%t selected=%q dropped=%d want %d", got.Everything, cmds(got), len(got.Dropped), len(p.Dropped))
+	}
+	var out, errs bytes.Buffer
+	code, err := runCmdPhase(context.Background(), []string{"--plan", path, "--phase", "selected", "--repo", t.TempDir(), "--log-dir", t.TempDir()}, &out, &errs)
+	if code != 0 || err != nil || !strings.Contains(out.String(), "the fast phase is skipped") {
+		t.Fatalf("the fast phase must be skipped, not run: code=%d err=%v out=%q", code, err, out.String())
+	}
+	if note := selectionNote(got, "", sha, SuiteRun{}, SuiteRun{}); note != "" {
+		t.Errorf("selectionNote on an everything plan = %q, want none", note)
+	}
+	if _, _, known := readSelected(t.TempDir(), got); known {
+		t.Error("readSelected must not claim to know a fast phase that was never run")
+	}
+}
+
+// Go's universe is every package that has tests: mid has none, so lib and top
+// are all of it.
+func TestAGoSelectionThatIsEveryTestedPackageCollapsesToEverything(t *testing.T) {
+	in := inputs(withChanged("go/lib/l.go"), withSeed("go/lib/l.go", "L"))
+	in.Go = &GoWorkspace{Module: module, Packages: []GoPackage{
+		{ImportPath: module + "/lib", Dir: "go/lib", GoFiles: []string{"go/lib/l.go"}, TestFiles: []string{"go/lib/l_test.go"}},
+		{ImportPath: module + "/mid", Dir: "go/mid", GoFiles: []string{"go/mid/m.go"}, Imports: []string{module + "/lib"}},
+		{ImportPath: module + "/top", Dir: "go/top", TestFiles: []string{"go/top/t_test.go"}, Imports: []string{module + "/mid", "testing"}},
+	}}
+	wantCollapsed(t, BuildPlan(in), "go")
 }

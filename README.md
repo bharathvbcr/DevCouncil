@@ -33,11 +33,11 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 | Binary / Crate | Language | Role & Ownership |
 |--------|----------|------------------|
 | `devc` (`devcouncil` / `dev`) | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), 7-layer specification lifecycle (`spec`), declarative DAG workflows (`workflow`), unified code search (`search`), task verification (`verify`), and devmap forwarding (`map`, `devmap`, `graph`, `ast`). |
-| `devc-map` (`dc-map` / `devmap`) | **Rust** | Unified code intelligence & graph engine: Language-aware tree-sitter extraction (schema 98), 11-tier symbol resolution ladder, Blake3 content-addressed AST store with per-worktree delta overlays, zero-copy `mmap` Compressed Sparse Row (CSR) graph storage (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`, `FastBitSet`, `sqlite_v30`), blast-radius calculation, dead-code analysis, doc-drift auditing, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`, 21 read-only tools). |
-| `devc-store` (`dc-store` / `dcstore`) | **Rust** | State & lease store: SQLite-backed task repository, ratified constitution gates (`constitution_gates`), mutual-exclusion leases (`ux_task_leases_active`) for concurrent agent building, evidence records, and gap tracking. |
-| `devc-verify` (`dc-verify` / `dcverify`) | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
-| `devc-grep` (`dc-grep` / `dcgrep`) | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
-| `dc-proc` | **Rust** | Subprocess isolation library: Hard deadlines, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation, and daemon reaping. |
+| `devc-map` (`dc-map` / `devmap`) | **Rust** | Unified code intelligence & graph engine: Language-aware tree-sitter extraction (schema 99) plus Lean 4 reader (`devmap lean-tcb`), 11-tier symbol resolution ladder, Blake3 content-addressed AST store with per-worktree delta overlays, zero-copy `mmap` Compressed Sparse Row (CSR) graph storage (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`, `FastBitSet`, `sqlite_v30`), blast-radius calculation, dead-code analysis, doc-drift auditing, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`, 21 read-only tools). |
+| `devc-store` (`dc-store` / `dcstore`) | **Rust** | State & lease store: SQLite-backed task repository (`dc-store` schema 11), workbench tasks & cross-repo queue/sync/outbox (`workbench_schema` 17), ratified constitution gates (`constitution_gates`), mutual-exclusion leases (`ux_task_leases_active`) for concurrent agent building, evidence records, and gap tracking. |
+| `devc-verify` (`dc-verify` / `dcverify`, `dcjsoncheck`) | **Rust** | Deterministic verification & evidence checking: Unified-diff parsing, planned file scope classification, anti-laziness/stub/test-rigor AST gates, `runner_hijack` and `lean_tcb` hard-safety checks, independent acceptance verification (`dc-evidence` via `dcverify evidence-check`), diff–coverage evaluation, and typed `next_actions` repair signals. |
+| `devc-grep` (`dc-grep` / `dcgrep`) | **Rust** | Code search: Ripgrep-powered ignore-aware search engine (`search`, `files`, `index`, BM25/learned `rank`, `health`) with optional trigram indexing (`tgrep-core`). |
+| `dc-proc` & `dc-redact` | **Rust** | Shared subprocess isolation (`cli` JSON-stdio contract helpers, `lean_kernel` runner, hard deadlines, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation, `spawn_session` 4 KiB stderr tail) and vendor/OAuth secret redaction (`dc-redact`). |
 
 ```mermaid
 flowchart TD
@@ -59,7 +59,7 @@ flowchart TD
     end
 
     subgraph Storage["Persistent State"]
-        GraphDB[(".devmap/devmap.sqlite (Code Graph)")]
+        GraphDB[(".devmap/codeintel/devmap.sqlite (Code Graph)")]
         TaskDB[(".devcouncil/state.sqlite (Tasks & Leases)")]
     end
 

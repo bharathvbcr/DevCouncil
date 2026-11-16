@@ -32,8 +32,7 @@ const DefaultLeaseTTL = 15 * time.Minute
 // allowed_next_tools_test.go — every tool this host serves is one an agent may
 // legitimately reach for, so withholding one would be a restriction the next
 // person to add a tool has to rediscover.
-func AllowedNextTools(status string, hasBlockingGaps bool) []string {
-	_ = hasBlockingGaps
+func AllowedNextTools(status string) []string {
 	switch status {
 	case "planned", "in_progress", "blocked", "verified", "done":
 		return ServedToolNames()

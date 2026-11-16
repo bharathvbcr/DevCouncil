@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A watcher-driven daemon over a scratch repository, for asserting that a
 //! path the walk excludes is excluded by the watcher too.
 
@@ -82,7 +83,8 @@ pub async fn excluded_path_stays_out(root: &Path, excluded: &str, control: &str)
     .await
     .expect("run_loop neither served nor returned within 60 s");
     let reader = Store::open(&store_path).unwrap();
-    // Let the connect-time sweep settle before the edits under test.
+    // Allow the filesystem watcher backend to attach and startup sweep to settle.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let settle = Instant::now();
     while reader.status("").unwrap().pending_count != 0
         && settle.elapsed() < Duration::from_secs(20)
@@ -117,7 +119,7 @@ pub async fn excluded_path_stays_out(root: &Path, excluded: &str, control: &str)
     // Positive control: a path the rules admit is drained, so the watcher was
     // live while the excluded one was ignored.
     std::fs::write(root.join(control), "export const control = 1;\n").unwrap();
-    let bound = Duration::from_secs(20);
+    let bound = Duration::from_secs(45);
     let started = Instant::now();
     let drained = loop {
         let indexed = reader.latest_file_hashes().unwrap().contains_key(control);

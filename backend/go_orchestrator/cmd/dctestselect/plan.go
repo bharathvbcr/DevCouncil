@@ -85,7 +85,9 @@ type Plan struct {
 	Trigger string        `json:"trigger"`
 	Blast   *BlastSummary `json:"blast"`
 	// Everything means the selection is the full suite, so the fast phase is
-	// skipped and nothing can be outside the selection.
+	// skipped and nothing can be outside the selection. It is also the plan for
+	// a selection that names every package of a suite's universe: that command
+	// would be the full suite's own, run twice.
 	Everything bool       `json:"everything"`
 	Widened    []Widening `json:"widened"`
 	Selected   []Selected `json:"selected"`
@@ -374,7 +376,82 @@ func BuildPlan(in Inputs) Plan {
 	}
 	p.Selected = sel.commands(blast.Seeds)
 	p.Dropped = sel.dropped
+	// A selected command that is the full suite's own command for its kind gives
+	// no signal the full suite does not, and runs the same tests twice. What to
+	// do about it depends on the kind, because the rest of the selection may
+	// still be a real fast phase:
+	//   - a full cargo command is the expensive rerun, so the plan is everything;
+	//   - a full go command is dropped and logged when another command remains,
+	//     and is everything only when it was the whole selection.
+	kept := []Selected{}
+	var goFull string
+	for _, s := range p.Selected {
+		reason, full := runsFullSuite(in, s)
+		switch {
+		case !full:
+			kept = append(kept, s)
+		case s.Units[0].Kind == "rust":
+			return everything(reason)
+		default:
+			goFull = reason
+		}
+	}
+	if goFull != "" {
+		if len(kept) == 0 {
+			return everything(goFull)
+		}
+		p.Notices = append(p.Notices, goFull+"; that command is dropped from the fast phase and the full suite runs it")
+	}
+	p.Selected = kept
 	return p
+}
+
+// runsFullSuite reports whether a selected command runs every package the job's
+// full suite runs for its kind: every non-excluded workspace member for cargo,
+// every package with tests for go. A crate in Excludes is not in the cargo
+// universe, so naming it changes nothing.
+func runsFullSuite(in Inputs, s Selected) (string, bool) {
+	if len(s.Units) == 0 {
+		return "", false
+	}
+	have := map[string]bool{}
+	for _, u := range s.Units {
+		have[u.Pkg] = true
+	}
+	kind := s.Units[0].Kind
+	universe := 0
+	switch kind {
+	case "rust":
+		excluded := map[string]bool{}
+		for _, ex := range in.Excludes {
+			excluded[ex] = true
+		}
+		for _, pkg := range in.Rust.Packages {
+			if excluded[pkg.Name] {
+				continue
+			}
+			universe++
+			if !have[pkg.Name] {
+				return "", false
+			}
+		}
+	case "go":
+		for _, pkg := range in.Go.Packages {
+			if len(pkg.TestFiles) == 0 {
+				continue
+			}
+			universe++
+			if !have[pkg.ImportPath] {
+				return "", false
+			}
+		}
+	default:
+		return "", false
+	}
+	if universe == 0 {
+		return "", false
+	}
+	return fmt.Sprintf("the selected %s command runs every package of the full suite (%d), so as a fast phase it would run them twice", kind, universe), true
 }
 
 func hasKind(us []devmap.BlastUnavailable, kind string) bool {

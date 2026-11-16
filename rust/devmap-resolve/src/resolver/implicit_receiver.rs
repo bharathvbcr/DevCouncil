@@ -590,7 +590,21 @@ impl Resolver {
             || self
                 .import_bindings
                 .get(call_file)
-                .is_some_and(|bindings| bindings.contains_key(type_name))
+                .and_then(|bindings| bindings.get(type_name))
+                .is_some_and(|(imp_target_file, _)| {
+                    imp_target_file == target_file
+                        || match (
+                            self.swift_module_by_file.get(imp_target_file.as_str()),
+                            self.swift_module_by_file.get(target_file.as_str()),
+                        ) {
+                            (Some(imp_mods), Some(target_mods)) => {
+                                imp_mods.iter().any(|module| target_mods.contains(module))
+                            }
+                            _ => false,
+                        }
+                })
+            || (call_file.ends_with(".rs")
+                && rust_origin.is_some_and(|o| o != RustOrigin::Absent && o != RustOrigin::Unknown))
             || match (
                 self.swift_module_by_file.get(call_file),
                 self.swift_module_by_file.get(target_file.as_str()),

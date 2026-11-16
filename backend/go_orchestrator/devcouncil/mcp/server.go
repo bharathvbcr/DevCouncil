@@ -56,6 +56,9 @@ type Server struct {
 
 	callsMu sync.Mutex
 	calls   map[string]*call
+
+	// Test hook to exercise tools/list behavior when a spec schema is invalid.
+	specsOverride []devcouncil.ToolSpec
 }
 
 // call is one request that has been accepted and not yet answered.
@@ -602,7 +605,11 @@ func (s *Server) legacyHandle(ctx context.Context, req rpcRequest) rpcResponse {
 		// request is owed a response; the empty result is devmap's answer too.
 		return okResult(req.ID, map[string]any{})
 	case "tools/list":
-		return okResult(req.ID, s.listTools())
+		listed, err := s.listTools()
+		if err != nil {
+			return errResult(req.ID, -32603, err.Error())
+		}
+		return okResult(req.ID, listed)
 	case "tools/call":
 		return s.callTool(ctx, req)
 	default:
@@ -610,12 +617,17 @@ func (s *Server) legacyHandle(ctx context.Context, req rpcRequest) rpcResponse {
 	}
 }
 
-func (s *Server) listTools() map[string]any {
-	specs := s.Registry.Specs()
+func (s *Server) listTools() (map[string]any, error) {
+	specs := s.specsOverride
+	if specs == nil {
+		specs = s.Registry.Specs()
+	}
 	tools := make([]map[string]any, 0, len(specs))
 	for _, spec := range specs {
 		var schema any
-		_ = json.Unmarshal(spec.InputSchema, &schema)
+		if err := json.Unmarshal(spec.InputSchema, &schema); err != nil {
+			return nil, fmt.Errorf("tool %s inputSchema: %w", spec.Name, err)
+		}
 		tools = append(tools, map[string]any{
 			"name":        spec.Name,
 			"description": spec.Description,
@@ -623,7 +635,7 @@ func (s *Server) listTools() map[string]any {
 			"annotations": spec.Behaviour.Annotations(),
 		})
 	}
-	return map[string]any{"tools": tools}
+	return map[string]any{"tools": tools}, nil
 }
 
 func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {

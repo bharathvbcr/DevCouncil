@@ -41,6 +41,10 @@ import (
 // reports opacity, as an unresolvable redirection target does. A glob is
 // judged as the literal path, as a glob in a redirection target is.
 func argumentWriteTargets(line string) argWrites {
+	return argumentWriteTargetsInRoot(line, "")
+}
+
+func argumentWriteTargetsInRoot(line, root string) argWrites {
 	var all argWrites
 	for _, clause := range SplitCommandChain(line) {
 		words := shellWords(clause)
@@ -62,7 +66,14 @@ func argumentWriteTargets(line string) argWrites {
 			}
 			args = append(args, words[k])
 		}
-		all.merge(commandWrites(words, at, args, 0))
+		cw := commandWrites(words, at, args, 0)
+		if root != "" && isGitWord(words[at].text) {
+			if gitRoot, _, escaped := resolveGitClauseWorktree(words, at, root); !escaped && gitRoot != "" && !sameWorktreePath(gitRoot, root) {
+				all.mergeSibling(gitRoot, cw)
+				continue
+			}
+		}
+		all.merge(cw)
 	}
 	return all
 }

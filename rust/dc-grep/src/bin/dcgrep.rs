@@ -14,30 +14,18 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use dc_grep::{IDENTITY, IndexRequest, ListRequest, RankedRequest, Request, SCHEMA_VERSION};
-
-// A disconnected consumer is a transport failure, not a Rust panic. Keep
-// diagnostics off this JSON protocol, including the error response path.
-macro_rules! respond {
-    ($($argument:tt)*) => {{
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
-            .and_then(|()| out.flush()).is_err() {
-            return ExitCode::FAILURE;
-        }
-    }};
-}
+use dc_proc::cli::{collect_args, is_version_arg, version_object};
 
 fn main() -> ExitCode {
     match run() {
         Ok(json) => {
-            respond!("{json}");
+            dc_proc::respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(message) => {
             // Hand-rolled rather than serialised, because this is the path
             // taken when serialisation itself is what failed.
-            respond!(
+            dc_proc::respond!(
                 "{{\"ok\":false,\"error\":{}}}",
                 serde_json::to_string(&message)
                     .unwrap_or_else(|_| "\"error message was not renderable\"".to_string())
@@ -49,16 +37,14 @@ fn main() -> ExitCode {
 
 const COMPONENT_ID: &str = "dcgrep";
 
-fn is_version_arg(arg: &str) -> bool {
-    matches!(arg, "--version" | "-V" | "-v" | "version")
-}
-
 fn run() -> Result<String, String> {
     let args = collect_args()?;
     if args.iter().any(|arg| is_version_arg(arg)) {
-        return Ok(format!(
-            "{{\"ok\":true,\"id\":\"{COMPONENT_ID}\",\"component\":\"{IDENTITY}\",\"version\":\"{}\"}}",
-            env!("CARGO_PKG_VERSION")
+        return Ok(version_object(
+            COMPONENT_ID,
+            IDENTITY,
+            env!("CARGO_PKG_VERSION"),
+            &[],
         ));
     }
     match args.first().map(String::as_str) {
@@ -178,22 +164,4 @@ fn index() -> Result<String, String> {
     let response = dc_grep::build_index(&request)?;
     serde_json::to_string(&response)
         .map_err(|err| format!("result could not be rendered as JSON: {err}"))
-}
-
-/// Collects the command line, refusing an argument that is not valid Unicode
-/// rather than dying on it.
-///
-/// `std::env::args()` panics on such an argument: exit 101, a backtrace on
-/// stderr and nothing on stdout, which the Go client can only report as a
-/// search that failed with no reason. A search that could not run must stay
-/// distinguishable from one that ran.
-fn collect_args() -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    for (index, arg) in std::env::args_os().skip(1).enumerate() {
-        match arg.into_string() {
-            Ok(value) => args.push(value),
-            Err(_) => return Err(format!("argument {index} is not valid UTF-8")),
-        }
-    }
-    Ok(args)
 }
