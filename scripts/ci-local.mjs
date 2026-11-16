@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,9 +18,9 @@ import {
   tagVerdict,
 } from "./ci-local-checks.mjs";
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
-const ACCURACY_MODULE = path.join(REPO_ROOT, "tools", "accuracy");
+export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
+export const ACCURACY_MODULE = path.join(REPO_ROOT, "tools", "accuracy");
 
 /** Steps that could not run. They are listed at the end and never counted as passes. */
 const notRun = [];
@@ -195,47 +195,76 @@ function releaseTagAgrees(dcrelease) {
   run("release identity (tag path)", dcrelease, ["--tag", state.tag, "--tag-at-head"]);
 }
 
-function main() {
-  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs", "scripts/code-map-bundle.test.mjs"]);
+/**
+ * A step that runs one command. The command is data so the tests can read it
+ * without running it.
+ *
+ * @param {string} label
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{ cwd?: string, needs?: string[] }} [opts]
+ * @returns {Step}
+ */
+function commandStep(label, command, args, opts = {}) {
+  const cwd = opts.cwd ?? REPO_ROOT;
+  return { label, needs: opts.needs ?? [], command, args, cwd, run: () => run(label, command, args, { cwd }) };
+}
+
+/**
+ * The binary `build dcrelease` writes, in a temp dir it creates when it runs
+ * (never on import), for the two release-identity steps.
+ */
+let dcrelease = "";
+
+/**
+ * Every ci:local step, in order. `needs` names the steps whose output a step
+ * uses.
+ *
+ * @typedef {{ label: string, needs: string[], run: () => void, command?: string, args?: string[], cwd?: string }} Step
+ * @type {Step[]}
+ */
+export const STEPS = [
+  commandStep("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs", "scripts/code-map-bundle.test.mjs"]),
   // The page shell is TypeScript bundled by the pinned Bun; the checked-in bundle must be what it builds.
-  run("code map bundle", process.execPath, ["scripts/code-map-bundle.mjs", "check"]);
-  run("code map tests", "bun", ["test", "rust/devmap-query/assets/code-map"]);
-  run("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], {
-    cwd: GO_MODULE,
-  });
-  // Built, not `go run`: `go run` reports every non-zero exit as 1, and this
-  // gate's 2 ("could not run") must not read as a mismatch.
-  const binDir = mkdtempSync(path.join(tmpdir(), "devcouncil-dcrelease-"));
-  process.on("exit", () => rmSync(binDir, { recursive: true, force: true }));
-  const dcrelease = path.join(binDir, process.platform === "win32" ? "dcrelease.exe" : "dcrelease");
-  run("build dcrelease", "go", ["build", "-o", dcrelease, "./cmd/dcrelease"], { cwd: GO_MODULE });
-  run("release identity", dcrelease, []);
-  releaseTagAgrees(dcrelease);
-  run("workflow lint", process.execPath, ["scripts/check-workflows.mjs"]);
-  run("npm pack", "npm", ["run", "pack:check"]);
-  run("npm runtime smoke", process.execPath, ["scripts/npm-runtime-smoke.mjs"]);
-  gofmtClean();
-  ensureGussetEngine();
-  run("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], {
-    cwd: GO_MODULE,
-  });
+  commandStep("code map bundle", process.execPath, ["scripts/code-map-bundle.mjs", "check"]),
+  commandStep("code map tests", "bun", ["test", "rust/devmap-query/assets/code-map"]),
+  commandStep("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], { cwd: GO_MODULE }),
+  {
+    label: "build dcrelease",
+    needs: [],
+    // Built, not `go run`: `go run` reports every non-zero exit as 1, and this
+    // gate's 2 ("could not run") must not read as a mismatch.
+    run: () => {
+      const binDir = mkdtempSync(path.join(tmpdir(), "devcouncil-dcrelease-"));
+      process.on("exit", () => rmSync(binDir, { recursive: true, force: true }));
+      dcrelease = path.join(binDir, process.platform === "win32" ? "dcrelease.exe" : "dcrelease");
+      run("build dcrelease", "go", ["build", "-o", dcrelease, "./cmd/dcrelease"], { cwd: GO_MODULE });
+    },
+  },
+  { label: "release identity", needs: ["build dcrelease"], run: () => run("release identity", dcrelease, []) },
+  { label: "release identity (tag path)", needs: ["build dcrelease"], run: () => releaseTagAgrees(dcrelease) },
+  commandStep("workflow lint", process.execPath, ["scripts/check-workflows.mjs"]),
+  commandStep("npm pack", "npm", ["run", "pack:check"]),
+  commandStep("npm runtime smoke", process.execPath, ["scripts/npm-runtime-smoke.mjs"]),
+  { label: "gofmt", needs: [], run: gofmtClean },
+  { label: "gusset engine", needs: [], run: ensureGussetEngine },
+  commandStep("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], { cwd: GO_MODULE, needs: ["gusset engine"] }),
   // The DevMap test selector's end-to-end tests (selected-tests.yml runs them
   // on every push). They are behind the e2e tag, so `./...` below does not
   // compile them, and this is their only run here; the selector's unit tests
   // are in `./...`. They drive the real `devmap` on PATH and fail, not skip,
   // without one.
-  run("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1", "-timeout", "30m"], {
-    cwd: GO_MODULE,
-  });
-  run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {
-    cwd: GO_MODULE,
-  });
+  commandStep("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1", "-timeout", "30m"], { cwd: GO_MODULE }),
+  // `./...` includes ./cmd/devcouncil and ./gussetfn, which link libgusset.a.
+  commandStep("go orchestrator tests", "go", ["test", "./...", "-count=1"], { cwd: GO_MODULE, needs: ["gusset engine"] }),
   // The go/types labeller behind the DevMap corpus record, its own module.
-  run("accuracy labeller vet", "go", ["vet", "./..."], { cwd: ACCURACY_MODULE });
-  run("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: ACCURACY_MODULE });
-  run("rust verify --quick", "bash", ["./verify.sh", "--quick"], {
-    cwd: path.join(REPO_ROOT, "rust"),
-  });
+  commandStep("accuracy labeller vet", "go", ["vet", "./..."], { cwd: ACCURACY_MODULE }),
+  commandStep("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: ACCURACY_MODULE }),
+  commandStep("rust verify --quick", "bash", ["./verify.sh", "--quick"], { cwd: path.join(REPO_ROOT, "rust") }),
+];
+
+function main() {
+  for (const step of STEPS) step.run();
   if (notRun.length > 0) {
     console.log(`\nOK: ci:local, with ${notRun.length} step(s) NOT RUN:`);
     for (const line of notRun) console.log(`  - ${line}`);
@@ -244,4 +273,8 @@ function main() {
   console.log("\nOK: ci:local");
 }
 
-main();
+// Run only as a program: the tests import STEPS.
+const entry = process.argv[1];
+if (entry !== undefined && realpathSync(path.resolve(entry)) === realpathSync(fileURLToPath(import.meta.url))) {
+  main();
+}

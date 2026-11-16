@@ -12,6 +12,7 @@ import {
   localTagState,
   tagVerdict,
 } from "./ci-local-checks.mjs";
+import { GO_MODULE, STEPS } from "./ci-local.mjs";
 
 const PIN = "320c56c27e1098f7e0a26e9854ff80c4f4354ef9";
 
@@ -212,19 +213,23 @@ describe("test-support ownership", () => {
 
 describe("ci:local runs the DevMap test selector's tests", () => {
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const source = () => readFileSync(path.join(root, "scripts", "ci-local.mjs"), "utf8");
+  const selectorSteps = () => STEPS.filter((s) => (s.args ?? []).includes("./cmd/dctestselect"));
 
   it("has a step that runs the selector's end-to-end tests under the e2e tag, from the Go module", () => {
-    const step = /run\(\s*"test selector end-to-end",\s*"go",\s*\["test", "-tags", "e2e", "\.\/cmd\/dctestselect", "-run", "\^TestE2E", "-count=1", "-p", "1", "-timeout", "(\d+)m"\],\s*\{\s*cwd: GO_MODULE,?\s*\}\s*\)/.exec(source());
-    assert.ok(step, "ci-local.mjs does not run `go test -tags e2e ./cmd/dctestselect -run ^TestE2E -timeout Nm` from GO_MODULE");
+    const step = STEPS.find((s) => s.label === "test selector end-to-end");
+    assert.ok(step, "ci-local.mjs has no `test selector end-to-end` step");
+    assert.equal(step.command, "go");
+    assert.equal(step.cwd, GO_MODULE);
+    const timeout = /^(\d+)m$/.exec(step.args.at(-1) ?? "");
+    assert.deepEqual(step.args.slice(0, -1), ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1", "-timeout"]);
+    assert.ok(timeout, `the last argument must be a -timeout in minutes, got ${step.args.at(-1)}`);
     // go test's default package timeout is 10 minutes; the whole-crate e2e test
     // bounds itself at 25, which only works if -timeout is longer than that.
-    assert.ok(Number(step[1]) > 25, `-timeout ${step[1]}m must exceed the 25-minute in-test bound`);
+    assert.ok(Number(timeout[1]) > 25, `-timeout ${timeout[1]}m must exceed the 25-minute in-test bound`);
   });
 
   it("does not run the selector twice: the e2e tests are tagged out of ./..., so only this step runs them", () => {
-    const text = source();
-    assert.equal((text.match(/\.\/cmd\/dctestselect/g) ?? []).length, 1);
+    assert.deepEqual(selectorSteps().map((s) => s.label), ["test selector end-to-end"]);
     for (const file of ["e2e_test.go"]) {
       const head = readFileSync(path.join(root, "backend", "go_orchestrator", "cmd", "dctestselect", file), "utf8").split("\n")[0];
       assert.equal(head, "//go:build e2e", `${file} must carry the e2e build tag`);
