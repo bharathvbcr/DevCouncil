@@ -435,6 +435,8 @@ func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, e
 	if err != nil {
 		return RedirectRefusal{}, err
 	}
+	// The first sibling whose command writes files its text does not name.
+	var siblingUnjudged *policy.SiblingWrite
 	if !stopped && evalSibling != nil {
 		for _, sib := range set.SiblingWrites {
 			sibRoot := sib.Root
@@ -447,10 +449,33 @@ func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, e
 			if stopped {
 				break
 			}
+			if sib.Unjudged != "" && siblingUnjudged == nil {
+				unjudged := sib
+				siblingUnjudged = &unjudged
+			}
 		}
 	}
 	if chosen, refused := policy.MostImportant(blocked); refused {
 		return RedirectRefusal{Decision: chosen, Refused: true, FromTarget: true}, nil
+	}
+	// A sibling's files are another session's, never the caller's scope, so this
+	// does not depend on scopeBound. Policy records why it could not name them
+	// (git apply reads its targets from the patch); without this refusal that
+	// reason was collected and never read, and the command ran unexamined.
+	if siblingUnjudged != nil {
+		return RedirectRefusal{
+			Decision: policy.Decision{
+				Action:   policy.Deny,
+				Rule:     policy.RuleCommandSubstitution,
+				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
+				Reason: "This command writes files in the registered worktree " + siblingUnjudged.Root +
+					" that its text does not name (" + siblingUnjudged.Unjudged + "), so they cannot be checked before it runs, " +
+					"and that worktree belongs to another session. Apply changes to explicit file paths or use your file editing tools instead.",
+				Target: command,
+				TaskID: taskID,
+			},
+			Refused: true,
+		}, nil
 	}
 	if scopeBound && set.Unjudged != "" {
 		return RedirectRefusal{

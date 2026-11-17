@@ -196,3 +196,50 @@ func TestGateOpaqueAndUnjudgedRefusalTextsNameJudgedAlternative(t *testing.T) {
 		}
 	}
 }
+
+// 2026-11-17 review of 7767f7cf: policy records a sibling's Unjudged reason
+// (git apply names its targets inside the patch), but the gate only read the
+// caller's own, and only for a scope-bound task. So `git -C <sibling> apply`
+// ran unexamined in another session's worktree. A sibling's files are never
+// the caller's scope, so the refusal must not depend on it.
+func TestGateRefusesAnUnjudgedWriteInARegisteredSiblingWorktree(t *testing.T) {
+	mainRoot, wtB, _ := setupGateWorktreeEnv(t)
+	g := newGateAtRoot(t, mainRoot, nil)
+	scoped := &dc.Task{
+		ID:              "TASK-001",
+		PlannedFiles:    []dc.PlannedFile{{Path: "src/calc.go", AllowedChange: dc.ChangeModify}},
+		AllowedCommands: []string{"git *"},
+	}
+	unscoped := &dc.Task{ID: "TASK-002", AllowedCommands: []string{"git *"}}
+	for name, task := range map[string]*dc.Task{"scoped": scoped, "unscoped": unscoped} {
+		for _, cmd := range []string{
+			"git -C ../wt-b apply fix.patch",
+			"git -C " + wtB + " apply fix.patch",
+			"git -C ../wt-b apply --apply fix.patch",
+		} {
+			d, err := g.EvaluateCommand(cmd, task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Blocked() {
+				t.Errorf("%s task: %q = %s (%s); want blocked: it changes files named inside the patch, in another worktree",
+					name, cmd, d.Action, d.Reason)
+				continue
+			}
+			lower := strings.ToLower(d.Reason)
+			for _, sub := range []string{"explicit", "edit"} {
+				if !strings.Contains(lower, sub) {
+					t.Errorf("%s task: %q reason %q missing %q", name, cmd, d.Reason, sub)
+				}
+			}
+		}
+		// A read-only apply names nothing it changes, so it stays allowed.
+		d, err := g.EvaluateCommand("git -C ../wt-b apply --check fix.patch", task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Blocked() {
+			t.Errorf("%s task: read-only apply --check = %s (%s): %s; want non-blocked", name, d.Action, d.Rule, d.Reason)
+		}
+	}
+}
