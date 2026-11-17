@@ -646,7 +646,7 @@ pub(super) fn extract_treesitter_before_deadline(
                         .map(|region| (region.range.start_byte, region.range.end_byte))
                         .collect(),
                 );
-                let parse_outcome = parse_outcome_of(
+                let mut parse_outcome = parse_outcome_of(
                     root,
                     source,
                     is_metal_path(path),
@@ -935,13 +935,6 @@ pub(super) fn extract_treesitter_before_deadline(
                         )),
                     );
                 }
-                let dropped_references = if references.len() > MAX_FILE_REFERENCES {
-                    let dropped = references.len() - MAX_FILE_REFERENCES;
-                    references.truncate(MAX_FILE_REFERENCES);
-                    dropped
-                } else {
-                    0
-                };
                 // Ties on a span break by name, except for a Python base: its
                 // segments share the base's one span and their emission order
                 // (member, then the qualifier from the root down) is what says which
@@ -960,6 +953,20 @@ pub(super) fn extract_treesitter_before_deadline(
                         tie_name(lang, b),
                     ))
                 });
+                // The ceilings cut AFTER the sort, so what is kept is a byte
+                // prefix of the file and the cut is one offset. References used to
+                // be cut first and sorted second, which kept an arbitrary subset.
+                // The earliest cut, to the end of the file, is the region nobody
+                // read; it is carried on `parse_outcome` below.
+                let mut unread_from: Option<usize> = None;
+                let dropped_references = if references.len() > MAX_FILE_REFERENCES {
+                    let dropped = references.len() - MAX_FILE_REFERENCES;
+                    unread_from = Some(references[MAX_FILE_REFERENCES].span.start_byte);
+                    references.truncate(MAX_FILE_REFERENCES);
+                    dropped
+                } else {
+                    0
+                };
 
                 // Framework matching is an auxiliary extractor. A matcher
                 // failure cannot retroactively turn a successful grammar
@@ -977,11 +984,20 @@ pub(super) fn extract_treesitter_before_deadline(
                 }
                 if calls.len() > MAX_FILE_CALLS {
                     let dropped = calls.len() - MAX_FILE_CALLS;
+                    // Only a file over the ceiling is reordered, so every other
+                    // file's output is unchanged. A stable sort keeps the
+                    // emission order of calls that share a span.
+                    calls.sort_by_key(|call| (call.span.start_byte, call.span.end_byte));
+                    let cut = calls[MAX_FILE_CALLS].span.start_byte;
+                    unread_from = Some(unread_from.map_or(cut, |from| from.min(cut)));
                     calls.truncate(MAX_FILE_CALLS);
                     diagnostics.push(format!(
                         "{}{dropped} call site(s) were dropped at the single-file ceiling of {MAX_FILE_CALLS}",
                         crate::model::CALLS_DROPPED_PREFIX
                     ));
+                }
+                if let Some(start) = unread_from {
+                    parse_outcome = with_unread_tail(parse_outcome, start, source.len());
                 }
                 if lang == "hcl" && calls.len() > crate::model::MAX_CALL_BLIND_SITES {
                     let dropped = calls.len() - crate::model::MAX_CALL_BLIND_SITES;
@@ -1352,6 +1368,42 @@ pub(crate) fn publish_exports(symbols: &[ExtractedSymbol], exports: &mut Vec<Ext
             b.span.start_byte,
         ))
     });
+}
+
+/// The outcome with one more region nobody read: the tail of a file cut at a
+/// single-file ceiling, from the first dropped item to the end.
+///
+/// A cut noted only in `diagnostics` is gone once stored, because
+/// `Extraction::for_durable_store` clears them, so a build that re-resolves from
+/// cached payloads reads the file as `Clean`. The notebook and embedded
+/// extractors carry theirs on the outcome for exactly this reason. `Clean`
+/// becomes `Partial` over the tail; a `Partial` gains it; an outcome that is
+/// already a failure, a fallback or a skip already says the file was not read in
+/// full and is left alone.
+fn with_unread_tail(outcome: ParseOutcome, start_byte: usize, end_byte: usize) -> ParseOutcome {
+    let tail = TextRange {
+        start_byte,
+        end_byte,
+    };
+    match outcome {
+        ParseOutcome::Clean => ParseOutcome::Partial {
+            error_ranges: vec![tail],
+            nameless_ranges: Vec::new(),
+        },
+        ParseOutcome::Partial {
+            mut error_ranges,
+            nameless_ranges,
+        } => {
+            error_ranges.push(tail);
+            error_ranges.sort();
+            error_ranges.dedup();
+            ParseOutcome::Partial {
+                error_ranges,
+                nameless_ranges,
+            }
+        }
+        other => other,
+    }
 }
 
 /// The outcome of a parse: `Clean`, or `Partial` with the ranges that are not

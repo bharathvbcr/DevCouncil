@@ -2650,26 +2650,13 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
                     gap: ExtractionGap::CallBlind,
                     reason,
                 });
-            } else if let Some(dropped) = ext
-                .diagnostics
-                .iter()
-                .find(|line| line.starts_with(CALLS_DROPPED_PREFIX))
-            {
-                // A language with a call extractor, cut at the single-file call
-                // ceiling: the call list is a prefix, so a callee reached only
-                // from the cut part has lost its caller and must not read as
-                // dead. Only the call-blind branch above used to copy this note
-                // into a gap, so a capable language's cut was invisible once
-                // `diagnostics` was cleared before storage.
-                gaps.push(ExtractionGapEntry {
-                    path: ext.file_path.clone(),
-                    gap: ExtractionGap::CallBlind,
-                    reason: format!(
-                        "`{}` call sites past the single-file ceiling were not extracted, so this file's call list is a prefix; {dropped}",
-                        ext.language
-                    ),
-                });
             }
+            // A language WITH a call extractor that was cut at the single-file
+            // call or reference ceiling is a `Partial` parse over the unread tail
+            // (devmap-extract carries the cut on `parse_outcome`, which is
+            // stored), and is charged by the `PartialParse` arm above. It is not
+            // read from `diagnostics` here: they are cleared before storage, so
+            // a gap built from them vanishes on a re-resolve from cached payloads.
             if !capabilities.contains(Capability::Imports) {
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),

@@ -161,6 +161,82 @@ fn file_exceeding_reference_ceiling_truncates_references_and_notes_diagnostic() 
     );
 }
 
+/// A ceiling that cuts a file must leave a trace the store keeps.
+/// `for_durable_store()` clears `diagnostics`, so a cut noted only there reads
+/// `Clean` once stored, and a build that re-resolves from cached payloads cannot
+/// tell the file from one read in full (2026-11-17 Opus review of 7767f7cf). The
+/// notebook and embedded extractors carry theirs on `parse_outcome` for exactly
+/// this reason. The unread region is the tail from the first dropped item, so
+/// the items kept must be a byte prefix of the file.
+fn assert_cut_is_stored_as_the_unread_tail(
+    ext: &devmap_extract::model::Extraction,
+    source_len: usize,
+    kept_starts: Vec<usize>,
+    what: &str,
+) {
+    let stored = ext.for_durable_store();
+    let ParseOutcome::Partial { error_ranges, .. } = &stored.parse_outcome else {
+        panic!(
+            "a file cut at the {what} ceiling must not store as {:?}",
+            stored.parse_outcome
+        );
+    };
+    let cut = error_ranges
+        .iter()
+        .map(|range| range.start_byte)
+        .min()
+        .expect("a cut records a range");
+    assert!(
+        error_ranges
+            .iter()
+            .any(|range| range.end_byte == source_len),
+        "{what}: the unread tail must run to the end of the file: {error_ranges:?}"
+    );
+    let last_kept = kept_starts
+        .iter()
+        .copied()
+        .max()
+        .expect("something was kept");
+    assert!(
+        last_kept <= cut,
+        "{what}: the items kept must be a byte prefix of the file (the last kept starts at \
+         {last_kept}, the cut is at {cut})"
+    );
+}
+
+#[test]
+fn a_file_cut_at_the_call_ceiling_stores_as_partial_over_the_unread_tail() {
+    let mut source = String::from("fn run() {\n");
+    for _ in 0..30_500 {
+        source.push_str("    f();\n");
+    }
+    source.push_str("}\n");
+    let ext = extract_file_with_budget("huge_calls.rs", &source, Duration::from_secs(20));
+    assert_eq!(ext.calls.len(), devmap_extract::treesitter::MAX_FILE_CALLS);
+    let starts = ext.calls.iter().map(|call| call.span.start_byte).collect();
+    assert_cut_is_stored_as_the_unread_tail(&ext, source.len(), starts, "call");
+}
+
+#[test]
+fn a_file_cut_at_the_reference_ceiling_stores_as_partial_over_the_unread_tail() {
+    let mut source = String::from("let a = 1;\nfunction run() {\n");
+    for _ in 0..40_500 {
+        source.push_str("    a;\n");
+    }
+    source.push_str("}\n");
+    let ext = extract_file_with_budget("huge_refs.js", &source, Duration::from_secs(20));
+    assert_eq!(
+        ext.references.len(),
+        devmap_extract::treesitter::MAX_FILE_REFERENCES
+    );
+    let starts = ext
+        .references
+        .iter()
+        .map(|reference| reference.span.start_byte)
+        .collect();
+    assert_cut_is_stored_as_the_unread_tail(&ext, source.len(), starts, "reference");
+}
+
 #[test]
 fn sqlddl_overrun_refuses_file_with_budget_prefix() {
     let sql = "CREATE TABLE a (id int);\nCREATE TABLE b (id int REFERENCES a(id));\n";
