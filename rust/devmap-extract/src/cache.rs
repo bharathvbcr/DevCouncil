@@ -851,8 +851,12 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// entry and emitted no row for that insert, so an ordinary import that
 /// a known entry shadowed bound the sibling file confidently; a warm cache
 /// would keep serving that edge. A `sys.path` write the pass cannot follow
-/// (`remove`, reassignment, `del`) still withdraws every entry. No resolver
-/// rule changed, so `RESOLUTION_REUSE_EPOCH` does not move.
+/// (`remove`, reassignment, `del`) still withdraws every entry. The veto is an
+/// extractor change and moves no resolver rule by itself. The same landing
+/// moves `RESOLUTION_REUSE_EPOCH` from 2 to 3 for a different reason: commit
+/// 7767f7cf changed what the resolver binds (bare-name candidates, receiver
+/// types, sibling-field fallbacks) and left the epoch at 2, so a store built
+/// before it would have kept serving the old edges.
 ///
 /// v100 also folds the byte length into the source identity
 /// (`source_identity`, stored as `content_hash`): a v99 row holds plain

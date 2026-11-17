@@ -3022,3 +3022,35 @@ mod generation_checks_staleness {
         );
     }
 }
+
+/// The resolver epoch is moved by hand, and a resolver change that alters any
+/// file's edges without moving it is reused as if current. Commit 7767f7cf
+/// changed what the resolver binds (bare-name candidates, receiver types, the
+/// `is_sibling_type_field` fallbacks) and left the epoch at "2", so a store
+/// built before it kept serving the old edges (Opus review, 2026-11-17).
+#[cfg(test)]
+mod resolver_epoch_after_the_binding_rule_changes {
+    use super::*;
+
+    /// A generation stamped with the epoch that named the resolver rules before
+    /// 7767f7cf must not read as current: the no-change shortcut, `--affected`
+    /// and the daemon drain all trust only a `Current` stamp.
+    #[test]
+    fn a_generation_stamped_with_the_pre_snapshot_epoch_is_older_not_current() {
+        let store = Store::open_in_memory().expect("store");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (1, 1.0, 'seed', ?1)",
+                rusqlite::params![r#"{"resolver_epoch":"2"}"#],
+            )
+            .expect("generation");
+        }
+        assert_eq!(
+            store.latest_generation_resolver_stamp().expect("stamp"),
+            ResolverStamp::Older,
+            "epoch \"2\" named the resolver rules before 7767f7cf; this binary resolves differently, so its edges are not current"
+        );
+    }
+}

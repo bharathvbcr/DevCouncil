@@ -14,7 +14,10 @@ use super::*;
 /// looks at the rules themselves. It is moved by hand, and a resolver change
 /// that alters any file's edges without moving it is reused as if current.
 /// Moving it costs each store one full resolve (no re-parse) on its next build.
-pub const RESOLUTION_REUSE_EPOCH: &str = "2";
+///
+/// 3: the binding changes of commit 7767f7cf (bare-name candidates, receiver
+/// types, the sibling-field fallbacks) altered edges while this stayed at 2.
+pub const RESOLUTION_REUSE_EPOCH: &str = "3";
 
 /// One file's resolution before the whole-tree post-pass.
 ///
