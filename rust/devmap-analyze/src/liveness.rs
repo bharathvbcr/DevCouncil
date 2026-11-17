@@ -2650,6 +2650,25 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
                     gap: ExtractionGap::CallBlind,
                     reason,
                 });
+            } else if let Some(dropped) = ext
+                .diagnostics
+                .iter()
+                .find(|line| line.starts_with(CALLS_DROPPED_PREFIX))
+            {
+                // A language with a call extractor, cut at the single-file call
+                // ceiling: the call list is a prefix, so a callee reached only
+                // from the cut part has lost its caller and must not read as
+                // dead. Only the call-blind branch above used to copy this note
+                // into a gap, so a capable language's cut was invisible once
+                // `diagnostics` was cleared before storage.
+                gaps.push(ExtractionGapEntry {
+                    path: ext.file_path.clone(),
+                    gap: ExtractionGap::CallBlind,
+                    reason: format!(
+                        "`{}` call sites past the single-file ceiling were not extracted, so this file's call list is a prefix; {dropped}",
+                        ext.language
+                    ),
+                });
             }
             if !capabilities.contains(Capability::Imports) {
                 gaps.push(ExtractionGapEntry {

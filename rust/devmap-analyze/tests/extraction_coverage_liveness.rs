@@ -722,3 +722,44 @@ fn a_powershell_recovery_does_not_cap_python_findings() {
         "a .ps1 must not demote a Python orphan: {dangling:?}"
     );
 }
+
+/// 2026-11-17, Opus review of 7767f7cf. Past `MAX_FILE_CALLS` the extractor
+/// keeps a prefix of a file's calls and notes the rest in a diagnostic that is
+/// cleared before the payload is stored. Only a language with no call extractor
+/// ever turned that note into a gap, so a Rust or Python file with 30,001 calls
+/// read as complete while every callee after the cut lost its caller, and a
+/// function called only from there was reported dead.
+#[test]
+fn a_file_whose_calls_were_cut_at_the_ceiling_is_charged_as_call_blind() {
+    let ceiling = devmap_extract::treesitter::MAX_FILE_CALLS;
+    let mut source = String::from("fn f() {\n");
+    for _ in 0..=ceiling {
+        source.push_str("    other();\n");
+    }
+    source.push_str("}\nfn other() {}\n");
+    let extractions = vec![extract_file("big.rs", &source)];
+    assert_eq!(
+        extractions[0].calls.len(),
+        ceiling,
+        "precondition: the file must really have been cut at the ceiling"
+    );
+
+    let gaps = extraction_gaps(&extractions);
+    assert!(
+        gaps.iter().any(|gap| gap.path == "big.rs"
+            && gap.gap == ExtractionGap::CallBlind
+            && gap.reason.contains("single-file ceiling")),
+        "a file whose calls were cut must be charged as call-blind, naming the ceiling: {gaps:?}"
+    );
+
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let outcome =
+        analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none());
+    assert!(
+        !outcome.coverage.is_complete(),
+        "a corpus holding a file with cut calls must not read as complete: {:?}",
+        outcome.coverage
+    );
+}
