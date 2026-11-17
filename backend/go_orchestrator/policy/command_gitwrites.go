@@ -50,6 +50,95 @@ func gitWrites(args []shellWord) argWrites {
 	return argWrites{}
 }
 
+// siblingGitReadOnly are the git subcommands that only read: none of them
+// changes a file, the index, or a ref of the worktree it is run in.
+var siblingGitReadOnly = map[string]bool{
+	"status": true, "diff": true, "log": true, "show": true, "whatchanged": true,
+	"rev-parse": true, "rev-list": true, "merge-base": true, "ls-files": true,
+	"ls-tree": true, "cat-file": true, "blame": true, "describe": true,
+	"for-each-ref": true, "show-ref": true, "shortlog": true,
+	// `fetch` updates remote-tracking refs, never the working tree or a local branch.
+	"fetch": true,
+	// `add` and `commit` record into the index and the current branch; neither
+	// rewrites or discards a file in the working tree. `commit --amend` rewrites
+	// a commit and is refused below.
+	"add": true, "commit": true,
+}
+
+// siblingGitUnjudged says why a git command run in ANOTHER session's registered
+// worktree (`git -C <sibling> ...`) may not run, or "" when it may.
+//
+// A write there is the other session's work. The modelled writes (checkout,
+// restore, rm, mv, clean) name files the sibling evaluator can judge against the
+// hard rules, but the hard rules are all it checks: it knows nothing of the
+// sibling's plan or its lease holder, so a modelled `checkout -- .` would
+// discard another session's edits and still pass. And no write rule models
+// `reset`, `stash`, `switch`, `merge`, `rebase`, `pull`, `am`, `read-tree`,
+// `update-ref`, `branch -D` or `worktree remove`, so a deny-list could not be
+// complete. The rule is therefore a closed allowlist: git may look at a sibling
+// and record into it, and everything else is refused with the reason below.
+// Dry runs and listings are looked at, not run.
+func siblingGitUnjudged(args []shellWord) string {
+	at := gitSubcommandAt(args)
+	if at < 0 {
+		return ""
+	}
+	sub, rest := args[at].text, args[at+1:]
+	switch sub {
+	case "commit":
+		if parseOptArgs(rest, "mCcF", "message", "file", "author", "date", "reuse-message", "reedit-message", "fixup", "squash", "template", "cleanup", "trailer").has("--amend") {
+			return siblingGitRefusal(sub+" --amend", "rewrites a commit")
+		}
+		return ""
+	case "branch":
+		p := parseOptArgs(rest, "", "contains", "no-contains", "merged", "no-merged", "points-at", "format", "sort", "color", "column", "abbrev")
+		if p.has("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force",
+			"-u", "--set-upstream-to", "--unset-upstream", "--edit-description", "--track", "-t", "--no-track") {
+			return siblingGitRefusal("branch", "creates, moves or deletes a branch")
+		}
+		if len(p.operands) > 0 && !p.has("-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at") {
+			return siblingGitRefusal("branch", "creates a branch")
+		}
+		return ""
+	case "worktree":
+		if first := firstOperand(rest); first == "list" {
+			return ""
+		}
+		return siblingGitRefusal("worktree", "adds, moves or removes a worktree")
+	case "stash":
+		if first := firstOperand(rest); first == "list" || first == "show" {
+			return ""
+		}
+		return siblingGitRefusal("stash", "moves another session's uncommitted work out of its working tree")
+	case "apply":
+		if gitApplyUnjudged(args) == "" {
+			return ""
+		}
+		return siblingGitRefusal("apply", "changes the files named inside the patch")
+	}
+	if siblingGitReadOnly[sub] {
+		return ""
+	}
+	return siblingGitRefusal(sub, "can rewrite or discard files, the index or refs in that worktree")
+}
+
+// firstOperand is the first word of a git subcommand's arguments that is not an
+// option, or "".
+func firstOperand(words []shellWord) string {
+	for _, w := range words {
+		if !strings.HasPrefix(w.text, "-") {
+			return w.text
+		}
+	}
+	return ""
+}
+
+func siblingGitRefusal(sub, why string) string {
+	return "`git " + sub + "` " + why + " in another session's worktree; there git may only read " +
+		"(status, diff, log, show, rev-parse, ls-files, blame, a branch or worktree or stash listing, " +
+		"`apply --check`) or record (add, commit, fetch)"
+}
+
 // gitSubcommandAt is the index of the subcommand among the words after `git`,
 // stepping over global options and unquoted redirections, or -1.
 func gitSubcommandAt(words []shellWord) int {

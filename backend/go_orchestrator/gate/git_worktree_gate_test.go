@@ -102,7 +102,12 @@ func TestGateRegisteredSiblingWorktreeWritesAndShellRedirects(t *testing.T) {
 		}
 	}
 
-	// Non-hard git -C <sibling> writes (both relative and absolute) must not be blocked by caller's scope or caller's outside_root.
+	// A modelled git write into a sibling worktree (both relative and absolute
+	// path) is refused by the sibling allowlist, not by the caller's scope or the
+	// caller's outside_root. It used to be allowed because the sibling evaluator
+	// checks hard rules only, so `checkout -- docs/notes.md` discarded another
+	// session's edits and still passed; the snapshot that added this test
+	// pinned that as intended (2026-11-17 Fable ruling replaces it).
 	for _, cmd := range []string{
 		"git -C ../wt-b checkout -- docs/notes.md",
 		"git -C " + wtB + " checkout -- docs/notes.md",
@@ -111,8 +116,8 @@ func TestGateRegisteredSiblingWorktreeWritesAndShellRedirects(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if d.Blocked() {
-			t.Errorf("%q = %s (%s): %s; want non-blocked against caller scope",
+		if !d.Blocked() || d.Rule != policy.RuleCommandSubstitution || !strings.Contains(d.Reason, "another session's worktree") {
+			t.Errorf("%q = %s/%s (%s); want refused by the sibling-worktree allowlist, not by the caller's scope",
 				cmd, d.Action, d.Rule, d.Reason)
 		}
 	}
@@ -240,6 +245,79 @@ func TestGateRefusesAnUnjudgedWriteInARegisteredSiblingWorktree(t *testing.T) {
 		}
 		if d.Blocked() {
 			t.Errorf("%s task: read-only apply --check = %s (%s): %s; want non-blocked", name, d.Action, d.Rule, d.Reason)
+		}
+	}
+}
+
+// 2026-11-17 Fable ruling: in another session's registered worktree git may
+// read and record, and nothing else runs. A sibling write is judged against the
+// hard rules only, so the modelled writes (`checkout -- .`, `clean`, `restore`)
+// discard that session's edits and still pass, and `reset`, `stash`, `switch`,
+// `merge`, `rebase`, `pull`, `am`, `read-tree`, `update-ref`, `branch -D` and
+// `worktree remove` are modelled by no write rule at all: a deny-list would
+// always be incomplete, so the rule is a closed allowlist. Before this, an
+// allowed `git *` matched every one of them through `git -C <sibling>`.
+func TestGateOnlyLetsGitReadAndRecordInARegisteredSiblingWorktree(t *testing.T) {
+	mainRoot, wtB, _ := setupGateWorktreeEnv(t)
+	g := newGateAtRoot(t, mainRoot, nil)
+	scoped := &dc.Task{
+		ID:              "TASK-001",
+		PlannedFiles:    []dc.PlannedFile{{Path: "src/calc.go", AllowedChange: dc.ChangeModify}},
+		AllowedCommands: []string{"git *"},
+	}
+	unscoped := &dc.Task{ID: "TASK-002", AllowedCommands: []string{"git *"}}
+	refused := []string{
+		"reset --hard", "reset --hard HEAD~1", "reset --mixed", "stash", "stash drop", "stash pop",
+		"stash push -m x", "clean -fdx", "clean -f docs", "checkout -- docs/notes.md", "checkout main",
+		"switch main", "restore docs", "restore --staged docs/notes.md", "commit --amend",
+		"commit --amend -m x", "rebase main", "merge feat", "pull", "am fix.patch",
+		"read-tree HEAD", "update-ref -d refs/heads/feat", "branch -D feat", "branch newbranch",
+		"worktree remove ../x", "rm docs/notes.md", "mv a b", "cherry-pick HEAD", "revert HEAD",
+		"gc", "push",
+	}
+	allowed := []string{
+		"status", "status --short", "diff", "diff --stat HEAD", "log --oneline -5", "show HEAD",
+		"rev-parse HEAD", "ls-files", "blame README.md", "branch", "branch --list", "branch -a",
+		"worktree list", "stash list", "stash show", "apply --check fix.patch", "fetch",
+		"add docs/notes.md", "commit -m msg", "describe --tags",
+	}
+	for name, task := range map[string]*dc.Task{"scoped": scoped, "unscoped": unscoped} {
+		for _, sub := range refused {
+			for _, target := range []string{"../wt-b", wtB} {
+				cmd := "git -C " + target + " " + sub
+				d, err := g.EvaluateCommand(cmd, task)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !d.Blocked() || d.Rule != policy.RuleCommandSubstitution || !strings.Contains(d.Reason, "another session's worktree") {
+					t.Errorf("%s task: %q = %s/%s (%s); want refused by the sibling-worktree allowlist",
+						name, cmd, d.Action, d.Rule, d.Reason)
+				}
+			}
+		}
+		// The bare dot is judged against the project root and is refused by the
+		// hard path.outside_root rule already, so only "blocked" is asserted: the
+		// hole was a NAMED path (`checkout -- docs/notes.md`), listed above.
+		for _, sub := range []string{"checkout -- .", "restore ."} {
+			cmd := "git -C ../wt-b " + sub
+			d, err := g.EvaluateCommand(cmd, task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Blocked() {
+				t.Errorf("%s task: %q = %s (%s); want blocked", name, cmd, d.Action, d.Reason)
+			}
+		}
+		for _, sub := range allowed {
+			cmd := "git -C ../wt-b " + sub
+			d, err := g.EvaluateCommand(cmd, task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Blocked() {
+				t.Errorf("%s task: %q = %s/%s (%s); a sibling worktree may be read and recorded into",
+					name, cmd, d.Action, d.Rule, d.Reason)
+			}
 		}
 	}
 }

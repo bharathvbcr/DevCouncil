@@ -70,6 +70,11 @@ Agents cannot overwrite instructions or MCP configuration that govern their own 
 - **Residual boundaries:** Shell interpreters (`sh -c`), archive unpackers (`tar`/`unzip`),
   git state manipulators (`reset`, `merge`, `pull`, `stash pop`), and directory `cp`/`mv` under all
   postures remain unmodelled external execution paths pinned by tests in `gate/zadv_prompt_input_test.go`.
+  The one exception is a git command aimed at another session's registered worktree
+  (`git -C <sibling>`): there git may only read or record (`status`, `diff`, `log`, `add`,
+  `commit` without `--amend`, and the other read-only forms), and `reset`, `stash`, `switch`,
+  `merge`, `rebase`, `pull` and the rest are refused. See
+  [Git in another session's worktree](SECURITY_BOUNDARIES.md#git-in-another-sessions-worktree).
 
 Installing MCP configuration does not grant universal scope enforcement.
 [Integration](coding-cli-integration.md) documents which settings and hooks

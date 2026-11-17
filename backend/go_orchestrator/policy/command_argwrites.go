@@ -69,6 +69,11 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 		cw := commandWrites(words, at, args, 0)
 		if root != "" && isGitWord(words[at].text) {
 			if gitRoot, _, escaped := resolveGitClauseWorktree(words, at, root); !escaped && gitRoot != "" && !sameWorktreePath(gitRoot, root) {
+				// Another session's worktree: git may read it and record into
+				// it, and nothing else runs there (siblingGitUnjudged).
+				if reason := siblingGitUnjudged(args); reason != "" {
+					cw.unjudged = reason
+				}
 				all.mergeSibling(gitRoot, cw)
 				continue
 			}
