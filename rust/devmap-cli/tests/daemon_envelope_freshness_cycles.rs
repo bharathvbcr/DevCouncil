@@ -112,7 +112,9 @@ fn edit(root: &Path, cycle: usize) {
             0 | 3 => {
                 let path = src.join(format!("m{}.py", cycle % 3));
                 let mut f = std::fs::File::create(&path)?;
-                f.write_all(format!("def edited_{cycle}(x):\n    return x + {cycle}\n").as_bytes())?;
+                f.write_all(
+                    format!("def edited_{cycle}(x):\n    return x + {cycle}\n").as_bytes(),
+                )?;
                 f.sync_all()
             }
             1 => {
