@@ -128,6 +128,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 name = "dc-grep"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
  "grep-regex",
  "grep-searcher",
  "ignore",
@@ -137,6 +138,13 @@ dependencies = [
  "tgrep-core",
  "unicode-normalization",
  "unicode-properties",
+]
+
+[[package]]
+name = "dc-proc"
+version = "0.2.5"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
