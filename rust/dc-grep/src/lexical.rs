@@ -233,7 +233,7 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
     let scope = target
         .strip_prefix(&root)
         .ok()
-        .and_then(crate::slashed)
+        .and_then(|p| crate::slashed(p, false))
         .unwrap_or_default();
 
     let limit = match request.max_results {

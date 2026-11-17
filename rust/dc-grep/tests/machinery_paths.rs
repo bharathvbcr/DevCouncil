@@ -190,3 +190,68 @@ fn ordinary_targets_are_unchanged() {
         assert_eq!(reply["paths"], json!(["src/lib.rs"]), "files path={path:?}");
     }
 }
+
+#[test]
+fn global_gitignore_anchors_at_repo_root_regardless_of_process_cwd() {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let repo = Repo::new();
+    repo.write("global_ignored.txt", "needle-global-root\n");
+    repo.write("sub/global_ignored.txt", "needle-global-sub\n");
+
+    let scratch_env = Repo::new();
+    let other_cwd = scratch_env.0.join("unrelated_cwd");
+    let fake_home = scratch_env.0.join("fake_home");
+    let fake_xdg = scratch_env.0.join("fake_xdg");
+    fs::create_dir_all(&other_cwd).unwrap();
+    fs::create_dir_all(fake_xdg.join("git")).unwrap();
+    fs::create_dir_all(&fake_home).unwrap();
+    fs::write(fake_xdg.join("git/ignore"), "/global_ignored.txt\n").unwrap();
+
+    for (cmd_name, req) in [
+        ("search", json!({ "pattern": "needle", "root": repo.0 })),
+        ("files", json!({ "root": repo.0 })),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
+            .arg(cmd_name)
+            .current_dir(&other_cwd)
+            .env("HOME", &fake_home)
+            .env("XDG_CONFIG_HOME", &fake_xdg)
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn dcgrep");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(req.to_string().as_bytes())
+            .unwrap();
+        let mut out = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+        assert!(child.wait().unwrap().success());
+        let reply: Value = serde_json::from_slice(&out).expect("JSON reply");
+        if cmd_name == "search" {
+            let paths: Vec<&str> = reply["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["path"].as_str().unwrap())
+                .collect();
+            assert!(!paths.contains(&"global_ignored.txt"), "{reply}");
+            assert!(paths.contains(&"sub/global_ignored.txt"), "{reply}");
+        } else {
+            let paths: Vec<&str> = reply["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            assert!(!paths.contains(&"global_ignored.txt"), "{reply}");
+            assert!(paths.contains(&"sub/global_ignored.txt"), "{reply}");
+        }
+    }
+}

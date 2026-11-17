@@ -62,7 +62,8 @@ fn run() -> Result<String, String> {
             "{{\"ok\":true,\"id\":\"{COMPONENT_ID}\",\"component\":\"{IDENTITY}\",\"version\":\"{}\",\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\
              \"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\",\
              \"ranked_engines\":{},\"ranked_vocabularies\":{},\
-             \"limits\":{{\"max_results\":{},\"max_list_results\":{}}}}}",
+             \"limits\":{{\"max_results\":{},\"max_list_results\":{}}},\
+             \"capabilities\":{{\"fixed_strings\":true,\"include_hidden\":true,\"preserve_whitespace\":true,\"include_oversized\":true,\"include_symlinks\":true,\"precompose_unicode\":true,\"include_devcouncil\":true,\"ignore_dot_ignore\":true,\"include_git_tracked\":true}}}}",
             env!("CARGO_PKG_VERSION"),
             render(&dc_grep::ranked_engines())?,
             render(&dc_grep::ranked_vocabularies())?,

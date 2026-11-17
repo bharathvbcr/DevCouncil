@@ -48,17 +48,21 @@
 //! before it reaches the source. `include_ignored` turns the whole set off for
 //! the case where the build output *is* the question.
 
-use std::fs::File;
+use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::overrides::OverrideBuilder;
 use ignore::{WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
+mod git;
 mod index;
 mod lexical;
 pub use index::{IndexRequest, IndexResponse, LeftOut, SearchIndex, build_index};
@@ -178,9 +182,10 @@ pub const MAX_LINE_BYTES_CEILING: usize = 64 * 1024;
 const ALWAYS_EXCLUDED: &[&str] = &[".git", ".devcouncil"];
 
 /// One search, as the Go execution plane asked for it.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Request {
-    /// The regular expression to find. Required, and never empty.
+    /// The regular expression (or literal string when `fixed_strings` is true)
+    /// to find. Required, and never empty.
     pub pattern: String,
     /// The repository root. Every result path is relative to it, and nothing
     /// outside it is read.
@@ -198,6 +203,20 @@ pub struct Request {
     /// replaced; `(?i)` in the pattern has always worked and still does.
     #[serde(default)]
     pub case_insensitive: bool,
+    /// Treat `pattern` as a fixed literal string instead of a regular expression.
+    #[serde(default)]
+    pub fixed_strings: bool,
+    /// Include non-ignored dotfiles and dot-directories in the search.
+    /// `.git` and `.devcouncil` remain unconditionally excluded.
+    #[serde(default)]
+    pub include_hidden: bool,
+    /// Preserve leading and interior line whitespace, trimming only the trailing
+    /// line terminator (`\n` or `\r\n`).
+    #[serde(default)]
+    pub preserve_whitespace: bool,
+    /// Normalize repository-relative paths to Unicode NFC.
+    #[serde(default)]
+    pub precompose_unicode: bool,
     /// Files at or above this size are skipped and counted. Zero means the
     /// default.
     #[serde(default)]
@@ -205,6 +224,17 @@ pub struct Request {
     /// Longest rendered line. Zero means the default.
     #[serde(default)]
     pub max_line_bytes: usize,
+    /// Include un-ignored `.devcouncil/*` project files while keeping `.git` and
+    /// `.devcouncil/dcgrep` index caches excluded.
+    #[serde(default)]
+    pub include_devcouncil: bool,
+    /// Do not read `.ignore` files (so `.ignore` cannot override `.gitignore`).
+    #[serde(default)]
+    pub ignore_dot_ignore: bool,
+    /// Also search regular files tracked in `.git/index` even when `.gitignore`
+    /// matches them (ignored if `include_ignored` is already true).
+    #[serde(default)]
+    pub include_git_tracked: bool,
 }
 
 /// One matching line.
@@ -324,7 +354,7 @@ pub(crate) fn is_zero_usize(value: &usize) -> bool {
 /// Every `Err` here names a fault. None of them is reachable by a search that
 /// simply found nothing: that is `Ok` with `count: 0`.
 pub fn search(request: &Request) -> Result<Response, String> {
-    if request.pattern.trim().is_empty() {
+    if request.pattern.is_empty() || (!request.fixed_strings && request.pattern.trim().is_empty()) {
         return Err("pattern is required".to_string());
     }
     if request.pattern.len() > MAX_PATTERN_BYTES {
@@ -338,13 +368,17 @@ pub fn search(request: &Request) -> Result<Response, String> {
         ));
     }
 
-    let (root, target) = resolve_roots(&request.root, &request.path)?;
+    let (root, target) =
+        resolve_roots_with(&request.root, &request.path, request.include_devcouncil)?;
 
     // Compiled before the walk starts, so a bad pattern costs nothing and —
     // far more importantly — reports as a bad pattern rather than as a walk
     // that visited every file and matched none of them.
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(request.case_insensitive)
+        .fixed_strings(request.fixed_strings)
+        .multi_line(true)
+        .crlf(true)
         .line_terminator(Some(b'\n'))
         // Bounds on what the pattern may compile *to*. Exceeding either is a
         // build error, which is reported as a refused pattern — the same shape
@@ -373,167 +407,233 @@ pub fn search(request: &Request) -> Result<Response, String> {
     };
 
     let apply_ignore_rules = !request.include_ignored;
-    let mut walker = build_walker(&target, apply_ignore_rules)?;
+    let walk_opts = WalkOptions {
+        apply_ignore_rules,
+        include_hidden: request.include_hidden,
+        include_devcouncil: request.include_devcouncil,
+        ignore_dot_ignore: request.ignore_dot_ignore,
+    };
+    let has_git_root = root.join(".git").exists();
+    let ignore_case = if apply_ignore_rules && has_git_root {
+        git::read_ignore_case(&root)
+    } else {
+        false
+    };
 
-    let (candidate_index, mut index) =
-        index::Candidates::load(&root, &request.pattern, request.case_insensitive);
+    struct TrackedState {
+        items: Vec<(String, AtomicBool)>,
+        lookup: HashMap<String, usize>,
+        ignore_case: bool,
+    }
+
+    let tracked_state = if request.include_git_tracked && apply_ignore_rules && has_git_root {
+        let target_rel = if target == root {
+            String::new()
+        } else {
+            target
+                .strip_prefix(&root)
+                .ok()
+                .and_then(|rel| slashed(rel, false))
+                .unwrap_or_default()
+        };
+        let tracked = git::read_tracked_regular_paths(&root)?;
+        let mut items = Vec::new();
+        let mut lookup = HashMap::new();
+        for rel in tracked {
+            if is_excluded_machinery_rel(&rel, request.include_devcouncil) {
+                continue;
+            }
+            if !target_rel.is_empty() && !rel_is_under_target(&rel, &target_rel, ignore_case) {
+                continue;
+            }
+            let key = tracked_dedup_key(&rel, ignore_case);
+            if let std::collections::hash_map::Entry::Vacant(slot) = lookup.entry(key) {
+                let idx = items.len();
+                slot.insert(idx);
+                items.push((rel, AtomicBool::new(false)));
+            }
+        }
+        Some(TrackedState {
+            items,
+            lookup,
+            ignore_case,
+        })
+    } else {
+        None
+    };
+
+    let (candidate_index, mut index) = index::Candidates::load(
+        &root,
+        &request.pattern,
+        request.case_insensitive,
+        request.fixed_strings,
+    );
 
     let collected = Mutex::new(Collected::default());
     let shared = &collected;
     let matcher = &matcher;
-    let root = &root;
+    let root_ref = &root;
     let candidate_index = candidate_index.as_ref();
+    let preserve_whitespace = request.preserve_whitespace;
+    let precompose_unicode = request.precompose_unicode;
+    let tracked_ref = tracked_state.as_ref();
 
-    // One worker per core, bounded. Everything else in this crate bounds what
-    // it will take from the machine it runs on, and threads are no different:
-    // a 128-core build server is not a reason to hold 128 files open inside
-    // one agent tool call.
-    walker.threads(search_threads());
-    walker.build_parallel().run(|| {
-        // Per worker. A `Searcher` owns a read buffer and is not shareable;
-        // the matcher is immutable and is shared by reference.
-        let mut searcher = SearcherBuilder::new()
-            .line_number(true)
-            // One line per match. Multi-line would let a single hit carry an
-            // unbounded span of the file into the result.
-            .multi_line(false)
-            // Stop reading a file the moment it looks binary. The matches
-            // already collected from it are then discarded — see `binary`.
-            .binary_detection(BinaryDetection::quit(b'\x00'))
-            .build();
+    let skip_nested_walk =
+        apply_ignore_rules && has_git_root && target_inside_nested_git(&root, &target);
 
-        Box::new(move |entry| {
-            let entry = match entry {
-                Ok(entry) => entry,
-                // A directory that could not be read is a hole in the answer,
-                // not a reason to abandon the search — but it is never silent.
-                Err(_) => return note(shared, |c| c.skipped.unreadable += 1),
-            };
-            // `file_type()` is `None` only for stdin, which this walk never
-            // has. Anything that is not a regular file — a directory, a
-            // symlink, a FIFO, a device node — is skipped before it can be
-            // opened.
-            match entry.file_type() {
-                Some(file_type) if file_type.is_file() => {}
-                _ => return WalkState::Continue,
-            }
+    if !skip_nested_walk {
+        let mut walker = build_walker_with(&root, &target, walk_opts)?;
+        // One worker per core, bounded. Everything else in this crate bounds what
+        // it will take from the machine it runs on, and threads are no different:
+        // a 128-core build server is not a reason to hold 128 files open inside
+        // one agent tool call.
+        walker.threads(search_threads());
+        walker.build_parallel().run(|| {
+            // Per worker. A `Searcher` owns a read buffer and is not shareable;
+            // the matcher is immutable and is shared by reference.
+            let mut searcher = build_line_searcher();
 
-            let path = entry.path();
-            let Ok(rel) = path.strip_prefix(root) else {
-                // Unreachable while `follow_links` is off and `target` is
-                // under `root`, and counted rather than ignored if it ever
-                // stops being.
-                return note(shared, |c| c.skipped.unreadable += 1);
-            };
-            let Some(rel) = slashed(rel) else {
-                return note(shared, |c| c.skipped.unrepresentable_name += 1);
-            };
-
-            // Size is decided from the walk's own stat, before the prune, so
-            // that `too_large` counts the same files on every run. It is a
-            // coverage hole and it belongs to the repository, not to whichever
-            // worker happened to arrive first — and a hole that appears in one
-            // run and not the next is a warning the caller cannot act on. The
-            // descriptor is re-checked below; that check is about a file that
-            // changed under us, not about this one.
-            match entry.metadata() {
-                Ok(meta) if meta.len() >= max_file_bytes => {
-                    return note(shared, |c| c.skipped.too_large += 1);
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    // A directory that could not be read is a hole in the answer,
+                    // not a reason to abandon the search — but it is never silent.
+                    Err(_) => return note(shared, |c| c.skipped.unreadable += 1),
+                };
+                // `file_type()` is `None` only for stdin, which this walk never
+                // has. Anything that is not a regular file — a directory, a
+                // symlink, a FIFO, a device node — is skipped before it can be
+                // opened.
+                match entry.file_type() {
+                    Some(file_type) if file_type.is_file() => {}
+                    _ => return WalkState::Continue,
                 }
-                Ok(_) => {}
-                Err(_) => return note(shared, |c| c.skipped.unreadable += 1),
-            }
 
-            // Asked before the file is opened, because not opening it is the
-            // entire saving. See `Collected::can_skip` for why this is sound
-            // and why it is not a coverage hole.
-            if skippable(shared, &rel, limit) {
-                return note(shared, |c| c.files_pruned += 1);
-            }
-
-            // Opened once and then interrogated through the descriptor. Every
-            // question below — is it really a regular file, how big is it,
-            // does it look binary — is asked of what was actually opened
-            // rather than of the name, which is the distinction that let a
-            // 182-byte symlink to a 5 MiB file past a 2 MiB guard on the Go
-            // side of this harness.
-            let Ok(file) = open_for_search(path) else {
-                return note(shared, |c| c.skipped.unreadable += 1);
-            };
-            let Ok(meta) = file.metadata() else {
-                return note(shared, |c| c.skipped.unreadable += 1);
-            };
-            if !meta.is_file() {
-                // The walk already filtered on `lstat`. This catches the race
-                // where the name was a regular file then and is a FIFO or a
-                // device now.
-                return note(shared, |c| c.skipped.unreadable += 1);
-            }
-            if meta.len() >= max_file_bytes {
-                // Grew past the limit between the walk's stat above and this
-                // open. Counted here as well, so the file is named as a hole
-                // exactly once either way.
-                return note(shared, |c| c.skipped.too_large += 1);
-            }
-
-            if let Some(candidates) = candidate_index {
-                match candidates.verdict(&rel, &meta) {
-                    index::Candidate::Excluded => {
-                        return note(shared, |c| c.index_filtered += 1);
-                    }
-                    index::Candidate::Stale => {
-                        tally(shared, |c| c.index_stale += 1);
-                    }
-                    index::Candidate::Search => {}
+                let path = entry.path();
+                let Ok(rel) = path.strip_prefix(root_ref) else {
+                    // Unreachable while `follow_links` is off and `target` is
+                    // under `root`, and counted rather than ignored if it ever
+                    // stops being.
+                    return note(shared, |c| c.skipped.unreadable += 1);
+                };
+                let Some(raw_rel) = slashed(rel, false) else {
+                    return note(shared, |c| c.skipped.unrepresentable_name += 1);
+                };
+                if let Some(tracked) = tracked_ref
+                    && let Some(&idx) = tracked
+                        .lookup
+                        .get(&tracked_dedup_key(&raw_rel, tracked.ignore_case))
+                {
+                    tracked.items[idx].1.store(true, Ordering::Relaxed);
                 }
-            }
+                let display_rel = if precompose_unicode && !raw_rel.is_ascii() {
+                    raw_rel.nfc().collect::<String>()
+                } else {
+                    raw_rel.clone()
+                };
 
-            // Per file, into a buffer this worker owns alone. Nothing touches
-            // shared state until the file is finished, which is what keeps
-            // "drop this file's matches" a local operation rather than a
-            // rollback of something another worker may already have read.
-            let mut local: Vec<Hit> = Vec::new();
-            let mut overflowed = false;
-            let mut binary = false;
+                // Size is decided from the walk's own stat, before the prune, so
+                // that `too_large` counts the same files on every run. It is a
+                // coverage hole and it belongs to the repository, not to whichever
+                // worker happened to arrive first — and a hole that appears in one
+                // run and not the next is a warning the caller cannot act on. The
+                // descriptor is re-checked below; that check is about a file that
+                // changed under us, not about this one.
+                match entry.metadata() {
+                    Ok(meta) if meta.len() >= max_file_bytes => {
+                        return note(shared, |c| c.skipped.too_large += 1);
+                    }
+                    Ok(_) => {}
+                    Err(_) => return note(shared, |c| c.skipped.unreadable += 1),
+                }
 
-            let outcome = searcher.search_file(
-                matcher,
-                &file,
-                Collector {
-                    path: &rel,
-                    out: &mut local,
+                // Asked before the file is opened, because not opening it is the
+                // entire saving. See `Collected::can_skip` for why this is sound
+                // and why it is not a coverage hole.
+                if skippable(shared, &display_rel, limit) {
+                    return note(shared, |c| c.files_pruned += 1);
+                }
+
+                // Opened once and then interrogated through the descriptor. Every
+                // question below — is it really a regular file, how big is it,
+                // does it look binary — is asked of what was actually opened
+                // rather than of the name, which is the distinction that let a
+                // 182-byte symlink to a 5 MiB file past a 2 MiB guard on the Go
+                // side of this harness.
+                let Ok(file) = open_for_search(path) else {
+                    return note(shared, |c| c.skipped.unreadable += 1);
+                };
+                search_opened_file(
+                    &file,
+                    &raw_rel,
+                    &display_rel,
                     limit,
+                    max_file_bytes,
                     max_line_bytes,
-                    truncated: &mut overflowed,
-                    binary: &mut binary,
-                },
-            );
-
-            if binary {
-                // A NUL past the probe window. Ripgrep's own detection would
-                // keep the matches it found before it; they are dropped
-                // instead, because this result goes into a model's context and
-                // half a line of a compiled object file is noise that reads
-                // like evidence. Dropping them also makes the answer the same
-                // on every platform: macOS streams through a 64 KiB buffer and
-                // emits those matches, Linux memory-maps and does not.
-                //
-                // `local` and `overflowed` are dropped with it, so a file
-                // excluded whole can never be the reason the *limit* is
-                // reported as having held matches back. That used to need a
-                // saved flag put back by hand; here it is structural.
-                return note(shared, |c| c.skipped.binary += 1);
-            }
-            if outcome.is_err() {
-                return note(shared, |c| c.skipped.unreadable += 1);
-            }
-
-            note(shared, |c| {
-                c.files_searched += 1;
-                c.merge(local, overflowed, limit);
+                    preserve_whitespace,
+                    candidate_index,
+                    matcher,
+                    &mut searcher,
+                    shared,
+                );
+                WalkState::Continue
             })
-        })
-    });
+        });
+    }
+
+    if let Some(tracked) = tracked_state.as_ref() {
+        let missing: Vec<&str> = tracked
+            .items
+            .iter()
+            .filter_map(|(rel, seen)| (!seen.load(Ordering::Relaxed)).then_some(rel.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            let mut searcher = build_line_searcher();
+            for raw_rel in missing {
+                let file = match open_tracked_regular_no_symlinks(root_ref, raw_rel) {
+                    TrackedOpen::File(file) => file,
+                    TrackedOpen::Skip => continue,
+                    TrackedOpen::Unreadable => {
+                        tally(shared, |c| c.skipped.unreadable += 1);
+                        continue;
+                    }
+                };
+                let display_rel = if precompose_unicode && !raw_rel.is_ascii() {
+                    raw_rel.nfc().collect::<String>()
+                } else {
+                    raw_rel.to_string()
+                };
+                let Ok(meta) = file.metadata() else {
+                    tally(shared, |c| c.skipped.unreadable += 1);
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                if meta.len() >= max_file_bytes {
+                    tally(shared, |c| c.skipped.too_large += 1);
+                    continue;
+                }
+                if skippable(shared, &display_rel, limit) {
+                    tally(shared, |c| c.files_pruned += 1);
+                    continue;
+                }
+                search_opened_file(
+                    &file,
+                    raw_rel,
+                    &display_rel,
+                    limit,
+                    max_file_bytes,
+                    max_line_bytes,
+                    preserve_whitespace,
+                    candidate_index,
+                    matcher,
+                    &mut searcher,
+                    shared,
+                );
+            }
+        }
+    }
 
     let Collected {
         best,
@@ -588,7 +688,7 @@ pub fn search(request: &Request) -> Result<Response, String> {
 }
 
 /// One file listing, as the Go execution plane asked for it.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ListRequest {
     /// The repository root. Every path is relative to it.
     pub root: PathBuf,
@@ -601,12 +701,32 @@ pub struct ListRequest {
     /// List files the ignore rules would exclude, hidden files included.
     #[serde(default)]
     pub include_ignored: bool,
+    /// List non-ignored dotfiles and dot-directories.
+    /// `.git` and `.devcouncil` remain unconditionally excluded.
+    #[serde(default)]
+    pub include_hidden: bool,
+    /// Include regular files regardless of `max_file_bytes`.
+    #[serde(default)]
+    pub include_oversized: bool,
+    /// Include symbolic links (without following them).
+    #[serde(default)]
+    pub include_symlinks: bool,
+    /// Normalize repository-relative paths to Unicode NFC.
+    #[serde(default)]
+    pub precompose_unicode: bool,
     /// Files at or above this size are left out and counted, exactly as
     /// `search` leaves them out. Zero means the default — the same default
     /// `search` uses — so the two agree unless a caller overrides one of
     /// them and not the other.
     #[serde(default)]
     pub max_file_bytes: u64,
+    /// Include un-ignored `.devcouncil/*` project files while keeping `.git` and
+    /// `.devcouncil/dcgrep` index caches excluded.
+    #[serde(default)]
+    pub include_devcouncil: bool,
+    /// Do not read `.ignore` files (so `.ignore` cannot override `.gitignore`).
+    #[serde(default)]
+    pub ignore_dot_ignore: bool,
 }
 
 /// The answer to one `ListRequest`.
@@ -653,7 +773,8 @@ pub struct ListResponse {
 /// fixture; moving that into this crate would fork the glob semantics to gain
 /// nothing. What was wrong was never the matching — it was the two walks.
 pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
-    let (root, target) = resolve_roots(&request.root, &request.path)?;
+    let (root, target) =
+        resolve_roots_with(&request.root, &request.path, request.include_devcouncil)?;
 
     let limit = match request.max_results {
         0 => DEFAULT_MAX_LIST_RESULTS,
@@ -666,7 +787,28 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
         n => n.min(MAX_FILE_BYTES_CEILING),
     };
     let apply_ignore_rules = !request.include_ignored;
-    let walker = build_walker(&target, apply_ignore_rules)?;
+    let has_git_root = root.join(".git").exists();
+    if apply_ignore_rules && has_git_root && target_inside_nested_git(&root, &target) {
+        return Ok(ListResponse {
+            ok: true,
+            count: 0,
+            paths: Vec::new(),
+            truncated: false,
+            limit: None,
+            skipped: Skipped::default(),
+            ignore_rules_applied: apply_ignore_rules,
+        });
+    }
+    let walker = build_walker_with(
+        &root,
+        &target,
+        WalkOptions {
+            apply_ignore_rules,
+            include_hidden: request.include_hidden,
+            include_devcouncil: request.include_devcouncil,
+            ignore_dot_ignore: request.ignore_dot_ignore,
+        },
+    )?;
 
     let mut paths = Vec::new();
     let mut truncated = false;
@@ -680,29 +822,36 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
                 continue;
             }
         };
-        match entry.file_type() {
-            Some(file_type) if file_type.is_file() => {}
-            _ => continue,
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_symlink = file_type.is_symlink();
+        if !file_type.is_file() && !(request.include_symlinks && is_symlink) {
+            continue;
         }
         let Ok(rel) = entry.path().strip_prefix(&root) else {
             skipped.unreadable += 1;
             continue;
         };
-        // The walk already stat'ed this entry, so the size filter the search
-        // applies costs nothing to apply here too — and applying it is what
-        // makes this list answer the question its caller is really asking.
-        match entry.metadata() {
-            Ok(meta) if meta.len() >= max_file_bytes => {
-                skipped.too_large += 1;
-                continue;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                skipped.unreadable += 1;
-                continue;
+        // The walk already stat'ed regular entries, so the size filter the
+        // search applies costs nothing to apply here too — and applying it is
+        // what makes this list answer the question its caller is really asking.
+        // Symlinks (only reachable when `include_symlinks` is set) skip both
+        // the size limit and `metadata()` so dangling symlinks stay listed.
+        if !is_symlink {
+            match entry.metadata() {
+                Ok(meta) if !request.include_oversized && meta.len() >= max_file_bytes => {
+                    skipped.too_large += 1;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    skipped.unreadable += 1;
+                    continue;
+                }
             }
         }
-        let Some(rel) = slashed(rel) else {
+        let Some(rel) = slashed(rel, request.precompose_unicode) else {
             skipped.unrepresentable_name += 1;
             continue;
         };
@@ -736,6 +885,67 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
 /// symlinked directory, satisfy a prefix test while reading somewhere else
 /// entirely.
 fn resolve_roots(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf), String> {
+    resolve_roots_with(root, requested, false)
+}
+
+fn is_hfs_ignorable(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{206A}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+fn is_git_metadata_component(part: &str) -> bool {
+    let trimmed = part.trim_end_matches(['.', ' ']);
+    let base = trimmed.split(':').next().unwrap_or(trimmed);
+    if base.eq_ignore_ascii_case(".git") || base.eq_ignore_ascii_case("git~1") {
+        return true;
+    }
+    if base.chars().any(is_hfs_ignorable) {
+        let stripped: String = base.chars().filter(|c| !is_hfs_ignorable(*c)).collect();
+        let stripped_trimmed = stripped.trim_end_matches(['.', ' ']);
+        if stripped_trimmed.eq_ignore_ascii_case(".git")
+            || stripped_trimmed.eq_ignore_ascii_case("git~1")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_devcouncil_dcgrep_pair(prev: &str, curr: &str) -> bool {
+    prev.eq_ignore_ascii_case(".devcouncil") && curr.eq_ignore_ascii_case("dcgrep")
+}
+
+fn is_excluded_machinery_rel(rel: &str, include_devcouncil: bool) -> bool {
+    let mut prev: Option<&str> = None;
+    for part in rel.split(['/', '\\']) {
+        if is_git_metadata_component(part) {
+            return true;
+        }
+        if !include_devcouncil && part.eq_ignore_ascii_case(".devcouncil") {
+            return true;
+        }
+        if include_devcouncil
+            && let Some(prev_part) = prev
+            && is_devcouncil_dcgrep_pair(prev_part, part)
+        {
+            return true;
+        }
+        prev = Some(part);
+    }
+    false
+}
+
+fn resolve_roots_with(
+    root: &Path,
+    requested: &str,
+    include_devcouncil: bool,
+) -> Result<(PathBuf, PathBuf), String> {
     let root = root
         .canonicalize()
         .map_err(|err| format!("repository root {root:?} is unreadable: {err}"))?;
@@ -760,20 +970,63 @@ fn resolve_roots(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf), Str
     // returned. The canonical target is judged here instead, component by
     // component below the root, and case-folded because `.GIT` is `.git` on
     // APFS and NTFS.
-    if let Ok(below) = target.strip_prefix(&root)
-        && let Some(name) = below.components().find_map(|part| {
-            let part = part.as_os_str().to_str()?;
-            ALWAYS_EXCLUDED
-                .iter()
-                .find(|excluded| part.eq_ignore_ascii_case(excluded))
-        })
-    {
-        return Err(format!(
-            "path {requested:?} resolves into `{name}`, the repository's own machinery or the \
-             harness's state, which this tool never reads"
-        ));
+    if let Ok(below) = target.strip_prefix(&root) {
+        let mut prev: Option<&str> = None;
+        for part in below.components() {
+            let Some(part) = part.as_os_str().to_str() else {
+                prev = None;
+                continue;
+            };
+            if part.eq_ignore_ascii_case(".git") {
+                return Err(format!(
+                    "path {requested:?} resolves into `.git`, the repository's own machinery or the \
+                     harness's state, which this tool never reads"
+                ));
+            }
+            if !include_devcouncil && part.eq_ignore_ascii_case(".devcouncil") {
+                return Err(format!(
+                    "path {requested:?} resolves into `.devcouncil`, the repository's own machinery or the \
+                     harness's state, which this tool never reads"
+                ));
+            }
+            if include_devcouncil
+                && let Some(prev_part) = prev
+                && is_devcouncil_dcgrep_pair(prev_part, part)
+            {
+                return Err(format!(
+                    "path {requested:?} resolves into `.devcouncil/dcgrep`, the repository's own machinery or the \
+                     harness's state, which this tool never reads"
+                ));
+            }
+            prev = Some(part);
+        }
     }
     Ok((root, target))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WalkOptions {
+    pub apply_ignore_rules: bool,
+    pub include_hidden: bool,
+    pub include_devcouncil: bool,
+    pub ignore_dot_ignore: bool,
+}
+
+fn target_inside_nested_git(root: &Path, target: &Path) -> bool {
+    if target == root {
+        return false;
+    }
+    let Ok(rel) = target.strip_prefix(root) else {
+        return false;
+    };
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if fs::symlink_metadata(cur.join(".git")).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Builds the tree walk both operations use.
@@ -784,9 +1037,39 @@ fn resolve_roots(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf), Str
 /// `grep` would never open it. Two readers of one repository with different
 /// assumptions is how "the same tree" drifts apart, and an agent given both
 /// answers has no way to tell which one is about the repository it is editing.
-fn build_walker(target: &Path, apply_ignore_rules: bool) -> Result<WalkBuilder, String> {
+pub(crate) fn build_walker(
+    root: &Path,
+    target: &Path,
+    apply_ignore_rules: bool,
+    include_hidden: bool,
+) -> Result<WalkBuilder, String> {
+    build_walker_with(
+        root,
+        target,
+        WalkOptions {
+            apply_ignore_rules,
+            include_hidden,
+            include_devcouncil: false,
+            ignore_dot_ignore: false,
+        },
+    )
+}
+
+pub(crate) fn build_walker_with(
+    root: &Path,
+    target: &Path,
+    opts: WalkOptions,
+) -> Result<WalkBuilder, String> {
     let mut overrides = OverrideBuilder::new(target);
-    for glob in ALWAYS_EXCLUDED {
+    overrides
+        .case_insensitive(true)
+        .map_err(|err| format!("case-insensitive internal exclusions failed: {err}"))?;
+    let excluded: &[&str] = if opts.include_devcouncil {
+        &[".git"]
+    } else {
+        ALWAYS_EXCLUDED
+    };
+    for glob in excluded {
         // A leading `!` is an *ignore* in override syntax — the sense is
         // inverted from gitignore. Only ignores are added here, which keeps
         // `num_whitelists()` at zero; a single non-`!` glob would flip the
@@ -800,6 +1083,20 @@ fn build_walker(target: &Path, apply_ignore_rules: bool) -> Result<WalkBuilder, 
         .build()
         .map_err(|err| format!("internal exclusions did not compile: {err}"))?;
 
+    // A standard checkout has a `.git` directory; a linked git worktree has a
+    // `.git` file pointing to `$GIT_DIR` / `$GIT_COMMON_DIR`. Enabling
+    // `require_git(true)` when `.git` exists at `root` both bounds parent
+    // `.gitignore` traversal at `root` and lets `ignore` resolve
+    // `$GIT_COMMON_DIR/info/exclude` for linked worktrees.
+    let has_git_root = root.join(".git").exists();
+    let ignore_case = if opts.apply_ignore_rules && has_git_root {
+        git::read_ignore_case(root)
+    } else {
+        false
+    };
+    let include_devcouncil = opts.include_devcouncil;
+    let prune_nested_git = opts.apply_ignore_rules && has_git_root;
+
     let mut walker = WalkBuilder::new(target);
     walker
         .overrides(overrides)
@@ -807,19 +1104,248 @@ fn build_walker(target: &Path, apply_ignore_rules: bool) -> Result<WalkBuilder, 
         // containment is checked at all, and a link that points back inside is
         // reached through its real path anyway.
         .follow_links(false)
-        .standard_filters(apply_ignore_rules)
-        // `require_git(false)` so `.gitignore` is honoured in a directory that
-        // is not itself a git checkout — a worktree subdirectory, an extracted
-        // archive, a test fixture. Without it the rules silently stop applying
-        // and the caller cannot tell.
-        .require_git(false)
-        .git_ignore(apply_ignore_rules)
-        .git_global(apply_ignore_rules)
-        .git_exclude(apply_ignore_rules)
-        .ignore(apply_ignore_rules)
-        .parents(apply_ignore_rules)
-        .hidden(apply_ignore_rules);
+        .standard_filters(opts.apply_ignore_rules)
+        .require_git(has_git_root)
+        .git_ignore(opts.apply_ignore_rules)
+        .git_global(opts.apply_ignore_rules)
+        .git_exclude(opts.apply_ignore_rules)
+        .ignore(opts.apply_ignore_rules && !opts.ignore_dot_ignore)
+        .ignore_case_insensitive(ignore_case)
+        .parents(apply_ignore_rules_and_git(
+            opts.apply_ignore_rules,
+            has_git_root,
+        ))
+        .hidden(opts.apply_ignore_rules && !opts.include_hidden)
+        .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if name.eq_ignore_ascii_case(".git") {
+                    return false;
+                }
+                if !include_devcouncil && name.eq_ignore_ascii_case(".devcouncil") {
+                    return false;
+                }
+                if include_devcouncil
+                    && name.eq_ignore_ascii_case("dcgrep")
+                    && let Some(parent_name) = entry
+                        .path()
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                    && parent_name.eq_ignore_ascii_case(".devcouncil")
+                {
+                    return false;
+                }
+            }
+            !(prune_nested_git
+                && entry.file_type().is_some_and(|ft| ft.is_dir())
+                && fs::symlink_metadata(entry.path().join(".git")).is_ok())
+        });
+
+    // Non-git trees (or synthetic scratch directories) keep `parents(false)` so
+    // an arbitrary `.gitignore` above `root` cannot leak into the walk, while
+    // subdirectory walks (`target != root`) still load `.gitignore`/`.ignore`
+    // files strictly within `[root, target)`.
+    if opts.apply_ignore_rules
+        && !has_git_root
+        && target != root
+        && let Ok(rel) = target.strip_prefix(root)
+    {
+        let mut cur = root.to_path_buf();
+        let mut ancestors = Vec::new();
+        let mut components = rel.components().peekable();
+        ancestors.push(cur.clone());
+        while let Some(comp) = components.next() {
+            if components.peek().is_none() {
+                break;
+            }
+            cur.push(comp);
+            ancestors.push(cur.clone());
+        }
+        let ignore_names: &[&str] = if opts.ignore_dot_ignore {
+            &[".gitignore"]
+        } else {
+            &[".gitignore", ".ignore"]
+        };
+        for dir in ancestors {
+            for name in ignore_names {
+                let ignore_path = dir.join(name);
+                if ignore_path.is_file() {
+                    walker.current_dir(&dir);
+                    let _ = walker.add_ignore(ignore_path);
+                }
+            }
+        }
+    }
+    // Always anchor global gitignore matching at `root` rather than letting
+    // `WalkBuilder` read the caller process's arbitrary working directory.
+    walker.current_dir(root);
+
     Ok(walker)
+}
+
+fn apply_ignore_rules_and_git(apply_ignore_rules: bool, has_git_root: bool) -> bool {
+    apply_ignore_rules && has_git_root
+}
+
+fn build_line_searcher() -> Searcher {
+    SearcherBuilder::new()
+        .line_number(true)
+        // One line per match. Multi-line would let a single hit carry an
+        // unbounded span of the file into the result.
+        .multi_line(false)
+        // Stop reading a file the moment it looks binary. The matches
+        // already collected from it are then discarded — see `binary`.
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build()
+}
+
+fn tracked_dedup_key(rel: &str, ignore_case: bool) -> String {
+    let normalized = if rel.is_ascii() {
+        rel.to_string()
+    } else {
+        rel.nfc().collect::<String>()
+    };
+    if ignore_case {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn rel_is_under_target(rel: &str, target_rel: &str, ignore_case: bool) -> bool {
+    let rel_norm = tracked_dedup_key(rel, ignore_case);
+    let target_norm = tracked_dedup_key(target_rel, ignore_case);
+    rel_norm == target_norm
+        || rel_norm
+            .strip_prefix(&target_norm)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+enum TrackedOpen {
+    File(File),
+    Skip,
+    Unreadable,
+}
+
+fn open_tracked_regular_no_symlinks(root: &Path, raw_rel: &str) -> TrackedOpen {
+    let mut cur = root.to_path_buf();
+    let mut components = Path::new(raw_rel).components().peekable();
+    while let Some(component) = components.next() {
+        let is_last = components.peek().is_none();
+        match component {
+            Component::Normal(part) => cur.push(part),
+            _ => return TrackedOpen::Skip,
+        }
+        let meta = match fs::symlink_metadata(&cur) {
+            Ok(meta) => meta,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return TrackedOpen::Skip;
+            }
+            Err(_) => return TrackedOpen::Unreadable,
+        };
+        if meta.file_type().is_symlink() {
+            return TrackedOpen::Skip;
+        }
+        if !is_last && !meta.file_type().is_dir() {
+            return TrackedOpen::Skip;
+        }
+        if is_last && !meta.file_type().is_file() {
+            return TrackedOpen::Skip;
+        }
+    }
+    match open_for_search(&cur) {
+        Ok(file) => TrackedOpen::File(file),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            TrackedOpen::Skip
+        }
+        Err(_) => TrackedOpen::Unreadable,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_opened_file(
+    file: &File,
+    raw_rel: &str,
+    display_rel: &str,
+    limit: usize,
+    max_file_bytes: u64,
+    max_line_bytes: usize,
+    preserve_whitespace: bool,
+    candidate_index: Option<&index::Candidates>,
+    matcher: &grep_regex::RegexMatcher,
+    searcher: &mut Searcher,
+    shared: &Mutex<Collected>,
+) {
+    let Ok(meta) = file.metadata() else {
+        tally(shared, |c| c.skipped.unreadable += 1);
+        return;
+    };
+    if !meta.is_file() {
+        tally(shared, |c| c.skipped.unreadable += 1);
+        return;
+    }
+    if meta.len() >= max_file_bytes {
+        tally(shared, |c| c.skipped.too_large += 1);
+        return;
+    }
+
+    if let Some(candidates) = candidate_index {
+        match candidates.verdict(raw_rel, &meta) {
+            index::Candidate::Excluded => {
+                tally(shared, |c| c.index_filtered += 1);
+                return;
+            }
+            index::Candidate::Stale => {
+                tally(shared, |c| c.index_stale += 1);
+            }
+            index::Candidate::Search => {}
+        }
+    }
+
+    let mut local: Vec<Hit> = Vec::new();
+    let mut overflowed = false;
+    let mut binary = false;
+
+    let outcome = searcher.search_file(
+        matcher,
+        file,
+        Collector {
+            path: display_rel,
+            out: &mut local,
+            limit,
+            max_line_bytes,
+            preserve_whitespace,
+            truncated: &mut overflowed,
+            binary: &mut binary,
+        },
+    );
+
+    if binary {
+        tally(shared, |c| c.skipped.binary += 1);
+        return;
+    }
+    if outcome.is_err() {
+        tally(shared, |c| c.skipped.unreadable += 1);
+        return;
+    }
+
+    tally(shared, |c| {
+        c.files_searched += 1;
+        c.merge(local, overflowed, limit);
+    });
 }
 
 /// Opens a file for searching without letting the filesystem redirect or block
@@ -851,7 +1377,13 @@ fn open_for_search(path: &Path) -> io::Result<File> {
 /// `../outside` and an absolute path, and `O_NOFOLLOW` does not stop either:
 /// an absolute path replaces the root, and `..` is an intermediate component.
 pub(crate) fn contained_relative(path: &str) -> bool {
-    if path.is_empty() || path.as_bytes().contains(&0) {
+    if path.is_empty() || path.as_bytes().contains(&0) || path.contains('\\') {
+        return false;
+    }
+    if path
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
         return false;
     }
     let path = Path::new(path);
@@ -912,7 +1444,7 @@ pub(crate) fn open_inside_root(root: &Path, path: &str) -> io::Result<File> {
 /// alternative and it is worse than refusing: it yields a path containing
 /// U+FFFD, which names no file on any filesystem, so the caller receives a
 /// match it cannot open and has no way to tell that from a real one.
-fn slashed(path: &Path) -> Option<String> {
+fn slashed(path: &Path, precompose_unicode: bool) -> Option<String> {
     let mut out = String::new();
     for component in path.components() {
         let part = component.as_os_str().to_str()?;
@@ -921,7 +1453,11 @@ fn slashed(path: &Path) -> Option<String> {
         }
         out.push_str(part);
     }
-    Some(out)
+    if precompose_unicode && !out.is_ascii() {
+        Some(out.nfc().collect())
+    } else {
+        Some(out)
+    }
 }
 
 /// Workers for one search.
@@ -1082,6 +1618,7 @@ struct Collector<'a> {
     out: &'a mut Vec<Hit>,
     limit: usize,
     max_line_bytes: usize,
+    preserve_whitespace: bool,
     truncated: &'a mut bool,
     binary: &'a mut bool,
 }
@@ -1097,7 +1634,8 @@ impl Sink for Collector<'_> {
             *self.truncated = true;
             return Ok(false);
         }
-        let (line, line_truncated) = render_line(mat.bytes(), self.max_line_bytes);
+        let (line, line_truncated) =
+            render_line(mat.bytes(), self.max_line_bytes, self.preserve_whitespace);
         self.out.push(Hit {
             path: self.path.to_string(),
             // `line_number(true)` is set on the searcher, so this is always
@@ -1137,9 +1675,14 @@ impl Sink for Collector<'_> {
 /// Lossy, deliberately: a line with one invalid byte in it is still the line
 /// the agent asked about, and refusing to render it would turn a real match
 /// into a silent absence.
-fn render_line(bytes: &[u8], max_line_bytes: usize) -> (String, bool) {
+fn render_line(bytes: &[u8], max_line_bytes: usize, preserve_whitespace: bool) -> (String, bool) {
     let text = String::from_utf8_lossy(bytes);
-    let trimmed = text.trim();
+    let trimmed = if preserve_whitespace {
+        let s = text.as_ref().strip_suffix('\n').unwrap_or(text.as_ref());
+        s.strip_suffix('\r').unwrap_or(s)
+    } else {
+        text.trim()
+    };
     if trimmed.len() <= max_line_bytes {
         return (trimmed.to_string(), false);
     }
@@ -1192,12 +1735,7 @@ mod tests {
             Request {
                 pattern: pattern.to_string(),
                 root: self.path.clone(),
-                path: String::new(),
-                max_results: 0,
-                include_ignored: false,
-                case_insensitive: false,
-                max_file_bytes: 0,
-                max_line_bytes: 0,
+                ..Default::default()
             }
         }
     }
@@ -1620,10 +2158,8 @@ mod tests {
     fn list(scratch: &Scratch, include_ignored: bool) -> ListResponse {
         list_files(&ListRequest {
             root: scratch.path.clone(),
-            path: String::new(),
-            max_results: 0,
             include_ignored,
-            max_file_bytes: 0,
+            ..Default::default()
         })
         .expect("listing runs")
     }
@@ -1680,9 +2216,7 @@ mod tests {
         let err = list_files(&ListRequest {
             root: scratch.path.clone(),
             path: "../..".to_string(),
-            max_results: 0,
-            include_ignored: false,
-            max_file_bytes: 0,
+            ..Default::default()
         })
         .expect_err("must not succeed");
         assert!(err.contains("outside the repository"), "{err}");
@@ -1696,10 +2230,8 @@ mod tests {
         }
         let response = list_files(&ListRequest {
             root: scratch.path.clone(),
-            path: String::new(),
             max_results: 4,
-            include_ignored: false,
-            max_file_bytes: 0,
+            ..Default::default()
         })
         .expect("listing runs");
         assert_eq!(response.count, 4);
@@ -1732,10 +2264,8 @@ mod tests {
         }
         let response = list_files(&ListRequest {
             root: scratch.path.clone(),
-            path: String::new(),
             max_results: MAX_MAX_RESULTS + 1_000,
-            include_ignored: false,
-            max_file_bytes: 0,
+            ..Default::default()
         })
         .expect("listing runs");
         assert!(
@@ -2049,10 +2579,8 @@ mod tests {
             for limit in 1..=(total_files + 2) {
                 let listing = list_files(&ListRequest {
                     root: scratch.path.clone(),
-                    path: String::new(),
                     max_results: limit,
-                    include_ignored: false,
-                    max_file_bytes: 0,
+                    ..Default::default()
                 })
                 .expect("listing runs");
 
@@ -2182,10 +2710,8 @@ mod tests {
         // even on the paths neither of them can name.
         let listing = list_files(&ListRequest {
             root: scratch.path.clone(),
-            path: String::new(),
-            max_results: 0,
             include_ignored: true,
-            max_file_bytes: 0,
+            ..Default::default()
         })
         .expect("listing runs");
         assert!(
@@ -2207,13 +2733,13 @@ mod tests {
             use std::os::unix::ffi::OsStrExt;
             let bad = PathBuf::from(OsStr::from_bytes(b"src/ca\xffe.rs"));
             assert_eq!(
-                slashed(&bad),
+                slashed(&bad, false),
                 None,
                 "a lossy path names no file and must never reach a caller"
             );
         }
         assert_eq!(
-            slashed(Path::new("src/nested/a.rs")),
+            slashed(Path::new("src/nested/a.rs"), false),
             Some("src/nested/a.rs".to_string())
         );
     }
@@ -2432,10 +2958,8 @@ mod tests {
             for include_ignored in [false, true] {
                 let mut listed = list_files(&ListRequest {
                     root: scratch.path.clone(),
-                    path: String::new(),
-                    max_results: 0,
                     include_ignored,
-                    max_file_bytes: 0,
+                    ..Default::default()
                 })
                 .expect("listing runs")
                 .paths;
@@ -2475,5 +2999,497 @@ mod tests {
         let encoded = serde_json::to_string(&response).expect("renders as JSON");
         let decoded: serde_json::Value = serde_json::from_str(&encoded).expect("and parses back");
         assert_eq!(decoded["matches"][0]["line"], response.matches[0].line);
+    }
+
+    #[test]
+    fn fixed_strings_matches_metacharacters_and_whitespace() {
+        let scratch = Scratch::new();
+        scratch.write("src/expr.txt", b"match (a+)+ and [ and -dash\n   \n");
+
+        for literal in ["(a+)+", "[", "-dash", "   "] {
+            let mut request = scratch.request(literal);
+            request.fixed_strings = true;
+            let response = search(&request).expect("fixed-string search runs");
+            assert_eq!(
+                response.count, 1,
+                "expected 1 literal match for {literal:?}: {response:?}"
+            );
+            assert_eq!(response.matches[0].path, "src/expr.txt");
+        }
+
+        // Default regex mode still rejects `[` as invalid regex and `"   "` as empty.
+        assert!(search(&scratch.request("[")).is_err());
+        assert!(search(&scratch.request("   ")).is_err());
+    }
+
+    #[test]
+    fn include_hidden_admits_dotfiles_but_keeps_gitignore_and_internal_exclusions() {
+        let scratch = Scratch::new();
+        scratch.write(".gitignore", b"*.ignored\n.hidden-ignored/\n");
+        scratch.write(".github/ci.yml", b"needle\n");
+        scratch.write(".hidden-ignored/secret.txt", b"needle\n");
+        scratch.write("skip.ignored", b"needle\n");
+        scratch.write(".git/HEAD", b"needle\n");
+        scratch.write(".devcouncil/state.json", b"needle\n");
+        scratch.write("visible.txt", b"needle\n");
+
+        let mut request = scratch.request("needle");
+        request.include_hidden = true;
+        let mut matched: Vec<String> = search(&request)
+            .expect("search runs")
+            .matches
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        matched.sort();
+        assert_eq!(matched, vec![".github/ci.yml", "visible.txt"]);
+
+        let mut listed = list_files(&ListRequest {
+            root: scratch.path.clone(),
+            include_hidden: true,
+            ..Default::default()
+        })
+        .expect("listing runs")
+        .paths;
+        listed.sort();
+        assert_eq!(listed, vec![".github/ci.yml", ".gitignore", "visible.txt"]);
+    }
+
+    #[test]
+    fn walker_honors_linked_worktree_exclude_and_stops_above_non_git_root() {
+        // 1. Linked worktree `.git` file pointing at gitdir + commondir with `info/exclude`.
+        let outer = Scratch::new();
+        outer.write("main-repo/.git/HEAD", b"ref: refs/heads/main\n");
+        outer.write("main-repo/.git/info/exclude", b"*.wt_excluded\n");
+        outer.write("main-repo/.git/worktrees/wt1/commondir", b"../..\n");
+        let gitdir = outer.path.join("main-repo/.git/worktrees/wt1");
+        outer.write(
+            "wt1/.git",
+            format!("gitdir: {}\n", gitdir.display()).as_bytes(),
+        );
+        outer.write("wt1/keep.txt", b"needle\n");
+        outer.write("wt1/drop.wt_excluded", b"needle\n");
+
+        let mut wt_req = Request {
+            pattern: "needle".to_string(),
+            root: outer.path.join("wt1"),
+            ..Default::default()
+        };
+        wt_req.include_hidden = true;
+        let wt_res = search(&wt_req).expect("worktree search runs");
+        assert_eq!(paths(&wt_res), vec!["keep.txt"]);
+
+        let wt_list = list_files(&ListRequest {
+            root: outer.path.join("wt1"),
+            include_hidden: true,
+            ..Default::default()
+        })
+        .expect("worktree list runs");
+        assert_eq!(wt_list.paths, vec!["keep.txt"]);
+
+        // 2. Non-git tree does not inherit parent directory's `.gitignore` above `root`,
+        //    yet walking a subdirectory (`path: "sub"`) still honors `root/.gitignore`.
+        outer.write(".gitignore", b"keep.txt\n");
+        outer.write("nongit/.gitignore", b"sub/skip.txt\n");
+        outer.write("nongit/keep.txt", b"needle\n");
+        outer.write("nongit/sub/ok.txt", b"needle\n");
+        outer.write("nongit/sub/skip.txt", b"needle\n");
+
+        let root_res = search(&Request {
+            pattern: "needle".to_string(),
+            root: outer.path.join("nongit"),
+            ..Default::default()
+        })
+        .expect("nongit root search runs");
+        let mut root_paths: Vec<_> = root_res.matches.into_iter().map(|m| m.path).collect();
+        root_paths.sort();
+        assert_eq!(root_paths, vec!["keep.txt", "sub/ok.txt"]);
+
+        let sub_res = search(&Request {
+            pattern: "needle".to_string(),
+            root: outer.path.join("nongit"),
+            path: "sub".to_string(),
+            ..Default::default()
+        })
+        .expect("nongit sub search runs");
+        assert_eq!(paths(&sub_res), vec!["sub/ok.txt"]);
+    }
+
+    #[test]
+    fn preserve_whitespace_keeps_indentation_and_strips_crlf_or_lf() {
+        let scratch = Scratch::new();
+        scratch.write("indent.txt", b"  \tneedle\t \r\n    needle\n");
+
+        let mut req = scratch.request("needle");
+        req.preserve_whitespace = true;
+        let res = search(&req).expect("search runs");
+        assert_eq!(res.count, 2);
+        assert_eq!(res.matches[0].line, "  \tneedle\t ");
+        assert_eq!(res.matches[1].line, "    needle");
+
+        let default_res = search(&scratch.request("needle")).expect("default search runs");
+        assert_eq!(default_res.matches[0].line, "needle");
+        assert_eq!(default_res.matches[1].line, "needle");
+    }
+
+    #[test]
+    fn list_files_supports_oversized_symlinks_and_unicode_precomposition() {
+        let scratch = Scratch::new();
+        scratch.write("small.txt", b"hi\n");
+        scratch.write("big.txt", &[b'a'; 128]);
+        scratch.write("cafe\u{0301}.txt", b"hi\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("small.txt", scratch.path.join("link.txt")).expect("create valid symlink");
+            symlink("missing.txt", scratch.path.join("dangling.txt"))
+                .expect("create dangling symlink");
+        }
+
+        let listed = list_files(&ListRequest {
+            root: scratch.path.clone(),
+            max_file_bytes: 32,
+            include_oversized: true,
+            include_symlinks: true,
+            precompose_unicode: true,
+            ..Default::default()
+        })
+        .expect("listing runs");
+
+        assert!(listed.paths.contains(&"big.txt".to_string()));
+        assert!(listed.paths.contains(&"caf\u{00e9}.txt".to_string()));
+        #[cfg(unix)]
+        {
+            assert!(listed.paths.contains(&"link.txt".to_string()));
+            assert!(listed.paths.contains(&"dangling.txt".to_string()));
+        }
+        assert_eq!(listed.skipped.too_large, 0);
+        assert_eq!(listed.skipped.unreadable, 0);
+
+        // Also assert `precompose_unicode` on `slashed` directly (independent of OS normalization).
+        assert_eq!(
+            slashed(Path::new("dir/cafe\u{0301}.txt"), true),
+            Some("dir/caf\u{00e9}.txt".to_string())
+        );
+
+        let mut search_req = scratch.request("hi");
+        search_req.precompose_unicode = true;
+        let search_res = search(&search_req).expect("search with precompose runs");
+        assert!(
+            search_res
+                .matches
+                .iter()
+                .any(|m| m.path == "caf\u{00e9}.txt"),
+            "expected precomposed search match path: {search_res:?}"
+        );
+    }
+
+    fn run_git_helper(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn include_devcouncil_admits_project_files_while_excluding_dcgrep_and_preserving_defaults() {
+        let scratch = Scratch::new();
+        scratch.write(
+            ".gitignore",
+            b".devcouncil/*\n!.devcouncil/config.yaml\n!.devcouncil/claude-plugin/\n",
+        );
+        scratch.write(".devcouncil/config.yaml", b"mode: needle\n");
+        scratch.write(
+            ".devcouncil/claude-plugin/devcouncil/agents/a.md",
+            b"agent needle\n",
+        );
+        scratch.write(".devcouncil/ledger.sqlite", b"ignored needle\n");
+        scratch.write(".devcouncil/dcgrep/meta.json", b"cache needle\n");
+        scratch.write("src/main.rs", b"code needle\n");
+
+        // Default caller (Manvi / Go client): `.devcouncil` stays excluded.
+        let mut default_req = scratch.request("needle");
+        default_req.include_hidden = true;
+        let default_res = search(&default_req).expect("default search runs");
+        assert_eq!(paths(&default_res), vec!["src/main.rs"]);
+        assert!(
+            search(&Request {
+                pattern: "needle".into(),
+                root: scratch.path.clone(),
+                path: ".devcouncil".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+
+        // Explorer caller (`include_devcouncil: true`): admits un-ignored `.devcouncil/*`,
+        // keeps `.devcouncil/ledger.sqlite` ignored and `.devcouncil/dcgrep` excluded even if
+        // `include_ignored: true` or targeted directly.
+        let mut explorer_req = scratch.request("needle");
+        explorer_req.include_hidden = true;
+        explorer_req.include_devcouncil = true;
+        let mut matched: Vec<String> = search(&explorer_req)
+            .expect("explorer search runs")
+            .matches
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        matched.sort();
+        assert_eq!(
+            matched,
+            vec![
+                ".devcouncil/claude-plugin/devcouncil/agents/a.md",
+                ".devcouncil/config.yaml",
+                "src/main.rs",
+            ]
+        );
+
+        let mut listed = list_files(&ListRequest {
+            root: scratch.path.clone(),
+            include_hidden: true,
+            include_devcouncil: true,
+            ..Default::default()
+        })
+        .expect("explorer list runs")
+        .paths;
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ".devcouncil/claude-plugin/devcouncil/agents/a.md",
+                ".devcouncil/config.yaml",
+                ".gitignore",
+                "src/main.rs",
+            ]
+        );
+
+        // Even with `include_ignored: true` + `include_devcouncil: true`, `.devcouncil/dcgrep`
+        // index blobs remain excluded and cannot be targeted directly.
+        let mut ignored_req = scratch.request("needle");
+        ignored_req.include_hidden = true;
+        ignored_req.include_devcouncil = true;
+        ignored_req.include_ignored = true;
+        let ignored_paths: Vec<String> = search(&ignored_req)
+            .expect("ignored explorer search runs")
+            .matches
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        assert!(
+            ignored_paths
+                .iter()
+                .all(|p| !p.starts_with(".devcouncil/dcgrep")),
+            "dcgrep cache leaked: {ignored_paths:?}"
+        );
+        assert!(ignored_paths.contains(&".devcouncil/ledger.sqlite".to_string()));
+
+        assert!(
+            search(&Request {
+                pattern: "needle".into(),
+                root: scratch.path.clone(),
+                path: ".devcouncil".into(),
+                include_devcouncil: true,
+                include_hidden: true,
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            search(&Request {
+                pattern: "needle".into(),
+                root: scratch.path.clone(),
+                path: ".devcouncil/dcgrep".into(),
+                include_devcouncil: true,
+                include_hidden: true,
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ignore_dot_ignore_prevents_dot_ignore_from_overriding_gitignore() {
+        let scratch = Scratch::new();
+        scratch.write(".gitignore", b"*.ignored\nsecret/\n");
+        scratch.write(".ignore", b"!keep.ignored\n!secret/\n");
+        scratch.write("keep.ignored", b"needle\n");
+        scratch.write("secret/data.txt", b"needle\n");
+        scratch.write("src/ok.txt", b"needle\n");
+        // Non-git nested subdirectory `.ignore` must also be suppressed when requested.
+        scratch.write("sub/.ignore", b"!nested.ignored\n");
+        scratch.write("sub/nested.ignored", b"needle\n");
+        scratch.write("sub/ok.txt", b"needle\n");
+
+        // Default `.ignore` behavior stays unchanged for existing callers.
+        let default_res = search(&scratch.request("needle")).expect("default search runs");
+        assert!(
+            paths(&default_res).contains(&"keep.ignored"),
+            "default dc-grep honors .ignore: {:?}",
+            default_res.matches
+        );
+
+        let mut git_only_req = scratch.request("needle");
+        git_only_req.ignore_dot_ignore = true;
+        let git_only_res = search(&git_only_req).expect("ignore_dot_ignore search runs");
+        assert_eq!(paths(&git_only_res), vec!["src/ok.txt", "sub/ok.txt"]);
+
+        let mut sub_req = scratch.request("needle");
+        sub_req.path = "sub".to_string();
+        sub_req.ignore_dot_ignore = true;
+        let sub_res = search(&sub_req).expect("sub search runs");
+        assert_eq!(paths(&sub_res), vec!["sub/ok.txt"]);
+
+        let mut listed = list_files(&ListRequest {
+            root: scratch.path.clone(),
+            ignore_dot_ignore: true,
+            ..Default::default()
+        })
+        .expect("list runs")
+        .paths;
+        listed.sort();
+        assert_eq!(listed, vec!["src/ok.txt", "sub/ok.txt"]);
+    }
+
+    #[test]
+    fn untracked_nested_git_repos_and_worktrees_are_not_descended_inside_git_root() {
+        let scratch = Scratch::new();
+        scratch.write(".git/HEAD", b"ref: refs/heads/main\n");
+        scratch.write("keep.txt", b"needle\n");
+        scratch.write(".worktrees/wt1/.git", b"gitdir: /elsewhere/wt1\n");
+        scratch.write(".worktrees/wt1/secret.rs", b"needle\n");
+        scratch.write("nested_repo/.git/HEAD", b"ref: refs/heads/main\n");
+        scratch.write("nested_repo/inside.rs", b"needle\n");
+
+        let mut req = scratch.request("needle");
+        req.include_hidden = true;
+        let res = search(&req).expect("search runs");
+        assert_eq!(paths(&res), vec!["keep.txt"]);
+
+        let listed = list_files(&ListRequest {
+            root: scratch.path.clone(),
+            include_hidden: true,
+            ..Default::default()
+        })
+        .expect("list runs");
+        assert_eq!(listed.paths, vec!["keep.txt"]);
+
+        // Direct subdir target inside an untracked nested git repo is also empty.
+        let mut sub_req = scratch.request("needle");
+        sub_req.path = "nested_repo".to_string();
+        sub_req.include_hidden = true;
+        let sub_res = search(&sub_req).expect("sub search runs");
+        assert!(sub_res.matches.is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_machinery_core_ignorecase_and_crlf_anchors() {
+        let scratch = Scratch::new();
+        scratch.write(".git/HEAD", b"ref: refs/heads/main\n");
+        // Verify comment-before-backslash and `]` inside quoted subsection name do not break `core.ignorecase`.
+        scratch.write(
+            ".git/config",
+            b"[branch \"fix]1\"]\n\tremote = origin # comment \\\n[core]\n\tignorecase = true\n",
+        );
+        scratch.write(".gitignore", b"BUILD/\n");
+        scratch.write("build/generated.txt", b"needle\n");
+        scratch.write("sub/.GIT/secret.txt", b"needle\n");
+        scratch.write("sub/.DEVCouncil/secret.txt", b"needle\n");
+        scratch.write("crlf.txt", b"alpha needle\r\nneedle beta\r\n");
+
+        let mut req = scratch.request("needle$");
+        req.include_hidden = true;
+        let res = search(&req).expect("crlf end-anchor search runs");
+        assert_eq!(res.count, 1, "only CRLF end-of-line should match: {res:?}");
+        assert_eq!(res.matches[0].path, "crlf.txt");
+        assert_eq!(res.matches[0].line_number, 1);
+
+        let mut all_req = scratch.request("needle");
+        all_req.include_hidden = true;
+        let all_res = search(&all_req).expect("all search runs");
+        assert_eq!(paths(&all_res), vec!["crlf.txt", "crlf.txt"]);
+
+        // `include_ignored: true` + `include_hidden: true` must still exclude `.GIT` and `.DEVCouncil`.
+        let mut inc_ignored = scratch.request("needle");
+        inc_ignored.include_hidden = true;
+        inc_ignored.include_ignored = true;
+        let inc_res = search(&inc_ignored).expect("ignored search runs");
+        assert!(
+            inc_res
+                .matches
+                .iter()
+                .all(|m| !m.path.contains(".GIT") && !m.path.contains(".DEVCouncil")),
+            "case-insensitive machinery leaked: {:?}",
+            inc_res.matches
+        );
+
+        // With `core.ignorecase = false`, `BUILD/` must NOT ignore lowercase `build/`.
+        scratch.write(".git/config", b"[core]\n\tignorecase = false\n");
+        let case_sensitive_res = search(&all_req).expect("case-sensitive ignore search runs");
+        let cs_paths = paths(&case_sensitive_res);
+        assert!(
+            cs_paths.contains(&"build/generated.txt"),
+            "expected build/generated.txt when core.ignorecase = false: {cs_paths:?}"
+        );
+    }
+
+    #[test]
+    fn include_git_tracked_searches_tracked_gitignored_files_in_v3_and_v4_indexes() {
+        for index_version in [3, 4] {
+            let scratch = Scratch::new();
+            run_git_helper(&scratch.path, &["init", "-q"]);
+            run_git_helper(
+                &scratch.path,
+                &["config", "index.version", &index_version.to_string()],
+            );
+            scratch.write(".gitignore", b"AGENTS.md\nCLAUDE.md\nignored.txt\n");
+            scratch.write("AGENTS.md", b"guide needle\n");
+            scratch.write("CLAUDE.md", b"claude needle\n");
+            scratch.write("ignored.txt", b"untracked needle\n");
+            scratch.write("src/lib.rs", b"code needle\n");
+            scratch.write("tracked_deleted.md", b"deleted needle\n");
+            run_git_helper(
+                &scratch.path,
+                &["add", ".gitignore", "src/lib.rs", "tracked_deleted.md"],
+            );
+            run_git_helper(&scratch.path, &["add", "-f", "AGENTS.md", "CLAUDE.md"]);
+            fs::remove_file(scratch.path.join("tracked_deleted.md")).unwrap();
+
+            #[cfg(unix)]
+            let outside = Scratch::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                outside.write("outside_target.txt", b"symlink needle\n");
+                // Ignored + tracked-as-regular: replace on-disk file with symlink -> must NOT follow.
+                fs::remove_file(scratch.path.join("CLAUDE.md")).unwrap();
+                symlink(
+                    outside.path.join("outside_target.txt"),
+                    scratch.path.join("CLAUDE.md"),
+                )
+                .unwrap();
+            }
+
+            let mut req = scratch.request("needle");
+            req.include_hidden = true;
+            req.include_git_tracked = true;
+            req.include_devcouncil = true;
+            req.ignore_dot_ignore = true;
+            let res = search(&req).expect("git tracked search runs");
+            let mut matched = paths(&res);
+            matched.sort();
+            #[cfg(unix)]
+            let expected = vec!["AGENTS.md", "src/lib.rs"];
+            #[cfg(not(unix))]
+            let expected = vec!["AGENTS.md", "CLAUDE.md", "src/lib.rs"];
+            assert_eq!(matched, expected, "v{index_version} matches: {res:?}");
+            assert_eq!(res.skipped.unreadable, 0);
+        }
     }
 }

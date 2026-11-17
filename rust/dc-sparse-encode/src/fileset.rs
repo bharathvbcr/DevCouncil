@@ -78,10 +78,9 @@ pub fn select(root: &Path, max_files: usize, force_walk: bool) -> Result<Selecti
 fn list(root: &Path, max_files: usize) -> Result<Selection, String> {
     let response = dc_grep::list_files(&dc_grep::ListRequest {
         root: root.to_path_buf(),
-        path: String::new(),
         max_results: max_files,
-        include_ignored: false,
         max_file_bytes: MAX_FILE_BYTES,
+        ..Default::default()
     })?;
     if !response.ok {
         return Err("dcgrep files returned ok: false".into());
