@@ -853,6 +853,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// would keep serving that edge. A `sys.path` write the pass cannot follow
 /// (`remove`, reassignment, `del`) still withdraws every entry. No resolver
 /// rule changed, so `RESOLUTION_REUSE_EPOCH` does not move.
+///
+/// v100 also folds the byte length into the source identity
+/// (`source_identity`, stored as `content_hash`): a v99 row holds plain
+/// FNV-1a 64, so it never matches, and two inputs with one FNV-1a 64 and
+/// different lengths no longer read as the same file. `ipc_identity_for` and
+/// the artifact fingerprint stay on plain FNV (`fnv1a64`). The value moves
+/// with no DDL, so the store schema constants do not move.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "100";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -874,7 +881,7 @@ pub struct CacheKey {
 #[cfg(feature = "parse")]
 impl CacheKey {
     pub fn for_source(language: &str, source: &str) -> Self {
-        Self::for_content_hash(language, crate::content_hash(source))
+        Self::for_content_hash(language, crate::source_identity(source))
     }
 
     fn for_content_hash(language: &str, content_hash: u64) -> Self {

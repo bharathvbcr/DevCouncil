@@ -1890,6 +1890,8 @@ pub struct RustScopeFacts {
 pub struct Extraction {
     pub file_path: String,
     pub language: String,
+    /// `source_identity` of the file bytes (FNV-1a 64 with the byte length
+    /// folded in), under the name the payload JSON and SQL columns always had.
     pub content_hash: u64,
     #[serde(default = "default_extraction_engine")]
     pub engine: ExtractionEngine,

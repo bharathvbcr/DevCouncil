@@ -100,7 +100,7 @@ fn write_generation(root: &Path, head: &str) {
              VALUES (?1, ?1, ?2, ?3, ?4, ?5, '\"Clean\"', '\"TreeSitter\"', '{}')",
             params![
                 id,
-                devmap_extract::content_hash(source) as i64,
+                devmap_extract::source_identity(source) as i64,
                 language,
                 grammar,
                 analyzer

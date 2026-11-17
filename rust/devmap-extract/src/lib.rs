@@ -434,17 +434,52 @@ mod prune_ledger_tests {
     }
 }
 
-/// Canonical source-content identity shared by extraction, cache, and
-/// connect-time freshness checks.
-pub fn content_hash(source: &str) -> u64 {
+/// Plain FNV-1a 64 over `bytes`: the one owner of the constants.
+///
+/// This is the hash a contract names, not a source identity. The daemon's IPC
+/// endpoint (`ipc_identity_for`, mirrored by the Python client) and the
+/// artifact stamp fingerprint use it as is. What an `Extraction` records, and
+/// what every freshness comparison reads, is [`source_identity`], which folds
+/// the length in on top of this value. (`clonesig` and the store's CSR
+/// writer keep private FNV copies for their own, unrelated formats.)
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
-    source
-        .as_bytes()
-        .iter()
-        .fold(FNV_OFFSET_BASIS, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-        })
+    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+/// Folds a byte length into an FNV state: `(h ^ len * K) * P`, with `K` and
+/// the FNV prime `P` both odd.
+///
+/// For a fixed `h`, `len -> fold_length(h, len)` is injective on `u64`: a
+/// multiplication by an odd constant and an XOR with a fixed value are each a
+/// bijection mod 2^64. So two inputs whose FNV-1a 64 agree and whose lengths
+/// differ always get different identities. The `K` multiply keeps the fold from
+/// reducing to "plain FNV of the bytes followed by a length byte", which would
+/// let a pre-fold row alias a current identity.
+fn fold_length(h: u64, len: u64) -> u64 {
+    const FNV_PRIME: u64 = 0x100000001b3;
+    const LENGTH_KEY: u64 = 0x9E3779B97F4A7C15;
+    (h ^ len.wrapping_mul(LENGTH_KEY)).wrapping_mul(FNV_PRIME)
+}
+
+/// Canonical source-content identity shared by extraction, cache, and
+/// connect-time freshness checks, over the raw bytes of a file.
+///
+/// It is FNV-1a 64 with the byte length folded in ([`fold_length`]), so a
+/// collision of different lengths no longer reads as an unchanged file.
+/// Equal-length collisions are not separated: no 64-bit value can be injective
+/// over all inputs, and this one is a change detector, not a cryptographic
+/// digest. Stored under the column and field name `content_hash`.
+pub fn source_identity_bytes(bytes: &[u8]) -> u64 {
+    fold_length(fnv1a64(bytes), bytes.len() as u64)
+}
+
+/// [`source_identity_bytes`] over the UTF-8 bytes of `source`.
+pub fn source_identity(source: &str) -> u64 {
+    source_identity_bytes(source.as_bytes())
 }
 
 /// The one configuration of the tree walk, and so the one statement of which
@@ -1101,12 +1136,103 @@ pub fn retry_budget_refusals(
 
 #[cfg(test)]
 mod content_hash_tests {
-    use super::content_hash;
+    use super::{fnv1a64, fold_length, source_identity, source_identity_bytes};
 
     #[test]
-    fn content_hash_is_pinned_fnv1a64() {
-        assert_eq!(content_hash(""), 0xcbf29ce484222325);
-        assert_eq!(content_hash("hello"), 0xa430d84680aabd0b);
+    fn fnv1a64_is_pinned() {
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"hello"), 0xa430d84680aabd0b);
+    }
+
+    /// Computed by an independent implementation of the same formula
+    /// (`fold_length(fnv1a64(x), len(x))`), not by this crate.
+    #[test]
+    fn source_identity_is_pinned_and_is_not_plain_fnv() {
+        assert_eq!(source_identity(""), 0xaf63bd4c8601b7df);
+        assert_eq!(source_identity("hello"), 0x47ea7c68ae9dc986);
+        assert_ne!(source_identity(""), fnv1a64(b""));
+        assert_ne!(source_identity("hello"), fnv1a64(b"hello"));
+        assert_eq!(
+            source_identity("hello"),
+            source_identity_bytes(b"hello"),
+            "the &str entry point is the byte entry point"
+        );
+    }
+
+    /// `d5 6b b9 53 42 87 08 36` hashes to 0 under FNV-1a 64 (the zero-hash
+    /// input from the FNV reference material; the citation is not re-fetched
+    /// here, the value is recomputed). State 0 is sticky under a `0x00` byte, so
+    /// appending one gives a second, longer input with the same FNV.
+    ///
+    /// The input is not valid UTF-8, so it cannot be reached through `&str` and
+    /// a real indexed file never holds it (discovery drops non-UTF-8 files).
+    /// The test is byte-level because the guarantee under test is the
+    /// function's, not the walker's.
+    #[test]
+    fn two_inputs_with_one_fnv_and_different_lengths_get_different_identities() {
+        let x: [u8; 8] = [0xd5, 0x6b, 0xb9, 0x53, 0x42, 0x87, 0x08, 0x36];
+        let mut x0 = x.to_vec();
+        x0.push(0);
+        let mut xs = x.to_vec();
+        xs.push(b'x');
+        let mut x0s = x.to_vec();
+        x0s.extend_from_slice(&[0, b'x']);
+
+        for (short, long) in [(x.to_vec(), x0), (xs, x0s)] {
+            assert_eq!(
+                fnv1a64(&short),
+                fnv1a64(&long),
+                "control: the pair is a real FNV-1a 64 collision"
+            );
+            assert_ne!(short.len(), long.len());
+            assert_ne!(
+                source_identity_bytes(&short),
+                source_identity_bytes(&long),
+                "length must separate a collision of different lengths"
+            );
+        }
+        assert_eq!(fnv1a64(&x), 0);
+    }
+
+    /// For one fixed FNV state the fold is injective in the length (XOR with a
+    /// fixed value and multiplication by an odd constant are bijections mod
+    /// 2^64), which is the exact guarantee the doc states.
+    #[test]
+    fn the_fold_separates_every_length_for_a_fixed_state() {
+        let states = [
+            0,
+            1,
+            1 << 63,
+            u64::MAX,
+            0xcbf29ce484222325,
+            0xa430d84680aabd0b,
+        ];
+        let lens: [u64; 8] = [0, 1, 2, 255, 256, 1 << 20, (1 << 20) + 1, u64::MAX];
+        for h in states {
+            let seen: std::collections::BTreeSet<u64> =
+                lens.iter().map(|len| fold_length(h, *len)).collect();
+            assert_eq!(seen.len(), lens.len(), "state {h:#x} aliased two lengths");
+        }
+    }
+
+    /// The fold is not "plain FNV of the bytes plus one length byte": that
+    /// structure would let a v99 row of `x ‖ [len]` alias the v100 identity of
+    /// `x`. It holds for every non-empty input; the empty input is the one
+    /// structural alias (`0 * K == 0`, so it equals plain FNV of a lone `0x00`
+    /// byte), which the `:extract-v100` analyzer string, not the value, keeps
+    /// away from a v99 row.
+    #[test]
+    fn the_fold_does_not_alias_an_appended_length_byte() {
+        assert_eq!(
+            source_identity(""),
+            fnv1a64(&[0]),
+            "the documented exception"
+        );
+        for src in ["a", "hello", "fn main() {}\n"] {
+            let mut appended = src.as_bytes().to_vec();
+            appended.push(src.len() as u8);
+            assert_ne!(source_identity(src), fnv1a64(&appended), "{src:?}");
+        }
     }
 }
 
@@ -1336,7 +1462,7 @@ impl ScannedTree {
     /// `(path, content_hash)` for every admitted file.
     ///
     /// This is exactly the identity an `Extraction` carries. Every construction
-    /// site sets `content_hash: content_hash(source)` over the same bytes
+    /// site sets `content_hash: source_identity(source)` over the same bytes
     /// discovery read (`treesitter.rs` — the parsed, refused and unavailable
     /// arms alike; `notebook.rs` builds on the same base), and `file_path` is
     /// the discovery path. A cached payload is only ever returned for a key
@@ -1346,7 +1472,7 @@ impl ScannedTree {
     pub fn file_hashes(&self) -> Vec<(&str, u64)> {
         self.sources
             .par_iter()
-            .map(|(path, source)| (path.as_str(), content_hash(source)))
+            .map(|(path, source)| (path.as_str(), source_identity(source)))
             .collect()
     }
 

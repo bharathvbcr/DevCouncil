@@ -11,7 +11,7 @@ pub(super) fn unparsed_extraction(
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
-        content_hash: content_hash(source),
+        content_hash: source_identity(source),
         engine,
         parse_outcome,
         // The File node is still emitted: being unable to parse a file is not a
@@ -161,7 +161,7 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
-        content_hash: content_hash(source),
+        content_hash: source_identity(source),
         engine: match (recovered, declarative) {
             (true, _) => ExtractionEngine::RegexFallback {
                 requested_language: lang.to_string(),

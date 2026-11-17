@@ -834,7 +834,7 @@ impl StoreQueryEngine<'_> {
                             crate::bounded_text(&error.to_string(), REASON_PATH_BYTES)
                         ));
                     }
-                    Ok(source) if devmap_extract::content_hash(&source) != row.content_hash => {
+                    Ok(source) if devmap_extract::source_identity(&source) != row.content_hash => {
                         regions_unchecked += ranges.len();
                         why.push(
                             "changed since the build; its charged ranges were not checked"

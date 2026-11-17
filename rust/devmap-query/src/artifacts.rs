@@ -416,7 +416,7 @@ impl ArtifactRecord {
                     "artifact exceeds the bounded fingerprint read limit",
                 ));
             }
-            Some(devmap_extract::content_hash(&content))
+            Some(devmap_extract::fnv1a64(content.as_bytes()))
         } else {
             None
         };

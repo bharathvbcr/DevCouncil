@@ -247,7 +247,7 @@ fn p1_the_build_read_path_and_the_check_read_path_hash_alike() {
         devmap_extract::MAX_SOURCE_BYTES,
     )
     .unwrap();
-    assert_eq!(devmap_extract::content_hash(&source), ext.content_hash);
+    assert_eq!(devmap_extract::source_identity(&source), ext.content_hash);
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -626,7 +626,7 @@ pub(super) fn extract_treesitter_before_deadline(
                 // Measured: a 4,000-byte C++ file of 2,000 nested braces parses
                 // in 3 ms and then spends 199 s in the walk, so bounding the
                 // parse alone bounds nothing that actually hurts.
-                let content_hash = content_hash(source);
+                let content_hash = source_identity(source);
 
                 let root = tree.root_node();
                 // Kotlin only: statements the grammar read as expressions,

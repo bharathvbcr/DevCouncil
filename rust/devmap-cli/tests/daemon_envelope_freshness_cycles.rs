@@ -83,7 +83,7 @@ fn tree_differs(root: &Path, reader: &Store) -> bool {
     }
     walked.iter().any(|(path, _)| {
         let on_disk = std::fs::read_to_string(root.join(path))
-            .map(|source| devmap_extract::content_hash(&source));
+            .map(|source| devmap_extract::source_identity(&source));
         on_disk.ok() != stored.get(path).copied()
     })
 }

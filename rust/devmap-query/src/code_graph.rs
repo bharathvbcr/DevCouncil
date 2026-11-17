@@ -798,7 +798,7 @@ fn graph_core(
             devmap_extract::MAX_SOURCE_BYTES,
         )
         .ok()
-        .filter(|text| devmap_extract::content_hash(text) == ext.content_hash)
+        .filter(|text| devmap_extract::source_identity(text) == ext.content_hash)
         .map(|text| LineIndex::new(&text));
         if lines.is_none() {
             provenance.files_without_readable_source += 1;

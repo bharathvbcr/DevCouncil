@@ -564,7 +564,7 @@ fn run_build(
     // The comparison itself is made against the scan rather than
     // against extractions. `ScannedTree::matches_file_hashes` compares
     // the same `(path, content_hash)` pairs the extractions carry —
-    // every `Extraction` is built with `content_hash(source)` over the
+    // every `Extraction` is built with `source_identity(source)` over the
     // bytes discovery read, and a cached payload is only ever served
     // for a key built from those same bytes and a matching `file_path`
     // — so the verdict is the one extraction would have produced, for

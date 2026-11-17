@@ -5,8 +5,8 @@ use tracing::{info, warn};
 
 use devmap_analyze::analyze_with_discovery;
 use devmap_extract::{
-    collect_project_manifests, collect_sources_with_report, content_hash, extract_file,
-    is_indexable_source, DiscoverySkipReason, MAX_SOURCE_BYTES,
+    collect_project_manifests, collect_sources_with_report, extract_file, is_indexable_source,
+    source_identity, DiscoverySkipReason, MAX_SOURCE_BYTES,
 };
 use devmap_resolve::Resolver;
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
@@ -827,7 +827,7 @@ impl Daemon {
             .collect();
         let current: std::collections::BTreeMap<_, _> = sources
             .iter()
-            .map(|(path, source)| (path.clone(), content_hash(source)))
+            .map(|(path, source)| (path.clone(), source_identity(source)))
             .collect();
         let mut pending = std::collections::BTreeSet::new();
         for (path, hash) in &current {
@@ -2423,7 +2423,7 @@ enum LoopExit {
 ///    separator and no terminator.
 /// 3. **Hash**: FNV-1a, 64-bit. Offset basis `0xcbf29ce484222325`, prime
 ///    `0x100000001b3`; per byte, `hash = (hash XOR byte) * prime`, multiplication
-///    wrapping at 64 bits. This is `devmap_extract::content_hash`, reused rather
+///    wrapping at 64 bits. This is `devmap_extract::fnv1a64`, reused rather
 ///    than re-spelled so the constants have one definition.
 /// 4. **Rendering**: lowercase hexadecimal, zero-padded to exactly 16 digits.
 /// 5. **Directory**: `<system temp dir>/devmap-<hex>`, created mode `0700`.
@@ -2451,7 +2451,7 @@ enum LoopExit {
 pub fn ipc_identity_for(root: &std::path::Path) -> u64 {
     let canonical = root.canonicalize();
     let canonical = canonical.as_deref().unwrap_or(root);
-    devmap_extract::content_hash(&canonical.to_string_lossy())
+    devmap_extract::fnv1a64(canonical.to_string_lossy().as_bytes())
 }
 
 /// `<temp_dir>/devmap-{ipc_identity_for(root):016x}/ipc.sock`.
@@ -5029,7 +5029,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-shutdown-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5093,7 +5093,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-vanished-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5156,7 +5156,7 @@ mod tests {
         let db = root.join("devmap.sqlite");
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-replaced-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5298,7 +5298,7 @@ mod tests {
         let db = root.join("devmap.sqlite");
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-nostore-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5339,6 +5339,32 @@ mod tests {
         );
         assert!(!lock.exists(), "a storeless daemon left its lock behind");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The endpoint identity is a cross-implementation contract (the Python
+    /// client derives it), so its output is pinned as literals rather than
+    /// restated through the hash it is built from. The two roots do not exist,
+    /// so `ipc_identity_for` falls back to the path as written and the input
+    /// bytes are exactly the ones below. The values are plain FNV-1a 64 over
+    /// those bytes, computed by an independent implementation; they must not
+    /// move when the source-identity hash changes.
+    #[cfg(unix)]
+    #[test]
+    fn the_ipc_identity_is_pinned_to_plain_fnv1a64() {
+        use std::path::Path;
+        assert_eq!(
+            ipc_identity_for(Path::new("/nonexistent-w16/devmap/golden")),
+            0x0824_c575_5ad9_30d8
+        );
+        assert_eq!(
+            ipc_identity_for(Path::new("/nonexistent-w16/other-root")),
+            0x4bf7_e9ab_f6a2_1b82
+        );
+        assert_eq!(
+            ipc_identity_for(Path::new("")),
+            0xcbf2_9ce4_8422_2325,
+            "the empty path is the FNV offset basis"
+        );
     }
 
     /// The IPC path must be a function of the *canonical* root.
@@ -5384,7 +5410,7 @@ mod tests {
         let expected = std::env::temp_dir()
             .join(format!(
                 "devmap-{:016x}",
-                devmap_extract::content_hash(&canonical.to_string_lossy())
+                devmap_extract::fnv1a64(canonical.to_string_lossy().as_bytes())
             ))
             .join("ipc.sock");
         assert_eq!(direct, expected);
@@ -5405,7 +5431,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-cancel-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let _ = fs::remove_file(&socket);
         let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())

@@ -126,7 +126,8 @@ flowchart TD
 ## Code graph pipeline
 
 1. `devmap-extract` discovers files and extracts definitions, imports, calls and
-   language-specific evidence (extraction schema 100), including bounded Lean 4
+   language-specific evidence (extraction schema 100; a file's `content_hash` is FNV-1a 64
+   with its byte length folded in, `source_identity`), including bounded Lean 4
    declarations (`devmap lean-tcb`) and per-file symbol/call/reference caps
    (`MAX_FILE_SYMBOLS`, `MAX_FILE_CALLS`, `MAX_FILE_REFERENCES`). Handles Java records, compact
    constructors, enum constants, Kotlin expression-recovery, Svelte template text
