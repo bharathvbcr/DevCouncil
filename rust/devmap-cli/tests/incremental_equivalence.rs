@@ -1340,3 +1340,114 @@ fn a_blob_beside_the_current_epoch_directory_is_never_read() {
     assert_matches_cold(&root);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// Attack lane A (ft-87363ce5): the file-wide unreadable-insert veto through the
+// real build, incremental and cache seams.
+// ---------------------------------------------------------------------------
+
+const ATK_HEAD: &str = "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\nsys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))\n";
+const ATK_TAIL: &str = "import analyse_wave20 as a20\n\ndef test_it():\n    a20.spearman([], [])\n";
+const ATK_MODULE: &str = "def spearman(xs, ys):\n    return 0.0\n";
+
+fn atk_tree(name: &str) -> std::path::PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("devmap-atk-syspath-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("scripts/aws")).unwrap();
+    std::fs::write(root.join("scripts/aws/analyse_wave20.py"), ATK_MODULE).unwrap();
+    root
+}
+
+fn atk_links_aws(root: &std::path::Path) -> bool {
+    graph(root)
+        .iter()
+        .any(|row| row.contains("test_x.py") && row.contains("scripts/aws/analyse_wave20.py"))
+}
+
+/// Adding an unreadable module-level insert on an incremental build removes the
+/// `sys.path`-derived link; removing it restores the link; each build equals a
+/// cold build of the same tree.
+#[test]
+fn atk_an_edit_that_adds_or_removes_an_unreadable_insert_updates_the_link() {
+    let root = atk_tree("edit");
+    let file = root.join("scripts/test_x.py");
+    std::fs::write(&file, format!("{ATK_HEAD}{ATK_TAIL}")).unwrap();
+    build(&root);
+    assert!(atk_links_aws(&root), "control: the readable insert links");
+
+    std::fs::write(
+        &file,
+        format!("{ATK_HEAD}sys.path.insert(0, somewhere)\n{ATK_TAIL}"),
+    )
+    .unwrap();
+    build(&root);
+    let vetoed = graph(&root);
+    assert!(
+        !atk_links_aws(&root),
+        "the unreadable insert did not veto: {vetoed:?}"
+    );
+
+    std::fs::write(&file, format!("{ATK_HEAD}{ATK_TAIL}")).unwrap();
+    build(&root);
+    assert!(
+        atk_links_aws(&root),
+        "removing the unreadable insert did not restore the link"
+    );
+    let incremental = graph(&root);
+
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(&root)).unwrap();
+    build(&root);
+    assert_eq!(incremental, graph(&root), "incremental != cold");
+
+    // The same through the explicit affected-files path.
+    std::fs::write(
+        &file,
+        format!("{ATK_HEAD}sys.path.insert(0, somewhere)\n{ATK_TAIL}"),
+    )
+    .unwrap();
+    let out = Command::new(devmap())
+        .args(["build", ".", "--affected", "scripts/test_x.py"])
+        .current_dir(&root)
+        .output()
+        .expect("devmap build --affected");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!atk_links_aws(&root), "--affected did not apply the veto");
+    let affected = graph(&root);
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(&root)).unwrap();
+    build(&root);
+    assert_eq!(affected, graph(&root), "--affected != cold");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A generation whose payloads carry the v99 identity is stale, is rebuilt, and
+/// the rebuilt graph equals a cold one.
+#[test]
+fn atk_a_v99_generation_with_an_unreadable_insert_is_not_served_at_v100() {
+    let root = atk_tree("v99");
+    std::fs::write(
+        root.join("scripts/test_x.py"),
+        format!("{ATK_HEAD}sys.path.insert(0, somewhere)\n{ATK_TAIL}"),
+    )
+    .unwrap();
+    build(&root);
+    let fresh = graph(&root);
+    let v99 = format!("{}:extract-v99", devmap_extract::cache::ANALYZER_VERSION);
+    {
+        let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+        assert!(age_payloads(&conn, Some(&v99)) > 0);
+    }
+    let store = devmap_store::Store::open(db_path(&root)).unwrap();
+    assert!(!store.latest_generation_payload_is_current().unwrap());
+    drop(store);
+    build(&root);
+    let store = devmap_store::Store::open(db_path(&root)).unwrap();
+    assert!(store.latest_generation_payload_is_current().unwrap());
+    drop(store);
+    assert_eq!(graph(&root), fresh);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -1119,8 +1119,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v92 integrates the Rust, TypeScript/Go and Swift lanes; v93 integrates
     // main's Swift payload on top (see cache.rs).
+    //
+    // v100 keeps a Python file's readable module-level `sys.path` entries and
+    // adds a file-wide veto row when a module-level insert's directory cannot
+    // be read (see cache.rs).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "99",
+        EXTRACTION_SCHEMA_VERSION, "100",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

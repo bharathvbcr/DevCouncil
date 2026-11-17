@@ -127,8 +127,8 @@ fn a_generation_carrying_v98_payloads_is_not_current_and_forces_rebuild() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         let changed = conn
             .execute(
-                "UPDATE file_payloads SET analyzer_version = REPLACE(analyzer_version, ':extract-v99', ':extract-v98')",
-                [],
+                "UPDATE file_payloads SET analyzer_version = REPLACE(analyzer_version, ?1, ':extract-v98')",
+                [format!(":extract-v{EXTRACTION_SCHEMA_VERSION}")],
             )
             .unwrap();
         assert!(
@@ -175,9 +175,10 @@ fn a_generation_carrying_v98_payloads_is_not_current_and_forces_rebuild() {
             |row| row.get(0),
         )
         .unwrap();
+    let expected = format!(":extract-v{EXTRACTION_SCHEMA_VERSION}");
     assert!(
-        analyzer_version.ends_with(":extract-v99"),
-        "rebuilt generation files must carry :extract-v99, got {analyzer_version}"
+        analyzer_version.ends_with(&expected),
+        "rebuilt generation files must carry {expected}, got {analyzer_version}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

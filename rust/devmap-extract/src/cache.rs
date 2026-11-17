@@ -843,7 +843,17 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// resolution-reuse blob. That also retires edges written under the resolver
 /// rules that changed after `RESOLUTION_REUSE_EPOCH` 2, so the epoch does not
 /// move with this bump.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "99";
+///
+/// v100 keeps a Python file's readable module-level `sys.path` entries when a
+/// module-level insert's directory cannot be read, and adds one
+/// `SearchDirectory` row with an empty specifier, no `anchor_up` and no scope
+/// at the first such insert: the resolver's `veto_all`. v99 withdrew every
+/// entry and emitted no row for that insert, so an ordinary import that
+/// a known entry shadowed bound the sibling file confidently; a warm cache
+/// would keep serving that edge. A `sys.path` write the pass cannot follow
+/// (`remove`, reassignment, `del`) still withdraws every entry. No resolver
+/// rule changed, so `RESOLUTION_REUSE_EPOCH` does not move.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "100";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
