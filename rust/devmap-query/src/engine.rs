@@ -4245,6 +4245,10 @@ fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
 mod attribution_disclosure_tests;
 
 #[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/pruned_generation_namesake.rs"]
+mod pruned_generation_namesake;
+
+#[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/tests.rs"]
 mod tests;
 

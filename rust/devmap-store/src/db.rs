@@ -59,6 +59,33 @@ pub(crate) fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
+thread_local! {
+    /// Set only by tests. Production leaves it `None`, and the read then does
+    /// nothing here.
+    static GENERATION_READ_PAUSE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pause after a generation existence check has passed and before the select
+/// that reads that generation.
+///
+/// `#[cfg(test)]` items are not compiled into the library that `tests/*.rs`
+/// and `devmap-query`'s tests link, so this is `pub` and hidden rather than
+/// test-gated. A test sets it to commit a prune from a second connection at
+/// that one point. The hook is thread-local and runs on the reading thread.
+/// Nothing in production sets it; the cost is one thread-local read per call.
+#[doc(hidden)]
+pub fn set_generation_read_pause(hook: Option<fn()>) {
+    GENERATION_READ_PAUSE.with(|slot| slot.set(hook));
+}
+
+fn fire_generation_read_pause() {
+    GENERATION_READ_PAUSE.with(|slot| {
+        if let Some(hook) = slot.get() {
+            hook();
+        }
+    });
+}
+
 /// What a reader is told about a damaged full-text index, and what to do.
 ///
 /// Two causes produce the same symptom, and the remedy differs, so both are

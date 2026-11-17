@@ -362,6 +362,11 @@ impl Store {
 
     /// [`Self::search_page`] against a generation the caller already pinned.
     ///
+    /// The existence check, the count, the page and the two disclosures read
+    /// one deferred snapshot ([`Self::generation_snapshot`]), so a prune that
+    /// commits mid-call cannot turn a hit into `total: 0, rows: []`. `None` is
+    /// a generation the snapshot did not hold.
+    ///
     /// `narrowing` of `None`, or one with every list empty, runs the unfiltered
     /// statements unchanged. A set filter joins the same generation's paths and
     /// files so the count and the page see one filtered set — applying the
@@ -375,23 +380,16 @@ impl Store {
         narrowing: Option<&KeywordNarrowing>,
     ) -> Result<Option<SearchPage>> {
         let conn = lock_conn(&self.conn)?;
-        let present: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM generations WHERE id = ?1",
-                params![generation],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if present.is_none() {
+        let Some(snapshot) = Self::generation_snapshot(&conn, generation)? else {
             return Ok(None);
-        }
+        };
         let active = narrowing.filter(|filter| filter.active());
         let (total, rows, applied) = if let Some(filter) = active {
-            Self::search_narrowed(&conn, generation, query, limit, filter)?
+            Self::search_narrowed(&snapshot, generation, query, limit, filter)?
         } else {
             (
-                Self::count_search_symbols_locked(&conn, generation, query)?,
-                Self::search_symbols_locked(&conn, generation, query, limit)?,
+                Self::count_search_symbols_locked(&snapshot, generation, query)?,
+                Self::search_symbols_locked(&snapshot, generation, query, limit)?,
                 None,
             )
         };
@@ -399,8 +397,8 @@ impl Store {
             generation,
             total,
             rows,
-            repo_root: self.generation_repo_root_in(&conn, generation)?,
-            analysis: Self::analysis_disclosure_in(&conn, generation)?,
+            repo_root: self.generation_repo_root_in(&snapshot, generation)?,
+            analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
             narrowing: applied,
         }))
     }
@@ -1827,6 +1825,33 @@ impl Store {
             Some(generation) => Ok(Some((snapshot, generation))),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::latest_snapshot`] for a generation the caller already holds.
+    ///
+    /// `BEGIN DEFERRED`; the existence check is the transaction's first
+    /// statement, so it is the snapshot every later read sees. A prune that
+    /// commits afterwards, from another connection or process, is invisible to
+    /// those reads: the reader gets the generation's rows as they were when the
+    /// check passed, not an empty or partial answer from a store that has
+    /// since lost it. `None` means the generation is not in this store in that
+    /// snapshot (pruned or never written), which is a refusal and not an empty
+    /// read. Rolled back on drop; takes no write lock.
+    pub(super) fn generation_snapshot(
+        conn: &Connection,
+        generation: u32,
+    ) -> Result<Option<rusqlite::Transaction<'_>>> {
+        let snapshot = conn.unchecked_transaction()?;
+        let present: bool = snapshot.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
+            params![generation],
+            |row| row.get::<_, i64>(0).map(|found| found != 0),
+        )?;
+        if !present {
+            return Ok(None);
+        }
+        super::fire_generation_read_pause();
+        Ok(Some(snapshot))
     }
 
     /// Refuse a search whose index is not there, instead of reporting that the

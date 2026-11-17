@@ -344,6 +344,12 @@ impl Store {
     /// retained generation is readable exactly. `None` when `generation` is no
     /// longer retained — the pair cannot be made consistent, and the caller
     /// must say so rather than mix two states of the repository.
+    ///
+    /// The existence check and the ledger select are one deferred snapshot
+    /// ([`Self::generation_snapshot`]). Without it a prune committing between
+    /// them deleted the ledger rows whose range had already ended and left the
+    /// rest: a subset that read as the whole ledger. Now the answer is the
+    /// generation's ledger as the check saw it, or `None`.
     pub fn unresolved_sites_naming(
         &self,
         generation: u32,
@@ -424,14 +430,9 @@ impl Store {
         limit_per_key: usize,
     ) -> Result<Option<UnresolvedSitesByName>> {
         let conn = lock_conn(&self.conn)?;
-        let retained: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
-            params![generation],
-            |row| row.get(0),
-        )?;
-        if !retained {
+        let Some(snapshot) = Self::generation_snapshot(&conn, generation)? else {
             return Ok(None);
-        }
+        };
         let mut found: UnresolvedSitesByName = keys
             .iter()
             .map(|name| (name.clone(), (Vec::new(), false)))
@@ -440,7 +441,7 @@ impl Store {
             return Ok(Some(found));
         }
         let sql = keyed_ledger_sql(key, keys.len(), unattributed_only);
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = snapshot.prepare(&sql)?;
         let generation = i64::from(generation);
         let cap = sqlite_limit(limit_per_key.saturating_add(1));
         let mut values: Vec<rusqlite::types::Value> = keys
