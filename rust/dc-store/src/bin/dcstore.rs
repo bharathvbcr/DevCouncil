@@ -31,7 +31,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 
-use dc_proc::cli::{collect_args_with_note, is_version_arg, quote};
+use dc_proc::cli::{collect_args_with_note, is_version_arg, quote, wants_version};
 use dc_store::{AcquireRequest, Lease, LeaseCode, ReadyMode, ScopeWrite, Store, StoreError};
 
 fn main() -> ExitCode {
@@ -261,7 +261,7 @@ fn open_for(command: &str, db: &str, for_serve: bool) -> Result<Store, Failure> 
 }
 
 fn run(args: &[String]) -> Result<String, Failure> {
-    if args.iter().any(|arg| is_version_arg(arg)) {
+    if wants_version(args) {
         return Ok(version_object());
     }
     let parsed = parse(args)?;

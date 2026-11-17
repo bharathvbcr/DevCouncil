@@ -131,6 +131,51 @@ fn dcjsoncheck_version_flag_reports_this_build_without_reading_stdin() {
     }
 }
 
+/// A version word is a version request only as the whole command line.
+///
+/// `--cwd version` and `--deadline-secs -v` hand the word to an option as its
+/// value. Answering them with the version object exits 0 with `"ok":true` and
+/// runs no check, so a ratchet invoked with a stray word would pass having
+/// examined nothing. They must be refused like any other bad invocation.
+#[test]
+fn dcjsoncheck_version_word_in_a_value_position_is_not_a_version_request() {
+    for args in [
+        vec!["--cwd", "version"],
+        vec!["--deadline-secs", "-v"],
+        vec!["-v", "--cwd", "."],
+        vec!["--cwd", ".", "--version"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dcjsoncheck"))
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("dcjsoncheck must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("\"component\":\"dc-verify\"") && !output.status.success(),
+            "dcjsoncheck {args:?} must not answer as a version request or succeed, got {:?}: {stdout}",
+            output.status.code()
+        );
+    }
+}
+
+/// The same class on the verifier: a planned path named `version` is a path.
+#[test]
+fn dcverify_version_word_beside_other_arguments_is_not_a_version_request() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dcverify"))
+        .args(["health", "version"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("dcverify must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The version object has no `verifier` key; the health reply does. A
+    // `version` word beside `health` must reach the command, not short-circuit.
+    assert!(
+        stdout.contains("\"verifier\":\"dc-verify\""),
+        "dcverify health version must run health, not answer a version request: {stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn dcjsoncheck_refuses_non_utf8_arg_as_json_not_panic() {

@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use dc_proc::cli::{collect_args, is_version_arg, quote, version_object};
+use dc_proc::cli::{collect_args, quote, version_object, wants_version};
 use dc_verify::json_stdout::{ContractError, holds_exactly_one_value, holds_json_lines};
 
 fn main() -> ExitCode {
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if args.iter().any(|arg| is_version_arg(arg)) {
+    if wants_version(&args) {
         dc_proc::respond!(
             "{}",
             version_object("dcjsoncheck", "dc-verify", env!("CARGO_PKG_VERSION"), &[])

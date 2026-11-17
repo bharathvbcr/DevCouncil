@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use dc_proc::cli::{collect_args, is_version_arg, quote, version_object};
+use dc_proc::cli::{collect_args, quote, version_object, wants_version};
 use dc_verify::bounded::{MAX_CHECK_BYTES, decode_lossy, read_bounded};
 use dc_verify::rigor::{
     Finding, Severity, Strength, detect_lean_tcb_report_with_root, detect_runner_hijack_with,
@@ -82,7 +82,7 @@ const COMPONENT_ID: &str = "dcverify";
 const SCHEMA_VERSION: u32 = 1;
 
 fn run(args: &[String]) -> Result<String, String> {
-    if args.iter().any(|arg| is_version_arg(arg)) {
+    if wants_version(args) {
         return Ok(version_object(
             COMPONENT_ID,
             IDENTITY,

@@ -62,6 +62,15 @@ pub fn is_version_arg(arg: &str) -> bool {
     matches!(arg, "--version" | "-V" | "-v" | "version")
 }
 
+/// Reports whether a whole argument list is a version request: exactly one
+/// argument, and that argument a version form. A version form anywhere else
+/// is a value (`--cwd version`, `--deadline-secs -v`, a path named `version`),
+/// and answering it with a success object would report a run that checked
+/// nothing as ok.
+pub fn wants_version(args: &[String]) -> bool {
+    matches!(args, [only] if is_version_arg(only))
+}
+
 /// Builds the canonical version JSON payload with optional extra raw JSON fields.
 pub fn version_object(
     id: &str,
@@ -124,6 +133,24 @@ mod tests {
         }
         for other in ["--ver", "-version", "health", ""] {
             assert!(!is_version_arg(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn wants_version_only_for_a_lone_version_argument() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for flag in ["--version", "-V", "-v", "version"] {
+            assert!(wants_version(&args(&[flag])), "{flag}");
+        }
+        for list in [
+            &[][..],
+            &["--cwd", "version"][..],
+            &["--deadline-secs", "-v"][..],
+            &["-v", "--cwd", "x"][..],
+            &["health", "--version"][..],
+            &["--version", "--version"][..],
+        ] {
+            assert!(!wants_version(&args(list)), "{list:?}");
         }
     }
 
