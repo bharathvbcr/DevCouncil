@@ -663,4 +663,32 @@ describe("rust/verify.sh --continue", { skip: process.platform === "win32" }, ()
     assert.match(r.stdout, /QUICK GATES GREEN; the full gate suite was NOT RUN/);
     assert.doesNotMatch(r.stdout, /──/);
   });
+
+  // 2026-11-17: macOS /bin/bash 3.2 reads the bytes of "$rule─" as part of the
+  // variable name, so summary() died under `set -u`, and the EXIT trap's own
+  // status replaced the crash's. The base gate then printed "PASS rust verify
+  // --quick" and "0 failed" with two failing test targets. This harness gives
+  // verify.sh no LANG, so it ran in the C locale and never saw any of it.
+  it("prints its summary and exits 1 when a step failed, in a UTF-8 locale", () => {
+    const r = verify(["--quick", "--continue"], { DEVCOUNCIL_BIN: "host", FAKE_CARGO_FAIL: "fmt", LANG: "en_US.UTF-8" });
+    assert.doesNotMatch(r.stderr, /unbound variable/, r.stderr);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ {2}3 passed · 1 failed · 0 skipped · 6 not applicable of 10 steps$/m);
+  });
+
+  it("never reads a bare variable followed by a multibyte character (bash 3.2 takes its bytes as part of the name)", () => {
+    const bad = readFileSync(script, "utf8")
+      .split("\n")
+      .map((line, i) => [i + 1, line])
+      .filter(([, line]) => /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/.test(line));
+    assert.deepEqual(bad, [], "write ${name} before a non-ASCII character");
+  });
+
+  it("keeps the exit status of the run when its EXIT trap cleans up", () => {
+    const trap = readFileSync(script, "utf8")
+      .split("\n")
+      .find((line) => /^trap .* EXIT$/.test(line));
+    assert.ok(trap, "verify.sh installs no EXIT trap");
+    assert.match(trap, /exit "\$/, `an EXIT trap that does not re-exit with the incoming status replaces it with its own: ${trap}`);
+  });
 });
