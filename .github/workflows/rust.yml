@@ -19,6 +19,13 @@ on:
       - "rust/dc-proc/**"
       - "rust/dc-regress/**"
       - "rust/dc-regress-store/**"
+      # dc-redact, dc-glob and dc-evidence are dependencies of devmap-extract (and
+      # of devmap-resolve, devmap-query and devmap-cli), but this job excludes
+      # them from its own test run. Without these paths a change to one of them
+      # never ran the kernel on macOS or Windows; selected-tests is ubuntu only.
+      - "rust/dc-redact/**"
+      - "rust/dc-glob/**"
+      - "rust/dc-evidence/**"
       - "rust/vendor/**"
       - "rust/testdata/**"
       - "rust/tools/**"
@@ -45,6 +52,13 @@ on:
       - "rust/dc-proc/**"
       - "rust/dc-regress/**"
       - "rust/dc-regress-store/**"
+      # dc-redact, dc-glob and dc-evidence are dependencies of devmap-extract (and
+      # of devmap-resolve, devmap-query and devmap-cli), but this job excludes
+      # them from its own test run. Without these paths a change to one of them
+      # never ran the kernel on macOS or Windows; selected-tests is ubuntu only.
+      - "rust/dc-redact/**"
+      - "rust/dc-glob/**"
+      - "rust/dc-evidence/**"
       - "rust/vendor/**"
       - "rust/testdata/**"
       - "rust/tools/**"
