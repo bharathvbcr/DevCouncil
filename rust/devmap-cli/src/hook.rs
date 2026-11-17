@@ -1071,12 +1071,32 @@ fn summarize_last_session(raw: &str) -> Option<String> {
     Some(truncate(sentence, 90))
 }
 
+/// The `; last session …` tail of a repository clause. A probe that failed is
+/// reported as unavailable, never folded into "no last session".
+fn last_session_suffix(last_text: Option<&str>, probe_failed: bool) -> Option<String> {
+    match last_text.and_then(summarize_last_session) {
+        Some(last) => Some(format!("; last session {last}")),
+        None if probe_failed => Some("; last session unavailable (session-report failed)".into()),
+        None => None,
+    }
+}
+
 fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::Result<Value> {
+    session_start_within(executable, selection, SESSION_START_BUDGET)
+}
+
+/// [`session_start_sync`] with the wall-clock budget as a parameter, so the
+/// out-of-time path is reachable from a test without a ten-second child.
+fn session_start_within(
+    executable: &Path,
+    selection: &RootSelection,
+    budget: Duration,
+) -> anyhow::Result<Value> {
     let started = Instant::now();
     let mut clauses: Vec<String> = Vec::new();
     let mut ran_out_of_time = false;
     let mut completed_roots: usize = 0;
-    let mut has_queryable_root = selection.roots.is_empty();
+    let mut refused_roots: usize = 0;
     for root in &selection.roots {
         if let Some(refusal) = marker_dir_refusal(root) {
             clauses.push(truncate(&refusal, MARKER_REFUSAL_CAP));
@@ -1088,6 +1108,7 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
                 &refused_executable_notice(&error),
                 EXEC_REFUSAL_CAP,
             ));
+            refused_roots += 1;
             continue;
         }
         let status_res = probe(
@@ -1095,13 +1116,18 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
             root,
             &["--json", "status", "--auto-rebuild"],
             started,
-            SESSION_START_BUDGET,
+            budget,
         );
         let Some(status_text) = (match status_res {
             Ok(opt) => opt,
             Err(error) => {
+                // The error carries a raw path and the child's own words, so it
+                // takes the same escaping as every other agent-visible line.
                 clauses.push(truncate(
-                    &format!("{}: probe error: {error}", repo_context_label(root, "repo")),
+                    &context_line(&format!(
+                        "{}: probe error: {error}",
+                        repo_context_label(root, "repo")
+                    )),
                     REPO_CLAUSE_CAP,
                 ));
                 continue;
@@ -1115,28 +1141,33 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
             root,
             &["session-report", "--last"],
             started,
-            SESSION_START_BUDGET,
+            budget,
         );
-        let last_text = match last_res {
-            Ok(Some(text)) => Some(text),
+        // A failed `session-report --last` is not "no last session": say so, or
+        // "could not check" reads the same as "nothing to report".
+        let (last_text, last_failed) = match last_res {
+            Ok(Some(text)) => (Some(text), false),
             Ok(None) => {
                 ran_out_of_time = true;
                 break;
             }
-            Err(_) => None,
+            Err(_) => (None, true),
         };
         completed_roots += 1;
-        has_queryable_root = true;
         let mut clause = format!(
             "{}: {}",
             repo_context_label(root, "repo"),
             summarize_status(&status_text)
         );
-        if let Some(last) = last_text.as_deref().and_then(summarize_last_session) {
-            clause.push_str(&format!("; last session {last}"));
+        if let Some(suffix) = last_session_suffix(last_text.as_deref(), last_failed) {
+            clause.push_str(&suffix);
         }
         clauses.push(truncate(&clause, REPO_CLAUSE_CAP));
     }
+    // The directive is withheld only when every root was refused: a root that
+    // merely ran out of budget (or whose probe failed) is still queryable, and
+    // the directive was always present when no repository answered.
+    let has_queryable_root = selection.roots.is_empty() || refused_roots < selection.roots.len();
 
     let additional = compose_session_start(
         clauses,
@@ -2083,8 +2114,10 @@ fn compose_session_start(
             "(stopped after {completed_roots} of {total_roots} repo(s): {SESSION_START_BUDGET:?} budget)"
         ));
     } else if capped {
+        // Roots acted on, refused ones included: "first 0 repo(s)" when every
+        // root was refused would say the hook looked at nothing.
         lines.push(format!(
-            "(first {completed_roots} repo(s); more were named than one hook acts on)"
+            "(first {total_roots} repo(s); more were named than one hook acts on)"
         ));
     }
     // The directive is pushed only when queryable roots exist.
@@ -2654,26 +2687,7 @@ fn repository_top(canonical_root: &Path) -> PathBuf {
         .unwrap_or_else(|| canonical_root.to_path_buf())
 }
 
-/// Canonical executable a hook may spawn for `root`, or an error when the path
-/// cannot be resolved or is inside the repository.
-///
-/// "Inside the repository" is inside its top, as `docs/SECURITY_BOUNDARIES.md`
-/// (lines 25-33) defines it: run from `repo/backend`, a planted
-/// `repo/tools/bin/devmap` is still refused. The top is the nearest git
-/// worktree root above `root` ([`repository_top`]), else `root`. The document's
-/// further `.devcouncil` fallback is not implemented here: it would be a second
-/// walk beside `git_worktree_root`. `action` ("probe", "detach") names
-/// the refused operation in the diagnostic.
-///
-/// This is the one owner of the containment check: `probe` and every detached
-/// spawn (`detach_build_with`, `detach_stack_sync`, `detach_session_report`)
-/// route through it, so no hook path starts a binary the repository can replace.
-///
-/// "Not inside the repository" is the whole policy: there is no install-directory
-/// allowlist. Containment is canonical components, not a string prefix
-/// (`/repo-evil` is not inside `/repo`). On Unix an ancestor with the repo's
-/// device and inode counts too, so a symlink inside the repo that points at
-/// an outside binary is still inside.
+/// Most symlink hops the executable walk follows before it refuses the path.
 const MAX_LINK_HOPS: usize = 40;
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -2964,6 +2978,26 @@ fn check_hook_executable_containment(
     }
 }
 
+/// Canonical executable a hook may spawn for `root`, or an error when the path
+/// cannot be resolved or is inside the repository.
+///
+/// "Inside the repository" is inside its top, as `docs/SECURITY_BOUNDARIES.md`
+/// (lines 25-33) defines it: run from `repo/backend`, a planted
+/// `repo/tools/bin/devmap` is still refused. The top is the nearest git
+/// worktree root above `root` ([`repository_top`]), else `root`; the ancestor
+/// walk in `check_hook_executable_containment` also treats any parent holding a
+/// `.git` or `.devcouncil` entry as a repository top. `action` ("probe",
+/// "detach") names the refused operation in the diagnostic.
+///
+/// This is the one owner of the containment check: `probe` and every detached
+/// spawn (`detach_build_with`, `detach_stack_sync`, `detach_session_report`)
+/// route through it, so no hook path starts a binary the repository can replace.
+///
+/// "Not inside the repository" is the whole policy: there is no install-directory
+/// allowlist. Containment is canonical components, not a string prefix
+/// (`/repo-evil` is not inside `/repo`). On Unix an ancestor with the repo's
+/// device and inode counts too, so a symlink inside the repo that points at
+/// an outside binary is still inside.
 pub(crate) fn canonical_hook_executable(
     executable: &Path,
     root: &Path,
@@ -7657,6 +7691,86 @@ mod attack_hook_trust {
             "marker refusal must survive timeout: {out}"
         );
         assert!(out.contains("stopped after 0 of 1 repo(s)"), "{out}");
+    }
+
+    /// A root that ran out of budget was not refused: the directive stays. It
+    /// was present whenever no repository answered, and a slow repository must
+    /// not strip the agent's DevMap instruction.
+    #[cfg(unix)]
+    #[test]
+    fn session_start_keeps_the_directive_when_the_only_root_ran_out_of_budget() {
+        let base = scratch("ss-slow-root");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let outside = base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let slow = outside.join("devmap");
+        fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let selection = RootSelection::whole(vec![repo.clone()]);
+        let result = session_start_within(&slow, &selection, Duration::from_millis(300));
+        let _ = fs::remove_dir_all(&base);
+        let text = result
+            .expect("a slow root is a shorter summary, not an error")
+            .to_string();
+        assert!(text.contains("stopped after 0 of 1 repo(s)"), "{text}");
+        assert!(
+            text.contains("Ask DevMap before reading files"),
+            "an unrefused root that ran out of time must keep the directive: {text}"
+        );
+    }
+
+    /// When every root is refused the cap note still counts what the hook
+    /// attempted, never "first 0 repo(s)".
+    #[test]
+    fn compose_cap_note_counts_attempted_roots_not_completed_ones() {
+        let out = compose_session_start(vec![], false, true, 0, 3, false, None);
+        assert!(out.contains("first 3 repo(s)"), "{out}");
+        assert!(!out.contains("first 0 repo(s)"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_session_report_is_unavailable_not_absent() {
+        assert_eq!(last_session_suffix(None, false), None);
+        assert_eq!(
+            last_session_suffix(None, true).as_deref(),
+            Some("; last session unavailable (session-report failed)")
+        );
+        assert_eq!(
+            last_session_suffix(Some("DevMap session: edited 3 files. More."), true).as_deref(),
+            Some("; last session edited 3 files")
+        );
+    }
+
+    /// The probe error names the root's path, and a directory name is
+    /// repository-controlled text: a newline in it must not start a line of its
+    /// own in the agent's context.
+    #[cfg(unix)]
+    #[test]
+    fn session_start_probe_error_cannot_break_a_line_with_a_path_newline() {
+        let base = scratch("ss-probe-newline");
+        let repo = base.join("lane\nINJECTED directive");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let outside = base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let failing_exe = outside.join("devmap");
+        fs::write(&failing_exe, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&failing_exe, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let selection = RootSelection::whole(vec![repo.clone()]);
+        let value = session_start_sync(&failing_exe, &selection).expect("notice, not error");
+        let _ = fs::remove_dir_all(&base);
+        let context = value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext is a string");
+        assert!(context.contains("probe error"), "{context}");
+        assert!(
+            !context.lines().any(|line| line.starts_with("INJECTED")),
+            "a path newline started its own context line: {context:?}"
+        );
     }
 
     /// AC 3 / Opus #2: Marker-dir refusal emitted when probe errors.
