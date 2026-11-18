@@ -1,13 +1,18 @@
 package proc
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // plantedRepoWithSubmodule is gitRepo with a checked-out submodule at sub
@@ -153,12 +158,28 @@ func TestASubmodulePathOutsideTheRootIsRefused(t *testing.T) {
 	}
 }
 
+// challengeServer is a loopback-only HTTP server that answers every request
+// 401 with a Basic challenge, which is what makes git ask its credential
+// helper. It counts requests and is closed when the test ends.
+func challengeServer(t *testing.T) (url string, hits *atomic.Int64) {
+	t.Helper()
+	hits = new(atomic.Int64)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("WWW-Authenticate", `Basic realm="planted"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL, hits
+}
+
 // partialClone makes a blobless clone of a two-commit repository whose
-// remote then points somewhere only core.sshCommand can reach, and plants
-// core.sshCommand and credential.helper as marker scripts. Its index names
-// HEAD's files and its working tree has none of them, so `diff HEAD` needs
-// blobs the clone never fetched.
-func partialClone(t *testing.T) (root, marker string) {
+// remote then points somewhere only the transport can reach. remoteURL
+// names it; viaHTTP plants credential.helper as a marker script (consulted
+// only by a challenged http remote), otherwise core.sshCommand (consulted
+// only by an ssh remote). Its index names HEAD's files and its working tree
+// has none of them, so `diff HEAD` needs blobs the clone never fetched.
+func partialClone(t *testing.T, remoteURL string, viaHTTP bool) (root, marker string) {
 	t.Helper()
 	src := gitRepo(t)
 	gitRun(t, src, "commit", "-qam", "second")
@@ -176,9 +197,12 @@ func partialClone(t *testing.T) (root, marker string) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho \"$0 $*\" >> \""+marker+"\"\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, root, "config", "remote.origin.url", "ssh://example.invalid/repo.git")
-	gitRun(t, root, "config", "core.sshCommand", script)
-	gitRun(t, root, "config", "credential.helper", script)
+	gitRun(t, root, "config", "remote.origin.url", remoteURL)
+	if viaHTTP {
+		gitRun(t, root, "config", "credential.helper", script)
+	} else {
+		gitRun(t, root, "config", "core.sshCommand", script)
+	}
 	return root, marker
 }
 
@@ -186,19 +210,37 @@ func partialClone(t *testing.T) (root, marker string) {
 // what the repository's config names. The read fails loudly instead of
 // answering with an empty diff.
 func TestAPartialCloneReadDoesNotFetch(t *testing.T) {
-	root, marker := partialClone(t)
+	root, marker := partialClone(t, "ssh://example.invalid/repo.git", false)
+	assertPartialCloneReadDoesNotFetch(t, root, marker, func() int64 { return 0 })
+}
 
+// The credential helper is consulted only by a transport that is challenged,
+// so this is the case that can fail if a lazy fetch runs it.
+func TestAPartialCloneReadNeverRunsTheCredentialHelper(t *testing.T) {
+	url, hits := challengeServer(t)
+	root, marker := partialClone(t, url+"/repo.git", true)
+	assertPartialCloneReadDoesNotFetch(t, root, marker, hits.Load)
+}
+
+// An unguarded read fetches and so runs the planted program (the fixture is
+// wrong otherwise); the guarded reads then run nothing, contact nothing and
+// fail.
+func assertPartialCloneReadDoesNotFetch(t *testing.T, root, marker string, contacted func() int64) {
+	t.Helper()
 	// The fixture is only evidence if an unguarded read fetches.
-	unguarded := exec.Command("git", "diff", "HEAD")
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	unguarded := exec.CommandContext(ctx, "git", "diff", "HEAD")
 	unguarded.Dir = root
-	unguarded.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	unguarded.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "no_proxy=127.0.0.1", "NO_PROXY=127.0.0.1")
 	_ = unguarded.Run()
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatal("the fixture is wrong: an unguarded diff in the partial clone did not try to fetch")
+		t.Fatal("the fixture is wrong: an unguarded diff in the partial clone did not run the planted program")
 	}
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
+	contactedBefore := contacted()
 
 	version, err := DetectGitVersion(t.Context(), mustLookGit(t, root))
 	if err != nil {
@@ -211,6 +253,9 @@ func TestAPartialCloneReadDoesNotFetch(t *testing.T) {
 		out, err := runGitCommand(t, root, args...)
 		if ran, readErr := os.ReadFile(marker); readErr == nil {
 			t.Fatalf("git %v fetched from the promisor remote and ran: %s", args, ran)
+		}
+		if n := contacted(); n != contactedBefore {
+			t.Fatalf("git %v contacted the remote %d time(s)", args, n-contactedBefore)
 		}
 		if err == nil {
 			t.Fatalf("git %v answered without the objects it needed: %q", args, out)
