@@ -167,10 +167,13 @@ bad JSON, an undeclared or missing argument); `3` it could not run here
 `git_repo_undetermined`, a timeout). Every call prints one stderr line saying it
 was answered from the shell, so a fallback is visible in the transcript.
 
-The policy allowlist admits `dev tool list` and the no-lease tools (next_task,
-checkout_task, get_diff, get_gaps, policy_check_write) without a lease, and
-renew_lease, release_task and verify_task to a lease holder; never
-`dev tool call *`.
+The policy allowlist admits `dev tool list` and the read-only tools (next_task,
+get_diff, get_gaps, policy_check_write) without a lease, and renew_lease,
+release_task and verify_task to a lease holder; never `dev tool call *`.
+`devcouncil_checkout_task` is in neither list: a harness that enforces the gate
+(Manvi) offers its own checkout, which takes no `force` and no caller-chosen
+client id, and the shell spelling would carry both. Where no gate runs (an
+interactive host; DevCouncil's hooks are retired) the shell checkout works.
 
 This fixes transport failures only. The CLI shares the registry, the store and
 the project-root resolution with the server, so a missing store or a wrong root
@@ -494,7 +497,7 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
-| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:`, `dev map` and the no-lease `dev tool` fallbacks, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
+| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:`, `dev map` and the read-only `dev tool` fallbacks, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
 | `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID --mode enforce --json` for an existing task, or `dcverify`. |
 | `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Managed guides are available with `devmap build --manifest --guides`; they do not replace the full wiki/OKF feature set. |
 | `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |

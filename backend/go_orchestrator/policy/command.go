@@ -50,7 +50,8 @@ var devBinaries = map[string]bool{
 // `dev doctor`, each also spelled `uv run dev …`: the Python CLI's commands,
 // every one of which exits 2 on the Go host, and a `uv` entry point that no
 // longer exists. A lease is acquired through the devcouncil_checkout_task MCP
-// tool or, when MCP is unavailable, through `dev tool call` with the same name.
+// tool (or the harness's own checkout), never through an allowlisted shell
+// command; see the dev tool entries below for why.
 var NoTaskAllowedCommands = []string{
 	"git status", "git diff", "git diff *",
 	"echo", "echo *", "true", ":",
@@ -59,13 +60,21 @@ var NoTaskAllowedCommands = []string{
 	// that points at `dev map` while the list holding it sits behind the lease
 	// check is a message that cannot be followed.
 	"dev map", "dev map *",
-	// The shell fallback for the MCP tools a session without a lease may
-	// call: finding work, taking a lease, and the read-only inspections.
-	// Named tool by tool, never `dev tool call *`: renewing, releasing and
-	// verifying a lease are a holder's, and sit in the list below.
+	// The shell fallback for the read-only MCP tools: finding work and the
+	// inspections. Named tool by tool, never `dev tool call *`: renewing,
+	// releasing and verifying a lease are a holder's, and sit in the list
+	// below.
+	//
+	// devcouncil_checkout_task is deliberately absent, from both lists. The
+	// harnesses that enforce this gate (Manvi's exec tool passes a nil task
+	// when its session holds no lease) offer their own checkout, which takes
+	// no force and no caller-chosen client id. Admitting the shell spelling
+	// here would hand a no-lease agent both: revoking another agent's lease,
+	// and the live token of any client id it can guess. Where no gate runs —
+	// an interactive host, whose hooks are retired — the shell checkout works
+	// anyway.
 	"dev tool list", "dev tool list *",
 	"dev tool call devcouncil_next_task", "dev tool call devcouncil_next_task *",
-	"dev tool call devcouncil_checkout_task *",
 	"dev tool call devcouncil_get_diff", "dev tool call devcouncil_get_diff *",
 	"dev tool call devcouncil_get_gaps *",
 	"dev tool call devcouncil_policy_check_write *",
@@ -75,9 +84,8 @@ var NoTaskAllowedCommands = []string{
 // Every command it names must be one the allowlist above admits and the host
 // dispatches; the host's tests read it back from a real decision.
 const noLeaseRemedy = "Shell commands require an active task lease. Acquire one with the " +
-	"`devcouncil_checkout_task` MCP tool (when MCP is unavailable: " +
-	"`dev tool call devcouncil_checkout_task --args '{\"task_id\":\"…\",\"client_id\":\"…\"}'`), " +
-	"or use the allowlisted read-only orientation commands (`git status`, `git diff`, `dev map …`)."
+	"`devcouncil_checkout_task` tool, or use the allowlisted read-only orientation " +
+	"commands (`git status`, `git diff`, `dev map …`, `dev tool list`)."
 
 // LeaseLifecycleAllowedCommands are available to a lease holder, independent
 // of the task's own allowed_commands.
