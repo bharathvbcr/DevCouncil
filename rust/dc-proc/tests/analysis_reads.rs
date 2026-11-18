@@ -87,8 +87,31 @@ fn repo(dir: &Path) {
     setup(dir, &["commit", "-qm", "base"]);
 }
 
+/// Pins the network environment of a git the test runs, so no ambient proxy
+/// can divert a fetch away from the loopback server (which would let a
+/// guard-less run pass without ever reaching the credential helper) and no
+/// askpass program stands in for the planted one.
+fn pin_network_env(command: &mut Command) {
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    ] {
+        command.env_remove(var);
+    }
+    command
+        .env("no_proxy", "127.0.0.1")
+        .env("NO_PROXY", "127.0.0.1");
+}
+
 fn read(program: &OsStr, root: &Path, args: &[&str]) -> Result<Captured, Failure> {
     let mut command = git_with_program(program, root, args)?;
+    pin_network_env(&mut command);
     run_bounded(
         &mut command,
         Bounds {
@@ -298,24 +321,36 @@ fn partial_clone(base: &Path, transport: Transport) -> (PathBuf, PathBuf) {
 fn partial_clone_read_fails_rather_than_fetching(
     transport: Transport,
     contacted: &dyn Fn() -> usize,
+    reaches_server: bool,
 ) {
     let base = Scratch::new("partial");
     let (root, marker) = partial_clone(&base.0, transport);
 
-    let _ = Command::new("git")
+    let mut unguarded = Command::new("git");
+    unguarded
         .arg("-C")
         .arg(&root)
         .args(["diff", "HEAD"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("no_proxy", "127.0.0.1")
-        .env("NO_PROXY", "127.0.0.1")
-        .stdin(Stdio::null())
-        .output();
+        .stdin(Stdio::null());
+    pin_network_env(&mut unguarded);
+    let _ = run_bounded(
+        &mut unguarded,
+        Bounds {
+            deadline: Duration::from_secs(20),
+            stdout_cap: 1 << 20,
+            stderr_cap: 1 << 16,
+        },
+    );
     assert!(
         marker.exists(),
         "the fixture is wrong: an unguarded diff did not run the planted program"
+    );
+    assert!(
+        !reaches_server || contacted() > 0,
+        "the fixture is wrong: an unguarded diff never reached the loopback server"
     );
     std::fs::remove_file(&marker).unwrap();
     let contacted_before = contacted();
@@ -359,7 +394,7 @@ fn partial_clone_read_fails_rather_than_fetching(
 
 #[test]
 fn a_partial_clone_read_fails_rather_than_fetching() {
-    partial_clone_read_fails_rather_than_fetching(Transport::Ssh, &|| 0);
+    partial_clone_read_fails_rather_than_fetching(Transport::Ssh, &|| 0, false);
 }
 
 /// The credential helper is consulted only by a transport that is
@@ -367,7 +402,11 @@ fn a_partial_clone_read_fails_rather_than_fetching() {
 #[test]
 fn a_partial_clone_read_never_runs_the_credential_helper() {
     let server = Challenge::start();
-    partial_clone_read_fails_rather_than_fetching(Transport::Http(server.addr), &|| server.hits());
+    partial_clone_read_fails_rather_than_fetching(
+        Transport::Http(server.addr),
+        &|| server.hits(),
+        true,
+    );
 }
 
 /// A git standing in for the real one that reports `version` and otherwise

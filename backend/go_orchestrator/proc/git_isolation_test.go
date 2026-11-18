@@ -67,12 +67,33 @@ func gitOutput(t *testing.T, root string, args ...string) string {
 
 func runGitCommand(t *testing.T, root string, args ...string) (string, error) {
 	t.Helper()
-	cmd, err := GitCommand(t.Context(), root, args...)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	cmd, err := GitCommand(ctx, root, args...)
 	if err != nil {
 		return "", err
 	}
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = pinNetworkEnv(cmd.Env)
 	out, err := cmd.Output()
 	return string(out), err
+}
+
+// pinNetworkEnv returns env with no ambient proxy that could divert a fetch
+// away from the loopback server (letting a guard-less run pass without ever
+// reaching the credential helper), no askpass program standing in for the
+// planted one, and no_proxy naming loopback.
+func pinNetworkEnv(env []string) []string {
+	drop := []string{"HTTP_PROXY=", "http_proxy=", "HTTPS_PROXY=", "https_proxy=", "ALL_PROXY=", "all_proxy=", "NO_PROXY=", "no_proxy=", "GIT_ASKPASS=", "SSH_ASKPASS="}
+	pinned := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		if !slices.ContainsFunc(drop, func(prefix string) bool { return strings.HasPrefix(entry, prefix) }) {
+			pinned = append(pinned, entry)
+		}
+	}
+	return append(pinned, "no_proxy=127.0.0.1", "NO_PROXY=127.0.0.1")
 }
 
 // A submodule's own filter driver does not run when the superproject is
@@ -211,7 +232,7 @@ func partialClone(t *testing.T, remoteURL string, viaHTTP bool) (root, marker st
 // answering with an empty diff.
 func TestAPartialCloneReadDoesNotFetch(t *testing.T) {
 	root, marker := partialClone(t, "ssh://example.invalid/repo.git", false)
-	assertPartialCloneReadDoesNotFetch(t, root, marker, func() int64 { return 0 })
+	assertPartialCloneReadDoesNotFetch(t, root, marker, func() int64 { return 0 }, false)
 }
 
 // The credential helper is consulted only by a transport that is challenged,
@@ -219,23 +240,26 @@ func TestAPartialCloneReadDoesNotFetch(t *testing.T) {
 func TestAPartialCloneReadNeverRunsTheCredentialHelper(t *testing.T) {
 	url, hits := challengeServer(t)
 	root, marker := partialClone(t, url+"/repo.git", true)
-	assertPartialCloneReadDoesNotFetch(t, root, marker, hits.Load)
+	assertPartialCloneReadDoesNotFetch(t, root, marker, hits.Load, true)
 }
 
 // An unguarded read fetches and so runs the planted program (the fixture is
 // wrong otherwise); the guarded reads then run nothing, contact nothing and
 // fail.
-func assertPartialCloneReadDoesNotFetch(t *testing.T, root, marker string, contacted func() int64) {
+func assertPartialCloneReadDoesNotFetch(t *testing.T, root, marker string, contacted func() int64, reachesServer bool) {
 	t.Helper()
 	// The fixture is only evidence if an unguarded read fetches.
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	unguarded := exec.CommandContext(ctx, "git", "diff", "HEAD")
 	unguarded.Dir = root
-	unguarded.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "no_proxy=127.0.0.1", "NO_PROXY=127.0.0.1")
+	unguarded.Env = append(pinNetworkEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	_ = unguarded.Run()
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("the fixture is wrong: an unguarded diff in the partial clone did not run the planted program")
+	}
+	if reachesServer && contacted() == 0 {
+		t.Fatal("the fixture is wrong: an unguarded diff never reached the loopback server")
 	}
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
@@ -259,6 +283,10 @@ func assertPartialCloneReadDoesNotFetch(t *testing.T, root, marker string, conta
 		}
 		if err == nil {
 			t.Fatalf("git %v answered without the objects it needed: %q", args, out)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("git %v did not run: %v", args, err)
 		}
 	}
 }
