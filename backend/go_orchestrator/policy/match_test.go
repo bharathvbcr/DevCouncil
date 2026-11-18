@@ -6,7 +6,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 )
 
-func TestMatchesAnyIsThePlannedPathLoop(t *testing.T) {
+func TestMatchesPlannedPathIsThePathMatchesLoop(t *testing.T) {
 	planned := []dc.PlannedFile{
 		{Path: "src/foo.go"},
 		{Path: "docs/*.md"},

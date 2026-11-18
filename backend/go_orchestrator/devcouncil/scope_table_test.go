@@ -29,27 +29,41 @@ type scopeRow struct {
 	path    string
 	op      string // create | modify | delete
 	inScope bool
-	change  string // allowed_change of every entry; "" means modify
+	change  string // allowed_change of every entry in planned; "" means modify
+	// readOnly are extra read_only entries; they come before planned when
+	// roFirst is set, after otherwise. read_only wins whatever the order.
+	readOnly []string
+	roFirst  bool
 }
 
 var scopeRows = []scopeRow{
-	{"exact", []string{"src/a.go"}, "src/a.go", "modify", true, ""},
-	{"same dir", []string{"src/a.go"}, "src/other.go", "modify", false, ""},
-	{"same subsystem", []string{"src/a.go"}, "src/sub/deep.go", "modify", false, ""},
-	{"root file", []string{"src/a.go"}, "README.md", "modify", false, ""},
-	{"manifest", []string{"src/a.go"}, "go.mod", "modify", false, ""},
-	{"planned manifest", []string{"go.mod"}, "go.mod", "modify", true, ""},
-	{"delete planned for delete", []string{"src/a.go"}, "src/a.go", "delete", true, "delete"},
-	{"dot-slash entry", []string{"./src/a.go"}, "src/a.go", "modify", true, ""},
-	{"dot-slash entry, unplanned sibling", []string{"./src/a.go"}, "src/other.go", "modify", false, ""},
-	{"glob entry", []string{"src/*.go"}, "src/a.go", "modify", true, ""},
-	{"glob entry, outside", []string{"src/*.go"}, "docs/x.md", "modify", false, ""},
-	{"dot-slash glob", []string{"./src/*.go"}, "src/a.go", "modify", true, ""},
+	{"exact", []string{"src/a.go"}, "src/a.go", "modify", true, "", nil, false},
+	{"same dir", []string{"src/a.go"}, "src/other.go", "modify", false, "", nil, false},
+	{"same subsystem", []string{"src/a.go"}, "src/sub/deep.go", "modify", false, "", nil, false},
+	{"root file", []string{"src/a.go"}, "README.md", "modify", false, "", nil, false},
+	{"manifest", []string{"src/a.go"}, "go.mod", "modify", false, "", nil, false},
+	{"planned manifest", []string{"go.mod"}, "go.mod", "modify", true, "", nil, false},
+	{"delete planned for delete", []string{"src/a.go"}, "src/a.go", "delete", true, "delete", nil, false},
+	{"dot-slash entry", []string{"./src/a.go"}, "src/a.go", "modify", true, "", nil, false},
+	{"dot-slash entry, unplanned sibling", []string{"./src/a.go"}, "src/other.go", "modify", false, "", nil, false},
+	{"glob entry", []string{"src/*.go"}, "src/a.go", "modify", true, "", nil, false},
+	{"glob entry, outside", []string{"src/*.go"}, "docs/x.md", "modify", false, "", nil, false},
+	{"dot-slash glob", []string{"./src/*.go"}, "src/a.go", "modify", true, "", nil, false},
+	// read_only overlaps: read_only wins on every surface, in either order, in
+	// any spelling. The sibling row pins that the overlap restricts only the
+	// path the read_only entry names.
+	{"ro glob over modify exact", []string{"src/a.go"}, "src/a.go", "modify", false, "", []string{"src/*.go"}, false},
+	{"ro glob over modify exact, ro first", []string{"src/a.go"}, "src/a.go", "modify", false, "", []string{"src/*.go"}, true},
+	{"ro dot-slash over modify exact", []string{"src/a.go"}, "src/a.go", "modify", false, "", []string{"./src/a.go"}, false},
+	{"ro dot-slash over modify exact, ro first", []string{"src/a.go"}, "src/a.go", "modify", false, "", []string{"./src/a.go"}, true},
+	{"ro exact under modify glob", []string{"src/*"}, "src/a.go", "modify", false, "", []string{"src/a.go"}, false},
+	{"ro exact under modify glob, ro first", []string{"src/*"}, "src/a.go", "modify", false, "", []string{"src/a.go"}, true},
+	{"ro exact leaves the glob's other files", []string{"src/*"}, "src/other.go", "modify", true, "", []string{"src/a.go"}, false},
 	// A backslash entry cannot be seeded: dc-store refuses it (invalid_scope).
 	// It reaches the detectors and the gate only through hand-written JSON, and
 	// those readers are pinned in verify's planned_judge_test.go and policy's
 	// planpath_test.go.
-	{"case-variant entry", []string{"SRC/a.go"}, "src/a.go", "modify", false, ""},
+	{"case-variant entry", []string{"SRC/a.go"}, "src/a.go", "modify", false, "", nil, false},
 }
 
 func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
@@ -83,13 +97,22 @@ func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, row := range scopeRows {
-		entries := make([]map[string]string, len(row.planned))
-		for j, p := range row.planned {
+		var entries []map[string]string
+		for _, p := range row.planned {
 			change := row.change
 			if change == "" {
 				change = "modify"
 			}
-			entries[j] = map[string]string{"path": p, "allowed_change": change}
+			entries = append(entries, map[string]string{"path": p, "allowed_change": change})
+		}
+		var roEntries []map[string]string
+		for _, p := range row.readOnly {
+			roEntries = append(roEntries, map[string]string{"path": p, "allowed_change": "read_only"})
+		}
+		if row.roFirst {
+			entries = append(roEntries, entries...)
+		} else {
+			entries = append(entries, roEntries...)
 		}
 		scope, _ := json.Marshal(map[string]any{"planned_files": entries})
 		testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: fmt.Sprintf("ROW-%d", i), Scope: string(scope)})
@@ -135,10 +158,16 @@ func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
 				t.Fatalf("task %s: %v", taskID, err)
 			}
 			verifyIn := true
-			for _, g := range verify.DetectOrphanDiffGaps(taskID, stored.PlannedFiles, []string{row.path}, nil) {
+			for _, g := range verify.DetectOrphanDiffGapsIn(root, taskID, stored.PlannedFiles, []string{row.path}, nil) {
 				verifyIn = verifyIn && !g.Blocking
 			}
 
+			// would_block_verification is the preflight's forecast of verify's
+			// verdict: on an allowed write the two must agree.
+			if allowed && wouldBlock != !verifyIn {
+				t.Errorf("%s %s planned %q ro %q: would_block_verification=%v but verify in-scope=%v",
+					row.op, row.path, row.planned, row.readOnly, wouldBlock, verifyIn)
+			}
 			if diffIn != row.inScope || policyIn != row.inScope || verifyIn != row.inScope {
 				t.Errorf("%s %s planned %q: get_diff=%v policy_check_write=%v verify=%v, fixture says in-scope=%v",
 					row.op, row.path, row.planned, diffIn, policyIn, verifyIn, row.inScope)

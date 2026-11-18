@@ -53,17 +53,26 @@ func TestPlansPathReadsGlobEntries(t *testing.T) {
 }
 
 // A glob entry is not a licence over what the hard rules protect: the gate
-// refuses those paths before it reads the plan, and verification must not read a
-// "*" plan as covering them. An entry naming the path exactly is unchanged.
+// refuses those paths before it reads the plan, so verification and get_diff must
+// not read a "*" plan as covering them. An entry naming the path exactly is read
+// as it always was.
 func TestGlobEntryNeverCoversAHardRulePath(t *testing.T) {
 	glob := []dc.PlannedFile{modify("*"), modify("./**")}
-	for _, path := range []string{".env", ".git/config", ".devcouncil/config.yaml", ".devmap/repo_map.json", "deploy/server.pem"} {
+	for _, path := range []string{
+		".env", ".git/config", ".devcouncil/config.yaml", ".devmap/repo_map.json", "deploy/server.pem",
+		// prompt inputs: the gate refuses these before it reads the plan
+		"CLAUDE.md", "AGENTS.md", "plugins/x/mcp.json", ".mcp.json", ".claude/skills/x/SKILL.md",
+		// malformed or aliasing spellings, which the gate refuses raw and cleaned
+		"a.", ".git /config", "a\nb.go",
+	} {
 		if MatchesPlannedPath(path, glob) {
 			t.Errorf("a glob entry covers hard-rule path %s", path)
 		}
 		if editable, _ := PlannedScope(path, glob); editable {
 			t.Errorf("a glob entry makes %s editable", path)
 		}
+		// An entry naming the path exactly is read as it always was; the gate
+		// refuses the write regardless.
 		if !MatchesPlannedPath(path, []dc.PlannedFile{modify("./" + path)}) {
 			t.Errorf("an entry naming %s exactly must still match it", path)
 		}
@@ -86,5 +95,67 @@ func TestPlannedScopeClassifiesByEntryKind(t *testing.T) {
 	}
 	if editable, ro := PlannedScope("docs/x.md", planned); editable || ro {
 		t.Errorf("docs/x.md: editable=%v readOnly=%v, want neither", editable, ro)
+	}
+}
+
+// The invariant behind the rows above: wherever the write gate refuses a path by
+// a hard rule before it reads the plan, no glob entry plans it, in the judge
+// verify and get_diff use. HardDenied is the gate's own pre-task function, so
+// this also pins that the gate and the judge cannot drift.
+func TestNoGlobPlansAPathTheGateHardDenies(t *testing.T) {
+	glob := []dc.PlannedFile{modify("*"), modify("./**")}
+	task := &dc.Task{ID: "TASK-1", PlannedFiles: glob}
+	g := FileGate{Root: t.TempDir(), HardRules: true}
+	hard := map[RuleID]bool{RuleSecretPath: true, RuleRestrictedPath: true, RuleMalformedPath: true, RuleOutsideRoot: true}
+	denied := 0
+	for _, path := range []string{
+		".env", ".env.local", "a/.env", "secrets/k", "deploy/server.pem", "id_rsa", ".npmrc",
+		".git/config", ".GIT/config", ".git", ".claude/settings.json", ".codex/x", ".devcouncil/state.sqlite", ".devmap/g.sqlite",
+		"CLAUDE.md", "AGENTS.md", "docs/AGENTS.md", "mcp.json", ".mcp.json", "plugins/x/mcp.json", ".claude/skills/x/SKILL.md",
+		"a.", "a ", ".git /config", "a\nb.go", "a\x00b", "src/../.env", ".//.env", "../x",
+	} {
+		d := g.EvaluateFileChange(path, task, dc.OpModify, false)
+		if !d.Blocked() || !hard[d.Rule] {
+			continue
+		}
+		denied++
+		if editable, _ := PlannedScope(path, glob); editable {
+			t.Errorf("%q: gate hard-denies (%s) but a glob plans it", path, d.Rule)
+		}
+		if !HardDenied("", path) {
+			t.Errorf("%q: gate hard-denies (%s) but HardDenied with no root does not", path, d.Rule)
+		}
+	}
+	if denied < 20 {
+		t.Fatalf("only %d paths were hard denials; the matrix no longer exercises the invariant", denied)
+	}
+}
+
+// read_only wins at the gate whatever the order or spelling of the overlapping
+// entries, as it does in verify.
+func TestGateReadOnlyWinsOverlapRegardlessOfOrder(t *testing.T) {
+	ro := func(p string) dc.PlannedFile { return dc.PlannedFile{Path: p, AllowedChange: dc.ChangeReadOnly} }
+	for _, pair := range [][2]dc.PlannedFile{
+		{modify("src/a.go"), ro("src/a.go")},
+		{modify("src/a.go"), ro("src/*.go")},
+		{modify("src/a.go"), ro("./src/a.go")},
+		{modify("src/*"), ro("src/a.go")},
+	} {
+		for _, files := range [][]dc.PlannedFile{{pair[0], pair[1]}, {pair[1], pair[0]}} {
+			if d := decide(t, mapless(t), "src/a.go", planTask(files...), dc.OpModify); d.Rule != RuleReadOnly {
+				t.Errorf("%+v: rule=%s, want %s", files, d.Rule, RuleReadOnly)
+			}
+		}
+	}
+	// The overlap restricts only what the read_only entry names.
+	if d := decide(t, mapless(t), "src/b.go", planTask(modify("src/*"), ro("src/a.go")), dc.OpModify); d.Blocked() {
+		t.Errorf("src/b.go is planned and not read_only: %+v", d)
+	}
+}
+
+func TestForbiddenEntriesAreNormalisedByTheGate(t *testing.T) {
+	task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("*")}, ForbiddenChanges: []string{"./secret/*"}}
+	if d := decide(t, mapless(t), "secret/x", task, dc.OpModify); d.Rule != RuleForbiddenChange {
+		t.Errorf("rule=%s, want %s", d.Rule, RuleForbiddenChange)
 	}
 }

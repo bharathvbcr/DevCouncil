@@ -41,10 +41,10 @@ func DetectNoWorkGap(taskID string, planned []dc.PlannedFile, workPresent bool) 
 // changedMatches reports whether any changed path is one the planned entry
 // names, asked of policy.MatchesPlannedPath so verification reads an entry the
 // way the write gate does.
-func changedMatches(pf dc.PlannedFile, changed []string) bool {
+func changedMatches(root string, pf dc.PlannedFile, changed []string) bool {
 	entry := []dc.PlannedFile{pf}
 	for _, c := range changed {
-		if policy.MatchesPlannedPath(c, entry) {
+		if editable, readOnly := policy.PlannedScopeIn(root, c, entry); editable || readOnly {
 			return true
 		}
 	}
@@ -53,6 +53,12 @@ func changedMatches(pf dc.PlannedFile, changed []string) bool {
 
 // DetectPlannedFileGaps returns advisory gaps for planned files not touched.
 func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []string) []Gap {
+	return DetectPlannedFileGapsIn("", taskID, planned, changed)
+}
+
+// DetectPlannedFileGapsIn is DetectPlannedFileGaps with the repository root, so
+// the planned-path judge can run its on-disk alias rungs. root may be "".
+func DetectPlannedFileGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
 	for _, pf := range planned {
 		if pf.AllowedChange == dc.ChangeReadOnly {
@@ -61,7 +67,7 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 		// The planned-path judge, entry by entry: a glob entry is satisfied
 		// by any change it matches, and "./" or backslash spellings by the
 		// path they name.
-		if changedMatches(pf, changed) {
+		if changedMatches(root, pf, changed) {
 			continue
 		}
 		path := pf.Path
@@ -84,12 +90,18 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 // and emits hard-safety `oracle_tampering` gaps if any `read_only` planned file
 // was modified.
 func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
+	return DetectOrphanDiffGapsIn("", taskID, planned, changed, orphanAdded)
+}
+
+// DetectOrphanDiffGapsIn is DetectOrphanDiffGaps with the repository root (see
+// DetectPlannedFileGapsIn). root may be "".
+func DetectOrphanDiffGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
 	var gaps []Gap
 	for _, cf := range changed {
 		if policy.IsToolState(cf) {
 			continue
 		}
-		editable, readOnly := policy.PlannedScope(cf, planned)
+		editable, readOnly := policy.PlannedScopeIn(root, cf, planned)
 		if readOnly {
 			gaps = append(gaps, Gap{
 				ID:             StableGapID(taskID, "READONLY-"+cf),
@@ -143,12 +155,18 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 
 // DetectDependencyRiskGaps blocks unplanned dependency-manifest edits.
 func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed []string) []Gap {
+	return DetectDependencyRiskGapsIn("", taskID, planned, changed)
+}
+
+// DetectDependencyRiskGapsIn is DetectDependencyRiskGaps with the repository
+// root (see DetectPlannedFileGapsIn). root may be "".
+func DetectDependencyRiskGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
 	for _, path := range changed {
 		if _, ok := depFileNames[filepath.Base(path)]; !ok {
 			continue
 		}
-		if editable, _ := policy.PlannedScope(path, planned); editable {
+		if editable, _ := policy.PlannedScopeIn(root, path, planned); editable {
 			continue
 		}
 		gaps = append(gaps, Gap{

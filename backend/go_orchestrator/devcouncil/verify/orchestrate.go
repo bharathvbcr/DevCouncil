@@ -190,9 +190,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	if g := DetectNoWorkGap(taskID, planned, workPresent); g != nil {
 		gaps = append(gaps, *g)
 	}
-	gaps = append(gaps, DetectPlannedFileGaps(taskID, planned, in.ChangedFiles)...)
-	gaps = append(gaps, DetectOrphanDiffGaps(taskID, planned, in.ChangedFiles, in.AddedFiles)...)
-	gaps = append(gaps, DetectDependencyRiskGaps(taskID, planned, in.ChangedFiles)...)
+	gaps = append(gaps, DetectPlannedFileGapsIn(in.Root, taskID, planned, in.ChangedFiles)...)
+	gaps = append(gaps, DetectOrphanDiffGapsIn(in.Root, taskID, planned, in.ChangedFiles, in.AddedFiles)...)
+	gaps = append(gaps, DetectDependencyRiskGapsIn(in.Root, taskID, planned, in.ChangedFiles)...)
 	if in.GitErr != nil {
 		gaps = append(gaps, gitStateGap(taskID, in.GitErr))
 	}
