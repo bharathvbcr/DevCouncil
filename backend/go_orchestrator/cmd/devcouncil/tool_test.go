@@ -241,6 +241,27 @@ func TestToolCallLeaseIsTheStoresNotTheServers(t *testing.T) {
 	if isError {
 		t.Fatalf("MCP renew of the shell's lease: %s", text)
 	}
+	// Verify runs under the shell's lease from both sides. Exit 0 means the
+	// tool answered, not that the task passed: the verdict is "passed".
+	for _, side := range []string{"shell", "mcp"} {
+		var verdict map[string]any
+		if side == "shell" {
+			out, _, code := cliTool(t, root, "devcouncil_verify_task", map[string]any{"task_id": "T-1", "lease_token": token})
+			verdict = decode(out)
+			if code != devcouncil.ToolExitOK {
+				t.Fatalf("shell verify under the shell's lease: exit %d %s", code, out)
+			}
+		} else {
+			out, isError := mcpTool(t, root, "devcouncil_verify_task", map[string]any{"task_id": "T-1", "lease_token": token})
+			verdict = decode(out)
+			if isError {
+				t.Fatalf("MCP verify under the shell's lease: %s", out)
+			}
+		}
+		if verdict["task_id"] != "T-1" || verdict["passed"] == nil || verdict["status"] == nil {
+			t.Fatalf("%s verify did not return a verdict: %v", side, verdict)
+		}
+	}
 	// The same client asking again, from MCP, is handed its lease back.
 	text, isError = mcpTool(t, root, "devcouncil_checkout_task", map[string]any{"task_id": "T-1", "client_id": "agent-a"})
 	if isError || decode(text)["lease_token"] != token {

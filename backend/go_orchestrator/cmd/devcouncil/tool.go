@@ -30,7 +30,8 @@ Usage:
 Omit it for a tool that takes none. Example:
   devcouncil tool call devcouncil_checkout_task --args '{"task_id":"T-1","client_id":"me"}'
 
-Exit status: 0 the tool answered ok; 1 it refused (ok:false); 2 the call was
+Exit status: 0 the tool answered ok (for devcouncil_verify_task that means a
+verdict came back; read "passed" for it); 1 it refused (ok:false); 2 the call was
 malformed (unknown tool, bad JSON, an undeclared or missing argument); 3 it
 could not run here (no task store, a store, gate or verification failure, a
 timeout).
@@ -213,7 +214,9 @@ func servedTool(name string) bool {
 
 // parseToolArgs reads the arguments the way the MCP server does: one JSON
 // object decoded into map[string]any (numbers as float64), absent or null
-// meaning none. Anything that is not an object is the caller's mistake, as
+// meaning none. It stays on encoding/json v1 because the server decodes
+// tools/call arguments with v1; v2 would refuse duplicate names the server
+// accepts, and the two must judge the same call the same way. Anything that is not an object is the caller's mistake, as
 // a non-object "arguments" is the server's -32602.
 func parseToolArgs(raw string, given bool, stdin io.Reader) (map[string]any, error) {
 	if !given {

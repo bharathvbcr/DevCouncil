@@ -62,8 +62,8 @@ Install the MCP server for a host with `dev integrate claude --apply`.
 tool, from the same registry, with the same arguments, and prints the text an MCP
 client would receive; `dev tool list` names the tools. Leases live in the task
 store, so a lease taken over MCP is renewed, verified and released from the shell
-and the other way round; keep one `client_id`. Exit status: 0 ok, 1 refused,
-2 malformed call, 3 could not run here. Say in your report when you fell back.
+and the other way round; keep one `client_id`. Exit status: 0 answered (for verify,
+read `passed`), 1 refused, 2 malformed call, 3 could not run here. Say in your report when you fell back.
 `dev doctor --mcp` starts each MCP server, times its handshake and `tools/list`,
 and says whether the served tools match this binary.
 

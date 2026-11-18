@@ -42,6 +42,14 @@ Use the tool’s advertised input schema. The host does not offer arbitrary
 Implement edits through the agent’s own tools. A policy-check result protects
 only consumers that honor it; ordinary external writes are not intercepted.
 
+When an MCP call errors or times out, the same tool answers from a shell:
+`dev tool call <name> --args '<same JSON>'` runs it through the same registry and
+prints the text the MCP client would have received. The lease lives in the task
+store, so the loop can move between MCP and the shell at any step; keep one
+`client_id`. Exit status 0 means the tool answered (for verify, read `passed`).
+`dev doctor --mcp` times each server's handshake. See the
+[CLI reference](cli-reference.md#mcp-fallback-tool).
+
 ```mermaid
 stateDiagram-v2
     [*] --> Idle: Task created in store

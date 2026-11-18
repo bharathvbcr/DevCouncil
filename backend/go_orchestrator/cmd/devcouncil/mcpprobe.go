@@ -3,7 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -201,7 +202,7 @@ func sendFrame(w io.Writer, frame map[string]any) error {
 
 // readReply reads lines until the response with the given id, skipping
 // notifications. A JSON-RPC error is returned as an error.
-func readReply(ctx context.Context, r *bufio.Reader, id int, budget time.Duration) (json.RawMessage, error) {
+func readReply(ctx context.Context, r *bufio.Reader, id int, budget time.Duration) (jsontext.Value, error) {
 	for {
 		line, err := readBoundedLine(r, mcpProbeMaxLine)
 		if err != nil {
@@ -211,8 +212,8 @@ func readReply(ctx context.Context, r *bufio.Reader, id int, budget time.Duratio
 			return nil, err
 		}
 		var msg struct {
-			ID     json.RawMessage `json:"id"`
-			Result json.RawMessage `json:"result"`
+			ID     jsontext.Value `json:"id"`
+			Result jsontext.Value `json:"result"`
 			Error  *struct {
 				Code    int    `json:"code"`
 				Message string `json:"message"`

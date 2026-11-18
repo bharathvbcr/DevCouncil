@@ -157,9 +157,10 @@ is the server's `tools/list` result.
 Leases live in the task store, not in a server process, so a lease taken over MCP
 is renewed, verified and released from the shell and the other way round. Use the
 same `client_id` on both: a checkout by the holding client hands its lease back.
-`force` is accepted exactly as over MCP.
 
-Exit status: `0` the tool answered ok; `1` it refused (`ok: false`, e.g.
+Exit status: `0` the tool answered ok (for `devcouncil_verify_task` that means a
+verdict came back: read `passed`; `dev verify` instead exits 1 on a failing
+verdict); `1` it refused (`ok: false`, e.g.
 `lease_conflict`, `not_found`); `2` the call was malformed (unknown tool,
 bad JSON, an undeclared or missing argument); `3` it could not run here
 (`not_initialized`, `store_error`, `policy_error`, `verify_error`,

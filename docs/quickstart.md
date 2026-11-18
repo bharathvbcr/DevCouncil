@@ -145,6 +145,9 @@ the host, this includes user-level MCP registration, project guides, skills and
 navigation hooks. Inspect the receipt; reload the host and complete its trust
 steps as needed. Every DevMap MCP call should carry the absolute `repo_path`.
 See [integration details](coding-cli-integration.md) for the separate Go-host setup.
+If the host's MCP connection is flaky, `dev doctor --mcp` times each server's
+handshake, and `dev tool call <name> --args '<json>'` answers any `devcouncil_*`
+tool from a shell with the same text.
 
 ## 5. Add task verification when needed
 
