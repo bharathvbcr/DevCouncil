@@ -12,7 +12,7 @@ import (
 // of verify.CommandTimeout and, with the run recorded on the expired context,
 // lost it. The tool that hosts a test suite now outlives one.
 func TestVerifyTaskOutlivesItsCommandsAndOtherToolsKeepTheShortBudget(t *testing.T) {
-	t.Setenv(callBudgetEnv, "")
+	t.Setenv(CallBudgetEnv, "")
 	verifyCall := json.RawMessage(`{"name":"devcouncil_verify_task","arguments":{}}`)
 	if got := callBudgetFor("tools/call", verifyCall); got < verify.CommandTimeout {
 		t.Errorf("verify_task budget %s is shorter than a verification command's %s", got, verify.CommandTimeout)
@@ -32,12 +32,12 @@ func TestVerifyTaskOutlivesItsCommandsAndOtherToolsKeepTheShortBudget(t *testing
 }
 
 func TestTheBudgetKnobOverridesEveryTool(t *testing.T) {
-	t.Setenv(callBudgetEnv, "1500")
+	t.Setenv(CallBudgetEnv, "1500")
 	verifyCall := json.RawMessage(`{"name":"devcouncil_verify_task"}`)
 	if got := callBudgetFor("tools/call", verifyCall); got != 1500*time.Millisecond {
 		t.Errorf("budget with the knob set = %s, want 1.5s", got)
 	}
-	t.Setenv(callBudgetEnv, "nonsense")
+	t.Setenv(CallBudgetEnv, "nonsense")
 	if got := callBudgetFor("ping", nil); got != defaultCallBudget {
 		t.Errorf("a malformed knob must fall back to the default, got %s", got)
 	}

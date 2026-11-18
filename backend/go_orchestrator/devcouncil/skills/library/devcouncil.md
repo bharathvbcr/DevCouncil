@@ -50,12 +50,22 @@ so `devmap --help` lists the rest.
 | Need | Prefer |
 |---|---|
 | Task loop (checkout, verify, release) | MCP tools (`mcp__devcouncil__devcouncil_*`) |
+| Any `devcouncil_*` call when MCP errors or times out | `dev tool call <name> --args '<json>'` |
 | Gate mode | `dev gate status` |
 | Scripting, CI, headless runs | `dev verify TASK-ID --json` |
 | Read-only inspection (gaps, diff) | MCP read tools before re-running verify |
 
 MCP tool names in Claude Code are prefixed: `mcp__devcouncil__devcouncil_<name>`.
 Install the MCP server for a host with `dev integrate claude --apply`.
+
+**When MCP is unreliable.** `dev tool call <name> --args '<json>'` runs the same
+tool, from the same registry, with the same arguments, and prints the text an MCP
+client would receive; `dev tool list` names the tools. Leases live in the task
+store, so a lease taken over MCP is renewed, verified and released from the shell
+and the other way round; keep one `client_id`. Exit status: 0 ok, 1 refused,
+2 malformed call, 3 could not run here. Say in your report when you fell back.
+`dev doctor --mcp` starts each MCP server, times its handshake and `tools/list`,
+and says whether the served tools match this binary.
 
 ## MCP tools (by role)
 

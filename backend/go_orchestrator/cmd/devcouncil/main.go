@@ -74,6 +74,7 @@ var commands = map[string]func(args []string) int{
 	"integrations": runIntegrate,
 	"skills":       runSkills,
 	"verify":       runVerify,
+	"tool":         runTool,
 	"grep":         runGrep,
 	"search":       runSearch,
 	"install":      components.RunInstall,
@@ -140,8 +141,13 @@ Usage:
   devcouncil review list --task ID [--criterion AC] [--json] [--project-root DIR]
                                    Independent reviews that prove llm_review criteria; record is the
                                    harness's (refused in agent shells)
-  devcouncil doctor [--json] [--project-root DIR]
-                                   Which store next_task reads, and how many ready items it holds
+  devcouncil doctor [--json] [--mcp] [--project-root DIR]
+                                   Which store next_task reads, and how many ready items it holds;
+                                   --mcp also starts each MCP server and times its handshake and tools/list
+  devcouncil tool list [--json]
+  devcouncil tool call NAME [--args JSON|-] [--project-root DIR]
+                                   The devcouncil_* MCP tools from a shell, same registry and answer text;
+                                   the fallback when an MCP call errors or times out
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--devmap-bin PATH]

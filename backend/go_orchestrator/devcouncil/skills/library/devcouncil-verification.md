@@ -39,6 +39,10 @@ devcouncil_get_gaps           # gap list for task_id (no filter argument; read e
 devcouncil_get_diff           # working-tree diff, optionally scoped to the task
 ```
 
+When an MCP call errors or times out, `dev tool call devcouncil_get_gaps --args '{"task_id":"T-1"}'`
+(and the same for the other tools) answers it from the shell with the MCP text;
+exit status 3 means the tool could not run here, never a clean result.
+
 Those two are the whole persisted-state surface this host serves. The typed
 actions and `allowed_next_tools` ride on the `devcouncil_verify_task` result;
 evidence and the audit trail come from `dev verify TASK-ID --json` and the

@@ -12,13 +12,20 @@ import (
 const doctorHelp = `devcouncil doctor — which store next_task reads, and what it holds
 
 Usage:
-  devcouncil doctor [--json] [--project-root DIR]
+  devcouncil doctor [--json] [--mcp] [--project-root DIR]
 
 Reports the task store (the workbench.db config key, default
 .devcouncil/state.sqlite), whether it can be opened, the gate mode, and how many
 ready items it holds: all of them, and how many next_task would offer under the
 gate mode in force (a task with a blocking gap is not offered under enforce).
 Exits 1 when the store cannot be read.
+
+--mcp also starts each MCP server an agent here is given (this host's
+"devcouncil mcp" and "devmap mcp"), runs initialize and tools/list under a
+bound, and reports how long each took and whether this host's server
+advertises exactly the tools this binary serves. A server that could not be
+started is reported not_run, never ok, and either one exits 1. When MCP calls
+fail, "devcouncil tool call" answers the devcouncil_* tools from the shell.
 `
 
 // doctorReport is what `devcouncil doctor` says.
@@ -37,10 +44,13 @@ type doctorReport struct {
 	Blocked    int      `json:"blocked_by_gaps"`
 	NextTask   string   `json:"next_task,omitempty"`
 	Problems   []string `json:"problems,omitempty"`
+	// MCP is present only under --mcp.
+	MCP []mcpProbe `json:"mcp,omitempty"`
 }
 
 func runDoctor(args []string) int {
 	jsonOut := false
+	probeMCP := false
 	root := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -49,6 +59,8 @@ func runDoctor(args []string) int {
 			return 0
 		case "--json":
 			jsonOut = true
+		case "--mcp":
+			probeMCP = true
 		case "--project-root":
 			i++
 			r, ok := projectRootFlag(args, i)
@@ -67,6 +79,15 @@ func runDoctor(args []string) int {
 		return 2
 	}
 	report := inspectStore(root)
+	if probeMCP {
+		report.MCP = probeMCPServers(console.Context(), root)
+		for _, p := range report.MCP {
+			if p.Status != "ok" {
+				report.Problems = append(report.Problems, fmt.Sprintf("mcp %s: %s: %s", p.Server, p.Status, p.Reason))
+				report.OK = false
+			}
+		}
+	}
 	if jsonOut {
 		if err := console.JSON(report); err != nil {
 			return 1
@@ -145,6 +166,17 @@ func printDoctor(r doctorReport) {
 			r.ReadyItems, r.Offered, r.GateMode, r.Blocked)
 		if r.NextTask != "" {
 			console.Printf("next task:    %s\n", r.NextTask)
+		}
+	}
+	for _, p := range r.MCP {
+		if p.Status == "ok" {
+			console.Printf("mcp %-10s ok: started %d ms, initialize %d ms, tools/list %d ms, %d tools\n",
+				p.Server, p.StartMS, p.InitializeMS, p.ToolsListMS, p.Tools)
+		} else {
+			console.Printf("mcp %-10s %s: %s\n", p.Server, p.Status, p.Reason)
+			if p.Stderr != "" {
+				console.Printf("               stderr: %s\n", p.Stderr)
+			}
 		}
 	}
 	for _, p := range r.Problems {

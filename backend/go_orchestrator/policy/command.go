@@ -50,7 +50,7 @@ var devBinaries = map[string]bool{
 // `dev doctor`, each also spelled `uv run dev …`: the Python CLI's commands,
 // every one of which exits 2 on the Go host, and a `uv` entry point that no
 // longer exists. A lease is acquired through the devcouncil_checkout_task MCP
-// tool, which is not a shell command and needs no entry here.
+// tool or, when MCP is unavailable, through `dev tool call` with the same name.
 var NoTaskAllowedCommands = []string{
 	"git status", "git diff", "git diff *",
 	"echo", "echo *", "true", ":",
@@ -59,14 +59,25 @@ var NoTaskAllowedCommands = []string{
 	// that points at `dev map` while the list holding it sits behind the lease
 	// check is a message that cannot be followed.
 	"dev map", "dev map *",
+	// The shell fallback for the MCP tools a session without a lease may
+	// call: finding work, taking a lease, and the read-only inspections.
+	// Named tool by tool, never `dev tool call *`: renewing, releasing and
+	// verifying a lease are a holder's, and sit in the list below.
+	"dev tool list", "dev tool list *",
+	"dev tool call devcouncil_next_task", "dev tool call devcouncil_next_task *",
+	"dev tool call devcouncil_checkout_task *",
+	"dev tool call devcouncil_get_diff", "dev tool call devcouncil_get_diff *",
+	"dev tool call devcouncil_get_gaps *",
+	"dev tool call devcouncil_policy_check_write *",
 }
 
 // noLeaseRemedy is the reason a shell command is refused for want of a lease.
 // Every command it names must be one the allowlist above admits and the host
 // dispatches; the host's tests read it back from a real decision.
 const noLeaseRemedy = "Shell commands require an active task lease. Acquire one with the " +
-	"`devcouncil_checkout_task` MCP tool, or use the allowlisted read-only orientation " +
-	"commands (`git status`, `git diff`, `dev map …`)."
+	"`devcouncil_checkout_task` MCP tool (when MCP is unavailable: " +
+	"`dev tool call devcouncil_checkout_task --args '{\"task_id\":\"…\",\"client_id\":\"…\"}'`), " +
+	"or use the allowlisted read-only orientation commands (`git status`, `git diff`, `dev map …`)."
 
 // LeaseLifecycleAllowedCommands are available to a lease holder, independent
 // of the task's own allowed_commands.
@@ -84,9 +95,13 @@ const noLeaseRemedy = "Shell commands require an active task lease. Acquire one 
 //
 // `dev release`, `dev lease`, `dev scope` and `dev run-cmd` were dropped with
 // the Python CLI: leases are released and renewed through the devcouncil_*
-// MCP tools, and none of those names dispatches on the Go host.
+// MCP tools, or their `dev tool call` fallback, and none of the old names
+// dispatches on the Go host.
 var LeaseLifecycleAllowedCommands = []string{
 	"dev graph", "dev graph *",
+	"dev tool call devcouncil_renew_lease *",
+	"dev tool call devcouncil_release_task *",
+	"dev tool call devcouncil_verify_task *",
 	"python -m pytest *", "uv run python -m pytest *",
 	"uv run pytest *", "pytest *",
 }

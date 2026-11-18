@@ -100,6 +100,7 @@ Report: task ID, what changed, verification result, and any advisory (non-blocki
 |---|---|
 | Subagent `devcouncil-implementer` | Delegate the entire loop |
 | `dev verify TASK-ID --json` | Scripting or CI: the same verifier, from a shell |
+| `dev tool call <name> --args '<json>'` | Any step above when its MCP call errors or times out; same answer text, same lease. Report that you fell back |
 
 DevCouncil has no command that plans a goal into tasks or drives the loop for you;
 Manvi is the harness that runs it end to end.

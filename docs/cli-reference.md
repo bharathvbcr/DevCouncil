@@ -66,7 +66,8 @@ Usage:
   devcouncil skills list                               # List embedded agent skills
   devcouncil skills scaffold [options]                 # Distribute skills into project
   devcouncil task create|status|show …                 # Create, move and show tasks (workbench items)
-  devcouncil doctor [--json]                           # Which store next_task reads; how many ready items it holds
+  devcouncil doctor [--json] [--mcp]                   # Which store next_task reads; --mcp times each MCP server's handshake
+  devcouncil tool list|call NAME [--args JSON|-]       # The devcouncil_* MCP tools from a shell (MCP fallback)
   devcouncil verify TASK_ID [options]                  # Deterministically verify a task diff
   devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
   devcouncil search QUERY [--type symbol|structural|literal|regex] [--path DIR] [--max N] [--json]
@@ -99,7 +100,7 @@ devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [
                        [--scope-json JSON | --scope-file PATH] [--project-root DIR]
 devcouncil task status ID --to backlog|ready|in_progress|review|done
 devcouncil task show ID [--json]
-devcouncil doctor [--json] [--project-root DIR]
+devcouncil doctor [--json] [--mcp] [--project-root DIR]
 ```
 
 The task board has five statuses. `inbox`, the name the Backlog column had before the two were merged, is still accepted wherever a status is read and means `backlog`; no task is stored or shown as `inbox`.
@@ -120,6 +121,12 @@ The task board has five statuses. `inbox`, the name the Backlog column had befor
   default `.devcouncil/state.sqlite`, always inside `.devcouncil/`), the gate mode,
   and how many ready items the store holds: all of them, and how many `next_task`
   offers under that mode. It exits 1 when the store cannot be read.
+- `doctor --mcp` also starts `devcouncil mcp` (this executable) and `devmap mcp`,
+  runs `initialize` and `tools/list` under a 30 s bound per server, and reports
+  the time each phase took, the tool count, and any tool this host's server
+  advertises that this binary does not serve (or the reverse) — a sign the
+  server on that path is another build. A server that could not be started is
+  `not_run`, never `ok`; either one exits 1.
 
 ### Host MCP Server
 
@@ -129,6 +136,44 @@ devcouncil mcp
 ```
 
 Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. What `integrate` installs into Cursor/Claude. Arbitrary filesystem/patch/shell tools are not exposed by this host. Its verification gateway does invoke `dcverify` for rigor; see [the task loop contract](hero-loop.md).
+
+### MCP fallback (`tool`)
+
+```bash
+devcouncil tool list [--json]
+devcouncil tool call NAME [--args JSON|-] [--project-root DIR]
+devcouncil tool call devcouncil_checkout_task --args '{"task_id":"T-1","client_id":"me"}'
+```
+
+For when a `devcouncil_*` MCP call errors or times out. `tool call` builds the
+registry `devcouncil mcp` builds and calls the named tool once, in this process:
+the same argument checks (an undeclared argument is refused), the same per-tool
+time budget (`DEVCOUNCIL_MCP_CALL_TIMEOUT_MS` overrides both), and stdout is
+byte-for-byte the text an MCP client receives — one renderer serves both. The
+write gate is built only for `devcouncil_policy_check_write`. `--args -` reads
+the object from stdin (at most 4 MiB, the server's frame cap). `tool list --json`
+is the server's `tools/list` result.
+
+Leases live in the task store, not in a server process, so a lease taken over MCP
+is renewed, verified and released from the shell and the other way round. Use the
+same `client_id` on both: a checkout by the holding client hands its lease back.
+`force` is accepted exactly as over MCP.
+
+Exit status: `0` the tool answered ok; `1` it refused (`ok: false`, e.g.
+`lease_conflict`, `not_found`); `2` the call was malformed (unknown tool,
+bad JSON, an undeclared or missing argument); `3` it could not run here
+(`not_initialized`, `store_error`, `policy_error`, `verify_error`,
+`git_repo_undetermined`, a timeout). Every call prints one stderr line saying it
+was answered from the shell, so a fallback is visible in the transcript.
+
+The policy allowlist admits `dev tool list` and the no-lease tools (next_task,
+checkout_task, get_diff, get_gaps, policy_check_write) without a lease, and
+renew_lease, release_task and verify_task to a lease holder; never
+`dev tool call *`.
+
+This fixes transport failures only. The CLI shares the registry, the store and
+the project-root resolution with the server, so a missing store or a wrong root
+fails the same way on both.
 
 ### Agent Host Integrations
 
@@ -448,7 +493,7 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
-| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:` and `dev map`, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
+| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:`, `dev map` and the no-lease `dev tool` fallbacks, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
 | `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID --mode enforce --json` for an existing task, or `dcverify`. |
 | `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Managed guides are available with `devmap build --manifest --guides`; they do not replace the full wiki/OKF feature set. |
 | `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |
