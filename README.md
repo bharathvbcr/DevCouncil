@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="DevCouncil Logo" width="128" height="128" />
+</p>
+
 # DevCouncil
 
 Code intelligence and verification components for AI development.
