@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // AllowedChange is what a task's plan permits for one planned file.
@@ -47,6 +48,33 @@ const (
 	OpWrite Operation = "write"
 )
 
+// NormalizePlanPath is the one spelling rule for a path named in a plan: a
+// backslash is a slash, and any leading "./" is dropped. A planned entry, a
+// forbidden_changes entry and the path being judged are all put through it, so
+// "./src/a.go" and "src/a.go" are one entry however each reached the gate. It
+// does not clean, fold case, or trim: those change what a path means, and the
+// callers that need them say so themselves.
+func NormalizePlanPath(path string) string {
+	normalized := strings.ReplaceAll(path, "\\", "/")
+	for strings.HasPrefix(normalized, "./") {
+		normalized = normalized[2:]
+	}
+	return normalized
+}
+
+// NormalizePlanPaths applies NormalizePlanPath to each entry, returning a new
+// slice (nil stays nil).
+func NormalizePlanPaths(paths []string) []string {
+	if paths == nil {
+		return nil
+	}
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = NormalizePlanPath(p)
+	}
+	return out
+}
+
 // PlannedFile is one entry in a task's declared file scope.
 type PlannedFile struct {
 	Path          string        `json:"path"`
@@ -67,7 +95,7 @@ func (p *PlannedFile) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(trimmed, &path); err != nil {
 			return err
 		}
-		p.Path = path
+		p.Path = NormalizePlanPath(path)
 		p.AllowedChange = ChangeModify
 		return nil
 	}
@@ -77,6 +105,7 @@ func (p *PlannedFile) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*p = PlannedFile(decoded)
+	p.Path = NormalizePlanPath(p.Path)
 	if p.AllowedChange == "" {
 		p.AllowedChange = ChangeModify
 	}

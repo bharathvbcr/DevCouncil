@@ -53,14 +53,22 @@ func TestPreflightAndVerifierAgreeOnWhichPathsMayChange(t *testing.T) {
 			for _, gap := range verify.DetectOrphanDiffGaps("TASK-1", planned, changed, added) {
 				blocking = blocking || gap.Blocking
 			}
+			// Direction one: allowed with no warning => no blocking orphan_diff.
 			if allowed && !wouldBlock && blocking {
 				t.Errorf("%s %s: the preflight allowed it with no warning and verification blocks it", op, path)
 			}
-			if blocking && allowed && !wouldBlock {
-				t.Errorf("%s %s: blocking orphan not flagged", op, path)
+			// Direction two, stated from the verifier's side: a blocking
+			// orphan_diff => the preflight refused the write or flagged
+			// would_block_verification. (Logically the contrapositive of
+			// direction one; kept so a failure names the verifier's verdict.)
+			if blocking && !(!allowed || wouldBlock) {
+				t.Errorf("%s %s: blocking orphan not flagged by the preflight", op, path)
 			}
-			if allowed && wouldBlock != blocking && !verify.ToolOwned(path) {
-				t.Errorf("%s %s: would_block_verification=%v but verification's orphan blocking=%v", op, path, wouldBlock, blocking)
+			// The substantive converse, on allowed writes: no blocking orphan
+			// => no would_block_verification, so a warning is never one
+			// verification does not back.
+			if allowed && !blocking && wouldBlock && !verify.ToolOwned(path) {
+				t.Errorf("%s %s: would_block_verification=true but verification raises no blocking orphan", op, path)
 			}
 		}
 	}

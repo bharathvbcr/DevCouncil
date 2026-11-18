@@ -142,7 +142,7 @@ var ToolStateDirs = []string{".devcouncil", ".devmap"}
 // a DevCouncil tool owns. Folded and slash-normalised like the restricted rung,
 // because that is the rung it must agree with.
 func IsToolState(path string) bool {
-	cleaned := strings.TrimPrefix(normalizeSlashes(strings.TrimSpace(path)), "./")
+	cleaned := dc.NormalizePlanPath(strings.TrimSpace(path))
 	folded := fnmatch.Fold(cleaned)
 	for _, dir := range ToolStateDirs {
 		if folded == dir || strings.HasPrefix(folded, dir+"/") {
@@ -672,10 +672,7 @@ func isRootArea(area string) bool {
 }
 
 func scopeDir(p string) (string, bool) {
-	normalized := normalizeSlashes(p)
-	for strings.HasPrefix(normalized, "./") {
-		normalized = normalized[2:]
-	}
+	normalized := dc.NormalizePlanPath(p)
 	idx := strings.LastIndex(normalized, "/")
 	if idx <= 0 {
 		return "", false
@@ -878,7 +875,7 @@ func NormalizeRepoPath(root, raw string) (string, bool) {
 
 	rel, err := filepath.Rel(rootResolved, resolved)
 	if err != nil {
-		return strings.TrimPrefix(cleaned, "./"), true
+		return dc.NormalizePlanPath(cleaned), true
 	}
 	rel = filepath.ToSlash(rel)
 	if rel == ".." || strings.HasPrefix(rel, "../") {
@@ -984,25 +981,47 @@ func resolveExisting(p string) (string, bool) {
 	return "", false
 }
 
-// NormalizePlannedCandidate strips the leading "./" the way write
-// authorization does, so both surfaces match the same string.
-func NormalizePlannedCandidate(path string) string {
-	normalized := normalizeSlashes(path)
-	for strings.HasPrefix(normalized, "./") {
-		normalized = normalized[2:]
-	}
-	return normalized
+// MatchesPlannedPath reports whether path matches a planned file exactly or by
+// glob. It is the one planned-path judge: the write gate (pathMatches), the
+// verify detectors, get_diff and WouldBlockVerification all ask it, so a plan
+// entry means the same thing on every surface. Entries and path are spelled
+// through dc.NormalizePlanPath, the one strip rule. Matching is case-sensitive
+// on purpose (see EvaluateFileChange): a differently-cased path must not claim
+// another entry's authorisation.
+func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
+	editable, readOnly := PlannedScope(path, planned)
+	return editable || readOnly
 }
 
-// MatchesPlannedPath reports whether path matches a planned file exactly or by
-// glob. CLI and MCP surfaces in DevCouncil drifted on this once; one helper is
-// the fix, so the harness uses one too.
-func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
-	patterns := make([]string, len(planned))
-	for i, pf := range planned {
-		patterns[i] = pf.Path
+// PlannedScope classifies path against the plan with the judge
+// MatchesPlannedPath uses, entry by entry: editable when some entry that is not
+// read_only matches, readOnly when some read_only entry matches. Both can be
+// true when entries overlap; callers that must not widen (verification's
+// oracle-tampering check) treat readOnly as winning, whatever the entry order.
+//
+// A glob entry never covers a path the hard rules protect (secret, restricted
+// or tool-state): the write gate refuses those before it reads the plan, so a
+// glob such as "*" must not make verification treat a change to ".env" or
+// ".git/config" as planned. An entry that names such a path exactly is read as
+// it always was.
+func PlannedScope(path string, planned []dc.PlannedFile) (editable, readOnly bool) {
+	want := dc.NormalizePlanPath(path)
+	mt := matching{m: GoMatcher}
+	guarded := hardRulePath(mt, want)
+	for _, pf := range planned {
+		if !pathMatches(mt, pf.Path, want) {
+			continue
+		}
+		if guarded && dc.NormalizePlanPath(pf.Path) != want {
+			continue
+		}
+		if pf.AllowedChange == dc.ChangeReadOnly {
+			readOnly = true
+		} else {
+			editable = true
+		}
 	}
-	return matchesAny(patterns, NormalizePlannedCandidate(path))
+	return editable, readOnly
 }
 
 // plannedFileFor finds the entry that authorises a path, and reports the
@@ -1067,7 +1086,7 @@ func forbiddenAlias(root, path string, forbidden []string) (string, bool) {
 		return "", false
 	}
 	for _, raw := range forbidden {
-		entry := NormalizePlannedCandidate(raw)
+		entry := dc.NormalizePlanPath(raw)
 		if entry == "" || entry == path || strings.ContainsAny(entry, "*?[") {
 			continue
 		}
@@ -1089,21 +1108,15 @@ func forbiddenAlias(root, path string, forbidden []string) (string, bool) {
 	return "", false
 }
 
-func pathMatches(mt matching, pattern, path string) bool {
-	p := normalizeSlashes(pattern)
-	return path == p || mt.any([]string{p}, path)
+// hardRulePath reports whether the hard rules protect path, folded as the
+// gate's own rungs are.
+func hardRulePath(mt matching, path string) bool {
+	return mt.anyFold(SecretPathPatterns, path) || matchesRestricted(mt, path) || IsToolState(path)
 }
 
-// matchesAny backs MatchesPlannedPath, a bool API called outside any gate
-// entry point, so there is no failClosed to catch an engine error: it asks
-// fnmatch, never the configurable default.
-func matchesAny(patterns []string, path string) bool {
-	for _, raw := range patterns {
-		if pathMatches(matching{m: GoMatcher}, raw, path) {
-			return true
-		}
-	}
-	return false
+func pathMatches(mt matching, pattern, path string) bool {
+	p := dc.NormalizePlanPath(pattern)
+	return path == p || mt.any([]string{p}, path)
 }
 
 // matchesRestricted mirrors the Python rule, which tests both a glob match and
@@ -1167,11 +1180,5 @@ func WouldBlockVerification(d Decision, task *dc.Task) bool {
 // PlansPath reports whether the task's planned files name path exactly, which
 // is the set verification's orphan check compares the changed files with.
 func PlansPath(task *dc.Task, path string) bool {
-	want := strings.TrimPrefix(normalizeSlashes(path), "./")
-	for _, pf := range task.PlannedFiles {
-		if strings.TrimPrefix(normalizeSlashes(pf.Path), "./") == want {
-			return true
-		}
-	}
-	return false
+	return MatchesPlannedPath(path, task.PlannedFiles)
 }
