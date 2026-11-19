@@ -21,9 +21,9 @@ const path = require("node:path");
 
 const WIN32 = process.platform === "win32";
 
-function localBinDir() {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  return home ? path.join(home, ".local", "bin") : "";
+function localBinDir(env = process.env, pathMod = path) {
+  const home = env.HOME || env.USERPROFILE || "";
+  return home ? pathMod.join(home, ".local", "bin") : "";
 }
 
 function isSelf(file) {
@@ -80,21 +80,36 @@ function isNativeBin(file) {
   return true;
 }
 
-function resolveBin(name, envKey) {
-  const override = process.env[envKey];
+// Find the native binary `name` on PATH (then ~/.local/bin). Only PATH entries
+// are searched: never the current directory, which Windows' own lookup would
+// try first. On win32 only `.exe` / `.com` count; an extensionless file there
+// is an npm sh wrapper (next to `.cmd` / `.ps1`), which Windows cannot exec
+// and which re-enters this shim. `opts` exists so tests can pin the platform,
+// environment and filesystem probe instead of patching globals.
+function resolveBin(name, envKey, opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  const env = opts.env ?? process.env;
+  const isNative = opts.isNative ?? isNativeBin;
+  const win32 = platform === "win32";
+  const pathMod = win32 ? path.win32 : path.posix;
+  const override = env[envKey];
   if (override) {
     return override;
   }
-  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  const local = localBinDir();
+  const rawPath = (win32 ? env.PATH ?? env.Path : env.PATH) || "";
+  const dirs = rawPath
+    .split(pathMod.delimiter)
+    .map((dir) => (win32 ? dir.replace(/^"(.*)"$/, "$1") : dir))
+    .filter(Boolean);
+  const local = localBinDir(env, pathMod);
   if (local) {
     dirs.push(local);
   }
-  const exts = WIN32 ? [".exe", ".com", ""] : [""];
+  const exts = win32 ? [".exe", ".com"] : [""];
   for (const dir of dirs) {
     for (const ext of exts) {
-      const candidate = path.join(dir, name + ext);
-      if (isNativeBin(candidate)) {
+      const candidate = pathMod.join(dir, name + ext);
+      if (isNative(candidate)) {
         return candidate;
       }
     }
@@ -141,20 +156,29 @@ function missing(name, hint) {
   );
 }
 
-const args = process.argv.slice(2);
+function main() {
+  const args = process.argv.slice(2);
 
-const goBin = resolveBin("devcouncil", "DEVCOUNCIL_BIN");
-if (!goBin) {
-  missing(
-    "devcouncil",
-    WIN32
-      ? "Build: go -C backend/go_orchestrator build -o %USERPROFILE%\\.local\\bin\\devcouncil.exe ./cmd/devcouncil\nOr run scripts\\install.ps1, which builds it and runs `devcouncil install host`."
-      : "Build: go -C backend/go_orchestrator build -o ~/.local/bin/devcouncil ./cmd/devcouncil\nAlso: ln -sf devcouncil ~/.local/bin/dev"
-  );
+  const goBin = resolveBin("devcouncil", "DEVCOUNCIL_BIN");
+  if (!goBin) {
+    missing(
+      "devcouncil",
+      WIN32
+        ? "Build: go -C backend/go_orchestrator build -o %USERPROFILE%\\.local\\bin\\devcouncil.exe ./cmd/devcouncil\nOr run scripts\\install.ps1, which builds it and runs `devcouncil install host`."
+        : "Build: go -C backend/go_orchestrator build -o ~/.local/bin/devcouncil ./cmd/devcouncil\nAlso: ln -sf devcouncil ~/.local/bin/dev"
+    );
+  }
+
+  const result = run(goBin, args);
+  if (result.error) {
+    fail(`Failed to start devcouncil: ${result.error.message}`);
+  }
+  process.exit(result.status ?? 1);
 }
 
-const result = run(goBin, args);
-if (result.error) {
-  fail(`Failed to start devcouncil: ${result.error.message}`);
+// Run as a program only; `require` (the unit tests) gets the exports.
+if (require.main === module) {
+  main();
 }
-process.exit(result.status ?? 1);
+
+module.exports = { resolveBin, isNativeBin, isSelf, looksLikeNodeShim };

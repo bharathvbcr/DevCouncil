@@ -25,13 +25,19 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify package
+    name: Verify package (${{ matrix.os }})
     timeout-minutes: 20
     # id-token stays on the workflow for the publish job's provenance. This
     # job runs on every push and does not request a token.
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    # The package is a launcher shim: its binary resolution differs on win32,
+    # so the pack and smoke run on every OS it ships to, not only ubuntu.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout repository
@@ -53,10 +59,21 @@ jobs:
       - name: Release identity
         run: npm run check:release
 
+      # Separate steps: on windows-latest the default shell (pwsh) does not
+      # stop after a failing first native command in a multi-line script.
       - name: Check npm package contents
-        run: |
-          npm run pack:check
-          npm run smoke:package
+        run: npm run pack:check
+
+      # scripts/npm-runtime-smoke.mjs assumes the POSIX global layout
+      # (<prefix>/bin) and a /bin/sh stand-in for the host binary, so it runs
+      # on ubuntu and macOS. On Windows the shim's binary resolution is what
+      # differs, and that is pinned by the unit test below (run everywhere).
+      - name: Package smoke
+        if: runner.os != 'Windows'
+        run: npm run smoke:package
+
+      - name: Shim binary resolution
+        run: node --test scripts/npm-shim-resolve.test.mjs
 
   publish:
     name: Publish to npm
