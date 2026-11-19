@@ -94,10 +94,21 @@ func TestRepoEnvAllowRefusesCredentialBearingNames(t *testing.T) {
 		"DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN", "DSN", "PAT", "REDIS_URL", "AMQP_URL",
 		"MONGODB_URI", "POSTGRES_URL", "DB_URL", "BROKER_URL", "CACHE_URI", "DB_CONNECTION_STRING",
 		"CONNECTION_STRING", "SLACK_WEBHOOK", "SLACK_WEBHOOK_URL", "WEBHOOK_URL", "database_url",
+		"CI_JOB_JWT", "JWT",
+		"DATABASE_URL_TEST", "DB_URL_RO", "DATABASE_URL2", "REDIS_URI_REPLICA",
+		"PGPASS", "DB_PASS", "DB_PWD", "MYSQL_PWD", "PASSWD", "DB_PASSPHRASE", "PASS",
+		"NETRC", "GIT_ASKPASS", "SSH_ASKPASS", "HTTP_PROXY", "https_proxy", "GOPROXY",
+		"PG_URL", "JDBC_URL", "SPRING_DATASOURCE_URL", "SQLITE_URL", "MARIADB_URL", "MSSQL_URL",
+		"SQLSERVER_URL", "COUCHDB_URL", "NEO4J_URI", "ELASTICSEARCH_URL", "OPENSEARCH_URL",
+		"CLICKHOUSE_URL", "KAFKA_URL", "RABBITMQ_URL", "NATS_URL", "MEMCACHED_URL", "SMTP_URL",
+		"LDAP_URL", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "UV_INDEX_URL",
+		"SENTRYDSN", "SLACKWEBHOOK", "SLACK_HOOK", "DISCORD_HOOK_URL",
 	}
 	allowed := []string{
 		"TEAM_BUILD_FLAVOUR", "NODE_ENV", "RUST_LOG", "GOFLAGS", "CI_URL", "API_URL", "PATH_EXTRA",
 		"PATCH_LEVEL", "DB_HOST", "DB_PORT", "DATABASE_NAME", "COMPASS", "REDIS_PORT", "PATTERN",
+		"COMPAT_MODE", "OUTPUT_PATH", "VAULT_ADDR", "KUBECONFIG", "PWD", "OLDPWD", "BYPASS_CACHE",
+		"GIT_HOOKS_DIR", "INDEX_NAME",
 	}
 	for _, name := range refused {
 		root := t.TempDir()
@@ -117,16 +128,18 @@ func TestRepoEnvAllowRefusesCredentialBearingNames(t *testing.T) {
 	}
 }
 
-// TestUserLevelEnvAllowStillPassesCredentialNames: the name rule binds only the
-// repository's config; a caller-supplied extra (proc.ScrubEnv's variadic, the
-// user-level path) still passes these names.
-func TestUserLevelEnvAllowStillPassesCredentialNames(t *testing.T) {
+// TestScrubEnvExtrasAreNotSubjectToTheNameRule: the credential-name rule binds
+// only LoadEnvPolicy (the repository's config.yaml). proc.ScrubEnv's extra
+// list is not subject to it. There is no user-level env_allow source today:
+// the extras come only from EnvPolicy.Environ and a code-owned list
+// (components parityEnvExtra), so this pins the seam, not a config path.
+func TestScrubEnvExtrasAreNotSubjectToTheNameRule(t *testing.T) {
 	environ := []string{"DATABASE_URL=postgres://u:p@h/db", "GITHUB_PAT=x", "SENTRY_DSN=https://k@s/1", "OTHER=1"}
 	got := proc.ScrubEnv(environ, "DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN")
 	joined := strings.Join(got, "\n")
 	for _, name := range []string{"DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN"} {
 		if !strings.Contains(joined, name+"=") {
-			t.Errorf("user-level allow of %s did not reach the child: %v", name, got)
+			t.Errorf("ScrubEnv extra %s did not reach the child: %v", name, got)
 		}
 	}
 	if strings.Contains(joined, "OTHER=") {
