@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -17,9 +18,8 @@ import (
 // and without it the report says so rather than reporting a diff as exercised.
 func RunCLI(ctx context.Context, root string, client *store.Client, taskID string, gate GateState, sandbox, coveragePath string, jsonOut bool) int {
 	if client == nil {
-		payload := map[string]any{"ok": false, "error": "DevCouncil state is unavailable in this directory."}
-		writeJSON(payload)
-		return 1
+		return reportNotRun(CLIResult{GateMode: gate.Mode, Tasks: []TaskCLIResult{}}, NotRunStoreUnavailable, taskID,
+			"DevCouncil state is unavailable in this directory.", jsonOut)
 	}
 	sandbox, err := ParseSandbox(sandbox)
 	if err != nil {
@@ -67,6 +67,9 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID strin
 	for _, id := range taskIDs {
 		mcp, gaps, err := VerifyTask(ctx, root, client, id, gate, sandbox, coveragePath)
 		if err != nil {
+			if reason, notRun := notRunReason(err); notRun {
+				return reportNotRun(cli, reason, id, err.Error(), jsonOut)
+			}
 			cli.OK = false
 			cli.Error = err.Error()
 			writeJSON(cli)
@@ -124,6 +127,23 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID strin
 		return 1
 	}
 	return 0
+}
+
+// reportNotRun ends a verify that judged nothing: not_run in the JSON envelope,
+// one stderr line in human mode. The exit code stays 1.
+func reportNotRun(cli CLIResult, reason, taskID, message string, jsonOut bool) int {
+	cli.OK = false
+	cli.Error = message
+	cli.NotRun = &NotRun{Reason: reason, TaskID: taskID}
+	if jsonOut {
+		writeJSON(cli)
+		return 1
+	}
+	if reason == NotRunTaskNotFound {
+		message = fmt.Sprintf("no task %q in this repository's task store", taskID)
+	}
+	console.Errorf("verify: NOT RUN (%s): %s\n", reason, message)
+	return 1
 }
 
 func writeJSON(v any) bool {
