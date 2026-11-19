@@ -298,3 +298,108 @@ func TestARootThatIsASymlinkIsComparedByItsRealPath(t *testing.T) {
 	assertArtifactsRefused(t, rootLink, filepath.Join("..", "outside"))
 	assertArtifactsRefused(t, rootLink, outside)
 }
+
+func TestAdversarialSymlinkShapesNeverAdmitOutside(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	mkdirAll(t, filepath.Join(parent, "repo2"))
+	outside := mkdirAll(t, filepath.Join(parent, "outside"))
+	plantArchives(t, outside)
+	symlink(t, outside, filepath.Join(root, "hop2"))
+	symlink(t, "hop2", filepath.Join(root, "hop1"))
+	symlink(t, "hop1", filepath.Join(root, "hop0"))
+	symlink(t, "..", filepath.Join(root, "up"))
+	symlink(t, filepath.Join(parent, "repo2"), filepath.Join(root, "sib"))
+	symlink(t, "b", filepath.Join(root, "a"))
+	symlink(t, "a", filepath.Join(root, "b"))
+	symlink(t, outside, filepath.Join(root, "arts"))
+	sep := string(filepath.Separator)
+	for _, artifacts := range []string{
+		"hop0",
+		"hop0" + sep + "missing",
+		"up",
+		"up" + sep + "outside",
+		"up" + sep + "repo2",
+		"sib",
+		"arts" + sep,
+		"." + sep + "arts",
+		"arts" + sep + sep + "x",
+		"arts" + sep + "." + sep + "x",
+		root + sep + sep + "arts",
+		filepath.Join(root, "arts") + sep,
+	} {
+		assertArtifactsRefused(t, root, artifacts)
+	}
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", "a")
+	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "dcrelease:") {
+		t.Fatalf("two-link cycle: exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+}
+
+func TestAdversarialEmptyFileAndRootSpellings(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	if err := os.WriteFile(filepath.Join(root, "afile"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "ofile"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", "")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "--artifacts needs a value") {
+		t.Fatalf("empty --artifacts: exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+	assertArtifactsRefused(t, root, filepath.Join("..", "ofile"))
+	assertArtifactsRefused(t, root, filepath.Join(parent, "ofile"))
+	assertArtifactsInspected(t, root, "afile")
+	assertArtifactsInspected(t, root, root+string(filepath.Separator))
+	assertArtifactsInspected(t, root, "."+string(filepath.Separator))
+	// Prefix confusion: root-evil and root2 share root's prefix.
+	for _, name := range []string{"repo-evil", "repo2", "repository"} {
+		mkdirAll(t, filepath.Join(parent, name))
+		assertArtifactsRefused(t, root, filepath.Join(parent, name))
+		assertArtifactsRefused(t, root, filepath.Join("..", name))
+	}
+}
+
+// A spelling that differs from the checkout only in case or Unicode
+// normalisation may be refused (a limitation on APFS) but never admitted
+// when it names a directory outside, and never prints OK.
+func TestAdversarialCaseAndNormalisationNeverAdmitOutside(t *testing.T) {
+	parent := t.TempDir()
+	nfc := "caf\u00e9"
+	nfd := "cafe\u0301"
+	root := mkdirAll(t, filepath.Join(parent, nfc))
+	outside := mkdirAll(t, filepath.Join(parent, nfc+"-evil"))
+	plantArchives(t, outside)
+	for _, artifacts := range []string{
+		filepath.Join(parent, nfd+"-evil"),
+		filepath.Join(parent, "CAF\u00c9-EVIL"),
+		filepath.Join(parent, nfd, "..", nfd+"-evil"),
+	} {
+		code, stdout, stderr := runArgs("--root", root, "--artifacts", artifacts)
+		if strings.Contains(stdout, "OK:") || code == 0 || strings.Contains(stderr, "missing package.json") {
+			t.Fatalf("--artifacts %q admitted: exit %d\nstdout %q\nstderr %q", artifacts, code, stdout, stderr)
+		}
+	}
+}
+
+// The tag check prints OK to stdout before --artifacts is judged, so a refused
+// --artifacts leaves an OK line on stdout beside exit 1. The refusal itself
+// is still exit 1 with FAIL on stderr.
+func TestTagAtHeadOKLineThenArtifactsRefusalExitsOne(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	dir := t.TempDir()
+	git(t, dir, "init", "-q")
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "a")
+	git(t, dir, "commit", "-q", "-m", "one")
+	code, stdout, stderr := runArgs("--root", dir, "--tag", "v9.9.9", "--tag-at-head", "--artifacts", "..")
+	if code != 1 || stderr != artifactsOutside || strings.Contains(stdout, "is consistent") {
+		t.Fatalf("exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+}
