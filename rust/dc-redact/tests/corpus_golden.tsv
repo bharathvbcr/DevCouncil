@@ -137,6 +137,11 @@ secrets.tsv	echo token ya29.a0FAKEfake-Token_notReal.0123456789abcdefXYZ	echo to
 secrets.tsv	aws_access_key_id = "AKIA" + "IOSFODNN7EXAMPLE"	aws_access_key_id = "AKIA… (20 chars)"
 secrets.tsv	def dapiClientFactoryBuilderHelperForEveryTenant(): pass	def dapiClientFactoryBuilderHelperForEveryTenant(): pass
 secrets.tsv	GSK_CONFIG = "gsk_config_value_for_each_worker_in_region_x_y"	GSK_CONFIG = "gsk_config_value_for_each_worker_in_region_x_y"
+secrets.tsv	password=ghp_0123456789abcdefghijklmnopqrstuvwxyzA!!	password=ghp_… (43 chars)
+secrets.tsv	ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH	ANTHROPIC_API_KEY=sk-ant-… (57 chars)
+secrets.tsv	# don't leak: aws_access_key_id = "AKIA" + "QJZXVBNMLKPOIUYT"	# don't leak: aws_access_key_id = "AKIA… (20 chars)"
+secrets.tsv	aws_access_key_id = "hello" + "AKIA" + "QJZXVBNMLKPOIUYT"	aws_access_key_id = "hello" + "AKIA… (20 chars)"
+secrets.tsv	  printf 'GEMINI_API_KEY=%s\\n' "\\$KEY" > $ENV_FILE && chmod 600 $ENV_FILE	  printf 'GEMINI_API_KEY=%s\\n' "\\$KEY" > $ENV_FILE && chmod 600 $ENV_FILE
 secrets_holdout.tsv	spring.datasource.password=Pr0dDbP4ss2026	spring.datasource.password=… (14 chars)
 secrets_holdout.tsv	  "apiKey": "AbC123dEf456GhI789jKl0",	  "apiKey": "… (22 chars)",
 secrets_holdout.tsv	REDIS_URL=redis://:9xYzQ8wVu7tS6rQ5@cache.internal:6379/0	REDIS_URL=redis://:… (16 chars)@cache.internal:6379/0
@@ -185,6 +190,8 @@ secrets_holdout.tsv	TOKENIZERS_PARALLELISM=false	TOKENIZERS_PARALLELISM=false
 secrets_holdout.tsv	tok, err := auth.TokenFromContext(ctx)	tok, err := auth.TokenFromContext(ctx)
 secrets_holdout.tsv	  accessToken: string;	  accessToken: string;
 secrets_holdout.tsv	Log in with your GitHub account; no password is stored.	Log in with your GitHub account; no password is stored.
+secrets_holdout.tsv	" aws_access_key_id = "AKIA" + "QJZXVBNMLKPOIUYT"	" aws_access_key_id = "AKIA" + "QJZXVBNMLKPOIUYT"
+secrets_holdout.tsv	const K: &str = concat!("AKIA", "QJZXVBNMLKPOIUYT");	const K: &str = concat!("AKIA", "QJZXVBNMLKPOIUYT");
 secrets_holdout_2.tsv	  password: Kq7vT2mWx9Lp	  password: … (12 chars)
 secrets_holdout_2.tsv	const apiKey = "Zr8nV3qL6tY1wB4kP7sD"	const apiKey = "… (20 chars)"
 secrets_holdout_2.tsv	_auth=ZGVwbG95OlNlY3JldFBhc3MyMDI2	_auth=… (28 chars)
