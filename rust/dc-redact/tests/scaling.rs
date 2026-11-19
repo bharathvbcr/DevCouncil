@@ -5,7 +5,7 @@
 //! Each shape is measured at 100 KB and 400 KB (12.5 and 50 in a debug build), min of several runs, and
 //! 4x the input may cost at most ~5x the time (linear is 4x; quadratic is 16x).
 
-use dc_redact::{contains_secret, redact_secrets};
+use dc_redact::{contains_secret, find_secret, redact_secrets};
 use std::time::{Duration, Instant};
 
 /// The cheapest of `runs` timings of `work` on each input, taken in
@@ -35,6 +35,7 @@ fn best_pair(small: &str, large: &str, runs: usize, work: &dyn Fn(&str)) -> (Dur
 
 fn scan(line: &str) {
     let _ = contains_secret(line);
+    let _ = find_secret(line);
     let _ = redact_secrets(line);
 }
 
@@ -48,7 +49,7 @@ fn is_linear(a: Duration, b: Duration) -> bool {
 /// separator of one long line.
 #[test]
 fn repeated_credential_assignments_scale_linearly() {
-    let shapes: [(&str, &str); 15] = [
+    let shapes: [(&str, &str); 21] = [
         // Every `:` is a credential key's, and the type after it runs to the
         // end of the line: the annotation check reads a bounded prefix.
         ("token: type run", "token:a:"),
@@ -69,6 +70,14 @@ fn repeated_credential_assignments_scale_linearly() {
         ("--password value", "--password Ab12345678 "),
         ("--password flags", "--password --password "),
         ("netrc", "machine m login l password Ab12345678 "),
+        // Same-line joins: the line is scanned as written and, when it holds
+        // a run of two or more quoted literals, once more as one joined copy.
+        ("join plus", "\"a\" + "),
+        ("join adjacent", "\"a\" "),
+        ("join split key", "\"AKIA\" + \"IOSFODNN7EXAMPLE\" "),
+        ("unclosed single quote", "'a "),
+        ("raw hash unclosed", "r#\"a "),
+        ("raw hash mismatched closer", "r##\"a\"# "),
     ];
     // 100 KB against 400 KB in a release build. A debug build scans some twenty
     // times slower, so it measures an eighth of that: the ratio is the same.
