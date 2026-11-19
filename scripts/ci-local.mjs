@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import {
   StepStop,
   devmapAvailable,
+  expectedRowLabels,
   goModToolchain,
   gussetPin,
   gussetPinVerdict,
@@ -301,6 +302,14 @@ const VERIFY_ARGS = ["./verify.sh", "--quick"];
  * @returns {Step}
  */
 export function rustVerifyStep(cwd) {
+  /** The steps verify.sh declares, read when the run ends so the script that ran is the one read. */
+  const declaredSteps = (/** @type {string} */ dir) => {
+    try {
+      return expectedRowLabels(readFileSync(path.join(dir, "verify.sh"), "utf8"));
+    } catch {
+      return undefined;
+    }
+  };
   return {
     label: "rust verify --quick",
     needs: [],
@@ -312,7 +321,7 @@ export function rustVerifyStep(cwd) {
     run: (ctx) =>
       exec(ctx, "bash", ctx.mode === "default" ? VERIFY_ARGS : [...VERIFY_ARGS, "--continue", "--nested"], {
         cwd,
-        check: (log) => nestedGateProblem(log, { nested: ctx.mode !== "default" }),
+        check: (log) => nestedGateProblem(log, { nested: ctx.mode !== "default", labels: declaredSteps(cwd) }),
       }),
   };
 }

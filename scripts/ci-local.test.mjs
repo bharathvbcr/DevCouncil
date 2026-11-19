@@ -13,6 +13,7 @@ import {
   goModToolchain,
   gussetPin,
   gussetPinVerdict,
+  expectedRowLabels,
   libtestFailures,
   localTagState,
   nestedGateProblem,
@@ -840,6 +841,10 @@ describe("rust/verify.sh across bash and locale", { skip: process.platform === "
           assert.equal(r.status, 1, r.stdout + r.stderr);
           assert.match(nestedGateProblem(r.stdout, { nested: true }), /FAIL row: FAIL +1\/8 format/);
           assert.match(r.stdout, /^ {2}── rust\/verify\.sh ─+$/m);
+          // The real script's rows are exactly the steps it declares.
+          const labels = expectedRowLabels(readFileSync(script, "utf8"));
+          assert.equal(labels.length, 10);
+          assert.doesNotMatch(nestedGateProblem(r.stdout, { nested: true, labels }), /row\(s\) but the script declares/);
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
@@ -870,8 +875,55 @@ describe("ci:local nested-gate verdict, adversarial logs", { skip: process.platf
 
 
 
-  it("FAILs, closed, on a CRLF summary block", () => {
-    assert.equal(runFake([emit(block().replace(/\n/g, "\r\n"))]).row.status, "FAIL");
+  // Line endings are normalised (CRLF and bare CR) before anything is matched,
+  // so a gate that ends its lines with \r is read the way one ending in \n is.
+  it("reads a CRLF summary block as the block it is, and still judges its rows", () => {
+    assert.equal(runFake([emit(block().replace(/\n/g, "\r\n"))]).row.status, "PASS");
+    assert.equal(runFake([emit(block(["    FAIL  3/8 tests    2.0s"]).replace(/\n/g, "\r\n"))]).row.status, "FAIL");
+  });
+
+  it("BREAK: FAILs when an early PASS block is followed by a later FAIL block", () => {
+    const later = block(["    FAIL  3/8 tests                                    2.0s"]);
+    const r = runFake([emit(block()), "echo more steps", emit(later)]);
+    assert.equal(r.row.status, "FAIL", r.out);
+  });
+
+  it("FAILs on two summary blocks even when both are clean: verify.sh prints exactly one", () => {
+    const r = runFake([emit(block()), emit(block())]);
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /2 summary blocks/);
+  });
+
+  it("BREAK: FAILs on a libtest FAILED line that carries a carriage return", () => {
+    const r = runFake([emit("test a::b ... FAILED\r\n"), emit(block())]);
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.equal(runFake([emit("test a::b ... FAILED\r"), emit(block())]).row.status, "FAIL");
+  });
+
+  it("FAILs on cargo's compile and target failures beside exit 0 and a valid block", () => {
+    for (const line of [
+      "error: could not compile `dc-verify` (test \"json_contract\") due to 1 previous error",
+      "error: 2 targets failed:",
+      "error: 1 target failed:",
+      "error: test failed, to rerun pass `-p dc-verify --lib`",
+    ]) {
+      const r = runFake([emit(line + "\n"), emit(block())]);
+      assert.equal(r.row.status, "FAIL", line + "\n" + r.out);
+    }
+  });
+
+  // The step list is knowable: verify.sh declares one L_NAME="label" per step.
+  it("compares the block's rows with the steps the script declares", () => {
+    const decl = ['L_A="1/2 alpha"', 'L_B="2/2 beta"'];
+    const rows = (...r) => block(r);
+    const good = rows("    PASS  1/2 alpha        0.1s", "    PASS  2/2 beta         0.1s");
+    assert.equal(runFake([...decl, emit(good)]).row.status, "PASS");
+    const missing = rows("    PASS  1/2 alpha        0.1s");
+    const r = runFake([...decl, emit(missing)]);
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /1 row\(s\) but the script declares 2 steps/);
+    const wrong = rows("    PASS  1/2 alpha        0.1s", "    PASS  2/2 gamma        0.1s");
+    assert.match(runFake([...decl, emit(wrong)]).row.note, /row 2 is not "2\/2 beta"/);
   });
 
   it("reads ANSI colour around the block, its FAIL row and the libtest lines", () => {
@@ -924,5 +976,49 @@ describe("ci:local nested-gate verdict, adversarial logs", { skip: process.platf
   it("FAILs when the default-mode green line sits beside a libtest FAILED line", () => {
     const r = runFake(["echo 'test result: FAILED. 0 passed; 1 failed'", "printf '\\nQUICK GATES GREEN; the full gate suite was NOT RUN\\n'"], "default");
     assert.equal(r.code, 1, r.out);
+  });
+});
+
+// 2026-11-19: on /bin/bash 3.2.57 a top-level `set -u` abort enters the EXIT
+// trap with $?=0, so a trap that only re-exits with its entry status exits 0
+// over a crash. verify.sh sets COMPLETED=1 as the last statement of a run that
+// finished, and its trap turns a 0 without it into 1. This drives the real
+// script into a top-level set -u abort without cargo: a `perl` that prints a
+// word instead of a clock reading makes the step timer's arithmetic read an
+// unbound variable (`date` fails, so now_ns falls through to perl).
+describe("rust/verify.sh completion flag", { skip: process.platform === "win32" }, () => {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "rust", "verify.sh");
+  const which = (name) => spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+  const shells = [...new Set(["/bin/bash", which("bash")].filter((p) => p && spawnSync(p, ["-c", "exit 0"]).status === 0))];
+
+  for (const shell of shells) {
+    it(`exits non-zero when a top-level set -u abort enters the EXIT trap: ${shell}`, () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "verify-abort-"));
+      try {
+        const bin = path.join(dir, "bin");
+        mkdirSync(bin);
+        for (const tool of ["dirname", "mktemp", "rm", "cat", "sh"]) symlinkSync(which(tool), path.join(bin, tool));
+        writeFileSync(path.join(bin, "date"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+        writeFileSync(path.join(bin, "perl"), "#!/bin/sh\necho bogus\n", { mode: 0o755 });
+        writeFileSync(path.join(bin, "cargo"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        const host = path.join(dir, "devcouncil");
+        writeFileSync(host, "");
+        const r = spawnSync(shell, [script, "--quick", "--continue"], {
+          encoding: "utf8",
+          env: { PATH: bin, HOME: dir, DEVCOUNCIL_BIN: host },
+        });
+        assert.match(r.stderr, /unbound variable/, "the fixture must reach a set -u abort: " + r.stderr);
+        assert.notEqual(r.status, 0, r.stdout + r.stderr);
+        assert.doesNotMatch(r.stdout, /passed ·/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("sets COMPLETED=1 before each successful exit, and the trap fails a bare 0", () => {
+    const src = readFileSync(script, "utf8");
+    assert.match(src, /^COMPLETED=0$/m);
+    assert.match(src, /\[ "\$COMPLETED" -ne 1 \]/);
   });
 });
