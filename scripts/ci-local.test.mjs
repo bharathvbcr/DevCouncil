@@ -847,3 +847,82 @@ describe("rust/verify.sh across bash and locale", { skip: process.platform === "
     }
   }
 });
+
+// Attack round (ft-7fdb1ab4 lane C): adversarial logs for the verify step's
+// verdict. Each case runs the step against a fake verify.sh.
+describe("ci:local nested-gate verdict, adversarial logs", { skip: process.platform === "win32" }, () => {
+  const rule = "─".repeat(42);
+  const ROWS = ["    PASS  1/8 format                                   0.1s", "    PASS  3/8 tests                                    2.0s"];
+  const block = (rows = ROWS) => ["", "  ── rust/verify.sh " + rule, "", ...rows, "", ""].join("\n");
+  const q = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
+  const emit = (s) => "printf '%s' " + q(s);
+  function runFake(body, mode = "continue") {
+    const dir = mkdtempSync(path.join(tmpdir(), "ci-local-adv-"));
+    try {
+      writeFileSync(path.join(dir, "verify.sh"), ["#!/usr/bin/env bash", ...body, ""].join("\n"), { mode: 0o755 });
+      const lines = [];
+      const res = runSteps([rustVerifyStep(dir)], { mode, gate: "t", log: (s) => lines.push(s) });
+      return { row: res.rows[0], code: res.code, out: lines.join("\n") };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+
+
+  it("FAILs, closed, on a CRLF summary block", () => {
+    assert.equal(runFake([emit(block().replace(/\n/g, "\r\n"))]).row.status, "FAIL");
+  });
+
+  it("reads ANSI colour around the block, its FAIL row and the libtest lines", () => {
+    const esc = "\u001b[1m";
+    const coloured = block().replace("  ── rust", "  " + esc + "── rust").replace("    PASS  1/8", "    \u001b[32mPASS\u001b[0m  1/8");
+    assert.equal(runFake([emit(coloured)]).row.status, "PASS");
+    const failRow = block(["    \u001b[31mFAIL\u001b[0m  3/8 tests    2.0s"]);
+    assert.equal(runFake([emit(failRow)]).row.status, "FAIL");
+    assert.equal(runFake([emit("\u001b[31mtest a ... FAILED\u001b[0m\n"), emit(block())]).row.status, "FAIL");
+  });
+
+  it("believes a block written to stderr only (stderr is merged into the captured log)", () => {
+    assert.equal(runFake([emit(block()) + " >&2"]).row.status, "PASS");
+  });
+
+  it("FAILs a block valid in itself when a libtest FAILED line follows it", () => {
+    assert.equal(runFake([emit(block()), "echo 'test late::one ... FAILED'"]).row.status, "FAIL");
+  });
+
+  it("does not FAIL a passing test whose name contains FAILED", () => {
+    const r = runFake([emit("test it_reports_FAILED_rows ... ok\ntest result: ok. 1 passed; 0 failed\n"), emit(block())]);
+    assert.equal(r.row.status, "PASS", r.out);
+  });
+
+  it("reads unicode and box-drawing in step names and notes", () => {
+    const rows = ["    PASS  3/8 tests — host fixture │ ✓                  0.0s", "    N/A   4/8 determinism — ünïcödé  (not applicable: quick mode)"];
+    assert.equal(runFake([emit(block(rows))]).row.status, "PASS");
+  });
+
+  it("FAILs a signal-killed nested gate", () => {
+    const r = runFake([emit(block()), "kill -9 $$"]);
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /exit 137/);
+  });
+
+  it("FAILs, closed, when a stderr line lands inside the block", () => {
+    const parts = block().split("\n");
+    const r = runFake([emit(parts.slice(0, 4).join("\n") + "\n"), "echo 'warning: noise' >&2", emit(parts.slice(4).join("\n"))]);
+    assert.equal(r.row.status, "FAIL", r.out);
+  });
+
+  it("scans a 3 MiB single-line log in bounded time", () => {
+    const line = "test " + "a ".repeat(1_500_000);
+    const start = Date.now();
+    assert.equal(nestedGateProblem(line + "\n" + block(), { nested: true }), undefined);
+    assert.deepEqual(libtestFailures(line + " ... FAILED"), [line + " ... FAILED"]);
+    assert.ok(Date.now() - start < 5000, "scan time");
+  });
+
+  it("FAILs when the default-mode green line sits beside a libtest FAILED line", () => {
+    const r = runFake(["echo 'test result: FAILED. 0 passed; 1 failed'", "printf '\\nQUICK GATES GREEN; the full gate suite was NOT RUN\\n'"], "default");
+    assert.equal(r.code, 1, r.out);
+  });
+});
