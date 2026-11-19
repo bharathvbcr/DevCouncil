@@ -66,6 +66,14 @@ func (s *GitSession) RunEnv(ctx context.Context, limit int, env []string, args .
 		// is empty rather than a read of buffers in use.
 		return GitResult{TimedOut: true, ExitCode: 124}, fmt.Errorf("git %s did not return within the deadline: %w", strings.Join(args, " "), ctx.Err())
 	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr == context.DeadlineExceeded {
+			// The same empty result as a deadline RunBounded saw first, built
+			// before the buffers are read: the output of a read the deadline cut
+			// short is not an answer.
+			return GitResult{TimedOut: true, ExitCode: 124}, fmt.Errorf("git %s: %w: %w", strings.Join(args, " "), err, ctxErr)
+		}
+	}
 	res := GitResult{
 		Stdout:    stdout.Bytes(),
 		Stderr:    stderr.Bytes(),
@@ -76,11 +84,6 @@ func (s *GitSession) RunEnv(ctx context.Context, limit int, env []string, args .
 	}
 	res.ExitCode = -1
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		if ctxErr == context.DeadlineExceeded {
-			// The same empty result as a deadline RunBounded saw first: the
-			// output of a read the deadline cut short is not an answer.
-			return GitResult{TimedOut: true, ExitCode: 124}, fmt.Errorf("git %s: %w: %w", strings.Join(args, " "), err, ctxErr)
-		}
 		return res, fmt.Errorf("git %s: %w: %w", strings.Join(args, " "), err, ctxErr)
 	}
 	var exit *exec.ExitError

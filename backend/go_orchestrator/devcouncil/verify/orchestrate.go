@@ -604,7 +604,11 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	// instead of each starting its own.
 	ctx, cancel := proc.WithWalkBudget(ctx)
 	defer cancel()
-	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-status", "-z"}, toolStateExcludes()...)...)
+	// base is what the diffs compare the tree to: HEAD, or in a repository with
+	// no commits yet the empty tree, so what is staged or modified there is
+	// listed and read like any other change instead of being dropped.
+	base := "HEAD"
+	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", base, "--name-status", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
 		noHead, headErr := hasNoHead(ctx, git)
@@ -614,7 +618,14 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 		if !noHead {
 			return GitState{}, err
 		}
-		headless, nameOut = true, nil
+		headless = true
+		if base, err = emptyTreeOID(ctx, git); err != nil {
+			return GitState{}, err
+		}
+		nameOut, err = runGit(ctx, git, gitListingLimit, append([]string{"diff", base, "--name-status", "-z"}, toolStateExcludes()...)...)
+		if err != nil {
+			return GitState{}, err
+		}
 	}
 	entries, err := parseNameStatus(nameOut)
 	if err != nil {
@@ -702,8 +713,8 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	if err != nil {
 		return GitState{}, err
 	}
-	if !headless {
-		args := append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)
+	{
+		args := append([]string{"-c", "core.quotePath=false", "diff", base}, toolStateExcludes()...)
 		for _, path := range recreated {
 			args = append(args, ":(top,exclude,literal)"+path)
 		}
@@ -782,6 +793,33 @@ func toolStateExcludes() []string {
 	return spec
 }
 
+// emptyTreeOID is the object id of the empty tree in this repository's hash
+// format (a sha256 repository has a different one), asked of git rather than
+// written down.
+func emptyTreeOID(ctx context.Context, git *proc.GitSession) (string, error) {
+	out, err := runGit(ctx, git, 1<<10, "hash-object", "-t", "tree", os.DevNull)
+	if err != nil {
+		return "", fmt.Errorf("reading the empty tree id: %w", err)
+	}
+	oid := strings.TrimSpace(string(out))
+	if n := len(oid); n != 40 && n != 64 {
+		return "", fmt.Errorf("git named %q as the empty tree", oid)
+	}
+	return oid, nil
+}
+
+// probeGit is one small git read whose exit code is the answer, under its own
+// gitReadBound (each read of hasNoHead gets the full bound, not a share of one).
+func probeGit(ctx context.Context, git *proc.GitSession, args ...string) (proc.GitResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitReadBound)
+	defer cancel()
+	res, err := git.Run(ctx, 1<<10, args...)
+	if err != nil && res.TimedOut {
+		err = fmt.Errorf("%w (per-read bound %s, or the enclosing deadline, expired)", err, gitReadBound)
+	}
+	return res, err
+}
+
 // hasNoHead reports whether the repository has no HEAD commit yet. Only one
 // answer is that: git ran, `rev-parse --verify --quiet HEAD` exited 1 with
 // nothing on stderr, HEAD is a symbolic ref (`symbolic-ref -q HEAD` names a
@@ -789,11 +827,10 @@ func toolStateExcludes() []string {
 // exits 1). Anything else is an error, not "no commits": a lock failure, a
 // corrupt repository, a detached HEAD naming a missing object, or a git that
 // could not run all exit non-zero too, and reading them as an empty repository
-// clears the change list and skips the diff.
+// clears the change list and skips the diff. A true answer is not "nothing to
+// read": the caller diffs against the empty tree instead (emptyTreeOID).
 func hasNoHead(ctx context.Context, git *proc.GitSession) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, gitReadBound)
-	defer cancel()
-	res, err := git.Run(ctx, 1<<10, "rev-parse", "--verify", "--quiet", "HEAD")
+	res, err := probeGit(ctx, git, "rev-parse", "--verify", "--quiet", "HEAD")
 	if err == nil {
 		return false, nil
 	}
@@ -801,7 +838,7 @@ func hasNoHead(ctx context.Context, git *proc.GitSession) (bool, error) {
 	if !errors.As(err, &exit) || res.ExitCode != 1 || len(bytes.TrimSpace(res.Stderr)) != 0 {
 		return false, err
 	}
-	sym, err := git.Run(ctx, 1<<10, "symbolic-ref", "-q", "HEAD")
+	sym, err := probeGit(ctx, git, "symbolic-ref", "-q", "HEAD")
 	if err != nil {
 		return false, fmt.Errorf("HEAD does not resolve and is not a branch name: %w", err)
 	}
@@ -809,7 +846,7 @@ func hasNoHead(ctx context.Context, git *proc.GitSession) (bool, error) {
 	if ref == "" {
 		return false, errors.New("HEAD does not resolve and symbolic-ref named no branch")
 	}
-	res, err = git.Run(ctx, 1<<10, "show-ref", "--verify", "--quiet", ref)
+	res, err = probeGit(ctx, git, "show-ref", "--verify", "--quiet", ref)
 	if err == nil {
 		return false, fmt.Errorf("HEAD does not resolve although %s exists", ref)
 	}

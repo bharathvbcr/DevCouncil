@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // expiringContext is a context whose deadline the test fires by hand, so the
@@ -62,11 +63,29 @@ func TestGitSessionRunReturnsNothingWhenTheDeadlineWinsOverAWritingGit(t *testin
 		res, err := s.Run(ctx, 1<<20, "rev-parse", "--verify", "HEAD")
 		done <- outcome{res, err}
 	}()
-	if _, err := os.ReadFile(fifo); err != nil {
-		t.Fatal(err)
+	// A fake that never writes must fail the test with a message, not hang it
+	// until go test -timeout. The bound is generous and is only a failure bound:
+	// the test never waits on it when the fake behaves.
+	signalled := make(chan error, 1)
+	go func() {
+		_, err := os.ReadFile(fifo)
+		signalled <- err
+	}()
+	select {
+	case err := <-signalled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatal("the fake git never signalled that it was writing")
 	}
 	ctx.expire()
-	got := <-done
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("Run did not return after its deadline fired")
+	}
 
 	if got.err == nil {
 		t.Fatal("a read the deadline cut short must be an error")
@@ -76,5 +95,29 @@ func TestGitSessionRunReturnsNothingWhenTheDeadlineWinsOverAWritingGit(t *testin
 	}
 	if len(got.res.Stdout) != 0 || len(got.res.Stderr) != 0 || got.res.Truncated {
 		t.Fatalf("a timed-out read returned bytes: stdout=%d stderr=%d truncated=%v", len(got.res.Stdout), len(got.res.Stderr), got.res.Truncated)
+	}
+}
+
+// A caller's GIT_DIR / GIT_WORK_TREE (a hook, an alias, a wrapper) must not
+// redirect a read of the session's root to another repository.
+func TestGitSessionIgnoresTheCallersRepositoryLocatingEnvironment(t *testing.T) {
+	root := gitRepo(t)
+	other := gitRepo(t)
+	if err := os.WriteFile(filepath.Join(root, "mine.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	t.Setenv("GIT_WORK_TREE", other)
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(other, ".git", "index"))
+	s, err := NewGitSession(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Run(context.Background(), 1<<20, "ls-files", "--others", "-z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Stdout) != "mine.txt\x00" {
+		t.Fatalf("read %q, want the session root's mine.txt", res.Stdout)
 	}
 }

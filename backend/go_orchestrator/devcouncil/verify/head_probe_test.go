@@ -92,3 +92,58 @@ func TestAnUnbornBranchIsStillAnEmptyRepo(t *testing.T) {
 		t.Fatalf("changed=%v, want new.txt", state.Changed)
 	}
 }
+
+// A repository whose HEAD has no commit but whose index and worktree hold
+// work: the staged file, and a staged file modified afterwards, must be listed
+// and carry their bytes. Dropping them reads a real change as no change.
+func TestHeadlessReadsKeepTheIndexAndWorktree(t *testing.T) {
+	stage := func(t *testing.T, root string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, "s.txt"), []byte("staged\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGitIn(t, root, "add", "s.txt")
+		if err := os.WriteFile(filepath.Join(root, "s.txt"), []byte("modified-after-staging\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]func(t *testing.T) string{
+		"unborn repository": func(t *testing.T) string {
+			root := t.TempDir()
+			runGitIn(t, root, "init", "-q")
+			stage(t, root)
+			return root
+		},
+		"orphan branch": func(t *testing.T) string {
+			root := committedRepo(t)
+			runGitIn(t, root, "checkout", "-q", "--orphan", "fresh")
+			stage(t, root)
+			return root
+		},
+		"deleted current branch": func(t *testing.T) string {
+			root := committedRepo(t)
+			head, err := os.ReadFile(filepath.Join(root, ".git", "HEAD"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runGitIn(t, root, "update-ref", "-d", strings.TrimSpace(strings.TrimPrefix(string(head), "ref:")))
+			stage(t, root)
+			return root
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := build(t)
+			state, err := verify.CollectGitStateReport(context.Background(), root)
+			if err != nil {
+				return // failing closed is acceptable; reading it as empty is not
+			}
+			if !strings.Contains(strings.Join(state.Changed, ","), "s.txt") || state.Empty {
+				t.Fatalf("changed=%v empty=%v: the staged file is missing", state.Changed, state.Empty)
+			}
+			if !strings.Contains(state.Diff, "modified-after-staging") {
+				t.Fatalf("diff does not carry the worktree bytes: %q", state.Diff)
+			}
+		})
+	}
+}
