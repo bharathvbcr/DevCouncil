@@ -763,6 +763,19 @@ pub struct Store {
 /// acceptable for a diagnostic, not a figure derived from the call rate.)
 const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a `fresh: true` verdict from [`Store::status`] may be repeated on
+/// query envelopes before it is reported as unverified.
+///
+/// Edits the watcher sees end the verdict at once (a non-empty pending queue
+/// blocks the cached answer), so this bound only covers changes nothing
+/// reported: a missed filesystem event, a tool writing around the watcher, or
+/// a long-lived MCP server with no watcher at all. It is the same sixty
+/// seconds as [`GENERATION_CHECK_MAX_AGE`], the longest the store already
+/// accepts for an unreported fault; a poller calling `status` once a minute
+/// keeps verdicts verified. A `fresh: false` verdict is never aged out: it
+/// only ends when `status` runs again.
+pub const SOURCE_FRESHNESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(test)]
 thread_local! {
     /// Added to the memo clock by tests, so age is advanced and never slept.
@@ -850,6 +863,8 @@ struct GenerationChecks {
 /// Process-local memo of the last [`Store::status`] source check.
 #[derive(Debug, Clone)]
 struct CachedSourceFreshness {
+    /// When `status` finished the walk, on the memo clock.
+    verified_at: std::time::Instant,
     generation_id: u32,
     fresh: Option<bool>,
     reason: Option<String>,
@@ -908,6 +923,9 @@ pub struct QuerySourceFreshness {
     pub fresh: Option<bool>,
     pub generation_id: Option<u32>,
     pub reason: Option<String>,
+    /// Milliseconds since `status` last walked the tree for this verdict.
+    /// `None` when no walk backs the answer.
+    pub verified_age_ms: Option<u64>,
 }
 
 impl QuerySourceFreshness {
@@ -916,6 +934,7 @@ impl QuerySourceFreshness {
             fresh: None,
             generation_id: None,
             reason: Some(reason.into()),
+            verified_age_ms: None,
         }
     }
 }

@@ -1441,11 +1441,30 @@ impl Store {
             return blocked;
         }
         match cache {
-            Some(cached) if cached.generation_id == latest => QuerySourceFreshness {
-                fresh: cached.fresh,
-                generation_id: Some(cached.generation_id),
-                reason: cached.reason,
-            },
+            Some(cached) if cached.generation_id == latest => {
+                let age = crate::db::memo_now().saturating_duration_since(cached.verified_at);
+                let verified_age_ms = Some(u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+                if cached.fresh == Some(true) && age > crate::db::SOURCE_FRESHNESS_MAX_AGE {
+                    QuerySourceFreshness {
+                        fresh: None,
+                        generation_id: Some(cached.generation_id),
+                        reason: Some(format!(
+                            "source freshness was verified {}s ago, older than the {}s bound; \
+run `devmap status` (or call `devmap_status`) to re-verify",
+                            age.as_secs(),
+                            crate::db::SOURCE_FRESHNESS_MAX_AGE.as_secs()
+                        )),
+                        verified_age_ms,
+                    }
+                } else {
+                    QuerySourceFreshness {
+                        fresh: cached.fresh,
+                        generation_id: Some(cached.generation_id),
+                        reason: cached.reason,
+                        verified_age_ms,
+                    }
+                }
+            }
             Some(cached) => QuerySourceFreshness::unverified(format!(
                 "cached source freshness described generation {}, but this answer is from \
 generation {latest}; run `devmap status` to re-verify",
@@ -1472,6 +1491,7 @@ generation {latest}; run `devmap status` to re-verify",
     ) {
         if let Ok(mut cache) = self.source_freshness_cache.lock() {
             *cache = Some(CachedSourceFreshness {
+                verified_at: crate::db::memo_now(),
                 generation_id,
                 fresh,
                 reason,
@@ -2412,6 +2432,72 @@ mod freshness_race {
         let store = seeded();
         store.enqueue_pending_paths(&[]).expect("empty enqueue");
         assert_eq!(store.query_source_freshness().fresh, Some(true));
+    }
+
+    struct ResetClock;
+    impl Drop for ResetClock {
+        fn drop(&mut self) {
+            crate::db::MEMO_CLOCK_SKEW.with(|skew| skew.set(std::time::Duration::ZERO));
+        }
+    }
+
+    fn advance_clock(by: std::time::Duration) {
+        crate::db::MEMO_CLOCK_SKEW.with(|skew| skew.set(by));
+    }
+
+    #[test]
+    fn a_fresh_verdict_older_than_the_bound_is_unverified() {
+        let _reset = ResetClock;
+        let store = seeded();
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE + std::time::Duration::from_secs(1));
+        let verdict = store.query_source_freshness();
+        assert_eq!(
+            verdict.fresh, None,
+            "a fresh verdict past the bound must not stay fresh: {verdict:?}"
+        );
+        assert_eq!(verdict.generation_id, Some(7));
+        let age = verdict.verified_age_ms.expect("the age is reported");
+        assert!(age >= 61_000, "age {age}ms must include the advanced clock");
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("verified 61s ago"), "{reason}");
+        assert!(reason.contains("devmap status"), "{reason}");
+    }
+
+    #[test]
+    fn a_fresh_verdict_inside_the_bound_stays_fresh_and_carries_its_age() {
+        let _reset = ResetClock;
+        let store = seeded();
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE - std::time::Duration::from_secs(1));
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
+        let age = verdict.verified_age_ms.expect("the age is reported");
+        assert!((59_000..60_000).contains(&age), "age {age}ms");
+    }
+
+    #[test]
+    fn re_running_status_resets_the_age() {
+        let _reset = ResetClock;
+        let store = seeded();
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE + std::time::Duration::from_secs(1));
+        assert_eq!(store.query_source_freshness().fresh, None);
+        let id = store.latest_generation_id().expect("read").expect("id");
+        store.remember_source_freshness(id, Some(true), None);
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
+        assert!(verdict.verified_age_ms.expect("age") < 1_000);
+    }
+
+    #[test]
+    fn a_stale_verdict_stays_stale_however_old() {
+        let _reset = ResetClock;
+        let store = seeded();
+        let id = store.latest_generation_id().expect("read").expect("id");
+        store.remember_source_freshness(id, Some(false), Some("tree differs".to_string()));
+        advance_clock(std::time::Duration::from_secs(3600));
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(false), "{verdict:?}");
+        assert_eq!(verdict.reason.as_deref(), Some("tree differs"));
+        assert!(verdict.verified_age_ms.expect("age") >= 3_600_000);
     }
 
     #[test]
