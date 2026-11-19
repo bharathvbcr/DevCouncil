@@ -623,7 +623,13 @@ fn write_backup_under_lock(
         let _ = std::fs::remove_file(&partial);
         detail
     };
-    let reader = Connection::open(path).map_err(|error| discard(error.to_string()))?;
+    // Read-only: a profile that vanished must fail the copy, not be created
+    // empty and copied. `VACUUM INTO` only reads the source.
+    let reader = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| discard(error.to_string()))?;
     reader
         .busy_timeout(crate::BUSY_TIMEOUT)
         .map_err(|error| discard(error.to_string()))?;
@@ -2238,6 +2244,8 @@ fn item_query(
     )
 }
 
+#[cfg(test)]
+mod backup_lock_tests;
 #[cfg(test)]
 mod enhancement_lifecycle_tests;
 #[cfg(test)]

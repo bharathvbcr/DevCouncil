@@ -18,6 +18,10 @@
 //! * Only `<profile>.pre-schema-<digits>.bak` regular files are candidates. The
 //!   `pre-tasks-retire` copy, `*.partial` files and anything else are not.
 //! * Each removal is named on stderr and in the returned [`PruneReport`].
+//! * A file the upgrade moved aside because it did not verify
+//!   (`<name>.bak.invalid-<unix seconds>[-n]`) is not a candidate: it is never
+//!   counted and never removed. The upgrade names it in
+//!   [`PruneReport::unverified`] as `...; moved aside to <path>`.
 
 use rusqlite::{Connection, OpenFlags};
 use std::num::NonZeroUsize;
@@ -94,7 +98,10 @@ impl BackupRetention {
 pub struct PruneReport {
     /// Full paths of the backups removed.
     pub removed: Vec<String>,
-    /// Older backups that failed verification: not counted, not removed.
+    /// Older backups that failed verification: not counted, not removed. When
+    /// the upgrade itself found an unusable file at the name of the backup it
+    /// needed, an entry reading `<path>: <reason>; moved aside to <path>` is
+    /// added too: that file was renamed (never deleted) and a fresh copy written.
     pub unverified: Vec<String>,
     /// Backups that should have been removed and could not be.
     pub errors: Vec<String>,
@@ -151,7 +158,8 @@ pub(super) fn verify_holds_table(path: &Path, table: &str) -> Result<(), String>
     if !table_present(&conn, table).map_err(|error| format!("it cannot be read: {error}"))? {
         return Err(format!("it holds no `{table}` table"));
     }
-    conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| {
+    let quoted = table.replace('"', "\"\"");
+    conn.query_row(&format!("SELECT count(*) FROM \"{quoted}\""), [], |row| {
         row.get::<_, i64>(0)
     })
     .map(|_| ())

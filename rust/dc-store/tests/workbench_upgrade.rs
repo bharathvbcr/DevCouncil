@@ -471,10 +471,14 @@ fn the_upgrade_backup_exists_check_and_copy_hold_the_write_lock() {
 }
 
 /// Host A stops after it found no backup, still inside the backup window. Host
-/// B, which will not wait for a lock, then tries its whole upgrade. A host that
-/// took no lock upgrades the profile and writes its own copy, and A then
-/// replaces the pre-upgrade copy with a copy of the migrated profile. With the
-/// lock, B is refused until A is done, and the copy A kept is the old schema.
+/// B, which will not wait for a lock, then tries its whole upgrade. Without the
+/// lock both hosts write through the same `.bak.partial` name, and the retire
+/// path (no schema version to verify against) had nothing to refuse a copy of
+/// an already-changed profile. (A schema-17 copy under the pre-schema-11 name
+/// was already refused by `verify`, so that is not the failure shown here.)
+/// With the lock, B is refused until A is done, and the copy A kept is the old
+/// schema. Which host waits for the lock and then finds the copy is covered
+/// in-crate by `backup_lock_tests`.
 #[test]
 fn a_second_host_cannot_replace_the_pre_upgrade_backup() {
     let (_dir, path) = profile();
@@ -517,7 +521,8 @@ fn a_second_host_cannot_replace_the_pre_upgrade_backup() {
     assert_eq!(version(&path), dc_store::workbench::WORKBENCH_SCHEMA);
     assert_eq!(workspace_rows(&path, "host-a"), 1);
 
-    // Host B, now behind a finished upgrade, leaves the copy as it was.
+    // Not the backup path: B now sees the current schema and takes no backup.
+    // This only shows a finished upgrade leaves the copy as it was.
     let kept = std::fs::read(&backup).unwrap();
     put_workspace(&host_b, "host-b").unwrap();
     assert_eq!(std::fs::read(&backup).unwrap(), kept);
@@ -789,10 +794,17 @@ fn an_awkward_or_symlinked_profile_path_is_backed_up_beside_the_real_file() {
 fn an_unwritable_backup_directory_refuses_the_upgrade() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, path) = profile();
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
     let store = Store::open(&path).unwrap();
+    let _restore = RestoreMode(dir.path().to_path_buf());
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
     let outcome = put_workspace(&store, "ro");
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(_restore);
     if let Err(error) = outcome {
         assert_eq!(error.code, "backup_failed", "{error}");
         assert_eq!(version(&path), 11, "the profile moved without a backup");
