@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -272,7 +273,12 @@ func (r *Reported) Error() string {
 // false) and dropped the reason. Such a document is a *Reported, in every mode.
 // When a report was printed first, the envelope after it is not parsed.
 func (c *Client) install(ctx context.Context, into any, mode InstallMode, stdin []byte, args ...string) error {
-	out, err := c.invoke(ctx, installBudget, stdin, args...)
+	// Not in the repository: every installing command is handed the repository
+	// as --project-root, and a working directory that is the repository is one
+	// more place a file of its own could be found by name. The binary itself was
+	// resolved outside it (ResolveOutside), and devmap now registers its own
+	// canonical path, never a name looked up from here.
+	out, err := c.invokeIn(ctx, os.TempDir(), installBudget, stdin, args...)
 	if err != nil {
 		return err
 	}
