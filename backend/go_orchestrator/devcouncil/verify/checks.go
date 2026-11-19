@@ -39,12 +39,13 @@ func DetectNoWorkGap(taskID string, planned []dc.PlannedFile, workPresent bool) 
 }
 
 // changedMatches reports whether any changed path is one the planned entry
-// names, asked of policy.MatchesPlannedPath so verification reads an entry the
-// way the write gate does.
-func changedMatches(root string, pf dc.PlannedFile, changed []string) bool {
+// names, asked of the policy planned-path judge so verification reads an entry
+// the way the write gate does. The judge is shared across entries: it asks the
+// filesystem about each changed path once, not once per entry.
+func changedMatches(judge *policy.ScopeJudge, pf dc.PlannedFile, changed []string) bool {
 	entry := []dc.PlannedFile{pf}
 	for _, c := range changed {
-		if editable, readOnly := policy.PlannedScopeIn(root, c, entry); editable || readOnly {
+		if editable, readOnly := judge.Scope(c, entry); editable || readOnly {
 			return true
 		}
 	}
@@ -60,6 +61,7 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 // the planned-path judge can run its on-disk alias rungs. root may be "".
 func DetectPlannedFileGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
+	judge := policy.NewScopeJudge(root)
 	for _, pf := range planned {
 		if pf.AllowedChange == dc.ChangeReadOnly {
 			continue
@@ -67,7 +69,7 @@ func DetectPlannedFileGapsIn(root, taskID string, planned []dc.PlannedFile, chan
 		// The planned-path judge, entry by entry: a glob entry is satisfied
 		// by any change it matches, and "./" or backslash spellings by the
 		// path they name.
-		if changedMatches(root, pf, changed) {
+		if changedMatches(judge, pf, changed) {
 			continue
 		}
 		path := pf.Path

@@ -2,11 +2,13 @@ package verify_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 )
 
 // The three scope detectors read a plan entry with the one planned-path judge,
@@ -120,5 +122,34 @@ func TestRunKeepsAModifiedUnplannedTestFileBlocking(t *testing.T) {
 	}
 	if g := orphan(run(map[string]struct{}{"tests/test_lib.py": {}})); g == nil || g.Blocking {
 		t.Errorf("added unplanned test file: want an advisory orphan_diff, got %+v", g)
+	}
+}
+
+// ft-84b49733 item 6: the scope detectors judge each changed path once, however
+// many plan entries there are. Asked entry by entry, 100 entries over 300 paths
+// ran the gate's pre-task rungs 30,000 times (~230 ms); the bound is one
+// evaluation per changed path per detector call, counted rather than timed.
+func TestScopeDetectorsEvaluateHardDeniedOncePerChangedPath(t *testing.T) {
+	root := t.TempDir()
+	var planned []dc.PlannedFile
+	for i := 0; i < 100; i++ {
+		planned = append(planned, dc.PlannedFile{Path: fmt.Sprintf("pkg%d/*.go", i), AllowedChange: dc.ChangeModify})
+	}
+	var changed []string
+	for i := 0; i < 300; i++ {
+		// Outside every glob, so no entry ends the search early.
+		changed = append(changed, fmt.Sprintf("other%d/f.go", i), fmt.Sprintf("other%d/go.mod", i))
+	}
+	for name, detect := range map[string]func(){
+		"planned_file_not_changed": func() { verify.DetectPlannedFileGapsIn(root, "T", planned, changed) },
+		"orphan_diff":              func() { verify.DetectOrphanDiffGapsIn(root, "T", planned, changed, nil) },
+		"dependency_risk":          func() { verify.DetectDependencyRiskGapsIn(root, "T", planned, changed) },
+	} {
+		before := policy.HardDeniedEvaluations()
+		detect()
+		if got := policy.HardDeniedEvaluations() - before; got > int64(len(changed)) {
+			t.Errorf("%s: %d HardDenied evaluations for %d planned entries and %d changed paths, want at most %d (one per changed path)",
+				name, got, len(planned), len(changed), len(changed))
+		}
 	}
 }

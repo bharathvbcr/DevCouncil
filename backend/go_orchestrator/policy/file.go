@@ -1,15 +1,18 @@
 package policy
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/fnmatch"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Path pattern sets, ported verbatim from DevCouncil's policy engine. They are
@@ -336,6 +339,18 @@ func (g FileGate) preTaskDecision(mt matching, path, normalized string, outside,
 				return deny(RuleRestrictedPath, "Path is another name for `"+disk+"`, a protected repository path.", normalized, taskID), true
 			}
 		}
+		// A hard link is another name the text rules cannot see: the path spells
+		// nothing protected and its inode is a secret's. See protectedHardLink
+		// for what is searched and what a search that cannot finish answers.
+		switch kind, other := protectedHardLink(mt, g.Root, normalized, internal); kind {
+		case hardLinkSecret:
+			return deny(RuleSecretPath, "Path is a hard link to `"+other+"`, a secret or credential path, which is never writable.", normalized, taskID), true
+		case hardLinkRestricted:
+			return deny(RuleRestrictedPath, "Path is a hard link to `"+other+"`, a protected repository path.", normalized, taskID), true
+		case hardLinkUnknown:
+			return deny(RuleRestrictedPath, "Path has other hard links and the repository could not be searched for their names ("+other+"); "+
+				"an unchecked file is not treated as clean.", normalized, taskID), true
+		}
 	}
 
 	// Outside the hard-rules block on purpose: see PromptInputPatterns for what
@@ -350,6 +365,131 @@ func (g FileGate) preTaskDecision(mt matching, path, normalized string, outside,
 	return Decision{}, false
 }
 
+// hardLinkWalkCap bounds the directory entries one hard-link search reads. A
+// var so a test can spend it; production never writes it.
+var hardLinkWalkCap = 250000
+
+type hardLinkKind int
+
+const (
+	hardLinkNone hardLinkKind = iota
+	hardLinkSecret
+	hardLinkRestricted
+	// hardLinkUnknown means the file has other names and the search for them
+	// could not finish. It is a refusal, never a pass: a check that could not run
+	// must not read the same as one that found nothing.
+	hardLinkUnknown
+)
+
+// protectedHardLink reports whether the existing regular file at rel (a resolved
+// repository-relative path) has another name that is a secret, a restricted
+// path or a prompt input, and returns that name. Identity, not spelling: a hard
+// link spells nothing protected and is the same inode, so a glob plan covering
+// its directory would otherwise let the write land on the secret.
+//
+// A link count of 1 ends it, which is every ordinary write: one lstat, one open
+// and one fstat (safefile.LinkCount, which reads the open handle on unix and
+// windows alike; os.SameFile compares dev+inode on unix and the volume and file
+// index on windows, so the rung holds on all three). Only a file with other
+// names pays for a walk of the repository, and the walk stats each regular
+// file (SameFile) before it classifies any name, so pattern matching is spent on
+// the one or two names that are the same file. The walk does not follow
+// symbolic links and does not skip any directory, .git included: a link into
+// .git/objects is a write to repository state. Past hardLinkWalkCap entries, or
+// with a directory it cannot read, a search that found nothing answers
+// hardLinkUnknown with the reason in the second result.
+func protectedHardLink(mt matching, root, rel string, internal bool) (hardLinkKind, string) {
+	if root == "" || rel == "" {
+		return hardLinkNone, ""
+	}
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	info, err := os.Lstat(full)
+	if err != nil || !info.Mode().IsRegular() {
+		return hardLinkNone, ""
+	}
+	links, err := linkCount(full)
+	if err != nil {
+		return hardLinkUnknown, "its link count could not be read: " + err.Error()
+	}
+	if links <= 1 {
+		return hardLinkNone, ""
+	}
+
+	var (
+		kind       = hardLinkNone
+		found      string
+		incomplete string
+		seen       int
+	)
+	errStop := errors.New("search ended")
+	// The error is only the stop signal or what the callback already recorded.
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A directory that cannot be read may hold the other name; keep
+			// going, and say so if nothing is found.
+			incomplete = "a directory could not be read: " + err.Error()
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		seen++
+		if seen > hardLinkWalkCap {
+			incomplete = "more than " + strconv.Itoa(hardLinkWalkCap) + " entries"
+			return errStop
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		name, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return nil
+		}
+		name = filepath.ToSlash(name)
+		if name == rel {
+			return nil
+		}
+		entry, statErr := d.Info()
+		if statErr != nil || !os.SameFile(info, entry) {
+			return nil
+		}
+		switch {
+		case mt.anyFold(SecretPathPatterns, name):
+			kind = hardLinkSecret
+		case !internal && (matchesRestricted(mt, name) || IsPromptInput(name)):
+			kind = hardLinkRestricted
+		default:
+			return nil
+		}
+		found = name
+		return errStop
+	})
+	if kind != hardLinkNone {
+		return kind, found
+	}
+	if incomplete != "" {
+		return hardLinkUnknown, incomplete
+	}
+	return hardLinkNone, ""
+}
+
+// linkCount is the number of names the regular file at full has.
+func linkCount(full string) (uint64, error) {
+	f, err := os.Open(full)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return safefile.LinkCount(f)
+}
+
+// hardDeniedEvaluations counts HardDenied's runs of the pre-task rungs, so a
+// test can bound how often a caller pays for them.
+var hardDeniedEvaluations atomic.Int64
+
+// HardDeniedEvaluations is how many times HardDenied has run in this process.
+func HardDeniedEvaluations() int64 { return hardDeniedEvaluations.Load() }
+
 // textOnlyRoot is the root HardDenied asks with when its caller has none: a
 // directory that cannot exist, so every on-disk rung (aliases, hard links)
 // finds nothing and only the textual rungs speak.
@@ -363,6 +503,7 @@ const textOnlyRoot = "/nonexistent/devcouncil-text-only-root"
 // textual rungs run, which is a lower bound, never a license. An engine that
 // cannot answer counts as denied, as it does in the gate.
 func HardDenied(root, path string) bool {
+	hardDeniedEvaluations.Add(1)
 	d, outside := hardDecision(root, path)
 	return outside || d.Blocked()
 }
@@ -1049,7 +1190,9 @@ func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
 	return editable || readOnly
 }
 
-// PlannedScope is PlannedScopeIn with no root.
+// PlannedScope is PlannedScopeIn with no root: text only, the on-disk rungs do
+// not run (see ScopeAnswer.OnDiskChecked). Callers that have a root use
+// PlannedScopeIn.
 func PlannedScope(path string, planned []dc.PlannedFile) (editable, readOnly bool) {
 	return PlannedScopeIn("", path, planned)
 }
@@ -1069,9 +1212,50 @@ func PlannedScope(path string, planned []dc.PlannedFile) (editable, readOnly boo
 // verify tests pin a planned secret path as planned, so its secret scan, not an
 // orphan_diff, speaks for it); the gate refuses the write either way.
 func PlannedScopeIn(root, path string, planned []dc.PlannedFile) (editable, readOnly bool) {
-	want := dc.NormalizePlanPath(path)
-	ed, ro := scopeMatch(matching{m: GoMatcher}, want, planned, HardDenied(root, path))
-	return ed != nil, ro != nil
+	return NewScopeJudge(root).Scope(path, planned)
+}
+
+// ScopeJudge is PlannedScopeIn for a caller that asks about many plan entries
+// over the same paths. HardDenied reads the filesystem, so asking it once per
+// (entry, path) pair made verification quadratic; a judge asks it once per path
+// and remembers the answer. It is not safe for concurrent use, and its memory is
+// one bool per distinct path asked about, so keep one per detector call rather
+// than one per process: the repository can change between calls.
+type ScopeJudge struct {
+	root   string
+	denied map[string]bool
+}
+
+// NewScopeJudge returns a judge for root. With root "" the on-disk rungs (alias
+// spellings, symbolic and hard links) cannot run and every answer says so.
+func NewScopeJudge(root string) *ScopeJudge {
+	return &ScopeJudge{root: root, denied: map[string]bool{}}
+}
+
+// ScopeAnswer is a judge's verdict on one path. OnDiskChecked is false when the
+// judge had no root: the answer then comes from the path's text alone, and a
+// symbolic or hard link to a protected file reads as planned.
+type ScopeAnswer struct {
+	Editable      bool
+	ReadOnly      bool
+	OnDiskChecked bool
+}
+
+// Judge classifies path against planned, as PlannedScopeIn does.
+func (j *ScopeJudge) Judge(path string, planned []dc.PlannedFile) ScopeAnswer {
+	guarded, seen := j.denied[path]
+	if !seen {
+		guarded = HardDenied(j.root, path)
+		j.denied[path] = guarded
+	}
+	ed, ro := scopeMatch(matching{m: GoMatcher}, dc.NormalizePlanPath(path), planned, guarded)
+	return ScopeAnswer{Editable: ed != nil, ReadOnly: ro != nil, OnDiskChecked: j.root != ""}
+}
+
+// Scope is Judge without the on-disk marker.
+func (j *ScopeJudge) Scope(path string, planned []dc.PlannedFile) (editable, readOnly bool) {
+	a := j.Judge(path, planned)
+	return a.Editable, a.ReadOnly
 }
 
 // scopeMatch is the one place plan entries are compared with a path: the first
@@ -1244,15 +1428,33 @@ func normalizeSlashes(p string) string { return strings.ReplaceAll(p, `\`, "/") 
 // question verification asks — is the path one the task plans — asked of the
 // path the decision names, so the two verdicts have one definition of scope.
 // A refused write never reaches verification.
+//
+// It has no root, so the on-disk alias rungs do not run: a decision that was not
+// made by this gate, naming a link to a protected file, reads as planned.
+// WouldBlockVerificationIn takes the root; prefer it wherever one is known.
 func WouldBlockVerification(d Decision, task *dc.Task) bool {
+	return WouldBlockVerificationIn("", d, task)
+}
+
+// WouldBlockVerificationIn is WouldBlockVerification with the repository root,
+// so the planned-path judge runs its on-disk rungs.
+func WouldBlockVerificationIn(root string, d Decision, task *dc.Task) bool {
 	if d.Blocked() || task == nil || d.Target == "" {
 		return false
 	}
-	return !PlansPath(task, d.Target)
+	return !PlansPathIn(root, task, d.Target)
 }
 
 // PlansPath reports whether some planned entry names path, exactly or by glob,
 // which is the set verification's orphan check compares the changed files with.
+// It has no root: text only, see PlansPathIn.
 func PlansPath(task *dc.Task, path string) bool {
-	return MatchesPlannedPath(path, task.PlannedFiles)
+	return PlansPathIn("", task, path)
+}
+
+// PlansPathIn is PlansPath with the repository root, so a symbolic or hard link
+// to a secret or restricted file is not read as planned by a glob.
+func PlansPathIn(root string, task *dc.Task, path string) bool {
+	editable, readOnly := PlannedScopeIn(root, path, task.PlannedFiles)
+	return editable || readOnly
 }

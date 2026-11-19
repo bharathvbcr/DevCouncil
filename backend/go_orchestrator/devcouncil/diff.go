@@ -179,20 +179,26 @@ func GetDiff(ctx context.Context, root string, args GetDiffArgs) (any, error) {
 				entries = append(entries, dc.PlannedFile{Path: strings.ReplaceAll(p, "\\", "/"), AllowedChange: dc.ChangeModify})
 			}
 		}
-		if len(scopePaths) > 0 {
-			filtered := make([]string, 0, len(scopePaths))
-			for _, p := range scopePaths {
-				if editable, readOnly := policy.PlannedScopeIn(root, p, entries); editable && !readOnly {
-					filtered = append(filtered, p)
-				}
+		// One path for both modes. With no paths the changed names are listed
+		// first, so the plan is never handed to git as pathspecs (a glob entry
+		// would pull in a read_only overlap or a prompt input the planned-path
+		// judge refuses); either way each name is judged on its own, and git is
+		// then given only the names that passed, as literals so a name with glob
+		// characters in it, or an explicit path that is itself a glob, names
+		// exactly one file.
+		candidates := scopePaths
+		if len(candidates) == 0 {
+			listed, err := changedNames(ctx, root, args.Staged)
+			if err != nil {
+				return DiffResult{OK: false, Files: []DiffFile{}, Staged: args.Staged, Error: err.Error()}, nil
 			}
-			scopePaths = filtered
-		} else {
-			scopePaths = make([]string, 0, len(entries))
-			for _, pf := range entries {
-				if pf.AllowedChange != dc.ChangeReadOnly {
-					scopePaths = append(scopePaths, pf.Path)
-				}
+			candidates = listed
+		}
+		judge := policy.NewScopeJudge(root)
+		scopePaths = make([]string, 0, len(candidates))
+		for _, p := range candidates {
+			if editable, readOnly := judge.Scope(p, entries); editable && !readOnly {
+				scopePaths = append(scopePaths, ":(literal)"+p)
 			}
 		}
 	}
@@ -201,6 +207,90 @@ func GetDiff(ctx context.Context, root string, args GetDiffArgs) (any, error) {
 		return emptyDiff(args.Staged), nil
 	}
 	return gitDiff(ctx, root, scopePaths, args.Staged)
+}
+
+// wholeTreePaths is the whole tree, less what DevCouncil's own tools wrote: a
+// state database is not a hunk an agent can read or should be told to revert.
+func wholeTreePaths() []string {
+	paths := []string{"."}
+	for _, dir := range policy.ToolStateDirs {
+		paths = append(paths, ":(top,exclude)"+dir)
+	}
+	return paths
+}
+
+// changedNames lists the paths gitDiff would report for the whole tree: tracked
+// changes against HEAD (or the index, when staged) and, for the working tree,
+// dirty submodules and untracked files. Names only, so it reads no file content
+// and has none of gitDiff's per-file limits. A listing that was cut short is an
+// error, not a shorter list: a name left out here is a change get_diff would
+// silently not show.
+func changedNames(ctx context.Context, root string, staged bool) ([]string, error) {
+	git, err := proc.NewGitSession(root)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, DiffTimeout)
+	defer cancel()
+	whole := wholeTreePaths()
+
+	read := func(label string, args []string) ([]string, error) {
+		out, err := runGit(ctx, git, append(append(args, "--"), whole...)...)
+		if err != nil && !isGitFail(err, out) {
+			return nil, err
+		}
+		if out.returnCode != 0 {
+			detail := strings.TrimSpace(out.stderr)
+			if detail == "" {
+				detail = strings.TrimSpace(out.stdout)
+			}
+			if detail == "" {
+				detail = fmt.Sprintf("%s exited %d", label, out.returnCode)
+			}
+			return nil, errors.New(detail)
+		}
+		if out.truncated {
+			return nil, fmt.Errorf("%s output exceeded %d bytes; pass paths to narrow the request", label, gitReadLimit)
+		}
+		var names []string
+		for _, name := range strings.Split(out.stdout, "\x00") {
+			if name != "" {
+				names = append(names, name)
+			}
+		}
+		return names, nil
+	}
+
+	tracked := []string{"diff", "--name-only", "-z"}
+	if staged {
+		tracked = append(tracked, "--cached")
+	}
+	names, err := read("git diff --name-only", tracked)
+	if err != nil {
+		return nil, err
+	}
+	if !staged {
+		dirty, err := git.DirtySubmodules(ctx, whole...)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, dirty...)
+		untracked, err := read("git ls-files --others", []string{"ls-files", "--others", "--exclude-standard", "-z"})
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, untracked...)
+	}
+	seen := make(map[string]struct{}, len(names))
+	listed := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, dup := seen[name]; dup || policy.IsToolState(name) {
+			continue
+		}
+		seen[name] = struct{}{}
+		listed = append(listed, name)
+	}
+	return listed, nil
 }
 
 func emptyDiff(staged bool) DiffResult {
@@ -217,12 +307,7 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 		namestatusArgs = append(namestatusArgs, "--cached")
 	}
 	if len(paths) == 0 {
-		// The whole tree, less what DevCouncil's own tools wrote: a state
-		// database is not a hunk an agent can read or should be told to revert.
-		paths = []string{"."}
-		for _, dir := range policy.ToolStateDirs {
-			paths = append(paths, ":(top,exclude)"+dir)
-		}
+		paths = wholeTreePaths()
 	}
 	diffArgs = append(append(diffArgs, "--"), paths...)
 	numstatArgs = append(append(numstatArgs, "--"), paths...)

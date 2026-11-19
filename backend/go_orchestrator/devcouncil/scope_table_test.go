@@ -64,6 +64,13 @@ var scopeRows = []scopeRow{
 	// those readers are pinned in verify's planned_judge_test.go and policy's
 	// planpath_test.go.
 	{"case-variant entry", []string{"SRC/a.go"}, "src/a.go", "modify", false, "", nil, false},
+	// ft-84b49733 item 2: a glob plan over files the gate refuses before it reads
+	// the plan (a prompt input, a secret) plans neither, on every surface, and a
+	// glob over an ordinary file still plans it.
+	{"star glob over a prompt input", []string{"*"}, "CLAUDE.md", "modify", false, "", nil, false},
+	{"star glob over a secret", []string{"*"}, ".env", "modify", false, "", nil, false},
+	{"star glob over an ordinary file", []string{"*"}, "README.md", "modify", true, "", nil, false},
+	{"read_only over a star glob", []string{"*"}, "README.md", "modify", false, "", []string{"README.md"}, false},
 }
 
 func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
@@ -86,7 +93,7 @@ func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
 		}
 	}
 	git("init", "-q")
-	for _, p := range []string{"src/a.go", "src/other.go", "src/sub/deep.go", "README.md", "go.mod", "docs/x.md"} {
+	for _, p := range []string{"src/a.go", "src/other.go", "src/sub/deep.go", "README.md", "go.mod", "docs/x.md", "CLAUDE.md", ".env"} {
 		write(p, "v1\n")
 	}
 	git("add", "-A")
@@ -143,6 +150,40 @@ func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
 			diffIn := false
 			for _, f := range diff.Files {
 				diffIn = diffIn || f.Path == row.path
+			}
+
+			// An explicit path that is itself a glob names one file, not a pathspec:
+			// it must not pull in the files the glob would expand to.
+			globbed, err := reg.Call(t.Context(), "devcouncil_get_diff", map[string]any{"task_id": taskID, "paths": []any{"*"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gd, ok := globbed.(devcouncil.DiffResult); !ok || !gd.OK {
+				t.Fatalf("get_diff with a glob path: got %T %+v", globbed, globbed)
+			} else if len(gd.Files) != 0 {
+				t.Errorf("get_diff with paths=[\"*\"] expanded the glob and listed %+v", gd.Files)
+			}
+
+			// The same question with no paths: the changed set is enumerated and
+			// judged path by path, so the file set must be the one the explicit
+			// request gave, not whatever git makes of the plan's globs as pathspecs.
+			whole, err := reg.Call(t.Context(), "devcouncil_get_diff", map[string]any{"task_id": taskID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wholeDiff, ok := whole.(devcouncil.DiffResult)
+			if !ok || !wholeDiff.OK {
+				t.Fatalf("get_diff without paths: got %T %+v", whole, whole)
+			}
+			wholeIn := false
+			for _, f := range wholeDiff.Files {
+				wholeIn = wholeIn || f.Path == row.path
+				if f.Path != row.path {
+					t.Errorf("get_diff without paths lists %q, which this row did not change", f.Path)
+				}
+			}
+			if wholeIn != diffIn {
+				t.Errorf("%s %s planned %q ro %q: get_diff with paths=%v, without paths=%v", row.op, row.path, row.planned, row.readOnly, diffIn, wholeIn)
 			}
 
 			// policy_check_write: in scope is allowed with no would_block_verification.
