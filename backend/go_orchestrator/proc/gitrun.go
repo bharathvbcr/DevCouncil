@@ -60,24 +60,26 @@ func (s *GitSession) RunEnv(ctx context.Context, limit int, env []string, args .
 	cmd.Stderr = stderr
 	cmd.WaitDelay = gitWaitDelay
 	err, timedOut := RunBounded(ctx, cmd.Run)
+	if timedOut {
+		// RunBounded abandoned the goroutine running git, which may still be
+		// writing; what it has written so far is a partial answer, so the result
+		// is empty rather than a read of buffers in use.
+		return GitResult{TimedOut: true, ExitCode: 124}, fmt.Errorf("git %s did not return within the deadline: %w", strings.Join(args, " "), ctx.Err())
+	}
 	res := GitResult{
 		Stdout:    stdout.Bytes(),
 		Stderr:    stderr.Bytes(),
 		Truncated: stdout.Overflowed() || stderr.Overflowed(),
-		TimedOut:  timedOut,
-	}
-	if timedOut {
-		res.ExitCode = 124
-		return res, fmt.Errorf("git %s did not return within the deadline: %w", strings.Join(args, " "), ctx.Err())
 	}
 	if err == nil {
 		return res, nil
 	}
 	res.ExitCode = -1
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		res.TimedOut = ctxErr == context.DeadlineExceeded
-		if res.TimedOut {
-			res.ExitCode = 124
+		if ctxErr == context.DeadlineExceeded {
+			// The same empty result as a deadline RunBounded saw first: the
+			// output of a read the deadline cut short is not an answer.
+			return GitResult{TimedOut: true, ExitCode: 124}, fmt.Errorf("git %s: %w: %w", strings.Join(args, " "), err, ctxErr)
 		}
 		return res, fmt.Errorf("git %s: %w: %w", strings.Join(args, " "), err, ctxErr)
 	}

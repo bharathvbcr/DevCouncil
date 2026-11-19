@@ -1,6 +1,7 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -606,7 +607,11 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-status", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
-		if !hasNoHead(ctx, git) {
+		noHead, headErr := hasNoHead(ctx, git)
+		if headErr != nil {
+			return GitState{}, fmt.Errorf("%w (and HEAD could not be classified: %v)", err, headErr)
+		}
+		if !noHead {
 			return GitState{}, err
 		}
 		headless, nameOut = true, nil
@@ -777,13 +782,41 @@ func toolStateExcludes() []string {
 	return spec
 }
 
-// hasNoHead reports whether the repository has no HEAD commit yet: git ran
-// and answered that HEAD does not resolve. A git that could not run, or was
-// refused, is not that answer.
-func hasNoHead(ctx context.Context, git *proc.GitSession) bool {
-	_, err := runGit(ctx, git, 1<<10, "rev-parse", "--verify", "--quiet", "HEAD")
+// hasNoHead reports whether the repository has no HEAD commit yet. Only one
+// answer is that: git ran, `rev-parse --verify --quiet HEAD` exited 1 with
+// nothing on stderr, HEAD is a symbolic ref (`symbolic-ref -q HEAD` names a
+// branch), and that branch's ref does not exist (`show-ref --verify --quiet`
+// exits 1). Anything else is an error, not "no commits": a lock failure, a
+// corrupt repository, a detached HEAD naming a missing object, or a git that
+// could not run all exit non-zero too, and reading them as an empty repository
+// clears the change list and skips the diff.
+func hasNoHead(ctx context.Context, git *proc.GitSession) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitReadBound)
+	defer cancel()
+	res, err := git.Run(ctx, 1<<10, "rev-parse", "--verify", "--quiet", "HEAD")
+	if err == nil {
+		return false, nil
+	}
 	var exit *exec.ExitError
-	return errors.As(err, &exit)
+	if !errors.As(err, &exit) || res.ExitCode != 1 || len(bytes.TrimSpace(res.Stderr)) != 0 {
+		return false, err
+	}
+	sym, err := git.Run(ctx, 1<<10, "symbolic-ref", "-q", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("HEAD does not resolve and is not a branch name: %w", err)
+	}
+	ref := strings.TrimSpace(string(sym.Stdout))
+	if ref == "" {
+		return false, errors.New("HEAD does not resolve and symbolic-ref named no branch")
+	}
+	res, err = git.Run(ctx, 1<<10, "show-ref", "--verify", "--quiet", ref)
+	if err == nil {
+		return false, fmt.Errorf("HEAD does not resolve although %s exists", ref)
+	}
+	if errors.As(err, &exit) && res.ExitCode == 1 && len(bytes.TrimSpace(res.Stderr)) == 0 {
+		return true, nil
+	}
+	return false, err
 }
 
 // Output caps for the git reads verification judges. The diff is what the
@@ -798,12 +831,18 @@ const (
 // ErrGitOutputTruncated is returned when a git read exceeded its output cap.
 var ErrGitOutputTruncated = errors.New("git output exceeded the verification cap")
 
-// runGit runs a git read through the shared proc.GitSession runner. The diff
-// verification judges comes from git, and a git the repository supplies — or
-// a program its .git/config names — could report any diff it likes,
-// including none.
+// gitReadBound is the longest one git read of verification may take. It bounds
+// each read on its own; the whole collection also draws on the walk budget
+// (proc.WithWalkBudget), and gitDiffLimit caps what a read may return, so a
+// read that is merely large is refused by size, not by this bound.
+const gitReadBound = 60 * time.Second
+
+// runGit runs a git read through the shared proc.GitSession runner, bounded by
+// gitReadBound. The diff verification judges comes from git, and a git the
+// repository supplies — or a program its .git/config names — could report any
+// diff it likes, including none.
 func runGit(ctx context.Context, git *proc.GitSession, limit int, args ...string) ([]byte, error) {
-	return runGitEnv(ctx, git, limit, 60*time.Second, nil, args...)
+	return runGitEnv(ctx, git, limit, gitReadBound, nil, args...)
 }
 
 // runGitEnv is runGit with its own time bound and env added to git's
@@ -813,6 +852,9 @@ func runGitEnv(ctx context.Context, git *proc.GitSession, limit int, bound time.
 	defer cancel()
 	res, err := git.RunEnv(ctx, limit, env, args...)
 	if err != nil {
+		if res.TimedOut {
+			return nil, fmt.Errorf("%w (per-read bound %s, or the enclosing deadline, expired)", err, bound)
+		}
 		return nil, err
 	}
 	if res.Truncated {
