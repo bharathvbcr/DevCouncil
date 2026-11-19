@@ -181,6 +181,8 @@ impl UnattributedReason {
 pub struct UnattributedChange {
     pub path: String,
     pub start_line: u32,
+    /// `null` in JSON means "to the end of the file".
+    #[serde(with = "crate::change::whole_file_end")]
     pub end_line: u32,
     pub reason: UnattributedReason,
 }

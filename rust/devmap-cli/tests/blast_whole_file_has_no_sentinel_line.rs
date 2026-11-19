@@ -3,7 +3,7 @@
 //! `dc_regress::change::parse_location` spells "the whole file" as
 //! `1..=u32::MAX`, and that sentinel used to reach the JSON as a real line
 //! number (`end_line: 4294967295`). The `--json` output is read by GitPulse
-//! and MCP clients, so the end line is now `null` with `whole_file: true`
+//! and MCP clients, so the end line is now `null` ("to the end of the file")
 //! beside it, and no blast or suspects field may carry the sentinel.
 
 use std::path::{Path, PathBuf};
@@ -124,7 +124,6 @@ fn a_bare_path_target_reports_a_whole_file_range_without_a_sentinel() {
         range["end_line"].is_null(),
         "a whole-file range has no end line: {range}"
     );
-    assert_eq!(range["whole_file"], true, "{range}");
     assert_eq!(find_sentinel(&report, "$"), None, "{report:#}");
 }
 
