@@ -174,6 +174,7 @@ finish() {
     esac
     i=$((i + 1))
   done
+  COMPLETED=1
   exit "$code"
 }
 
@@ -184,7 +185,12 @@ TMP1=$(mktemp -d) ; TMP2=$(mktemp -d)
 if [ "$CONTINUE" -eq 1 ]; then STATE=$(mktemp -d); fi
 # The trap re-exits with the status it was entered with: a trap's own status
 # (rm succeeding) otherwise replaces a crash's, and a run that died reports 0.
-trap 'status=$?; rm -rf "$TMP1" "$TMP2" ${STATE:+"$STATE"}; exit "$status"' EXIT
+# That is not enough on bash 3.2 (macOS /bin/bash): a top-level `set -u` abort
+# enters the trap with $? = 0. So a run says it finished by setting COMPLETED=1
+# as the last thing it does before a successful exit, and a 0 without it is
+# turned into 1. A non-zero status is kept as it is.
+COMPLETED=0
+trap 'status=$?; rm -rf "$TMP1" "$TMP2" ${STATE:+"$STATE"}; if [ "$status" -eq 0 ] && [ "$COMPLETED" -ne 1 ]; then status=1; fi; exit "$status"' EXIT
 
 L_FORMAT="1/8 format"
 L_CLIPPY="2/8 clippy (-D warnings)"
@@ -495,6 +501,7 @@ if [ "$QUICK" -eq 1 ]; then
     finish
   fi
   printf '\n\033[1mQUICK GATES GREEN; the full gate suite was NOT RUN\033[0m\n'
+  COMPLETED=1
   exit 0
 fi
 
@@ -525,3 +532,4 @@ if [ "${#NOT_RUN[@]}" -gt 0 ]; then
 else
   printf '\n\033[1mALL GATES GREEN\033[0m\n'
 fi
+COMPLETED=1
