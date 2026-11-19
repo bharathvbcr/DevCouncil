@@ -114,9 +114,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # A failing job still saves its cache; without this the jobs that fail
           # most never warm one and every rerun rebuilds from nothing.
@@ -166,7 +166,7 @@ jobs:
           cargo build --locked -p devmap-cli --example worktree_stress --example ipc_probe
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: ${{ always() }}
         with:
           name: capacity-${{ matrix.os }}
@@ -199,9 +199,9 @@ jobs:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # A failing job still saves its cache; without this the jobs that fail
           # most never warm one and every rerun rebuilds from nothing.
@@ -212,7 +212,7 @@ jobs:
       # missing. Feature-off is still the thing under test here; the host is
       # a fixture. It links the Gusset umbrella archive, so that sibling and
       # staticlib have to exist before `go build`.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -245,9 +245,9 @@ jobs:
     timeout-minutes: 90
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # A failing job still saves its cache; without this the jobs that fail
           # most never warm one and every rerun rebuilds from nothing.
@@ -256,7 +256,7 @@ jobs:
       - name: Install gate dependencies
         run: sudo apt-get update && sudo apt-get install -y sqlite3 rsync
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -288,17 +288,17 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with:
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # A failing job still saves its cache; without this the jobs that fail
           # most never warm one and every rerun rebuilds from nothing.
           cache-on-failure: true
           workspaces: rust/gusset-engine
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -345,9 +345,9 @@ jobs:
     timeout-minutes: 45
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           workspaces: rust/dc-sparse-encode

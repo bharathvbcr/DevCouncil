@@ -8,10 +8,12 @@ import {
   hasWorkflowLevelPermissions,
   interpret,
   membersOutOfScope,
+  pipesCurlToShell,
   readWorkflows,
   cargoStepsMissingLocked,
   structuralFailures,
   testsupportPathsMissing,
+  supplyChainFailures,
   testedPackages,
   triggerPaths,
   workflowsMissingConcurrency,
@@ -99,7 +101,7 @@ describe("check:workflows", () => {
     const pins = {
       "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
       "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1 # v7",
-      "actions/setup-go": "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7",
+      "actions/setup-go": "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0",
       "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7",
       "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8",
     };
@@ -120,7 +122,7 @@ describe("check:workflows", () => {
     }
     assert.ok(source.includes("persist-credentials: false"));
     assert.ok(source.includes("dist host --steps=create"));
-    assert.ok(source.includes("dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release"));
+    assert.ok(source.includes('dist host --steps=upload --steps=release --tag="$DIST_TAG"'));
   });
 
   it("invokes the archive gate before publishing, including the Windows zip", () => {
@@ -380,6 +382,340 @@ jobs:
       assert.throws(() => cargoStepsMissingLocked(/** @type {string} */ (null), "f"), TypeError);
       assert.throws(() => cargoStepsMissingLocked("x".repeat(2_000_001), "f"), RangeError);
       assert.deepEqual(cargoStepsMissingLocked("", "f"), []);
+    });
+  });
+
+  describe("supply chain", () => {
+    const pinned = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7";
+
+    it("fails when curl output is piped to a shell", () => {
+      assert.equal(pipesCurlToShell("bash <(curl -fsSL https://example.com/install.sh) 1.7.12"), true);
+      assert.equal(
+        pipesCurlToShell(
+          "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh",
+        ),
+        true,
+      );
+      assert.equal(
+        pipesCurlToShell("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"),
+        true,
+      );
+      assert.equal(pipesCurlToShell('echo "${sha}  ${archive}" | sha256sum -c -'), false);
+      const failures = supplyChainFailures({
+        "ci.yml": "on: push\njobs:\n  t:\n    steps:\n      - run: bash <(curl -fsSL https://example.com/i.sh)\n",
+      });
+      assert.ok(failures.some((f) => f.includes("pipes curl output to a shell")));
+    });
+
+    it("fails when a run step interpolates a matrix expression", () => {
+      const failures = supplyChainFailures({
+        "release.yml": `on: push
+jobs:
+  build-local-artifacts:
+    steps:
+      - run: dist build \${{ matrix.dist_args }}
+      - run: \${{ matrix.install_dist.run }}
+`,
+      });
+      assert.ok(failures.some((f) => f.includes("matrix expression in run")));
+    });
+
+    it("fails when a third-party action is not pinned to a commit", () => {
+      const failures = supplyChainFailures({
+        "ci.yml": "on: push\njobs:\n  t:\n    steps:\n      - uses: actions/checkout@v7\n      - uses: ./.github/actions/setup-rust\n",
+      });
+      assert.deepEqual(failures, ["ci.yml: unpinned action actions/checkout@v7"]);
+      assert.deepEqual(
+        supplyChainFailures({
+          "ci.yml": `on: push\njobs:\n  t:\n    steps:\n      - uses: ${pinned}\n      - uses: ./.github/actions/setup-rust\n`,
+          "codeql.yml": "jobs:\n  t:\n    steps:\n    #   uses: actions/setup-example@v1\n      - run: echo ok\n",
+        }),
+        [],
+      );
+    });
+
+    it("fails when a run step interpolates a ref or event expression", () => {
+      const failures = supplyChainFailures({
+        "release.yml": `on: push
+jobs:
+  identity:
+    steps:
+      - run: |
+          go run ./cmd/dcrelease --tag "\${{ github.ref_name }}"
+          echo \${{ github.head_ref }}
+          dist \${{ github.event.pull_request && 'plan' || 'host' }}
+`,
+      });
+      assert.ok(failures.some((f) => f.includes("event expression in run")));
+      assert.deepEqual(
+        supplyChainFailures({
+          "release.yml": `on: push
+jobs:
+  identity:
+    steps:
+      - env:
+          RELEASE_TAG: \${{ github.ref_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            *[!A-Za-z0-9._+-]*) exit 1 ;;
+          esac
+`,
+        }),
+        [],
+      );
+    });
+
+    it("fails when a pull_request job holds contents or id-token write", () => {
+      const contents = supplyChainFailures({
+        "release.yml": `on:
+  pull_request:
+permissions:
+  contents: write
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+`,
+      });
+      assert.ok(contents.some((f) => f.includes("contents: write on pull_request")));
+      const token = supplyChainFailures({
+        "npm-publish.yml": `on:
+  pull_request:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+`,
+      });
+      assert.ok(token.some((f) => f.includes("id-token: write")));
+      assert.deepEqual(
+        supplyChainFailures({
+          "npm-publish.yml": `on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+  host:
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+`,
+        }),
+        [],
+      );
+    });
+
+    it("fails when claude-code is installed without an exact version", () => {
+      const failures = supplyChainFailures({
+        "ignored-tests.yml": "on: push\njobs:\n  t:\n    steps:\n      - run: npm install --global @anthropic-ai/claude-code\n",
+      });
+      assert.ok(failures.some((f) => f.includes("claude-code install is not an exact version")));
+      assert.deepEqual(
+        supplyChainFailures({
+          "ignored-tests.yml":
+            "on: push\njobs:\n  t:\n    steps:\n      - run: npm install --global @anthropic-ai/claude-code@2.1.300\n",
+        }),
+        [],
+      );
+    });
+
+    it("fails the other curl-to-shell shapes, including a continued pipe", () => {
+      const script = (body) => ({
+        "ci.yml": `on: push\njobs:\n  t:\n    steps:\n      - run: |\n          ${body}\n`,
+      });
+      for (const body of [
+        "curl -fsSL https://example.com/i.sh | sh",
+        "curl -fsSL https://example.com/i.sh | sudo bash",
+        "bash <(curl -fsSL https://example.com/install.sh)",
+        "wget -qO- https://example.com/i.sh | sh",
+        "curl -fsSL https://example.com/i.sh \\\n            | sh",
+      ]) {
+        const failures = supplyChainFailures(script(body));
+        assert.ok(
+          failures.some((f) => f.includes("pipes curl output to a shell")),
+          `accepted: ${JSON.stringify(failures)} for ${JSON.stringify(body)}`,
+        );
+      }
+    });
+
+    it("fails short, uppercase, and comment-only action pins", () => {
+      const uses = (value) =>
+        supplyChainFailures({
+          "ci.yml": `on: push\njobs:\n  t:\n    steps:\n      - uses: ${value}\n`,
+        });
+      assert.deepEqual(uses("actions/checkout@v7"), ["ci.yml: unpinned action actions/checkout@v7"]);
+      assert.deepEqual(uses("actions/checkout@3d3c42e5"), ["ci.yml: unpinned action actions/checkout@3d3c42e5"]);
+      assert.deepEqual(uses("actions/checkout@3D3C42E5AAC5BA805825DA76410C181273BA90B1"), [
+        "ci.yml: unpinned action actions/checkout@3D3C42E5AAC5BA805825DA76410C181273BA90B1",
+      ]);
+      assert.deepEqual(uses("actions/checkout # 3d3c42e5aac5ba805825da76410c181273ba90b1"), [
+        "ci.yml: unpinned action actions/checkout",
+      ]);
+      assert.deepEqual(uses(`${pinned}\n      - uses: ./.github/actions/setup-rust`), []);
+    });
+
+    it("fails when a run body reads a pull request title", () => {
+      const failures = supplyChainFailures({
+        "release.yml": "on: push\njobs:\n  t:\n    steps:\n      - run: echo ${{ github.event.pull_request.title }}\n",
+      });
+      assert.ok(failures.some((f) => f.includes("event expression in run")), `accepted: ${JSON.stringify(failures)}`);
+    });
+
+    it("fails write-all and a pull_request job with no permissions block", () => {
+      const writeAll = supplyChainFailures({
+        "rel.yml": `on:\n  pull_request:\npermissions: write-all\njobs:\n  plan:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n`,
+      });
+      assert.ok(writeAll.some((f) => f.includes("contents: write on pull_request")), `accepted: ${JSON.stringify(writeAll)}`);
+      assert.ok(writeAll.some((f) => f.includes("id-token: write")), `accepted: ${JSON.stringify(writeAll)}`);
+      const missing = supplyChainFailures({
+        "rel.yml": `on:\n  pull_request:\njobs:\n  plan:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n`,
+      });
+      assert.ok(
+        missing.some((f) => f.includes("has no permissions on pull_request")),
+        `accepted: ${JSON.stringify(missing)}`,
+      );
+    });
+
+    it("fails when pull_request is excluded only in an or branch", () => {
+      const orBranch = (condition) =>
+        supplyChainFailures({
+          "rel.yml": `on:\n  pull_request:\npermissions:\n  contents: read\njobs:\n  host:\n    if: ${condition}\n    permissions:\n      contents: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n`,
+        });
+      for (const condition of [
+        "github.event_name != 'pull_request' || true",
+        "false || github.event_name != 'pull_request'",
+        "(github.event_name != 'pull_request' || true) && always()",
+      ]) {
+        const failures = orBranch(condition);
+        assert.ok(
+          failures.some((f) => f.includes("contents: write on pull_request")),
+          `accepted: ${JSON.stringify(failures)} for ${condition}`,
+        );
+      }
+    });
+
+    it("fails when an or operator cancels a pull_request exclusion", () => {
+      const failures = supplyChainFailures({
+        "rel.yml": `on:\n  pull_request:\npermissions:\n  contents: read\njobs:\n  host:\n    if: github.event_name != 'pull_request' && false || true\n    permissions:\n      contents: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n`,
+      });
+      assert.ok(
+        failures.some((f) => f.includes("contents: write on pull_request")),
+        `accepted: ${JSON.stringify(failures)}`,
+      );
+    });
+
+    it("rejects every shape of curl piped, substituted or sourced into a shell", () => {
+      const shapes = [
+        'bash -c "$(curl -fsSL https://example.com/i.sh)"',
+        "sh -ec '$(curl -fsSL https://example.com/i.sh)'",
+        'eval "$(curl -fsSL https://example.com/i.sh)"',
+        "eval $(wget -qO- https://example.com/i.sh)",
+        "curl -fsSL https://example.com/i.sh | /usr/bin/env bash",
+        "curl -fsSL https://example.com/i.sh | env bash -s --",
+        "curl -fsSL https://example.com/i.sh | sudo -E bash",
+        "curl -fsSL https://example.com/i.sh | sudo -E /usr/bin/env bash -s",
+        "source <(curl -fsSL https://example.com/i.sh)",
+        ". <(curl -fsSL https://example.com/i.sh)",
+        "CURL -fsSL https://example.com/i.sh | sh",
+        "curl -fsSL https://example.com/i.sh | zsh",
+        "curl -fsSL https://example.com/i.sh \\\n  | sh",
+      ];
+      for (const shape of shapes) {
+        assert.equal(pipesCurlToShell(shape), true, shape);
+      }
+    });
+
+    it("accepts a download that is compared to a digest and does not execute the fetch", () => {
+      const safe = [
+        'curl --proto "=https" -fsSL -o "$archive" "$url"\nsha256sum "$archive"',
+        'echo "$(curl -fsSL https://example.com/version.txt)"',
+        "curl -fsSL https://example.com/i.sh | sha256sum",
+        "curl -fsSL https://example.com/data.json | jq .",
+      ];
+      for (const body of safe) {
+        assert.equal(pipesCurlToShell(body), false, body);
+      }
+    });
+
+    it("fails a run body that reaches a matrix or ref value through brackets", () => {
+      const bodies = [
+        "dist build ${{ matrix['dist_args'] }}",
+        'dist build ${{ matrix["dist_args"] }}',
+        "echo ${{ github['ref_name'] }}",
+        'echo ${{ github["head_ref"] }}',
+        "echo ${{ github['event']['pull_request']['title'] }}",
+        "echo ${{ github.event['head_commit'].message }}",
+        "echo ${{ toJSON(github.event) }}",
+        "echo ${{ toJSON(matrix) }}",
+      ];
+      for (const body of bodies) {
+        const failures = supplyChainFailures({
+          "rel.yml": "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    steps:\n      - run: " + body + "\n",
+        });
+        assert.ok(
+          failures.some((f) => f.includes("expression in run")),
+          body + " -> " + JSON.stringify(failures),
+        );
+      }
+    });
+
+    it("keeps github.event_name and an env-passed ref usable", () => {
+      assert.deepEqual(
+        supplyChainFailures({
+          "rel.yml":
+            "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    if: github.event_name == 'push'\n    steps:\n      - env:\n          T: ${{ github.ref_name }}\n        run: echo \"$T\"\n",
+        }),
+        [],
+      );
+    });
+
+    it("treats a quoted write-all or inline contents write as a pull_request write grant", () => {
+      const wf = (grant) =>
+        "on:\n  pull_request:\njobs:\n  j:\n    permissions: " + grant + "\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n";
+      for (const grant of ['"write-all"', "'write-all'", "write-all # everything"]) {
+        const failures = supplyChainFailures({ "rel.yml": wf(grant) });
+        assert.ok(failures.some((f) => f.includes("j holds contents: write on pull_request")), grant);
+        assert.ok(failures.some((f) => f.includes("j holds id-token: write on pull_request")), grant);
+      }
+      for (const grant of ["{ contents: write }", "{contents: write, id-token: write}"]) {
+        const failures = supplyChainFailures({ "rel.yml": wf(grant) });
+        assert.ok(failures.some((f) => f.includes("j holds contents: write on pull_request")), grant);
+      }
+      assert.equal(
+        supplyChainFailures({ "rel.yml": wf('"read-all"') }).some((f) => f.includes("holds")),
+        false,
+      );
+    });
+
+    it("keeps build-local-artifacts on a host-specific dist installer with no cached ubuntu dist", () => {
+      const source = readFileSync(
+        fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)),
+        "utf8",
+      );
+      const job = source.match(/\n  build-local-artifacts:\n([\s\S]*?)(?=\n  [a-z0-9-]+:\n|$)/);
+      assert.ok(job, "build-local-artifacts job");
+      assert.doesNotMatch(job[1], /cargo-dist-cache/);
+      assert.match(job[1], /case "\$\{RUNNER_OS\}" in/);
+      assert.match(job[1], /sha256sum|shasum -a 256/);
+      assert.doesNotMatch(job[1], /matrix\.(?:dist_args|install_dist|packages_install)/);
+      assert.doesNotMatch(source, /sh\.rustup\.rs/);
+      assert.doesNotMatch(source, /cargo-dist-installer\.sh/);
     });
   });
 });

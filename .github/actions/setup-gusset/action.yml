@@ -19,7 +19,7 @@ runs:
   using: composite
   steps:
     - name: Check out Gusset
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: bharathvbcr/gusset
         # Pinned to the sibling revision this tree was linked against, and the

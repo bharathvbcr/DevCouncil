@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -64,15 +63,18 @@ jobs:
     runs-on: ubuntu-latest
     needs: verify
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       published: ${{ steps.decide.outputs.published }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -83,6 +85,12 @@ jobs:
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
           TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            *[!A-Za-z0-9._+-]*)
+              printf '%s\n' "refusing release tag with shell metacharacters" >&2
+              exit 1
+              ;;
+          esac
           if [ "$TAG" != "v${VERSION}" ]; then
             echo "::error::tag ${TAG} does not match package.json ${VERSION}"
             exit 1
@@ -120,9 +128,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -134,6 +142,12 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in
+            *[!A-Za-z0-9._+-]*)
+              printf '%s\n' "refusing release tag with shell metacharacters" >&2
+              exit 1
+              ;;
+          esac
           WITHDRAWN_MSG="withdrawn: mis-numbered build of the 0.2.4 line; install devcouncil@latest"
           SUPERSEDED_MSG="superseded by the 0.2.x line; install devcouncil@latest"
           # version|message, one per line
@@ -166,6 +180,10 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           case "$VERSION" in
+            *[!A-Za-z0-9._+-]*)
+              printf '%s\n' "refusing release tag with shell metacharacters" >&2
+              exit 1
+              ;;
             *-*) echo "::notice::${VERSION} is a pre-release; dist-tags.latest is not asserted"; exit 0;;
           esac
           npm ping
@@ -199,9 +217,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && needs.publish.outputs.published == 'true'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -210,7 +228,7 @@ jobs:
       # checkout (the only install route) so the published launcher has a
       # real binary to reach.
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -228,6 +246,12 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in
+            *[!A-Za-z0-9._+-]*)
+              printf '%s\n' "refusing release tag with shell metacharacters" >&2
+              exit 1
+              ;;
+          esac
           export NPM_REGISTRY_SMOKE_VERSION="$VERSION"
           export NPM_REGISTRY_SMOKE_TIMEOUT=600
           npm run smoke:registry
