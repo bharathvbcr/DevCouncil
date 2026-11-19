@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
@@ -84,22 +85,30 @@ func requireNotRun(t *testing.T, env map[string]any, reason string) {
 	}
 }
 
-func rowCount(t *testing.T, db, table string) string {
+// storedRows counts what the store holds for a task, through the store
+// itself (no sqlite3 CLI needed): gaps through the client, runs through
+// `dcstore runs`.
+func storedRows(t *testing.T, client *store.Client, taskID string) (gaps, runs int) {
 	t.Helper()
-	bin, err := exec.LookPath("sqlite3")
+	rows, _, err := client.Gaps(context.Background(), taskID)
 	if err != nil {
-		t.Skip("sqlite3 CLI not available to count " + table)
+		t.Fatalf("Gaps: %v", err)
 	}
-	out, err := exec.Command(bin, db, "SELECT COUNT(*) FROM "+table).Output()
+	out, err := exec.Command(testsupport.DCStore(t), "--db", client.DB, "runs", "--task", taskID).Output()
 	if err != nil {
-		t.Fatalf("sqlite3 count %s: %v", table, err)
+		t.Fatalf("dcstore runs: %v", err)
 	}
-	return strings.TrimSpace(string(out))
+	var reply struct {
+		Shown int `json:"shown"`
+	}
+	if err := json.Unmarshal(out, &reply); err != nil {
+		t.Fatalf("dcstore runs reply %q: %v", out, err)
+	}
+	return len(rows), reply.Shown
 }
 
 func TestVerifyUnknownTaskIsNotRunAgainstARealStore(t *testing.T) {
-	db := filepath.Join(t.TempDir(), "state.sqlite")
-	client := store.New(testsupport.DCStore(t), db)
+	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -118,10 +127,8 @@ func TestVerifyUnknownTaskIsNotRunAgainstARealStore(t *testing.T) {
 	if env["processed_tasks"] != float64(0) {
 		t.Fatalf("processed_tasks = %v, want 0", env["processed_tasks"])
 	}
-	for _, table := range []string{"verification_runs", "gaps"} {
-		if n := rowCount(t, db, table); n != "0" {
-			t.Fatalf("%s has %s rows after a not-run verify", table, n)
-		}
+	if gaps, runs := storedRows(t, client, "NO-SUCH"); gaps != 0 || runs != 0 {
+		t.Fatalf("a not-run verify wrote %d gap row(s) and %d run row(s)", gaps, runs)
 	}
 	if stderr != "" {
 		t.Fatalf("--json wrote to stderr: %q", stderr)
@@ -196,4 +203,76 @@ func TestVerifiedAndBlockedRunsCarryNoNotRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNotRunHumanLineEscapesControlCharacters(t *testing.T) {
+	// The store error carries the binary path verbatim: plant escape, CR, a
+	// C1 control and a bidi override in it.
+	hostile := "bin\x1b[2J\rEVIL\u0085\u202ex"
+	client := store.New(filepath.Join(t.TempDir(), hostile), filepath.Join(t.TempDir(), "state.sqlite"))
+	_, _, stderr := runCLIOutput(t, client, "TASK-1", t.TempDir(), verify.GateState{Mode: "enforce"}, false)
+	if !strings.HasPrefix(stderr, "verify: NOT RUN (store_error): ") || strings.Count(stderr, "\n") != 1 {
+		t.Fatalf("not one NOT RUN line: %q", stderr)
+	}
+	for _, r := range strings.TrimSuffix(stderr, "\n") {
+		if r != ' ' && !unicode.IsPrint(r) {
+			t.Fatalf("raw non-printing rune %U reached the terminal: %q", r, stderr)
+		}
+	}
+	if !strings.Contains(stderr, "\\x1b") {
+		t.Fatalf("the escape character should be shown as an escape: %q", stderr)
+	}
+	// A hostile task id in the not-found line is quoted too.
+	client = store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	if _, err := client.ActiveLeases(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, _, stderr = runCLIOutput(t, client, "A\x1b[2JB", t.TempDir(), verify.GateState{Mode: "enforce"}, false)
+	if strings.ContainsRune(stderr, 0x1b) {
+		t.Fatalf("raw ESC in task_not_found line: %q", stderr)
+	}
+}
+
+func TestNoStoreEnvelopeKeepsAnInvalidGateConfig(t *testing.T) {
+	_, stdout, _ := runCLIOutput(t, nil, "TASK-1", t.TempDir(),
+		verify.GateState{Mode: "off", Origin: "invalid", Error: "bad gate yaml"}, true)
+	env := decodeEnvelope(t, stdout)
+	requireNotRun(t, env, "store_unavailable")
+	if env["gate_mode_origin"] != "invalid" || env["gate_mode_error"] != "bad gate yaml" {
+		t.Fatalf("a judged-run envelope carries the invalid gate config; this one dropped it: %s", stdout)
+	}
+}
+
+func TestPartialRunKeepsEarnedVerdictsAndNamesTheNotRunTask(t *testing.T) {
+	code, stdout, stderr := partialRun(t, true)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	env := decodeEnvelope(t, stdout)
+	if _, top := env["not_run"]; top {
+		t.Fatalf("top-level not_run on a run that judged a task: %s", stdout)
+	}
+	if env["ok"] != false || env["processed_tasks"] != float64(1) {
+		t.Fatalf("totals: %s", stdout)
+	}
+	tasks, _ := env["tasks"].([]any)
+	if len(tasks) != 2 {
+		t.Fatalf("tasks = %d entries, want the judged task and the not-run one: %s", len(tasks), stdout)
+	}
+	first, second := tasks[0].(map[string]any), tasks[1].(map[string]any)
+	if first["task_id"] != "TASK-A" || first["status"] == "not_run" {
+		t.Fatalf("first entry should be TASK-A's verdict: %v", first)
+	}
+	nr, _ := second["not_run"].(map[string]any)
+	if second["task_id"] != "TASK-B" || second["status"] != "not_run" || nr["reason"] != "store_error" {
+		t.Fatalf("second entry should be TASK-B not_run/store_error: %v", second)
+	}
+	if _, has := first["not_run"]; has {
+		t.Fatalf("a judged entry carries not_run: %v", first)
+	}
+	_, human, humanErr := partialRun(t, false)
+	if !strings.Contains(human, "TASK-A") || !strings.Contains(humanErr, "NOT RUN (store_error)") {
+		t.Fatalf("human: stdout=%q stderr=%q", human, humanErr)
+	}
+	_ = stderr
 }

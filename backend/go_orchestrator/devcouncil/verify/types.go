@@ -105,6 +105,9 @@ type TaskCLIResult struct {
 	Gaps                  []Gap        `json:"gaps"`
 	NextActions           []NextAction `json:"next_actions"`
 	AdvisoryActions       []NextAction `json:"advisory_actions"`
+	// NotRun is set only on an entry with status "not_run": a task a
+	// multi-task run reached after judging others, which it could not judge.
+	NotRun *NotRun `json:"not_run,omitempty"`
 }
 
 // CLIResult is the `dev verify --json` / `devcouncil verify --json` envelope.
@@ -136,7 +139,11 @@ const (
 	NotRunStoreError       = "store_error"
 )
 
-// NotRun says a verify did not run. It is not a verdict: "no such task here" is
+// NotRun says a verify did not run. It appears in two places and never beside
+// a verdict for the same task: top-level on CLIResult when the run judged
+// nothing (processed_tasks is 0), and on a tasks[] entry (status "not_run")
+// when an earlier task in the same run was judged and a later one could not
+// be. The totals never count it. It is not a verdict: "no such task here" is
 // a different answer from "this task has blocking gaps", and a board card id is
 // not a task in this store.
 type NotRun struct {
