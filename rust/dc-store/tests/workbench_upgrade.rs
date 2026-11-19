@@ -5,6 +5,9 @@ use dc_store::Store;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+
+mod support;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -387,4 +390,216 @@ fn a_schema_17_profile_is_current_and_a_newer_one_is_refused_as_unsupported() {
         .filter(|e| e.file_name().to_string_lossy().contains("pre-schema-17"))
         .count();
     assert_eq!(backups, 0, "a refused profile was backed up");
+}
+
+/// Clears the backup-window hook when a test ends, even by panic.
+struct ResetHook;
+
+impl Drop for ResetHook {
+    fn drop(&mut self) {
+        dc_store::workbench::set_backup_window_hook(None);
+    }
+}
+
+/// What a second connection reports when it tries to take the write lock
+/// without waiting: `Err` when another connection holds it.
+fn try_write_lock(path: &Path) -> Result<(), String> {
+    let conn = Connection::open(path).map_err(|error| error.to_string())?;
+    conn.busy_timeout(std::time::Duration::ZERO)
+        .map_err(|error| error.to_string())?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| error.to_string())?;
+    conn.execute_batch("ROLLBACK")
+        .map_err(|error| error.to_string())
+}
+
+fn workspace_rows(path: &Path, id: &str) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM work_workspaces WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Installs a hook that records whether another connection could take the
+/// write lock while the backup is being written.
+fn probe_lock_in_backup_window(path: &Path) -> Arc<Mutex<Vec<Result<(), String>>>> {
+    let probes = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&probes);
+    let path = path.to_path_buf();
+    dc_store::workbench::set_backup_window_hook(Some(Arc::new(move || {
+        seen.lock().unwrap().push(try_write_lock(&path));
+    })));
+    probes
+}
+
+fn assert_locked_out(probes: &Mutex<Vec<Result<(), String>>>) {
+    let probes = probes.lock().unwrap();
+    assert_eq!(
+        probes.len(),
+        1,
+        "the backup window ran {} times",
+        probes.len()
+    );
+    let refused = probes[0]
+        .as_ref()
+        .expect_err("another connection took the write lock while the backup was written");
+    assert!(
+        refused.contains("locked") || refused.contains("busy"),
+        "the lock probe failed for another reason: {refused}"
+    );
+}
+
+#[test]
+fn the_upgrade_backup_exists_check_and_copy_hold_the_write_lock() {
+    let (_dir, path) = profile();
+    let _reset = ResetHook;
+    let probes = probe_lock_in_backup_window(&path);
+    let store = Store::open(&path).unwrap();
+    put_workspace(&store, "locked").unwrap();
+    assert_locked_out(&probes);
+    let backup = path.with_file_name("profile.sqlite.pre-schema-11.bak");
+    assert_eq!(version(&backup), 11);
+    assert_eq!(version(&path), dc_store::workbench::WORKBENCH_SCHEMA);
+    assert!(
+        try_write_lock(&path).is_ok(),
+        "the backup lock outlived the backup"
+    );
+}
+
+/// Host A stops after it found no backup, still inside the backup window. Host
+/// B, which will not wait for a lock, then tries its whole upgrade. A host that
+/// took no lock upgrades the profile and writes its own copy, and A then
+/// replaces the pre-upgrade copy with a copy of the migrated profile. With the
+/// lock, B is refused until A is done, and the copy A kept is the old schema.
+#[test]
+fn a_second_host_cannot_replace_the_pre_upgrade_backup() {
+    let (_dir, path) = profile();
+    // Opened first: opening takes the write lock, which host A holds below.
+    let host_b = Store::open(&path).unwrap();
+    host_b
+        .connection()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = Mutex::new(resume_rx);
+    let path_a = path.clone();
+    let host_a = std::thread::spawn(move || {
+        let _reset = ResetHook;
+        dc_store::workbench::set_backup_window_hook(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        })));
+        let store = Store::open(&path_a).unwrap();
+        put_workspace(&store, "host-a").map_err(|error| error.to_string())
+    });
+    entered_rx
+        .recv()
+        .expect("host A never reached the backup window");
+
+    let during = put_workspace(&host_b, "host-b");
+    resume_tx.send(()).unwrap();
+    host_a.join().unwrap().expect("host A failed");
+    let refused =
+        during.expect_err("host B upgraded the profile while host A held the backup window");
+    assert!(
+        refused.message.contains("locked") || refused.message.contains("busy"),
+        "host B was refused for another reason: {refused}"
+    );
+
+    let backup = path.with_file_name("profile.sqlite.pre-schema-11.bak");
+    assert_eq!(version(&backup), 11, "the pre-upgrade copy was replaced");
+    assert_eq!(workspace_rows(&backup, "host-a"), 0);
+    assert_eq!(version(&path), dc_store::workbench::WORKBENCH_SCHEMA);
+    assert_eq!(workspace_rows(&path, "host-a"), 1);
+
+    // Host B, now behind a finished upgrade, leaves the copy as it was.
+    let kept = std::fs::read(&backup).unwrap();
+    put_workspace(&host_b, "host-b").unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), kept);
+    assert_eq!(workspace_rows(&backup, "host-b"), 0);
+    assert_eq!(workspace_rows(&path, "host-b"), 1);
+    assert!(
+        !path
+            .with_file_name("profile.sqlite.pre-schema-11.bak.partial")
+            .exists()
+    );
+}
+
+#[test]
+fn an_existing_backup_is_kept_rather_than_rewritten() {
+    let (_dir, path) = profile();
+    let backup = path.with_file_name("profile.sqlite.pre-schema-11.bak");
+    std::fs::write(&backup, b"sentinel-pre-upgrade").unwrap();
+    let store = Store::open(&path).unwrap();
+    put_workspace(&store, "kept").unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), b"sentinel-pre-upgrade");
+    assert_eq!(version(&path), dc_store::workbench::WORKBENCH_SCHEMA);
+    assert!(try_write_lock(&path).is_ok());
+}
+
+/// A rollback-journal profile lets a reader in beside the writer, so the copy
+/// can be read while the lock is held. The upgrade must neither deadlock nor
+/// skip the backup there.
+#[test]
+fn an_upgrade_in_delete_journal_mode_still_backs_up_the_old_schema() {
+    let (_dir, path) = profile();
+    let _reset = ResetHook;
+    let probes = probe_lock_in_backup_window(&path);
+    let store = Store::open(&path).unwrap();
+    let mode: String = store
+        .connection()
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    put_workspace(&store, "delete-mode").unwrap();
+    assert_locked_out(&probes);
+    let backup = path.with_file_name("profile.sqlite.pre-schema-11.bak");
+    assert_eq!(version(&backup), 11);
+    assert_eq!(workspace_rows(&backup, "delete-mode"), 0);
+    assert_eq!(workspace_rows(&path, "delete-mode"), 1);
+}
+
+/// The legacy `tasks` table is retired after a `pre-tasks-retire` copy, taken
+/// by the same function. Its window must hold the lock too.
+#[test]
+fn the_tasks_retire_backup_holds_the_write_lock() {
+    let dir = Scratch::new();
+    let path = dir.path().join("profile.sqlite");
+    drop(Store::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(support::LEGACY_TASKS).unwrap();
+    conn.execute_batch(
+        r#"INSERT INTO tasks (id, title, description, status, priority, difficulty, planned_files_json,
+                              requirement_ids_json, acceptance_criterion_ids_json, expected_tests_json,
+                              allowed_commands_json, forbidden_changes_json,
+                              agent_appended_planned_files_json)
+           VALUES ('TASK-2', 'verified one', '', 'verified', 'low', NULL, '[]', '[]', '[]', '[]', '[]', '[]', '[]');
+           INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);"#,
+    )
+    .unwrap();
+    drop(conn);
+    let _reset = ResetHook;
+    let probes = probe_lock_in_backup_window(&path);
+    let store = Store::open(&path).unwrap();
+    assert_locked_out(&probes);
+    let backup = path.with_file_name("profile.sqlite.pre-tasks-retire.bak");
+    let old = Connection::open(&backup).unwrap();
+    let kept: i64 = old
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kept, 1, "the retire copy does not hold the legacy table");
+    let gone: i64 = store
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tasks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(gone, 0, "the legacy table was not retired");
 }

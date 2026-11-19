@@ -446,6 +446,27 @@ fn prune_json(conn: &Connection, report: &PruneReport) -> Result<String> {
     )?)
 }
 
+thread_local! {
+    static BACKUP_WINDOW_HOOK: std::cell::RefCell<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a hook that runs on this thread inside [`backup_profile`], after
+/// it found no backup and before it writes one: the window two hosts used to
+/// race through. Production never installs one. Tests do, because an
+/// integration test links this library without `cfg(test)`.
+#[doc(hidden)]
+pub fn set_backup_window_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    BACKUP_WINDOW_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn backup_window() {
+    let hook = BACKUP_WINDOW_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// A backup file, and whether this call is the one that wrote it.
 struct Backup {
     path: std::path::PathBuf,
@@ -456,6 +477,17 @@ struct Backup {
 /// profile, verified readable (and, when `expected_version` is given, at that
 /// schema) and only then renamed into place, so no file carries the `.bak` name
 /// until it has been read back.
+///
+/// The exists-check, the copy and the rename share one write lock
+/// (`BEGIN IMMEDIATE`), so a second host cannot pass the exists-check beside
+/// this one, and a host that waited for the lock finds the copy the first one
+/// made instead of replacing it with a copy of a profile that has since moved
+/// on. `VACUUM INTO` cannot run on a connection with a transaction open, so
+/// the copy is read by a second connection while this one holds the lock; a
+/// writer lock lets readers in, in WAL and in rollback-journal mode alike.
+/// The lock is released before this returns, because the caller's migration
+/// opens its own transactions. `locking_mode=EXCLUSIVE` is not used: with
+/// another connection already open it never acquires the file lock.
 fn backup_profile(
     conn: &Connection,
     stamp: &str,
@@ -466,16 +498,43 @@ fn backup_profile(
         return Ok(None);
     };
     let backup = std::path::PathBuf::from(format!("{path}.{stamp}.bak"));
-    if backup.exists() {
-        return Ok(Some(Backup {
-            path: backup,
-            created: false,
-        }));
-    }
     let fail = |detail: String| Error {
         code: "backup_failed",
         message: refusal(&backup, detail),
     };
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| fail(error.to_string()))?;
+    let outcome = write_backup_under_lock(path, &backup, expected_version, &fail);
+    match outcome {
+        Ok(made) => {
+            tx.commit().map_err(|error| fail(error.to_string()))?;
+            Ok(Some(made))
+        }
+        Err(mut error) => {
+            if let Err(rollback) = tx.rollback() {
+                error.message.push_str(&format!(
+                    "; rolling back the backup lock also failed: {rollback}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The body of [`backup_profile`], run while the caller holds the write lock.
+fn write_backup_under_lock(
+    path: &str,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    fail: &impl Fn(String) -> Error,
+) -> Result<Backup> {
+    if backup.exists() {
+        return Ok(Backup {
+            path: backup.to_path_buf(),
+            created: false,
+        });
+    }
+    backup_window();
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
     let target = partial
@@ -487,15 +546,20 @@ fn backup_profile(
         let _ = std::fs::remove_file(&partial);
         fail(detail)
     };
-    conn.execute("VACUUM INTO ?1", [target])
+    let reader = Connection::open(path).map_err(|error| discard(error.to_string()))?;
+    reader
+        .busy_timeout(crate::BUSY_TIMEOUT)
+        .map_err(|error| discard(error.to_string()))?;
+    reader
+        .execute("VACUUM INTO ?1", [target])
         .map_err(|error| discard(error.to_string()))?;
     backups::verify(&partial, expected_version)
         .map_err(|reason| discard(format!("the copy it wrote does not read back: {reason}")))?;
-    std::fs::rename(&partial, &backup).map_err(|error| discard(error.to_string()))?;
-    Ok(Some(Backup {
-        path: backup,
+    std::fs::rename(&partial, backup).map_err(|error| discard(error.to_string()))?;
+    Ok(Backup {
+        path: backup.to_path_buf(),
         created: true,
-    }))
+    })
 }
 
 fn local_repository_request() -> String {
