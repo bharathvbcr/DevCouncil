@@ -190,12 +190,12 @@ func (r *Registry) callGetDiff(ctx context.Context, args map[string]any) (any, e
 		if r.Store == nil {
 			diffArgs.DBInitialized = false
 		} else {
-			planned, found, err := r.Lease.PlannedPaths(ctx, taskID)
+			entries, found, err := r.Lease.PlannedEntries(ctx, taskID)
 			if err != nil {
 				return ErrorPayload{OK: false, Code: "store_error", Error: err.Error()}, nil
 			}
 			diffArgs.TaskFound = found
-			diffArgs.PlannedFiles = planned
+			diffArgs.PlannedEntries = entries
 			diffArgs.DBInitialized = true
 		}
 	}

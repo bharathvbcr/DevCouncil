@@ -10,6 +10,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 )
 
 // The preflight and the verifier answer one question — may this path change for
@@ -53,13 +54,36 @@ func TestPreflightAndVerifierAgreeOnWhichPathsMayChange(t *testing.T) {
 			for _, gap := range verify.DetectOrphanDiffGaps("TASK-1", planned, changed, added) {
 				blocking = blocking || gap.Blocking
 			}
+			rule := out["decision"].(policy.Decision).Rule
+
+			// Direction one: allowed with no warning => no blocking orphan_diff.
 			if allowed && !wouldBlock && blocking {
 				t.Errorf("%s %s: the preflight allowed it with no warning and verification blocks it", op, path)
 			}
-			if blocking && allowed && !wouldBlock {
-				t.Errorf("%s %s: blocking orphan not flagged", op, path)
+			// Direction two, the substantive converse: no blocking orphan_diff =>
+			// the preflight allows the write with no rule and no warning. Every
+			// carve-out is a case where the preflight refuses for a reason that is
+			// not a scope question, and so verification has nothing to say:
+			//  - a hard-rule denial (secret, restricted/tool-state, malformed path):
+			//    the gate refuses these before it reads the plan. The plan can still
+			//    list .env exactly, and verification then reads it as planned.
+			//  - an operation refusal (scope.operation): src/a.go is planned for
+			//    modify only, so a create or delete of it is refused although the
+			//    path is in the plan.
+			carveOut := ""
+			switch {
+			case rule == policy.RuleSecretPath || rule == policy.RuleRestrictedPath || rule == policy.RuleMalformedPath:
+				carveOut = "hard-rule denial"
+			case rule == policy.RuleOperation:
+				carveOut = "operation refusal"
 			}
-			if allowed && wouldBlock != blocking && !verify.ToolOwned(path) {
+			if !blocking && carveOut == "" && (!allowed || rule != policy.RuleNone || wouldBlock) {
+				t.Errorf("%s %s: verification raises no blocking orphan but the preflight says allowed=%v rule=%s would_block=%v",
+					op, path, allowed, rule, wouldBlock)
+			}
+			// On every allowed write the forecast and the verdict are one answer,
+			// both directions.
+			if allowed && wouldBlock != blocking {
 				t.Errorf("%s %s: would_block_verification=%v but verification's orphan blocking=%v", op, path, wouldBlock, blocking)
 			}
 		}

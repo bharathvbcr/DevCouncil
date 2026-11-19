@@ -386,7 +386,7 @@ func (t *Task) Domain() *dc.Task {
 		PlannedFiles:              planned,
 		AgentAppendedPlannedFiles: t.AgentAppended,
 		AllowedCommands:           t.AllowedCommands,
-		ForbiddenChanges:          t.ForbiddenChanges,
+		ForbiddenChanges:          dc.NormalizePlanPaths(t.ForbiddenChanges),
 		RequirementIDs:            t.RequirementIDs,
 		AcceptanceCriterionIDs:    t.AcceptanceCriterionIDs,
 	}
@@ -456,7 +456,7 @@ func (c *Client) AppendPlannedFiles(ctx context.Context, taskID, token string, a
 
 	wanted := make([]dc.PlannedFile, 0, len(add))
 	for _, pf := range add {
-		path := strings.TrimSpace(pf.Path)
+		path := dc.NormalizePlanPath(strings.TrimSpace(pf.Path))
 		if path == "" {
 			return nil, errors.New("store: a scope entry with no path widens nothing")
 		}
