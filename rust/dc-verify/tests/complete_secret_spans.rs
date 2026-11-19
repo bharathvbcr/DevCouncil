@@ -50,30 +50,39 @@ fn every_family_checks_later_candidates_and_redacts_distinct_values() {
         "lin_api_",
         "lin_oauth_",
         "ntn_",
+        concat!("sk-", "svcacct-"),
+        concat!("gs", "k_"),
+        concat!("da", "pi"),
     ] {
-        let first = format!("{prefix}{}", "A".repeat(48));
-        let second = format!("{prefix}{}", "B".repeat(48));
-        let line = format!("é {prefix}short \"{first}\", '{second}' {first}\n");
-        assert!(
-            contains_secret(&line),
-            "invalid prefix hid later {prefix} candidates"
-        );
-        let redacted = redact_secrets(&line);
-        assert!(
-            !redacted.contains(&first) && !redacted.contains(&second),
-            "a distinct {prefix} value survived redaction"
-        );
-        assert_eq!(
-            redact_secrets(&redacted),
-            redacted,
-            "redaction must be idempotent for {prefix}"
-        );
-        assert!(
-            !contains_secret(&redacted),
-            "{prefix} replacement must not look like a credential"
-        );
-        assert!(redacted.starts_with("é ") && redacted.ends_with('\n'));
+        every_family_member_checks(prefix, 48);
     }
+    // Atlassian tokens run to about 190 characters; the floor sits at 100.
+    every_family_member_checks(concat!("ATA", "TT3"), 190);
+}
+
+fn every_family_member_checks(prefix: &str, body_len: usize) {
+    let first = format!("{prefix}{}", "A".repeat(body_len));
+    let second = format!("{prefix}{}", "B".repeat(body_len));
+    let line = format!("é {prefix}short \"{first}\", '{second}' {first}\n");
+    assert!(
+        contains_secret(&line),
+        "invalid prefix hid later {prefix} candidates"
+    );
+    let redacted = redact_secrets(&line);
+    assert!(
+        !redacted.contains(&first) && !redacted.contains(&second),
+        "a distinct {prefix} value survived redaction"
+    );
+    assert_eq!(
+        redact_secrets(&redacted),
+        redacted,
+        "redaction must be idempotent for {prefix}"
+    );
+    assert!(
+        !contains_secret(&redacted),
+        "{prefix} replacement must not look like a credential"
+    );
+    assert!(redacted.starts_with("é ") && redacted.ends_with('\n'));
 }
 
 #[test]

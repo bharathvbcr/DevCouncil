@@ -14,6 +14,31 @@
 //! take the table at all while it lived there. A second copy of the table
 //! would have been the alternative, and a second table is how a key redacted
 //! by one consumer leaks out of another.
+//!
+//! # What a value is judged on
+//!
+//! A credential-named key (`password=`, `"token": `, `--password`) is followed
+//! by a value that may be a secret or may be a reference to one, and the
+//! detectors decide which by reading the value: its length, whether it reads as
+//! an identifier or as words, whether it is a placeholder. That judgement reads
+//! at most the first `MAX_JUDGED_VALUE` (512) bytes of the value, cut at a
+//! character boundary. The detectors ask at every separator of a line, and the
+//! value after a separator can run to the end of it, so an unbounded read made
+//! a long line of repeated `password=` quadratic; the bound makes a line cost
+//! time proportional to its length (`tests/scaling.rs` measures 100 KB against
+//! 400 KB). A real password, key or token is far shorter than 512 bytes. The
+//! bound is on the judgement only: a value judged a secret is redacted whole,
+//! however long, and a value whose first 512 bytes read as words or an
+//! identifier is not judged by anything past them.
+//!
+//! # Same-line joins
+//!
+//! The scan reads one line at a time. On one line, a run of two or more quoted
+//! literals separated only by whitespace or one `+` is also scanned once as one
+//! joined literal, so a key written as two quoted halves is the key it reads as. The
+//! line as written is always scanned first, and a match in the joined copy
+//! counts only when it starts in one literal and ends in a later one. A split
+//! across lines and a headerless PEM body stay misses.
 
 /// A credential shape worth stopping a commit for.
 struct SecretPattern {
@@ -278,6 +303,18 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "openai admin api key",
         prefix: "sk-admin-",
+        min_len: 24,
+        body: Body::Any,
+    },
+    // OpenAI service-account keys: `sk-svcacct-`, then a body written in the
+    // URL-safe alphabet with `-` and `_`, which is why the legacy `sk-` rule
+    // below (alphanumeric bodies only) never saw them. Gitleaks'
+    // `openai-api-key` rule names `sk-(?:proj|svcacct|admin)-` as one family
+    // (https://github.com/gitleaks/gitleaks, config/gitleaks.toml); OpenAI
+    // states no length, so the floor matches the sibling prefixes above.
+    SecretPattern {
+        name: "openai service account api key",
+        prefix: "sk-svcacct-",
         min_len: 24,
         body: Body::Any,
     },
@@ -814,6 +851,40 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 30,
         body: Body::Any,
     },
+    // Groq: `gsk_` and 52 letters and digits, TruffleHog's `groq` detector
+    // (`gsk_[a-zA-Z0-9]{52}`, https://github.com/trufflesecurity/trufflehog,
+    // pkg/detectors/groq). Groq's documentation does not state the format. The
+    // floor sits below that length, and the alphanumeric body keeps a
+    // `gsk_config_value` identifier from reading as a key.
+    SecretPattern {
+        name: "groq api key",
+        prefix: "gsk_",
+        min_len: 48,
+        body: Body::Alphanumeric,
+    },
+    // Atlassian API tokens: `ATATT3` and a long run of URL-safe base64 with
+    // `=`, 186 characters after the prefix in Gitleaks'
+    // `atlassian-api-token` rule (config/gitleaks.toml). Atlassian documents
+    // no length, and other scanners anchor on the prefix alone, so the floor is
+    // half of that.
+    SecretPattern {
+        name: "atlassian api token",
+        prefix: "ATATT3",
+        min_len: 100,
+        body: Body::Shape(atlassian_body),
+    },
+    // Databricks personal access token: `dapi`, 32 hex digits and an optional
+    // `-` and digit (Kingfisher's imported Betterleaks rule
+    // `dapi[a-f0-9]{32}(?:-\d)?`; AWS Secrets Manager's partner documentation
+    // describes it as "dapi followed by 32 hexadecimal characters",
+    // https://docs.aws.amazon.com/secretsmanager/latest/userguide/mes-partner-DatabricksPAT.html).
+    // `dapi` begins ordinary words, so only the hex body makes it a key.
+    SecretPattern {
+        name: "databricks personal access token",
+        prefix: "dapi",
+        min_len: 36,
+        body: Body::Shape(databricks_body),
+    },
     SecretPattern {
         name: "private key block",
         prefix: "-----BEGIN",
@@ -827,6 +898,23 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
 fn base64_body(body: &str) -> bool {
     body.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// Atlassian's body: the URL-safe base64 alphabet, and `=`.
+fn atlassian_body(body: &str) -> bool {
+    body.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'='))
+}
+
+/// Databricks' body: at least 32 hex digits, then optionally `-` and digits.
+fn databricks_body(body: &str) -> bool {
+    let hex = match body.rsplit_once('-') {
+        Some((hex, suffix)) if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+            hex
+        }
+        _ => body,
+    };
+    hex.len() >= 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Stripe's body: base64's alphabet — letters and digits for Stripe's own
