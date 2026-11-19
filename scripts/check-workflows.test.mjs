@@ -719,3 +719,101 @@ jobs:
     });
   });
 });
+
+
+describe("check:workflows adversarial pins", () => {
+  const wf = (steps, on = "push") =>
+    "on: " + on + "\npermissions:\n  contents: read\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n" + steps;
+  const SHA = "a".repeat(40);
+
+  it("rejects wrapper and path variants of fetch-into-shell", () => {
+    for (const shape of [
+      "wget -qO- https://example.com/i.sh | sh",
+      "curl https://example.com/i.sh | sudo bash",
+      "curl https://example.com/i.sh | bash -s -- a",
+      "curl https://example.com/i.sh | bash /dev/stdin",
+      "curl https://example.com/i.sh | env -i bash",
+      "/usr/bin/curl https://example.com/i.sh | sh",
+      "command curl https://example.com/i.sh | sh",
+      "source <(wget -qO- https://example.com/i.sh)",
+      'bash -lc "$(curl https://example.com/i.sh)"',
+      'sudo bash -c "$(curl https://example.com/i.sh)"',
+      "curl https://example.com/i.sh |\n  sh",
+    ]) {
+      assert.equal(pipesCurlToShell(shape), true, shape);
+    }
+  });
+
+  it("rejects docker, short-sha, uppercase-sha, no-ref and reusable-workflow uses", () => {
+    for (const uses of [
+      "docker://alpine:latest",
+      "docker://alpine@sha256:" + "a".repeat(64),
+      "a/b@abcdef1",
+      "a/b@" + "A".repeat(40),
+      "a/b/c/d@main",
+      "a/b",
+      "a/b@main # " + SHA,
+    ]) {
+      const failures = supplyChainFailures({ "w.yml": wf("      - uses: " + uses + "\n") });
+      assert.ok(failures.some((f) => f.includes("unpinned action")), uses + " -> " + JSON.stringify(failures));
+    }
+    const job = supplyChainFailures({
+      "w.yml": "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    uses: a/b/.github/workflows/x.yml@main\n",
+    });
+    assert.ok(job.some((f) => f.includes("unpinned action")), JSON.stringify(job));
+  });
+
+  it("rejects event expressions in folded, format-wrapped and pwsh run steps", () => {
+    for (const step of [
+      "      - run: echo \"${{ github.event.issue.title }}\"\n",
+      "      - run: echo \"${{ format('{0}', github.event.issue.title) }}\"\n",
+      "      - shell: pwsh\n        run: Write-Host \"${{ github.event.issue.title }}\"\n",
+      "      - run: echo \"${{ github.event.head_commit.message }}\"\n",
+      "      - run: echo \"${{ github.event.inputs.name }}\"\n",
+    ]) {
+      const failures = supplyChainFailures({ "w.yml": wf(step) });
+      assert.ok(failures.some((f) => f.includes("event expression in run")), step + " -> " + JSON.stringify(failures));
+    }
+  });
+
+  it("flags a folded or continued run that pipes curl to a shell", () => {
+    for (const step of [
+      "      - run: >\n          curl https://x |\n          sh\n",
+      "      - run: |\n          curl https://x \\\n            | sh\n",
+      "      - run: | # note\n          curl https://x | sh\n",
+      "      - name: x\n        run: curl https://x | sh\n",
+    ]) {
+      const failures = supplyChainFailures({ "w.yml": wf(step) });
+      assert.ok(failures.some((f) => f.includes("pipes curl")), step);
+    }
+  });
+
+  it("sees pull_request in flow-list and typed block forms, and write grants in flow or quoted-key form", () => {
+    const job = (on, perm) =>
+      "on: " + on + "\npermissions:\n  contents: read\njobs:\n  b:\n    permissions:" + perm + "\n    runs-on: x\n    steps:\n      - run: echo hi\n";
+    for (const [on, perm] of [
+      ["[push,  pull_request ]", "\n      contents: write"],
+      ["\n  pull_request: # c\n    types: [opened]", "\n      contents: write"],
+      ["\n  pull_request:", " {contents: write}"],
+      ["\n  pull_request:", '\n      "contents": "write"'],
+    ]) {
+      const failures = supplyChainFailures({ "w.yml": job(on, perm) });
+      assert.ok(failures.some((f) => f.includes("contents: write on pull_request")), on + perm);
+    }
+  });
+
+  it("keeps benign expressions and env-passed event values usable", () => {
+    for (const body of ["github.event_name", "github.sha", "github.actor", "github.event_path", "secrets.X"]) {
+      assert.deepEqual(supplyChainFailures({ "w.yml": wf("      - run: echo \"${{ " + body + " }}\"\n") }), [], body);
+    }
+  });
+
+  it("rejects a claude-code install that is not an exact x.y.z", () => {
+    for (const spec of ["@^1.0.0", "@latest", "", "@1.0.0-beta"]) {
+      const failures = supplyChainFailures({
+        "w.yml": wf("      - run: npm i -g @anthropic-ai/claude-code" + spec + "\n"),
+      });
+      assert.ok(failures.some((f) => f.includes("claude-code install")), spec);
+    }
+  });
+});
