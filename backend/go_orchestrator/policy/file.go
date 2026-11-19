@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -236,7 +238,7 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 	// case-sensitive on purpose: its failure direction is denial, which is
 	// safe, and folding it would let a differently-cased path claim another
 	// entry's authorisation.)
-	forbidden := dc.NormalizePlanPaths(task.ForbiddenChanges)
+	forbidden := forbiddenEntries(task.ForbiddenChanges)
 	if mt.anyFold(forbidden, normalized) {
 		return g.noteHardRules(deny(RuleForbiddenChange, "Path is listed in forbidden_changes.", normalized, task.ID))
 	}
@@ -387,27 +389,39 @@ const (
 // link spells nothing protected and is the same inode, so a glob plan covering
 // its directory would otherwise let the write land on the secret.
 //
-// A link count of 1 ends it, which is every ordinary write: one lstat, one open
-// and one fstat (safefile.LinkCount, which reads the open handle on unix and
-// windows alike; os.SameFile compares dev+inode on unix and the volume and file
-// index on windows, so the rung holds on all three). Only a file with other
-// names pays for a walk of the repository, and the walk stats each regular
-// file (SameFile) before it classifies any name, so pattern matching is spent on
-// the one or two names that are the same file. The walk does not follow
-// symbolic links and does not skip any directory, .git included: a link into
-// .git/objects is a write to repository state. Past hardLinkWalkCap entries, or
-// with a directory it cannot read, a search that found nothing answers
-// hardLinkUnknown with the reason in the second result.
+// A link count of 1 ends it, which is every ordinary write: one lstat on unix
+// (the count is in the stat it already made, so a write-only file is no harder
+// to judge than a readable one) and, where lstat carries no count, one open and
+// safefile.LinkCount on the handle. os.SameFile compares dev+inode on unix and
+// volume+file index on windows. Only a file with other names pays for a walk of
+// the repository, and the walk stats each regular file before it classifies any
+// name, so pattern matching is spent on the one or two names that are the same
+// file. It does not follow symbolic links below the root and skips no directory,
+// .git included: a link into .git/objects is a write to repository state.
+//
+// The root is resolved first (a symlinked root would otherwise read as one
+// entry), and the names found are counted against the link count. A file with
+// more names than the walk could see has names outside the repository (a secret
+// in the home directory, a hook of the main repository seen from a linked
+// worktree, a package store), and those cannot be classified: it is refused,
+// with that reason, rather than read as clean. Past hardLinkWalkCap entries, or
+// with a directory it cannot read, a search that found nothing is refused too.
 func protectedHardLink(mt matching, root, rel string, internal bool) (hardLinkKind, string) {
 	if root == "" || rel == "" {
 		return hardLinkNone, ""
 	}
-	full := filepath.Join(root, filepath.FromSlash(rel))
-	info, err := os.Lstat(full)
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		if _, statErr := os.Lstat(filepath.Join(root, filepath.FromSlash(rel))); statErr != nil {
+			return hardLinkNone, ""
+		}
+		return hardLinkUnknown, "the repository root could not be resolved: " + err.Error()
+	}
+	info, err := os.Lstat(filepath.Join(realRoot, filepath.FromSlash(rel)))
 	if err != nil || !info.Mode().IsRegular() {
 		return hardLinkNone, ""
 	}
-	links, err := linkCount(full)
+	links, err := linkCount(info, filepath.Join(realRoot, filepath.FromSlash(rel)))
 	if err != nil {
 		return hardLinkUnknown, "its link count could not be read: " + err.Error()
 	}
@@ -420,10 +434,11 @@ func protectedHardLink(mt matching, root, rel string, internal bool) (hardLinkKi
 		found      string
 		incomplete string
 		seen       int
+		names      uint64
 	)
 	errStop := errors.New("search ended")
 	// The error is only the stop signal or what the callback already recorded.
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(realRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// A directory that cannot be read may hold the other name; keep
 			// going, and say so if nothing is found.
@@ -441,16 +456,17 @@ func protectedHardLink(mt matching, root, rel string, internal bool) (hardLinkKi
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		name, relErr := filepath.Rel(root, p)
+		entry, statErr := d.Info()
+		if statErr != nil || !os.SameFile(info, entry) {
+			return nil
+		}
+		names++
+		name, relErr := filepath.Rel(realRoot, p)
 		if relErr != nil {
 			return nil
 		}
 		name = filepath.ToSlash(name)
 		if name == rel {
-			return nil
-		}
-		entry, statErr := d.Info()
-		if statErr != nil || !os.SameFile(info, entry) {
 			return nil
 		}
 		switch {
@@ -470,11 +486,21 @@ func protectedHardLink(mt matching, root, rel string, internal bool) (hardLinkKi
 	if incomplete != "" {
 		return hardLinkUnknown, incomplete
 	}
+	if names < links {
+		return hardLinkUnknown, strconv.FormatUint(links, 10) + " names for this file but only " + strconv.FormatUint(names, 10) +
+			" are inside the repository: the others are outside it or not visible, and cannot be checked against the protected paths"
+	}
 	return hardLinkNone, ""
 }
 
-// linkCount is the number of names the regular file at full has.
-func linkCount(full string) (uint64, error) {
+// linkCount is the number of names of the regular file info describes. On unix
+// the stat already holds it (Nlink); elsewhere it is read from an open handle.
+func linkCount(info os.FileInfo, full string) (uint64, error) {
+	if sys := reflect.ValueOf(info.Sys()); sys.Kind() == reflect.Pointer && !sys.IsNil() && sys.Elem().Kind() == reflect.Struct {
+		if n := sys.Elem().FieldByName("Nlink"); n.IsValid() && n.CanUint() {
+			return n.Uint(), nil
+		}
+	}
 	f, err := os.Open(full)
 	if err != nil {
 		return 0, err
@@ -1318,6 +1344,37 @@ func matchPlannedFile(mt matching, path string, planned []dc.PlannedFile) *dc.Pl
 	return editable
 }
 
+// forbiddenEntries reads forbidden_changes entries the way the filesystem reads
+// the names they stand for. An entry is a prohibition, so the reading that never
+// voids one is the right one: a ".." segment is resolved lexically ("src/../lib/x"
+// forbids lib/x, which is the file the kernel opens, symlinks aside), and an entry
+// ending in "/" or "/." names a directory and forbids the directory and everything
+// under it. Left as written, both matched nothing and silently allowed what they
+// named. An entry that resolves to somewhere above the root names nothing this
+// gate is responsible for and is kept as written. This is the gate's reading, not
+// the decoder's, so a task built in code gets it too; planned entries are not
+// read this way, because a planned entry that matches nothing only narrows scope.
+func forbiddenEntries(raw []string) []string {
+	if raw == nil {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		entry = dc.NormalizePlanPath(entry)
+		dir := strings.HasSuffix(entry, "/") || strings.HasSuffix(entry, "/.") || entry == "."
+		if strings.Contains(entry, "..") || dir {
+			if cleaned := pathpkg.Clean(entry); cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../") && !strings.HasPrefix(cleaned, "/") {
+				entry = cleaned
+			}
+		}
+		out = append(out, entry)
+		if dir {
+			out = append(out, entry+"/**")
+		}
+	}
+	return out
+}
+
 // forbiddenAlias reports which forbidden_changes entry names the same *file*
 // as path under a different name, and whether one does.
 //
@@ -1429,15 +1486,9 @@ func normalizeSlashes(p string) string { return strings.ReplaceAll(p, `\`, "/") 
 // path the decision names, so the two verdicts have one definition of scope.
 // A refused write never reaches verification.
 //
-// It has no root, so the on-disk alias rungs do not run: a decision that was not
-// made by this gate, naming a link to a protected file, reads as planned.
-// WouldBlockVerificationIn takes the root; prefer it wherever one is known.
-func WouldBlockVerification(d Decision, task *dc.Task) bool {
-	return WouldBlockVerificationIn("", d, task)
-}
-
-// WouldBlockVerificationIn is WouldBlockVerification with the repository root,
-// so the planned-path judge runs its on-disk rungs.
+// root is the repository root, so the planned-path judge runs its on-disk rungs
+// (a symbolic or hard link to a protected file is not planned). There is no
+// root-less form: it could not tell a link to a secret from an ordinary file.
 func WouldBlockVerificationIn(root string, d Decision, task *dc.Task) bool {
 	if d.Blocked() || task == nil || d.Target == "" {
 		return false
@@ -1445,15 +1496,10 @@ func WouldBlockVerificationIn(root string, d Decision, task *dc.Task) bool {
 	return !PlansPathIn(root, task, d.Target)
 }
 
-// PlansPath reports whether some planned entry names path, exactly or by glob,
+// PlansPathIn reports whether some planned entry names path, exactly or by glob,
 // which is the set verification's orphan check compares the changed files with.
-// It has no root: text only, see PlansPathIn.
-func PlansPath(task *dc.Task, path string) bool {
-	return PlansPathIn("", task, path)
-}
-
-// PlansPathIn is PlansPath with the repository root, so a symbolic or hard link
-// to a secret or restricted file is not read as planned by a glob.
+// A symbolic or hard link to a secret or restricted file is not read as planned
+// by a glob; root enables those rungs.
 func PlansPathIn(root string, task *dc.Task, path string) bool {
 	editable, readOnly := PlannedScopeIn(root, path, task.PlannedFiles)
 	return editable || readOnly

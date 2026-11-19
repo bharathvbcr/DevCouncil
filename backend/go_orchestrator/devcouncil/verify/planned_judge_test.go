@@ -153,3 +153,29 @@ func TestScopeDetectorsEvaluateHardDeniedOncePerChangedPath(t *testing.T) {
 		}
 	}
 }
+
+// The bound holds for a whole verify.Run, not per detector: the three scope
+// detectors share one judge, so a changed path costs one HardDenied evaluation
+// however many detectors read it.
+func TestRunEvaluatesHardDeniedOncePerChangedPathAcrossDetectors(t *testing.T) {
+	var planned []dc.PlannedFile
+	for i := 0; i < 100; i++ {
+		planned = append(planned, dc.PlannedFile{Path: fmt.Sprintf("pkg%d/*.go", i), AllowedChange: dc.ChangeModify})
+	}
+	var changed []string
+	for i := 0; i < 300; i++ {
+		changed = append(changed, fmt.Sprintf("other%d/f.go", i), fmt.Sprintf("other%d/go.mod", i))
+	}
+	var in verify.Input
+	in.Root = t.TempDir()
+	in.Task = &store.Task{ID: "T-COST", PlannedFiles: planned}
+	in.GateMode = "enforce"
+	in.AllowNoRigor = true
+	in.ChangedFiles = changed
+	in.DiffContent = "diff --git a/other0/f.go b/other0/f.go\n"
+	before := policy.HardDeniedEvaluations()
+	verify.Run(context.Background(), in)
+	if got := policy.HardDeniedEvaluations() - before; got > int64(len(changed)) {
+		t.Errorf("verify.Run made %d HardDenied evaluations for %d changed paths, want at most %d", got, len(changed), len(changed))
+	}
+}

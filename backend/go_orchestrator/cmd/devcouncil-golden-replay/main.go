@@ -217,7 +217,7 @@ func replayGetDiffCases(golden, repo string, out, errw io.Writer) int {
 	}
 
 	got, err = devcouncil.GetDiff(ctx, repo, devcouncil.GetDiffArgs{
-		TaskID: "TASK-001", TaskFound: true, DBInitialized: true, PlannedFiles: nil,
+		TaskID: "TASK-001", TaskFound: true, DBInitialized: true,
 	})
 	if err != nil || !sameAsGolden("empty_planned_scope", golden, "mcp/get_diff/empty_planned_scope.json", got, errw) {
 		if err != nil {

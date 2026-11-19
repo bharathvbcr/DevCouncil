@@ -60,8 +60,14 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 // DetectPlannedFileGapsIn is DetectPlannedFileGaps with the repository root, so
 // the planned-path judge can run its on-disk alias rungs. root may be "".
 func DetectPlannedFileGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
+	return DetectPlannedFileGapsWith(policy.NewScopeJudge(root), taskID, planned, changed)
+}
+
+// DetectPlannedFileGapsWith is DetectPlannedFileGapsIn with the judge supplied,
+// so one verify run asks the filesystem about each changed path once across all
+// three scope detectors (see policy.ScopeJudge).
+func DetectPlannedFileGapsWith(judge *policy.ScopeJudge, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
-	judge := policy.NewScopeJudge(root)
 	for _, pf := range planned {
 		if pf.AllowedChange == dc.ChangeReadOnly {
 			continue
@@ -98,12 +104,17 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 // DetectOrphanDiffGapsIn is DetectOrphanDiffGaps with the repository root (see
 // DetectPlannedFileGapsIn). root may be "".
 func DetectOrphanDiffGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
+	return DetectOrphanDiffGapsWith(policy.NewScopeJudge(root), taskID, planned, changed, orphanAdded)
+}
+
+// DetectOrphanDiffGapsWith is DetectOrphanDiffGapsIn with the judge supplied.
+func DetectOrphanDiffGapsWith(judge *policy.ScopeJudge, taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
 	var gaps []Gap
 	for _, cf := range changed {
 		if policy.IsToolState(cf) {
 			continue
 		}
-		editable, readOnly := policy.PlannedScopeIn(root, cf, planned)
+		editable, readOnly := judge.Scope(cf, planned)
 		if readOnly {
 			gaps = append(gaps, Gap{
 				ID:             StableGapID(taskID, "READONLY-"+cf),
@@ -163,12 +174,17 @@ func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed [
 // DetectDependencyRiskGapsIn is DetectDependencyRiskGaps with the repository
 // root (see DetectPlannedFileGapsIn). root may be "".
 func DetectDependencyRiskGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
+	return DetectDependencyRiskGapsWith(policy.NewScopeJudge(root), taskID, planned, changed)
+}
+
+// DetectDependencyRiskGapsWith is DetectDependencyRiskGapsIn with the judge supplied.
+func DetectDependencyRiskGapsWith(judge *policy.ScopeJudge, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
 	for _, path := range changed {
 		if _, ok := depFileNames[filepath.Base(path)]; !ok {
 			continue
 		}
-		if editable, _ := policy.PlannedScopeIn(root, path, planned); editable {
+		if editable, _ := judge.Scope(path, planned); editable {
 			continue
 		}
 		gaps = append(gaps, Gap{

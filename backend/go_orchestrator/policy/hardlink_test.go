@@ -153,7 +153,7 @@ func TestPlansPathInSeesAnAliasThatPlansPathCannot(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 	task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("src/*")}}
-	if !PlansPath(task, "src/x") {
+	if !PlansPathIn("", task, "src/x") {
 		t.Fatal("the text-only answer changed: src/x is planned by src/* without a root")
 	}
 	if PlansPathIn(root, task, "src/x") {

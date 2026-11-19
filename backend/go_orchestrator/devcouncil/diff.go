@@ -122,13 +122,12 @@ func ProbeGitRepoState(ctx context.Context, root string) GitRepoState {
 
 // GetDiffArgs are the MCP/CLI arguments for get_diff.
 type GetDiffArgs struct {
-	TaskID       string
-	Paths        []string
-	Staged       bool
-	PlannedFiles []string // when TaskID set: planned paths from the task
-	// PlannedEntries, when non-nil, replaces PlannedFiles: the task's planned
-	// files with their allowed_change, so a path the plan makes read_only is
-	// out of the task's diff scope exactly as the write gate and verify read it.
+	TaskID string
+	Paths  []string
+	Staged bool
+	// PlannedEntries is the task's planned files with their allowed_change when
+	// TaskID is set, so a path the plan makes read_only is out of the task's diff
+	// scope exactly as the write gate and verify read it.
 	PlannedEntries []dc.PlannedFile
 	TaskFound      bool // false + TaskID set => not_found
 	DBInitialized  bool // false + TaskID set => not_initialized
@@ -174,11 +173,6 @@ func GetDiff(ctx context.Context, root string, args GetDiffArgs) (any, error) {
 		}
 		taskScoped = true
 		entries := args.PlannedEntries
-		if entries == nil {
-			for _, p := range args.PlannedFiles {
-				entries = append(entries, dc.PlannedFile{Path: strings.ReplaceAll(p, "\\", "/"), AllowedChange: dc.ChangeModify})
-			}
-		}
 		// One path for both modes. With no paths the changed names are listed
 		// first, so the plan is never handed to git as pathspecs (a glob entry
 		// would pull in a read_only overlap or a prompt input the planned-path
@@ -206,7 +200,7 @@ func GetDiff(ctx context.Context, root string, args GetDiffArgs) (any, error) {
 	if taskScoped && len(scopePaths) == 0 {
 		return emptyDiff(args.Staged), nil
 	}
-	return gitDiff(ctx, root, scopePaths, args.Staged)
+	return gitDiff(ctx, root, scopePaths, args.Staged, taskScoped)
 }
 
 // wholeTreePaths is the whole tree, less what DevCouncil's own tools wrote: a
@@ -261,7 +255,7 @@ func changedNames(ctx context.Context, root string, staged bool) ([]string, erro
 		return names, nil
 	}
 
-	tracked := []string{"diff", "--name-only", "-z"}
+	tracked := []string{"diff", "--name-only", "--no-renames", "-z"}
 	if staged {
 		tracked = append(tracked, "--cached")
 	}
@@ -297,10 +291,19 @@ func emptyDiff(staged bool) DiffResult {
 	return DiffResult{OK: true, Files: []DiffFile{}, UnifiedDiff: "", Truncated: false, Staged: staged}
 }
 
-func gitDiff(ctx context.Context, root string, paths []string, staged bool) (DiffResult, error) {
+// gitDiff reads the diff for paths. noRenames is set for a task-scoped read:
+// scope is judged per name, and rename detection would fold a rename into its
+// destination, so the deletion of a planned source vanished from the listing
+// whenever the destination was outside the plan.
+func gitDiff(ctx context.Context, root string, paths []string, staged, noRenames bool) (DiffResult, error) {
 	diffArgs := []string{"diff"}
 	numstatArgs := []string{"diff", "--numstat"}
 	namestatusArgs := []string{"diff", "--name-status", "-z"}
+	if noRenames {
+		diffArgs = append(diffArgs, "--no-renames")
+		numstatArgs = append(numstatArgs, "--no-renames")
+		namestatusArgs = append(namestatusArgs, "--no-renames")
+	}
 	if staged {
 		diffArgs = append(diffArgs, "--cached")
 		numstatArgs = append(numstatArgs, "--cached")

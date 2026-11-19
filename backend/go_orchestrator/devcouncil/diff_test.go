@@ -74,7 +74,7 @@ func TestGetDiffEmptyPlannedScopeFailClosed(t *testing.T) {
 	root := newRepo(t)
 	write(t, root, "src/a.py", "VALUE = 9\n")
 	got, err := devcouncil.GetDiff(context.Background(), root, devcouncil.GetDiffArgs{
-		TaskID: "TASK-001", TaskFound: true, DBInitialized: true, PlannedFiles: nil,
+		TaskID: "TASK-001", TaskFound: true, DBInitialized: true,
 	})
 	if err != nil {
 		t.Fatal(err)

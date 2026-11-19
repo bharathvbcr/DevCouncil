@@ -32,7 +32,7 @@ func TestDotSlashPlanEntryIsOneEntryOnEveryReader(t *testing.T) {
 			if d := decide(t, g, "src/b.go", task, dc.OpModify); d.Blocked() {
 				t.Errorf("write to planned src/b.go refused: %+v", d)
 			}
-			if !PlansPath(task, "src/a.go") || !PlansPath(task, "./src/a.go") {
+			if !PlansPathIn("", task, "src/a.go") || !PlansPathIn("", task, "./src/a.go") {
 				t.Error("PlansPath must answer true for planned ./src/a.go")
 			}
 			if !MatchesPlannedPath("src/a.go", files) || !MatchesPlannedPath("./src/a.go", files) {
@@ -44,10 +44,10 @@ func TestDotSlashPlanEntryIsOneEntryOnEveryReader(t *testing.T) {
 
 func TestPlansPathReadsGlobEntries(t *testing.T) {
 	task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("docs/*.md")}}
-	if !PlansPath(task, "docs/x.md") {
+	if !PlansPathIn("", task, "docs/x.md") {
 		t.Error("a glob entry plans the paths it matches, as verification's orphan check reads it")
 	}
-	if PlansPath(task, "src/x.md") {
+	if PlansPathIn("", task, "src/x.md") {
 		t.Error("a glob entry must not plan a path it does not match")
 	}
 }
