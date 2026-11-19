@@ -136,10 +136,10 @@ fn scan_secrets_precision_and_recall_on_the_tuning_corpus() {
     assert_eq!(
         matrix,
         Matrix {
-            tp: 69,
+            tp: 76,
             fp: 0,
             fn_: 0,
-            tn: 61
+            tn: 63
         },
         "scan_secrets moved on secrets.tsv; update the pinned counts here and the \
          figures in rust/STATUS.md together\n{}",
