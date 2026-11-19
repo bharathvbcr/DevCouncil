@@ -128,6 +128,15 @@ secrets.tsv	vault-cli connect --password --host db.internal	vault-cli connect --
 secrets.tsv	The password line holds the secret for that machine.	The password line holds the secret for that machine.
 secrets.tsv	PyPI tokens all begin with pypi- so scanners can find them.	PyPI tokens all begin with pypi- so scanners can find them.
 secrets.tsv	def run_ntn_scheduler_for_each_worker_pool_in_region_x(): pass	def run_ntn_scheduler_for_each_worker_pool_in_region_x(): pass
+secrets.tsv	SVC_KEY = "sk-svcacct-Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_Ab1_"	SVC_KEY = "sk-svcacct-… (131 chars)"
+secrets.tsv	client = connect("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")	client = connect("gsk_… (56 chars)")
+secrets.tsv	print("ATATT3Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv_b=Zx8-Cv")	print("ATATT3… (192 chars)")
+secrets.tsv	client = connect("dapi0f1e2d3c0f1e2d3c0f1e2d3c0f1e2d3c")	client = connect("dapi… (36 chars)")
+secrets.tsv	DEBUG oauth refresh answered with GOCSPX-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5	DEBUG oauth refresh answered with GOCSPX-… (34 chars)
+secrets.tsv	echo token ya29.a0FAKEfake-Token_notReal.0123456789abcdefXYZ	echo token ya29.… (49 chars)
+secrets.tsv	aws_access_key_id = "AKIA" + "IOSFODNN7EXAMPLE"	aws_access_key_id = "AKIA… (20 chars)"
+secrets.tsv	def dapiClientFactoryBuilderHelperForEveryTenant(): pass	def dapiClientFactoryBuilderHelperForEveryTenant(): pass
+secrets.tsv	GSK_CONFIG = "gsk_config_value_for_each_worker_in_region_x_y"	GSK_CONFIG = "gsk_config_value_for_each_worker_in_region_x_y"
 secrets_holdout.tsv	spring.datasource.password=Pr0dDbP4ss2026	spring.datasource.password=… (14 chars)
 secrets_holdout.tsv	  "apiKey": "AbC123dEf456GhI789jKl0",	  "apiKey": "… (22 chars)",
 secrets_holdout.tsv	REDIS_URL=redis://:9xYzQ8wVu7tS6rQ5@cache.internal:6379/0	REDIS_URL=redis://:… (16 chars)@cache.internal:6379/0
