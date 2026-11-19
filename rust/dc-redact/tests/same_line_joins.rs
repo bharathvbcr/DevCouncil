@@ -276,3 +276,44 @@ fn hostile_quote_soup_does_not_panic_and_keeps_utf8() {
         AKIA_TAIL,
     );
 }
+
+/// A shell line that formats a credential into a file: the format string and
+/// the variable are references, not pieces of a secret.
+#[test]
+fn printf_formats_and_variable_references_are_not_joined() {
+    for line in [
+        r#"printf 'GEMINI_API_KEY=%s\n' "\$KEY" > $ENV_FILE && chmod 600 $ENV_FILE"#,
+        r#"printf 'GEMINI_API_KEY=%s\n' "$KEY" > $ENV_FILE"#,
+        r#"printf "TOKEN=%q " '$SECRET'"#,
+        r#"fmt.Sprintf("API_KEY=%v", "$KEY")"#,
+    ] {
+        assert_untouched("printf", line);
+    }
+    // A percent sign that is not a conversion does not make a reference.
+    assert_redacted(
+        "literal percent",
+        &format!("k = \"100%% {}\" + \"{}\"", "AKIA", AKIA_TAIL),
+        AKIA_TAIL,
+    );
+}
+
+/// A vendor key inside a longer credential value is one merged span, and its
+/// marker counts the whole of it, as it did before joins existed.
+#[test]
+fn a_merged_span_counts_the_whole_merged_text() {
+    let key = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyzA");
+    assert_eq!(
+        redact_secrets(&format!("password={key}!!")),
+        "password=ghp_… (43 chars)"
+    );
+    let ant = concat!(
+        "sk-ant-",
+        "api03-",
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH"
+    );
+    let out = redact_secrets(&format!("ANTHROPIC_API_KEY={ant}"));
+    assert_eq!(
+        out,
+        format!("ANTHROPIC_API_KEY=sk-ant-… ({} chars)", ant.len())
+    );
+}

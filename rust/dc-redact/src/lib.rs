@@ -104,7 +104,11 @@ impl Body {
 impl SecretPattern {
     /// Validated UTF-8 byte spans. Rejected prefixes do not hide subsequent
     /// candidates; a matched token is consumed once, including nested prefixes.
-    fn spans<'a>(&'a self, content: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+    fn spans<'a>(
+        &'a self,
+        content: &'a str,
+        boundary: &'a dyn Fn(usize) -> bool,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
         let pem = self.prefix == "-----BEGIN";
         let mut token_end = 0;
         let mut consumed = 0;
@@ -113,7 +117,7 @@ impl SecretPattern {
             .filter_map(move |(start, _)| {
                 // A PEM header opens with its own dashes, which are the
                 // boundary; one glued to the word before it is still a header.
-                if start < consumed || !(pem || starts_a_token(content, start)) {
+                if start < consumed || !(pem || starts_a_token(content, start) || boundary(start)) {
                     return None;
                 }
                 let end = if pem {
@@ -1029,6 +1033,10 @@ struct Lit {
     /// Closed, and not a format string, a verbatim string, or an identifier
     /// glued to the quote. Only joinable literals are concatenated.
     joinable: bool,
+    /// A plain quote that never closed. The scan treats the quote as an
+    /// ordinary character and goes on at the next one, so an apostrophe in a
+    /// comment does not swallow the well-formed literals after it.
+    resync: bool,
 }
 
 fn is_prefix_letter(b: u8) -> bool {
@@ -1096,6 +1104,7 @@ fn try_raw_hash(line: &str, i: usize) -> Option<Lit> {
                 content_end: k,
                 end,
                 joinable: false,
+                resync: false,
             });
         }
         k += 1;
@@ -1107,12 +1116,13 @@ fn try_raw_hash(line: &str, i: usize) -> Option<Lit> {
         content_end: line.len(),
         end: line.len(),
         joinable: false,
+        resync: false,
     })
 }
 
 /// The literal at `i`: a hashed Rust raw string, or an ordinary quote.
-fn at_literal(line: &str, i: usize) -> Option<Lit> {
-    try_raw_hash(line, i).or_else(|| try_literal(line, i))
+fn at_literal(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    try_raw_hash(line, i).or_else(|| try_literal(line, i, dead))
 }
 
 /// The ordinary literal that starts at `i`, if one does.
@@ -1123,7 +1133,7 @@ fn at_literal(line: &str, i: usize) -> Option<Lit> {
 /// `rf`) and C# verbatim `@"..."` are recognised so they are not joined, and
 /// then skipped the same way. Backticks and macro calls are not literals.
 /// Hashed Rust raw strings are handled by [`try_raw_hash`] before this runs.
-fn try_literal(line: &str, i: usize) -> Option<Lit> {
+fn try_literal(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
     let b = line.as_bytes();
     if i >= b.len() {
         return None;
@@ -1151,13 +1161,32 @@ fn try_literal(line: &str, i: usize) -> Option<Lit> {
     let verbatim = quote == b'"' && quote_at > 0 && b[quote_at - 1] == b'@';
     let glued = quote_at == i && prev_ident;
     let triple = quote_at + 2 < b.len() && b[quote_at + 1] == quote && b[quote_at + 2] == quote;
-    let (content, content_end, end) = if triple {
-        close_triple(b, quote_at, quote).unwrap_or((quote_at + 3, line.len(), line.len()))
+    let single = usize::from(quote == b'\'');
+    let kind = if triple {
+        2 + single
     } else if verbatim {
-        close_verbatim(b, quote_at).unwrap_or((quote_at + 1, line.len(), line.len()))
+        4
     } else {
-        close_quoted(line, quote_at, quote).unwrap_or((quote_at + 1, line.len(), line.len()))
+        single
     };
+    let closer = if dead.0[kind].get() {
+        None
+    } else if triple {
+        close_triple(b, quote_at, quote)
+    } else if verbatim {
+        close_verbatim(b, quote_at)
+    } else {
+        close_quoted(line, quote_at, quote)
+    };
+    // A scan of this kind that ran off the end means no later opener of the
+    // same kind closes either (an escaped quote is skipped the same way from
+    // wherever it is reached), so the answer is remembered rather than found
+    // again at every later opener: that is what keeps `"\"\"\"…` linear.
+    if closer.is_none() {
+        dead.0[kind].set(true);
+    }
+    let unclosed_open = if triple { quote_at + 3 } else { quote_at + 1 };
+    let (content, content_end, end) = closer.unwrap_or((unclosed_open, line.len(), line.len()));
     let closed = content_end < line.len();
     // `"$URL"` and `"Bearer ${TOKEN}"` are references written as literals.
     // Joining one onto the string beside it pulls the reference into a value
@@ -1170,14 +1199,47 @@ fn try_literal(line: &str, i: usize) -> Option<Lit> {
         content_end,
         end,
         joinable: closed && !format_prefix && !verbatim && !glued && !reference,
+        resync: !closed,
     })
 }
 
 /// A quoted interior that names a value rather than being one: a shell
-/// `$var`, or a template. A `$` later in a password is still a character.
+/// `$var` (or `\$var`, as it is written inside an eval or a heredoc), a
+/// template, or a printf format with a conversion in it (`'KEY=%s\n'`). A `$`
+/// later in a password is still a character.
 fn interior_is_reference(line: &str, content: usize, content_end: usize) -> bool {
     let v = &line[content..content_end];
-    v.starts_with('$') || ["${", "$(", "{{", "%("].iter().any(|t| v.contains(t))
+    v.starts_with('$')
+        || v.starts_with("\\$")
+        || ["${", "$(", "{{", "%("].iter().any(|t| v.contains(t))
+        || has_printf_conversion(v)
+}
+
+/// Whether `v` holds a printf conversion: `%`, optional flags, width and
+/// precision, then a conversion letter (`%s`, `%q`, `%v`, `%-8.3f`). `%%` is
+/// a literal percent sign and is not one.
+fn has_printf_conversion(v: &str) -> bool {
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if b.get(i + 1) == Some(&b'%') {
+            i += 2;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < b.len() && matches!(b[j], b'-' | b'+' | b'#' | b' ' | b'0'..=b'9' | b'.' | b'*') {
+            j += 1;
+        }
+        if j < b.len() && b"sdqvxXfFeEgGcTtpbouUi".contains(&b[j]) {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
 }
 
 /// `(content_end, end)` of a single-quoted literal, honouring backslash escapes.
@@ -1236,17 +1298,17 @@ fn skip_hspace(b: &[u8], mut j: usize) -> usize {
 
 /// The next joinable literal after `i` when only whitespace, or whitespace
 /// around one `+`, separates them.
-fn join_sep(line: &str, i: usize) -> Option<Lit> {
+fn join_sep(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
     let b = line.as_bytes();
     let j = skip_hspace(b, i);
-    if let Some(lit) = at_literal(line, j)
+    if let Some(lit) = at_literal(line, j, dead)
         && lit.joinable
     {
         return Some(lit);
     }
     if j < b.len() && b[j] == b'+' && !matches!(b.get(j + 1).copied(), Some(b'+' | b'=')) {
         let k = skip_hspace(b, j + 1);
-        if let Some(lit) = at_literal(line, k)
+        if let Some(lit) = at_literal(line, k, dead)
             && lit.joinable
         {
             return Some(lit);
@@ -1255,139 +1317,238 @@ fn join_sep(line: &str, i: usize) -> Option<Lit> {
     None
 }
 
-fn push_slice(out: &mut String, map: &mut Vec<usize>, line: &str, range: std::ops::Range<usize>) {
-    map.extend(range.clone());
+/// Quote kinds whose closer was looked for and not found, one flag each: plain
+/// `"`, plain `'`, triple `"`, triple `'`, and C# verbatim. See `try_literal`.
+#[derive(Default)]
+struct Dead([std::cell::Cell<bool>; 5]);
+
+/// Appends `range` of `line` to `out`.
+fn push_slice(out: &mut String, line: &str, range: std::ops::Range<usize>) {
     out.push_str(&line[range]);
 }
 
-/// The longest joinable run starting at the literal at `i`.
-fn literal_run(line: &str, first: Lit) -> Vec<Lit> {
-    let mut group = vec![first];
-    if group[0].joinable {
-        while let Some(next) = join_sep(line, group.last().unwrap().end) {
-            // A separator that does not move forward would rescan the same
-            // literal. Closed literals are at least a pair of quotes, so this
-            // is a refusal rather than a case the walk is meant to meet.
-            if next.end <= group.last().unwrap().end {
-                break;
-            }
-            group.push(next);
-        }
-    }
-    group
-}
-
-fn has_quoted_join(line: &str) -> bool {
+/// Whether `line` holds a run of two or more joinable literals. Stops at the
+/// second literal of the first run, so a line with no join costs one pass and
+/// a line with one costs the distance to it.
+fn has_quoted_join(line: &str, dead: &Dead) -> bool {
     let mut i = 0;
     while i < line.len() {
-        if let Some(first) = at_literal(line, i) {
-            let group = literal_run(line, first);
-            if group.len() >= 2 {
-                return true;
+        match at_literal(line, i, dead) {
+            Some(first) if !first.resync => {
+                if first.joinable && join_sep(line, first.end, dead).is_some() {
+                    return true;
+                }
+                i = first.end;
             }
-            i = group[0].end;
-        } else {
-            i += line[i..].chars().next().map_or(1, char::len_utf8);
+            _ => i += line[i..].chars().next().map_or(1, char::len_utf8),
         }
     }
     false
 }
 
-/// The joined shadow of `line`: concatenated interiors, a map back to `line`,
-/// and the shadow range of each interior that was concatenated.
-struct Joined {
-    shadow: String,
-    map: Vec<usize>,
-    pieces: Vec<std::ops::Range<usize>>,
+/// The set bit that marks a [`Cut`] as the start of a joined piece.
+const PIECE: usize = 1 << (usize::BITS - 1);
+
+/// A point where the joined copy stops being a byte-for-byte copy of the line.
+///
+/// From shadow position `at()` on, shadow position `p` is line position
+/// `orig + (p - at())`, until the next cut. There is one cut per joined piece
+/// (flagged) and one after each run of pieces, so the map is sixteen bytes per
+/// literal rather than eight per byte of the line.
+struct Cut {
+    at_and_flag: usize,
+    orig: usize,
 }
 
-/// Whether `span` starts in one concatenated interior and ends in a later one.
-///
-/// A match that sits wholly inside one piece is already visible on the
-/// original line. Taking it from the shadow as well would hide the boundary
-/// the quote is, which is how `"hello" + "AKIA…"` lost the key.
-fn span_crosses(pieces: &[std::ops::Range<usize>], span: &std::ops::Range<usize>) -> bool {
-    if pieces.is_empty() || span.start >= span.end {
-        return false;
+impl Cut {
+    fn piece(at: usize, orig: usize) -> Cut {
+        Cut {
+            at_and_flag: at | PIECE,
+            orig,
+        }
     }
-    let start_at = pieces.partition_point(|piece| piece.end <= span.start);
-    let starts_inside = pieces
-        .get(start_at)
-        .is_some_and(|piece| piece.start <= span.start && span.start < piece.end);
-    if !starts_inside {
-        return false;
+
+    fn after(at: usize, orig: usize) -> Cut {
+        Cut {
+            at_and_flag: at,
+            orig,
+        }
     }
-    let last = span.end - 1;
-    let end_at = pieces.partition_point(|piece| piece.end <= last);
-    let ends_inside = pieces
-        .get(end_at)
-        .is_some_and(|piece| piece.start <= last && last < piece.end);
-    ends_inside && end_at > start_at
+
+    fn at(&self) -> usize {
+        self.at_and_flag & !PIECE
+    }
+
+    fn is_piece(&self) -> bool {
+        self.at_and_flag & PIECE != 0
+    }
+}
+
+/// The joined copy of a line: every run of two or more joinable literals is
+/// one literal (one opening quote, the concatenated interiors, one closing
+/// quote), everything else is as written. `cuts` maps it back to the line.
+struct Joined {
+    shadow: String,
+    cuts: Vec<Cut>,
+}
+
+impl Joined {
+    /// Line position of shadow position `p`.
+    fn orig_of(&self, p: usize) -> usize {
+        match self.cuts.partition_point(|c| c.at() <= p) {
+            0 => p,
+            n => self.cuts[n - 1].orig + (p - self.cuts[n - 1].at()),
+        }
+    }
+
+    /// The line bytes a shadow span was joined from; `None` for an empty span
+    /// or one off the end of the shadow.
+    fn orig_range(&self, span: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        if span.start >= span.end || span.end > self.shadow.len() {
+            return None;
+        }
+        Some(self.orig_of(span.start)..self.orig_of(span.end - 1) + 1)
+    }
+
+    /// The cut that starts the piece holding shadow byte `p`, if one does. A
+    /// piece ends where the next cut begins, less the closing quote the copy
+    /// keeps after the last piece of a run.
+    fn piece_at(&self, p: usize) -> Option<usize> {
+        let idx = self.cuts.partition_point(|c| c.at() <= p).checked_sub(1)?;
+        if !self.cuts[idx].is_piece() {
+            return None;
+        }
+        let next = self.cuts.get(idx + 1)?;
+        let end = if next.is_piece() {
+            next.at()
+        } else {
+            next.at() - 1
+        };
+        (p < end).then_some(idx)
+    }
+
+    /// Whether `span` starts in one joined piece and ends in a later one. A
+    /// match wholly inside one piece is visible on the line as written, and
+    /// taking it from the copy too would hide the quote that bounds it.
+    fn crosses(&self, span: &std::ops::Range<usize>) -> bool {
+        if span.start >= span.end {
+            return false;
+        }
+        match (self.piece_at(span.start), self.piece_at(span.end - 1)) {
+            (Some(first), Some(last)) => last > first,
+            _ => false,
+        }
+    }
+
+    /// Whether a piece begins at shadow position `p`. A piece begins at a
+    /// quote, so a key that starts there starts a token whatever the piece
+    /// before it ended in.
+    fn is_piece_start(&self, p: usize) -> bool {
+        let mut k = self.cuts.partition_point(|c| c.at() < p);
+        while let Some(cut) = self.cuts.get(k)
+            && cut.at() == p
+        {
+            if cut.is_piece() {
+                return true;
+            }
+            k += 1;
+        }
+        false
+    }
+
+    /// The joined text of line bytes `a..b`: those bytes, less the quotes and
+    /// separators the copy took out between pieces. It is the secret as a
+    /// reader of the line sees it, and what a marker's length counts.
+    fn joined_text(&self, a: usize, b: usize) -> String {
+        let mut out = String::new();
+        // Segment i is the shadow bytes from cut i to cut i+1, which are the
+        // line bytes from cut i's `orig` on; segment -1 runs from 0 to cut 0.
+        let first = self.cuts.partition_point(|c| c.orig <= a);
+        let mut seg = first.checked_sub(1);
+        loop {
+            let (at, orig) = seg.map_or((0, 0), |k| (self.cuts[k].at(), self.cuts[k].orig));
+            if orig >= b {
+                break;
+            }
+            let next = seg.map_or(0, |k| k + 1);
+            let end = self.cuts.get(next).map_or(self.shadow.len(), |c| c.at());
+            let len = end - at;
+            let (lo, hi) = (a.max(orig), b.min(orig + len));
+            if lo < hi {
+                out.push_str(&self.shadow[at + (lo - orig)..at + (hi - orig)]);
+            }
+            if next >= self.cuts.len() {
+                break;
+            }
+            seg = Some(next);
+        }
+        out
+    }
 }
 
 /// A line in which every same-line run of two or more quoted literals is one
-/// literal, and a map from each byte of that line back to `line`.
+/// literal, with the map back to `line`.
 ///
 /// `None` when there is no such run, so the caller scans `line` itself and
 /// redaction of every other line stays byte-identical. The join is lexical,
 /// not a parse: `'` and `"` (including a Python `r`/`u`/`b` prefix and a
 /// triple quote), separated by whitespace or one `+`. Not joined: a format
-/// string, a quoted reference (`"$URL"`, `"${TOKEN}"`), a backtick template,
-/// a C# verbatim string, a hashed Rust raw string, a call, or anything on the
-/// next line. Interiors are copied raw, escapes and all; they are not decoded.
+/// string, a quoted reference (`"$URL"`, `"${TOKEN}"`, `'KEY=%s'`), a backtick
+/// template, a C# verbatim string, a hashed Rust raw string, a call or macro
+/// (`concat!("A", "B")` is an accepted miss), or anything on the next line. A
+/// quote that never closes is an ordinary character, and the scan goes on at
+/// the next one. Interiors are copied raw, escapes and all; they are not
+/// decoded.
 fn join_quoted_literals(line: &str) -> Option<Joined> {
     let b = line.as_bytes();
-    if !b.contains(&b'"') && !b.contains(&b'\'') || !has_quoted_join(line) {
+    if !b.contains(&b'"') && !b.contains(&b'\'') {
         return None;
     }
-    let mut out = String::with_capacity(line.len());
-    let mut map = Vec::with_capacity(line.len());
-    let mut pieces = Vec::new();
+    let dead = Dead::default();
+    if !has_quoted_join(line, &dead) {
+        return None;
+    }
+    let mut shadow = String::with_capacity(line.len());
+    let mut cuts = Vec::new();
     let mut i = 0;
     while i < line.len() {
-        if let Some(first) = at_literal(line, i) {
-            let group = literal_run(line, first);
-            let last = group.last().unwrap();
-            if group.len() == 1 {
-                push_slice(&mut out, &mut map, line, group[0].start..group[0].end);
-            } else {
+        match at_literal(line, i, &dead) {
+            Some(first) if !first.resync => {
+                let second = if first.joinable {
+                    join_sep(line, first.end, &dead)
+                } else {
+                    None
+                };
+                let Some(second) = second else {
+                    push_slice(&mut shadow, line, first.start..first.end);
+                    i = first.end;
+                    continue;
+                };
                 // One opening quote, so the scanners that already understand a
                 // quoted literal see the concatenated interior. Extra quotes of
-                // a triple-quoted piece are left out of the shadow; the map
-                // still points at the quote that was kept.
-                push_slice(
-                    &mut out,
-                    &mut map,
-                    line,
-                    group[0].start..group[0].quote_at + 1,
-                );
-                for lit in &group {
-                    let piece = out.len();
-                    push_slice(&mut out, &mut map, line, lit.content..lit.content_end);
-                    pieces.push(piece..out.len());
+                // a triple-quoted piece are left out of the copy.
+                push_slice(&mut shadow, line, first.start..first.quote_at + 1);
+                let mut lit = first;
+                let mut next = Some(second);
+                loop {
+                    cuts.push(Cut::piece(shadow.len(), lit.content));
+                    push_slice(&mut shadow, line, lit.content..lit.content_end);
+                    let Some(n) = next.take() else { break };
+                    lit = n;
+                    next = join_sep(line, lit.end, &dead);
                 }
-                if last.content_end < line.len() {
-                    push_slice(
-                        &mut out,
-                        &mut map,
-                        line,
-                        last.content_end..last.content_end + 1,
-                    );
-                }
+                push_slice(&mut shadow, line, lit.content_end..lit.content_end + 1);
+                i = lit.end;
+                cuts.push(Cut::after(shadow.len(), i));
             }
-            i = last.end;
-        } else {
-            let n = line[i..].chars().next().map_or(1, char::len_utf8);
-            push_slice(&mut out, &mut map, line, i..i + n);
-            i += n;
+            _ => {
+                let n = line[i..].chars().next().map_or(1, char::len_utf8);
+                push_slice(&mut shadow, line, i..i + n);
+                i += n;
+            }
         }
     }
-    debug_assert_eq!(out.len(), map.len());
-    Some(Joined {
-        shadow: out,
-        map,
-        pieces,
-    })
+    Some(Joined { shadow, cuts })
 }
 
 /// Every credential on `line`, from both tables, as (name, span, bytes kept).
@@ -1397,9 +1558,19 @@ fn join_quoted_literals(line: &str) -> Option<Joined> {
 fn detections(
     line: &str,
 ) -> impl Iterator<Item = (&'static str, std::ops::Range<usize>, usize)> + '_ {
-    let prefixed = SECRET_PATTERNS
-        .iter()
-        .flat_map(move |p| p.spans(line).map(move |s| (p.name, s, p.prefix.len())));
+    detections_at(line, &|_| false)
+}
+
+/// [`detections`] where `boundary(p)` also says that a token may start at byte
+/// `p`: the start of a joined piece, which is the quote that opens a literal.
+fn detections_at<'a>(
+    line: &'a str,
+    boundary: &'a dyn Fn(usize) -> bool,
+) -> impl Iterator<Item = (&'static str, std::ops::Range<usize>, usize)> + 'a {
+    let prefixed = SECRET_PATTERNS.iter().flat_map(move |p| {
+        p.spans(line, boundary)
+            .map(move |s| (p.name, s, p.prefix.len()))
+    });
     let contextual = CONTEXT_PATTERNS.iter().flat_map(move |p| {
         (p.spans)(line)
             .into_iter()
@@ -2318,10 +2489,11 @@ pub fn find_secret(line: &str) -> Option<SecretMatch> {
         });
     }
     // Nothing on the original line. A secret split across literals exists
-    // only in the joined shadow, and only when the match itself crosses.
+    // only in the joined copy, and only when the match itself crosses.
     let joined = join_quoted_literals(line)?;
-    detections(&joined.shadow)
-        .find(|(_, span, _)| span_crosses(&joined.pieces, span))
+    let boundary = |p: usize| joined.is_piece_start(p);
+    detections_at(&joined.shadow, &boundary)
+        .find(|(_, span, _)| joined.crosses(span))
         .map(|(name, span, keep)| SecretMatch {
             name,
             redacted: redact(&joined.shadow[span], keep),
@@ -2381,130 +2553,79 @@ fn redact_line(line: &str) -> String {
     redact(line, 0)
 }
 
-/// One detection placed back on the original line.
-///
-/// `token` indexes `text` when `shadow` is false, and the joined shadow when
-/// it is true. The marker is rendered from `token`, which for a cross-literal
-/// match is the concatenated secret, not the quotes and `+` between the pieces.
-struct RedactHit {
-    orig: std::ops::Range<usize>,
-    token: std::ops::Range<usize>,
-    keep: usize,
-    shadow: bool,
-}
-
-/// The original bytes a shadow span was joined from.
-///
-/// `None` when the span is empty, runs off the map, or `end` is zero — those
-/// are not indexed. The caller leaves that span out rather than panicking.
-fn mapped_orig(map: &[usize], span: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
-    if span.end == 0 || span.start >= span.end || span.end > map.len() {
-        return None;
-    }
-    let start = *map.get(span.start)?;
-    let last = *map.get(span.end - 1)?;
-    let end = last.checked_add(1)?;
-    (start < end).then_some(start..end)
-}
-
 /// One redaction pass over a line: every detection, overlaps merged.
+///
+/// Detections are found on the line as written and, when the line holds a
+/// same-line join, on the joined copy (only matches that cross pieces). They
+/// are merged in line coordinates exactly as a line with no join is, and a
+/// merged span's marker is rendered from the whole merged text, so a line
+/// with no join comes out byte for byte as it always did.
 fn redact_pass(text: &str) -> String {
-    // The original line always. A key that begins in a later literal is a
-    // token there — the quote before it is a boundary — and gluing the
-    // previous interior onto it would erase that boundary.
-    let mut hits = Vec::new();
-    for (_, span, keep) in detections(text) {
-        if span.start >= span.end || span.end > text.len() {
-            continue;
-        }
-        hits.push(RedactHit {
-            orig: span.clone(),
-            token: span,
-            keep,
-            shadow: false,
-        });
-    }
-    // A split secret is not a token on the original line. It is one on the
-    // shadow, and it counts only when it starts in one literal and ends in
-    // a later one. A match wholly inside one piece is the original's job.
+    // (span in `text`, bytes kept, found on the joined copy)
+    let mut hits: Vec<(std::ops::Range<usize>, usize, bool)> = detections(text)
+        .map(|(_, span, keep)| (span, keep, false))
+        .collect();
     let joined = join_quoted_literals(text);
     if let Some(joined) = &joined {
-        for (_, span, keep) in detections(&joined.shadow) {
-            if !span_crosses(&joined.pieces, &span) {
+        let boundary = |p: usize| joined.is_piece_start(p);
+        for (_, span, keep) in detections_at(&joined.shadow, &boundary) {
+            if !joined.crosses(&span) {
                 continue;
             }
-            let Some(orig) = mapped_orig(&joined.map, &span) else {
-                continue;
-            };
-            if orig.end > text.len() {
-                continue;
+            match joined.orig_range(&span) {
+                Some(orig) if orig.end <= text.len() => hits.push((orig, keep, true)),
+                // A span that cannot be placed on the line is still a
+                // credential: redact the line whole rather than leave it.
+                _ => return redact(text, 0),
             }
-            hits.push(RedactHit {
-                orig,
-                token: span,
-                keep,
-                shadow: true,
-            });
         }
     }
-    apply_hits(
-        text,
-        joined.as_ref().map(|joined| joined.shadow.as_str()),
-        hits,
-    )
-}
-
-/// Write `hits` into `original`. A span that would read before `copied`, or
-/// off either string, or off a character boundary, is skipped.
-fn apply_hits(original: &str, shadow: Option<&str>, mut hits: Vec<RedactHit>) -> String {
     // Preserve byte offsets until every family has been checked. Sorting and
     // merging overlaps keeps the most specific prefix at a shared start and
     // prevents replacement text from being interpreted as another credential.
     // The prefix is chosen before the length: a vendor key and a context match
     // that start together merge into the longer span, and that span still
     // shows the vendor's prefix, which says what leaked and nothing more.
-    hits.sort_by_key(|hit| {
+    hits.sort_by_key(|(span, keep, _)| {
         (
-            hit.orig.start,
-            std::cmp::Reverse(hit.keep),
-            std::cmp::Reverse(hit.orig.end),
+            span.start,
+            std::cmp::Reverse(*keep),
+            std::cmp::Reverse(span.end),
         )
     });
-    let mut merged: Vec<RedactHit> = Vec::new();
-    for hit in hits {
-        if let Some(previous) = merged.last_mut()
-            && hit.orig.start < previous.orig.end
+    let mut merged: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
+    for (span, keep, on_copy) in hits {
+        if let Some((previous, _, previous_on_copy)) = merged.last_mut()
+            && span.start < previous.end
         {
-            previous.orig.end = previous.orig.end.max(hit.orig.end);
+            previous.end = previous.end.max(span.end);
+            *previous_on_copy |= on_copy;
             continue;
         }
-        merged.push(hit);
+        merged.push((span, keep, on_copy));
     }
-    let mut out = String::with_capacity(original.len());
-    let mut copied = 0usize;
-    for hit in merged {
-        let Some(token_src) = (if hit.shadow { shadow } else { Some(original) }) else {
-            continue;
-        };
-        if hit.orig.start < copied
-            || hit.orig.end > original.len()
-            || hit.token.start >= hit.token.end
-            || hit.token.end > token_src.len()
-            || !original.is_char_boundary(hit.orig.start)
-            || !original.is_char_boundary(hit.orig.end)
-            || !token_src.is_char_boundary(hit.token.start)
-            || !token_src.is_char_boundary(hit.token.end)
-        {
-            continue;
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (span, keep, on_copy) in merged {
+        // Widened, never narrowed, to character boundaries: a bad span may
+        // redact too much of a line, and cannot leave part of one in the clear.
+        let mut start = span.start.min(text.len());
+        while !text.is_char_boundary(start) {
+            start -= 1;
         }
-        out.push_str(&original[copied..hit.orig.start]);
-        out.push_str(&redact(&token_src[hit.token.clone()], hit.keep));
-        copied = hit.orig.end;
+        let mut end = span.end.min(text.len());
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let start = start.max(copied);
+        out.push_str(&text[copied..start]);
+        match &joined {
+            Some(joined) if on_copy => out.push_str(&redact(&joined.joined_text(start, end), keep)),
+            _ => out.push_str(&redact(&text[start..end], keep)),
+        }
+        copied = end;
     }
-    if copied > original.len() || !original.is_char_boundary(copied) {
-        return original.to_string();
-    }
-    out.push_str(&original[copied..]);
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -2516,7 +2637,8 @@ pub fn contains_secret(text: &str) -> bool {
     text.lines().any(|line| {
         detections(line).next().is_some()
             || join_quoted_literals(line).is_some_and(|joined| {
-                detections(&joined.shadow).any(|(_, span, _)| span_crosses(&joined.pieces, &span))
+                let boundary = |p: usize| joined.is_piece_start(p);
+                detections_at(&joined.shadow, &boundary).any(|(_, span, _)| joined.crosses(&span))
             })
     })
 }
@@ -2984,7 +3106,7 @@ mod redaction_tests {
             .filter(|(_, line)| {
                 SECRET_PATTERNS
                     .iter()
-                    .any(|p| p.spans(line).next().is_some())
+                    .any(|p| p.spans(line, &|_| false).next().is_some())
             })
             .map(|(i, _)| i + 1)
             .collect();
