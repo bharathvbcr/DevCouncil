@@ -13,13 +13,15 @@ import {
   goModToolchain,
   gussetPin,
   gussetPinVerdict,
+  libtestFailures,
   localTagState,
+  nestedGateProblem,
   parseArgs,
   runSteps,
   summarize,
   tagVerdict,
 } from "./ci-local-checks.mjs";
-import { GO_MODULE, STEPS } from "./ci-local.mjs";
+import { GO_MODULE, STEPS, rustVerifyStep } from "./ci-local.mjs";
 
 const PIN = "320c56c27e1098f7e0a26e9854ff80c4f4354ef9";
 
@@ -691,4 +693,157 @@ describe("rust/verify.sh --continue", { skip: process.platform === "win32" }, ()
     assert.ok(trap, "verify.sh installs no EXIT trap");
     assert.match(trap, /exit "\$/, `an EXIT trap that does not re-exit with the incoming status replaces it with its own: ${trap}`);
   });
+});
+
+// 2026-11-17: the merge-train base gate printed "PASS rust verify --quick" and
+// "0 failed" beside "3/8 tests failed (exit 101)". verify.sh's summary() had
+// died and its EXIT trap had turned the crash into exit 0, and ci-local, which
+// read only the exit status, believed it. A nested gate's exit 0 is a claim;
+// these tests run the verify step against fake scripts that make it falsely.
+describe("ci:local does not believe a nested gate's exit status alone", { skip: process.platform === "win32" }, () => {
+  const BLOCK = [
+    "",
+    "  ── rust/verify.sh " + "─".repeat(42),
+    "",
+    "    PASS  1/8 format                                   0.1s",
+    "    PASS  3/8 tests                                    2.0s",
+    "    N/A   4/8 determinism                  (not applicable: quick mode)",
+    "",
+    "",
+  ].join("\n");
+
+  /** Run the verify step against a fake verify.sh whose body is `body`; returns the row and the exit code. */
+  function runFake(body, mode) {
+    const dir = mkdtempSync(path.join(tmpdir(), "ci-local-fake-verify-"));
+    try {
+      writeFileSync(path.join(dir, "verify.sh"), body, { mode: 0o755 });
+      const lines = [];
+      const res = runSteps([rustVerifyStep(dir)], { mode, gate: "t", log: (s) => lines.push(s) });
+      return { row: res.rows[0], code: res.code, out: lines.join("\n") };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const script = (...lines) => ["#!/usr/bin/env bash", ...lines, ""].join("\n");
+  const printBlock = (block) => `printf '%b' '${block.replace(/\n/g, "\\n")}'`;
+
+  it("accepts a complete block and exit 0 (control: the fake is a faithful verify.sh)", () => {
+    const r = runFake(script("echo steps", printBlock(BLOCK)), "continue");
+    assert.equal(r.row.status, "PASS", r.out);
+    assert.equal(r.code, 0);
+  });
+
+  it("FAILs, never PASSes, when verify.sh exits 0 after its steps but printed no summary block", () => {
+    const r = runFake(script("echo '== 1/8 format =='", "echo 'test t ... ok'", "exit 0"), "continue");
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /no summary block/);
+    assert.equal(r.code, 1);
+  });
+
+  it("FAILs on a malformed block: a header with no rows, or rows with no terminating blank line", () => {
+    const headerOnly = BLOCK.split("\n").slice(0, 3).join("\n") + "\n";
+    assert.equal(runFake(script(printBlock(headerOnly)), "continue").row.status, "FAIL");
+    const cut = BLOCK.trimEnd();
+    assert.equal(runFake(script(printBlock(cut)), "continue").row.status, "FAIL");
+    const junk = BLOCK.replace("    PASS  3/8 tests", "    garbage 3/8 tests");
+    assert.equal(runFake(script(printBlock(junk)), "continue").row.status, "FAIL");
+  });
+
+  it("FAILs when exit 0 sits beside a FAIL row", () => {
+    const r = runFake(script(printBlock(BLOCK.replace("    PASS  3/8 tests", "    FAIL  3/8 tests"))), "continue");
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /FAIL row/);
+  });
+
+  it("FAILs when the log holds libtest FAILED lines but every row is PASS", () => {
+    const r = runFake(
+      script("echo 'test store::tests::roundtrip ... FAILED'", "echo 'test result: FAILED. 7 passed; 1 failed; 0 ignored'", printBlock(BLOCK)),
+      "continue",
+    );
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /libtest/);
+  });
+
+  it("in the default mode requires the QUICK GATES GREEN line, not just exit 0", () => {
+    assert.equal(runFake(script("echo steps", "exit 0"), "default").code, 1);
+    const ok = runFake(script("printf '\\nQUICK GATES GREEN; the full gate suite was NOT RUN\\n'"), "default");
+    assert.equal(ok.code, 0, ok.out);
+    const failed = runFake(script("echo 'test a ... FAILED'", "printf '\\nQUICK GATES GREEN; the full gate suite was NOT RUN\\n'"), "default");
+    assert.equal(failed.code, 1);
+  });
+
+  it("still reports a non-zero exit as its own FAIL with that code", () => {
+    const r = runFake(script("echo boom", "exit 101"), "continue");
+    assert.equal(r.row.status, "FAIL");
+    assert.equal(r.row.note, "exit 101");
+    assert.equal(runFake(script("exit 101"), "default").code, 101);
+  });
+});
+
+describe("libtestFailures and nestedGateProblem", () => {
+  const block = ["", "  ── rust/verify.sh " + "─".repeat(42), "", "    PASS  1/8 format    0.1s", "", ""].join("\n");
+
+  it("reads cargo's FAILED lines, through ANSI colour, and nothing else", () => {
+    const log = ["test a::ok ... ok", "test a::bad ... FAILED", "\u001b[31mtest result: FAILED. 1 passed; 1 failed\u001b[0m", "test result: ok. 3 passed", "failures:", "    a::bad"].join("\n");
+    assert.deepEqual(libtestFailures(log), ["test a::bad ... FAILED", "test result: FAILED. 1 passed; 1 failed"]);
+    assert.deepEqual(libtestFailures("test x ... ignored\n3/8 tests failed (exit 101)"), []);
+  });
+
+  it("believes a complete nested block, and a default-mode run that reached its green line", () => {
+    assert.equal(nestedGateProblem(block, { nested: true }), undefined);
+    assert.equal(nestedGateProblem("QUICK GATES GREEN; the full gate suite was NOT RUN\n", { nested: false }), undefined);
+  });
+
+  it("does not believe an empty log in either mode", () => {
+    assert.match(nestedGateProblem("", { nested: true }), /no summary block/);
+    assert.match(nestedGateProblem("", { nested: false }), /never printed/);
+  });
+});
+
+// The 2026-11-17 crash needed bash 3.2 (/bin/bash on macOS) and a UTF-8
+// locale; the harness above runs the first bash on PATH with no LANG. This
+// matrix runs the gate under every distinct bash among PATH's and /bin/bash,
+// with and without LANG=en_US.UTF-8.
+//
+// CI (.github/workflows/ci.yml, `npm run test:scripts` on ubuntu-latest) has
+// one bash (5.x) and may have no en_US.UTF-8 locale installed, so there the
+// matrix collapses to the default row and the bash 3.2 rows only run on a Mac.
+// Covering them in CI means adding a macos job that runs `npm run test:scripts`
+// (macos runners ship /bin/bash 3.2.57): a workflow change this test file does
+// not make.
+describe("rust/verify.sh across bash and locale", { skip: process.platform === "win32" }, () => {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "rust", "verify.sh");
+  const which = (name) => spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+  const real = (p) => spawnSync("/bin/sh", ["-c", `cd "$(dirname "${p}")" && pwd -P`], { encoding: "utf8" }).stdout.trim() + "/" + path.basename(p);
+  const shells = [...new Set([which("bash"), "/bin/bash"].filter((p) => p && spawnSync(p, ["-c", "exit 0"]).status === 0).map(real))];
+  const locales = [undefined, "en_US.UTF-8"];
+
+  for (const shell of shells) {
+    for (const lang of locales) {
+      it(`prints its block and exits 1 for a failed step: ${shell}, LANG=${lang ?? "(unset)"}`, () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "verify-matrix-"));
+        try {
+          const bin = path.join(dir, "bin");
+          mkdirSync(bin);
+          for (const tool of ["dirname", "mktemp", "rm", "date", "perl", "gdate", "cat", "sh"]) {
+            const at = which(tool);
+            if (at) symlinkSync(at, path.join(bin, tool));
+          }
+          writeFileSync(path.join(bin, "cargo"), '#!/bin/sh\ncase "$*" in *fmt*) exit 1 ;; esac\nexit 0\n', { mode: 0o755 });
+          const host = path.join(dir, "devcouncil");
+          writeFileSync(host, "");
+          const r = spawnSync(shell, [script, "--quick", "--continue", "--nested"], {
+            encoding: "utf8",
+            env: { PATH: bin, HOME: dir, DEVCOUNCIL_BIN: host, ...(lang ? { LANG: lang, LC_ALL: lang } : {}) },
+          });
+          assert.doesNotMatch(r.stderr, /unbound variable/, r.stderr);
+          assert.equal(r.status, 1, r.stdout + r.stderr);
+          assert.match(nestedGateProblem(r.stdout, { nested: true }), /FAIL row: FAIL +1\/8 format/);
+          assert.match(r.stdout, /^ {2}── rust\/verify\.sh ─+$/m);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
 });

@@ -96,6 +96,65 @@ export function goModToolchain(goMod) {
   return v ? `go${v}` : undefined;
 }
 
+const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
+const NESTED_HEADER = /^ {2}── rust\/verify\.sh ─+$/;
+const NESTED_ROW = /^ {4}(PASS|FAIL|SKIP|N\/A) {2,3}\S.*$/;
+const QUICK_GREEN = "QUICK GATES GREEN; the full gate suite was NOT RUN";
+
+/**
+ * The libtest lines that say a test failed: `test <name> ... FAILED` and
+ * `test result: FAILED. N passed; M failed`. Cargo prints them for every
+ * failing target, so a log that holds one is not a green run, whatever status
+ * the process that printed it exited with.
+ *
+ * @param {string} log
+ * @returns {string[]}
+ */
+export function libtestFailures(log) {
+  return log
+    .replace(ANSI, "")
+    .split("\n")
+    .filter((l) => /^test .+ \.\.\. FAILED$/.test(l) || /^test result: FAILED\./.test(l));
+}
+
+/**
+ * Why a nested gate's exit 0 cannot be believed, or undefined when its own
+ * output backs it. An exit status is a claim: on 2026-11-17 rust/verify.sh's
+ * summary() died and its EXIT trap turned the crash into 0, so the status said
+ * green over a log holding "3/8 tests failed (exit 101)".
+ *
+ * Nested (--continue --nested) the output must hold the complete summary
+ * block: header, at least one well-formed row, a blank line ending it, and no
+ * FAIL row. Without those flags the run must end with its QUICK GATES GREEN
+ * line. In both, the log must hold no libtest FAILED line.
+ *
+ * @param {string} log the gate's merged stdout and stderr
+ * @param {{ nested: boolean }} opts
+ * @returns {string | undefined}
+ */
+export function nestedGateProblem(log, { nested }) {
+  const lines = log.replace(ANSI, "").split("\n");
+  if (nested) {
+    const at = lines.findIndex((l) => NESTED_HEADER.test(l));
+    if (at < 0) return "exit 0 but no summary block was printed";
+    let i = at + 2; // the header, then the blank line under it
+    if (lines[at + 1] !== "") return "malformed summary block: no blank line under the header";
+    let rows = 0;
+    while (i < lines.length && NESTED_ROW.test(lines[i])) {
+      if (lines[i].trimStart().startsWith("FAIL")) return `exit 0 but the summary block has a FAIL row: ${lines[i].trim()}`;
+      rows++;
+      i++;
+    }
+    if (rows === 0) return "malformed summary block: no rows";
+    if (lines[i] !== "" || i + 1 >= lines.length) return `malformed summary block: ${lines[i] === undefined ? "ends inside the rows" : `unexpected line ${JSON.stringify(lines[i])}`}`;
+  } else if (!lines.includes(QUICK_GREEN)) {
+    return `exit 0 but the run never printed "${QUICK_GREEN}"`;
+  }
+  const failed = libtestFailures(log);
+  if (failed.length > 0) return `exit 0 but the log holds ${failed.length} libtest FAILED line(s): ${failed[0]}`;
+  return undefined;
+}
+
 /**
  * How a step stops short of a pass. The step prints its own message first;
  * the runner decides what the stop means. `cannotRun` marks a step that never

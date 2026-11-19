@@ -25,6 +25,7 @@ import {
   gussetPin,
   gussetPinVerdict,
   localTagState,
+  nestedGateProblem,
   parseArgs,
   runSteps,
   tagVerdict,
@@ -53,10 +54,11 @@ function fail(code, message, opts) {
  * @param {import("./ci-local-checks.mjs").StepContext} ctx
  * @param {string} command
  * @param {string[]} args
- * @param {{ cwd?: string }} [opts]
+ * @param {{ cwd?: string, check?: (log: string) => string | undefined }} [opts]
  */
 function exec(ctx, command, args, opts = {}) {
   ctx.header();
+  if (opts.check) return execChecked(ctx, command, args, opts);
   const result = spawnSync(command, args, {
     cwd: opts.cwd ?? REPO_ROOT,
     env: ctx.env,
@@ -69,6 +71,48 @@ function exec(ctx, command, args, opts = {}) {
   if (result.status !== 0) {
     const note = result.signal ? `signal ${result.signal}` : `exit ${result.status}`;
     throw fail(result.status ?? 1, `${ctx.label} (exit ${result.status})`, { note });
+  }
+}
+
+/**
+ * exec() for a nested gate whose exit 0 must be backed by its own output.
+ * The output still streams to this terminal (stderr merged into stdout, and
+ * through a pipe, as it is in any logged run); `tee` keeps a copy, and the
+ * command's status is written to a file because a pipeline reports tee's.
+ * After an exit 0, `check(log)` names why the run cannot be believed, or
+ * returns undefined.
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{ cwd?: string, check: (log: string) => string | undefined }} opts
+ */
+function execChecked(ctx, command, args, opts) {
+  const dir = mkdtempSync(path.join(tmpdir(), "ci-local-run-"));
+  const logFile = path.join(dir, "log");
+  const statusFile = path.join(dir, "status");
+  try {
+    const result = spawnSync(
+      "sh",
+      ["-c", 'st=$1; lg=$2; shift 2; { "$@"; echo $? > "$st"; } 2>&1 | tee "$lg"', "sh", statusFile, logFile, command, ...args],
+      { cwd: opts.cwd ?? REPO_ROOT, env: ctx.env, stdio: "inherit", shell: false },
+    );
+    if (result.error) {
+      throw fail(2, `${ctx.label} could not run: ${result.error.message}`, { cannotRun: true });
+    }
+    const status = existsSync(statusFile) ? Number.parseInt(readFileSync(statusFile, "utf8"), 10) : Number.NaN;
+    if (Number.isNaN(status)) {
+      throw fail(2, `${ctx.label} did not report an exit status`, { cannotRun: true });
+    }
+    if (status !== 0) {
+      throw fail(status, `${ctx.label} (exit ${status})`, { note: `exit ${status}` });
+    }
+    const problem = opts.check(existsSync(logFile) ? readFileSync(logFile, "utf8") : "");
+    if (problem !== undefined) {
+      throw fail(1, `${ctx.label} is not believed: ${problem}`, { note: `unverified: ${problem}` });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -250,6 +294,30 @@ function commandStep(label, command, args, opts = {}) {
 const VERIFY_ARGS = ["./verify.sh", "--quick"];
 
 /**
+ * The rust/verify.sh step, with the directory as a parameter so a test can run
+ * it against a fake script.
+ *
+ * @param {string} cwd the directory holding verify.sh
+ * @returns {Step}
+ */
+export function rustVerifyStep(cwd) {
+  return {
+    label: "rust verify --quick",
+    needs: [],
+    command: "bash",
+    args: VERIFY_ARGS,
+    cwd,
+    // In the new modes verify.sh keeps going too (cargo test --no-fail-fast),
+    // and prints its rows as a nested block without totals.
+    run: (ctx) =>
+      exec(ctx, "bash", ctx.mode === "default" ? VERIFY_ARGS : [...VERIFY_ARGS, "--continue", "--nested"], {
+        cwd,
+        check: (log) => nestedGateProblem(log, { nested: ctx.mode !== "default" }),
+      }),
+  };
+}
+
+/**
  * Every ci:local step, in order. `needs` names the steps whose output a step
  * uses; the runner hands a step only its declared producers' `env` and
  * `paths`, and in the new modes runs it only when they passed.
@@ -298,19 +366,7 @@ export const STEPS = [
   // The go/types labeller behind the DevMap corpus record, its own module.
   commandStep("accuracy labeller vet", "go", ["vet", "./..."], { cwd: ACCURACY_MODULE }),
   commandStep("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: ACCURACY_MODULE }),
-  {
-    label: "rust verify --quick",
-    needs: [],
-    command: "bash",
-    args: VERIFY_ARGS,
-    cwd: path.join(REPO_ROOT, "rust"),
-    // In the new modes verify.sh keeps going too (cargo test --no-fail-fast),
-    // and prints its rows as a nested block without totals.
-    run: (ctx) =>
-      exec(ctx, "bash", ctx.mode === "default" ? VERIFY_ARGS : [...VERIFY_ARGS, "--continue", "--nested"], {
-        cwd: path.join(REPO_ROOT, "rust"),
-      }),
-  },
+  rustVerifyStep(path.join(REPO_ROOT, "rust")),
 ];
 
 function main() {
