@@ -2070,7 +2070,18 @@ pub(crate) fn read_host_config(path: &Path) -> io::Result<String> {
             format!("{}: not a regular file", path.display()),
         ));
     }
-    let file = fs::File::open(path)?;
+    // The `stat` above and this open are two lookups of one name, so a regular
+    // file swapped for a FIFO between them would block a plain open. O_NONBLOCK
+    // makes the open return at once for a FIFO, and the type is then judged on
+    // the opened handle (fstat), which cannot be swapped.
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(io::Error::new(

@@ -1380,6 +1380,31 @@ pub fn known_subcommands<C: clap::CommandFactory>() -> Vec<String> {
     })
 }
 
+/// `path` with its deepest existing ancestor canonicalized and the missing
+/// tail re-appended. A tail with `..` or no file name is refused.
+fn canonical_with_missing_tail(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut tail = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match current.canonicalize() {
+            Ok(mut resolved) => {
+                resolved.extend(tail.iter().rev());
+                return Ok(resolved);
+            }
+            Err(_) => {
+                let Some(name) = current.file_name().map(std::ffi::OsStr::to_os_string) else {
+                    anyhow::bail!(
+                        "refusing to register {}: cannot resolve where it would land",
+                        path.display()
+                    );
+                };
+                tail.push(name);
+                current.pop();
+            }
+        }
+    }
+}
+
 /// What command line reaches this binary: the one owner every writer shares.
 ///
 /// Always an absolute, canonical path that is not inside the repository at
@@ -1402,14 +1427,19 @@ pub fn reachable_command(
         let missing = std::fs::symlink_metadata(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         if missing && path.is_absolute() {
-            if crate::hook::executable_is_inside_repository(path, root)? {
+            // Judged where it will land: the deepest existing ancestor is
+            // resolved through its links and the missing tail re-appended, so
+            // `out/link/devmap` with `out/link -> repo/bin` is the repository's.
+            let landing = canonical_with_missing_tail(path)?;
+            if crate::hook::executable_is_inside_repository(&landing, root)? {
                 anyhow::bail!(
-                    "refusing to register the devmap command: {} is inside the repository at {}",
+                    "refusing to register the devmap command: {} lands inside the repository at {} ({})",
                     path.display(),
-                    root.display()
+                    root.display(),
+                    landing.display()
                 );
             }
-            return Ok(path.to_path_buf());
+            return Ok(landing);
         }
     }
     crate::hook::canonical_hook_executable(
