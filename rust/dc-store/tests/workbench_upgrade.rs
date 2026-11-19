@@ -603,3 +603,194 @@ fn the_tasks_retire_backup_holds_the_write_lock() {
         .unwrap();
     assert_eq!(gone, 0, "the legacy table was not retired");
 }
+
+// ---- adversarial schema-backup race cases (ft-0e6cfa7a lane A attack) ----
+
+fn bak11(path: &Path) -> PathBuf {
+    path.with_file_name("profile.sqlite.pre-schema-11.bak")
+}
+
+fn assert_valid_old_backup(path: &Path) {
+    assert_eq!(version(&bak11(path)), 11);
+    assert!(
+        !path
+            .with_file_name("profile.sqlite.pre-schema-11.bak.partial")
+            .exists()
+    );
+}
+
+/// TRUNCATE and PERSIST keep the rollback journal; the second connection must
+/// read the pre-upgrade snapshot beside the writer lock in both.
+#[test]
+fn an_upgrade_in_truncate_and_persist_journal_modes_backs_up_the_old_schema() {
+    for mode in ["TRUNCATE", "PERSIST"] {
+        let (_dir, path) = profile();
+        let _reset = ResetHook;
+        let probes = probe_lock_in_backup_window(&path);
+        let store = Store::open(&path).unwrap();
+        let got: String = store
+            .connection()
+            .query_row(&format!("PRAGMA journal_mode={mode}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(got.to_ascii_uppercase(), mode);
+        put_workspace(&store, "m").unwrap();
+        assert_locked_out(&probes);
+        assert_valid_old_backup(&path);
+        assert_eq!(workspace_rows(&bak11(&path), "m"), 0, "{mode}");
+        assert_eq!(workspace_rows(&path, "m"), 1, "{mode}");
+    }
+}
+
+/// A host that crashed mid-copy leaves a partial file of any content behind;
+/// the next host replaces it and writes a correct backup.
+#[test]
+fn a_stale_partial_from_a_crashed_host_is_replaced() {
+    let (_dir, path) = profile();
+    std::fs::write(
+        path.with_file_name("profile.sqlite.pre-schema-11.bak.partial"),
+        b"half a copy from a host that died",
+    )
+    .unwrap();
+    let store = Store::open(&path).unwrap();
+    put_workspace(&store, "after-crash").unwrap();
+    assert_valid_old_backup(&path);
+    assert_eq!(workspace_rows(&bak11(&path), "after-crash"), 0);
+}
+
+/// A host that panics inside the window drops its connection mid-backup: the
+/// lock is released, nothing carries the backup name, and the next host
+/// writes the backup.
+#[test]
+fn a_host_that_dies_in_the_backup_window_releases_the_lock_and_leaves_no_backup() {
+    let (_dir, path) = profile();
+    let path_a = path.clone();
+    let crashed = std::thread::spawn(move || {
+        let _reset = ResetHook;
+        dc_store::workbench::set_backup_window_hook(Some(Arc::new(|| {
+            panic!("host A dies inside the backup window")
+        })));
+        let store = Store::open(&path_a).unwrap();
+        let _ = put_workspace(&store, "doomed");
+    })
+    .join();
+    assert!(crashed.is_err(), "the hook did not run");
+    assert!(try_write_lock(&path).is_ok(), "the dead host kept the lock");
+    assert!(!bak11(&path).exists(), "a dead host left a backup name");
+    assert_eq!(version(&path), 11);
+    let next = Store::open(&path).unwrap();
+    put_workspace(&next, "survivor").unwrap();
+    assert_valid_old_backup(&path);
+    assert_eq!(workspace_rows(&bak11(&path), "survivor"), 0);
+}
+
+/// A host that will not wait is refused with backup_failed while another holds
+/// the window: fail closed, no migration, no backup name.
+#[test]
+fn a_host_that_cannot_get_the_backup_lock_is_refused_without_migrating() {
+    let (_dir, path) = profile();
+    let host_b = Store::open(&path).unwrap();
+    host_b
+        .connection()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    // Opened first: opening takes the write lock, which host A holds below.
+    let mut reader = Store::open(&path).unwrap();
+    reader.refuse_workbench_upgrades();
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = Mutex::new(resume_rx);
+    let path_a = path.clone();
+    let host_a = std::thread::spawn(move || {
+        let _reset = ResetHook;
+        dc_store::workbench::set_backup_window_hook(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        })));
+        let store = Store::open(&path_a).unwrap();
+        put_workspace(&store, "a").map_err(|error| error.to_string())
+    });
+    entered_rx.recv().unwrap();
+    let during = put_workspace(&host_b, "b");
+    let seen_version = version(&path);
+    let seen_backup = bak11(&path).exists();
+    // A host that refuses upgrades never waits for the lock: it is told to
+    // upgrade, not blocked or reported as a store error.
+    let read = reader.workbench_request("workspaces.list", "{}");
+    resume_tx.send(()).unwrap();
+    host_a.join().unwrap().expect("host A failed");
+    let refused = during.unwrap_err();
+    assert_eq!(refused.code, "backup_failed", "{refused}");
+    assert_eq!(seen_version, 11, "host B migrated without a backup");
+    assert!(!seen_backup, "the backup name existed before A finished");
+    assert_eq!(read.unwrap_err().code, "schema_upgrade_required");
+}
+
+/// Retention on the writing host removes older copies and never the one just
+/// written, and a later host that finds it prunes nothing.
+#[test]
+fn pruning_keeps_the_pre_upgrade_backup_it_was_called_for() {
+    let (_dir, path) = profile();
+    let older = path.with_file_name("profile.sqlite.pre-schema-10.bak");
+    std::fs::copy(&path, &older).unwrap();
+    set_version(&older, 10);
+    let mut store = Store::open(&path).unwrap();
+    store.set_backup_retention(dc_store::workbench::BackupRetention::keep(1).unwrap());
+    put_workspace(&store, "kept").unwrap();
+    assert_valid_old_backup(&path);
+    assert!(!older.exists(), "the older copy was not pruned");
+    let mut other = Store::open(&path).unwrap();
+    other.set_backup_retention(dc_store::workbench::BackupRetention::keep(1).unwrap());
+    put_workspace(&other, "later").unwrap();
+    assert_valid_old_backup(&path);
+}
+
+/// Unicode, spaces and a quote in the directory name, and a symlinked profile.
+#[test]
+fn an_awkward_or_symlinked_profile_path_is_backed_up_beside_the_real_file() {
+    let dir = Scratch::new();
+    let real_dir = dir.path().join("r\u{e9}al d\u{f6}r 'q' \u{65e5}\u{672c}");
+    std::fs::create_dir(&real_dir).unwrap();
+    let real = real_dir.join("profile.sqlite");
+    let store = Store::open(&real).unwrap();
+    store.workbench_request("workspaces.list", "{}").unwrap();
+    drop(store);
+    set_version(&real, 11);
+    let link = dir.path().join("link.sqlite");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    for target in [&real, &link] {
+        let store = Store::open(target).unwrap();
+        put_workspace(&store, "awkward").unwrap();
+        // SQLite resolves a symlink to the real file, so the copy sits beside it.
+        let backup = real.with_file_name("profile.sqlite.pre-schema-11.bak");
+        assert_eq!(version(&backup), 11, "{}", backup.display());
+        assert_eq!(workspace_rows(&backup, "awkward"), 0);
+        drop(store);
+        if target == &real {
+            // The second pass starts again from an old profile.
+            std::fs::remove_file(&backup).unwrap();
+            set_version(&real, 11);
+            Connection::open(&real)
+                .unwrap()
+                .execute("DELETE FROM work_workspaces", [])
+                .unwrap();
+        }
+    }
+}
+
+/// A profile directory that cannot be written refuses the upgrade.
+#[test]
+fn an_unwritable_backup_directory_refuses_the_upgrade() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let outcome = put_workspace(&store, "ro");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    if let Err(error) = outcome {
+        assert_eq!(error.code, "backup_failed", "{error}");
+        assert_eq!(version(&path), 11, "the profile moved without a backup");
+    } else {
+        // Running as a user the mode does not bind (root): nothing to assert.
+        assert_valid_old_backup(&path);
+    }
+}
