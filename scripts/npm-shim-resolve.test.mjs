@@ -119,3 +119,92 @@ test("a node-script wrapper is skipped even when extensionless", posixOnly, () =
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+// ---- adversarial cases ----
+function probeAll(opts) {
+  const probed = [];
+  opts.isNative = (c) => { probed.push(c); return false; };
+  return probed;
+}
+
+test("adv: win32 empty PATH entries (;;) are dropped, so cwd is never probed", () => {
+  const opts = win32([], {});
+  opts.env = { PATH: ";;" + GO + ";" };
+  const probed = probeAll(opts);
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts);
+  assert.deepEqual(probed, [GO + "\\devcouncil.exe", GO + "\\devcouncil.com"]);
+});
+
+test("adv: win32 trailing backslash, forward slashes and UNC entries normalise", () => {
+  const opts = win32([], {});
+  opts.env = { PATH: [GO + "\\", "C:/fwd/bin", "\\\\srv\\share\\bin"].join(";") };
+  const probed = probeAll(opts);
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts);
+  assert.deepEqual(probed.filter((p) => p.endsWith(".exe")), [
+    GO + "\\devcouncil.exe",
+    "C:\\fwd\\bin\\devcouncil.exe",
+    "\\\\srv\\share\\bin\\devcouncil.exe",
+  ]);
+});
+
+test("adv: win32 PATH wins over Path when both are present", () => {
+  const opts = win32([GO + "\\devcouncil.exe", "C:\\other\\devcouncil.exe"]);
+  opts.env = { PATH: GO, Path: "C:\\other" };
+  assert.equal(resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts), GO + "\\devcouncil.exe");
+});
+
+test("adv: win32 probes only lowercase .exe/.com names (case-insensitive match is the filesystem's job)", () => {
+  const opts = win32([GO + "\\devcouncil.EXE"]);
+  assert.equal(resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts), null);
+});
+
+test("adv: win32 does not consult PATHEXT (.bat/.cmd/.ps1 never resolve)", () => {
+  const opts = win32([GO + "\\devcouncil.bat", GO + "\\devcouncil.cmd", GO + "\\devcouncil.ps1"], { PATHEXT: ".COM;.EXE;.BAT;.CMD" });
+  assert.equal(resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts), null);
+});
+
+test("adv: win32 ~/.local/bin uses HOME before USERPROFILE and is searched last", () => {
+  const opts = win32([], { USERPROFILE: "C:\\Users\\u" });
+  const probed = probeAll(opts);
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts);
+  assert.equal(probed.at(-2), "C:\\Users\\u\\.local\\bin\\devcouncil.exe");
+  const opts2 = win32([], { HOME: "D:\\h", USERPROFILE: "C:\\Users\\u" });
+  const probed2 = probeAll(opts2);
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts2);
+  assert.equal(probed2.at(-2), "D:\\h\\.local\\bin\\devcouncil.exe");
+});
+
+const posixReal = { skip: process.platform === "win32" && "POSIX fixture" };
+
+test("adv: a directory named devcouncil is not a native binary", posixReal, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "dc-shim-"));
+  try {
+    mkdirSync(path.join(dir, "devcouncil"));
+    assert.equal(resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "linux", env: { PATH: dir } }), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("adv: posix shim first on PATH, real binary later: shim skipped, real returned", posixReal, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "dc-shim-"));
+  try {
+    const a = path.join(dir, "a");
+    const b = path.join(dir, "b");
+    mkdirSync(a);
+    mkdirSync(b);
+    writeFileSync(path.join(a, "devcouncil"), "#!/usr/bin/env node\n" + "x".repeat(5_000_000));
+    writeFileSync(path.join(b, "devcouncil"), "\x7fELF\n");
+    assert.equal(
+      resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "linux", env: { PATH: [a, b].join(":") } }),
+      path.join(b, "devcouncil"),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("adv: requiring the shim does not run main (no exit, no spawn)", () => {
+  assert.equal(typeof require(shimPath).resolveBin, "function");
+});
