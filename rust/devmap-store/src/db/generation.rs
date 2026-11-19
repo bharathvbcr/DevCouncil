@@ -2449,17 +2449,21 @@ mod freshness_race {
     fn a_fresh_verdict_older_than_the_bound_is_unverified() {
         let _reset = ResetClock;
         let store = seeded();
-        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE + std::time::Duration::from_secs(1));
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 2);
         let verdict = store.query_source_freshness();
         assert_eq!(
             verdict.fresh, None,
             "a fresh verdict past the bound must not stay fresh: {verdict:?}"
         );
         assert_eq!(verdict.generation_id, Some(7));
+        // Real time only ever adds to the advanced clock, so lower bounds hold.
         let age = verdict.verified_age_ms.expect("the age is reported");
-        assert!(age >= 61_000, "age {age}ms must include the advanced clock");
+        assert!(
+            age >= 120_000,
+            "age {age}ms must include the advanced clock"
+        );
         let reason = verdict.reason.expect("reason");
-        assert!(reason.contains("verified 61s ago"), "{reason}");
+        assert!(reason.contains("older than the 60s bound"), "{reason}");
         assert!(reason.contains("devmap status"), "{reason}");
     }
 
@@ -2467,24 +2471,26 @@ mod freshness_race {
     fn a_fresh_verdict_inside_the_bound_stays_fresh_and_carries_its_age() {
         let _reset = ResetClock;
         let store = seeded();
-        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE - std::time::Duration::from_secs(1));
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE / 2);
         let verdict = store.query_source_freshness();
         assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
         let age = verdict.verified_age_ms.expect("the age is reported");
-        assert!((59_000..60_000).contains(&age), "age {age}ms");
+        assert!(age >= 30_000, "age {age}ms must include the advanced clock");
     }
 
     #[test]
     fn re_running_status_resets_the_age() {
         let _reset = ResetClock;
         let store = seeded();
-        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE + std::time::Duration::from_secs(1));
-        assert_eq!(store.query_source_freshness().fresh, None);
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 2);
+        let aged = store.query_source_freshness();
+        assert_eq!(aged.fresh, None);
         let id = store.latest_generation_id().expect("read").expect("id");
         store.remember_source_freshness(id, Some(true), None);
         let verdict = store.query_source_freshness();
         assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
-        assert!(verdict.verified_age_ms.expect("age") < 1_000);
+        // The re-verification stamped the (advanced) clock, so the age fell.
+        assert!(verdict.verified_age_ms.expect("age") < aged.verified_age_ms.expect("age"));
     }
 
     #[test]

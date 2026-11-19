@@ -537,6 +537,42 @@ fn p2b_generation_deleted_mid_session_is_never_fresh() {
 
 // Probe 4: both halves of a layered impact carry the same freshness, on every
 // arm, and the same freshness the plain `impact` of the same query carries.
+/// Every store-backed envelope carries the age of the verdict it repeats, and
+/// carries none when no walk backs it (an absent age is "never verified").
+#[test]
+fn p5_a_verified_verdict_carries_its_age_on_the_envelope() {
+    let fx = fixture("p5", None);
+    let engine = StoreQueryEngine::new(&fx.store);
+    let before = engine.impact(req("a", 3)).unwrap().source_freshness;
+    assert_eq!(before.verified_age_ms, None, "{before:?}");
+    assert!(!serde_json::to_string(&before)
+        .unwrap()
+        .contains("verified_age_ms"));
+
+    fx.store.status("t").unwrap();
+    let layered = engine.impact_layered(req("a", 3)).unwrap();
+    for (name, freshness) in [
+        (
+            "impact",
+            engine.impact(req("a", 3)).unwrap().source_freshness,
+        ),
+        ("layered edges", layered.edges.source_freshness),
+        (
+            "search",
+            engine.search(req("a", 3)).unwrap().source_freshness,
+        ),
+    ] {
+        assert_eq!(freshness.fresh, Some(true), "{name}: {freshness:?}");
+        assert!(freshness.verified_age_ms.is_some(), "{name}: {freshness:?}");
+        assert!(
+            serde_json::to_string(&freshness)
+                .unwrap()
+                .contains("verified_age_ms"),
+            "{name} must put the age on the wire"
+        );
+    }
+}
+
 #[test]
 fn p4_layered_halves_agree_with_each_other_and_with_plain_impact() {
     for prime in [false, true] {
