@@ -2670,7 +2670,8 @@ pub(crate) fn shell_quote_hook_executable(text: &str) -> anyhow::Result<String> 
 const INSIDE_REPO_REMEDY: &str = "Remedy: install devmap outside the repository \
      (`bash scripts/install.sh --only=devmap` from a checkout, or `cargo install --git \
      https://github.com/bharathvbcr/DevCouncil.git --tag <release tag> --locked devmap-cli`) \
-     and point the hooks at that binary";
+     (`cargo install --path rust/devmap-cli --locked` from a checkout also installs outside it) \
+     and point the hooks at that binary, or pass `--binary <path outside the repository>`";
 
 /// The agent-visible line for a refused hook executable: the refusal message
 /// (which already names the executable, the repository top and the remedy),

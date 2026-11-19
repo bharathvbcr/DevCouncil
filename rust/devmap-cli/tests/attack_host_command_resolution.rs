@@ -6,118 +6,12 @@
 //! (a copy or hard link in a repository, a symlink) builds that path itself.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use crate::common::host_cmd::*;
 
 use serde_json::Value;
-
-fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_devmap"))
-}
-
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "devmap-attack-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
-}
-
-struct Run {
-    status: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-impl Run {
-    fn text(&self) -> String {
-        format!("{}\n{}", self.stdout, self.stderr)
-    }
-}
-
-fn command_for(exe: &Path, args: &[&str], cwd: &Path, home: &Path, path: Option<&str>) -> Command {
-    let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("CODEX_HOME", home.join(".codex"))
-        .env_remove("CLAUDE_CONFIG_DIR");
-    if let Some(path) = path {
-        cmd.env("PATH", path);
-    }
-    cmd
-}
-
-fn run_exe(exe: &Path, args: &[&str], cwd: &Path, home: &Path, path: Option<&str>) -> Run {
-    let out = command_for(exe, args, cwd, home, path)
-        .stdin(Stdio::null())
-        .output()
-        .expect("devmap runs");
-    Run {
-        status: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    }
-}
-
-fn run(args: &[&str], cwd: &Path, home: &Path, path: Option<&str>) -> Run {
-    run_exe(&bin(), args, cwd, home, path)
-}
-
-/// A hard link of the binary at dest, else a copy: the binary reached through
-/// a different path, so current_exe is that path.
-fn place_binary(dest: &Path) {
-    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-    if std::fs::hard_link(bin().canonicalize().unwrap(), dest).is_err() {
-        std::fs::copy(bin(), dest).unwrap();
-    }
-}
-
-fn hook_commands(stdout: &str) -> Vec<String> {
-    let block: Value = serde_json::from_str(stdout).expect("hooks json");
-    let mut out = Vec::new();
-    for groups in block["hooks"].as_object().expect("hooks object").values() {
-        for group in groups.as_array().unwrap() {
-            for handler in group["hooks"].as_array().unwrap() {
-                out.push(handler["command"].as_str().unwrap().to_string());
-            }
-        }
-    }
-    assert!(!out.is_empty());
-    out
-}
-
-fn finished_within(mut child: Child, limit: Duration) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return Some(status);
-        }
-        if start.elapsed() > limit {
-            child.kill().ok();
-            child.wait().ok();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn put(path: &Path, text: &str) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, text).unwrap();
-}
-
-fn executable(path: &Path, text: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    put(path, text);
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
 
 // (1) current_exe reached through links ---------------------------------------
 
@@ -146,6 +40,7 @@ fn a_symlink_in_the_repository_to_an_outside_binary_is_never_what_gets_registere
 fn an_outside_symlink_to_a_binary_inside_the_repository_is_refused() {
     use std::os::unix::fs::symlink;
     let repo = scratch("link-to-repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
     let home = scratch("link-to-repo-home");
     let outside = scratch("link-to-repo-out");
     let inside = repo.join("bin/devmap");
@@ -215,6 +110,7 @@ fn a_repository_nested_inside_the_binary_directory_is_not_inside_it() {
 #[test]
 fn a_case_variant_spelling_of_the_repository_does_not_open_a_missing_binary_path() {
     let repo = scratch("case");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
     let home = scratch("case-home");
     let upper = PathBuf::from(repo.to_str().unwrap().to_uppercase());
     if !upper.exists() {
@@ -223,7 +119,13 @@ fn a_case_variant_spelling_of_the_repository_does_not_open_a_missing_binary_path
     }
     let variant = upper.join("new/devmap");
     let out = run(
-        &["--json", "claude", "hooks", "--binary", variant.to_str().unwrap()],
+        &[
+            "--json",
+            "claude",
+            "hooks",
+            "--binary",
+            variant.to_str().unwrap(),
+        ],
         &repo,
         &home,
         None,
@@ -244,7 +146,7 @@ fn binary_flag_relative_forms_are_resolved_absolute_or_refused() {
     let home = scratch("binflag-home");
     let repo = base.join("repo");
     let outside = base.join("tools");
-    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
     place_binary(&outside.join("devmap"));
     place_binary(&repo.join("devmap"));
@@ -266,7 +168,12 @@ fn binary_flag_relative_forms_are_resolved_absolute_or_refused() {
     }
 
     // relative, existing, inside (directly and by a .. detour): refused.
-    for rel in ["devmap", "./devmap", "../repo/devmap", "../tools/../repo/devmap"] {
+    for rel in [
+        "devmap",
+        "./devmap",
+        "../repo/devmap",
+        "../tools/../repo/devmap",
+    ] {
         let out = run(
             &["--json", "claude", "hooks", "--binary", rel],
             &repo,
@@ -315,7 +222,13 @@ fn hook_command_runs_the_stub_or_is_refused(dir: &Path, tag: &str) {
     let proof = scratch(&format!("{tag}-proof")).join("ran");
     executable(&stub, "#!/bin/sh\nprintf '%s ' \"$@\" > \"$STUBOUT\"\n");
     let out = run(
-        &["--json", "claude", "hooks", "--binary", stub.to_str().unwrap()],
+        &[
+            "--json",
+            "claude",
+            "hooks",
+            "--binary",
+            stub.to_str().unwrap(),
+        ],
         &repo,
         &home,
         None,
@@ -343,9 +256,18 @@ fn hook_command_runs_the_stub_or_is_refused(dir: &Path, tag: &str) {
         assert!(seen.starts_with("hook "), "stub saw {seen:?}");
     }
     for stray in ["PWNED", "PWNED2"] {
-        assert!(!cwd.join(stray).exists(), "{stray} was created by shell expansion");
-        assert!(!dir.join(stray).exists(), "{stray} was created by shell expansion");
-        assert!(!repo.join(stray).exists(), "{stray} was created by shell expansion");
+        assert!(
+            !cwd.join(stray).exists(),
+            "{stray} was created by shell expansion"
+        );
+        assert!(
+            !dir.join(stray).exists(),
+            "{stray} was created by shell expansion"
+        );
+        assert!(
+            !repo.join(stray).exists(),
+            "{stray} was created by shell expansion"
+        );
     }
 }
 
@@ -433,17 +355,13 @@ fn assert_written_commands_absolute(roots: &[&Path], planted: &Path, ctx: &str) 
                 }
             }
             Some("toml") => {
-                if let Some(command) = text
-                    .parse::<toml::Table>()
-                    .ok()
-                    .and_then(|t| {
-                        t.get("mcp_servers")?
-                            .get("devmap")?
-                            .get("command")?
-                            .as_str()
-                            .map(str::to_string)
-                    })
-                {
+                if let Some(command) = text.parse::<toml::Table>().ok().and_then(|t| {
+                    t.get("mcp_servers")?
+                        .get("devmap")?
+                        .get("command")?
+                        .as_str()
+                        .map(str::to_string)
+                }) {
                     commands.push(command);
                 }
             }
@@ -473,13 +391,26 @@ fn every_writer_registers_the_outside_binary_whatever_leads_path() {
     symlink(bin().canonicalize().unwrap(), bindir.join("devmap")).unwrap();
     for (n, lead) in [".", "", ".:", ":", "./"].iter().enumerate() {
         let path = format!("{lead}:{}:/usr/bin:/bin", bindir.display());
-        for host in ["claude", "cursor", "codex", "opencode", "antigravity", "warp"] {
+        for host in [
+            "claude",
+            "cursor",
+            "codex",
+            "opencode",
+            "antigravity",
+            "warp",
+        ] {
             let repo = scratch(&format!("pathlead-repo-{n}-{host}"));
             let home = scratch(&format!("pathlead-home-{n}-{host}"));
             let planted = repo.join("devmap");
             executable(&planted, "#!/bin/sh\nexit 0\n");
             let out = run(
-                &["--json", "integrate", host, "--project-root", repo.to_str().unwrap()],
+                &[
+                    "--json",
+                    "integrate",
+                    host,
+                    "--project-root",
+                    repo.to_str().unwrap(),
+                ],
                 &repo,
                 &home,
                 Some(&path),
@@ -504,32 +435,22 @@ fn every_writer_registers_the_outside_binary_whatever_leads_path() {
 
 // (5) doctor ------------------------------------------------------------------
 
-fn doctor_warning(place: impl Fn(&Path, &Path)) -> Option<String> {
-    let repo = scratch("doctor-repo");
-    let home = scratch("doctor-home");
-    place(&repo, &home);
-    let out = run(&["--json", "doctor"], &repo, &home, Some("/usr/bin:/bin"));
-    let report: Value = serde_json::from_str(&out.stdout)
-        .unwrap_or_else(|e| panic!("doctor is not JSON ({e}): {}\n{}", out.stdout, out.stderr));
-    report["host_command_defect_warning"]
-        .as_str()
-        .map(str::to_string)
-}
-
-fn mcp_json(command: &str, args: &[&str]) -> String {
-    serde_json::json!({"mcpServers": {"devmap": {"command": command, "args": args}}}).to_string()
-}
-
 type McpForm = (&'static str, Box<dyn Fn(&Path) -> (String, Vec<String>)>);
 
 #[test]
 fn doctor_flags_each_relative_or_in_repository_mcp_command_form() {
-    let fixed = |name: &'static str, command: &'static str, args: &'static [&'static str]| -> McpForm {
-        (
-            name,
-            Box::new(move |_| (command.to_string(), args.iter().map(|a| a.to_string()).collect())),
-        )
-    };
+    let fixed =
+        |name: &'static str, command: &'static str, args: &'static [&'static str]| -> McpForm {
+            (
+                name,
+                Box::new(move |_| {
+                    (
+                        command.to_string(),
+                        args.iter().map(|a| a.to_string()).collect(),
+                    )
+                }),
+            )
+        };
     let cases: Vec<McpForm> = vec![
         fixed("./devmap", "./devmap", &["mcp"]),
         fixed("devmap.exe", "devmap.exe", &["mcp"]),
@@ -537,10 +458,19 @@ fn doctor_flags_each_relative_or_in_repository_mcp_command_form() {
         fixed("../devmap", "../devmap", &["mcp"]),
         fixed("env devmap", "env", &["devmap", "mcp"]),
         fixed("sh -c devmap", "sh", &["-c", "devmap mcp"]),
-        fixed("$CLAUDE_PROJECT_DIR/devmap", "$CLAUDE_PROJECT_DIR/devmap", &["mcp"]),
+        fixed(
+            "$CLAUDE_PROJECT_DIR/devmap",
+            "$CLAUDE_PROJECT_DIR/devmap",
+            &["mcp"],
+        ),
         (
             "absolute in repository",
-            Box::new(|repo| (repo.join("devmap").display().to_string(), vec!["mcp".into()])),
+            Box::new(|repo| {
+                (
+                    repo.join("devmap").display().to_string(),
+                    vec!["mcp".into()],
+                )
+            }),
         ),
         (
             "absolute via ..",
@@ -589,7 +519,10 @@ fn doctor_flags_a_codex_command_in_every_toml_spelling() {
             missed.push(text);
         }
     }
-    assert!(missed.is_empty(), "doctor reported nothing for: {missed:#?}");
+    assert!(
+        missed.is_empty(),
+        "doctor reported nothing for: {missed:#?}"
+    );
 }
 
 #[test]
@@ -613,7 +546,10 @@ fn doctor_flags_a_hook_command_led_by_a_relative_or_expanded_word() {
             missed.push(command);
         }
     }
-    assert!(missed.is_empty(), "doctor reported nothing for: {missed:#?}");
+    assert!(
+        missed.is_empty(),
+        "doctor reported nothing for: {missed:#?}"
+    );
 }
 
 #[test]
@@ -622,22 +558,40 @@ fn doctor_and_paths_survive_a_deeply_nested_or_huge_host_config() {
     let depth = 400_000;
     let json_deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
     let toml_arrays = format!("a = {}{}\n", "[".repeat(depth), "]".repeat(depth));
-    let toml_tables = format!("a = {}1{}\n", "{a=".repeat(depth / 4), "}".repeat(depth / 4));
+    let toml_tables = format!(
+        "a = {}1{}\n",
+        "{a=".repeat(depth / 4),
+        "}".repeat(depth / 4)
+    );
     let wide = format!(
         "{{\"hooks\": {{\"x\": [{}{{}}]}}}}",
         "{\"command\":\"/bin/true\"},".repeat(30_000)
     );
     let cases: Vec<(&str, &str, bool, String)> = vec![
         ("json-deep", ".mcp.json", false, json_deep.clone()),
-        ("json-deep-cursor", ".cursor/mcp.json", false, json_deep.clone()),
-        ("json-deep-claude", ".claude/settings.json", false, json_deep),
+        (
+            "json-deep-cursor",
+            ".cursor/mcp.json",
+            false,
+            json_deep.clone(),
+        ),
+        (
+            "json-deep-claude",
+            ".claude/settings.json",
+            false,
+            json_deep,
+        ),
         ("toml-arrays", ".codex/config.toml", true, toml_arrays),
         ("toml-tables", ".codex/config.toml", true, toml_tables),
         ("json-wide", ".claude/settings.json", false, wide),
     ];
     for (name, rel, in_home, body) in cases {
         let cwd = scratch(&format!("deep-{name}"));
-        let target = if in_home { home.join(rel) } else { cwd.join(rel) };
+        let target = if in_home {
+            home.join(rel)
+        } else {
+            cwd.join(rel)
+        };
         put(&target, &body);
         for args in [["--json", "doctor"], ["--json", "paths"]] {
             let child = command_for(&bin(), &args, &cwd, &home, None)
@@ -667,7 +621,11 @@ fn a_host_document_that_is_a_link_to_a_fifo_or_directory_does_not_block_doctor()
         let cwd = scratch(&format!("fifo-{kind}"));
         let real = cwd.join("real");
         if kind == "fifo" {
-            assert!(Command::new("mkfifo").arg(&real).status().unwrap().success());
+            assert!(Command::new("mkfifo")
+                .arg(&real)
+                .status()
+                .unwrap()
+                .success());
         } else {
             std::fs::create_dir(&real).unwrap();
         }
@@ -693,7 +651,12 @@ fn a_host_document_that_is_a_link_to_a_fifo_or_directory_does_not_block_doctor()
 
 fn opencode(repo: &Path, home: &Path) -> Run {
     run(
-        &["integrate", "opencode", "--project-root", repo.to_str().unwrap()],
+        &[
+            "integrate",
+            "opencode",
+            "--project-root",
+            repo.to_str().unwrap(),
+        ],
         repo,
         home,
         Some("/usr/bin:/bin"),
@@ -719,8 +682,14 @@ fn a_linked_integrations_path_is_refused_and_writes_nothing_beyond_the_link() {
         assert_ne!(out.status, Some(0), "{shape}: {}", out.text());
         let mut written = Vec::new();
         files_under(&outside, &mut written);
-        assert!(written.is_empty(), "{shape}: wrote through the link: {written:?}");
-        assert!(!repo.join("opencode.json").exists(), "{shape}: half-applied");
+        assert!(
+            written.is_empty(),
+            "{shape}: wrote through the link: {written:?}"
+        );
+        assert!(
+            !repo.join("opencode.json").exists(),
+            "{shape}: half-applied"
+        );
     }
 
     // A dangling link at the integrations directory and at the final file.
@@ -746,10 +715,17 @@ fn an_integrations_link_to_a_directory_inside_the_repository_is_also_refused() {
     let repo = scratch("pre-in");
     std::fs::create_dir_all(repo.join(".devcouncil")).unwrap();
     std::fs::create_dir_all(repo.join("elsewhere")).unwrap();
-    symlink(repo.join("elsewhere"), repo.join(".devcouncil/integrations")).unwrap();
+    symlink(
+        repo.join("elsewhere"),
+        repo.join(".devcouncil/integrations"),
+    )
+    .unwrap();
     let out = opencode(&repo, &home);
     assert_ne!(out.status, Some(0), "{}", out.text());
     let mut written = Vec::new();
     files_under(&repo.join("elsewhere"), &mut written);
-    assert!(written.is_empty(), "wrote through an in-repository link: {written:?}");
+    assert!(
+        written.is_empty(),
+        "wrote through an in-repository link: {written:?}"
+    );
 }

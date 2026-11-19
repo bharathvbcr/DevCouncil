@@ -15,61 +15,12 @@
 //! binary to run the same assertions against (to show they fail on an older one).
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use crate::common::host_cmd::*;
 
 use serde_json::Value;
-
-fn bin() -> PathBuf {
-    std::env::var_os("DEVMAP_UNDER_TEST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_devmap")))
-}
-
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "devmap-hostcmd-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    // The canonical spelling: macOS temp dirs sit behind a symlink.
-    dir.canonicalize().unwrap()
-}
-
-struct Run {
-    status: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-fn command(args: &[&str], cwd: &Path, home: &Path, path: Option<&Path>) -> Command {
-    let mut cmd = Command::new(bin());
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("CODEX_HOME", home.join(".codex"))
-        .env_remove("CLAUDE_CONFIG_DIR");
-    if let Some(path) = path {
-        cmd.env("PATH", path);
-    }
-    cmd
-}
-
-fn run(args: &[&str], cwd: &Path, home: &Path, path: Option<&Path>) -> Run {
-    let out = command(args, cwd, home, path)
-        .output()
-        .expect("devmap runs");
-    Run {
-        status: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    }
-}
 
 /// A repository root holding an executable file named `devmap`, and a `PATH`
 /// directory whose first `devmap` is the binary under test.
@@ -85,6 +36,7 @@ fn planted(tag: &str) -> Planted {
     let repo = scratch(&format!("{tag}-repo"));
     let home = scratch(&format!("{tag}-home"));
     let bindir = scratch(&format!("{tag}-bin"));
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
     let fake = repo.join("devmap");
     std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -96,19 +48,6 @@ fn planted(tag: &str) -> Planted {
         bindir,
         canonical,
     }
-}
-
-fn hook_commands(block: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    for groups in block["hooks"].as_object().expect("hooks object").values() {
-        for group in groups.as_array().unwrap() {
-            for handler in group["hooks"].as_array().unwrap() {
-                out.push(handler["command"].as_str().unwrap().to_string());
-            }
-        }
-    }
-    assert!(!out.is_empty(), "no hook commands emitted");
-    out
 }
 
 fn assert_all_name(commands: &[String], canonical: &Path) {
@@ -129,13 +68,10 @@ fn claude_hooks_name_the_binary_under_test_not_a_devmap_in_the_working_directory
         &["--json", "claude", "hooks"],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_eq!(first.status, Some(0), "{}", first.stderr);
-    assert_all_name(
-        &hook_commands(&serde_json::from_str(&first.stdout).unwrap()),
-        &p.canonical,
-    );
+    assert_all_name(&hook_commands(&first.stdout), &p.canonical);
 
     // No `devmap` on PATH at all: absolute too.
     let empty = scratch("hooks-empty-path");
@@ -143,13 +79,10 @@ fn claude_hooks_name_the_binary_under_test_not_a_devmap_in_the_working_directory
         &["--json", "claude", "hooks"],
         &p.repo,
         &p.home,
-        Some(&empty),
+        Some(empty.to_str().unwrap()),
     );
     assert_eq!(none.status, Some(0), "{}", none.stderr);
-    assert_all_name(
-        &hook_commands(&serde_json::from_str(&none.stdout).unwrap()),
-        &p.canonical,
-    );
+    assert_all_name(&hook_commands(&none.stdout), &p.canonical);
 }
 
 #[test]
@@ -160,7 +93,7 @@ fn integrate_registers_the_outside_binary_in_every_host_document() {
         &["--json", "integrate", "codex", "--project-root", root],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_eq!(codex.status, Some(0), "{}\n{}", codex.stdout, codex.stderr);
     let toml: toml::Table = std::fs::read_to_string(p.home.join(".codex/config.toml"))
@@ -175,14 +108,14 @@ fn integrate_registers_the_outside_binary_in_every_host_document() {
     let plugin_hooks = p.repo.join(".codex-plugin/hooks/hooks.json");
     if plugin_hooks.is_file() {
         let block: Value = serde_json::from_slice(&std::fs::read(&plugin_hooks).unwrap()).unwrap();
-        assert_all_name(&hook_commands(&block), &p.canonical);
+        assert_all_name(&hook_commands_of(&block), &p.canonical);
     }
 
     let cursor = run(
         &["--json", "integrate", "cursor", "--project-root", root],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_eq!(
         cursor.status,
@@ -226,7 +159,7 @@ fn an_explicit_binary_inside_the_repository_is_refused_before_anything_is_writte
         ],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_ne!(refused.status, Some(0), "{}", refused.stdout);
     assert!(
@@ -266,7 +199,12 @@ fn doctor_reports_a_relative_or_in_repository_host_command_with_the_rewrite() {
         ),
     )
     .unwrap();
-    let out = run(&["--json", "doctor"], &p.repo, &p.home, Some(&p.bindir));
+    let out = run(
+        &["--json", "doctor"],
+        &p.repo,
+        &p.home,
+        Some(p.bindir.to_str().unwrap()),
+    );
     let report: Value = serde_json::from_str(&out.stdout)
         .unwrap_or_else(|e| panic!("doctor is not JSON ({e}): {}\n{}", out.stdout, out.stderr));
     let warning = report["host_command_defect_warning"]
@@ -297,7 +235,12 @@ fn doctor_is_quiet_about_an_absolute_outside_command() {
         ),
     )
     .unwrap();
-    let out = run(&["--json", "doctor"], &p.repo, &p.home, Some(&p.bindir));
+    let out = run(
+        &["--json", "doctor"],
+        &p.repo,
+        &p.home,
+        Some(p.bindir.to_str().unwrap()),
+    );
     let report: Value = serde_json::from_str(&out.stdout).unwrap();
     assert!(report["host_command_defect_warning"].is_null(), "{report}");
 }
@@ -321,7 +264,7 @@ fn integrate_opencode_refuses_a_linked_integrations_directory_in_the_plan_pass()
         ],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_ne!(
         refused.status,
@@ -335,31 +278,16 @@ fn integrate_opencode_refuses_a_linked_integrations_directory_in_the_plan_pass()
         0,
         "the plugin was written through the link"
     );
-    let names: Vec<_> = std::fs::read_dir(&p.repo)
+    let mut names: Vec<_> = std::fs::read_dir(&p.repo)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
+    names.sort();
     assert_eq!(
         names,
-        [".devcouncil"],
+        [".devcouncil", ".git"],
         "a refused plan left files behind: {names:?}"
     );
-}
-
-/// Waits for `child` for at most `limit`; a hang is a failure, not a stuck suite.
-fn finished_within(mut child: Child, limit: Duration) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return Some(status);
-        }
-        if start.elapsed() > limit {
-            child.kill().ok();
-            child.wait().ok();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[test]
@@ -380,7 +308,7 @@ fn paths_and_doctor_return_promptly_on_a_fifo_or_oversized_mcp_json() {
             let file = std::fs::File::create(&target).unwrap();
             file.set_len(1 << 30).unwrap();
         }
-        let child = command(&args, &cwd, &home, None)
+        let child = command_for(&bin(), &args, &cwd, &home, None)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
@@ -409,7 +337,7 @@ fn a_binary_flag_naming_a_path_not_installed_yet_is_still_written_when_outside()
         ],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_eq!(ok.status, Some(0), "{}", ok.stderr);
     assert!(
@@ -429,7 +357,7 @@ fn a_binary_flag_naming_a_path_not_installed_yet_is_still_written_when_outside()
         ],
         &p.repo,
         &p.home,
-        Some(&p.bindir),
+        Some(p.bindir.to_str().unwrap()),
     );
     assert_ne!(refused.status, Some(0), "{}", refused.stdout);
 }

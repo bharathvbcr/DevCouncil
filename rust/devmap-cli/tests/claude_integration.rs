@@ -573,6 +573,8 @@ fn a_non_utf8_store_path_is_refused_rather_than_silently_mangled() {
         .arg("--db")
         .arg(raw)
         .args(["mcp", "--print-config"])
+        // Outside the repository: the printed command is checked against it.
+        .current_dir(std::env::temp_dir())
         .output()
         .expect("devmap runs");
     let stdout = String::from_utf8_lossy(&out.stdout);

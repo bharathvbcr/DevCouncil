@@ -561,12 +561,12 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                 if let Some(command) = handler.get("command").and_then(Value::as_str) {
                     // A bare or relative executable is the Cursor failure mode, and
                     // a repository file named `devmap` the worse one.
-                    if is_relative_command(command) {
+                    if let Some(why) = command_word_defect(command) {
                         let trimmed = command.trim();
                         out.push(Diagnostic::error(
                             at,
                             format!(
-                                "hook `command` {trimmed:?} starts with a bare or relative executable; \
+                                "hook `command` {trimmed:?} starts with an executable that {why}; \
                                  Cursor/Codex need an absolute-path shell-form command \
                                  ('/path/to/devmap' hook <event>)"
                             ),
@@ -1355,15 +1355,96 @@ pub(crate) fn command_executable_word(command: &str) -> &str {
     trimmed.split_whitespace().next().unwrap_or("")
 }
 
-/// True when a host entry's executable would be resolved against the working
-/// directory or `PATH` at run time: neither an absolute path nor a
-/// `$VAR`/`~` expansion.
-pub(crate) fn is_relative_command(command: &str) -> bool {
+/// How one command word fares as an executable a host will run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordVerdict {
+    /// Absolute (or expanding to the user's home) and outside the repository.
+    Fine,
+    /// Neither absolute nor an expansion: resolved against the host's cwd or PATH.
+    Relative,
+    /// Led by a `$VAR` other than `$HOME`, or `~user`: the environment decides.
+    Expanded,
+    /// Resolves inside the repository, which can replace it.
+    Inside,
+}
+
+impl WordVerdict {
+    pub(crate) fn defect(self) -> Option<&'static str> {
+        match self {
+            Self::Fine => None,
+            Self::Relative => {
+                Some("is relative, so the host resolves it against whatever directory it runs in")
+            }
+            Self::Expanded => Some(
+                "is expanded by the host from its environment, which a repository can influence",
+            ),
+            Self::Inside => Some("is inside the repository, which can replace it"),
+        }
+    }
+}
+
+/// `~`, `$HOME` or `${HOME}` alone or followed by `/…`: the rest of the word.
+fn home_relative(word: &str) -> Option<&str> {
+    for prefix in ["~", "${HOME}", "$HOME"] {
+        if let Some(rest) = word.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return Some(rest);
+            }
+        }
+    }
+    None
+}
+
+/// The one predicate for "is this command word acceptable", shared by the hook
+/// validators and `doctor`: absolute and outside `repo` is fine; a leading `~`
+/// or `$HOME` expanding to `home` is judged as that path; any other `$VAR`-led
+/// or `~user` word, and any relative word, is a defect. An error means the word
+/// could not be judged, which a caller must never read as fine.
+pub(crate) fn judge_command_word(
+    word: &str,
+    home: Option<&Path>,
+    repo: Option<&Path>,
+) -> anyhow::Result<WordVerdict> {
+    let resolved = if let Some(rest) = home_relative(word) {
+        let home =
+            home.ok_or_else(|| anyhow::anyhow!("HOME is unset, so {word:?} cannot be expanded"))?;
+        home.join(rest.trim_start_matches('/'))
+    } else if word.starts_with('$') || word.starts_with('~') {
+        return Ok(WordVerdict::Expanded);
+    } else if !Path::new(word).is_absolute() {
+        return Ok(WordVerdict::Relative);
+    } else {
+        PathBuf::from(word)
+    };
+    if let Some(repo) = repo {
+        if !resolved.is_dir() && crate::hook::executable_is_inside_repository(&resolved, repo)? {
+            return Ok(WordVerdict::Inside);
+        }
+    }
+    Ok(WordVerdict::Fine)
+}
+
+/// Why the leading executable word of a hook command string is not acceptable,
+/// judged with `$HOME` from the environment and no repository. `None` when it is.
+pub(crate) fn command_word_defect(command: &str) -> Option<String> {
     let word = command_executable_word(command);
-    !word.is_empty()
-        && !Path::new(word).is_absolute()
-        && !word.starts_with('$')
-        && !word.starts_with('~')
+    if word.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match judge_command_word(word, home.as_deref(), None) {
+        Ok(verdict) => verdict.defect().map(str::to_string),
+        Err(error) => Some(format!("could not be judged: {error}")),
+    }
+}
+
+/// The repository the working directory is in: its git worktree top, unless
+/// that is `$HOME` itself (a home directory is not the repository a hook
+/// command could be planted in). `None` outside any repository.
+pub fn cwd_repository() -> anyhow::Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let home = std::env::var_os("HOME").and_then(|home| PathBuf::from(home).canonicalize().ok());
+    Ok(devmap_extract::git_worktree_root(&cwd).filter(|top| Some(top) != home.as_ref()))
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -1418,7 +1499,7 @@ fn canonical_with_missing_tail(path: &Path) -> anyhow::Result<PathBuf> {
 pub fn reachable_command(
     executable: &Path,
     explicit: Option<&Path>,
-    root: &Path,
+    root: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     // A packager names the install location before anything is installed there
     // (`--binary /usr/local/bin/devmap`). Such a path cannot be canonicalized,
@@ -1431,7 +1512,9 @@ pub fn reachable_command(
             // resolved through its links and the missing tail re-appended, so
             // `out/link/devmap` with `out/link -> repo/bin` is the repository's.
             let landing = canonical_with_missing_tail(path)?;
-            if crate::hook::executable_is_inside_repository(&landing, root)? {
+            if let Some(root) = root.filter(|root| {
+                crate::hook::executable_is_inside_repository(&landing, root).unwrap_or(true)
+            }) {
                 anyhow::bail!(
                     "refusing to register the devmap command: {} lands inside the repository at {} ({})",
                     path.display(),
@@ -1442,11 +1525,20 @@ pub fn reachable_command(
             return Ok(landing);
         }
     }
-    crate::hook::canonical_hook_executable(
-        explicit.unwrap_or(executable),
-        root,
-        "register the devmap command",
-    )
+    let chosen = explicit.unwrap_or(executable);
+    match root {
+        Some(root) => {
+            crate::hook::canonical_hook_executable(chosen, root, "register the devmap command")
+        }
+        // Not in any repository: nothing can supply a file by that name, so
+        // only the absolute, canonical form is required.
+        None => chosen.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "cannot resolve the devmap executable {}: {error}",
+                chosen.display()
+            )
+        }),
+    }
 }
 
 /// One shell-form hook command: `'<abs>' hook <event>`.
@@ -3259,24 +3351,31 @@ mod tests {
     }
 
     #[test]
-    fn relative_commands_are_told_from_absolute_ones() {
-        for relative in [
-            "devmap hook x",
-            "./devmap hook x",
-            "'devmap' hook x",
-            "bin/devmap",
+    fn one_predicate_judges_command_words() {
+        let home = Path::new("/home/u");
+        let verdict = |word: &str| judge_command_word(word, Some(home), None).unwrap();
+        for relative in ["devmap", "./devmap", "bin/devmap", "../x/devmap"] {
+            assert_eq!(verdict(relative), WordVerdict::Relative, "{relative}");
+        }
+        for expanded in [
+            "$CLAUDE_PROJECT_DIR/bin/devmap",
+            "${CLAUDE_PROJECT_DIR}/devmap",
+            "$HOMEX/devmap",
+            "~other/bin/devmap",
         ] {
-            assert!(is_relative_command(relative), "{relative}");
+            assert_eq!(verdict(expanded), WordVerdict::Expanded, "{expanded}");
         }
         for fine in [
-            "'/usr/bin/devmap' hook x",
-            "\"/usr/bin/devmap\" hook x",
-            "/usr/bin/devmap hook x",
-            "$HOME/.local/bin/devmap hook x",
-            "~/bin/devmap hook x",
-            "",
+            "/usr/bin/devmap",
+            "~/.local/bin/devmap",
+            "$HOME/.local/bin/devmap",
+            "${HOME}/.local/bin/devmap",
         ] {
-            assert!(!is_relative_command(fine), "{fine}");
+            assert_eq!(verdict(fine), WordVerdict::Fine, "{fine}");
         }
+        assert!(judge_command_word("~/devmap", None, None).is_err());
+        assert!(command_word_defect("'$CLAUDE_PROJECT_DIR'/devmap hook x").is_some());
+        assert!(command_word_defect("'/usr/bin/devmap' hook x").is_none());
+        assert!(command_word_defect("devmap hook x").is_some());
     }
 }

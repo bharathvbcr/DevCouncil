@@ -1600,10 +1600,10 @@ const OPENCODE_AFTER_TOOL: &str = "tool.execute.after";
 /// and detaches the rebuild itself, so a synchronous spawn here does not hold
 /// the agent's tool loop open — that bound is the reason the native dispatch
 /// exists.
-fn opencode_plugin_source(executable: &Path) -> anyhow::Result<String> {
+pub(crate) fn opencode_plugin_source(executable: &Path) -> anyhow::Result<String> {
     let exe = serde_json::to_string(&claude::utf8_path(
         "the devmap executable path",
-        executable,
+        &claude::absolute_executable(executable)?,
     )?)?;
     Ok(format!(
         r#"// Written by `devmap integrate opencode`. Edits here are overwritten.

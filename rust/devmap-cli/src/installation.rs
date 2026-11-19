@@ -311,6 +311,9 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
 struct HostEntry {
     at: String,
     rewrite: &'static str,
+    /// A hook handler in a file `devmap integrate` does not own the commands
+    /// of, as opposed to a server registration it rewrites.
+    hook: bool,
     words: Vec<String>,
 }
 
@@ -387,6 +390,7 @@ fn host_devmap_entries(home: Option<&Path>, cwd: &Path) -> HostEntries {
         found.entries.push(HostEntry {
             at: site.path.display().to_string(),
             rewrite,
+            hook: false,
             words,
         });
     }
@@ -417,6 +421,7 @@ fn host_devmap_entries(home: Option<&Path>, cwd: &Path) -> HostEntries {
                         found.entries.push(HostEntry {
                             at: codex.display().to_string(),
                             rewrite: "codex",
+                            hook: false,
                             words,
                         });
                     }
@@ -453,6 +458,7 @@ fn host_devmap_entries(home: Option<&Path>, cwd: &Path) -> HostEntries {
             found.entries.push(HostEntry {
                 at: path.display().to_string(),
                 rewrite,
+                hook: true,
                 words: shell_words(&command),
             });
         }
@@ -523,7 +529,7 @@ fn shell_words(command: &str) -> Vec<String> {
                     current.push(next);
                 }
             }
-            c if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')') => {
+            c if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`') => {
                 if in_word {
                     words.push(std::mem::take(&mut current));
                     in_word = false;
@@ -541,69 +547,131 @@ fn shell_words(command: &str) -> Vec<String> {
     words
 }
 
-/// A word whose file name is `devmap` (or `devmap.exe`, any case).
+/// The file name of `word` names devmap: `devmap`, or `devmap` with an
+/// executable extension (`.exe`, `.cmd`, `.bat`, `.ps1`, any case).
 fn word_references_devmap(word: &str) -> bool {
     Path::new(word).file_name().is_some_and(|name| {
         let name = name.to_string_lossy().to_ascii_lowercase();
-        name == claude::PLUGIN_NAME || name == "devmap.exe"
+        name == claude::PLUGIN_NAME
+            || ["exe", "cmd", "bat", "ps1"]
+                .iter()
+                .any(|ext| name.strip_prefix("devmap.") == Some(ext))
     })
 }
 
-/// Every word of an entry, plus the words of any `sh -c` payload (one level).
-fn expand_launch_words(words: &[String]) -> Vec<String> {
+/// A `-c`-family flag cluster: `-c`, `-lc`, `-ic`, `-ec`, …
+fn is_command_flag(word: &str) -> bool {
+    word.strip_prefix('-').is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('c')
+    })
+}
+
+/// The pieces of a word a shell would run separately: split at command
+/// substitution and grouping characters, so `\`./devmap\`` and `$(./devmap` show
+/// the path they run.
+fn word_pieces(word: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(word).chain(
+        word.split(|c: char| matches!(c, '`' | '(' | ')' | ';' | '|' | '&') || c.is_whitespace())
+            .filter(move |piece| !piece.is_empty() && *piece != word),
+    )
+}
+
+/// Every word an entry can run, with the words of any `sh -c`-family payload
+/// expanded recursively (bounded).
+fn expand_launch_words(words: &[String], depth: u8) -> Vec<String> {
     let mut out = words.to_vec();
+    if depth >= 4 {
+        return out;
+    }
     for (i, word) in words.iter().enumerate() {
         let shell = Path::new(word).file_name().is_some_and(|name| {
             matches!(name.to_str(), Some("sh" | "bash" | "zsh" | "dash" | "ksh"))
         });
-        if shell {
-            if let Some(at) = words[i + 1..].iter().position(|w| w == "-c") {
-                if let Some(payload) = words.get(i + 1 + at + 1) {
-                    out.extend(shell_words(payload));
-                }
+        if !shell {
+            continue;
+        }
+        if let Some(flag) = words[i + 1..].iter().position(|w| is_command_flag(w)) {
+            if let Some(payload) = words.get(i + 1 + flag + 1) {
+                out.extend(expand_launch_words(&shell_words(payload), depth + 1));
             }
         }
     }
     out
 }
 
-/// Existing host entries that run a relative, `$VAR`-based or in-repository
-/// `devmap`, and the documents this check could not read.
+/// The exact edit that fixes a flagged entry. A server registration is
+/// rewritten by `devmap integrate`; a hook handler is not, so it is named.
+fn remedy(entry: &HostEntry, word: &str) -> String {
+    if !entry.hook {
+        return format!(
+            "rewrite it with `devmap integrate {}` from an installed devmap",
+            entry.rewrite
+        );
+    }
+    let canonical = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .map(|exe| exe.display().to_string())
+        .unwrap_or_else(|_| "the absolute path of an installed devmap".to_string());
+    format!(
+        "edit {} and replace {word:?} with \"{canonical}\"",
+        entry.at
+    )
+}
+
+/// Existing host entries that run a relative, environment-expanded or
+/// in-repository `devmap`, and the documents this check could not read.
 ///
 /// Configs written by earlier binaries resolved `devmap` against the working
 /// directory, so a repository file named `devmap` could be the command a host
-/// ran in every session. Every word of every entry is judged, so a launcher
-/// (`env`, `sh -c`, a `cd … &&` prefix) does not hide it. A document that
-/// exists but cannot be parsed is reported as unchecked, never as clean.
+/// ran in every session. Every word of every entry is judged by
+/// [`claude::judge_command_word`], so a launcher (`env`, `sh -c`, `bash -lc`,
+/// a command substitution, a `cd … &&` prefix) does not hide it. A document
+/// that cannot be parsed, or a word that cannot be judged, is reported as
+/// "could not check", never as clean.
 pub(crate) fn host_command_defect_warning(cwd: &Path) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    command_defects(&host_devmap_entries(home.as_deref(), cwd), cwd)
+    // The tree doctor was asked about is the repository: its git top, or itself
+    // when it has none; never the home directory.
+    let home_canonical = home.as_deref().and_then(|home| home.canonicalize().ok());
+    let repo = cwd
+        .canonicalize()
+        .ok()
+        .map(|root| devmap_extract::git_worktree_root(&root).unwrap_or(root))
+        .filter(|top| Some(top) != home_canonical.as_ref());
+    command_defects(
+        &host_devmap_entries(home.as_deref(), cwd),
+        home.as_deref(),
+        repo.as_deref(),
+    )
 }
 
-fn command_defects(found: &HostEntries, cwd: &Path) -> Option<String> {
+fn command_defects(
+    found: &HostEntries,
+    home: Option<&Path>,
+    repo: Option<&Path>,
+) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for entry in &found.entries {
-        for word in expand_launch_words(&entry.words) {
-            if !word_references_devmap(&word) {
-                continue;
+        for word in expand_launch_words(&entry.words, 0) {
+            for piece in word_pieces(&word) {
+                if !word_references_devmap(piece) {
+                    continue;
+                }
+                match claude::judge_command_word(piece, home, repo) {
+                    Ok(verdict) => {
+                        if let Some(why) = verdict.defect() {
+                            parts.push(format!(
+                                "{}: {piece:?} {why}; {}",
+                                entry.at,
+                                remedy(entry, piece)
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        parts.push(format!("could not check {}: {piece:?}: {error}", entry.at))
+                    }
+                }
             }
-            let path = Path::new(&word);
-            let why = if word.starts_with('$') {
-                "is expanded by the host from its environment, which a repository can influence"
-            } else if !path.is_absolute() && !word.starts_with('~') {
-                "is relative, so the host resolves it against whatever directory it runs in"
-            } else if path.is_absolute()
-                && !path.is_dir()
-                && crate::hook::executable_is_inside_repository(path, cwd).unwrap_or(false)
-            {
-                "is inside the repository, which can replace it"
-            } else {
-                continue;
-            };
-            parts.push(format!(
-                "{}: {word:?} {why}; rewrite it with `devmap integrate {}` from an installed devmap",
-                entry.at, entry.rewrite
-            ));
         }
     }
     parts.extend(found.unchecked.iter().cloned());
@@ -1252,15 +1320,12 @@ fn plugin_health(home: &Path) -> PluginHealth {
                                 if let Some(command) =
                                     handler.get("command").and_then(serde_json::Value::as_str)
                                 {
-                                    let trimmed = command.trim();
-                                    if !trimmed.contains('/')
-                                        && !trimmed.contains('\\')
-                                        && !trimmed.contains(' ')
-                                    {
+                                    if let Some(why) = claude::command_word_defect(command) {
                                         issues.push(format!(
-                                            "{}: bare-name hook command {trimmed:?}; use an \
-                                             absolute shell-form path",
-                                            hooks.display()
+                                            "{}: hook command {:?} starts with an executable that \
+                                             {why}; use an absolute shell-form path",
+                                            hooks.display(),
+                                            command.trim()
                                         ));
                                     }
                                 }
@@ -1830,5 +1895,42 @@ mod tests {
         let found =
             found.unwrap_or_else(|failure| panic!("no ps in {PROCESS_INVENTORY_PATH}: {failure}"));
         assert!(found.path().is_absolute(), "{}", found.path().display());
+    }
+
+    #[test]
+    fn an_unjudgeable_word_is_could_not_check_never_clean() {
+        let found = HostEntries {
+            entries: vec![HostEntry {
+                at: "cfg".to_string(),
+                rewrite: "cursor",
+                hook: false,
+                words: vec!["/usr/bin/devmap".to_string(), "mcp".to_string()],
+            }],
+            unchecked: Vec::new(),
+        };
+        // The repository cannot be resolved, so the word cannot be judged.
+        let warning = command_defects(
+            &found,
+            None,
+            Some(Path::new("/nonexistent/repo/for/doctor")),
+        )
+        .expect("an evaluation error must be reported");
+        assert!(warning.contains("could not check cfg"), "{warning}");
+        // Judged against no repository, the same entry is fine.
+        assert_eq!(command_defects(&found, None, None), None);
+    }
+
+    #[test]
+    fn shell_words_and_pieces_show_substitution_and_cluster_payloads() {
+        assert_eq!(
+            shell_words("\"$P\"/devmap hook x"),
+            ["$P/devmap", "hook", "x"]
+        );
+        let words = expand_launch_words(&shell_words("bash -lc './devmap hook x'"), 0);
+        assert!(words.iter().any(|w| w == "./devmap"), "{words:?}");
+        let pieces: Vec<&str> = word_pieces("$(./devmap").collect();
+        assert!(pieces.contains(&"./devmap"), "{pieces:?}");
+        assert!(word_references_devmap("DEVMAP.PS1") && word_references_devmap("./devmap.cmd"));
+        assert!(!word_references_devmap("devmapper") && !word_references_devmap("devmap.txt"));
     }
 }

@@ -7,6 +7,8 @@
 //! the same entry point, to every ambiguous ledger row.
 #![allow(dead_code)]
 
+pub mod host_cmd;
+
 use devmap_resolve::lsp::apply_language_server_resolutions;
 use devmap_resolve::model::{Resolution, ResolutionResult};
 

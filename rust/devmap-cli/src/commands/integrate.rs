@@ -168,7 +168,8 @@ fn run_integrate(
     // Absolute, canonical and outside the repository being configured: a
     // `devmap` file in that repository must never become the command a host
     // runs in every session.
-    let executable = claude::reachable_command(&std::env::current_exe()?, binary, project_root)?;
+    let executable =
+        claude::reachable_command(&std::env::current_exe()?, binary, Some(project_root))?;
     let db = cli.db();
     let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
     let report = integrate::integrate(
