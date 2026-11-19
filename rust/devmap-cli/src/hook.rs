@@ -5992,6 +5992,7 @@ mod tests {
             vec![dc_regress::Unavailable::ChangeUnattributed {
                 ranges: 1,
                 lines: 1,
+                lines_unknown_ranges: 0,
             }],
         );
         let text = format_blast_for_hook(&report);
