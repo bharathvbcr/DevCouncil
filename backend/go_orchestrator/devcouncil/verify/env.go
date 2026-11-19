@@ -22,8 +22,23 @@ const envAllowKey = "verify.env_allow"
 var (
 	envNameRE    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	secretNameRE = regexp.MustCompile(`(?i)(KEY|SECRET|TOKEN|PASSW|CREDENTIAL|AUTH|PRIVATE|COOKIE)`)
-	blockListRE  = regexp.MustCompile(`(?m)^\s*env_allow:\s*(#.*)?$`)
+	// credentialNameRE names variables that carry a credential without saying
+	// so in the secretNameRE vocabulary: a DSN or PAT token, a webhook (the URL
+	// is the secret), a connection string, or a datastore/broker URL or URI
+	// whose conventional value embeds user:password@. Tokens are matched
+	// between underscores so PATCH_LEVEL, PATTERN and DB_HOST stay admitted,
+	// and a plain CI_URL or API_URL (no credential by convention) stays too.
+	credentialNameRE = regexp.MustCompile(`(?i)((^|_)(DSN|PAT|WEBHOOKS?)($|_)|CONNECTION_?STRING|CONNSTR|(^|_)(DATABASE|DB|REDIS|AMQP|MONGO|MONGODB|POSTGRES|POSTGRESQL|MYSQL|BROKER|CACHE)(_[A-Z0-9]+)*_(URL|URI)$)`)
+	blockListRE      = regexp.MustCompile(`(?m)^\s*env_allow:\s*(#.*)?$`)
 )
+
+// isCredentialName is the one name rule for what a repository's own config may
+// not hand to a verification command. It binds LoadEnvPolicy only: a caller
+// that passes extras straight to proc.ScrubEnv (the user-level path) is not
+// subject to it.
+func isCredentialName(name string) bool {
+	return secretNameRE.MatchString(name) || credentialNameRE.MatchString(name)
+}
 
 // EnvPolicy is the environment a verification command runs with: the base
 // allowlist plus the repository's `verify.env_allow` additions that were
@@ -79,7 +94,7 @@ func LoadEnvPolicy(root string) EnvPolicy {
 			continue
 		}
 		seen[name] = struct{}{}
-		if !envNameRE.MatchString(name) || secretNameRE.MatchString(name) {
+		if !envNameRE.MatchString(name) || isCredentialName(name) {
 			p.Refused = append(p.Refused, name)
 			continue
 		}

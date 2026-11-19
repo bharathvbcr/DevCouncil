@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // envOf runs `env` through the runner and returns the child's environment as a
@@ -80,6 +82,55 @@ func TestEnvAllowFromConfigIsHonouredAndRecorded(t *testing.T) {
 	}
 	if len(policy.Refused) != 1 || policy.Refused[0] != "DEPLOY_PASSWORD" {
 		t.Errorf("Refused = %v, want [DEPLOY_PASSWORD]", policy.Refused)
+	}
+}
+
+// TestRepoEnvAllowRefusesCredentialBearingNames: names whose conventional
+// value is a credential (a DSN, a PAT, a URL with embedded userinfo, a webhook
+// URL) are refused from the repository's own config even though the name rule
+// has no KEY/TOKEN/SECRET in it. Ordinary names still pass.
+func TestRepoEnvAllowRefusesCredentialBearingNames(t *testing.T) {
+	refused := []string{
+		"DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN", "DSN", "PAT", "REDIS_URL", "AMQP_URL",
+		"MONGODB_URI", "POSTGRES_URL", "DB_URL", "BROKER_URL", "CACHE_URI", "DB_CONNECTION_STRING",
+		"CONNECTION_STRING", "SLACK_WEBHOOK", "SLACK_WEBHOOK_URL", "WEBHOOK_URL", "database_url",
+	}
+	allowed := []string{
+		"TEAM_BUILD_FLAVOUR", "NODE_ENV", "RUST_LOG", "GOFLAGS", "CI_URL", "API_URL", "PATH_EXTRA",
+		"PATCH_LEVEL", "DB_HOST", "DB_PORT", "DATABASE_NAME", "COMPASS", "REDIS_PORT", "PATTERN",
+	}
+	for _, name := range refused {
+		root := t.TempDir()
+		writeConfig(t, root, "verify:\n  env_allow: ["+name+"]\n")
+		p := LoadEnvPolicy(root)
+		if len(p.Extra) != 0 || len(p.Refused) != 1 || p.Refused[0] != name {
+			t.Errorf("%s: Extra=%v Refused=%v, want refused", name, p.Extra, p.Refused)
+		}
+	}
+	for _, name := range allowed {
+		root := t.TempDir()
+		writeConfig(t, root, "verify:\n  env_allow: ["+name+"]\n")
+		p := LoadEnvPolicy(root)
+		if len(p.Refused) != 0 || len(p.Extra) != 1 || p.Extra[0] != name {
+			t.Errorf("%s: Extra=%v Refused=%v, want admitted", name, p.Extra, p.Refused)
+		}
+	}
+}
+
+// TestUserLevelEnvAllowStillPassesCredentialNames: the name rule binds only the
+// repository's config; a caller-supplied extra (proc.ScrubEnv's variadic, the
+// user-level path) still passes these names.
+func TestUserLevelEnvAllowStillPassesCredentialNames(t *testing.T) {
+	environ := []string{"DATABASE_URL=postgres://u:p@h/db", "GITHUB_PAT=x", "SENTRY_DSN=https://k@s/1", "OTHER=1"}
+	got := proc.ScrubEnv(environ, "DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN")
+	joined := strings.Join(got, "\n")
+	for _, name := range []string{"DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN"} {
+		if !strings.Contains(joined, name+"=") {
+			t.Errorf("user-level allow of %s did not reach the child: %v", name, got)
+		}
+	}
+	if strings.Contains(joined, "OTHER=") {
+		t.Error("a name outside the allowlist reached the child")
 	}
 }
 
