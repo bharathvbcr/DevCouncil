@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_json, open_for_read};
+use crate::output::{emit_json, open_for_read, scrub_line_sentinels};
 
 #[derive(clap::Args)]
 #[group(id = "Suspects")]
@@ -45,7 +45,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     })?;
     let report = dc_regress::suspects(&root, &graph, symptom, since, &until, *depth);
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        let mut payload = serde_json::to_value(&report)?;
+        scrub_line_sentinels(&mut payload);
+        emit_json(cli, &payload)?;
     } else {
         emit_suspects(&report);
     }

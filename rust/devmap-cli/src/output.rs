@@ -108,6 +108,38 @@ pub(crate) fn emit_json(cli: &Cli, payload: &serde_json::Value) -> anyhow::Resul
     Ok(())
 }
 
+/// The line number `dc_regress` uses internally for "to the end of the file"
+/// (a bare `--at <path>` is `1..=u32::MAX`).
+const WHOLE_FILE_END_LINE: u64 = u32::MAX as u64;
+
+/// Replace the whole-file sentinel in a report with an honest shape before it
+/// is printed.
+///
+/// An object whose `end_line` is the sentinel keeps its field with a `null`
+/// value and gains `"whole_file": true`; any other field carrying the sentinel
+/// becomes `null`. A sentinel is an in-memory convention, and printed as a
+/// number it reads as a file with 4294967295 lines.
+pub(crate) fn scrub_line_sentinels(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let whole_file = map
+                .get("end_line")
+                .is_some_and(|end| end.as_u64() == Some(WHOLE_FILE_END_LINE));
+            if whole_file {
+                map.insert("whole_file".to_string(), serde_json::Value::Bool(true));
+            }
+            for child in map.values_mut() {
+                scrub_line_sentinels(child);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_line_sentinels),
+        serde_json::Value::Number(n) if n.as_u64() == Some(WHOLE_FILE_END_LINE) => {
+            *value = serde_json::Value::Null;
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn emit_unavailable(reason: &str) {
     outln!("unavailable: {reason}");
 }
