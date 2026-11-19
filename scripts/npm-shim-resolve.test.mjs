@@ -208,3 +208,109 @@ test("adv: posix shim first on PATH, real binary later: shim skipped, real retur
 test("adv: requiring the shim does not run main (no exit, no spawn)", () => {
   assert.equal(typeof require(shimPath).resolveBin, "function");
 });
+
+// --- fix round 1: override validation, recursion guard, win32 PATH/HOME ---
+const { shimRecursionProblem, SHIM_ACTIVE_ENV } = require(shimPath);
+
+test("override naming the shim itself is refused with an error naming the variable", posixOnly, () => {
+  assert.throws(
+    () => resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "linux", env: { DEVCOUNCIL_BIN: shimPath } }),
+    /DEVCOUNCIL_BIN.*shim/,
+  );
+});
+
+test("override naming a symlink to the shim is refused", posixOnly, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "dc-ovr-"));
+  try {
+    const link = path.join(dir, "devcouncil-link");
+    symlinkSync(shimPath, link);
+    assert.throws(
+      () => resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "linux", env: { DEVCOUNCIL_BIN: link } }),
+      /DEVCOUNCIL_BIN/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("override naming a node-shebang file is refused; a native file is used", posixOnly, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "dc-ovr-"));
+  try {
+    const nodeShim = path.join(dir, "wrapper");
+    const native = path.join(dir, "native");
+    writeFileSync(nodeShim, "#!/usr/bin/env node\n");
+    writeFileSync(native, "\x7fELF-not-a-node-script\n");
+    assert.throws(
+      () => resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "linux", env: { DEVCOUNCIL_BIN: nodeShim } }),
+      /DEVCOUNCIL_BIN.*node/,
+    );
+    assert.equal(
+      resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "linux", env: { DEVCOUNCIL_BIN: native } }),
+      native,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("win32 override must be .exe or .com", () => {
+  const env = (v) => ({ DEVCOUNCIL_BIN: v });
+  assert.throws(
+    () => resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "win32", env: env("C:\\x\\devcouncil.cmd") }),
+    /DEVCOUNCIL_BIN.*\.exe/,
+  );
+  assert.throws(
+    () => resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "win32", env: env("C:\\x\\devcouncil") }),
+    /DEVCOUNCIL_BIN/,
+  );
+  assert.equal(
+    resolveBin("devcouncil", "DEVCOUNCIL_BIN", { platform: "win32", env: env("C:\\x\\devcouncil.exe") }),
+    "C:\\x\\devcouncil.exe",
+  );
+});
+
+test("recursion guard refuses when the marker is already set", () => {
+  assert.equal(shimRecursionProblem({}), null);
+  assert.match(shimRecursionProblem({ [SHIM_ACTIVE_ENV]: "1" }), /itself|recurs/i);
+});
+
+test("win32 drops relative PATH entries (they would probe the cwd)", () => {
+  const probed = [];
+  const opts = {
+    platform: "win32",
+    env: { PATH: [".", "bin", "..\\up", GO].join(";") },
+    isNative: (c) => (probed.push(c), false),
+  };
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts);
+  assert.deepEqual(probed, [GO + "\\devcouncil.exe", GO + "\\devcouncil.com"]);
+});
+
+test("win32 PATH splitting honours double quotes around a semicolon", () => {
+  const probed = [];
+  const opts = {
+    platform: "win32",
+    env: { PATH: '"C:\\a;b";' + GO },
+    isNative: (c) => (probed.push(c), false),
+  };
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts);
+  assert.deepEqual(probed, [
+    "C:\\a;b\\devcouncil.exe",
+    "C:\\a;b\\devcouncil.com",
+    GO + "\\devcouncil.exe",
+    GO + "\\devcouncil.com",
+  ]);
+});
+
+test("win32 ~/.local/bin falls back to USERPROFILE when HOME is not win32-absolute", () => {
+  const probed = [];
+  const opts = {
+    platform: "win32",
+    env: { PATH: "", HOME: "/c/Users/u", USERPROFILE: "C:\\Users\\u" },
+    isNative: (c) => (probed.push(c), false),
+  };
+  resolveBin("devcouncil", "DEVCOUNCIL_BIN", opts);
+  assert.deepEqual(probed, [
+    "C:\\Users\\u\\.local\\bin\\devcouncil.exe",
+    "C:\\Users\\u\\.local\\bin\\devcouncil.com",
+  ]);
+});

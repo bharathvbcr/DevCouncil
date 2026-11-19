@@ -21,9 +21,45 @@ const path = require("node:path");
 
 const WIN32 = process.platform === "win32";
 
+// Set in the environment of the binary the shim spawns. A shim that starts
+// with it already set was reached again from its own child: refuse.
+const SHIM_ACTIVE_ENV = "DEVCOUNCIL_SHIM_ACTIVE";
+
+function shimRecursionProblem(env = process.env) {
+  return env[SHIM_ACTIVE_ENV]
+    ? `the devcouncil npm shim was re-entered from the binary it launched (${SHIM_ACTIVE_ENV} is set); refusing to recurse. Point PATH or DEVCOUNCIL_BIN at the native devcouncil binary, not at this shim.`
+    : null;
+}
+
+// On win32 a git-bash style HOME (/c/Users/u, which path.win32 calls rooted)
+// is not a usable path for the native binary, so only a drive-letter or UNC
+// HOME wins over USERPROFILE.
 function localBinDir(env = process.env, pathMod = path) {
-  const home = env.HOME || env.USERPROFILE || "";
+  let home = env.HOME || env.USERPROFILE || "";
+  if (pathMod === path.win32 && !/^([A-Za-z]:[\\/]|\\\\)/.test(env.HOME || "")) {
+    home = env.USERPROFILE || "";
+  }
   return home ? pathMod.join(home, ".local", "bin") : "";
+}
+
+// Windows PATH semantics: ';' separates entries except inside double quotes,
+// and the quotes are not part of the entry.
+function splitWin32Path(raw) {
+  const entries = [];
+  let cur = "";
+  let quoted = false;
+  for (const ch of raw) {
+    if (ch === '"') {
+      quoted = !quoted;
+    } else if (ch === ";" && !quoted) {
+      entries.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  entries.push(cur);
+  return entries;
 }
 
 function isSelf(file) {
@@ -80,6 +116,20 @@ function isNativeBin(file) {
   return true;
 }
 
+// Why an explicit override cannot be the native binary, or null if it can.
+function overrideProblem(file, win32, opts = {}) {
+  if (win32 && !/\.(exe|com)$/i.test(file)) {
+    return "on Windows it must be a .exe or .com file";
+  }
+  if ((opts.isSelf ?? isSelf)(file)) {
+    return "it is this npm shim itself, which would respawn forever";
+  }
+  if ((opts.looksLikeNodeShim ?? looksLikeNodeShim)(file)) {
+    return "it is a node script or wrapper, not the native devcouncil binary";
+  }
+  return null;
+}
+
 // Find the native binary `name` on PATH (then ~/.local/bin). Only PATH entries
 // are searched: never the current directory, which Windows' own lookup would
 // try first. On win32 only `.exe` / `.com` count; an extensionless file there
@@ -94,13 +144,17 @@ function resolveBin(name, envKey, opts = {}) {
   const pathMod = win32 ? path.win32 : path.posix;
   const override = env[envKey];
   if (override) {
+    const problem = overrideProblem(override, win32, opts);
+    if (problem) {
+      throw new Error(`${envKey}=${override} is not usable: ${problem}`);
+    }
     return override;
   }
   const rawPath = (win32 ? env.PATH ?? env.Path : env.PATH) || "";
-  const dirs = rawPath
-    .split(pathMod.delimiter)
-    .map((dir) => (win32 ? dir.replace(/^"(.*)"$/, "$1") : dir))
-    .filter(Boolean);
+  const dirs = (win32 ? splitWin32Path(rawPath) : rawPath.split(pathMod.delimiter))
+    .filter(Boolean)
+    // A relative Windows PATH entry resolves against the cwd.
+    .filter((dir) => !win32 || pathMod.isAbsolute(dir));
   const local = localBinDir(env, pathMod);
   if (local) {
     dirs.push(local);
@@ -138,7 +192,7 @@ function run(command, args) {
     cwd: process.cwd(),
     stdio: "inherit",
     shell: false,
-    env: spawnEnv(),
+    env: { ...spawnEnv(), [SHIM_ACTIVE_ENV]: "1" },
   });
 }
 
@@ -159,7 +213,16 @@ function missing(name, hint) {
 function main() {
   const args = process.argv.slice(2);
 
-  const goBin = resolveBin("devcouncil", "DEVCOUNCIL_BIN");
+  const recursion = shimRecursionProblem();
+  if (recursion) {
+    fail(recursion);
+  }
+  let goBin;
+  try {
+    goBin = resolveBin("devcouncil", "DEVCOUNCIL_BIN");
+  } catch (err) {
+    fail(err.message);
+  }
   if (!goBin) {
     missing(
       "devcouncil",
@@ -181,4 +244,11 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { resolveBin, isNativeBin, isSelf, looksLikeNodeShim };
+module.exports = {
+  resolveBin,
+  isNativeBin,
+  isSelf,
+  looksLikeNodeShim,
+  shimRecursionProblem,
+  SHIM_ACTIVE_ENV,
+};
