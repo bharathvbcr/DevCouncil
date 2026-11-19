@@ -54,8 +54,12 @@ impl Run {
 }
 
 fn devmap(args: &[&str]) -> Run {
+    // Never from inside the repository: the emitted command must be an
+    // absolute path *outside* the working directory's repository, and a
+    // checkout-local build tree is inside it.
     let out = Command::new(DEVMAP)
         .args(args)
+        .current_dir(std::env::temp_dir())
         .output()
         .expect("devmap binary runs");
     Run {
@@ -611,6 +615,8 @@ fn installed_artifacts_carry_no_store_path_to_mangle() {
             .arg("--db")
             .arg(raw)
             .args(&args)
+            // Outside the repository: the emitted command is checked against it.
+            .current_dir(std::env::temp_dir())
             .output()
             .expect("devmap runs");
         let stdout = String::from_utf8_lossy(&out.stdout);

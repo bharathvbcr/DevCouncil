@@ -1652,13 +1652,15 @@ pub fn merge_opencode_plugin(
     let plugin_ref = claude::utf8_path("the opencode plugin path", &plugin_rel)?.replace('\\', "/");
 
     let source = opencode_plugin_source(executable)?;
-    let current = fs::read_to_string(&plugin_abs).ok();
+    // Plan pass included: a linked `integrations` directory (or a linked
+    // `opencode.json`) is refused before anything is written, not discovered
+    // half-way through the apply.
+    preflight_repo_write(&plugin_abs)?;
+    preflight_repo_write(&root.join("opencode.json"))?;
+    let current = read_host_config(&plugin_abs).ok();
     let module_changed = current.as_deref() != Some(source.as_str());
     if module_changed && !dry_run {
-        if let Some(parent) = plugin_abs.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&plugin_abs, &source)
+        devmap_query::write_atomic(&plugin_abs, source.as_bytes())
             .with_context(|| format!("writing {}", plugin_abs.display()))?;
     }
     outcomes.push(McpMergeOutcome {
@@ -1959,6 +1961,7 @@ pub fn offer_project_mcp(
     executable: &Path,
     read_only: bool,
 ) -> anyhow::Result<Option<McpMergeOutcome>> {
+    preflight_repo_write(path)?;
     let existed = path.is_file();
     let mut document = if existed {
         read_json_object(path)?
@@ -1979,9 +1982,6 @@ pub fn offer_project_mcp(
     if !read_only {
         let servers = mcp_servers_mut(&mut document)?;
         servers.insert(MCP_SERVER_NAME.to_string(), replacement);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         write_json_pretty(path, &document)?;
     }
     Ok(Some(McpMergeOutcome {
@@ -2062,6 +2062,14 @@ const MAX_HOST_CONFIG_BYTES: u64 = 1 << 20;
 /// character device or an oversized file at a known config name was read until
 /// it stopped or the process did.
 pub(crate) fn read_host_config(path: &Path) -> io::Result<String> {
+    // Typed by `stat` before it is opened: opening a FIFO with no writer
+    // blocks until one appears, so the file-type check below would never run.
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        ));
+    }
     let file = fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -2126,10 +2134,16 @@ fn mcp_servers_mut(document: &mut Value) -> anyhow::Result<&mut Map<String, Valu
         .ok_or_else(|| anyhow!("mcpServers must be an object"))
 }
 
+/// Refuse a repository path whose directories or final component are links,
+/// before the apply writes to it. `write_atomic` refuses the same paths at
+/// write time; this is the plan pass asking first, so a refusal leaves nothing
+/// half-applied.
+fn preflight_repo_write(path: &Path) -> anyhow::Result<()> {
+    devmap_extract::safe_fs::preflight_write(path)
+        .with_context(|| format!("refusing to write through {}", path.display()))
+}
+
 fn write_json_pretty(path: &Path, value: &Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut text = serde_json::to_string_pretty(value)?;
     text.push('\n');
     Ok(devmap_query::write_atomic(path, text.as_bytes()).map(|_| ())?)
@@ -2142,6 +2156,7 @@ pub fn merge_cursor_hooks(
     read_only: bool,
 ) -> anyhow::Result<McpMergeOutcome> {
     let expected = claude::cursor_hooks_document(executable)?;
+    preflight_repo_write(path)?;
     if path.is_file() {
         let existing_text = read_host_config(path)?;
         let existing: Value = serde_json::from_str(&existing_text).map_err(|err| {
@@ -2189,9 +2204,7 @@ pub fn merge_codex_mcp(
     // This writer does not go through `mcp_entry`. The same refusal applies,
     // before the file is read, so a test-binary path cannot create or rewrite it.
     claude::refuse_hashed_test_binary(executable)?;
-    let command = executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_path_buf());
+    let command = claude::absolute_executable(executable)?;
     let command = command
         .to_str()
         .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
@@ -2211,9 +2224,6 @@ pub fn merge_codex_mcp(
     let updated = splice_toml_server(path, &existing, "mcp_servers", "devmap", entry)?;
     let changed = updated.is_some();
     if let (Some(updated), false) = (updated, read_only) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         // The JSON configs next door publish through safe_fs; a plain
         // `fs::write` here truncated whatever the name resolved to, link or
         // not, and left a half-written config behind on a failed write.
@@ -2247,6 +2257,8 @@ pub fn write_codex_plugin_assets(
     let hooks = claude::hooks_block(executable, &["hook".to_string()])?;
     let hooks_path = plugin_dir.join("hooks").join("hooks.json");
 
+    preflight_repo_write(&manifest_path)?;
+    preflight_repo_write(&hooks_path)?;
     for (path, value, note) in [
         (&manifest_path, &manifest, "wrote .codex-plugin/plugin.json"),
         (&hooks_path, &hooks, "wrote .codex-plugin/hooks/hooks.json"),

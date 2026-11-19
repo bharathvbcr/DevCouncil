@@ -3006,6 +3006,25 @@ pub(crate) fn canonical_hook_executable(
     check_hook_executable_containment(executable, root, None, action)
 }
 
+/// True when `executable` (resolved through links as far as it exists) lies in
+/// the repository at `root`, by the same boundaries
+/// [`canonical_hook_executable`] enforces. A path that does not exist yet is
+/// judged lexically; a `root` that cannot be resolved is an error, never "no".
+pub(crate) fn executable_is_inside_repository(
+    executable: &Path,
+    root: &Path,
+) -> anyhow::Result<bool> {
+    let boundaries = collect_containment_boundaries(root, None, "inspect")?;
+    let lexical = normalize_lexical(&absolute_non_canonical(executable));
+    let resolved = canonicalize_existing(executable).ok();
+    Ok(boundaries.iter().any(|boundary| {
+        boundary.contains_path(&lexical)
+            || resolved
+                .as_deref()
+                .is_some_and(|path| boundary.contains_path(path))
+    }))
+}
+
 pub(crate) fn canonical_hook_executable_with_seed(
     executable: &Path,
     root: &Path,

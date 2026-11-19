@@ -305,6 +305,128 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
     out
 }
 
+/// Every `devmap` command an existing host entry runs: (where, host to
+/// re-integrate, command). MCP documents, Codex's `config.toml`, and the hook
+/// handlers in Cursor's `hooks.json` and Claude Code's settings files.
+fn host_devmap_commands(home: Option<&Path>, cwd: &Path) -> Vec<(String, &'static str, String)> {
+    let mut found = Vec::new();
+    for site in host_mcp_config_sites(home, cwd) {
+        let Some(host) = site.host else { continue };
+        if let Some(command) = read_devmap_command_from_mcp_config(&site.path) {
+            let rewrite = match host {
+                McpHost::Cursor => "cursor",
+                McpHost::ClaudeCode => "claude",
+            };
+            found.push((site.path.display().to_string(), rewrite, command));
+        }
+    }
+    if let Some(home) = home {
+        let codex = home.join(".codex").join("config.toml");
+        if let Some(command) = integrate::read_host_config(&codex)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|table| {
+                table
+                    .get("mcp_servers")?
+                    .get(claude::MCP_SERVER_NAME)?
+                    .get("command")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+        {
+            found.push((codex.display().to_string(), "codex", command));
+        }
+    }
+    let mut hook_files: Vec<(PathBuf, &'static str)> =
+        vec![(cwd.join(".cursor").join("hooks.json"), "cursor")];
+    for name in ["settings.json", "settings.local.json"] {
+        hook_files.push((cwd.join(".claude").join(name), "claude"));
+    }
+    if let Some(home) = home {
+        hook_files.push((home.join(".cursor").join("hooks.json"), "cursor"));
+        hook_files.push((
+            claude::claude_config_dir(home).join("settings.json"),
+            "claude",
+        ));
+    }
+    for (path, rewrite) in hook_files {
+        let Ok(text) = integrate::read_host_config(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let mut commands = Vec::new();
+        collect_hook_commands(
+            value.get("hooks").unwrap_or(&serde_json::Value::Null),
+            &mut commands,
+        );
+        for command in commands {
+            let named_devmap = Path::new(claude::command_executable_word(&command))
+                .file_name()
+                .is_some_and(|name| name == claude::PLUGIN_NAME);
+            if named_devmap {
+                found.push((path.display().to_string(), rewrite, command));
+            }
+        }
+    }
+    found
+}
+
+fn collect_hook_commands(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                match (key.as_str(), child.as_str()) {
+                    ("command", Some(command)) => out.push(command.to_string()),
+                    _ => collect_hook_commands(child, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_hook_commands(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Existing host entries that run a relative or in-repository `devmap`.
+///
+/// Configs written by earlier binaries resolved `devmap` against the working
+/// directory, so a repository file named `devmap` could be the command a host
+/// ran in every session. Nothing re-checks them after the fact unless this does.
+/// `None` means every entry found names an absolute path outside `cwd`'s
+/// repository; entries that could not be read are not found, not clean.
+pub(crate) fn host_command_defect_warning(cwd: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    command_defects(&host_devmap_commands(home.as_deref(), cwd), cwd)
+}
+
+fn command_defects(commands: &[(String, &'static str, String)], cwd: &Path) -> Option<String> {
+    let defects: Vec<String> = commands
+        .iter()
+        .filter_map(|(at, rewrite, command)| {
+            let word = claude::command_executable_word(command);
+            let why = if claude::is_relative_command(command) {
+                "is relative, so the host resolves it against whatever directory it runs in"
+            } else if crate::hook::executable_is_inside_repository(Path::new(word), cwd)
+                .unwrap_or(false)
+            {
+                "is inside the repository, which can replace it"
+            } else {
+                return None;
+            };
+            Some(format!(
+                "{at}: command {command:?} {why}; rewrite it with `devmap integrate {rewrite}` \
+                 from an installed devmap"
+            ))
+        })
+        .collect();
+    (!defects.is_empty()).then(|| defects.join("; "))
+}
+
 fn resolve_devmap_command(command: &str) -> PathBuf {
     let path = PathBuf::from(command);
     if command.contains('/') || command.contains('\\') {
@@ -331,7 +453,7 @@ fn resolve_on_path(command: &str) -> Option<PathBuf> {
 }
 
 fn read_devmap_command_from_mcp_config(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = integrate::read_host_config(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let servers = value.get("mcpServers")?.as_object()?;
     let entry = servers.get("devmap")?;
@@ -461,7 +583,7 @@ pub(crate) fn missing_binary_warning(binaries: &[serde_json::Value]) -> Option<S
 }
 
 fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = integrate::read_host_config(path) else {
         return false;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -486,7 +608,7 @@ fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
 }
 
 fn mcp_entry_is_pinned(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = integrate::read_host_config(path) else {
         return false;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -698,7 +820,7 @@ pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
     let config_dir = claude::claude_config_dir(&home);
     let global = claude::claude_global_config(&home);
     let read_json = |path: &Path| -> Result<Option<serde_json::Value>, String> {
-        match std::fs::read_to_string(path) {
+        match integrate::read_host_config(path) {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
                 .map_err(|error| format!("{} is not JSON: {error}", path.display())),
@@ -916,7 +1038,7 @@ fn plugin_health(home: &Path) -> PluginHealth {
                 dir.display()
             )),
         }
-        if let Ok(text) = std::fs::read_to_string(&hooks) {
+        if let Ok(text) = integrate::read_host_config(&hooks) {
             if text.contains("\"args\"") || text.contains("\"async\"") {
                 issues.push(format!(
                     "{}: hooks still use args/async; regenerate with `devmap claude plugin` \
@@ -969,7 +1091,7 @@ fn plugin_health(home: &Path) -> PluginHealth {
 
     // Codex trust records naming a missing hooks.json.
     let codex_config = home.join(".codex").join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(&codex_config) {
+    if let Ok(text) = integrate::read_host_config(&codex_config) {
         if let Ok(table) = text.parse::<toml::Table>() {
             if let Some(trust) = table.get("hooks").and_then(|v| v.get("trust")) {
                 if let Some(map) = trust.as_table() {

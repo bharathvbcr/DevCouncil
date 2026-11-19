@@ -79,7 +79,11 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
     let subcommands = claude::known_subcommands::<Cli>();
     match action {
         ClaudeAction::Hooks { binary } => {
-            let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
+            let executable = claude::reachable_command(
+                &std::env::current_exe()?,
+                binary.as_deref(),
+                &std::env::current_dir()?,
+            )?;
             let block = claude::hooks_block(&executable, &subcommands)?;
             emit_json(cli, &block)
         }
@@ -136,7 +140,11 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
             dry_run,
             binary,
         } => {
-            let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
+            let executable = claude::reachable_command(
+                &std::env::current_exe()?,
+                binary.as_deref(),
+                &std::env::current_dir()?,
+            )?;
             let version = env!("CARGO_PKG_VERSION");
             let out = &out
                 .clone()
