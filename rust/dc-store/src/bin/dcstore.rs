@@ -28,7 +28,7 @@
 //! struct shape on a boundary this small, and the store deliberately carries
 //! only rusqlite.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 
 use dc_proc::cli::{collect_args_with_note, is_version_arg, quote, wants_version};
@@ -1158,6 +1158,14 @@ const MAX_SERVE_ARGS: usize = 64;
 /// sender considered legal and the receiver did not.
 const MAX_SERVE_ARG_BYTES: usize = 8 << 20;
 
+/// How many bytes one request may declare across all of its arguments, summed
+/// as each length header arrives and checked before that argument's body is
+/// read. The per-argument cap alone would let 64 arguments of 8 MiB each
+/// through. Two arguments' worth is the most the Go host sends: every request
+/// it builds carries at most one large value (an appended scope, a record, a
+/// verification wire) beside short ids and tokens.
+const MAX_SERVE_REQUEST_BYTES: usize = 2 * MAX_SERVE_ARG_BYTES;
+
 /// How many bytes a length header may run to before it is refused. Lengths are
 /// short decimal numbers; anything longer is a peer that will never send the
 /// newline this is waiting for.
@@ -1229,13 +1237,32 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<Vec<String>>, String
         return Ok(None);
     };
     let mut args = Vec::with_capacity(count);
+    let mut declared_total = 0usize;
     for index in 0..count {
         let len = read_bounded_len(reader, MAX_SERVE_ARG_BYTES, &format!("argument {index}"))?
             .ok_or_else(|| format!("stream ended before argument {index}"))?;
-        let mut buf = vec![0u8; len];
+        declared_total = declared_total
+            .checked_add(len)
+            .filter(|total| *total <= MAX_SERVE_REQUEST_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "argument {index} takes the request past the {MAX_SERVE_REQUEST_BYTES} byte cap"
+                )
+            })?;
+        // Memory follows the bytes that arrive, not the length that was
+        // declared: a peer that declares 8 MiB and sends nothing costs nothing.
+        let mut buf = Vec::new();
         reader
-            .read_exact(&mut buf)
+            .by_ref()
+            .take(len as u64)
+            .read_to_end(&mut buf)
             .map_err(|e| format!("reading argument {index}: {e}"))?;
+        if buf.len() != len {
+            return Err(format!(
+                "reading argument {index}: stream ended after {} of {len} bytes",
+                buf.len()
+            ));
+        }
         // Named by position and never by content: one of these arguments
         // carries a lease token, and an error echoing it would copy a
         // credential into the caller's logs. Same rule as collect_args.
@@ -1466,4 +1493,162 @@ fn maybe(value: Option<&str>) -> String {
 
 fn json_bool(v: bool) -> String {
     if v { "true".into() } else { "false".into() }
+}
+
+#[cfg(test)]
+mod serve_frame_tests {
+    use super::*;
+
+    /// One stretch of a scripted request stream.
+    enum Seg {
+        Bytes(Vec<u8>),
+        /// `n` zero bytes, produced on demand so a declared-but-large body
+        /// costs the test nothing until the code under test asks for it.
+        Zeros(usize),
+        /// Reading this far is the failure: the code under test went past a
+        /// point where it had already been obliged to refuse.
+        Tripwire,
+    }
+
+    struct Scripted {
+        segs: std::collections::VecDeque<Seg>,
+        consumed: usize,
+        max_read_request: usize,
+    }
+
+    impl Scripted {
+        fn new(segs: Vec<Seg>) -> Self {
+            Scripted {
+                segs: segs.into(),
+                consumed: 0,
+                max_read_request: 0,
+            }
+        }
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max_read_request = self.max_read_request.max(buf.len());
+            let Some(seg) = self.segs.front_mut() else {
+                return Ok(0);
+            };
+            let n = match seg {
+                Seg::Tripwire => {
+                    panic!("the request was read past the point it should have been refused")
+                }
+                Seg::Bytes(bytes) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    bytes.drain(..n);
+                    if bytes.is_empty() {
+                        self.segs.pop_front();
+                    }
+                    n
+                }
+                Seg::Zeros(left) => {
+                    let n = (*left).min(buf.len());
+                    buf[..n].fill(0);
+                    *left -= n;
+                    if *left == 0 {
+                        self.segs.pop_front();
+                    }
+                    n
+                }
+            };
+            self.consumed += n;
+            Ok(n)
+        }
+    }
+
+    impl BufRead for Scripted {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other(
+                "read_request reads through Read only",
+            ))
+        }
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    fn header(n: usize) -> Seg {
+        Seg::Bytes(format!("{n}\n").into_bytes())
+    }
+
+    #[test]
+    fn total_over_the_cap_is_refused_before_that_body_is_read() {
+        let mut reader = Scripted::new(vec![
+            header(3),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(1),
+            Seg::Tripwire,
+        ]);
+        let err =
+            read_request(&mut reader).expect_err("a third argument pushes the total over the cap");
+        assert!(
+            err.contains("takes the request past the") && err.contains("byte cap"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn many_arguments_each_under_the_cap_are_refused_in_total() {
+        let mut segs = vec![header(MAX_SERVE_ARGS)];
+        for _ in 0..MAX_SERVE_ARGS {
+            segs.push(header(1 << 20));
+            segs.push(Seg::Zeros(1 << 20));
+        }
+        let mut reader = Scripted::new(segs);
+        let err = read_request(&mut reader).expect_err("64 MiB declared across a request");
+        assert!(
+            err.contains("takes the request past the") && err.contains("byte cap"),
+            "{err}"
+        );
+        assert!(
+            reader.consumed <= MAX_SERVE_REQUEST_BYTES + 1024,
+            "read {} bytes of a request refused at {}",
+            reader.consumed,
+            MAX_SERVE_REQUEST_BYTES
+        );
+    }
+
+    #[test]
+    fn a_declared_length_is_not_allocated_ahead_of_the_bytes() {
+        let mut reader = Scripted::new(vec![
+            header(1),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Bytes(b"abc".to_vec()),
+        ]);
+        let err =
+            read_request(&mut reader).expect_err("the stream ends 3 bytes into an 8 MiB argument");
+        assert!(
+            err.contains("argument 0") && err.contains("stream ended after 3 of"),
+            "{err}"
+        );
+        // The invariant is that no read is sized to the declared length; how
+        // much smaller each read is belongs to std and is not asserted.
+        assert!(
+            reader.max_read_request < MAX_SERVE_ARG_BYTES,
+            "a read asked for {} bytes against 3 sent",
+            reader.max_read_request
+        );
+    }
+
+    #[test]
+    fn an_eight_mib_scope_append_still_passes() {
+        let mut reader = Scripted::new(vec![
+            header(2),
+            header(12),
+            Seg::Bytes(b"scope-append".to_vec()),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+        ]);
+        let args = read_request(&mut reader)
+            .expect("an 8 MiB argument is legal")
+            .expect("a request, not end of stream");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "scope-append");
+        assert_eq!(args[1].len(), MAX_SERVE_ARG_BYTES);
+    }
 }
