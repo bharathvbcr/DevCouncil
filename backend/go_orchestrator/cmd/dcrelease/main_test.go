@@ -166,3 +166,135 @@ func TestARelativeRootIsAUsageError(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}
 }
+
+const artifactsOutside = "FAIL: --artifacts is outside the checkout\n"
+
+func plantArchives(t *testing.T, dir string) {
+	t.Helper()
+	for _, name := range []string{
+		"devmap-cli-x86_64-unknown-linux-gnu.tar.xz",
+		"devmap-cli-aarch64-apple-darwin.tar.xz",
+		"devmap-cli-x86_64-apple-darwin.tar.xz",
+		"devmap-cli-x86_64-pc-windows-msvc.zip",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func mkdirAll(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+}
+
+func assertArtifactsRefused(t *testing.T, root, artifacts string) {
+	t.Helper()
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", artifacts)
+	if code != 1 || stdout != "" || stderr != artifactsOutside {
+		t.Fatalf("--artifacts %q: exit %d\nstdout %q\nstderr %q", artifacts, code, stdout, stderr)
+	}
+}
+
+// An inside path is not a containment failure: it reaches Inspect, which
+// fails on this empty root for its own reason.
+func assertArtifactsInspected(t *testing.T, root, artifacts string) {
+	t.Helper()
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", artifacts)
+	if code != 1 || strings.Contains(stdout, "OK:") || strings.Contains(stderr, "outside the checkout") || !strings.Contains(stderr, "missing package.json") {
+		t.Fatalf("--artifacts %q: exit %d\nstdout %q\nstderr %q", artifacts, code, stdout, stderr)
+	}
+}
+
+func TestArtifactsThatLeaveTheCheckoutAreRefused(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	evil := mkdirAll(t, filepath.Join(parent, "repo-evil"))
+	// A complete archive set outside would otherwise satisfy the check.
+	plantArchives(t, evil)
+	sep := string(filepath.Separator)
+	for _, artifacts := range []string{
+		"..",
+		filepath.Join("..", "repo-evil"),
+		"sub" + sep + ".." + sep + ".." + sep + "repo-evil",
+		evil,
+		root + sep + ".." + sep + "repo-evil",
+		parent,
+		filepath.Join(parent, "no-such-outside"),
+	} {
+		assertArtifactsRefused(t, root, artifacts)
+	}
+}
+
+func TestArtifactsInsideTheCheckoutAreInspected(t *testing.T) {
+	root := t.TempDir()
+	mkdirAll(t, filepath.Join(root, "sub", "dir"))
+	for _, artifacts := range []string{
+		".",
+		filepath.Join("sub", "dir"),
+		filepath.Join("sub", "..", "sub", "dir"),
+		filepath.Join("sub", "missing"),
+		root,
+		filepath.Join(root, "sub", "dir"),
+	} {
+		assertArtifactsInspected(t, root, artifacts)
+	}
+}
+
+func TestSymlinkedArtifactsThatLeaveTheCheckoutAreRefused(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	plantArchives(t, outside)
+	symlink(t, outside, filepath.Join(root, "arts"))
+	symlink(t, filepath.Join(outside, "not-created"), filepath.Join(root, "dangling"))
+	symlink(t, filepath.Join("..", "escaped"), filepath.Join(root, "relout"))
+	for _, artifacts := range []string{
+		"arts",
+		filepath.Join(root, "arts"),
+		filepath.Join("arts", "missing"),
+		"dangling",
+		"relout",
+	} {
+		assertArtifactsRefused(t, root, artifacts)
+	}
+
+	// A link that stays inside is the checkout's own directory.
+	inside := mkdirAll(t, filepath.Join(root, "inside"))
+	symlink(t, inside, filepath.Join(root, "kept"))
+	assertArtifactsInspected(t, root, "kept")
+}
+
+func TestASymlinkCycleIsACouldNotRunNotOK(t *testing.T) {
+	root := t.TempDir()
+	symlink(t, "cycle", filepath.Join(root, "cycle"))
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", "cycle")
+	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "dcrelease:") {
+		t.Fatalf("exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+}
+
+// A root that is itself a symlink must not make its real path look outside,
+// nor hide a path that leaves it.
+func TestARootThatIsASymlinkIsComparedByItsRealPath(t *testing.T) {
+	parent := t.TempDir()
+	real := mkdirAll(t, filepath.Join(parent, "real"))
+	outside := mkdirAll(t, filepath.Join(parent, "outside"))
+	plantArchives(t, outside)
+	rootLink := filepath.Join(parent, "rootlink")
+	symlink(t, real, rootLink)
+	assertArtifactsInspected(t, rootLink, filepath.Join(real, "sub"))
+	assertArtifactsInspected(t, rootLink, filepath.Join(rootLink, "sub"))
+	assertArtifactsInspected(t, rootLink, "sub")
+	assertArtifactsRefused(t, rootLink, filepath.Join("..", "outside"))
+	assertArtifactsRefused(t, rootLink, outside)
+}
