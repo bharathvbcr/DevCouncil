@@ -130,6 +130,34 @@ pub(super) fn verify(path: &Path, expected_version: Option<i64>) -> Result<(), S
     Ok(())
 }
 
+/// Whether `conn`'s database has a table called `table`.
+pub(super) fn table_present(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+/// A copy of a store that is about to lose `table` is a backup of it only when
+/// the copy holds that table and its rows read back. The `pre-tasks-retire`
+/// copy has no workbench version to compare, so this is its expectation.
+pub(super) fn verify_holds_table(path: &Path, table: &str) -> Result<(), String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("it cannot be opened: {error}"))?;
+    if !table_present(&conn, table).map_err(|error| format!("it cannot be read: {error}"))? {
+        return Err(format!("it holds no `{table}` table"));
+    }
+    conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|_| ())
+    .map_err(|error| format!("its `{table}` rows cannot be read: {error}"))
+}
+
 /// The schema version in `<profile>.pre-schema-<version>.bak`, and only that
 /// exact shape: no sign, no padding, no suffix after `.bak`.
 fn version_of(profile_name: &str, file_name: &str) -> Option<i64> {

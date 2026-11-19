@@ -406,6 +406,7 @@ fn backup_before_upgrade(
         conn,
         &format!("pre-schema-{version}"),
         Some(version),
+        None,
         refusal,
     )?
     else {
@@ -417,6 +418,8 @@ fn backup_before_upgrade(
         }
         _ => PruneReport::default(),
     };
+    let mut pruned = pruned;
+    pruned.unverified.extend(backup.displaced);
     Ok((Some(backup.path.display().to_string()), pruned))
 }
 
@@ -471,6 +474,8 @@ fn backup_window() {
 struct Backup {
     path: std::path::PathBuf,
     created: bool,
+    /// What was found at the backup name and moved aside, when something was.
+    displaced: Option<String>,
 }
 
 /// The shared `VACUUM INTO` copy: `<profile>.<stamp>.bak`, written beside the
@@ -492,6 +497,7 @@ fn backup_profile(
     conn: &Connection,
     stamp: &str,
     expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
     refusal: impl Fn(&std::path::Path, String) -> String,
 ) -> Result<Option<Backup>> {
     let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
@@ -504,7 +510,8 @@ fn backup_profile(
     };
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| fail(error.to_string()))?;
-    let outcome = write_backup_under_lock(path, &backup, expected_version, &fail);
+    let outcome = write_backup_under_lock(conn, path, &backup, expected_version, must_hold_table)
+        .map_err(&fail);
     match outcome {
         Ok(made) => {
             tx.commit().map_err(|error| fail(error.to_string()))?;
@@ -521,30 +528,100 @@ fn backup_profile(
     }
 }
 
+/// A file already at the backup name is a backup only if it reads back: it
+/// verifies at `expected_version` and holds `must_hold_table` with its rows
+/// readable. One that does not (empty, truncated, another schema, no legacy
+/// table) is never deleted, because it may be someone's only copy: it is moved
+/// to `<name>.invalid-<unix seconds>[-n]`, which no prune rule matches, and a
+/// fresh copy is written in its place.
+fn existing_backup_verdict(
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<(), String> {
+    backups::verify(backup, expected_version)?;
+    match must_hold_table {
+        Some(table) => backups::verify_holds_table(backup, table),
+        None => Ok(()),
+    }
+}
+
+/// Moves the unusable file at `backup` to a name beside it that is not taken,
+/// and returns that name.
+fn move_aside(backup: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let mut name = backup.as_os_str().to_owned();
+    name.push(format!(".invalid-{stamp}"));
+    let base = std::path::PathBuf::from(&name);
+    let mut aside = base.clone();
+    let mut n = 0u32;
+    // The write lock is held, so no other host picks the same name between the
+    // check and the rename.
+    while std::fs::symlink_metadata(&aside).is_ok() {
+        n += 1;
+        let mut next = base.as_os_str().to_owned();
+        next.push(format!("-{n}"));
+        aside = std::path::PathBuf::from(next);
+    }
+    std::fs::rename(backup, &aside)?;
+    Ok(aside)
+}
+
 /// The body of [`backup_profile`], run while the caller holds the write lock.
 fn write_backup_under_lock(
+    conn: &Connection,
     path: &str,
     backup: &std::path::Path,
     expected_version: Option<i64>,
-    fail: &impl Fn(String) -> Error,
-) -> Result<Backup> {
-    if backup.exists() {
-        return Ok(Backup {
-            path: backup.to_path_buf(),
-            created: false,
-        });
+    must_hold_table: Option<&str>,
+) -> std::result::Result<Backup, String> {
+    // A legacy table another host already retired is not required of a copy.
+    let must_hold_table = match must_hold_table {
+        Some(table) if backups::table_present(conn, table).map_err(|e| e.to_string())? => {
+            Some(table)
+        }
+        _ => None,
+    };
+    let mut displaced = None;
+    if std::fs::symlink_metadata(backup).is_ok() {
+        match existing_backup_verdict(backup, expected_version, must_hold_table) {
+            Ok(()) => {
+                return Ok(Backup {
+                    path: backup.to_path_buf(),
+                    created: false,
+                    displaced: None,
+                });
+            }
+            Err(reason) => {
+                let aside = move_aside(backup).map_err(|error| {
+                    format!(
+                        "the file already at {} does not read back ({reason}) and could not be moved aside: {error}",
+                        backup.display()
+                    )
+                })?;
+                let note = format!(
+                    "{}: {reason}; moved aside to {}",
+                    backup.display(),
+                    aside.display()
+                );
+                eprintln!("dc-store: workbench backup {note}");
+                displaced = Some(note);
+            }
+        }
     }
     backup_window();
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
     let target = partial
         .to_str()
-        .ok_or_else(|| fail("the path is not UTF-8".into()))?;
+        .ok_or_else(|| "the path is not UTF-8".to_string())?;
     // A copy that did not complete is removed at once: left behind it would be
     // a second profile-sized file on a disk that was already short of space.
     let discard = |detail: String| {
         let _ = std::fs::remove_file(&partial);
-        fail(detail)
+        detail
     };
     let reader = Connection::open(path).map_err(|error| discard(error.to_string()))?;
     reader
@@ -553,12 +630,13 @@ fn write_backup_under_lock(
     reader
         .execute("VACUUM INTO ?1", [target])
         .map_err(|error| discard(error.to_string()))?;
-    backups::verify(&partial, expected_version)
+    existing_backup_verdict(&partial, expected_version, must_hold_table)
         .map_err(|reason| discard(format!("the copy it wrote does not read back: {reason}")))?;
     std::fs::rename(&partial, backup).map_err(|error| discard(error.to_string()))?;
     Ok(Backup {
         path: backup.to_path_buf(),
         created: true,
+        displaced,
     })
 }
 

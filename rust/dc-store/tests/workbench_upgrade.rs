@@ -530,16 +530,23 @@ fn a_second_host_cannot_replace_the_pre_upgrade_backup() {
     );
 }
 
+/// A verified copy already at the name (an earlier, interrupted upgrade) is
+/// kept byte for byte.
 #[test]
-fn an_existing_backup_is_kept_rather_than_rewritten() {
+fn an_existing_verified_backup_is_kept_rather_than_rewritten() {
     let (_dir, path) = profile();
-    let backup = path.with_file_name("profile.sqlite.pre-schema-11.bak");
-    std::fs::write(&backup, b"sentinel-pre-upgrade").unwrap();
+    let backup = bak11(&path);
+    std::fs::copy(&path, &backup).unwrap();
+    let before = std::fs::read(&backup).unwrap();
     let store = Store::open(&path).unwrap();
     put_workspace(&store, "kept").unwrap();
-    assert_eq!(std::fs::read(&backup).unwrap(), b"sentinel-pre-upgrade");
+    assert_eq!(std::fs::read(&backup).unwrap(), before);
     assert_eq!(version(&path), dc_store::workbench::WORKBENCH_SCHEMA);
     assert!(try_write_lock(&path).is_ok());
+    assert!(
+        invalid_siblings(&path).is_empty(),
+        "a verified copy was moved aside"
+    );
 }
 
 /// A rollback-journal profile lets a reader in beside the writer, so the copy
@@ -793,4 +800,157 @@ fn an_unwritable_backup_directory_refuses_the_upgrade() {
         // Running as a user the mode does not bind (root): nothing to assert.
         assert_valid_old_backup(&path);
     }
+}
+
+// ---- an existing file at the backup name is trusted only when it verifies ----
+
+/// Files the upgrade moved aside from the backup name.
+fn invalid_siblings(path: &Path) -> Vec<PathBuf> {
+    let prefix = "profile.sqlite.pre-";
+    let mut found: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|entry| {
+            let name = entry.file_name().unwrap().to_str().unwrap();
+            name.starts_with(prefix) && name.contains(".bak.invalid-")
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// A zero-byte file under the backup name is not a backup. It is kept (it may
+/// be someone's only copy) under another name and a real copy is written.
+#[test]
+fn a_zero_byte_backup_name_does_not_stand_in_for_the_backup() {
+    let (_dir, path) = profile();
+    std::fs::write(bak11(&path), b"").unwrap();
+    let store = Store::open(&path).unwrap();
+    put_workspace(&store, "z").unwrap();
+    assert_valid_old_backup(&path);
+    assert_eq!(workspace_rows(&bak11(&path), "z"), 0);
+    let aside = invalid_siblings(&path);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(std::fs::metadata(&aside[0]).unwrap().len(), 0);
+}
+
+/// A valid database from another timeline (schema 99) under the name.
+#[test]
+fn a_backup_of_the_wrong_schema_is_not_trusted() {
+    let (_dir, path) = profile();
+    std::fs::copy(&path, bak11(&path)).unwrap();
+    set_version(&bak11(&path), 99);
+    let store = Store::open(&path).unwrap();
+    put_workspace(&store, "w").unwrap();
+    assert_valid_old_backup(&path);
+    let aside = invalid_siblings(&path);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(version(&aside[0]), 99, "the unusable file was changed");
+}
+
+/// Two unusable files in a row each get their own name; none is deleted.
+#[test]
+fn moved_aside_files_never_collide() {
+    let (_dir, path) = profile();
+    for round in 0..2u8 {
+        std::fs::write(bak11(&path), [round + 1]).unwrap();
+        set_version(&path, 11);
+        let store = Store::open(&path).unwrap();
+        put_workspace(&store, &format!("r{round}")).unwrap();
+        drop(store);
+    }
+    let aside = invalid_siblings(&path);
+    assert_eq!(aside.len(), 2, "{aside:?}");
+    let mut contents: Vec<Vec<u8>> = aside.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    contents.sort();
+    assert_eq!(contents, vec![vec![1u8], vec![2u8]]);
+}
+
+/// The upgrade reports what it moved aside, and retention neither counts nor
+/// removes it: with room for one backup, the moved-aside file stays.
+#[test]
+fn a_moved_aside_file_is_reported_and_not_pruned() {
+    let (_dir, path) = profile();
+    std::fs::write(bak11(&path), b"").unwrap();
+    let mut store = Store::open(&path).unwrap();
+    store.refuse_workbench_upgrades();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let report = store.upgrade_workbench_profile().unwrap();
+    assert_eq!(report.from, 11);
+    assert_eq!(report.prune.unverified.len(), 1, "{:?}", report.prune);
+    assert!(report.prune.unverified[0].contains("moved aside to"));
+    assert!(report.prune.removed.is_empty());
+    assert_eq!(invalid_siblings(&path).len(), 1);
+    assert_valid_old_backup(&path);
+}
+
+fn legacy_profile_with_stale_retire_backup(dir: &Scratch) -> (PathBuf, PathBuf) {
+    let path = dir.path().join("profile.sqlite");
+    drop(Store::open(&path).unwrap());
+    let stale = path.with_file_name("profile.sqlite.pre-tasks-retire.bak");
+    std::fs::copy(&path, &stale).unwrap(); // a valid profile with no tasks table
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(support::LEGACY_TASKS).unwrap();
+    conn.execute_batch(
+        r#"INSERT INTO tasks (id, title, description, status, priority, difficulty, planned_files_json,
+                              requirement_ids_json, acceptance_criterion_ids_json, expected_tests_json,
+                              allowed_commands_json, forbidden_changes_json,
+                              agent_appended_planned_files_json)
+           VALUES ('TASK-9', 'only copy', '', 'verified', 'low', NULL, '[]', '[]', '[]', '[]', '[]', '[]', '[]');
+           INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);"#,
+    )
+    .unwrap();
+    (path, stale)
+}
+
+fn tables_named(path: &Path, name: &str) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name=?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// A pre-existing pre-tasks-retire.bak that holds no tasks table must not
+/// license dropping the legacy table: a real copy is written first.
+#[test]
+fn a_stale_retire_backup_without_the_tasks_table_does_not_license_the_drop() {
+    let dir = Scratch::new();
+    let (path, stale) = legacy_profile_with_stale_retire_backup(&dir);
+    Store::open(&path).unwrap();
+    assert_eq!(
+        tables_named(&path, "tasks"),
+        0,
+        "the legacy table was not retired"
+    );
+    assert_eq!(
+        tables_named(&stale, "tasks"),
+        1,
+        "the legacy table was dropped and no copy holds it"
+    );
+    let aside: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("profile.sqlite.pre-tasks-retire.bak.invalid-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+}
+
+/// A retire copy that does hold the tasks table is kept as it is.
+#[test]
+fn a_retire_backup_that_holds_the_tasks_table_is_kept() {
+    let dir = Scratch::new();
+    let path = dir.path().join("profile.sqlite");
+    drop(Store::open(&path).unwrap());
+    let (live, stale) = legacy_profile_with_stale_retire_backup(&dir);
+    assert_eq!(live, path);
+    std::fs::copy(&path, &stale).unwrap(); // now with the tasks table
+    let before = std::fs::read(&stale).unwrap();
+    Store::open(&path).unwrap();
+    assert_eq!(tables_named(&path, "tasks"), 0);
+    assert_eq!(std::fs::read(&stale).unwrap(), before);
 }
