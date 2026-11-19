@@ -1,0 +1,224 @@
+secrets.tsv	aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"	aws_access_key_id = "AKIA… (20 chars)"
+secrets.tsv	aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"	aws_secret_access_key = "… (40 chars)"
+secrets.tsv	GH_TOKEN=ghp_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Q	GH_TOKEN=ghp_… (40 chars)
+secrets.tsv	  token: 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d5	  token: github_pat_… (95 chars)
+secrets.tsv	var oauthToken = "gho_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Q"	var oauthToken = "gho_… (40 chars)"
+secrets.tsv	const apiKey = "sk-ant-api03-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0P";	const apiKey = "sk-ant-… (108 chars)";
+secrets.tsv	OPENAI_KEY = "sk-proj-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1"	OPENAI_KEY = "sk-proj-… (64 chars)"
+secrets.tsv	openai.api_key = "sk-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8R"	openai.api_key = "sk-… (51 chars)"
+secrets.tsv	const MAPS_KEY = "AIzaFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7";	const MAPS_KEY = "AIza… (39 chars)";
+secrets.tsv	Stripe.api_key = "sk_live_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1"	Stripe.api_key = "sk_live_… (32 chars)"
+secrets.tsv	RESTRICTED = "rk_live_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1"	RESTRICTED = "rk_live_… (32 chars)"
+secrets.tsv	bot_token: xoxb-123456789012-123456789012-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1	bot_token: xoxb-… (55 chars)
+secrets.tsv	user_token: xoxp-123456789012-123456789012-123456789012-4f3c2b1a0e9d8c7b6a5f4e3d2c1b0a99	user_token: xoxp-… (76 chars)
+secrets.tsv	WEBHOOK = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"	WEBHOOK = "https://hooks.slack.com/services/… (77 chars)"
+secrets.tsv	-----BEGIN OPENSSH PRIVATE KEY-----	-----BEGIN… (35 chars)
+secrets.tsv	-----BEGIN EC PRIVATE KEY-----	-----BEGIN… (30 chars)
+secrets.tsv	-----BEGIN PRIVATE KEY-----	-----BEGIN… (27 chars)
+secrets.tsv	const testKey = `-----BEGIN RSA PRIVATE KEY-----	const testKey = `-----BEGIN… (31 chars)
+secrets.tsv	  "private_key": "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n",	  "private_key": "-----BEGIN… (27 chars)\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n",
+secrets.tsv	TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"	TOKEN = "eyJ… (108 chars)"
+secrets.tsv	headers = {"Authorization": "Bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a0"}	headers = {"Authorization": "Bearer … (32 chars)"}
+secrets.tsv	DATABASE_URL=postgres://app:s3cr3tPassw0rd@db.internal:5432/app	DATABASE_URL=postgres://app:… (14 chars)@db.internal:5432/app
+secrets.tsv	uri: mongodb+srv://admin:hunter2hunter2@cluster0.example.net/prod	uri: mongodb+srv://admin:… (14 chars)@cluster0.example.net/prod
+secrets.tsv	git clone https://deploy:Sup3rS3cretT0ken99@git.example.com/repo.git	git clone https://deploy:… (18 chars)@git.example.com/repo.git
+secrets.tsv	password = "Tr0ub4dor&3xample"	password = "… (17 chars)"
+secrets.tsv	DB_PASSWORD=correcthorsebatterystaple	DB_PASSWORD=… (25 chars)
+secrets.tsv	api_key: 4f3c2b1a0e9d8c7b6a5f4e3d2c1b0a99	api_key: … (32 chars)
+secrets.tsv	client_secret = "Zq8~Xv3.Lm7_Pt2-Rk9Wn4Yh6Bc1Df5Gj0Hs"	client_secret = "… (36 chars)"
+secrets.tsv	//registry.npmjs.org/:_authToken=npm_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Q	//registry.npmjs.org/:_authToken=npm_… (40 chars)
+secrets.tsv	export GITLAB_TOKEN=glpat-Fx7Qa9Lm2Zt4Wc8Rk3Vn	export GITLAB_TOKEN=glpat-… (26 chars)
+secrets.tsv	TWILIO_AUTH_TOKEN = "0123456789abcdef0123456789abcdef"	TWILIO_AUTH_TOKEN = "… (32 chars)"
+secrets.tsv	SENDGRID_API_KEY = "SG.Fx7Qa9Lm2Zt4Wc8Rk3Vn6Y.Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt"	SENDGRID_API_KEY = "SG.… (69 chars)"
+secrets.tsv	HF_TOKEN = "hf_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx"	HF_TOKEN = "hf_… (37 chars)"
+secrets.tsv	const apiToken = "tok_live_8e2f9a7c6b5d4e3f2a1b"	const apiToken = "… (29 chars)"
+secrets.tsv	  "secret": "a8f5f167f44f4964e6c998dee827110c",	  "secret": "… (32 chars)",
+secrets.tsv	      "auth": "dXNlcjpwYXNzd29yZDEyMzQ1Ng=="	      "auth": "… (28 chars)"
+secrets.tsv	export ANTHROPIC_API_KEY=sk-ant-api03-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0P	export ANTHROPIC_API_KEY=sk-ant-… (108 chars)
+secrets.tsv	DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Y==;EndpointSuffix=core.windows.net	DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=… (88 chars);EndpointSuffix=core.windows.net
+secrets.tsv	SHOPIFY_TOKEN = "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"	SHOPIFY_TOKEN = "shpat_… (38 chars)"
+secrets.tsv	private static final String DB_PASSWORD = "n0tInVault!2026xyz";	private static final String DB_PASSWORD = "… (18 chars)";
+secrets.tsv	api_key = os.environ["OPENAI_API_KEY"]	api_key = os.environ["OPENAI_API_KEY"]
+secrets.tsv	token := os.Getenv("GITHUB_TOKEN")	token := os.Getenv("GITHUB_TOKEN")
+secrets.tsv	password = getpass.getpass()	password = getpass.getpass()
+secrets.tsv	API_KEY=<your-api-key-here>	API_KEY=<your-api-key-here>
+secrets.tsv	          token: ${{ secrets.DEPLOY_KEY }}	          token: ${{ secrets.DEPLOY_KEY }}
+secrets.tsv	      "integrity": "sha512-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Y==",	      "integrity": "sha512-Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1Hd5Gj0PsFx7Qa9Lm2Zt4Wc8Rk3Vn6Y==",
+secrets.tsv	COMMIT = "3286db5e4f1c2a9b8d7e6f5a4b3c2d1e0f9a8b7c"	COMMIT = "3286db5e4f1c2a9b8d7e6f5a4b3c2d1e0f9a8b7c"
+secrets.tsv	request_id = "123e4567-e89b-12d3-a456-426614174000"	request_id = "123e4567-e89b-12d3-a456-426614174000"
+secrets.tsv	const emptySHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"	const emptySHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+secrets.tsv	-----BEGIN PUBLIC KEY-----	-----BEGIN PUBLIC KEY-----
+secrets.tsv	-----BEGIN CERTIFICATE-----	-----BEGIN CERTIFICATE-----
+secrets.tsv	ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl ops@example.com	ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl ops@example.com
+secrets.tsv	password_reset_token_ttl = 3600	password_reset_token_ttl = 3600
+secrets.tsv	def validate_token(token: str) -> bool:	def validate_token(token: str) -> bool:
+secrets.tsv	const tokenizerVocabularySize = 32000;	const tokenizerVocabularySize = 32000;
+secrets.tsv	primary_key = "user_id"	primary_key = "user_id"
+secrets.tsv	secret_name = "prod/db/credentials"	secret_name = "prod/db/credentials"
+secrets.tsv	token_endpoint = "https://oauth2.googleapis.com/token"	token_endpoint = "https://oauth2.googleapis.com/token"
+secrets.tsv	PASSWORD_MIN_LENGTH = 12	PASSWORD_MIN_LENGTH = 12
+secrets.tsv	api_key = "test"	api_key = "test"
+secrets.tsv	token = "fake-token-for-tests"	token = "fake-token-for-tests"
+secrets.tsv	auth = BearerAuth(token=settings.api_token)	auth = BearerAuth(token=settings.api_token)
+secrets.tsv	curl -H "Authorization: Bearer ${TOKEN}" "$URL"	curl -H "Authorization: Bearer ${TOKEN}" "$URL"
+secrets.tsv	DATABASE_URL=postgres://app@localhost:5432/app	DATABASE_URL=postgres://app@localhost:5432/app
+secrets.tsv	      DATABASE_URL: postgres://${DB_USER}:${DB_PASS}@db:5432/app	      DATABASE_URL: postgres://${DB_USER}:${DB_PASS}@db:5432/app
+secrets.tsv	const cls = "sk-fade-in-animation-keyframes-long";	const cls = "sk-fade-in-animation-keyframes-long";
+secrets.tsv	aws_region = "us-east-1"	aws_region = "us-east-1"
+secrets.tsv	const PIXEL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";	const PIXEL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+secrets.tsv	  "tokenizer": "cl100k_base",	  "tokenizer": "cl100k_base",
+secrets.tsv	## Secret management	## Secret management
+secrets.tsv	type TokenSource interface {	type TokenSource interface {
+secrets.tsv	key = f"{prefix}:{user_id}"	key = f"{prefix}:{user_id}"
+secrets.tsv	export GITHUB_TOKEN="$(gh auth token)"	export GITHUB_TOKEN="$(gh auth token)"
+secrets.tsv	            secretKeyRef:	            secretKeyRef:
+secrets.tsv	GitHub classic tokens start with `ghp_` and AWS key ids with `AKIA`.	GitHub classic tokens start with `ghp_` and AWS key ids with `AKIA`.
+secrets.tsv	const stripe = Stripe("pk_live_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1");	const stripe = Stripe("pk_live_Fx7Qa9Lm2Zt4Wc8Rk3Vn6Yb1");
+secrets.tsv	const CLIENT_ID = "1234567890-abc123def456ghi789jkl012mno345pq.apps.googleusercontent.com";	const CLIENT_ID = "1234567890-abc123def456ghi789jkl012mno345pq.apps.googleusercontent.com";
+secrets.tsv	const headerAuthorization = "Authorization"	const headerAuthorization = "Authorization"
+secrets.tsv	pub const SECRET_KEY_LEN: usize = 32;	pub const SECRET_KEY_LEN: usize = 32;
+secrets.tsv	pip install scikit-learn  # sk-learn style estimators	pip install scikit-learn  # sk-learn style estimators
+secrets.tsv	const token = localStorage.getItem("session_token");	const token = localStorage.getItem("session_token");
+secrets.tsv	aws_access_key_id = "AKIAQ3EGUTMHZXRWN4PB"	aws_access_key_id = "AKIA… (20 chars)"
+secrets.tsv	aws_secret_access_key = "Kx9vQ2mR7tW4pL8sN3bH6jF1dZ5cY0aG2eU7iO4q"	aws_secret_access_key = "… (40 chars)"
+secrets.tsv	WEBHOOK = "https://hooks.slack.com/services/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"	WEBHOOK = "https://hooks.slack.com/services/… (79 chars)"
+secrets.tsv	DATABASE_URL=postgres://app:hunter2@prod-db.internal:5432/app	DATABASE_URL=postgres://app:… (7 chars)@prod-db.internal:5432/app
+secrets.tsv	postgres://user:pass@localhost:5432/app	postgres://user:pass@localhost:5432/app
+secrets.tsv	fetch(url, { credentials: 'same-origin' })	fetch(url, { credentials: 'same-origin' })
+secrets.tsv	  "auth": "github-actions",	  "auth": "github-actions",
+secrets.tsv	auth: oidc-provider	auth: oidc-provider
+secrets.tsv	token: "refresh-token"	token: "refresh-token"
+secrets.tsv	secret: my-app-secret	secret: my-app-secret
+secrets.tsv	passwordless: webauthn-v2	passwordless: webauthn-v2
+secrets.tsv	token: v1.Token	token: v1.Token
+secrets.tsv	password: hashedPassword1	password: hashedPassword1
+secrets.tsv	user.password = hashed_password_2024	user.password = hashed_password_2024
+secrets.tsv	// Bearer token format: Bearer abc123def456ghi789	// Bearer token format: Bearer … (18 chars)
+secrets.tsv	secret: Tr0ub4dor-x9q	secret: … (13 chars)
+secrets.tsv	token: v1.Xk29LmQp3ZxW8vRt5N	token: … (21 chars)
+secrets.tsv	api_key: Ab1234567890Xy,zzzz	api_key: … (19 chars)
+secrets.tsv	mysql -u root -pS3cr3t"x y" appdb	mysql -u root -p… (11 chars) appdb
+secrets.tsv	OPENAI_ADMIN = sk-admin-Zq81mNx4Vb7LpR2tYc9Ke3Wd5Hf6Js0Ga	OPENAI_ADMIN = sk-admin-… (42 chars)
+secrets.tsv	key = "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"	key = "sk-or-v1-… (73 chars)"
+secrets.tsv	const endpointSecret = "whsec_Kq7Vn2Xb9Lm4Zt8Rc3Wd6Hf1Js5Ga0Pe";	const endpointSecret = "whsec_… (38 chars)";
+secrets.tsv	token = "glrt-Xk29LmQp3ZxW8vRt5Nb7Cd4Ye1"	token = "glrt-… (31 chars)"
+secrets.tsv	docker login -u gitlab+deploy-token-1 --password-stdin <<< gldt-Xk29LmQp3ZxW8vRt5Nb7Cd4Ye1	docker login -u gitlab+deploy-token-1 --password-stdin <<< gldt-… (31 chars)
+secrets.tsv	token = "glrtr-Xk29LmQp3ZxW8vRt5Nb7Cd4Ye1"	token = "glrtr-… (32 chars)"
+secrets.tsv	TWINE_PASSWORD=pypi-AgEIcHlwaS5vcmcCJDEyMzQ1Njc4LTlhYmMtNGRlZi1hYmNkLTEyMzQ1Njc4OWFiYwACKlszLCJhYmNkZWYxMjM0NTY3ODkwYWJjZGVmMTIzNDU2Nzg5MGFiY2RlZiJdAAAGIKzV	TWINE_PASSWORD=pypi-… (141 chars)
+secrets.tsv	token = "dop_v1_3f9a7c1e5b2d48a06e7f1c3b9d5a2e4f8c0b6d1a7e3f9c5b2d8a4e6f0c1b7d3a"	token = "dop_v1_… (71 chars)"
+secrets.tsv	access = "doo_v1_3f9a7c1e5b2d48a06e7f1c3b9d5a2e4f8c0b6d1a7e3f9c5b2d8a4e6f0c1b7d3a"	access = "doo_v1_… (71 chars)"
+secrets.tsv	REPLICATE = "r8_Xk29LmQp3ZxW8vRt5Nb7Cd4Ye1Fg6Hj0Km2Pq8Rs"	REPLICATE = "r8_… (43 chars)"
+secrets.tsv	const headers = { Authorization: "lin_api_Xk29LmQp3ZxW8vRt5Nb7Cd4Ye1Fg6Hj0Km2Pq" };	const headers = { Authorization: "lin_api_… (45 chars)" };
+secrets.tsv	NOTION_TOKEN=ntn_Xk29LmQp3ZxW8vRt5Nb7Cd4Ye1Fg6Hj0Km2Pq8	NOTION_TOKEN=ntn_… (42 chars)
+secrets.tsv	curl -u deploy:Xk29LmQp3ZxW8vRt https://registry.internal/v2/	curl -u deploy:… (16 chars) https://registry.internal/v2/
+secrets.tsv	curl --user "deploy:Xk29LmQp3ZxW8vRt" https://registry.internal/v2/	curl --user "deploy:… (17 chars) https://registry.internal/v2/
+secrets.tsv	curl -sSf -udeploy:Xk29LmQp3ZxW8vRt https://registry.internal/	curl -sSf -udeploy:… (16 chars) https://registry.internal/
+secrets.tsv	docker login registry.internal -u ci -p Xk29LmQp3ZxW8vRt	docker login registry.internal -u ci -p … (16 chars)
+secrets.tsv	docker login --username ci --password Xk29LmQp3ZxW8vRt registry.internal	docker login --username ci --password … (16 chars) registry.internal
+secrets.tsv	vault-cli connect --host db.internal --password Xk29LmQp3ZxW8vRt	vault-cli connect --host db.internal --password … (16 chars)
+secrets.tsv	machine registry.internal login ci password Xk29LmQp3ZxW8vRt	machine registry.internal login ci password … (16 chars)
+secrets.tsv	  password Xk29LmQp3ZxW8vRt	  password … (16 chars)
+secrets.tsv	curl -u "$USER:$PASS" https://registry.internal/v2/	curl -u "$USER:$PASS" https://registry.internal/v2/
+secrets.tsv	curl -u deploy https://registry.internal/v2/	curl -u deploy https://registry.internal/v2/
+secrets.tsv	curl -u deploy:<your-password> https://registry.internal/v2/	curl -u deploy:<your-password> https://registry.internal/v2/
+secrets.tsv	echo "$TOKEN" | docker login registry.internal -u ci --password-stdin	echo "$TOKEN" | docker login registry.internal -u ci --password-stdin
+secrets.tsv	docker login -u ci -p - registry.internal	docker login -u ci -p - registry.internal
+secrets.tsv	vault-cli connect --password "$DB_PASSWORD"	vault-cli connect --password "$DB_PASSWORD"
+secrets.tsv	vault-cli connect --password --host db.internal	vault-cli connect --password --host db.internal
+secrets.tsv	The password line holds the secret for that machine.	The password line holds the secret for that machine.
+secrets.tsv	PyPI tokens all begin with pypi- so scanners can find them.	PyPI tokens all begin with pypi- so scanners can find them.
+secrets.tsv	def run_ntn_scheduler_for_each_worker_pool_in_region_x(): pass	def run_ntn_scheduler_for_each_worker_pool_in_region_x(): pass
+secrets_holdout.tsv	spring.datasource.password=Pr0dDbP4ss2026	spring.datasource.password=… (14 chars)
+secrets_holdout.tsv	  "apiKey": "AbC123dEf456GhI789jKl0",	  "apiKey": "… (22 chars)",
+secrets_holdout.tsv	REDIS_URL=redis://:9xYzQ8wVu7tS6rQ5@cache.internal:6379/0	REDIS_URL=redis://:… (16 chars)@cache.internal:6379/0
+secrets_holdout.tsv	const auth = "Basic dXNlcjpwYXNzd29yZA==";	const auth = "Basic … (20 chars)";
+secrets_holdout.tsv	curl -H "X-API-Key: 7d9f3e1a2b4c6d8e0f1a3b5c7d9e1f2a" "$URL"	curl -H "X-API-Key: … (32 chars)" "$URL"
+secrets_holdout.tsv	secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYzz9EXAMPLE	secret_access_key: … (40 chars)
+secrets_holdout.tsv	jwt_secret = "kP9#mQ2$vL7@nR4!"	jwt_secret = "… (16 chars)"
+secrets_holdout.tsv	ENCRYPTION_KEY=3q2+7w==AbCdEfGh12345678	ENCRYPTION_KEY=… (24 chars)
+secrets_holdout.tsv	client = StripeClient("sk_test_4eC39HqLyjWDarjtT1zdp7dc")	client = StripeClient("sk_test_… (32 chars)")
+secrets_holdout.tsv	discord_token: MTIzNDU2Nzg5MDEyMzQ1Njc4.GhIjKl.MnOpQrStUvWxYzAbCdEfGhIjKlMnOpQrStUvWx	discord_token: … (70 chars)
+secrets_holdout.tsv	headers = {"Authorization": "Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"}	headers = {"Authorization": "Token … (40 chars)"}
+secrets_holdout.tsv	password: "hunter2!"	password: "… (8 chars)"
+secrets_holdout.tsv	mysql -u root -pS3cretRootPw appdb	mysql -u root -p… (12 chars) appdb
+secrets_holdout.tsv	AZURE_CLIENT_SECRET=Q~8Q~abcDEF123ghiJKL456mnoPQR789stu	AZURE_CLIENT_SECRET=… (35 chars)
+secrets_holdout.tsv	lftp ftp://deploy:Tr1cky-Pass_99@files.example.org/upload	lftp ftp://deploy:… (14 chars)@files.example.org/upload
+secrets_holdout.tsv	self.secret = "e0f1d2c3b4a5968778695a4b3c2d1e0f"	self.secret = "… (32 chars)"
+secrets_holdout.tsv	PGPASSWORD=xv9Lq2Rt7pW3 psql -h db -U app	PGPASSWORD=… (12 chars) psql -h db -U app
+secrets_holdout.tsv	val apiToken = "a7Hk29LmQp3ZxW8vRt5N"	val apiToken = "… (20 chars)"
+secrets_holdout.tsv	secret_key = "9c1f6b2e8a4d7f3c5e0b9a8d"	secret_key = "… (24 chars)"
+secrets_holdout.tsv	const ADMIN_PASSWORD: &str = "Wint3r!sComing2026";	const ADMIN_PASSWORD: &str = "… (18 chars)";
+secrets_holdout.tsv	password_confirmation = request.form["password_confirmation"]	password_confirmation = request.form["password_confirmation"]
+secrets_holdout.tsv	token = jwt.encode(payload, key, algorithm="HS256")	token = jwt.encode(payload, key, algorithm="HS256")
+secrets_holdout.tsv	if password == stored_password:	if password == stored_password:
+secrets_holdout.tsv	  "password": "",	  "password": "",
+secrets_holdout.tsv	      api_key: ${API_KEY:?missing}	      api_key: ${API_KEY:?missing}
+secrets_holdout.tsv	secret: !vault |	secret: !vault |
+secrets_holdout.tsv	TOKEN_EXPIRY_SECONDS = 86400	TOKEN_EXPIRY_SECONDS = 86400
+secrets_holdout.tsv	const passwordRegex = /^(?=.*\\d).{8,}$/;	const passwordRegex = /^(?=.*\\d).{8,}$/;
+secrets_holdout.tsv	<input type="password" name="password" autocomplete="current-password">	<input type="password" name="password" autocomplete="current-password">
+secrets_holdout.tsv	auth_method: oauth2_client_credentials	auth_method: oauth2_client_credentials
+secrets_holdout.tsv	secretsmanager.get_secret_value(SecretId="prod/api-key")	secretsmanager.get_secret_value(SecretId="prod/api-key")
+secrets_holdout.tsv	token_type = "Bearer"	token_type = "Bearer"
+secrets_holdout.tsv	git config credential.helper store	git config credential.helper store
+secrets_holdout.tsv	password = hash_password(raw)	password = hash_password(raw)
+secrets_holdout.tsv	resetToken: z.string().min(32),	resetToken: z.string().min(32),
+secrets_holdout.tsv	// Use Bearer authentication with a token from /oauth/token	// Use Bearer authentication with a token from /oauth/token
+secrets_holdout.tsv	### secret_scan: blocking	### secret_scan: blocking
+secrets_holdout.tsv	api_key_header = "X-Api-Key"	api_key_header = "X-Api-Key"
+secrets_holdout.tsv	      POSTGRES_PASSWORD_FILE=/run/secrets/db_password	      POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+secrets_holdout.tsv	auth_required: true	auth_required: true
+secrets_holdout.tsv	secret = os.urandom(32)	secret = os.urandom(32)
+secrets_holdout.tsv	      MasterUserPassword: !Ref DbPasswordParam	      MasterUserPassword: !Ref DbPasswordParam
+secrets_holdout.tsv	rabbit = "amqp://guest:guest@localhost:5672/"	rabbit = "amqp://guest:guest@localhost:5672/"
+secrets_holdout.tsv	  "private_key_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",	  "private_key_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+secrets_holdout.tsv	TOKENIZERS_PARALLELISM=false	TOKENIZERS_PARALLELISM=false
+secrets_holdout.tsv	tok, err := auth.TokenFromContext(ctx)	tok, err := auth.TokenFromContext(ctx)
+secrets_holdout.tsv	  accessToken: string;	  accessToken: string;
+secrets_holdout.tsv	Log in with your GitHub account; no password is stored.	Log in with your GitHub account; no password is stored.
+secrets_holdout_2.tsv	  password: Kq7vT2mWx9Lp	  password: … (12 chars)
+secrets_holdout_2.tsv	const apiKey = "Zr8nV3qL6tY1wB4kP7sD"	const apiKey = "… (20 chars)"
+secrets_holdout_2.tsv	_auth=ZGVwbG95OlNlY3JldFBhc3MyMDI2	_auth=… (28 chars)
+secrets_holdout_2.tsv	curl -u admin:Qw3rtyPa55word https://ci.internal/api	curl -u admin:… (14 chars) https://ci.internal/api
+secrets_holdout_2.tsv	      - POSTGRES_PASSWORD=Vb6mN1qZ8xRt	      - POSTGRES_PASSWORD=… (12 chars)
+secrets_holdout_2.tsv	SECRET_KEY = "django-insecure-7f#k2!q9z@x1m$w4v8b3n6p0r5t"	SECRET_KEY = "… (43 chars)"
+secrets_holdout_2.tsv	  token: c2VjcmV0dG9rZW4xMjM0NTY3OA==	  token: … (28 chars)
+secrets_holdout_2.tsv	headers: { Authorization: "Bearer 4f9a2c7e1b8d3f6a0c5e9b2d7f1a4c8e" }	headers: { Authorization: "Bearer … (32 chars)" }
+secrets_holdout_2.tsv	requirepass Hn4kR8wQ2zXv6	requirepass Hn4kR8wQ2zXv6
+secrets_holdout_2.tsv	private static final String DB_PASSWORD = "Mx92kLpQ7vRt";	private static final String DB_PASSWORD = "… (12 chars)";
+secrets_holdout_2.tsv	"Default": "Server=db;Database=shop;User Id=sa;Password=Yt5rE3wQ1zXc;"	"Default": "Server=db;Database=shop;User Id=sa;Password=… (12 chars);"
+secrets_holdout_2.tsv	TELEGRAM_TOKEN = "123456789:AAH4kZ9xQ2mWv7LpR3tYb8NcJ6dF1sE0gU5"	TELEGRAM_TOKEN = "… (45 chars)"
+secrets_holdout_2.tsv	sshpass -p 'Lm8nB2vC6xZq' ssh deploy@10.0.0.4	sshpass -p … (14 chars) ssh deploy@10.0.0.4
+secrets_holdout_2.tsv	bind_password = Rq3wE7tY1uI9	bind_password = … (12 chars)
+secrets_holdout_2.tsv	  master_password = "Tf8vB3nM6qZ1xL"	  master_password = "… (14 chars)"
+secrets_holdout_2.tsv	config.smtp_settings = { user_name: "apikey", password: "SG.AAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }	config.smtp_settings = { user_name: "apikey", password: "SG.… (69 chars)" }
+secrets_holdout_2.tsv	\tClientSecret: "Xq8vN2mL5tR9wK3pZ7bY1cJ4",	\tClientSecret: "… (24 chars)",
+secrets_holdout_2.tsv	Use token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA for the migration.	Use token ghp_… (40 chars) for the migration.
+secrets_holdout_2.tsv	passphrase = "b7!Kq#2mZ@x9"	passphrase = "… (12 chars)"
+secrets_holdout_2.tsv	  sessionSecret: "Wq4eR8tY2uI6oP0a",	  sessionSecret: "… (16 chars)",
+secrets_holdout_2.tsv	DB_PASSWORD = os.getenv("DB_PASSWORD")	DB_PASSWORD = os.getenv("DB_PASSWORD")
+secrets_holdout_2.tsv	  password: "Password must be at least 8 characters",	  password: "Password must be at least 8 characters",
+secrets_holdout_2.tsv	  secret: ${APP_SECRET}	  secret: ${APP_SECRET}
+secrets_holdout_2.tsv	  credentials: "include",	  credentials: "include",
+secrets_holdout_2.tsv	    password_hash = db.Column(db.String(128))	    password_hash = db.Column(db.String(128))
+secrets_holdout_2.tsv	  token: string;	  token: string;
+secrets_holdout_2.tsv	\tToken string `json:"token"`	\tToken string `json:"token"`
+secrets_holdout_2.tsv	  auth-mode: client-credentials	  auth-mode: client-credentials
+secrets_holdout_2.tsv	token = request.headers.get("X-Token")	token = request.headers.get("X-Token")
+secrets_holdout_2.tsv	Set the password with `--password` or the PGPASSWORD variable.	Set the password with `--password` or the PGPASSWORD variable.
+secrets_holdout_2.tsv	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+secrets_holdout_2.tsv	    password = "fake-password-123"	    password = "fake-password-123"
+secrets_holdout_2.tsv	  client_id: 1234567890-abc.apps.googleusercontent.com	  client_id: 1234567890-abc.apps.googleusercontent.com
+secrets_holdout_2.tsv	  post "/password/reset", to: "passwords#reset"	  post "/password/reset", to: "passwords#reset"
+secrets_holdout_2.tsv	  token_version: v2-rotating	  token_version: v2-rotating
+secrets_holdout_2.tsv	<input type="password" placeholder="Enter password" />	<input type="password" placeholder="Enter password" />
+secrets_holdout_2.tsv	export API_TOKEN="$(vault read -field=token secret/ci)"	export API_TOKEN="$(vault read -field=token secret/ci)"
+secrets_holdout_2.tsv	String token = tokenService.issue(user, Duration.ofHours(1));	String token = tokenService.issue(user, Duration.ofHours(1));
+secrets_holdout_2.tsv	  secret_rotation_days: 90	  secret_rotation_days: 90
+secrets_holdout_2.tsv	-----BEGIN CERTIFICATE-----	-----BEGIN CERTIFICATE-----
+secrets_holdout_2.tsv	logger.info("token refreshed for %s", user_id)	logger.info("token refreshed for %s", user_id)
+secrets_holdout_2.tsv	  apiKey: process.env.NEXT_PUBLIC_API_KEY ?? "",	  apiKey: process.env.NEXT_PUBLIC_API_KEY ?? "",
+secrets_holdout_2.tsv	curl -H "Authorization: Bearer <your-token>" https://api.example.com	curl -H "Authorization: Bearer <your-token>" https://api.example.com
+secrets_holdout_2.tsv	\tPassword string `db:"password_digest"`	\tPassword string `db:"password_digest"`
+secrets_holdout_2.tsv	build_sha = 4f2a9c1e7b3d8f6a0c5e9b2d7f1a4c8e3b6d9f2a	build_sha = 4f2a9c1e7b3d8f6a0c5e9b2d7f1a4c8e3b6d9f2a
+secrets_holdout_2.tsv	const session = await login(username, password);	const session = await login(username, password);
