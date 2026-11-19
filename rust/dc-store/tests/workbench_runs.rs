@@ -1516,3 +1516,335 @@ fn external_terminal_thread_binding_is_owned_immutable_and_preserved_across_fini
         "run_kind_mismatch"
     );
 }
+
+#[test]
+fn skip_checkout_occupancy_allows_concurrent_remote_and_local_runs_without_blocking_each_other() {
+    let (store, _) = fixture();
+    let with_skip = |id: &str, req: &str, skip: Option<bool>| {
+        let base = PREPARE
+            .replace("\"run\"", &format!("\"{id}\""))
+            .replace("\"prepare\"", &format!("\"{req}\""));
+        match skip {
+            None => base,
+            Some(v) => base.trim_end_matches('}').to_owned()
+                + &format!(",\"skip_checkout_occupancy\":{v}}}"),
+        }
+    };
+
+    // Omitted `skip_checkout_occupancy` keeps normalized `work_requests` JSON unchanged
+    // and enforces `checkout_busy` against subsequent local runs (omitted or `false`).
+    let local_1 = call(&store, "runs.prepare", &with_skip("local-1", "prep-local-1", None));
+    assert_eq!(number(&store, &local_1, "$.item.skip_checkout_occupancy"), 0);
+    let stored_req: String = store
+        .connection()
+        .query_row(
+            "SELECT input FROM work_requests WHERE id='prep-local-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !stored_req.contains("skip_checkout_occupancy"),
+        "normalized work_requests JSON must remain unchanged when omitted: {stored_req}"
+    );
+    assert_eq!(
+        request(&store, "runs.prepare", &with_skip("local-dup", "prep-local-dup", None))
+            .unwrap_err()
+            .code,
+        "checkout_busy"
+    );
+    assert_eq!(
+        request(
+            &store,
+            "runs.prepare",
+            &with_skip("local-false", "prep-local-false", Some(false))
+        )
+        .unwrap_err()
+        .code,
+        "checkout_busy"
+    );
+
+    // A `skip_checkout_occupancy: true` run is admitted while a local run holds the checkout,
+    // and multiple `skip_checkout_occupancy: true` runs are admitted concurrently on that checkout.
+    let remote_1 = call(
+        &store,
+        "runs.prepare",
+        &with_skip("remote-1", "prep-remote-1", Some(true)),
+    );
+    assert_eq!(number(&store, &remote_1, "$.item.skip_checkout_occupancy"), 1);
+    let remote_1_got = call(&store, "runs.get", r#"{"id":"remote-1"}"#);
+    assert_eq!(
+        number(&store, &remote_1_got, "$.item.skip_checkout_occupancy"),
+        1
+    );
+    let remote_2 = call(
+        &store,
+        "runs.prepare",
+        &with_skip("remote-2", "prep-remote-2", Some(true)),
+    );
+    assert_eq!(number(&store, &remote_2, "$.item.skip_checkout_occupancy"), 1);
+
+    // Cancel the local run; `remote-1` and `remote-2` remain active, yet local runs
+    // (both omitted and explicit `false`) are admitted across `prepared`, `starting`,
+    // `running`, and `unresolved` states.
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"local-1","request_id":"cancel-local-1","expected_revision":1}"#,
+    );
+
+    // State 1: `prepared` (both `remote-1` and `remote-2` are prepared).
+    call(
+        &store,
+        "runs.prepare",
+        &with_skip("local-while-prep", "prep-local-while-prep", None),
+    );
+    // Two local runs still collide with each other even while remote runs exist.
+    assert_eq!(
+        request(
+            &store,
+            "runs.prepare",
+            &with_skip("local-collide", "prep-local-collide", Some(false))
+        )
+        .unwrap_err()
+        .code,
+        "checkout_busy"
+    );
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"local-while-prep","request_id":"cancel-lwp","expected_revision":1}"#,
+    );
+
+    // State 2: `starting` (`remote-1` claimed; `remote-2` still `prepared`).
+    call(
+        &store,
+        "runs.claim",
+        r#"{"id":"remote-1","request_id":"claim-r1","expected_revision":1,"owner_id":"host-one","session_id":"sess-r1"}"#,
+    );
+    call(
+        &store,
+        "runs.prepare",
+        &with_skip("local-while-start", "prep-local-while-start", Some(false)),
+    );
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"local-while-start","request_id":"cancel-lws","expected_revision":1}"#,
+    );
+
+    // State 3: `running` (`remote-1` started).
+    call(
+        &store,
+        "runs.started",
+        r#"{"id":"remote-1","request_id":"start-r1","expected_revision":2,"owner_id":"host-one","session_id":"sess-r1","process_id":101,"process_start":"boot:r1"}"#,
+    );
+    call(
+        &store,
+        "runs.prepare",
+        &with_skip("local-while-run", "prep-local-while-run", None),
+    );
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"local-while-run","request_id":"cancel-lwr","expected_revision":1}"#,
+    );
+
+    // State 4: `unresolved` (`remote-1` finished as unresolved).
+    call(
+        &store,
+        "runs.finish",
+        r#"{"id":"remote-1","request_id":"unres-r1","expected_revision":3,"owner_id":"host-one","session_id":"sess-r1","outcome":"unresolved","reason":"ssh dropped"}"#,
+    );
+    call(
+        &store,
+        "runs.prepare",
+        &with_skip("local-while-unres", "prep-local-while-unres", Some(false)),
+    );
+
+    // Legacy `work_runs` row without `$.skip_checkout_occupancy` still occupies checkout.
+    store
+        .connection()
+        .execute(
+            "UPDATE work_runs SET body=json_remove(body,'$.skip_checkout_occupancy') WHERE id='local-while-unres'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        request(
+            &store,
+            "runs.prepare",
+            &with_skip("local-after-legacy", "prep-local-after-legacy", None)
+        )
+        .unwrap_err()
+        .code,
+        "checkout_busy"
+    );
+    call(
+        &store,
+        "runs.prepare",
+        &with_skip("remote-after-legacy", "prep-remote-after-legacy", Some(true)),
+    );
+}
+
+#[test]
+fn skip_checkout_occupancy_validates_input_and_preserves_run_invariants() {
+    let (store, clock) = fixture();
+
+    // Non-boolean values are refused with `invalid_input` and leave no run behind.
+    for (idx, bad) in ["\"yes\"", "1", "0", "[]", "{}"].iter().enumerate() {
+        let input = PREPARE
+            .replace("\"run\"", &format!("\"bad-{idx}\""))
+            .replace("\"prepare\"", &format!("\"prep-bad-{idx}\""))
+            .trim_end_matches('}')
+            .to_owned()
+            + &format!(",\"skip_checkout_occupancy\":{bad}}}");
+        assert_eq!(
+            request(&store, "runs.prepare", &input).unwrap_err().code,
+            "invalid_input",
+            "accepted non-boolean skip_checkout_occupancy={bad}"
+        );
+    }
+    assert_eq!(
+        number(&store, &call(&store, "runs.list", "{}"), "$.total"),
+        0
+    );
+
+    // `null` follows `Input::boolean` default (`false`), keeping checkout occupancy enforced.
+    let null_input = PREPARE
+        .replace("\"run\"", "\"run-null\"")
+        .replace("\"prepare\"", "\"prep-null\"")
+        .trim_end_matches('}')
+        .to_owned()
+        + ",\"skip_checkout_occupancy\":null}";
+    let null_prepared = call(&store, "runs.prepare", &null_input);
+    assert_eq!(
+        number(&store, &null_prepared, "$.item.skip_checkout_occupancy"),
+        0
+    );
+    assert_eq!(
+        request(
+            &store,
+            "runs.prepare",
+            &PREPARE
+                .replace("\"run\"", "\"run-after-null\"")
+                .replace("\"prepare\"", "\"prep-after-null\"")
+        )
+        .unwrap_err()
+        .code,
+        "checkout_busy"
+    );
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"run-null","request_id":"cancel-null","expected_revision":1}"#,
+    );
+
+    // `max_active_runs` capacity still bounds `skip_checkout_occupancy: true` runs.
+    let remote = |id: &str, req: &str, max_runs: Option<i64>| {
+        let mut s = PREPARE
+            .replace("\"run\"", &format!("\"{id}\""))
+            .replace("\"prepare\"", &format!("\"{req}\""))
+            .trim_end_matches('}')
+            .to_owned()
+            + ",\"skip_checkout_occupancy\":true";
+        if let Some(m) = max_runs {
+            s.push_str(&format!(",\"max_active_runs\":{m}"));
+        }
+        s.push('}');
+        s
+    };
+    call(&store, "runs.prepare", &remote("cap-1", "p-cap-1", Some(2)));
+    call(&store, "runs.prepare", &remote("cap-2", "p-cap-2", Some(2)));
+    assert_eq!(
+        request(&store, "runs.prepare", &remote("cap-3", "p-cap-3", Some(2)))
+            .unwrap_err()
+            .code,
+        "capacity_reached"
+    );
+
+    // `items.delete` and `repositories.relink` still refuse while a `skip_checkout_occupancy` run is active.
+    assert_eq!(
+        request(
+            &store,
+            "items.delete",
+            r#"{"id":"t","request_id":"del-t","expected_revision":1}"#
+        )
+        .unwrap_err()
+        .code,
+        "task_in_use"
+    );
+    assert_eq!(
+        request(
+            &store,
+            "repositories.relink",
+            r#"{"id":"r","request_id":"relink-r","expected_revision":1,"identity_key":"local:/moved/.git"}"#
+        )
+        .unwrap_err()
+        .code,
+        "repository_busy"
+    );
+
+    // `runs.claim` still checks snapshot revision and expiry, and `runs.reconcile` works identically.
+    call(
+        &store,
+        "runs.claim",
+        r#"{"id":"cap-1","request_id":"claim-cap-1","expected_revision":1,"owner_id":"host-one","session_id":"sess-cap-1"}"#,
+    );
+    call(
+        &store,
+        "runs.started",
+        r#"{"id":"cap-1","request_id":"start-cap-1","expected_revision":2,"owner_id":"host-one","session_id":"sess-cap-1","process_id":77,"process_start":"boot:cap1"}"#,
+    );
+    let reconciled = call(
+        &store,
+        "runs.reconcile",
+        &reconcile(
+            "cap-1",
+            3,
+            "host-two",
+            "host-one",
+            "remote runner host vanished",
+        ),
+    );
+    assert_eq!(text(&store, &reconciled, "$.item.state"), "exited");
+    assert_eq!(
+        number(&store, &reconciled, "$.item.outcome_uncertain"),
+        1
+    );
+    assert_eq!(
+        number(&store, &reconciled, "$.item.skip_checkout_occupancy"),
+        1
+    );
+
+    // Snapshot change refuses `runs.claim` on `cap-2`.
+    call(
+        &store,
+        "items.put",
+        r#"{"id":"t","request_id":"edit-t","expected_revision":1,"title":"Updated title","repository_ids":["r"],"primary_repository_id":"r"}"#,
+    );
+    assert_eq!(
+        request(
+            &store,
+            "runs.claim",
+            r#"{"id":"cap-2","request_id":"claim-cap-2-stale","expected_revision":1,"owner_id":"host-one","session_id":"sess-cap-2"}"#
+        )
+        .unwrap_err()
+        .code,
+        "revision_conflict"
+    );
+
+    // Expiry refuses `runs.claim` on a freshly prepared `skip_checkout_occupancy: true` run.
+    call(&store, "runs.prepare", &remote("exp-1", "p-exp-1", None).replace("\"source_revision\":1", "\"source_revision\":2"));
+    clock.store(1300, Ordering::SeqCst);
+    assert_eq!(
+        request(
+            &store,
+            "runs.claim",
+            r#"{"id":"exp-1","request_id":"claim-exp-1","expected_revision":1,"owner_id":"host-one","session_id":"sess-exp-1"}"#
+        )
+        .unwrap_err()
+        .code,
+        "expired"
+    );
+}
