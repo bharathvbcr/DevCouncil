@@ -21,13 +21,29 @@ const path = require("node:path");
 
 const WIN32 = process.platform === "win32";
 
-// Set in the environment of the binary the shim spawns. A shim that starts
-// with it already set was reached again from its own child: refuse.
-const SHIM_ACTIVE_ENV = "DEVCOUNCIL_SHIM_ACTIVE";
+// Recursion bound. Each shim passes depth+1 to the binary it spawns; a shim
+// reached through a chain of itself (DEVCOUNCIL_BIN or PATH resolving back to
+// a shim) climbs one level per hop and stops at MAX_SHIM_DEPTH. Legitimate
+// nesting (agent sessions, hooks, verify commands calling the shim again) is
+// far shallower. Rule: only a plain run of decimal digits counts; a missing,
+// empty, negative, fractional, exponent or otherwise non-numeric value is 0.
+const SHIM_DEPTH_ENV = "DEVCOUNCIL_SHIM_DEPTH";
+const MAX_SHIM_DEPTH = 16;
+
+function shimDepth(env = process.env) {
+  const raw = env[SHIM_DEPTH_ENV];
+  return typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : 0;
+}
+
+// The depth the spawned binary inherits.
+function childShimDepthEnv(env = process.env) {
+  return { [SHIM_DEPTH_ENV]: String(shimDepth(env) + 1) };
+}
 
 function shimRecursionProblem(env = process.env) {
-  return env[SHIM_ACTIVE_ENV]
-    ? `the devcouncil npm shim was re-entered from the binary it launched (${SHIM_ACTIVE_ENV} is set); refusing to recurse. Point PATH or DEVCOUNCIL_BIN at the native devcouncil binary, not at this shim.`
+  const depth = shimDepth(env);
+  return depth >= MAX_SHIM_DEPTH
+    ? `${SHIM_DEPTH_ENV}=${depth} reaches the limit of ${MAX_SHIM_DEPTH}: the devcouncil npm shim keeps launching itself. Likely cause: DEVCOUNCIL_BIN or PATH resolves back to a shim instead of the native devcouncil binary.`
     : null;
 }
 
@@ -192,7 +208,7 @@ function run(command, args) {
     cwd: process.cwd(),
     stdio: "inherit",
     shell: false,
-    env: { ...spawnEnv(), [SHIM_ACTIVE_ENV]: "1" },
+    env: { ...spawnEnv(), ...childShimDepthEnv() },
   });
 }
 
@@ -250,5 +266,8 @@ module.exports = {
   isSelf,
   looksLikeNodeShim,
   shimRecursionProblem,
-  SHIM_ACTIVE_ENV,
+  shimDepth,
+  childShimDepthEnv,
+  SHIM_DEPTH_ENV,
+  MAX_SHIM_DEPTH,
 };

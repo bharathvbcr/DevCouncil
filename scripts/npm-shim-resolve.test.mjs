@@ -210,7 +210,7 @@ test("adv: requiring the shim does not run main (no exit, no spawn)", () => {
 });
 
 // --- fix round 1: override validation, recursion guard, win32 PATH/HOME ---
-const { shimRecursionProblem, SHIM_ACTIVE_ENV } = require(shimPath);
+const { shimRecursionProblem, shimDepth, childShimDepthEnv, SHIM_DEPTH_ENV, MAX_SHIM_DEPTH } = require(shimPath);
 
 test("override naming the shim itself is refused with an error naming the variable", posixOnly, () => {
   assert.throws(
@@ -269,9 +269,33 @@ test("win32 override must be .exe or .com", () => {
   );
 });
 
-test("recursion guard refuses when the marker is already set", () => {
+test("recursion guard allows depth 0..15 and refuses 16 and above", () => {
+  assert.equal(MAX_SHIM_DEPTH, 16);
   assert.equal(shimRecursionProblem({}), null);
-  assert.match(shimRecursionProblem({ [SHIM_ACTIVE_ENV]: "1" }), /itself|recurs/i);
+  for (const d of ["0", "1", "15"]) {
+    assert.equal(shimRecursionProblem({ [SHIM_DEPTH_ENV]: d }), null, d);
+  }
+  for (const d of ["16", "17", "99999999999999999999"]) {
+    const msg = shimRecursionProblem({ [SHIM_DEPTH_ENV]: d });
+    assert.match(msg, /DEVCOUNCIL_SHIM_DEPTH=/, d);
+    assert.match(msg, /DEVCOUNCIL_BIN or PATH/, d);
+  }
+  assert.match(shimRecursionProblem({ [SHIM_DEPTH_ENV]: "16" }), /=16 /);
+});
+
+test("shimDepth: only plain decimal digits count; anything else is 0", () => {
+  assert.equal(shimDepth({}), 0);
+  for (const bad of ["", "abc", "-3", "1e9", "1.5", " 3", "0x10", "+4"]) {
+    assert.equal(shimDepth({ [SHIM_DEPTH_ENV]: bad }), 0, JSON.stringify(bad));
+    assert.equal(shimRecursionProblem({ [SHIM_DEPTH_ENV]: bad }), null, JSON.stringify(bad));
+  }
+  assert.equal(shimDepth({ [SHIM_DEPTH_ENV]: "7" }), 7);
+});
+
+test("the child env carries depth+1 (garbage counts as 0)", () => {
+  assert.deepEqual(childShimDepthEnv({}), { [SHIM_DEPTH_ENV]: "1" });
+  assert.deepEqual(childShimDepthEnv({ [SHIM_DEPTH_ENV]: "15" }), { [SHIM_DEPTH_ENV]: "16" });
+  assert.deepEqual(childShimDepthEnv({ [SHIM_DEPTH_ENV]: "-3" }), { [SHIM_DEPTH_ENV]: "1" });
 });
 
 test("win32 drops relative PATH entries (they would probe the cwd)", () => {
