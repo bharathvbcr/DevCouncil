@@ -163,7 +163,7 @@ export function expectedRowLabels(source) {
  * green over a log holding "3/8 tests failed (exit 101)".
  *
  * Nested (--continue --nested) the output must hold exactly one summary block:
- * header, at least one well-formed row, a blank line ending it, no FAIL row,
+ * header, at least one well-formed row, a blank line ending it, no FAIL or SKIP row,
  * and, when `labels` is given, one row per declared step in order. Exactly one
  * rather than "judge each": verify.sh prints its block once, at the end, so a
  * second header means the output is not one run's, and no reading of two blocks
@@ -187,6 +187,8 @@ export function nestedGateProblem(log, { nested, labels }) {
     const rows = [];
     while (i < lines.length && NESTED_ROW.test(lines[i])) {
       if (lines[i].trimStart().startsWith("FAIL")) return `exit 0 but the summary block has a FAIL row: ${lines[i].trim()}`;
+      // verify.sh exits 2 whenever any row is SKIP, so an exit 0 beside one is not its status.
+      if (lines[i].trimStart().startsWith("SKIP")) return `exit 0 but the summary block has a SKIP row: ${lines[i].trim()}`;
       rows.push(lines[i]);
       i++;
     }

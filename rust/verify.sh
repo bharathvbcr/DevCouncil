@@ -185,10 +185,12 @@ TMP1=$(mktemp -d) ; TMP2=$(mktemp -d)
 if [ "$CONTINUE" -eq 1 ]; then STATE=$(mktemp -d); fi
 # The trap re-exits with the status it was entered with: a trap's own status
 # (rm succeeding) otherwise replaces a crash's, and a run that died reports 0.
-# That is not enough on bash 3.2 (macOS /bin/bash): a top-level `set -u` abort
-# enters the trap with $? = 0. So a run says it finished by setting COMPLETED=1
-# as the last thing it does before a successful exit, and a 0 without it is
-# turned into 1. A non-zero status is kept as it is.
+# That is not enough on bash 3.2.57 (macOS /bin/bash): an unbound variable read
+# inside an ARITHMETIC expansion under `set -u` (x=$(( nope + 1 ))) aborts the
+# script with status 0, trap or no trap, while a plain `echo $nope` exits 1.
+# So a run says it finished by setting COMPLETED=1 as the last thing it does
+# before a successful exit, and a 0 without it is turned into 1. A non-zero
+# status is kept as it is.
 COMPLETED=0
 trap 'status=$?; rm -rf "$TMP1" "$TMP2" ${STATE:+"$STATE"}; if [ "$status" -eq 0 ] && [ "$COMPLETED" -ne 1 ]; then status=1; fi; exit "$status"' EXIT
 

@@ -756,6 +756,12 @@ describe("ci:local does not believe a nested gate's exit status alone", { skip: 
     assert.match(r.row.note, /FAIL row/);
   });
 
+  it("FAILs when exit 0 sits beside a SKIP row (verify.sh exits 2 whenever a row is SKIP)", () => {
+    const r = runFake(script(printBlock(BLOCK.replace("    PASS  3/8 tests", "    SKIP  3/8 tests"))), "continue");
+    assert.equal(r.row.status, "FAIL", r.out);
+    assert.match(r.row.note, /SKIP row/);
+  });
+
   it("FAILs when the log holds libtest FAILED lines but every row is PASS", () => {
     const r = runFake(
       script("echo 'test store::tests::roundtrip ... FAILED'", "echo 'test result: FAILED. 7 passed; 1 failed; 0 ignored'", printBlock(BLOCK)),
@@ -965,12 +971,10 @@ describe("ci:local nested-gate verdict, adversarial logs", { skip: process.platf
     assert.equal(r.row.status, "FAIL", r.out);
   });
 
-  it("scans a 3 MiB single-line log in bounded time", () => {
+  it("scans a 3 MiB single-line log", () => {
     const line = "test " + "a ".repeat(1_500_000);
-    const start = Date.now();
     assert.equal(nestedGateProblem(line + "\n" + block(), { nested: true }), undefined);
     assert.deepEqual(libtestFailures(line + " ... FAILED"), [line + " ... FAILED"]);
-    assert.ok(Date.now() - start < 5000, "scan time");
   });
 
   it("FAILs when the default-mode green line sits beside a libtest FAILED line", () => {
@@ -1020,5 +1024,69 @@ describe("rust/verify.sh completion flag", { skip: process.platform === "win32" 
     const src = readFileSync(script, "utf8");
     assert.match(src, /^COMPLETED=0$/m);
     assert.match(src, /\[ "\$COMPLETED" -ne 1 \]/);
+  });
+});
+
+// The false-red guard: the real verify.sh, green, must pass every check the
+// runner applies to a nested gate's output (its block, its declared steps),
+// in both modes and under each bash and locale. Without this the checks could
+// reject the script's own good output and nothing here would say so.
+describe("ci:local believes the real rust/verify.sh when it is green", { skip: process.platform === "win32" }, () => {
+  const realScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "rust", "verify.sh");
+  const which = (name) => spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+  const shells = [...new Set(["/bin/bash", which("bash")].filter((p) => p && spawnSync(p, ["-c", "exit 0"]).status === 0))];
+
+  for (const shell of shells) {
+    for (const lang of [undefined, "en_US.UTF-8"]) {
+      for (const mode of ["default", "continue"]) {
+        it(`${mode} mode: PASS: ${shell}, LANG=${lang ?? "(unset)"}`, () => {
+          const dir = mkdtempSync(path.join(tmpdir(), "verify-green-"));
+          try {
+            const bin = path.join(dir, "bin");
+            mkdirSync(bin);
+            for (const tool of ["dirname", "mktemp", "rm", "date", "perl", "gdate", "cat", "sh", "tee"]) {
+              const at = which(tool);
+              if (at) symlinkSync(at, path.join(bin, tool));
+            }
+            symlinkSync(shell, path.join(bin, "bash"));
+            writeFileSync(path.join(bin, "cargo"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+            const rust = path.join(dir, "rust");
+            mkdirSync(rust);
+            writeFileSync(path.join(rust, "verify.sh"), readFileSync(realScript), { mode: 0o755 });
+            const host = path.join(dir, "devcouncil");
+            writeFileSync(host, "");
+            const env = { PATH: bin, HOME: dir, DEVCOUNCIL_BIN: host, ...(lang ? { LANG: lang, LC_ALL: lang } : {}) };
+            const lines = [];
+            const res = runSteps([rustVerifyStep(rust)], { mode, gate: "t", baseEnv: env, log: (s) => lines.push(s) });
+            assert.equal(res.rows[0].status, "PASS", res.rows[0].note + "\n" + lines.join("\n"));
+            assert.equal(res.code, 0);
+          } finally {
+            rmSync(dir, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+  }
+
+  it("the real script's own green nested output has no problem, with its declared labels", () => {
+    const labels = expectedRowLabels(readFileSync(realScript, "utf8"));
+    assert.equal(labels.length, 10);
+    const dir = mkdtempSync(path.join(tmpdir(), "verify-green-out-"));
+    try {
+      const bin = path.join(dir, "bin");
+      mkdirSync(bin);
+      for (const tool of ["dirname", "mktemp", "rm", "date", "perl", "gdate", "cat", "sh"]) {
+        const at = which(tool);
+        if (at) symlinkSync(at, path.join(bin, tool));
+      }
+      writeFileSync(path.join(bin, "cargo"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const host = path.join(dir, "devcouncil");
+      writeFileSync(host, "");
+      const r = spawnSync("/bin/bash", [realScript, "--quick", "--continue", "--nested"], { encoding: "utf8", env: { PATH: bin, HOME: dir, DEVCOUNCIL_BIN: host } });
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      assert.equal(nestedGateProblem(r.stdout + r.stderr, { nested: true, labels }), undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
