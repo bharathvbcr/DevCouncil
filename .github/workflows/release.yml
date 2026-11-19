@@ -309,7 +309,7 @@ jobs:
           exit 1
       - name: Install dist
         # Deliberate deviation from the dist-generated file (allow-dirty = ["ci"]): 
-        # a host-specific digest-pinned archive replaces matrix.install_dist.run.
+        # a host-specific digest-pinned archive replaces the generated per-target installer command.
         shell: bash
         run: |
           set -euo pipefail
@@ -381,8 +381,8 @@ jobs:
           merge-multiple: true
       - name: Build artifacts
         # Deliberate deviation from the dist-generated file (allow-dirty = ["ci"]): 
-        # fixed arguments replace matrix.dist_args (and matrix.packages_install is gone:
-        # the matrix declares no system packages).
+        # fixed arguments replace the generated per-target dist arguments, and the
+        # generated system-package step is gone (the matrix declares no system packages).
         shell: bash
         env:
           DIST_TAG: ${{ needs.plan.outputs.tag }}
