@@ -384,10 +384,9 @@ func TestAdversarialCaseAndNormalisationNeverAdmitOutside(t *testing.T) {
 	}
 }
 
-// The tag check prints OK to stdout before --artifacts is judged, so a refused
-// --artifacts leaves an OK line on stdout beside exit 1. The refusal itself
-// is still exit 1 with FAIL on stderr.
-func TestTagAtHeadOKLineThenArtifactsRefusalExitsOne(t *testing.T) {
+// --artifacts is judged before any git runs, so a refusal prints nothing to
+// stdout: no "would publish" OK line beside the FAIL.
+func TestArtifactsRefusalWithTagAtHeadPrintsNoOKLine(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
@@ -399,7 +398,20 @@ func TestTagAtHeadOKLineThenArtifactsRefusalExitsOne(t *testing.T) {
 	git(t, dir, "add", "a")
 	git(t, dir, "commit", "-q", "-m", "one")
 	code, stdout, stderr := runArgs("--root", dir, "--tag", "v9.9.9", "--tag-at-head", "--artifacts", "..")
-	if code != 1 || stderr != artifactsOutside || strings.Contains(stdout, "is consistent") {
+	if code != 1 || stdout != "" || stderr != artifactsOutside {
 		t.Fatalf("exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
 	}
+}
+
+// A dangling link whose target walks back through a link that leaves: the
+// ".." belongs to the link's real directory, not to the lexical path.
+func TestDanglingLinkThroughAnOutsideLinkIsRefused(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	outside := mkdirAll(t, filepath.Join(parent, "outside"))
+	mkdirAll(t, filepath.Join(outside, "sub"))
+	symlink(t, filepath.Join(outside, "sub"), filepath.Join(root, "s"))
+	// Join would clean the target to "x"; the link must keep the ".." as written.
+	symlink(t, "s"+string(filepath.Separator)+".."+string(filepath.Separator)+"x", filepath.Join(root, "link"))
+	assertArtifactsRefused(t, root, "link")
 }

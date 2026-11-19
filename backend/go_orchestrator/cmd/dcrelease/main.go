@@ -89,8 +89,9 @@ var errArtifactsOutside = errors.New("--artifacts is outside the checkout")
 // artifactsWithinCheckout resolves artifacts against root. An empty value
 // stays empty. A relative path is joined to the checkout. Root and candidate
 // are then resolved through symlinks (as far as they exist) and compared, so
-// a link inside the checkout that points out, a dangling link, and a root
-// that is itself a link are all judged by where they really lead. A missing
+// a link inside the checkout that points out, a dangling link (its target's
+// directory part is resolved, its missing tail is kept), and a root that is
+// itself a link are all judged by where they really lead. A missing
 // path that resolves inside is not a containment failure.
 func artifactsWithinCheckout(root, artifacts string) (string, error) {
 	if artifacts == "" {
@@ -156,9 +157,24 @@ func resolveExisting(p string) (string, error) {
 				return "", rerr
 			}
 			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(cur), target)
+				// Concatenated, not Joined: Join would clean ".." lexically.
+				target = filepath.Dir(cur) + string(filepath.Separator) + target
 			}
-			cur = filepath.Clean(target)
+			// The target's directory part may itself be a link, so ".." in it
+			// is taken from its real location. A directory that cannot be
+			// resolved is an error, never a lexical guess.
+			dirPart, base := target, ""
+			if i := strings.LastIndex(target, string(filepath.Separator)); i >= 0 {
+				dirPart, base = target[:i+1], target[i+1:]
+			}
+			if base == "" || base == "." || base == ".." {
+				dirPart, base = target, ""
+			}
+			dir, derr := filepath.EvalSymlinks(dirPart)
+			if derr != nil {
+				return "", derr
+			}
+			cur = filepath.Join(dir, base)
 			continue
 		}
 		if lerr == nil {
@@ -225,6 +241,15 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
+	artifacts, err := artifactsWithinCheckout(root, a.artifacts)
+	if err != nil {
+		if errors.Is(err, errArtifactsOutside) {
+			fmt.Fprintf(stderr, "FAIL: %s\n", errArtifactsOutside)
+			return 1
+		}
+		fmt.Fprintf(stderr, "dcrelease: %v\n", err)
+		return 2
+	}
 	if a.tagAtHead {
 		head, err := revParse(root, "HEAD")
 		if err == nil && head == "" {
@@ -243,15 +268,6 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "OK: %s would publish the notes at HEAD\n", a.tag)
-	}
-	artifacts, err := artifactsWithinCheckout(root, a.artifacts)
-	if err != nil {
-		if errors.Is(err, errArtifactsOutside) {
-			fmt.Fprintf(stderr, "FAIL: %s\n", errArtifactsOutside)
-			return 1
-		}
-		fmt.Fprintf(stderr, "dcrelease: %v\n", err)
-		return 2
 	}
 	result := release.Inspect(release.DefaultSources(root), release.Options{Tag: a.tag, ArtifactsDir: artifacts})
 	if len(result.Errors) > 0 {
