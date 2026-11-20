@@ -541,3 +541,100 @@ fn ownership_fts_damage_does_not_write() {
     assert_untouched("A's store after FTS damage and B's build", &db, &before);
     assert_no_new_sidecars_or_lock("B's build over FTS damage", &db);
 }
+
+/// `devmap serve` from `cwd` against `db`, bounded. A serve that is not refused
+/// never returns, so the guard kills the one pid started here and reports the
+/// run as "still serving" (`None`) instead of hanging the suite.
+fn serve_until_exit_or_guard(cwd: &Path, db: &Path, socket: &Path) -> Option<(bool, String)> {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let bin = std::env::var_os("DEVMAP_ATTACK_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_devmap")),
+        PathBuf::from,
+    );
+    let child = Command::new(bin)
+        .current_dir(cwd)
+        .env("DEVMAP_AUTOSPAWN", "0")
+        .args(["--json", "--progress", "never", "--db"])
+        .arg(db)
+        .arg("serve")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn devmap serve");
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(output) => {
+            let output = output.expect("wait for devmap serve");
+            Some((
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+        Err(_) => {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+            None
+        }
+    }
+}
+
+fn short_socket(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("dm-{label}-{}.sock", std::process::id()))
+}
+
+/// `devmap serve` opens the store for writing: it migrates and heals before the
+/// daemon exists. From worktree B, against A's schema-27 store, it is refused for
+/// ownership before the open, and nothing beside A's store is created or changed.
+#[test]
+fn ownership_serve_does_not_migrate_or_lock() {
+    let a = a_worktrees_schema_27_store("serve-a");
+    let b = fixture("serve-b");
+    clear_writer_locks(&a.db);
+    drop_sidecars(&a.db);
+    let before = identity(&a.db);
+    let socket = short_socket("serve27");
+
+    let served = serve_until_exit_or_guard(&b, &a.db, &socket);
+    let _ = std::fs::remove_file(&socket);
+    let (ok, stderr) = served.expect("serve ran on over another worktree's store");
+    assert!(
+        !ok && stderr.contains("one store cannot serve two live worktrees"),
+        "B's serve must be refused for ownership: ok={ok} {stderr}"
+    );
+    assert_still_schema_27("B's refused serve", &a.db);
+    assert_untouched("A's schema-27 store after B's serve", &a.db, &before);
+    assert_no_new_sidecars_or_lock("B's refused serve", &a.db);
+}
+
+/// Same-version heals are writes too: at the current schema an owner page that
+/// cannot be read is refused by `serve` before the open heals anything.
+#[test]
+fn ownership_serve_unreadable_current_owner_is_not_written() {
+    let a = fixture("serve-unread-a");
+    let b = fixture("serve-unread-b");
+    let db = a.join("devmap.sqlite");
+    assert!(devmap_at(&a, &db, &["build", "."]).ok, "A's build");
+    smash_page_of(&db, "pending_state");
+    drop_sidecars(&db);
+    clear_writer_locks(&db);
+    let before = identity(&db);
+    let socket = short_socket("serveunread");
+
+    let served = serve_until_exit_or_guard(&b, &db, &socket);
+    let _ = std::fs::remove_file(&socket);
+    let (ok, stderr) = served.expect("serve ran on over an unreadable owner");
+    assert!(
+        !ok && stderr.contains("malformed"),
+        "an unreadable owner is refused as SQLite's corruption error: ok={ok} {stderr}"
+    );
+    assert_untouched("A's current store after B's serve", &db, &before);
+    assert_no_new_sidecars_or_lock("B's serve of an unreadable owner", &db);
+}
