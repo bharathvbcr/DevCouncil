@@ -36,10 +36,22 @@ fn devmap_bin() -> PathBuf {
         .join("devmap")
 }
 
-fn stamp_of(path: &Path) -> Option<(u64, u64, std::time::SystemTime)> {
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+/// No inode off unix: the stamp falls back to length and mtime, so a replaced
+/// file is still seen when either changes.
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
+fn stamp_of(path: &Path) -> Option<(u64, u64, std::time::SystemTime)> {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.ino(), meta.len(), meta.modified().ok()?))
+    Some((file_id(&meta), meta.len(), meta.modified().ok()?))
 }
 
 struct Round {
