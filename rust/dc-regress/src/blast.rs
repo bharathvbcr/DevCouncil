@@ -489,6 +489,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
         });
     }
 
+    let mut reported_ranges: BTreeMap<String, Vec<ChangedRange>> = BTreeMap::new();
     let mut exhausted = false;
     for (placed, file) in change.files.iter().enumerate() {
         if let Err(stop) = budget.check() {
@@ -500,7 +501,23 @@ pub fn blast_change_bounded<G: CodeGraph>(
             exhausted = true;
             break;
         }
-        place_file(blobs, graph, file, until, &mut seeds, &mut unattributed);
+        place_file(
+            blobs,
+            graph,
+            file,
+            until,
+            &mut seeds,
+            &mut unattributed,
+            &mut reported_ranges,
+        );
+    }
+    // The report names the file's real extent, not an end line the caller
+    // typed. A whole-file range stays open-ended (`null`) on purpose.
+    let mut changed_files = change.files.clone();
+    for file in &mut changed_files {
+        if let Some(ranges) = reported_ranges.remove(&file.path) {
+            file.ranges = ranges;
+        }
     }
 
     // Every unattributed range means the walk started from fewer places than
@@ -512,8 +529,11 @@ pub fn blast_change_bounded<G: CodeGraph>(
         // length was never learned (not indexed, unreadable, basis mismatch).
         // It is counted apart rather than summed: its length is unknown, and
         // `u32::MAX - start + 1` is not a count of anything.
+        // A range past the end of the file holds no lines at all, so it adds
+        // nothing to either count.
         let (unbounded, bounded): (Vec<_>, Vec<_>) = unattributed
             .iter()
+            .filter(|entry| !matches!(entry.reason, UnattributedReason::BeyondEndOfFile { .. }))
             .partition(|entry| entry.end_line == WHOLE_FILE_END_LINE);
         let lines: u64 = bounded
             .iter()
@@ -613,7 +633,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
 
     BlastReport::new(
         label.to_string(),
-        change.files.clone(),
+        changed_files,
         ordered,
         unattributed,
         impacted,
@@ -633,6 +653,7 @@ fn place_file<G: CodeGraph>(
     until: &str,
     seeds: &mut BTreeMap<String, SeedSymbol>,
     unattributed: &mut Vec<UnattributedChange>,
+    reported_ranges: &mut BTreeMap<String, Vec<ChangedRange>>,
 ) {
     // A file with no post-image lines cannot be intersected with anything. Its
     // ranges are empty by construction, so there is nothing to mark
@@ -674,19 +695,28 @@ fn place_file<G: CodeGraph>(
     let mut ranges = file.ranges.clone();
     let (symbols, spans_basis) = graph.symbols_in(&file.path);
     if symbols.is_empty() {
-        // The length is only worth a read when a range is open-ended; a
-        // change between revisions never is, so those reads are unchanged.
-        if ranges.iter().any(|r| r.end_line == WHOLE_FILE_END_LINE) {
-            if let Ok(resolved) = blobs.read(until, &file.path) {
-                resolve_whole_file(&mut ranges, &resolved.content);
-            }
+        // A range's end is only trustworthy once checked against the file's
+        // real length, so the content is read when it can be.
+        let mut last_line = None;
+        if let Ok(resolved) = blobs.read(until, &file.path) {
+            resolve_ranges(&mut ranges, &resolved.content);
+            last_line = Some(last_line_of(&resolved.content));
+            note_reported(reported_ranges, file, &ranges);
         }
-        push_all(
-            unattributed,
-            &file.path,
-            &ranges,
-            UnattributedReason::FileNotIndexed,
-        );
+        for range in &ranges {
+            let reason = match last_line {
+                Some(last_line) if range.start_line > last_line => {
+                    UnattributedReason::BeyondEndOfFile { last_line }
+                }
+                _ => UnattributedReason::FileNotIndexed,
+            };
+            push_all(
+                unattributed,
+                &file.path,
+                std::slice::from_ref(range),
+                reason,
+            );
+        }
         return;
     }
 
@@ -731,12 +761,10 @@ fn place_file<G: CodeGraph>(
         return;
     }
 
-    resolve_whole_file(&mut ranges, &resolved.content);
+    resolve_ranges(&mut ranges, &resolved.content);
+    note_reported(reported_ranges, file, &ranges);
     let index = LineIndex::new(&resolved.content);
-    // One past the newline count is the phantom final line a span ending at
-    // EOF lands on — the same convention `join` documents, so a symbol that
-    // ends at EOF is not judged to be past the end of its own file.
-    let last_line = resolved.content.matches('\n').count() as u32 + 1;
+    let last_line = last_line_of(&resolved.content);
 
     let placed: Vec<(u32, u32, &GraphSymbol)> = symbols
         .iter()
@@ -809,20 +837,52 @@ fn place_file<G: CodeGraph>(
     }
 }
 
-/// Give every whole-file range the file's real last line, now that the content
-/// is in hand, so nothing downstream counts lines from the sentinel.
+/// One past the newline count is the phantom final line a span ending at EOF
+/// lands on — the same convention `join` documents, so a symbol that ends at
+/// EOF is not judged to be past the end of its own file.
+fn last_line_of(content: &str) -> u32 {
+    u32::try_from(content.matches('\n').count())
+        .unwrap_or(u32::MAX - 2)
+        .saturating_add(1)
+}
+
+/// Record the clamped ranges for the report, keeping a whole-file range
+/// open-ended (it is `null` in JSON, and must not become a number).
+fn note_reported(
+    reported: &mut BTreeMap<String, Vec<ChangedRange>>,
+    file: &FileChange,
+    resolved: &[ChangedRange],
+) {
+    let ranges = file
+        .ranges
+        .iter()
+        .zip(resolved)
+        .map(|(original, clamped)| {
+            if original.end_line == WHOLE_FILE_END_LINE {
+                original.clone()
+            } else {
+                clamped.clone()
+            }
+        })
+        .collect();
+    reported.insert(file.path.clone(), ranges);
+}
+
+/// Clamp every range's end to the file's real last line, now that the content
+/// is in hand, so nothing downstream counts lines from a sentinel or from an
+/// end the caller typed. A whole-file range is the special case of an end that
+/// is past every file.
 ///
 /// The real count is the newline count, plus one when the last line is
 /// unterminated. An empty file has no lines; its range is clamped to its own
-/// start so it stays a valid one-line range rather than an inverted one.
-fn resolve_whole_file(ranges: &mut [ChangedRange], content: &str) {
+/// start so it stays a valid one-line range rather than an inverted one. A
+/// range that starts past the end keeps its start and gets `end = start`; the
+/// caller reports it as beyond the end of the file.
+fn resolve_ranges(ranges: &mut [ChangedRange], content: &str) {
     let newlines = content.matches('\n').count();
     let unterminated = !content.is_empty() && !content.ends_with('\n');
     let real_lines = u32::try_from(newlines + usize::from(unterminated)).unwrap_or(u32::MAX - 1);
-    for range in ranges
-        .iter_mut()
-        .filter(|r| r.end_line == WHOLE_FILE_END_LINE)
-    {
+    for range in ranges.iter_mut().filter(|r| r.end_line > real_lines) {
         range.end_line = real_lines.max(range.start_line);
     }
 }
@@ -1203,6 +1263,31 @@ pub fn owners_for_paths_with_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range(start: u32, end: u32) -> ChangedRange {
+        ChangedRange {
+            start_line: start,
+            end_line: end,
+            deletion_only: false,
+        }
+    }
+
+    /// An end the caller typed is clamped to the file's real length exactly as
+    /// the whole-file sentinel is; a start past the end keeps its start.
+    #[test]
+    fn every_range_end_is_clamped_to_the_real_length() {
+        let content = "one\ntwo\n";
+        let mut ranges = [
+            range(1, WHOLE_FILE_END_LINE),
+            range(1, u32::MAX - 1),
+            range(2, 2),
+            range(5, u32::MAX - 1),
+        ];
+        resolve_ranges(&mut ranges, content);
+        let ends: Vec<_> = ranges.iter().map(|r| (r.start_line, r.end_line)).collect();
+        assert_eq!(ends, vec![(1, 2), (1, 2), (2, 2), (5, 5)]);
+        assert_eq!(last_line_of(content), 3);
+    }
 
     #[test]
     fn a_module_is_the_files_directory() {

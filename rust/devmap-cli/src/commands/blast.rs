@@ -85,6 +85,16 @@ pub(crate) enum BlastFormat {
     Markdown,
 }
 
+/// `start-end` for a human renderer. The whole-file sentinel is "to the end of
+/// the file" (it is `null` in JSON), never the number `u32::MAX`.
+fn line_span(start: u32, end: u32) -> String {
+    if end == dc_regress::WHOLE_FILE_END_LINE {
+        format!("{start}-EOF")
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
 /// Render a blast report.
 ///
 /// The refusals and the unattributed lines print *first*, for the same reason
@@ -158,10 +168,9 @@ fn emit_blast(report: &dc_regress::BlastReport) {
                 outln!("  {}: {}", entry.path, entry.reason.describe());
             } else {
                 outln!(
-                    "  {}:{}-{}: {}",
+                    "  {}:{}: {}",
                     entry.path,
-                    entry.start_line,
-                    entry.end_line,
+                    line_span(entry.start_line, entry.end_line),
                     entry.reason.describe()
                 );
             }
@@ -303,10 +312,9 @@ fn emit_blast_markdown(report: &dc_regress::BlastReport) {
                 outln!("- `{}`: {}", entry.path, entry.reason.describe());
             } else {
                 outln!(
-                    "- `{}:{}-{}`: {}",
+                    "- `{}:{}`: {}",
                     entry.path,
-                    entry.start_line,
-                    entry.end_line,
+                    line_span(entry.start_line, entry.end_line),
                     entry.reason.describe()
                 );
             }
