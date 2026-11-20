@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // envOf runs `env` through the runner and returns the child's environment as a
@@ -80,6 +82,68 @@ func TestEnvAllowFromConfigIsHonouredAndRecorded(t *testing.T) {
 	}
 	if len(policy.Refused) != 1 || policy.Refused[0] != "DEPLOY_PASSWORD" {
 		t.Errorf("Refused = %v, want [DEPLOY_PASSWORD]", policy.Refused)
+	}
+}
+
+// TestRepoEnvAllowRefusesCredentialBearingNames: names whose conventional
+// value is a credential (a DSN, a PAT, a URL with embedded userinfo, a webhook
+// URL) are refused from the repository's own config even though the name rule
+// has no KEY/TOKEN/SECRET in it. Ordinary names still pass.
+func TestRepoEnvAllowRefusesCredentialBearingNames(t *testing.T) {
+	refused := []string{
+		"DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN", "DSN", "PAT", "REDIS_URL", "AMQP_URL",
+		"MONGODB_URI", "POSTGRES_URL", "DB_URL", "BROKER_URL", "CACHE_URI", "DB_CONNECTION_STRING",
+		"CONNECTION_STRING", "SLACK_WEBHOOK", "SLACK_WEBHOOK_URL", "WEBHOOK_URL", "database_url",
+		"CI_JOB_JWT", "JWT",
+		"DATABASE_URL_TEST", "DB_URL_RO", "DATABASE_URL2", "REDIS_URI_REPLICA",
+		"PGPASS", "DB_PASS", "DB_PWD", "MYSQL_PWD", "PASSWD", "DB_PASSPHRASE", "PASS",
+		"NETRC", "GIT_ASKPASS", "SSH_ASKPASS", "HTTP_PROXY", "https_proxy", "GOPROXY",
+		"PG_URL", "JDBC_URL", "SPRING_DATASOURCE_URL", "SQLITE_URL", "MARIADB_URL", "MSSQL_URL",
+		"SQLSERVER_URL", "COUCHDB_URL", "NEO4J_URI", "ELASTICSEARCH_URL", "OPENSEARCH_URL",
+		"CLICKHOUSE_URL", "KAFKA_URL", "RABBITMQ_URL", "NATS_URL", "MEMCACHED_URL", "SMTP_URL",
+		"LDAP_URL", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "UV_INDEX_URL",
+		"SENTRYDSN", "SLACKWEBHOOK", "SLACK_HOOK", "DISCORD_HOOK_URL",
+	}
+	allowed := []string{
+		"TEAM_BUILD_FLAVOUR", "NODE_ENV", "RUST_LOG", "GOFLAGS", "CI_URL", "API_URL", "PATH_EXTRA",
+		"PATCH_LEVEL", "DB_HOST", "DB_PORT", "DATABASE_NAME", "COMPASS", "REDIS_PORT", "PATTERN",
+		"COMPAT_MODE", "OUTPUT_PATH", "VAULT_ADDR", "KUBECONFIG", "PWD", "OLDPWD", "BYPASS_CACHE",
+		"GIT_HOOKS_DIR", "INDEX_NAME",
+	}
+	for _, name := range refused {
+		root := t.TempDir()
+		writeConfig(t, root, "verify:\n  env_allow: ["+name+"]\n")
+		p := LoadEnvPolicy(root)
+		if len(p.Extra) != 0 || len(p.Refused) != 1 || p.Refused[0] != name {
+			t.Errorf("%s: Extra=%v Refused=%v, want refused", name, p.Extra, p.Refused)
+		}
+	}
+	for _, name := range allowed {
+		root := t.TempDir()
+		writeConfig(t, root, "verify:\n  env_allow: ["+name+"]\n")
+		p := LoadEnvPolicy(root)
+		if len(p.Refused) != 0 || len(p.Extra) != 1 || p.Extra[0] != name {
+			t.Errorf("%s: Extra=%v Refused=%v, want admitted", name, p.Extra, p.Refused)
+		}
+	}
+}
+
+// TestScrubEnvExtrasAreNotSubjectToTheNameRule: the credential-name rule binds
+// only LoadEnvPolicy (the repository's config.yaml). proc.ScrubEnv's extra
+// list is not subject to it. There is no user-level env_allow source today:
+// the extras come only from EnvPolicy.Environ and a code-owned list
+// (components parityEnvExtra), so this pins the seam, not a config path.
+func TestScrubEnvExtrasAreNotSubjectToTheNameRule(t *testing.T) {
+	environ := []string{"DATABASE_URL=postgres://u:p@h/db", "GITHUB_PAT=x", "SENTRY_DSN=https://k@s/1", "OTHER=1"}
+	got := proc.ScrubEnv(environ, "DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN")
+	joined := strings.Join(got, "\n")
+	for _, name := range []string{"DATABASE_URL", "GITHUB_PAT", "SENTRY_DSN"} {
+		if !strings.Contains(joined, name+"=") {
+			t.Errorf("ScrubEnv extra %s did not reach the child: %v", name, got)
+		}
+	}
+	if strings.Contains(joined, "OTHER=") {
+		t.Error("a name outside the allowlist reached the child")
 	}
 }
 

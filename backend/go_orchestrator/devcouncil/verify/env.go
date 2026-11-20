@@ -22,8 +22,42 @@ const envAllowKey = "verify.env_allow"
 var (
 	envNameRE    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	secretNameRE = regexp.MustCompile(`(?i)(KEY|SECRET|TOKEN|PASSW|CREDENTIAL|AUTH|PRIVATE|COOKIE)`)
-	blockListRE  = regexp.MustCompile(`(?m)^\s*env_allow:\s*(#.*)?$`)
+	// credentialNameRE names variables that carry a credential without saying
+	// so in the secretNameRE vocabulary. It is a NAME rule: it cannot promise
+	// that no credential gets through, only that these shapes do not. Classes:
+	//   - tokens between underscores or at the ends: DSN, PAT, JWT, PASS, PWD,
+	//     HOOK, WEBHOOK(S); so PATCH_LEVEL, PATTERN, OUTPUT_PATH, BYPASS_CACHE
+	//     and GIT_HOOKS_DIR stay admitted. Run-together PAT is deliberately not
+	//     refused (COMPAT_MODE, COMPASS, ...): no token boundary, too many
+	//     ordinary names. Run-together DSN (suffix) and WEBHOOK (anywhere) are
+	//     refused (SENTRYDSN, SLACKWEBHOOK).
+	//   - PGPASS, PASSPHRASE, NETRC, ASKPASS (GIT_ASKPASS names a program the
+	//     child runs with credentials), CONNECTION_STRING / CONNSTR.
+	//   - a name ending in PROXY (proxy URLs embed user:pass). This also refuses
+	//     NO_PROXY and GOPROXY: a module proxy URL can embed credentials, and a
+	//     repository that needs either has no per-repo route.
+	//   - datastore, broker, mail, directory and package-index URLs or URIs,
+	//     whose conventional value embeds user:password@: a stem token, then
+	//     _URL or _URI followed by _, a digit or the end (DATABASE_URL_TEST,
+	//     DB_URL_RO, DATABASE_URL2), and any *_INDEX_URL (PIP/UV).
+	// A plain CI_URL or API_URL (no credential by convention) stays admitted.
+	credentialNameRE = regexp.MustCompile(`(?i)((^|_)(DSN|PAT|JWT|PASS|HOOK|WEBHOOKS?)($|_)|DSN$|WEBHOOK|PGPASS|PASSPHRASE|NETRC|ASKPASS|CONNECTION_?STRING|CONNSTR|PROXY$|((^|_)(DATABASE|DB|REDIS|AMQP|MONGO|MONGODB|POSTGRES|POSTGRESQL|PG|JDBC|DATASOURCE|MYSQL|MARIADB|MSSQL|SQLSERVER|SQLITE|COUCHDB|NEO4J|ELASTICSEARCH|OPENSEARCH|CLICKHOUSE|KAFKA|RABBITMQ|NATS|MEMCACHED|SMTP|LDAP|BROKER|CACHE)(_[A-Z0-9]+)*|_INDEX)_(URL|URI)($|_|[0-9]))`)
+	pwdTokenRE       = regexp.MustCompile(`(?i)(^|_)PWD($|_)`)
+	blockListRE      = regexp.MustCompile(`(?m)^\s*env_allow:\s*(#.*)?$`)
 )
+
+// isCredentialName is the one name rule for what a repository's own config may
+// not hand to a verification command. It binds LoadEnvPolicy only. There is no
+// user-level env_allow source today: proc.ScrubEnv's extras come from
+// EnvPolicy.Environ and from code-owned lists, and are not subject to it. A
+// PWD token (DB_PWD, MYSQL_PWD) is a password, but the bare shell variable PWD
+// is the working directory and stays admitted.
+func isCredentialName(name string) bool {
+	if secretNameRE.MatchString(name) || credentialNameRE.MatchString(name) {
+		return true
+	}
+	return !strings.EqualFold(name, "PWD") && pwdTokenRE.MatchString(name)
+}
 
 // EnvPolicy is the environment a verification command runs with: the base
 // allowlist plus the repository's `verify.env_allow` additions that were
@@ -79,7 +113,7 @@ func LoadEnvPolicy(root string) EnvPolicy {
 			continue
 		}
 		seen[name] = struct{}{}
-		if !envNameRE.MatchString(name) || secretNameRE.MatchString(name) {
+		if !envNameRE.MatchString(name) || isCredentialName(name) {
 			p.Refused = append(p.Refused, name)
 			continue
 		}
