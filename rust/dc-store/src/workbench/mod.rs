@@ -406,6 +406,7 @@ fn backup_before_upgrade(
         conn,
         &format!("pre-schema-{version}"),
         Some(version),
+        None,
         refusal,
     )?
     else {
@@ -417,6 +418,8 @@ fn backup_before_upgrade(
         }
         _ => PruneReport::default(),
     };
+    let mut pruned = pruned;
+    pruned.unverified.extend(backup.displaced);
     Ok((Some(backup.path.display().to_string()), pruned))
 }
 
@@ -446,56 +449,201 @@ fn prune_json(conn: &Connection, report: &PruneReport) -> Result<String> {
     )?)
 }
 
+thread_local! {
+    static BACKUP_WINDOW_HOOK: std::cell::RefCell<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a hook that runs on this thread inside [`backup_profile`], after
+/// it found no backup and before it writes one: the window two hosts used to
+/// race through. Production never installs one. Tests do, because an
+/// integration test links this library without `cfg(test)`.
+#[doc(hidden)]
+pub fn set_backup_window_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    BACKUP_WINDOW_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn backup_window() {
+    let hook = BACKUP_WINDOW_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// A backup file, and whether this call is the one that wrote it.
 struct Backup {
     path: std::path::PathBuf,
     created: bool,
+    /// What was found at the backup name and moved aside, when something was.
+    displaced: Option<String>,
 }
 
 /// The shared `VACUUM INTO` copy: `<profile>.<stamp>.bak`, written beside the
 /// profile, verified readable (and, when `expected_version` is given, at that
 /// schema) and only then renamed into place, so no file carries the `.bak` name
 /// until it has been read back.
+///
+/// The exists-check, the copy and the rename share one write lock
+/// (`BEGIN IMMEDIATE`), so a second host cannot pass the exists-check beside
+/// this one, and a host that waited for the lock finds the copy the first one
+/// made instead of replacing it with a copy of a profile that has since moved
+/// on. `VACUUM INTO` cannot run on a connection with a transaction open, so
+/// the copy is read by a second connection while this one holds the lock; a
+/// writer lock lets readers in, in WAL and in rollback-journal mode alike.
+/// The lock is released before this returns, because the caller's migration
+/// opens its own transactions. `locking_mode=EXCLUSIVE` is not used: with
+/// another connection already open it never acquires the file lock.
 fn backup_profile(
     conn: &Connection,
     stamp: &str,
     expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
     refusal: impl Fn(&std::path::Path, String) -> String,
 ) -> Result<Option<Backup>> {
     let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
         return Ok(None);
     };
     let backup = std::path::PathBuf::from(format!("{path}.{stamp}.bak"));
-    if backup.exists() {
-        return Ok(Some(Backup {
-            path: backup,
-            created: false,
-        }));
-    }
     let fail = |detail: String| Error {
         code: "backup_failed",
         message: refusal(&backup, detail),
     };
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| fail(error.to_string()))?;
+    let outcome = write_backup_under_lock(conn, path, &backup, expected_version, must_hold_table)
+        .map_err(&fail);
+    match outcome {
+        Ok(made) => {
+            tx.commit().map_err(|error| fail(error.to_string()))?;
+            Ok(Some(made))
+        }
+        Err(mut error) => {
+            if let Err(rollback) = tx.rollback() {
+                error.message.push_str(&format!(
+                    "; rolling back the backup lock also failed: {rollback}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// A file already at the backup name is a backup only if it reads back: it
+/// verifies at `expected_version` and holds `must_hold_table` with its rows
+/// readable. One that does not (empty, truncated, another schema, no legacy
+/// table) is never deleted, because it may be someone's only copy: it is moved
+/// to `<name>.invalid-<unix seconds>[-n]`, which no prune rule matches, and a
+/// fresh copy is written in its place.
+fn existing_backup_verdict(
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<(), String> {
+    backups::verify(backup, expected_version)?;
+    match must_hold_table {
+        Some(table) => backups::verify_holds_table(backup, table),
+        None => Ok(()),
+    }
+}
+
+/// Moves the unusable file at `backup` to a name beside it that is not taken,
+/// and returns that name.
+fn move_aside(backup: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let mut name = backup.as_os_str().to_owned();
+    name.push(format!(".invalid-{stamp}"));
+    let base = std::path::PathBuf::from(&name);
+    let mut aside = base.clone();
+    let mut n = 0u32;
+    // The write lock is held, so no other host picks the same name between the
+    // check and the rename.
+    while std::fs::symlink_metadata(&aside).is_ok() {
+        n += 1;
+        let mut next = base.as_os_str().to_owned();
+        next.push(format!("-{n}"));
+        aside = std::path::PathBuf::from(next);
+    }
+    std::fs::rename(backup, &aside)?;
+    Ok(aside)
+}
+
+/// The body of [`backup_profile`], run while the caller holds the write lock.
+fn write_backup_under_lock(
+    conn: &Connection,
+    path: &str,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<Backup, String> {
+    // A legacy table another host already retired is not required of a copy.
+    let must_hold_table = match must_hold_table {
+        Some(table) if backups::table_present(conn, table).map_err(|e| e.to_string())? => {
+            Some(table)
+        }
+        _ => None,
+    };
+    let mut displaced = None;
+    if std::fs::symlink_metadata(backup).is_ok() {
+        match existing_backup_verdict(backup, expected_version, must_hold_table) {
+            Ok(()) => {
+                return Ok(Backup {
+                    path: backup.to_path_buf(),
+                    created: false,
+                    displaced: None,
+                });
+            }
+            Err(reason) => {
+                let aside = move_aside(backup).map_err(|error| {
+                    format!(
+                        "the file already at {} does not read back ({reason}) and could not be moved aside: {error}",
+                        backup.display()
+                    )
+                })?;
+                let note = format!(
+                    "{}: {reason}; moved aside to {}",
+                    backup.display(),
+                    aside.display()
+                );
+                eprintln!("dc-store: workbench backup {note}");
+                displaced = Some(note);
+            }
+        }
+    }
+    backup_window();
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
     let target = partial
         .to_str()
-        .ok_or_else(|| fail("the path is not UTF-8".into()))?;
+        .ok_or_else(|| "the path is not UTF-8".to_string())?;
     // A copy that did not complete is removed at once: left behind it would be
     // a second profile-sized file on a disk that was already short of space.
     let discard = |detail: String| {
         let _ = std::fs::remove_file(&partial);
-        fail(detail)
+        detail
     };
-    conn.execute("VACUUM INTO ?1", [target])
+    // Read-only: a profile that vanished must fail the copy, not be created
+    // empty and copied. `VACUUM INTO` only reads the source.
+    let reader = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| discard(error.to_string()))?;
+    reader
+        .busy_timeout(crate::BUSY_TIMEOUT)
         .map_err(|error| discard(error.to_string()))?;
-    backups::verify(&partial, expected_version)
+    reader
+        .execute("VACUUM INTO ?1", [target])
+        .map_err(|error| discard(error.to_string()))?;
+    existing_backup_verdict(&partial, expected_version, must_hold_table)
         .map_err(|reason| discard(format!("the copy it wrote does not read back: {reason}")))?;
-    std::fs::rename(&partial, &backup).map_err(|error| discard(error.to_string()))?;
-    Ok(Some(Backup {
-        path: backup,
+    std::fs::rename(&partial, backup).map_err(|error| discard(error.to_string()))?;
+    Ok(Backup {
+        path: backup.to_path_buf(),
         created: true,
-    }))
+        displaced,
+    })
 }
 
 fn local_repository_request() -> String {
@@ -2096,6 +2244,8 @@ fn item_query(
     )
 }
 
+#[cfg(test)]
+mod backup_lock_tests;
 #[cfg(test)]
 mod enhancement_lifecycle_tests;
 #[cfg(test)]
