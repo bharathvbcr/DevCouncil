@@ -158,7 +158,10 @@ pub mod whole_file_end {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedRange {
     pub start_line: u32,
-    /// One-based inclusive; `null` in JSON means "to the end of the file".
+    /// One-based inclusive. `null` in JSON means "the whole file was
+    /// requested" (a bare `--at <path>`): `changed_files` keeps `null` even
+    /// when the length is known, while `unattributed` entries carry the real
+    /// length once the file could be read.
     #[serde(with = "whole_file_end")]
     pub end_line: u32,
     /// True when the hunk removed lines and added none, so this range is the

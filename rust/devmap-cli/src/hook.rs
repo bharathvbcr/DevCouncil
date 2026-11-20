@@ -1566,7 +1566,7 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
         let label_at = if *end == u32::MAX {
             path.clone()
         } else {
-            format!("{path}:{start}-{end}")
+            format!("{path}:{}", crate::commands::blast::line_span(*start, *end))
         };
         let report = dc_regress::blast::blast_change_bounded(
             std::ffi::OsStr::new("git"),
@@ -1624,10 +1624,9 @@ fn format_blast_for_hook(report: &dc_regress::BlastReport) -> String {
     if !report.unattributed.is_empty() {
         let first = &report.unattributed[0];
         lines.push(format!(
-            "  unattributed: {}:{}-{} ({})",
+            "  unattributed: {}:{} ({})",
             first.path,
-            first.start_line,
-            first.end_line,
+            crate::commands::blast::line_span(first.start_line, first.end_line),
             first.reason.describe()
         ));
         if report.unattributed.len() > 1 {
@@ -6004,6 +6003,30 @@ mod tests {
                 || text.contains("graph holds no"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn blast_hook_text_never_prints_the_whole_file_sentinel() {
+        let report = dc_regress::BlastReport::new(
+            "new2.md".into(),
+            vec![],
+            vec![],
+            vec![dc_regress::UnattributedChange {
+                path: "new2.md".into(),
+                start_line: 1,
+                end_line: dc_regress::WHOLE_FILE_END_LINE,
+                reason: dc_regress::UnattributedReason::FileNotIndexed,
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let text = format_blast_for_hook(&report);
+        assert!(!text.contains("4294967295"), "{text}");
+        assert!(text.contains("new2.md:1-EOF"), "{text}");
     }
 
     /// A committed, indexed donor `main` and a provisioned stacked `lane`.

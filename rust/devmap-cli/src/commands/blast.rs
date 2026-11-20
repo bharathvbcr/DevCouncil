@@ -87,7 +87,7 @@ pub(crate) enum BlastFormat {
 
 /// `start-end` for a human renderer. The whole-file sentinel is "to the end of
 /// the file" (it is `null` in JSON), never the number `u32::MAX`.
-fn line_span(start: u32, end: u32) -> String {
+pub(crate) fn line_span(start: u32, end: u32) -> String {
     if end == dc_regress::WHOLE_FILE_END_LINE {
         format!("{start}-EOF")
     } else {

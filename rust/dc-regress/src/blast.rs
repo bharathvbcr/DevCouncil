@@ -420,7 +420,11 @@ pub fn blast_bounded<G: CodeGraph>(
             )
         }
     };
-    blast_change_bounded(program, repo, graph, &change, &label, until, depth, budget)
+    // A range between two revisions comes from git and never exceeds its file,
+    // so no blob is read just to learn a length.
+    blast_change_inner(
+        program, repo, graph, &change, &label, until, depth, budget, false,
+    )
 }
 
 /// The analysis proper, over a change set already in hand.
@@ -463,6 +467,29 @@ pub fn blast_change_bounded<G: CodeGraph>(
     until: &str,
     depth: u32,
     budget: &Budget,
+) -> BlastReport {
+    // A change set in hand is a caller's own (`--at`, the hook): its ranges
+    // may name lines the file does not have, so they are checked.
+    blast_change_inner(
+        program, repo, graph, change, label, until, depth, budget, true,
+    )
+}
+
+/// The body of [`blast_change_bounded`]. `verify_extent` is whether an
+/// unindexed file's blob is read to check a range's extent: true for a
+/// caller-typed range, false for git's own ranges (a read per unindexed file
+/// would spend the shared history deadline for nothing).
+#[allow(clippy::too_many_arguments)]
+fn blast_change_inner<G: CodeGraph>(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    graph: &G,
+    change: &ChangeSet,
+    label: &str,
+    until: &str,
+    depth: u32,
+    budget: &Budget,
+    verify_extent: bool,
 ) -> BlastReport {
     // One config listing per repository for the whole analysis, not one per read.
     let _config = dc_proc::config_scope();
@@ -509,6 +536,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
             &mut seeds,
             &mut unattributed,
             &mut reported_ranges,
+            verify_extent,
         );
     }
     // The report names the file's real extent, not an end line the caller
@@ -654,6 +682,7 @@ fn place_file<G: CodeGraph>(
     seeds: &mut BTreeMap<String, SeedSymbol>,
     unattributed: &mut Vec<UnattributedChange>,
     reported_ranges: &mut BTreeMap<String, Vec<ChangedRange>>,
+    verify_extent: bool,
 ) {
     // A file with no post-image lines cannot be intersected with anything. Its
     // ranges are empty by construction, so there is nothing to mark
@@ -695,10 +724,13 @@ fn place_file<G: CodeGraph>(
     let mut ranges = file.ranges.clone();
     let (symbols, spans_basis) = graph.symbols_in(&file.path);
     if symbols.is_empty() {
-        // A range's end is only trustworthy once checked against the file's
-        // real length, so the content is read when it can be.
+        // The length is only worth a read when a range is open-ended or was
+        // typed by the caller; git's own ranges never exceed the file.
         let mut last_line = None;
-        if let Ok(resolved) = blobs.read(until, &file.path) {
+        let open_ended = ranges.iter().any(|r| r.end_line == WHOLE_FILE_END_LINE);
+        if !(verify_extent || open_ended) {
+            // nothing to check
+        } else if let Ok(resolved) = blobs.read(until, &file.path) {
             resolve_ranges(&mut ranges, &resolved.content);
             last_line = Some(last_line_of(&resolved.content));
             note_reported(reported_ranges, file, &ranges);
