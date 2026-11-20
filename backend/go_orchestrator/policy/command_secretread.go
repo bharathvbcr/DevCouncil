@@ -145,7 +145,7 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 			continue
 		}
 		if unbound == "" && !written[text] && !inertCommands[command] &&
-			!computedOptionValue(command, words, i) && operandFromFile(command, words[i]) {
+			!computedOptionValue(command, gitSub, words, i) && operandFromFile(command, words[i]) {
 			unbound = fmt.Sprintf("`%s` has an operand (`%s`) holding an expansion the gate cannot resolve to a "+
 				"value (a variable nothing binds, a parameter operator or a brace expansion), so the file it "+
 				"names was not judged. Spell the operand out.", command, text)

@@ -184,7 +184,7 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 	// Each reading of the line with its variables bound (expandBindings) is
 	// judged in full, and the most important refusal among them is the answer,
 	// ranked exactly as evaluate ranks clauses.
-	readings, truncated := expandBindings(command)
+	readings, truncated := expandBindingsInRoot(command, g.Root)
 	if truncated {
 		// A reading past the caps was never judged, so the line is refused
 		// rather than judged on the readings that fit. That refusal is about
@@ -293,15 +293,8 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		// that admits it never read. Hard and ahead of the allowlists for the
 		// same reason git safety is: no lease, grant or posture negotiates it.
 		// See RuleCommandGitReadArgument.
-		// An operand it could not resolve is not a refusal for what git was
-		// told to do: it is recorded as unreadable below, so a hard refusal
-		// elsewhere in the clause outranks it.
-		if reason, unverifiable := readOnlyArgumentViolation(command, g.Root); reason != "" {
-			if !unverifiable {
-				return g.noteHardRules(deny(RuleCommandGitReadArgument, reason, normalized, taskID))
-			}
-			unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
-			hasUnreadableOperand = true
+		if reason := readOnlyArgumentViolation(command, g.Root); reason != "" {
+			return g.noteHardRules(deny(RuleCommandGitReadArgument, reason, normalized, taskID))
 		}
 		// What any command is told to read: an operand naming a credential
 		// file. See RuleCommandSecretRead.

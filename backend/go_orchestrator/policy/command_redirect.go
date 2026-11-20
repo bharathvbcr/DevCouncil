@@ -94,7 +94,7 @@ func RedirectWrites(command string) (RedirectSet, error) {
 func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 	var found redirectFindings
 	memo := scanMemo{}
-	readings, truncated := expandBindings(command)
+	readings, truncated := expandBindingsInRoot(command, root)
 	finish := func(set RedirectSet) RedirectSet { return set }
 	if truncated {
 		// Readings past the caps were never scanned, so the line fails closed

@@ -22,6 +22,8 @@ func landGate(t *testing.T, posture string) (*Gate, string) {
 	must(os.WriteFile(filepath.Join(mainRoot, ".env"), []byte("SECRET=1\n"), 0o644))
 	must(os.WriteFile(filepath.Join(mainRoot, "README.md"), []byte("hi\n"), 0o644))
 	must(os.Link(filepath.Join(mainRoot, ".env"), filepath.Join(mainRoot, "src", "hl")))
+	must(os.Symlink("../.env", filepath.Join(mainRoot, "src", "sl")))
+	must(os.WriteFile(filepath.Join(mainRoot, "list.txt"), []byte("src\n"), 0o644))
 	return newGateAtRoot(t, mainRoot, map[string]string{flags.HarnessPosture: posture}), mainRoot
 }
 
@@ -89,7 +91,7 @@ func TestLandControlRowsStayAllowed(t *testing.T) {
 			"npm run *", "head *", "cat *", "git log *", "git show *", "git diff *"}
 		for _, c := range []string{
 			"exit $?", "kill $!", "wait $!", "sleep ${D:-1}", "seq 1 ${N:-3}",
-			"make -j${N:-4}", "go test -count=${COUNT:-1} ./...", "npm run dev -- --port ${PORT:-3000}",
+			"make -j${N:-4}", "go test -count=${COUNT:-1} ./...",
 			"head -n ${N:-5} README.md", "git log -n ${N:-5}", "git log --max-count=${N:-5}", "git log -n${N:-5}",
 			"cat \"$PWD/README.md\"", "cat ${PWD}/README.md",
 		} {
@@ -125,13 +127,67 @@ func TestLandNarrowedRowsStillRefuse(t *testing.T) {
 				t.Errorf("LEAK %s %q: want hard refusal, got %s %q", posture, c, d.Action, d.Rule)
 			}
 		}
-		// A computed git operand is unreadable, not a git read-argument violation.
+		// A computed git operand keeps the train's hard, unsoftenable rule.
 		d, err := g.EvaluateCommand("git log ${B:-main}", task)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if d.Rule != policy.RuleCommandOperandUnverifiable {
-			t.Errorf("%s computed git operand: got %q, want %q", posture, d.Rule, policy.RuleCommandOperandUnverifiable)
+		if d.Rule != policy.RuleCommandGitReadArgument {
+			t.Errorf("%s computed git operand: got %q, want %q", posture, d.Rule, policy.RuleCommandGitReadArgument)
+		}
+	}
+}
+
+// Fix round: options that take an optional or no value, end of options, other
+// programs, $PWD rebinding and file readers keep refusing. A row in gitHard was
+// a hard refusal under a rule a host cannot soften on the train (3b89faeb); it
+// must not become a softenable (unreadable) one.
+func TestLandFixRoundRowsRefuse(t *testing.T) {
+	gitHard := map[string]bool{
+		"git show -U ${x:-HEAD:.env}": true, "git show --unified ${x:-HEAD:.env}": true,
+		"git show --abbrev ${x:-HEAD:.env}": true, "git diff -U ${x:-.env}": true,
+		"git log -p -U ${x:-.env}": true, "git log -p -- -n ${x:-.env}": true,
+		"git diff -- -U ${x:-.env}": true, "git show -- -U ${x:-HEAD:.env}": true,
+	}
+	rows := []string{
+		"git blame -n ${x:-.env}", "head -- -n ${x:-.env}", "grep -e S -- --count ${x:-.env}",
+		"uniq --count ${x:-.env}", "grep -e SECRET --count ${x:-.env}", "rg -e . --count ${x:-.env}",
+		"sed -n p --depth ${x:-.env}", "mytool --port ${x:-.git/hooks/pre-commit}",
+		"mytool --depth ${x:-../outside}", "npm run dev -- --port ${PORT:-3000}",
+		"PWD=$(echo src); cat $PWD/sl", "printf -v PWD src; cat $PWD/sl", "read PWD < list.txt; cat $PWD/sl",
+		"export PWD=$(echo src); cat $PWD/sl", "declare PWD=$(echo src); cat $PWD/sl", "unset PWD; cat $PWD/x",
+		"cat $PWD/src/sl", "date -f ${x:-.env}", "date --file=${x:-.env}", "hostname -F ${x:-.env}",
+	}
+	for c := range gitHard {
+		rows = append(rows, c)
+	}
+	for _, posture := range []string{flags.PostureStrict, flags.PostureDev} {
+		g, _ := landGate(t, posture)
+		task := testTask()
+		task.AllowedCommands = []string{"*"}
+		for _, c := range rows {
+			d, err := g.EvaluateCommand(c, task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Blocked() || d.Severity != policy.Hard {
+				t.Errorf("LEAK %s %q: want hard refusal, got %s %q", posture, c, d.Action, d.Rule)
+			}
+			if gitHard[c] && policy.IsUnreadableRule(d.Rule) {
+				t.Errorf("%s %q: train refused this under a non-softenable rule, got unreadable %q", posture, c, d.Rule)
+			}
+		}
+		// Gate root is not the process working directory: $PWD names the root.
+		viaPWD, err := g.EvaluateCommand("cat $PWD/src/sl", task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		direct, err := g.EvaluateCommand("cat src/sl", task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if viaPWD.Rule != direct.Rule || direct.Rule != policy.RuleCommandSecretRead {
+			t.Errorf("%s: cat $PWD/src/sl = %q, cat src/sl = %q, want both command.secret_read", posture, viaPWD.Rule, direct.Rule)
 		}
 	}
 }
