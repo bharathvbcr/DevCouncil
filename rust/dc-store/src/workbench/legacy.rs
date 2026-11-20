@@ -313,7 +313,9 @@ pub(crate) fn retire(
         Err(mut error) => {
             let _ = conn.execute_batch("ROLLBACK");
             for note in &moved_aside {
-                error.message.push_str(&format!("; backup moved aside: {note}"));
+                error
+                    .message
+                    .push_str(&format!("; backup moved aside: {note}"));
             }
             Err(error)
         }

@@ -178,36 +178,35 @@ pub(super) fn verify_holds_table(path: &Path, table: &str) -> Result<(), String>
 }
 
 /// Files in `dir` that were moved aside from a backup name and whose file name
-/// starts with `prefix`.
-fn moved_aside_in(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+/// starts with `prefix`. A directory that cannot be listed is an error, never
+/// "none": the bound on moved-aside copies must not fail open.
+fn moved_aside_in(dir: &Path, prefix: &str) -> std::io::Result<Vec<PathBuf>> {
     let dir = if dir.as_os_str().is_empty() {
         Path::new(".")
     } else {
         dir
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut found: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(prefix) && name.contains(".bak.invalid-"))
-        })
-        .map(|entry| entry.path())
-        .collect();
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(prefix) && name.contains(".bak.invalid-"))
+        {
+            found.push(entry.path());
+        }
+    }
     found.sort();
-    found
+    Ok(found)
 }
 
 /// Every copy an upgrade moved aside beside `profile`
 /// (`<profile>.pre-*.bak.invalid-*`), for an operator deciding which to keep.
 /// The upgrade itself never removes one.
-pub fn moved_aside_copies(profile: &Path) -> Vec<PathBuf> {
+pub fn moved_aside_copies(profile: &Path) -> std::io::Result<Vec<PathBuf>> {
     let Some(name) = profile.file_name().and_then(|name| name.to_str()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     moved_aside_in(
         profile.parent().unwrap_or(Path::new(".")),
@@ -215,16 +214,15 @@ pub fn moved_aside_copies(profile: &Path) -> Vec<PathBuf> {
     )
 }
 
-/// How many copies are already moved aside from the backup name `backup`.
-pub(super) fn moved_aside_from(backup: &Path) -> usize {
+/// The copies already moved aside from the backup name `backup`.
+pub(super) fn moved_aside_from(backup: &Path) -> std::io::Result<Vec<PathBuf>> {
     let Some(name) = backup.file_name().and_then(|name| name.to_str()) else {
-        return 0;
+        return Ok(Vec::new());
     };
     moved_aside_in(
         backup.parent().unwrap_or(Path::new(".")),
         &format!("{name}.invalid-"),
     )
-    .len()
 }
 
 /// A digest of the rows of `only` (or of every table, when `None`), independent
@@ -362,6 +360,13 @@ pub(super) fn prune(profile: &Path, written: &Path, retention: BackupRetention) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_directory_is_an_error_not_no_moved_aside_copies() {
+        let missing = Path::new("/nonexistent-dc-store-dir/profile.sqlite.pre-schema-1.bak");
+        assert!(moved_aside_from(missing).is_err());
+        assert!(moved_aside_copies(Path::new("/nonexistent-dc-store-dir/profile.sqlite")).is_err());
+    }
 
     #[test]
     fn settings_parse_to_a_count_or_all_and_zero_is_refused() {

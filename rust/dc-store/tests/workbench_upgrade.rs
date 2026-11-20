@@ -999,9 +999,14 @@ fn a_second_upgrade_writes_its_own_backup_holding_the_row_added_since() {
         )
         .unwrap();
     assert_eq!(version(&path), 11);
-    let second = Store::open(&path).unwrap().upgrade_workbench_profile().unwrap();
+    let second = Store::open(&path)
+        .unwrap()
+        .upgrade_workbench_profile()
+        .unwrap();
     assert_eq!(second.from, 11);
-    let reported = second.backup.expect("the second upgrade reports its backup");
+    let reported = second
+        .backup
+        .expect("the second upgrade reports its backup");
     assert_eq!(
         Path::new(&reported).file_name(),
         bak11(&path).file_name(),
@@ -1018,7 +1023,11 @@ fn a_second_upgrade_writes_its_own_backup_holding_the_row_added_since() {
     assert_eq!(aside.len(), 1, "{aside:?}");
     assert_eq!(workspace_rows(&aside[0], "added-at-old"), 0);
     assert!(
-        second.prune.unverified.iter().any(|note| note.contains("moved aside to")),
+        second
+            .prune
+            .unverified
+            .iter()
+            .any(|note| note.contains("moved aside to")),
         "{:?}",
         second.prune
     );
@@ -1035,7 +1044,10 @@ fn a_resumed_upgrade_reuses_the_backup_the_interrupted_one_made() {
     drop_wal_files(&path);
     std::fs::copy(bak11(&path), &path).unwrap();
     let before = std::fs::read(bak11(&path)).unwrap();
-    let resumed = Store::open(&path).unwrap().upgrade_workbench_profile().unwrap();
+    let resumed = Store::open(&path)
+        .unwrap()
+        .upgrade_workbench_profile()
+        .unwrap();
     assert_eq!(resumed.from, 11);
     assert!(resumed.backup.is_some());
     assert_eq!(std::fs::read(bak11(&path)).unwrap(), before);
@@ -1071,13 +1083,21 @@ fn a_stale_retire_backup_with_older_task_rows_does_not_license_the_drop() {
     seed(&path, &["TASK-OLD", "TASK-NEW"]);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);")
+        .execute_batch(
+            "INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);",
+        )
         .unwrap();
     let store = Store::open(&path).unwrap();
-    assert_eq!(tables_named(&path, "tasks"), 0, "the legacy table was not retired");
+    assert_eq!(
+        tables_named(&path, "tasks"),
+        0,
+        "the legacy table was not retired"
+    );
     let copy_rows: i64 = Connection::open(&stale)
         .unwrap()
-        .query_row("SELECT count(*) FROM tasks WHERE id='TASK-NEW'", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM tasks WHERE id='TASK-NEW'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(copy_rows, 1, "no copy holds the row the drop destroyed");
     let aside: Vec<_> = std::fs::read_dir(dir.path())
@@ -1095,7 +1115,10 @@ fn a_stale_retire_backup_with_older_task_rows_does_not_license_the_drop() {
     let reported = &store.legacy_retirement().moved_aside;
     assert_eq!(reported.len(), 1, "{reported:?}");
     assert!(reported[0].contains("out of date"), "{reported:?}");
-    assert!(reported[0].contains(aside[0].to_str().unwrap()), "{reported:?}");
+    assert!(
+        reported[0].contains(aside[0].to_str().unwrap()),
+        "{reported:?}"
+    );
 }
 
 /// The retire path has no upgrade report, so the open handle carries it.
@@ -1107,7 +1130,10 @@ fn the_retire_path_reports_what_it_moved_aside() {
     let report = store.legacy_retirement();
     assert_eq!(report.archived, 1);
     assert_eq!(report.moved_aside.len(), 1, "{report:?}");
-    assert!(report.moved_aside[0].contains("moved aside to"), "{report:?}");
+    assert!(
+        report.moved_aside[0].contains("moved aside to"),
+        "{report:?}"
+    );
     assert!(stale.exists());
     // A plain open that retires nothing reports nothing.
     let again = Store::open(&path).unwrap();
@@ -1133,6 +1159,147 @@ fn too_many_moved_aside_copies_refuse_the_upgrade_and_delete_nothing() {
     assert_eq!(version(&path), 11, "the profile moved without a backup");
     assert_eq!(invalid_siblings(&path).len(), limit);
     assert_eq!(std::fs::metadata(bak11(&path)).unwrap().len(), 0);
-    let listed = dc_store::workbench::moved_aside_copies(&path);
+    let listed = dc_store::workbench::moved_aside_copies(&path).unwrap();
     assert_eq!(listed.len(), limit, "{listed:?}");
+    // The refusal is actionable without calling the library: it names the
+    // directory, the pattern and the files.
+    let dir = path.parent().unwrap().to_str().unwrap();
+    assert!(error.message.contains(dir), "{error}");
+    assert!(
+        error
+            .message
+            .contains("profile.sqlite.pre-schema-11.bak.invalid-*"),
+        "{error}"
+    );
+    assert!(
+        error
+            .message
+            .contains("profile.sqlite.pre-schema-11.bak.invalid-1-0"),
+        "{error}"
+    );
+}
+
+// ---- fix round 1: the moved-aside note survives a failed new copy; bounds fail closed ----
+
+fn aside_note_paths(message: &str) -> Vec<&str> {
+    message
+        .split(".invalid-")
+        .skip(1)
+        .map(|rest| rest.split([',', ';', ' ']).next().unwrap_or(""))
+        .collect()
+}
+
+/// Stale backup moved aside, then the new copy cannot be written (a directory
+/// where the partial file goes): the refusal still names the moved-aside file.
+#[test]
+fn a_failed_new_copy_still_names_the_backup_it_moved_aside() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    store.upgrade_workbench_profile().unwrap();
+    drop(store);
+    drop_wal_files(&path);
+    std::fs::copy(bak11(&path), &path).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO work_workspaces(id,revision,body) VALUES('x',1,'{\"position\":1}')",
+            [],
+        )
+        .unwrap();
+    std::fs::create_dir(path.with_file_name("profile.sqlite.pre-schema-11.bak.partial")).unwrap();
+    let error = Store::open(&path)
+        .unwrap()
+        .upgrade_workbench_profile()
+        .unwrap_err();
+    assert_eq!(error.code, "backup_failed", "{error}");
+    let aside = invalid_siblings(&path);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(
+        error.message.contains(aside[0].to_str().unwrap()),
+        "the only earlier backup is unnamed: {error}"
+    );
+    assert_eq!(aside_note_paths(&error.message).len(), 1, "{error}");
+    assert_eq!(version(&path), 11);
+}
+
+/// The same shape on the retire path, where the failure is Store::open's.
+#[test]
+fn a_failed_retire_copy_still_names_the_backup_it_moved_aside() {
+    let dir = Scratch::new();
+    let path = dir.path().join("profile.sqlite");
+    drop(Store::open(&path).unwrap());
+    let stale = path.with_file_name("profile.sqlite.pre-tasks-retire.bak");
+    let seed = |db: &Path, ids: &[&str]| {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(support::LEGACY_TASKS).unwrap();
+        for id in ids {
+            conn.execute(
+                "INSERT INTO tasks (id, title, description, status, priority, difficulty, planned_files_json,
+                                    requirement_ids_json, acceptance_criterion_ids_json, expected_tests_json,
+                                    allowed_commands_json, forbidden_changes_json,
+                                    agent_appended_planned_files_json)
+                 VALUES (?1, 't', '', 'verified', 'low', NULL, '[]', '[]', '[]', '[]', '[]', '[]', '[]')",
+                [id],
+            )
+            .unwrap();
+        }
+    };
+    std::fs::copy(&path, &stale).unwrap();
+    seed(&stale, &["T1"]);
+    seed(&path, &["T1", "T2"]);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);",
+        )
+        .unwrap();
+    std::fs::create_dir(path.with_file_name("profile.sqlite.pre-tasks-retire.bak.partial"))
+        .unwrap();
+    let error = Store::open(&path).unwrap_err().to_string();
+    let aside: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_str().unwrap().contains(".bak.invalid-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(
+        error.contains(aside[0].to_str().unwrap()),
+        "the only earlier retire backup is unnamed: {error}"
+    );
+    assert_eq!(
+        tables_named(&path, "tasks"),
+        1,
+        "the table was dropped without a copy"
+    );
+}
+
+/// A directory whose listing fails cannot be shown to be under the bound, so
+/// nothing is moved into it.
+#[test]
+fn an_unlistable_directory_refuses_to_move_a_backup_aside() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, path) = profile();
+    std::fs::write(bak11(&path), b"").unwrap();
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let store = Store::open(&path).unwrap();
+    let _restore = RestoreMode(dir.path().to_path_buf());
+    // Searchable and writable, not listable.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::read_dir(dir.path()).is_ok() {
+        // A user the mode does not bind (root): the unit test in backups.rs covers it.
+        return;
+    }
+    let outcome = put_workspace(&store, "nolist");
+    drop(_restore);
+    let error = outcome.expect_err("an unlistable directory let a backup be moved aside");
+    assert_eq!(error.code, "backup_failed", "{error}");
+    assert!(error.message.contains("cannot be counted"), "{error}");
+    assert_eq!(version(&path), 11);
+    assert!(invalid_siblings(&path).is_empty());
+    assert_eq!(std::fs::metadata(bak11(&path)).unwrap().len(), 0);
 }

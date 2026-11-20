@@ -25,8 +25,8 @@ pub use backups::{
     BackupRetention, DEFAULT_KEPT_BACKUPS, KEEP_BACKUPS_ENV, MAX_MOVED_ASIDE, PruneReport,
     moved_aside_copies,
 };
-pub use legacy::Retired;
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
+pub use legacy::Retired;
 pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
 pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
 
@@ -558,20 +558,21 @@ fn existing_backup_verdict(
 /// `must_hold_table` when there is one, else every table of a versioned
 /// `pre-schema` copy. An interrupted upgrade leaves the profile as it was, so
 /// its resumption still finds the copy current. A comparison that cannot be
-/// made counts as out of date: a fresh copy is the safe answer.
+/// made is neither: it is an `Err`, and the file is left where it is, because
+/// an always-failing comparison must not spend a moved-aside slot per attempt.
 fn backup_is_current(
     conn: &Connection,
     backup: &std::path::Path,
     expected_version: Option<i64>,
     must_hold_table: Option<&str>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<std::result::Result<(), String>, String> {
     let scope = match (must_hold_table, expected_version) {
         (Some(table), _) => Some(Some(table)),
         (None, Some(_)) => Some(None),
         (None, None) => None,
     };
     let Some(table) = scope else {
-        return Ok(());
+        return Ok(Ok(()));
     };
     // A profile another host has already moved past `expected_version` cannot
     // be compared: the copy is that host's pre-upgrade backup, which is what
@@ -579,34 +580,49 @@ fn backup_is_current(
     if let Some(expected) = expected_version
         && current_version(conn).map_err(|error| error.message)? != expected
     {
-        return Ok(());
+        return Ok(Ok(()));
     }
     let copy = Connection::open_with_flags(
         backup,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| format!("it cannot be compared with the profile: {error}"))?;
-    let compare = |error: rusqlite::Error| format!("it cannot be compared with the profile: {error}");
+    let compare =
+        |error: rusqlite::Error| format!("it cannot be compared with the profile: {error}");
     let profile_rows = backups::content_digest(conn, table).map_err(compare)?;
     let copy_rows = backups::content_digest(&copy, table).map_err(compare)?;
-    if profile_rows == copy_rows {
+    Ok(if profile_rows == copy_rows {
         Ok(())
     } else {
         Err("it is out of date: the profile has changed since it was written".to_string())
-    }
+    })
 }
 
 /// Moves the unusable file at `backup` to a name beside it that is not taken,
 /// and returns that name. Refuses when [`backups::MAX_MOVED_ASIDE`] copies are
 /// already beside it: nothing is deleted to make room.
 fn move_aside(backup: &std::path::Path) -> std::result::Result<std::path::PathBuf, String> {
-    let held = backups::moved_aside_from(backup);
-    if held >= backups::MAX_MOVED_ASIDE {
+    let held = backups::moved_aside_from(backup).map_err(|error| {
+        format!("the moved-aside copies beside it cannot be counted, so none is added: {error}")
+    })?;
+    if held.len() >= backups::MAX_MOVED_ASIDE {
+        let dir = backup.parent().unwrap_or(std::path::Path::new("."));
+        let pattern = format!(
+            "{}.invalid-*",
+            backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<backup>")
+        );
+        let listed: Vec<String> = held.iter().map(|path| path.display().to_string()).collect();
         return Err(format!(
-            "{held} moved-aside copies already sit beside it (the limit is {}); none is deleted \
-             automatically, so review them (`dc_store::workbench::moved_aside_copies`) and remove \
-             or archive the ones you do not need, then retry",
-            backups::MAX_MOVED_ASIDE
+            "{} moved-aside copies already sit beside it in {} (the limit is {}): {}; none is \
+             deleted automatically, so remove or archive the `{pattern}` files you do not need \
+             in that directory, then retry",
+            held.len(),
+            dir.display(),
+            backups::MAX_MOVED_ASIDE,
+            listed.join(", ")
         ));
     }
     let stamp = std::time::SystemTime::now()
@@ -646,8 +662,17 @@ fn write_backup_under_lock(
     };
     let mut displaced = None;
     if std::fs::symlink_metadata(backup).is_ok() {
-        let verdict = existing_backup_verdict(backup, expected_version, must_hold_table)
-            .and_then(|()| backup_is_current(conn, backup, expected_version, must_hold_table));
+        let verdict = match existing_backup_verdict(backup, expected_version, must_hold_table) {
+            Ok(()) => backup_is_current(conn, backup, expected_version, must_hold_table)
+                .map_err(|error| {
+                    // Not a verdict on the file: it stays where it is.
+                    format!(
+                        "the file already at {} could not be compared with the profile and was left in place: {error}",
+                        backup.display()
+                    )
+                })?,
+            unusable => unusable,
+        };
         match verdict {
             Ok(()) => {
                 return Ok(Backup {
@@ -673,6 +698,27 @@ fn write_backup_under_lock(
             }
         }
     }
+    // The old file now lives only under its moved-aside name, so a failure to
+    // write the new copy (a full disk, say) must say where it went.
+    let mut made =
+        write_fresh_copy(path, backup, expected_version, must_hold_table).map_err(|detail| {
+            match &displaced {
+                Some(note) => format!("{detail}; the earlier backup was moved aside: {note}"),
+                None => detail,
+            }
+        })?;
+    made.displaced = displaced;
+    Ok(made)
+}
+
+/// Writes `backup` as a verified copy of the profile: `VACUUM INTO` a
+/// `.partial`, read it back, then rename it into place.
+fn write_fresh_copy(
+    path: &str,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<Backup, String> {
     backup_window();
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
@@ -704,7 +750,7 @@ fn write_backup_under_lock(
     Ok(Backup {
         path: backup.to_path_buf(),
         created: true,
-        displaced,
+        displaced: None,
     })
 }
 
@@ -2466,5 +2512,31 @@ mod bounded_total_tests {
         // A last page is exact without a count at all (no table needed).
         let (total, exact) = bounded_total(&conn, "FROM missing", &[], 2, false, 4).unwrap();
         assert_eq!((total, exact), (2, true));
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    /// A copy that cannot be read for the comparison is neither current nor out
+    /// of date: the outer result is an error, so the caller leaves the file where
+    /// it is instead of spending a moved-aside slot on it.
+    #[test]
+    fn a_comparison_that_cannot_be_made_is_an_error_not_an_out_of_date_verdict() {
+        let dir = std::env::temp_dir().join(format!("dc-store-compare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unreadable = dir.join("not-a-database.bak");
+        std::fs::write(&unreadable, vec![0xA5u8; 8192]).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO work_meta VALUES (1, 11);",
+        )
+        .unwrap();
+        let verdict = backup_is_current(&conn, &unreadable, Some(11), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = verdict.expect_err("a copy that cannot be read was given a verdict");
+        assert!(error.contains("cannot be compared"), "{error}");
     }
 }
