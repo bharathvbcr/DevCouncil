@@ -12,16 +12,26 @@ pub(super) fn is_metal_path(path: &str) -> bool {
 
 /// How long one file may spend inside tree-sitter before the parse is abandoned.
 ///
-/// Measured, not guessed. A 4,000-byte C++ source consisting of 2,000 nested
-/// braces takes **131 seconds** to parse (`tree-sitter-cpp` 0.23, release
-/// build); the same input costs Ruby 8.8 s and Python 58 ms. Generated,
-/// minified and machine-emitted sources hit exactly this shape, and until now a
-/// single such file stalled the whole build with no diagnostic — a `dev map` on
-/// a repository containing one would look like a hang, and a daemon rebuild
-/// would hold its lock for the duration.
+/// The shape that is pathological has moved. A 4,000-byte C++ source of 2,000
+/// nested braces once took **131 s** to parse on an earlier `tree-sitter-cpp`;
+/// on 0.23.4 (`rust/Cargo.lock`) it parses in about 6 ms (release) / 50 ms
+/// (debug) — attacker-measured, not re-measured here. What is still
+/// superlinear is a long chain or a deep nest of calls. Measured here
+/// (release, `tree-sitter-cpp` 0.23.4, load average about 50, min of 3 runs,
+/// one source file parsed with a 120 s budget): a method chain `a.b().b()...`
+/// takes **3.1 s** at 2,000 calls (8 KB), **12.1 s** at 4,000 (16 KB) and
+/// **107 s** at 8,000 (32 KB); one of three 8,000-call runs hit the 120 s
+/// budget and was refused. Attacker-measured, same conditions and not
+/// re-measured here: 8,000 nested calls `f(f(f(...)))` (24 KB) 47.8 s, an
+/// `A<A<...int>>` nest of 8,000 (24 KB) 27.9 s, an 8,000-link ternary chain
+/// 21.1 s. Generated, minified and machine-emitted sources hit these shapes,
+/// and without a bound a single such file stalls the whole build with no
+/// diagnostic: a `dev map` on a repository containing one would look like a
+/// hang, and a daemon rebuild would hold its lock for the duration.
 ///
 /// Five seconds is far above what a legitimate file costs on an idle machine
-/// and far below the pathological case. Measured on the real corpora: the
+/// and far below the pathological shapes above. Measured on the real corpora
+/// (`benchmarks/results/map/20260902T173948Z.md`, not re-measured here): the
 /// largest source seen (624 KB, 12,353 lines) takes **875 ms** standalone at a
 /// load average of 85, and most files take single-digit milliseconds.
 ///
@@ -40,8 +50,8 @@ pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_
 ///
 /// Five: enough to absorb the 6x contention stretch measured on the 875 ms
 /// file's worst case once the contention within the process is gone, while
-/// keeping the retry bounded at 25 s per file against the 131 s pathological
-/// C++ input.
+/// keeping the retry bounded at 25 s per file against the pathological shapes
+/// above, which cost tens of seconds to minutes unbounded.
 pub const RETRY_BUDGET_FACTOR: u32 = 5;
 
 /// Maximum declared symbols permitted for a single file before extraction is refused.
