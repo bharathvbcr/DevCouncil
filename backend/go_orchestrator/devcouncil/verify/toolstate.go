@@ -49,9 +49,22 @@ import (
 func toolStatePathspecs() []string {
 	spec := []string{"--"}
 	for _, dir := range policy.ToolStateDirs {
-		spec = append(spec, ":(top,icase)"+dir)
+		spec = append(spec, toolStatePathspec("", dir))
 	}
 	return spec
+}
+
+// toolStatePathspec is the one spelling of a tool-state directory as a pathspec:
+// from the top of the tree and case-insensitive, as policy.IsToolState folds
+// case. The read (toolStatePathspecs) and the exclude (toolStateExcludes) both
+// build theirs here, so they cannot disagree about which paths are tool state.
+// extra is more magic, such as "exclude".
+func toolStatePathspec(extra, dir string) string {
+	magic := "top,icase"
+	if extra != "" {
+		magic += "," + extra
+	}
+	return ":(" + magic + ")" + dir
 }
 
 // maxToolStateReasons bounds the unscanned paths listed one by one. The rest are

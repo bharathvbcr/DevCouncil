@@ -603,18 +603,45 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	// instead of each starting its own.
 	ctx, cancel := proc.WithWalkBudget(ctx)
 	defer cancel()
-	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-status", "-z"}, toolStateExcludes()...)...)
+	// base is what the tree is compared to: HEAD, or in a repository with no
+	// commit yet the empty tree, so what is staged there is listed and read like
+	// any other change instead of being dropped.
+	base := "HEAD"
+	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", base, "--name-status", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
 		if !hasNoHead(ctx, git) {
 			return GitState{}, err
 		}
-		headless, nameOut = true, nil
+		headless = true
+		if base, err = emptyTreeOID(ctx, git); err != nil {
+			return GitState{}, err
+		}
+		nameOut, err = runGit(ctx, git, gitListingLimit, append([]string{"diff", base, "--name-status", "-z"}, toolStateExcludes()...)...)
+		if err != nil {
+			return GitState{}, err
+		}
 	}
 	entries, err := parseNameStatus(nameOut)
 	if err != nil {
 		return GitState{}, err
 	}
+	// The index is a second view of the change: what is staged is in the next
+	// commit whatever the worktree holds now, so a secret staged and then
+	// reverted or deleted on disk is in no worktree diff. Its paths join the
+	// list and its sections join the diff (appendNewSections).
+	// Unmerged paths are left out of the index view (--diff-filter=u): git prints
+	// a conflicted path as a `* Unmerged path` stub, which is no diff to parse,
+	// and the worktree view already carries it.
+	stagedOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "--cached", "--diff-filter=u", base, "--name-status", "-z"}, toolStateExcludes()...)...)
+	if err != nil {
+		return GitState{}, err
+	}
+	staged, err := parseNameStatus(stagedOut)
+	if err != nil {
+		return GitState{}, err
+	}
+	entries = append(entries, staged...)
 	seen := map[string]struct{}{}
 	add := func(path string) {
 		// Tool-owned state is not the agent's work; policy.ToolStateDirs
@@ -640,6 +667,7 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	tracked := map[string]struct{}{}
 	addedSet := map[string]struct{}{}
 	var recreated []string
+	recreatedSet := map[string]struct{}{}
 	for _, entry := range entries {
 		if policy.IsToolState(entry.path) {
 			continue
@@ -658,7 +686,10 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 			case serr != nil:
 				return GitState{}, fmt.Errorf("cannot tell whether deleted %s is back on disk: %v", entry.path, serr)
 			case !info.IsDir():
-				recreated = append(recreated, entry.path)
+				if _, dup := recreatedSet[entry.path]; !dup {
+					recreatedSet[entry.path] = struct{}{}
+					recreated = append(recreated, entry.path)
+				}
 				continue
 			}
 		}
@@ -697,8 +728,12 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	if err != nil {
 		return GitState{}, err
 	}
-	if !headless {
-		args := append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)
+	for _, cached := range []bool{false, true} {
+		args := []string{"-c", "core.quotePath=false", "diff"}
+		if cached {
+			args = append(args, "--cached", "--diff-filter=u")
+		}
+		args = append(append(args, base), toolStateExcludes()...)
 		for _, path := range recreated {
 			args = append(args, ":(top,exclude,literal)"+path)
 		}
@@ -706,7 +741,10 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 		if err != nil {
 			return GitState{}, err
 		}
-		diff = string(diffBytes)
+		diff = appendNewSections(diff, string(diffBytes))
+		if len(diff) > gitDiffLimit {
+			return GitState{}, diffTooLargeError{}
+		}
 	}
 	diff, err = attachMissingDiffBytes(ctx, git, root, changed, tracked, dirty, diff)
 	if err != nil {
@@ -772,9 +810,65 @@ func ToolOwned(path string) bool { return policy.IsToolState(path) }
 func toolStateExcludes() []string {
 	spec := []string{"--", "."}
 	for _, dir := range policy.ToolStateDirs {
-		spec = append(spec, ":(top,exclude)"+dir)
+		spec = append(spec, toolStatePathspec("exclude", dir))
 	}
 	return spec
+}
+
+// emptyTreeOID is the object id of the empty tree in this repository's hash
+// format (a sha256 repository has a different one), asked of git rather than
+// written down.
+func emptyTreeOID(ctx context.Context, git *proc.GitSession) (string, error) {
+	out, err := runGit(ctx, git, 1<<10, "hash-object", "-t", "tree", os.DevNull)
+	if err != nil {
+		return "", fmt.Errorf("reading the empty tree id: %w", err)
+	}
+	oid := strings.TrimSpace(string(out))
+	if n := len(oid); n != 40 && n != 64 {
+		return "", fmt.Errorf("git named %q as the empty tree", oid)
+	}
+	return oid, nil
+}
+
+// appendNewSections returns diff followed by each per-file section of extra
+// that diff does not already hold byte for byte. A file staged and left alone
+// on disk reads the same in both views; keeping one copy stops its findings
+// being reported twice, while a file whose index and worktree differ keeps both.
+func appendNewSections(diff, extra string) string {
+	if extra == "" {
+		return diff
+	}
+	have := map[string]struct{}{}
+	for _, sec := range diffSections(diff) {
+		have[sec] = struct{}{}
+	}
+	var b strings.Builder
+	b.WriteString(diff)
+	if diff != "" && !strings.HasSuffix(diff, "\n") {
+		b.WriteByte('\n')
+	}
+	for _, sec := range diffSections(extra) {
+		if _, ok := have[sec]; !ok {
+			b.WriteString(sec)
+		}
+	}
+	return b.String()
+}
+
+// diffSections splits a git diff into its `diff --git` sections, each kept
+// whole with its trailing newline.
+func diffSections(diff string) []string {
+	var out []string
+	for diff != "" {
+		next := strings.Index(diff, "\ndiff --git ")
+		if next < 0 {
+			out = append(out, diff)
+			break
+		}
+		out = append(out, diff[:next+1])
+		diff = diff[next+1:]
+	}
+	return out
 }
 
 // hasNoHead reports whether the repository has no HEAD commit yet: git ran

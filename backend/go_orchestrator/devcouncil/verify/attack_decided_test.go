@@ -344,13 +344,18 @@ func TestDecidedGitlinkBoundary(t *testing.T) {
 func TestDecidedHeadlessGitlinks(t *testing.T) {
 	root := t.TempDir()
 	runGitIn(t, root, "init", "-q")
-	awkward := []string{"z\nnl", "tab\there", "bad\xffbytes", "cr\rx", "nul-free\x1bescape", "\u202ertl"}
+	// Line breaks in a name are covered by TestDecidedHeadlessGitlinkWithControlBytePath:
+	// staged gitlinks are real changes against the empty tree, and a path with a
+	// LF or CR is one the planner and the substance reader refuse.
+	awkward := []string{"\u202ertl"}
 	entries := [][3]string{{"160000", sha('a'), ".devcouncil/g"}}
+	var plan []dc.PlannedFile
 	for _, p := range awkward {
 		entries = append(entries, [3]string{"160000", sha('a'), p})
+		plan = append(plan, dc.PlannedFile{Path: p, AllowedChange: dc.ChangeCreate})
 	}
 	indexInfo(t, root, entries)
-	o := attackRun(t, root, "TASK-D-GL-HL")
+	o := attackRun(t, root, "TASK-D-GL-HL", plan...)
 	requireGitlinkNotSilent(t, "", o, ".devcouncil/g")
 	if len(o.result.DegradedReasons) != len(entries) {
 		t.Fatalf("want one reason per gitlink (%d), got %d: %q", len(entries), len(o.result.DegradedReasons), o.result.DegradedReasons)
@@ -358,6 +363,21 @@ func TestDecidedHeadlessGitlinks(t *testing.T) {
 	for _, r := range o.result.DegradedReasons {
 		if strings.ContainsAny(r, "\n\r\t\x1b\x00") {
 			t.Fatalf("a reason holds a raw control byte: %q", r)
+		}
+	}
+}
+
+// A staged gitlink whose path holds a CR is a change against the empty tree
+// like any other, and the substance reader refuses such a path: the run must
+// stop, not read as verified.
+func TestDecidedHeadlessGitlinkWithControlBytePath(t *testing.T) {
+	for _, name := range []string{"cr\rx", "z\nnl", "bad\xffbytes", "nul-free\x1bescape", "tab\there"} {
+		root := t.TempDir()
+		runGitIn(t, root, "init", "-q")
+		indexInfo(t, root, [][3]string{{"160000", sha('a'), name}})
+		o := attackRun(t, root, "TASK-D-GL-HL-CR", dc.PlannedFile{Path: name, AllowedChange: dc.ChangeCreate})
+		if class := decidedClass(o); class == "verified" {
+			t.Fatalf("a staged gitlink named %q read as verified: %s", name, class)
 		}
 	}
 }
@@ -1112,7 +1132,7 @@ func TestDecidedOrdinaryStagedSecretThenRevertedForComparison(t *testing.T) {
 		o := attackRun(t, root, "TASK-D-ORD-REV", benignChange(t, root))
 		t.Logf("ordinary: class=%s empty=%v diffHasKey=%v", decidedClass(o), o.empty, strings.Contains(o.diff, key))
 		if decidedClass(o) == "verified" {
-			t.Skip("ft-c397c278 (pre-existing on main a76e963f, verified there): `git diff HEAD` compares the worktree to HEAD, so a secret staged and then reverted on disk is in the index (and the next commit) and in no diff; the same basis serves tool state below")
+			t.Fatalf("staged secret reverted on disk was verified clean (the gate read the worktree, not the index)")
 		}
 	})
 	t.Run("headless repo, staged secret file", func(t *testing.T) {
@@ -1123,7 +1143,7 @@ func TestDecidedOrdinaryStagedSecretThenRevertedForComparison(t *testing.T) {
 		o := attackRun(t, root, "TASK-D-ORD-HL")
 		t.Logf("headless staged: class=%s empty=%v diffHasKey=%v types=%v", decidedClass(o), o.empty, strings.Contains(o.diff, key), advTypes(o.gaps))
 		if decidedClass(o) == "verified" {
-			t.Skip("ft-c397c278 (pre-existing on main): a repository with no HEAD collects only untracked files and `ls-files --others` omits staged ones, so a staged secret is in no listing (the headless branch of CollectGitStateReport is unchanged by the lane except for tool state)")
+			t.Fatalf("headless staged secret was verified clean (the gate read only untracked files)")
 		}
 	})
 }
