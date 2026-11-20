@@ -1881,6 +1881,13 @@ impl Resolver {
                                     target_identity,
                                 );
                             if !out_of_scope
+                                && !self.plain_c_caller_declines_method(
+                                    family,
+                                    &ext.file_path,
+                                    &call.callee_name,
+                                    target_f,
+                                    target_identity,
+                                )
                                 && !self.rust_unique_rung_declines(
                                     family,
                                     &ext.file_path,
