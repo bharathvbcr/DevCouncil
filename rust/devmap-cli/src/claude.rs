@@ -559,14 +559,16 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                     }
                 }
                 if let Some(command) = handler.get("command").and_then(Value::as_str) {
-                    let trimmed = command.trim();
-                    // A bare name with no path separator is the Cursor failure mode.
-                    if !trimmed.contains('/') && !trimmed.contains('\\') && !trimmed.contains(' ') {
+                    // A bare or relative executable is the Cursor failure mode, and
+                    // a repository file named `devmap` the worse one.
+                    if let Some(why) = command_word_defect(command) {
+                        let trimmed = command.trim();
                         out.push(Diagnostic::error(
                             at,
                             format!(
-                                "hook `command` {trimmed:?} is a bare name; Cursor/Codex need an \
-                                 absolute-path shell-form command ('/path/to/devmap' hook <event>)"
+                                "hook `command` {trimmed:?} starts with an executable that {why}; \
+                                 Cursor/Codex need an absolute-path shell-form command \
+                                 ('/path/to/devmap' hook <event>)"
                             ),
                         ));
                     }
@@ -1326,18 +1328,123 @@ pub(crate) fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
     })
 }
 
-/// Absolute path for a hook `command`, even when PATH resolves to self.
-///
-/// MCP entries still use [`plugin_command`]'s bare-name rule; hooks must be
-/// absolute because Cursor/Codex do not expand a bare name the same way, and a
-/// bare `devmap` that clap-rejects exits 2 and blocks the agent.
-pub fn hook_executable(executable: &Path) -> PathBuf {
+/// The executable path a writer may put in a hook or MCP `command`: absolute,
+/// or an error. A relative path is never resolved against the working
+/// directory here, because that is how a file named `devmap` in a repository
+/// root became the command every session ran.
+pub fn absolute_executable(executable: &Path) -> anyhow::Result<PathBuf> {
     if executable.is_absolute() {
-        return executable.to_path_buf();
+        return Ok(executable.to_path_buf());
     }
-    executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_path_buf())
+    anyhow::bail!(
+        "refusing to register the relative executable {}: a host would resolve it against \
+         whatever directory it runs in. Resolve it with `reachable_command` first",
+        executable.display()
+    )
+}
+
+/// The leading executable word of a shell-form hook command: the single- or
+/// double-quoted path, else the first whitespace-delimited word.
+pub(crate) fn command_executable_word(command: &str) -> &str {
+    let trimmed = command.trim();
+    for quote in ['\'', '"'] {
+        if let Some(rest) = trimmed.strip_prefix(quote) {
+            return rest.split(quote).next().unwrap_or("");
+        }
+    }
+    trimmed.split_whitespace().next().unwrap_or("")
+}
+
+/// How one command word fares as an executable a host will run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordVerdict {
+    /// Absolute (or expanding to the user's home) and outside the repository.
+    Fine,
+    /// Neither absolute nor an expansion: resolved against the host's cwd or PATH.
+    Relative,
+    /// Led by a `$VAR` other than `$HOME`, or `~user`: the environment decides.
+    Expanded,
+    /// Resolves inside the repository, which can replace it.
+    Inside,
+}
+
+impl WordVerdict {
+    pub(crate) fn defect(self) -> Option<&'static str> {
+        match self {
+            Self::Fine => None,
+            Self::Relative => {
+                Some("is relative, so the host resolves it against whatever directory it runs in")
+            }
+            Self::Expanded => Some(
+                "is expanded by the host from its environment, which a repository can influence",
+            ),
+            Self::Inside => Some("is inside the repository, which can replace it"),
+        }
+    }
+}
+
+/// `~`, `$HOME` or `${HOME}` alone or followed by `/…`: the rest of the word.
+fn home_relative(word: &str) -> Option<&str> {
+    for prefix in ["~", "${HOME}", "$HOME"] {
+        if let Some(rest) = word.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return Some(rest);
+            }
+        }
+    }
+    None
+}
+
+/// The one predicate for "is this command word acceptable", shared by the hook
+/// validators and `doctor`: absolute and outside `repo` is fine; a leading `~`
+/// or `$HOME` expanding to `home` is judged as that path; any other `$VAR`-led
+/// or `~user` word, and any relative word, is a defect. An error means the word
+/// could not be judged, which a caller must never read as fine.
+pub(crate) fn judge_command_word(
+    word: &str,
+    home: Option<&Path>,
+    repo: Option<&Path>,
+) -> anyhow::Result<WordVerdict> {
+    let resolved = if let Some(rest) = home_relative(word) {
+        let home =
+            home.ok_or_else(|| anyhow::anyhow!("HOME is unset, so {word:?} cannot be expanded"))?;
+        home.join(rest.trim_start_matches('/'))
+    } else if word.starts_with('$') || word.starts_with('~') {
+        return Ok(WordVerdict::Expanded);
+    } else if !Path::new(word).is_absolute() {
+        return Ok(WordVerdict::Relative);
+    } else {
+        PathBuf::from(word)
+    };
+    if let Some(repo) = repo {
+        if !resolved.is_dir() && crate::hook::executable_is_inside_repository(&resolved, repo)? {
+            return Ok(WordVerdict::Inside);
+        }
+    }
+    Ok(WordVerdict::Fine)
+}
+
+/// Why the leading executable word of a hook command string is not acceptable,
+/// judged with `$HOME` from the environment and no repository. `None` when it is.
+pub(crate) fn command_word_defect(command: &str) -> Option<String> {
+    let word = command_executable_word(command);
+    if word.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match judge_command_word(word, home.as_deref(), None) {
+        Ok(verdict) => verdict.defect().map(str::to_string),
+        Err(error) => Some(format!("could not be judged: {error}")),
+    }
+}
+
+/// The repository the working directory is in: its git worktree top, unless
+/// that is `$HOME` itself (a home directory is not the repository a hook
+/// command could be planted in). `None` outside any repository.
+pub fn cwd_repository() -> anyhow::Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let home = std::env::var_os("HOME").and_then(|home| PathBuf::from(home).canonicalize().ok());
+    Ok(devmap_extract::git_worktree_root(&cwd).filter(|top| Some(top) != home.as_ref()))
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -1354,63 +1461,84 @@ pub fn known_subcommands<C: clap::CommandFactory>() -> Vec<String> {
     })
 }
 
-/// The command string to write into an emitted hook or MCP entry.
-///
-/// `std::env::current_exe()` is an absolute path into whatever tree the running
-/// binary came from — for a local build, `…/rust/target/release/devmap`.
-/// Baked into a bundle, that path is wrong in two ordinary situations: a bundle
-/// committed to the repository names a path that exists on one machine, and a
-/// bundle emitted from a build tree keeps pointing at a stale binary after
-/// `cargo install` puts a current one on `PATH`.
-///
-/// So the bare name `devmap` is emitted when `devmap` on `PATH` *is* this
-/// binary, and the absolute path otherwise. The test is by resolved path rather
-/// than by name: a *different* `devmap` earlier on `PATH` is precisely the case
-/// where the absolute path is the honest answer, because emitting the bare name
-/// would silently hand the hook to some other build.
-///
-/// `explicit` wins over both, for a packager who knows the install location
-/// before anything is installed there.
-pub fn plugin_command(executable: &Path, explicit: Option<&Path>) -> PathBuf {
-    if let Some(path) = explicit {
-        return path.to_path_buf();
+/// `path` with its deepest existing ancestor canonicalized and the missing
+/// tail re-appended. A tail with `..` or no file name is refused.
+fn canonical_with_missing_tail(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut tail = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match current.canonicalize() {
+            Ok(mut resolved) => {
+                resolved.extend(tail.iter().rev());
+                return Ok(resolved);
+            }
+            Err(_) => {
+                let Some(name) = current.file_name().map(std::ffi::OsStr::to_os_string) else {
+                    anyhow::bail!(
+                        "refusing to register {}: cannot resolve where it would land",
+                        path.display()
+                    );
+                };
+                tail.push(name);
+                current.pop();
+            }
+        }
     }
-    let path_var = std::env::var_os("PATH");
-    if resolves_to_self(PLUGIN_NAME, executable, path_var.as_deref()) {
-        return PathBuf::from(PLUGIN_NAME);
-    }
-    executable.to_path_buf()
 }
 
-/// True when looking `name` up on `path_var` finds `executable` itself.
+/// What command line reaches this binary: the one owner every writer shares.
 ///
-/// Compares canonicalized paths, so a `PATH` entry that is a symlink to the
-/// binary — which is what `cargo install` and every package manager produce —
-/// counts as the same file rather than as a different one.
-fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::OsStr>) -> bool {
-    let Some(path_var) = path_var else {
-        return false;
-    };
-    let Ok(target) = executable.canonicalize() else {
-        return false;
-    };
-    for dir in std::env::split_paths(path_var) {
-        // An empty `PATH` entry means the working directory on some shells.
-        // Resolving a hook command against wherever the agent happens to be
-        // running is not a behaviour worth reproducing.
-        if dir.as_os_str().is_empty() {
-            continue;
+/// Always an absolute, canonical path that is not inside the repository at
+/// `root` (nor reached through a link inside it), as
+/// [`crate::hook::canonical_hook_executable`] proves for the hooks themselves.
+/// A bare `devmap` is never returned, even when `devmap` on `PATH` is this
+/// binary: the bare name is resolved by the *host*, against its own `PATH` and
+/// working directory, and an executable `devmap` in a repository root would
+/// win there. `explicit` (`--binary`) replaces the running binary and goes
+/// through the same check.
+pub fn reachable_command(
+    executable: &Path,
+    explicit: Option<&Path>,
+    root: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    // A packager names the install location before anything is installed there
+    // (`--binary /usr/local/bin/devmap`). Such a path cannot be canonicalized,
+    // so it is judged by where it is: absolute, and not under the repository.
+    if let Some(path) = explicit {
+        let missing = std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if missing && path.is_absolute() {
+            // Judged where it will land: the deepest existing ancestor is
+            // resolved through its links and the missing tail re-appended, so
+            // `out/link/devmap` with `out/link -> repo/bin` is the repository's.
+            let landing = canonical_with_missing_tail(path)?;
+            if let Some(root) = root.filter(|root| {
+                crate::hook::executable_is_inside_repository(&landing, root).unwrap_or(true)
+            }) {
+                anyhow::bail!(
+                    "refusing to register the devmap command: {} lands inside the repository at {} ({})",
+                    path.display(),
+                    root.display(),
+                    landing.display()
+                );
+            }
+            return Ok(landing);
         }
-        let candidate = dir.join(name);
-        let Ok(resolved) = candidate.canonicalize() else {
-            continue;
-        };
-        // The first hit on PATH decides, exactly as execution would. Continuing
-        // past it would let a *later* entry that happens to be this binary
-        // authorize emitting a bare name that resolves to the earlier one.
-        return resolved == target;
     }
-    false
+    let chosen = explicit.unwrap_or(executable);
+    match root {
+        Some(root) => {
+            crate::hook::canonical_hook_executable(chosen, root, "register the devmap command")
+        }
+        // Not in any repository: nothing can supply a file by that name, so
+        // only the absolute, canonical form is required.
+        None => chosen.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "cannot resolve the devmap executable {}: {error}",
+                chosen.display()
+            )
+        }),
+    }
 }
 
 /// One shell-form hook command: `'<abs>' hook <event>`.
@@ -1437,7 +1565,7 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
             subcommands.join(", ")
         );
     }
-    let exe = hook_executable(executable);
+    let exe = absolute_executable(executable)?;
     let exe_text = utf8_path("the devmap executable path", &exe)?;
 
     // Groups are keyed by (event, matcher): two handlers that fire on the same
@@ -1612,7 +1740,10 @@ pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
 /// `preToolUse` is a permission hook, and a schema mismatch there blocks the
 /// tool, so the directive is injected after the first read instead.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
-    let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
+    let exe = utf8_path(
+        "the devmap executable path",
+        &absolute_executable(executable)?,
+    )?;
     let session_start = hook_shell_command(&exe, "session-start")?;
     let after_file_edit = hook_shell_command(&exe, "post-tool-use")?;
     let post_tool_use = hook_shell_command(&exe, "pre-tool-use")?;
@@ -1753,7 +1884,10 @@ pub fn mcp_entry(
     // Always the absolute path this binary validated. Emitting a bare `devmap`
     // silently hands the host whichever build wins on PATH; two installs with
     // different schemas is the skew doctor reports.
-    let command = utf8_path("the devmap executable path", executable)?;
+    let command = utf8_path(
+        "the devmap executable path",
+        &absolute_executable(executable)?,
+    )?;
     Ok(match http {
         Some(address) => json!({
             "type": "http",
@@ -1791,7 +1925,10 @@ pub fn mcp_entry_with_root(
     if http.is_some() {
         return mcp_entry(executable, None, http);
     }
-    let command = utf8_path("the devmap executable path", executable)?;
+    let command = utf8_path(
+        "the devmap executable path",
+        &absolute_executable(executable)?,
+    )?;
     Ok(json!({
         "type": "stdio",
         "command": command,
@@ -2975,8 +3112,8 @@ mod tests {
             format!("/tmp/o'{subst}/devmap"),
             format!("/tmp/'{subst}'/devmap"),
             "/tmp/foo'; touch \"$MARKER\"; echo '/devmap".to_string(),
-            format!("'{subst}"),
-            format!("{subst}'"),
+            format!("/'{subst}"),
+            format!("/{subst}'"),
             format!("/tmp/my bin/{subst}/devmap"),
             format!("/tmp/δé/{subst}/devmap"),
             format!("/tmp/路径/{tick}/devmap"),
@@ -2986,7 +3123,7 @@ mod tests {
             format!("/tmp/a\u{202e}{tick}/devmap"),
             format!("/tmp/foo # {subst}"),
             format!("/tmp/<({subst})/devmap"),
-            format!("a'b'c'{subst}"),
+            format!("/a'b'c'{subst}"),
         ];
         for path in &paths {
             let block = hooks_block(Path::new(path), &["hook".to_string()])
@@ -3189,5 +3326,56 @@ mod tests {
             linked.to_string().contains("devcouncil-testbin"),
             "{linked}"
         );
+    }
+
+    #[test]
+    fn a_relative_executable_is_never_registered() {
+        for relative in ["devmap", "./devmap", "bin/devmap"] {
+            let path = Path::new(relative);
+            assert!(absolute_executable(path).is_err(), "{relative}");
+            assert!(
+                hooks_block(path, &["hook".to_string()]).is_err(),
+                "{relative}"
+            );
+            assert!(cursor_hooks_document(path).is_err(), "{relative}");
+            assert!(mcp_entry(path, None, None).is_err(), "{relative}");
+            assert!(
+                mcp_entry_with_root(path, Path::new("/repo"), None).is_err(),
+                "{relative}"
+            );
+        }
+        assert_eq!(
+            absolute_executable(Path::new("/usr/local/bin/devmap")).unwrap(),
+            Path::new("/usr/local/bin/devmap")
+        );
+    }
+
+    #[test]
+    fn one_predicate_judges_command_words() {
+        let home = Path::new("/home/u");
+        let verdict = |word: &str| judge_command_word(word, Some(home), None).unwrap();
+        for relative in ["devmap", "./devmap", "bin/devmap", "../x/devmap"] {
+            assert_eq!(verdict(relative), WordVerdict::Relative, "{relative}");
+        }
+        for expanded in [
+            "$CLAUDE_PROJECT_DIR/bin/devmap",
+            "${CLAUDE_PROJECT_DIR}/devmap",
+            "$HOMEX/devmap",
+            "~other/bin/devmap",
+        ] {
+            assert_eq!(verdict(expanded), WordVerdict::Expanded, "{expanded}");
+        }
+        for fine in [
+            "/usr/bin/devmap",
+            "~/.local/bin/devmap",
+            "$HOME/.local/bin/devmap",
+            "${HOME}/.local/bin/devmap",
+        ] {
+            assert_eq!(verdict(fine), WordVerdict::Fine, "{fine}");
+        }
+        assert!(judge_command_word("~/devmap", None, None).is_err());
+        assert!(command_word_defect("'$CLAUDE_PROJECT_DIR'/devmap hook x").is_some());
+        assert!(command_word_defect("'/usr/bin/devmap' hook x").is_none());
+        assert!(command_word_defect("devmap hook x").is_some());
     }
 }

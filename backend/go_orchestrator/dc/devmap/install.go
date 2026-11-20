@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -263,6 +265,26 @@ func (r *Reported) Error() string {
 	return fmt.Sprintf("devmap %s refused: %s", r.Command, r.Message)
 }
 
+// absolutePathArgs makes every path argument absolute against this process's
+// working directory. devmap no longer starts in the repository, so a relative
+// --project-root, --only-path or --binary would otherwise mean a different file
+// than the caller named. A path that cannot be made absolute is an error.
+func absolutePathArgs(args []string) ([]string, error) {
+	out := slices.Clone(args)
+	for i := 0; i+1 < len(out); i++ {
+		switch out[i] {
+		case "--project-root", "--only-path", "--binary":
+			abs, err := filepath.Abs(out[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("cannot make %s %q absolute: %w", out[i], out[i+1], err)
+			}
+			out[i+1] = abs
+			i++
+		}
+	}
+	return out, nil
+}
+
 // install runs one installing command and decodes its report.
 //
 // The report is the first JSON document on stdout, and it is a report only if
@@ -272,7 +294,16 @@ func (r *Reported) Error() string {
 // false) and dropped the reason. Such a document is a *Reported, in every mode.
 // When a report was printed first, the envelope after it is not parsed.
 func (c *Client) install(ctx context.Context, into any, mode InstallMode, stdin []byte, args ...string) error {
-	out, err := c.invoke(ctx, installBudget, stdin, args...)
+	// Not in the repository: every installing command is handed the repository
+	// as --project-root, and a working directory that is the repository is one
+	// more place a file of its own could be found by name. The binary itself was
+	// resolved outside it (ResolveOutside), and devmap now registers its own
+	// canonical path, never a name looked up from here.
+	args, err := absolutePathArgs(args)
+	if err != nil {
+		return err
+	}
+	out, err := c.invokeIn(ctx, os.TempDir(), installBudget, stdin, args...)
 	if err != nil {
 		return err
 	}
