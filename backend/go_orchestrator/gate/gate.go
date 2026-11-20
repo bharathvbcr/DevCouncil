@@ -388,20 +388,25 @@ func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, e
 	if err != nil {
 		return RedirectRefusal{}, err
 	}
-	if opaque {
-		return RedirectRefusal{
-			Decision: policy.Decision{
-				Action:   policy.Deny,
-				Rule:     policy.RuleCommandSubstitution,
-				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
-				Reason: "A file this command writes — a redirection target or a file operand — is chosen " +
-					"by a command substitution, or the line writes more files than the gate enumerates, " +
-					"and was judged as an unverifiable write. Write to a literal file path or use your file editing tools instead.",
-				Target: command,
-				TaskID: taskID,
-			},
-			Refused: true,
-		}, nil
+	// An opaque line is refused, but only after the files it does name are
+	// judged: a refusal for a write the gate could not read must not hide the
+	// one for a write it could (a credential target is path.secret, not this).
+	opaqueReason := "A file this command writes — a redirection target or a file operand — is chosen " +
+		"by a command substitution, or the line writes more files than the gate enumerates, " +
+		"and was judged as an unverifiable write. Write to a literal file path or use your file editing tools instead."
+	if set.OpaqueReason != "" {
+		opaqueReason = set.OpaqueReason
+	}
+	opaqueRefusal := RedirectRefusal{
+		Decision: policy.Decision{
+			Action:   policy.Deny,
+			Rule:     policy.RuleCommandSubstitution,
+			Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
+			Reason:   opaqueReason,
+			Target:   command,
+			TaskID:   taskID,
+		},
+		Refused: true,
 	}
 	var blocked []policy.Decision
 	judgeSet := func(paths, delPaths []string, eval func(target string, op dc.Operation) (policy.Decision, error)) (bool, error) {
@@ -456,7 +461,13 @@ func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, e
 		}
 	}
 	if chosen, refused := policy.MostImportant(blocked); refused {
+		if opaque && !(chosen.Severity == policy.Hard && !policy.IsUnreadableRule(chosen.Rule)) {
+			return opaqueRefusal, nil
+		}
 		return RedirectRefusal{Decision: chosen, Refused: true, FromTarget: true}, nil
+	}
+	if opaque {
+		return opaqueRefusal, nil
 	}
 	// A sibling's files are another session's, never the caller's scope, so this
 	// does not depend on scopeBound. Policy records why it could not name them
