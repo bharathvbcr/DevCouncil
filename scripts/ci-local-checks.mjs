@@ -96,6 +96,117 @@ export function goModToolchain(goMod) {
   return v ? `go${v}` : undefined;
 }
 
+const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
+const NESTED_HEADER = /^ {2}── rust\/verify\.sh ─+$/;
+const NESTED_ROW = /^ {4}(PASS|FAIL|SKIP|N\/A) {2,3}\S.*$/;
+const QUICK_GREEN = "QUICK GATES GREEN; the full gate suite was NOT RUN";
+
+/**
+ * A gate's merged output as lines, colour stripped and CRLF and bare CR taken
+ * as line ends, so a gate that ends its lines with \r is read like one that
+ * ends them with \n. Every matcher below reads these lines.
+ *
+ * @param {string} log
+ * @returns {string[]}
+ */
+function logLines(log) {
+  return log.replace(ANSI, "").split(/\r\n|\r|\n/);
+}
+
+/**
+ * The libtest lines that say a test failed: `test <name> ... FAILED` and
+ * `test result: FAILED. N passed; M failed`. Cargo prints them for every
+ * failing target, so a log that holds one is not a green run, whatever status
+ * the process that printed it exited with. A passing test that merely has
+ * FAILED in its name ends in `... ok` and does not match.
+ *
+ * @param {string} log
+ * @returns {string[]}
+ */
+export function libtestFailures(log) {
+  return logLines(log).filter((l) => /^test .+ \.\.\. FAILED$/.test(l) || /^test result: FAILED\./.test(l));
+}
+
+/**
+ * Cargo's own failure lines, which libtest never prints because the target
+ * did not run: a test target that did not compile, and the closing count of
+ * failed targets. rust/verify.sh does not use nextest (checked by grep), so
+ * nextest's `FAIL [` lines are not read.
+ *
+ * @param {string} log
+ * @returns {string[]}
+ */
+export function cargoFailures(log) {
+  return logLines(log).filter(
+    (l) => /^error: could not compile /.test(l) || /^error: \d+ targets? failed/.test(l) || /^error: test failed, to rerun/.test(l),
+  );
+}
+
+/**
+ * The step labels a verify.sh declares (`L_NAME="label"`, one per step, in the
+ * order it records their rows), or undefined when it declares none. The block's
+ * rows must be exactly these: the step list is knowable from the script, and a
+ * block with rows missing is not the whole run.
+ *
+ * @param {string} source
+ * @returns {string[] | undefined}
+ */
+export function expectedRowLabels(source) {
+  const labels = [...source.matchAll(/^L_[A-Z0-9_]+="([^"]*)"\s*$/gm)].map((m) => m[1]);
+  return labels.length > 0 ? labels : undefined;
+}
+
+/**
+ * Why a nested gate's exit 0 cannot be believed, or undefined when its own
+ * output backs it. An exit status is a claim: on 2026-11-17 rust/verify.sh's
+ * summary() died and its EXIT trap turned the crash into 0, so the status said
+ * green over a log holding "3/8 tests failed (exit 101)".
+ *
+ * Nested (--continue --nested) the output must hold exactly one summary block:
+ * header, at least one well-formed row, a blank line ending it, no FAIL or SKIP row,
+ * and, when `labels` is given, one row per declared step in order. Exactly one
+ * rather than "judge each": verify.sh prints its block once, at the end, so a
+ * second header means the output is not one run's, and no reading of two blocks
+ * is more trustworthy than refusing both. Without those flags the run must end
+ * with its QUICK GATES GREEN line. In both, the log must hold no libtest FAILED
+ * line and no cargo compile or target failure.
+ *
+ * @param {string} log the gate's merged stdout and stderr
+ * @param {{ nested: boolean, labels?: string[] }} opts
+ * @returns {string | undefined}
+ */
+export function nestedGateProblem(log, { nested, labels }) {
+  const lines = logLines(log);
+  if (nested) {
+    const headers = lines.flatMap((l, n) => (NESTED_HEADER.test(l) ? [n] : []));
+    if (headers.length === 0) return "exit 0 but no summary block was printed";
+    if (headers.length > 1) return `${headers.length} summary blocks were printed; expected exactly one`;
+    const at = headers[0];
+    if (lines[at + 1] !== "") return "malformed summary block: no blank line under the header";
+    let i = at + 2;
+    const rows = [];
+    while (i < lines.length && NESTED_ROW.test(lines[i])) {
+      if (lines[i].trimStart().startsWith("FAIL")) return `exit 0 but the summary block has a FAIL row: ${lines[i].trim()}`;
+      // verify.sh exits 2 whenever any row is SKIP, so an exit 0 beside one is not its status.
+      if (lines[i].trimStart().startsWith("SKIP")) return `exit 0 but the summary block has a SKIP row: ${lines[i].trim()}`;
+      rows.push(lines[i]);
+      i++;
+    }
+    if (rows.length === 0) return "malformed summary block: no rows";
+    if (lines[i] !== "" || i + 1 >= lines.length) return `malformed summary block: ${lines[i] === undefined ? "ends inside the rows" : `unexpected line ${JSON.stringify(lines[i])}`}`;
+    if (labels) {
+      if (rows.length !== labels.length) return `summary block has ${rows.length} row(s) but the script declares ${labels.length} steps`;
+      const wrong = labels.findIndex((label, n) => !rows[n].includes(label));
+      if (wrong >= 0) return `summary block row ${wrong + 1} is not ${JSON.stringify(labels[wrong])}`;
+    }
+  } else if (!lines.includes(QUICK_GREEN)) {
+    return `exit 0 but the run never printed "${QUICK_GREEN}"`;
+  }
+  const failed = [...libtestFailures(log), ...cargoFailures(log)];
+  if (failed.length > 0) return `exit 0 but the log holds ${failed.length} libtest/cargo failure line(s): ${failed[0]}`;
+  return undefined;
+}
+
 /**
  * How a step stops short of a pass. The step prints its own message first;
  * the runner decides what the stop means. `cannotRun` marks a step that never
