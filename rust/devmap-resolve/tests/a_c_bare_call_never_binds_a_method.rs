@@ -352,3 +352,22 @@ fn a_static_in_another_c_file_beside_a_method_namesake_stays_unbound() {
     ]);
     no_call_edge_out_of(&result, "c/main.c");
 }
+
+/// A C function written inside an `@implementation` block is a free function,
+/// not a method of the class, so the plain-C gate must not decline it: the call
+/// binds exactly as it did before the gate.
+#[test]
+fn a_c_call_still_binds_a_c_function_written_inside_an_objc_implementation() {
+    let result = resolve(&[
+        ("d/a.c", &c_caller("bar")),
+        (
+            "o/T.m",
+            "@implementation T\nint bar(void){ return 1; }\n- (int)x{ return bar(); }\n@end\n",
+        ),
+    ]);
+    assert!(
+        calls(&result, "d/a.c", "o/T.m"),
+        "the C function inside the block keeps its edge: {:?}",
+        call_targets(&result, "d/a.c")
+    );
+}
