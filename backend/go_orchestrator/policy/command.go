@@ -184,7 +184,16 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 	// Each reading of the line with its variables bound (expandBindings) is
 	// judged in full, and the most important refusal among them is the answer,
 	// ranked exactly as evaluate ranks clauses.
-	readings := expandBindings(command)
+	readings, truncated := expandBindings(command)
+	if truncated {
+		// A reading past the caps was never judged, so the line is refused
+		// rather than judged on the readings that fit.
+		return g.noteHardRules(deny(RuleCommandOperandUnverifiable,
+			"A loop or variable in this command takes more values than the gate judges (at most "+
+				fmt.Sprint(maxBindingValues)+" values per name and "+fmt.Sprint(maxBindingVariants)+
+				" combinations), so some of what it would run was not examined. Split it into smaller loops or name the files.",
+			command, taskID))
+	}
 	if len(readings) == 1 {
 		return g.evaluate(readings[0], task, 0)
 	}
@@ -500,6 +509,17 @@ func matchesAnyCandidate(m matching, patterns, candidates []string) bool {
 	return false
 }
 
+// allowlistCandidates lists the spellings of a clause an allowlist pattern is
+// tried against.
+//
+// Security impact (ft-cb00d69d). The leading do/then/else/{/! words and a
+// validated `git -C <registered worktree>` option are stripped only to add a
+// candidate, never to replace the clause: the stripped text is what the shell
+// runs after the keyword, so a pattern for `git push *` admits `then git push`
+// exactly as it admits `git push`. Every earlier rung has already judged the
+// unstripped clause, and a -C that leaves the registered worktrees is refused
+// before this point (RuleCommandDirectoryChange), so stripping widens no
+// pattern beyond the command it names. Pinned by TestCompoundFramingAttackRound.
 func allowlistCandidates(command, raw, normalized, root string) []string {
 	var out []string
 	add := func(s string) {
@@ -548,7 +568,20 @@ var boundedCompoundKeywords = map[string]bool{
 // literal shell compound framing — either a single unquoted compound
 // delimiter/closer (`done`, `fi`, `esac`, `}`, `do`, `then`, `else`) or a
 // `for <var> in <literal...>` header with at most maxBindingValues literal
-// items (matching expandBindings's expansion cap).
+// items (maxBindingValues, the same cap lineBindings binds under).
+//
+// Security impact (ft-cb00d69d). What it admits: a clause with no executable
+// word at all — a lone delimiter, or a for-header whose items are literals —
+// and nothing else; any other word, quoted keyword, expansion, glob, operator
+// or redirection makes it false. Why it may be consulted before the no-lease
+// refusal in matchAllowlists: the clause runs nothing and its items are only
+// bound as words, never read, so there is nothing a lease would gate; the
+// commands in the loop body are separate clauses and each meets every rung
+// (secret operands via expandBindings — which binds exactly the items this
+// function admits, through the shared forHeader parser, and refuses a line it
+// would have to truncate — redirects, the lease refusal) itself.
+// Refusing framing without a task would instead break every no-task loop whose
+// body is a bootstrap command. Pinned by TestCompoundFramingAttackRound.
 func isBoundedShellCompoundFraming(clause string) bool {
 	words := shellWords(clause)
 	if len(words) == 0 {
@@ -560,14 +593,8 @@ func isBoundedShellCompoundFraming(clause string) bool {
 	for len(words) > 0 && !words[0].anyQuoted && (words[0].text == "do" || words[0].text == "then" || words[0].text == "else" || words[0].text == "{") {
 		words = words[1:]
 	}
-	if len(words) < 3 || words[0].anyQuoted || words[0].text != "for" {
-		return false
-	}
-	if words[1].anyQuoted || !bindingName(words[1].text) || words[2].anyQuoted || words[2].text != "in" {
-		return false
-	}
-	items := words[3:]
-	if len(items) > maxBindingValues {
+	_, items, ok := forHeader(words)
+	if !ok || len(items) > maxBindingValues {
 		return false
 	}
 	for _, item := range items {

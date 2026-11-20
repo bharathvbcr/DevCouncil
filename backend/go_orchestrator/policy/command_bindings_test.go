@@ -40,18 +40,40 @@ func TestExpandBindingsReadsWhatTheLineAndEnvironmentName(t *testing.T) {
 		// A substitution is quoted afresh, so its tilde is live.
 		{`echo "$(cat ~/x)"`, []string{`echo "$(cat /home/agent/x)"`}},
 	} {
-		if got := expandBindings(tc.line); !reflect.DeepEqual(got, tc.want) {
+		if got, truncated := expandBindings(tc.line); truncated || !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("expandBindings(%q) =\n  %q\nwant\n  %q", tc.line, got, tc.want)
 		}
 	}
 }
 
-// A loop over many values is judged on maxBindingVariants readings, never on an
-// unbounded number of them.
+// A loop over many values is judged on at most maxBindingVariants readings,
+// never an unbounded number of them, and a line past the cap says so instead of
+// quietly dropping the readings it did not render.
 func TestExpandBindingsIsBounded(t *testing.T) {
 	line := "for a in 1 2 3 4 5; do for b in 6 7 8 9 0; do echo $a$b; done; done"
-	if got := expandBindings(line); len(got) != maxBindingVariants {
-		t.Fatalf("got %d readings, want the cap %d", len(got), maxBindingVariants)
+	got, truncated := expandBindings(line)
+	if len(got) != maxBindingVariants || !truncated {
+		t.Fatalf("got %d readings truncated=%v, want the cap %d and truncated", len(got), truncated, maxBindingVariants)
+	}
+}
+
+// A name that would take a value past maxBindingValues is reported, but only
+// when the line references it: an unused long loop list is not a dropped reading.
+func TestExpandBindingsReportsDroppedValues(t *testing.T) {
+	long := "for f in a b c d e f g h i j k l m n o p .env; do "
+	if _, truncated := expandBindings(long + "cat $f; done"); !truncated {
+		t.Fatal("a referenced name that lost a value must report truncation")
+	}
+	if _, truncated := expandBindings(long + "echo hi; done"); truncated {
+		t.Fatal("an unreferenced name must not report truncation")
+	}
+}
+
+// The for-header parser binds every word after `in`, reserved words included.
+func TestForHeaderBindsEveryItem(t *testing.T) {
+	got, truncated := expandBindings("for f in a do .env; do cat $f; done")
+	if truncated || len(got) != 3 || got[2] != "for f in a do .env; do cat .env; done" {
+		t.Fatalf("got %q truncated=%v, want a reading for each of a, do, .env", got, truncated)
 	}
 }
 
