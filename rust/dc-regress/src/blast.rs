@@ -41,6 +41,7 @@ use crate::blob::BlobReader;
 use crate::budget::Budget;
 use crate::change::{
     changes_between_with_program, ChangeSet, ChangeStatus, ChangedRange, FileChange,
+    WHOLE_FILE_END_LINE,
 };
 use crate::history;
 use crate::{BlobIdentity, CodeGraph, ConeEntry, GraphSymbol, Unavailable};
@@ -181,6 +182,8 @@ impl UnattributedReason {
 pub struct UnattributedChange {
     pub path: String,
     pub start_line: u32,
+    /// `null` in JSON means "to the end of the file".
+    #[serde(with = "crate::change::whole_file_end")]
     pub end_line: u32,
     pub reason: UnattributedReason,
 }
@@ -505,7 +508,14 @@ pub fn blast_change_bounded<G: CodeGraph>(
     // once with the total rather than once per range, because a formatting
     // sweep would otherwise fill the ledger with a thousand identical rows.
     if !unattributed.is_empty() {
-        let lines: u64 = unattributed
+        // A range still ending at the whole-file sentinel is one whose file
+        // length was never learned (not indexed, unreadable, basis mismatch).
+        // It is counted apart rather than summed: its length is unknown, and
+        // `u32::MAX - start + 1` is not a count of anything.
+        let (unbounded, bounded): (Vec<_>, Vec<_>) = unattributed
+            .iter()
+            .partition(|entry| entry.end_line == WHOLE_FILE_END_LINE);
+        let lines: u64 = bounded
             .iter()
             // Widened before the arithmetic — see `ChangeSet::touched_lines`
             // for why `end - start + 1` in `u32` is a debug panic waiting on
@@ -515,6 +525,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
         unavailable.push(Unavailable::ChangeUnattributed {
             ranges: unattributed.len(),
             lines,
+            lines_unknown_ranges: unbounded.len(),
         });
     }
 
@@ -660,12 +671,20 @@ fn place_file<G: CodeGraph>(
         return;
     }
 
+    let mut ranges = file.ranges.clone();
     let (symbols, spans_basis) = graph.symbols_in(&file.path);
     if symbols.is_empty() {
+        // The length is only worth a read when a range is open-ended; a
+        // change between revisions never is, so those reads are unchanged.
+        if ranges.iter().any(|r| r.end_line == WHOLE_FILE_END_LINE) {
+            if let Ok(resolved) = blobs.read(until, &file.path) {
+                resolve_whole_file(&mut ranges, &resolved.content);
+            }
+        }
         push_all(
             unattributed,
             &file.path,
-            &file.ranges,
+            &ranges,
             UnattributedReason::FileNotIndexed,
         );
         return;
@@ -677,7 +696,7 @@ fn place_file<G: CodeGraph>(
         push_all(
             unattributed,
             &file.path,
-            &file.ranges,
+            &ranges,
             UnattributedReason::ContentUnavailable {
                 reason: reason.clone(),
             },
@@ -691,7 +710,7 @@ fn place_file<G: CodeGraph>(
             push_all(
                 unattributed,
                 &file.path,
-                &file.ranges,
+                &ranges,
                 UnattributedReason::ContentUnavailable {
                     reason: refusal.describe(),
                 },
@@ -703,7 +722,7 @@ fn place_file<G: CodeGraph>(
         push_all(
             unattributed,
             &file.path,
-            &file.ranges,
+            &ranges,
             UnattributedReason::BasisMismatch {
                 spans_taken_against: spans_basis.describe(),
                 lines_built_from: resolved.identity.describe(),
@@ -712,6 +731,7 @@ fn place_file<G: CodeGraph>(
         return;
     }
 
+    resolve_whole_file(&mut ranges, &resolved.content);
     let index = LineIndex::new(&resolved.content);
     // One past the newline count is the phantom final line a span ending at
     // EOF lands on — the same convention `join` documents, so a symbol that
@@ -737,7 +757,7 @@ fn place_file<G: CodeGraph>(
         })
         .collect();
 
-    for range in &file.ranges {
+    for range in &ranges {
         if range.start_line > last_line {
             unattributed.push(UnattributedChange {
                 path: file.path.clone(),
@@ -786,6 +806,24 @@ fn place_file<G: CodeGraph>(
                 },
             });
         }
+    }
+}
+
+/// Give every whole-file range the file's real last line, now that the content
+/// is in hand, so nothing downstream counts lines from the sentinel.
+///
+/// The real count is the newline count, plus one when the last line is
+/// unterminated. An empty file has no lines; its range is clamped to its own
+/// start so it stays a valid one-line range rather than an inverted one.
+fn resolve_whole_file(ranges: &mut [ChangedRange], content: &str) {
+    let newlines = content.matches('\n').count();
+    let unterminated = !content.is_empty() && !content.ends_with('\n');
+    let real_lines = u32::try_from(newlines + usize::from(unterminated)).unwrap_or(u32::MAX - 1);
+    for range in ranges
+        .iter_mut()
+        .filter(|r| r.end_line == WHOLE_FILE_END_LINE)
+    {
+        range.end_line = real_lines.max(range.start_line);
     }
 }
 
