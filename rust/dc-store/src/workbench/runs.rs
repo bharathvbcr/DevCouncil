@@ -639,9 +639,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     // — while two in one checkout would. Keying on the repository serialized
     // every task in it, worktrees included. Remote runners that do not touch
     // the local working tree opt out via `skip_checkout_occupancy`.
-    if !skip_checkout_occupancy
-        && has_active_checkout(input.conn, &repository_id, &git_dir, now)?
-    {
+    if !skip_checkout_occupancy && has_active_checkout(input.conn, &repository_id, &git_dir, now)? {
         return Err(refuse(
             "checkout_busy",
             "this checkout already has a prepared, active or unresolved run; launch in another worktree, or finish or reconcile that run first",

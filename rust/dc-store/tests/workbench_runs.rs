@@ -1526,15 +1526,24 @@ fn skip_checkout_occupancy_allows_concurrent_remote_and_local_runs_without_block
             .replace("\"prepare\"", &format!("\"{req}\""));
         match skip {
             None => base,
-            Some(v) => base.trim_end_matches('}').to_owned()
-                + &format!(",\"skip_checkout_occupancy\":{v}}}"),
+            Some(v) => {
+                base.trim_end_matches('}').to_owned()
+                    + &format!(",\"skip_checkout_occupancy\":{v}}}")
+            }
         }
     };
 
     // Omitted `skip_checkout_occupancy` keeps normalized `work_requests` JSON unchanged
     // and enforces `checkout_busy` against subsequent local runs (omitted or `false`).
-    let local_1 = call(&store, "runs.prepare", &with_skip("local-1", "prep-local-1", None));
-    assert_eq!(number(&store, &local_1, "$.item.skip_checkout_occupancy"), 0);
+    let local_1 = call(
+        &store,
+        "runs.prepare",
+        &with_skip("local-1", "prep-local-1", None),
+    );
+    assert_eq!(
+        number(&store, &local_1, "$.item.skip_checkout_occupancy"),
+        0
+    );
     let stored_req: String = store
         .connection()
         .query_row(
@@ -1548,9 +1557,13 @@ fn skip_checkout_occupancy_allows_concurrent_remote_and_local_runs_without_block
         "normalized work_requests JSON must remain unchanged when omitted: {stored_req}"
     );
     assert_eq!(
-        request(&store, "runs.prepare", &with_skip("local-dup", "prep-local-dup", None))
-            .unwrap_err()
-            .code,
+        request(
+            &store,
+            "runs.prepare",
+            &with_skip("local-dup", "prep-local-dup", None)
+        )
+        .unwrap_err()
+        .code,
         "checkout_busy"
     );
     assert_eq!(
@@ -1571,7 +1584,10 @@ fn skip_checkout_occupancy_allows_concurrent_remote_and_local_runs_without_block
         "runs.prepare",
         &with_skip("remote-1", "prep-remote-1", Some(true)),
     );
-    assert_eq!(number(&store, &remote_1, "$.item.skip_checkout_occupancy"), 1);
+    assert_eq!(
+        number(&store, &remote_1, "$.item.skip_checkout_occupancy"),
+        1
+    );
     let remote_1_got = call(&store, "runs.get", r#"{"id":"remote-1"}"#);
     assert_eq!(
         number(&store, &remote_1_got, "$.item.skip_checkout_occupancy"),
@@ -1582,7 +1598,10 @@ fn skip_checkout_occupancy_allows_concurrent_remote_and_local_runs_without_block
         "runs.prepare",
         &with_skip("remote-2", "prep-remote-2", Some(true)),
     );
-    assert_eq!(number(&store, &remote_2, "$.item.skip_checkout_occupancy"), 1);
+    assert_eq!(
+        number(&store, &remote_2, "$.item.skip_checkout_occupancy"),
+        1
+    );
 
     // Cancel the local run; `remote-1` and `remote-2` remain active, yet local runs
     // (both omitted and explicit `false`) are admitted across `prepared`, `starting`,
@@ -1683,7 +1702,11 @@ fn skip_checkout_occupancy_allows_concurrent_remote_and_local_runs_without_block
     call(
         &store,
         "runs.prepare",
-        &with_skip("remote-after-legacy", "prep-remote-after-legacy", Some(true)),
+        &with_skip(
+            "remote-after-legacy",
+            "prep-remote-after-legacy",
+            Some(true),
+        ),
     );
 }
 
@@ -1808,10 +1831,7 @@ fn skip_checkout_occupancy_validates_input_and_preserves_run_invariants() {
         ),
     );
     assert_eq!(text(&store, &reconciled, "$.item.state"), "exited");
-    assert_eq!(
-        number(&store, &reconciled, "$.item.outcome_uncertain"),
-        1
-    );
+    assert_eq!(number(&store, &reconciled, "$.item.outcome_uncertain"), 1);
     assert_eq!(
         number(&store, &reconciled, "$.item.skip_checkout_occupancy"),
         1
@@ -1835,7 +1855,11 @@ fn skip_checkout_occupancy_validates_input_and_preserves_run_invariants() {
     );
 
     // Expiry refuses `runs.claim` on a freshly prepared `skip_checkout_occupancy: true` run.
-    call(&store, "runs.prepare", &remote("exp-1", "p-exp-1", None).replace("\"source_revision\":1", "\"source_revision\":2"));
+    call(
+        &store,
+        "runs.prepare",
+        &remote("exp-1", "p-exp-1", None).replace("\"source_revision\":1", "\"source_revision\":2"),
+    );
     clock.store(1300, Ordering::SeqCst);
     assert_eq!(
         request(

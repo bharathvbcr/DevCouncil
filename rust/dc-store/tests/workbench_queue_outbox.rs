@@ -790,5 +790,8 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
             r#","queue_id":"q3","member_id":"m-b""#,
         ),
     );
-    assert_eq!(json::<i64>(&s, &leased, "$.item.skip_checkout_occupancy"), 1);
+    assert_eq!(
+        json::<i64>(&s, &leased, "$.item.skip_checkout_occupancy"),
+        1
+    );
 }

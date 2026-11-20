@@ -1671,7 +1671,10 @@ mod serve_frame_tests {
         ])
         .expect("exactly 16 MiB is legal")
         .expect("a request");
-        assert_eq!(args.iter().map(String::len).sum::<usize>(), MAX_SERVE_REQUEST_BYTES);
+        assert_eq!(
+            args.iter().map(String::len).sum::<usize>(),
+            MAX_SERVE_REQUEST_BYTES
+        );
 
         let err = run(vec![
             header(3),
@@ -1683,7 +1686,10 @@ mod serve_frame_tests {
             Seg::Tripwire,
         ])
         .expect_err("16 MiB + 1 is over");
-        assert!(err.contains("argument 2 takes the request past the"), "{err}");
+        assert!(
+            err.contains("argument 2 takes the request past the"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1693,15 +1699,22 @@ mod serve_frame_tests {
         let args = run(segs).expect("64 empty arguments").expect("a request");
         assert_eq!(args.len(), MAX_SERVE_ARGS);
         assert!(args.iter().all(String::is_empty));
-        let empty = run(vec![header(0)]).expect("zero arguments").expect("a request");
+        let empty = run(vec![header(0)])
+            .expect("zero arguments")
+            .expect("a request");
         assert!(empty.is_empty());
     }
 
     #[test]
     fn adversarial_huge_argument_count_is_refused_before_any_allocation_or_read() {
-        for count in ["1000000000", "65", "18446744073709551615", "18446744073709551616"] {
-            let err = run(vec![raw(&format!("{count}\n")), header(0), Seg::Tripwire])
-                .expect_err(count);
+        for count in [
+            "1000000000",
+            "65",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            let err =
+                run(vec![raw(&format!("{count}\n")), header(0), Seg::Tripwire]).expect_err(count);
             assert!(err.contains("argument count"), "{count}: {err}");
         }
     }
@@ -1710,19 +1723,33 @@ mod serve_frame_tests {
     fn adversarial_argument_over_the_per_argument_cap_is_refused_first() {
         for len in [MAX_SERVE_ARG_BYTES + 1, usize::MAX, usize::MAX - 1] {
             let err = run(vec![header(1), header(len), Seg::Tripwire]).expect_err("over the cap");
-            assert!(err.contains("argument 0 declares") && err.contains("cap"), "{err}");
-            assert!(!err.contains("request past"), "per-argument cap comes first: {err}");
+            assert!(
+                err.contains("argument 0 declares") && err.contains("cap"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("request past"),
+                "per-argument cap comes first: {err}"
+            );
         }
     }
 
     #[test]
     fn adversarial_malformed_lengths_are_refused() {
         for bad in [
-            "-1", "0x10", "1e3", "5 5", "", "   ", "1.0", "18446744073709551616",
-            "99999999999999999999999", "\u{0661}", "\0",
+            "-1",
+            "0x10",
+            "1e3",
+            "5 5",
+            "",
+            "   ",
+            "1.0",
+            "18446744073709551616",
+            "99999999999999999999999",
+            "\u{0661}",
+            "\0",
         ] {
-            let err = run(vec![header(1), raw(&format!("{bad}\n")), Seg::Tripwire])
-                .expect_err(bad);
+            let err = run(vec![header(1), raw(&format!("{bad}\n")), Seg::Tripwire]).expect_err(bad);
             assert!(err.contains("is not a number"), "{bad:?}: {err}");
         }
     }
@@ -1732,7 +1759,13 @@ mod serve_frame_tests {
         // Pinned current behaviour: leading zeros, a plus sign, padding and CRLF
         // all parse to the same number, so none of them can smuggle a larger
         // value past the caps.
-        for spelling in ["00000000000000000000000000000003", "+3", "  3 ", "3\r", "\t3"] {
+        for spelling in [
+            "00000000000000000000000000000003",
+            "+3",
+            "  3 ",
+            "3\r",
+            "\t3",
+        ] {
             let args = run(vec![raw("1\n"), raw(&format!("{spelling}\n")), raw("abc")])
                 .unwrap_or_else(|e| panic!("{spelling:?}: {e}"))
                 .expect("a request");
@@ -1744,16 +1777,25 @@ mod serve_frame_tests {
 
     #[test]
     fn adversarial_crlf_framing_keeps_body_bytes_verbatim() {
-        let args = run(vec![raw("2\r\n4\r\n"), raw("a\r\nb"), raw("1\r\n"), raw("x")])
-            .expect("CRLF headers")
-            .expect("a request");
+        let args = run(vec![
+            raw("2\r\n4\r\n"),
+            raw("a\r\nb"),
+            raw("1\r\n"),
+            raw("x"),
+        ])
+        .expect("CRLF headers")
+        .expect("a request");
         assert_eq!(args, vec!["a\r\nb".to_string(), "x".to_string()]);
     }
 
     #[test]
     fn adversarial_header_line_is_bounded_without_a_newline() {
         let at = "0".repeat(MAX_SERVE_HEADER_BYTES);
-        assert!(run(vec![raw(&format!("{at}\n"))]).expect("32 bytes is the limit").is_some());
+        assert!(
+            run(vec![raw(&format!("{at}\n"))])
+                .expect("32 bytes is the limit")
+                .is_some()
+        );
         let over = "0".repeat(MAX_SERVE_HEADER_BYTES + 1);
         let err = run(vec![raw(&over), Seg::Tripwire]).expect_err("33 bytes, no newline");
         assert!(err.contains("without a newline"), "{err}");
@@ -1778,8 +1820,14 @@ mod serve_frame_tests {
 
     #[test]
     fn adversarial_invalid_utf8_is_a_clean_error_that_does_not_echo_the_bytes() {
-        let err = run(vec![header(2), header(1), raw("a"), header(4), Seg::Bytes(vec![b'T', 0xff, 0xfe, b'K'])])
-            .expect_err("invalid UTF-8 body");
+        let err = run(vec![
+            header(2),
+            header(1),
+            raw("a"),
+            header(4),
+            Seg::Bytes(vec![b'T', 0xff, 0xfe, b'K']),
+        ])
+        .expect_err("invalid UTF-8 body");
         assert_eq!(err, "argument 1 is not UTF-8");
         let err = run(vec![Seg::Bytes(vec![b'1', 0xff, b'\n'])]).expect_err("invalid UTF-8 header");
         assert_eq!(err, "header is not UTF-8");
