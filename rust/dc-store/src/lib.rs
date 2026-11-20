@@ -370,6 +370,8 @@ pub struct Store {
     /// How many `pre-schema` backups an upgrade leaves. Defaults to the
     /// process-wide `DC_STORE_KEEP_BACKUPS` setting, else the newest two.
     backup_retention: workbench::BackupRetention,
+    /// What retiring the legacy `tasks` table did while this handle opened.
+    retired: workbench::Retired,
 }
 
 impl std::fmt::Debug for Store {
@@ -466,6 +468,7 @@ impl Store {
             now_fn: None,
             workbench_upgrades: false,
             backup_retention: workbench::BackupRetention::from_environment(),
+            retired: workbench::Retired::default(),
         })
     }
 
@@ -514,22 +517,22 @@ impl Store {
         };
         // A store newer than this build is refused before anything is moved.
         schema::check_stored_version(&conn, SCHEMA_VERSION).map_err(too_new)?;
-        let store = Store {
+        let mut store = Store {
             conn,
             now_fn: None,
             workbench_upgrades: true,
             backup_retention: workbench::BackupRetention::from_environment(),
+            retired: workbench::Retired::default(),
         };
         // The legacy tasks table becomes workbench items and the version is
         // stamped in one transaction: a refusal leaves the store as found, at
         // the old version with its tasks table, which an older reader still
         // understands.
-        workbench::retire_legacy_tasks(&store, SCHEMA_VERSION, stamp_budget).map_err(|e| {
-            StoreError::Workbench {
+        store.retired = workbench::retire_legacy_tasks(&store, SCHEMA_VERSION, stamp_budget)
+            .map_err(|e| StoreError::Workbench {
                 code: e.code,
                 message: e.message,
-            }
-        })?;
+            })?;
         schema::migrate(&store.conn, SCHEMA_VERSION).map_err(too_new)?;
         Ok(store)
     }
@@ -540,6 +543,13 @@ impl Store {
     #[doc(hidden)]
     pub fn open_failing_stamp_after(path: impl AsRef<Path>, steps: usize) -> Result<Self> {
         Self::prepare_with(Connection::open(path)?, &mut Some(steps))
+    }
+
+    /// What retiring the legacy `tasks` table did while this handle was opened:
+    /// the rows archived and any retire backup that had to be moved aside. All
+    /// zero and empty when there was nothing to retire.
+    pub fn legacy_retirement(&self) -> &workbench::Retired {
+        &self.retired
     }
 
     /// Stops this handle from upgrading an older workbench profile. A request

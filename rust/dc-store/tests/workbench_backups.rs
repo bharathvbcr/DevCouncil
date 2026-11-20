@@ -178,11 +178,16 @@ fn a_plain_open_a_read_and_a_current_profile_never_prune() {
 #[test]
 fn an_existing_backup_for_this_version_is_not_a_new_backup() {
     // An interrupted upgrade left pre-schema-11 behind; resuming it writes
-    // nothing, so it prunes nothing.
+    // nothing, so it prunes nothing. That copy is a copy of this profile (a
+    // planted stub is not: an out-of-date copy is moved aside, not trusted).
     let (dir, path) = old_profile();
-    for version in [9, 10, 11] {
+    for version in [9, 10] {
         plant_backup(&dir, version);
     }
+    Connection::open(&path)
+        .unwrap()
+        .execute("VACUUM INTO ?1", [backup(&dir, 11).to_str().unwrap()])
+        .unwrap();
     let store = Store::open(&path).unwrap();
     put_workspace(&store, "one");
     assert_eq!(present(&dir), names(&[9, 10, 11]));

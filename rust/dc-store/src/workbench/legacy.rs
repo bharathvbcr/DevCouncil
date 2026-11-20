@@ -34,6 +34,10 @@ pub struct Retired {
     pub archived: usize,
     /// Rows whose id already had an item (an interrupted earlier attempt).
     pub already_items: usize,
+    /// Backup files found at the retire backup name that did not read back (or
+    /// were out of date) and were moved aside, never deleted:
+    /// `<path>: <reason>; moved aside to <path>`.
+    pub moved_aside: Vec<String>,
 }
 
 struct LegacyRow {
@@ -243,6 +247,7 @@ pub(crate) fn retire(
     // 10 had one — is dropped without touching the profile, so a read does not
     // upgrade it for hosts that still speak the older one.
     let workbench_ready = held > 0;
+    let mut moved_aside = Vec::new();
     if workbench_ready {
         // Foreign keys and VACUUM INTO are both illegal inside a transaction.
         // The backup is a copy of the store before the tasks table is dropped.
@@ -263,7 +268,7 @@ pub(crate) fn retire(
             ensure_schema(conn, true, store.backup_retention)?;
         }
         // The retire copy is not a `pre-schema` backup and is never pruned.
-        backup_profile(
+        if let Some(backup) = backup_profile(
             conn,
             "pre-tasks-retire",
             None,
@@ -274,7 +279,9 @@ pub(crate) fn retire(
                     backup.display()
                 )
             },
-        )?;
+        )? {
+            moved_aside.extend(backup.displaced);
+        }
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -298,12 +305,18 @@ pub(crate) fn retire(
             })
     });
     match outcome {
-        Ok(done) => {
+        Ok(mut done) => {
             conn.execute_batch("COMMIT")?;
+            done.moved_aside = moved_aside;
             Ok(done)
         }
-        Err(error) => {
+        Err(mut error) => {
             let _ = conn.execute_batch("ROLLBACK");
+            for note in &moved_aside {
+                error
+                    .message
+                    .push_str(&format!("; backup moved aside: {note}"));
+            }
             Err(error)
         }
     }
