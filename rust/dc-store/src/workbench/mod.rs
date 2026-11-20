@@ -21,7 +21,11 @@ mod scope;
 mod signals;
 mod vacuum;
 
-pub use backups::{BackupRetention, DEFAULT_KEPT_BACKUPS, KEEP_BACKUPS_ENV, PruneReport};
+pub use backups::{
+    BackupRetention, DEFAULT_KEPT_BACKUPS, KEEP_BACKUPS_ENV, MAX_MOVED_ASIDE, PruneReport,
+    moved_aside_copies,
+};
+pub use legacy::Retired;
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
 pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
 pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
@@ -531,8 +535,9 @@ fn backup_profile(
 /// A file already at the backup name is a backup only if it reads back: it
 /// verifies at `expected_version` and holds `must_hold_table` with its rows
 /// readable. One that does not (empty, truncated, another schema, no legacy
-/// table) is never deleted, because it may be someone's only copy: it is moved
-/// to `<name>.invalid-<unix seconds>[-n]`, which no prune rule matches, and a
+/// table, or one that no longer matches the profile) is never deleted, because
+/// it may be someone's only copy: it is moved to
+/// `<name>.invalid-<unix seconds>[-n]`, which no prune rule matches, and a
 /// fresh copy is written in its place.
 fn existing_backup_verdict(
     backup: &std::path::Path,
@@ -546,9 +551,64 @@ fn existing_backup_verdict(
     }
 }
 
+/// A backup that reads back is still not the backup of this profile when the
+/// profile has changed since it was written (a restore followed by new rows, a
+/// `pre-tasks-retire` copy older than the rows now in `tasks`). The copy is
+/// compared with the profile under the write lock: the rows of
+/// `must_hold_table` when there is one, else every table of a versioned
+/// `pre-schema` copy. An interrupted upgrade leaves the profile as it was, so
+/// its resumption still finds the copy current. A comparison that cannot be
+/// made counts as out of date: a fresh copy is the safe answer.
+fn backup_is_current(
+    conn: &Connection,
+    backup: &std::path::Path,
+    expected_version: Option<i64>,
+    must_hold_table: Option<&str>,
+) -> std::result::Result<(), String> {
+    let scope = match (must_hold_table, expected_version) {
+        (Some(table), _) => Some(Some(table)),
+        (None, Some(_)) => Some(None),
+        (None, None) => None,
+    };
+    let Some(table) = scope else {
+        return Ok(());
+    };
+    // A profile another host has already moved past `expected_version` cannot
+    // be compared: the copy is that host's pre-upgrade backup, which is what
+    // this call would otherwise have kept.
+    if let Some(expected) = expected_version
+        && current_version(conn).map_err(|error| error.message)? != expected
+    {
+        return Ok(());
+    }
+    let copy = Connection::open_with_flags(
+        backup,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("it cannot be compared with the profile: {error}"))?;
+    let compare = |error: rusqlite::Error| format!("it cannot be compared with the profile: {error}");
+    let profile_rows = backups::content_digest(conn, table).map_err(compare)?;
+    let copy_rows = backups::content_digest(&copy, table).map_err(compare)?;
+    if profile_rows == copy_rows {
+        Ok(())
+    } else {
+        Err("it is out of date: the profile has changed since it was written".to_string())
+    }
+}
+
 /// Moves the unusable file at `backup` to a name beside it that is not taken,
-/// and returns that name.
-fn move_aside(backup: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+/// and returns that name. Refuses when [`backups::MAX_MOVED_ASIDE`] copies are
+/// already beside it: nothing is deleted to make room.
+fn move_aside(backup: &std::path::Path) -> std::result::Result<std::path::PathBuf, String> {
+    let held = backups::moved_aside_from(backup);
+    if held >= backups::MAX_MOVED_ASIDE {
+        return Err(format!(
+            "{held} moved-aside copies already sit beside it (the limit is {}); none is deleted \
+             automatically, so review them (`dc_store::workbench::moved_aside_copies`) and remove \
+             or archive the ones you do not need, then retry",
+            backups::MAX_MOVED_ASIDE
+        ));
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -565,7 +625,7 @@ fn move_aside(backup: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         next.push(format!("-{n}"));
         aside = std::path::PathBuf::from(next);
     }
-    std::fs::rename(backup, &aside)?;
+    std::fs::rename(backup, &aside).map_err(|error| error.to_string())?;
     Ok(aside)
 }
 
@@ -586,7 +646,9 @@ fn write_backup_under_lock(
     };
     let mut displaced = None;
     if std::fs::symlink_metadata(backup).is_ok() {
-        match existing_backup_verdict(backup, expected_version, must_hold_table) {
+        let verdict = existing_backup_verdict(backup, expected_version, must_hold_table)
+            .and_then(|()| backup_is_current(conn, backup, expected_version, must_hold_table));
+        match verdict {
             Ok(()) => {
                 return Ok(Backup {
                     path: backup.to_path_buf(),

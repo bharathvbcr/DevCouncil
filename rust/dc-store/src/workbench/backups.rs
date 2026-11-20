@@ -18,10 +18,14 @@
 //! * Only `<profile>.pre-schema-<digits>.bak` regular files are candidates. The
 //!   `pre-tasks-retire` copy, `*.partial` files and anything else are not.
 //! * Each removal is named on stderr and in the returned [`PruneReport`].
-//! * A file the upgrade moved aside because it did not verify
-//!   (`<name>.bak.invalid-<unix seconds>[-n]`) is not a candidate: it is never
+//! * A file the upgrade moved aside because it did not verify, or verified but
+//!   no longer matched the profile it was meant to protect
+//!   (`<name>.bak.invalid-<unix seconds>[-n]`), is not a candidate: it is never
 //!   counted and never removed. The upgrade names it in
-//!   [`PruneReport::unverified`] as `...; moved aside to <path>`.
+//!   [`PruneReport::unverified`] as `...; moved aside to <path>`, and the
+//!   tasks-retire path in `Retired::moved_aside`. At most [`MAX_MOVED_ASIDE`]
+//!   may sit beside one backup name: past that the upgrade fails closed rather
+//!   than move another, and [`moved_aside_copies`] lists them for an operator.
 
 use rusqlite::{Connection, OpenFlags};
 use std::num::NonZeroUsize;
@@ -92,6 +96,13 @@ impl BackupRetention {
         }
     }
 }
+
+/// How many moved-aside copies (`<backup name>.invalid-*`) may sit beside one
+/// backup name. The upgrade never deletes one, because it may be the only copy
+/// of something; past this many it refuses to move another aside and fails
+/// closed, so a profile that keeps meeting unusable or out-of-date backups is
+/// surfaced to an operator instead of filling the disk with profile-sized files.
+pub const MAX_MOVED_ASIDE: usize = 8;
 
 /// What a prune pass did, for the host to log and for `store.upgrade` to report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -164,6 +175,98 @@ pub(super) fn verify_holds_table(path: &Path, table: &str) -> Result<(), String>
     })
     .map(|_| ())
     .map_err(|error| format!("its `{table}` rows cannot be read: {error}"))
+}
+
+/// Files in `dir` that were moved aside from a backup name and whose file name
+/// starts with `prefix`.
+fn moved_aside_in(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix) && name.contains(".bak.invalid-"))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    found.sort();
+    found
+}
+
+/// Every copy an upgrade moved aside beside `profile`
+/// (`<profile>.pre-*.bak.invalid-*`), for an operator deciding which to keep.
+/// The upgrade itself never removes one.
+pub fn moved_aside_copies(profile: &Path) -> Vec<PathBuf> {
+    let Some(name) = profile.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    moved_aside_in(
+        profile.parent().unwrap_or(Path::new(".")),
+        &format!("{name}.pre-"),
+    )
+}
+
+/// How many copies are already moved aside from the backup name `backup`.
+pub(super) fn moved_aside_from(backup: &Path) -> usize {
+    let Some(name) = backup.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+    moved_aside_in(
+        backup.parent().unwrap_or(Path::new(".")),
+        &format!("{name}.invalid-"),
+    )
+    .len()
+}
+
+/// A digest of the rows of `only` (or of every table, when `None`), independent
+/// of row order, because `VACUUM INTO` may renumber rowids. Two databases with
+/// the same digest hold the same rows in those tables.
+pub(super) fn content_digest(conn: &Connection, only: Option<&str>) -> rusqlite::Result<u64> {
+    use rusqlite::types::ValueRef;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let tables: Vec<String> = match only {
+        Some(table) => vec![table.to_string()],
+        None => conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND substr(name,1,7)<>'sqlite_' ORDER BY name",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    let mut digest = DefaultHasher::new();
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let mut stmt = conn.prepare(&format!("SELECT * FROM \"{quoted}\""))?;
+        let columns = stmt.column_count();
+        let mut rows = stmt.query([])?;
+        let (mut count, mut sum) = (0u64, 0u64);
+        while let Some(row) = rows.next()? {
+            let mut row_hash = DefaultHasher::new();
+            for column in 0..columns {
+                match row.get_ref(column)? {
+                    ValueRef::Null => 0u8.hash(&mut row_hash),
+                    ValueRef::Integer(v) => (1u8, v).hash(&mut row_hash),
+                    ValueRef::Real(v) => (2u8, v.to_bits()).hash(&mut row_hash),
+                    ValueRef::Text(v) => (3u8, v).hash(&mut row_hash),
+                    ValueRef::Blob(v) => (4u8, v).hash(&mut row_hash),
+                }
+            }
+            count += 1;
+            sum = sum.wrapping_add(row_hash.finish());
+        }
+        (table, count, sum).hash(&mut digest);
+    }
+    Ok(digest.finish())
 }
 
 /// The schema version in `<profile>.pre-schema-<version>.bak`, and only that
