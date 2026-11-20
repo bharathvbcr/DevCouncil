@@ -546,26 +546,10 @@ fn ownership_fts_damage_does_not_write() {
 /// never returns, so the guard kills the one pid started here and reports the
 /// run as "still serving" (`None`) instead of hanging the suite.
 fn serve_until_exit_or_guard(cwd: &Path, db: &Path, socket: &Path) -> Option<(bool, String)> {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::sync::mpsc;
     use std::time::Duration;
-    let bin = std::env::var_os("DEVMAP_ATTACK_BIN").map_or_else(
-        || PathBuf::from(env!("CARGO_BIN_EXE_devmap")),
-        PathBuf::from,
-    );
-    let child = Command::new(bin)
-        .current_dir(cwd)
-        .env("DEVMAP_AUTOSPAWN", "0")
-        .args(["--json", "--progress", "never", "--db"])
-        .arg(db)
-        .arg("serve")
-        .arg("--socket")
-        .arg(socket)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn devmap serve");
+    let child = spawn_serve(cwd, db, socket);
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -584,6 +568,59 @@ fn serve_until_exit_or_guard(cwd: &Path, db: &Path, socket: &Path) -> Option<(bo
             None
         }
     }
+}
+
+fn spawn_serve(cwd: &Path, db: &Path, socket: &Path) -> std::process::Child {
+    use std::process::{Command, Stdio};
+    let bin = std::env::var_os("DEVMAP_ATTACK_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_devmap")),
+        PathBuf::from,
+    );
+    Command::new(bin)
+        .current_dir(cwd)
+        .env("DEVMAP_AUTOSPAWN", "0")
+        .args(["--json", "--progress", "never", "--db"])
+        .arg(db)
+        .arg("serve")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn devmap serve")
+}
+
+/// What a bounded `devmap serve` did: it answered on its socket (the daemon
+/// binds only after `Store::open` has migrated and healed), or it exited first.
+enum Served {
+    Ready,
+    Exited { ok: bool, stderr: String },
+}
+
+/// Start `devmap serve` and return when its socket exists or the process exits,
+/// whichever comes first, then kill the one child started here. The socket
+/// appearing is the readiness signal; the loop is bounded, not timed to a result.
+fn serve_until_ready_or_exit(cwd: &Path, db: &Path, socket: &Path) -> Served {
+    let mut child = spawn_serve(cwd, db, socket);
+    for _ in 0..12_000 {
+        if let Some(status) = child.try_wait().expect("poll devmap serve") {
+            let output = child.wait_with_output().expect("collect devmap serve");
+            return Served::Exited {
+                ok: status.success(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            };
+        }
+        if socket.exists() {
+            child.kill().expect("kill the serve this test started");
+            let _ = child.wait();
+            return Served::Ready;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().expect("kill the serve this test started");
+    let _ = child.wait();
+    panic!("devmap serve neither bound its socket nor exited");
 }
 
 fn short_socket(label: &str) -> PathBuf {
@@ -637,4 +674,42 @@ fn ownership_serve_unreadable_current_owner_is_not_written() {
     );
     assert_untouched("A's current store after B's serve", &db, &before);
     assert_no_new_sidecars_or_lock("B's serve of an unreadable owner", &db);
+}
+
+/// Positive control: the owner's own `serve` of its schema-27 store is not
+/// refused, and it migrates the store before it binds.
+#[test]
+fn the_owners_own_serve_is_not_refused_and_migrates_its_schema_27_store() {
+    let a = a_worktrees_schema_27_store("serve-owner");
+    let socket = short_socket("serveowner");
+    let served = serve_until_ready_or_exit(&a.owner, &a.db, &socket);
+    let _ = std::fs::remove_file(&socket);
+    match served {
+        Served::Ready => {}
+        Served::Exited { ok, stderr } => {
+            panic!("the owner's serve was refused or died: ok={ok} {stderr}")
+        }
+    }
+    assert!(
+        scalar_of(&a.db, "PRAGMA user_version") > 27,
+        "the owner's serve bound its socket without migrating the store"
+    );
+}
+
+/// Positive control: a first-time `serve` (no store file yet) is not refused.
+#[test]
+fn a_first_time_serve_with_no_store_file_is_not_refused() {
+    let b = fixture("serve-first");
+    let db = b.join("devmap.sqlite");
+    assert!(!db.exists(), "premise: no store yet");
+    let socket = short_socket("servefirst");
+    let served = serve_until_ready_or_exit(&b, &db, &socket);
+    let _ = std::fs::remove_file(&socket);
+    match served {
+        Served::Ready => {}
+        Served::Exited { ok, stderr } => {
+            panic!("a first-time serve was refused or died: ok={ok} {stderr}")
+        }
+    }
+    assert!(db.is_file(), "the first-time serve created its store");
 }
