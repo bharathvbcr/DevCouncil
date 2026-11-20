@@ -31,9 +31,10 @@ The Go gateway executes task commands through a local shell
 (`/bin/sh -c`) in the project root, with an allow-listed environment: the
 base list in `verify/env.go` (PATH, HOME, the Go, Cargo, Rustup, Node, Python
 and JVM roots, locale and temp variables) plus names a repository lists in
-`verify.env_allow: [NAME, NAME]` in `.devcouncil/config.yaml`. A name shaped
-like a credential (KEY, SECRET, TOKEN, PASSWORD, CREDENTIAL, AUTH, PRIVATE,
-COOKIE) is refused there, and every admitted and refused name is recorded in
+`verify.env_allow: [NAME, NAME]` in `.devcouncil/config.yaml`. A name matching
+the credential name rule (KEY, SECRET, TOKEN, PASSW*, CREDENTIAL, AUTH, PRIVATE,
+COOKIE; DSN, PAT, JWT, PASS, PWD, HOOK and WEBHOOK; PROXY; datastore, broker and
+package-index URL/URI names; see verify-sandbox-security-impact.md) is refused there, and every admitted and refused name is recorded in
 the run's evidence. Each command
 is bounded by a 30-minute timeout (`verify.CommandTimeout`) and by
 cancellation of the run, its process group is killed when it is stopped, and
