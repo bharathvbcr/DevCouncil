@@ -366,21 +366,3 @@ func (s *LeaseService) PlannedEntries(ctx context.Context, taskID string) (entri
 	}
 	return append([]dc.PlannedFile{}, task.PlannedFiles...), true, nil
 }
-
-// PlannedPaths returns planned file paths for a task, or ok=false details.
-func (s *LeaseService) PlannedPaths(ctx context.Context, taskID string) (paths []string, found bool, err error) {
-	if s.Store == nil {
-		return nil, false, errors.New("not initialized")
-	}
-	task, err := s.Store.Task(ctx, taskID)
-	if err != nil {
-		return nil, false, err
-	}
-	if task == nil {
-		return nil, false, nil
-	}
-	for _, pf := range task.PlannedFiles {
-		paths = append(paths, pf.Path)
-	}
-	return paths, true, nil
-}

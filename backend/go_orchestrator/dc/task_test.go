@@ -127,3 +127,28 @@ func TestPlannedFileRefusesAnUnknownAllowedChange(t *testing.T) {
 		}
 	}
 }
+
+// ft-84b49733 item 3: "//" and "/./" inside a plan entry are one separator and
+// one no-op, as the filesystem reads them. ".//secret/x" used to lose only its
+// "./" and come out "/secret/x", which matches nothing and voided the entry.
+func TestNormalizePlanPathCollapsesSeparatorsAndDotSegments(t *testing.T) {
+	for in, want := range map[string]string{
+		"src/a.go":      "src/a.go",
+		"./src/a.go":    "src/a.go",
+		"././src/a.go":  "src/a.go",
+		".//secret/x":   "secret/x",
+		"secret//x":     "secret/x",
+		"secret///x":    "secret/x",
+		"./secret/./x":  "secret/x",
+		".//./secret/x": "secret/x",
+		"secret\\\\x":   "secret/x",
+		".\\secret\\x":  "secret/x",
+		"src/*.go":      "src/*.go",
+		"**":            "**",
+		"":              "",
+	} {
+		if got := NormalizePlanPath(in); got != want {
+			t.Errorf("NormalizePlanPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

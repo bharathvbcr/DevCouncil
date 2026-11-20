@@ -49,13 +49,22 @@ const (
 )
 
 // NormalizePlanPath is the one spelling rule for a path named in a plan: a
-// backslash is a slash, and any leading "./" is dropped. A planned entry, a
+// backslash is a slash, a run of slashes is one slash, a "/./" segment is
+// nothing, and any leading "./" is dropped. A planned entry, a
 // forbidden_changes entry and the path being judged are all put through it, so
-// "./src/a.go" and "src/a.go" are one entry however each reached the gate. It
-// does not clean, fold case, or trim: those change what a path means, and the
-// callers that need them say so themselves.
+// "./src/a.go", ".//src/a.go" and "src/a.go" are one entry however each reached
+// the gate. The separators collapse before the leading "./" is dropped:
+// ".//secret/x" must end as "secret/x", not "/secret/x", which matches nothing
+// and would void a prohibition. The collapse is also the one place the rule
+// widens an entry: "src//a.go" now names src/a.go, the file the filesystem
+// opens for that spelling. It does not resolve "..", fold case, or trim: those
+// change what a path means, and the callers that need them say so themselves.
 func NormalizePlanPath(path string) string {
 	normalized := strings.ReplaceAll(path, "\\", "/")
+	for strings.Contains(normalized, "//") || strings.Contains(normalized, "/./") {
+		normalized = strings.ReplaceAll(normalized, "//", "/")
+		normalized = strings.ReplaceAll(normalized, "/./", "/")
+	}
 	for strings.HasPrefix(normalized, "./") {
 		normalized = normalized[2:]
 	}
