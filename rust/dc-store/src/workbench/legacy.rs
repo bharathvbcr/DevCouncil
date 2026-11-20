@@ -263,12 +263,18 @@ pub(crate) fn retire(
             ensure_schema(conn, true, store.backup_retention)?;
         }
         // The retire copy is not a `pre-schema` backup and is never pruned.
-        backup_profile(conn, "pre-tasks-retire", None, |backup, detail| {
-            format!(
-                "the legacy tasks table cannot be retired because its backup {} could not be written: {detail}",
-                backup.display()
-            )
-        })?;
+        backup_profile(
+            conn,
+            "pre-tasks-retire",
+            None,
+            Some("tasks"),
+            |backup, detail| {
+                format!(
+                    "the legacy tasks table cannot be retired because its backup {} could not be written: {detail}",
+                    backup.display()
+                )
+            },
+        )?;
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
