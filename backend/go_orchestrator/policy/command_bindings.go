@@ -251,6 +251,109 @@ func bindingTemplate(command string, values map[string][]string) ([]bindingSegme
 	return segments, refs
 }
 
+// unboundOperand reports whether a word still holds an expansion sh will
+// compute after expandBindings has bound what it can, so the value the command
+// is handed is one the gate cannot name:
+//
+//   - a parameter reference that is left: a variable nothing in the line or the
+//     well-known environment binds ($zz, $1, $@), or one with an operator
+//     (${v:-x}, ${v/a/b}, ${v%a}, ${!v}), which parameterReference does not
+//     read as a reference;
+//   - a brace expansion ({.env,x}, x{,.env}, {a..c}), which sh turns into
+//     several words before any rung sees them.
+//
+// A word whose expansion characters are all quoted or escaped is a literal
+// ('a$b') and is not one. A command substitution is not this predicate's
+// business: carriesSubstitution owns it. Over-refusal is the safe side: a
+// word with a quoted `$` beside an unquoted glob reads as expanding, because
+// shellWord records only whether any expansion character was live.
+func unboundOperand(w shellWord) bool {
+	return w.ansiC || (w.expands && (hasParameterReference(w.text, true) || hasBraceExpansion(w.text)))
+}
+
+// computedOperand is unboundOperand without the plain unbound variable: it
+// names only the expansions that are not a bare reference to a name — a
+// parameter operator, a special or positional parameter, a brace expansion.
+// `git log main..$b` and `mytool $OUT/x` read as the paths they spell (owner
+// decision, 2026-10-24, pinned by TestCommonReadOnlyGitOrientationPasses), so
+// the rungs that keep that decision ask this narrower question.
+func computedOperand(w shellWord) bool {
+	return w.ansiC || (w.expands && (hasParameterReference(w.text, false) || hasBraceExpansion(w.text)))
+}
+
+// hasParameterReference reports a `$` that opens a parameter expansion the
+// line did not bind: a special or positional parameter, a `${…}` with an
+// operator in it, and — when plain is true — a bare name (`$zz`, `${zz}`).
+// `$(` is a substitution, and a `$` before anything else (the end of a word,
+// `$|` in a regular expression) is literal.
+func hasParameterReference(text string, plain bool) bool {
+	for i := 0; i+1 < len(text); i++ {
+		if text[i] != '$' {
+			continue
+		}
+		c := text[i+1]
+		switch {
+		case c == '{':
+			if name, width := parameterReference([]rune(text[i+1:])); width > 0 {
+				// $_ is the previous command's last argument: a value the
+				// line did not bind and the gate cannot know.
+				if plain || name == "_" {
+					return true
+				}
+				continue
+			}
+			return true
+		case c == '_' && (i+2 >= len(text) || !isNameByte(text[i+2])):
+			return true // $_
+		case c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'):
+			if plain {
+				return true
+			}
+		case (c >= '0' && c <= '9') || c == '@' || c == '*' || c == '#' || c == '?' || c == '!' || c == '$' || c == '-':
+			return true
+		}
+	}
+	return false
+}
+
+func isNameByte(c byte) bool {
+	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+}
+
+// hasBraceExpansion reports a `{…}` span holding a top-level comma or a `..`
+// range, the two shapes bash and zsh expand into several words. `{}` (find's
+// placeholder) and `HEAD@{1}` hold neither and are not one.
+func hasBraceExpansion(text string) bool {
+	for open := strings.IndexByte(text, '{'); open >= 0; {
+		if open > 0 && text[open-1] == '$' {
+			// ${…} is a parameter expansion, read by hasParameterReference.
+			open = indexFrom(text, '{', open+1)
+			continue
+		}
+		end := strings.IndexByte(text[open:], '}')
+		if end < 0 {
+			return false
+		}
+		inner := text[open+1 : open+end]
+		if strings.Contains(inner, ",") || strings.Contains(inner, "..") {
+			return true
+		}
+		open = indexFrom(text, '{', open+1)
+	}
+	return false
+}
+
+// indexFrom is strings.IndexByte over text[from:], as an index into text.
+func indexFrom(text string, c byte, from int) int {
+	if from >= len(text) {
+		return -1
+	}
+	if i := strings.IndexByte(text[from:], c); i >= 0 {
+		return from + i
+	}
+	return -1
+}
+
 // parameterReference reads the name after a `$`: `NAME` or `${NAME}`. It
 // returns the name and how many runes it spans, or a zero width for anything
 // else — a positional or special parameter, or a `${…}` with an operator in it.

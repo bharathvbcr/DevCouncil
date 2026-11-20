@@ -55,9 +55,13 @@ const maxGlobMatchesJudged = 1024
 // disk, an interpreter's own argument (`python -c "open('.env')"`), an
 // expansion outside fileReaders. It is a rung against the plain commands, which
 // is where the credential was actually read from.
-func secretOperandViolation(clause, root string) string {
+//
+// unverifiable is true when the reason is not a credential spelling but an
+// operand the gate cannot resolve (see unboundOperand): a credential refusal
+// elsewhere in the clause takes precedence over it.
+func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
-	at := argumentCommandWord(words)
+	at := readerBehindWrapper(words, argumentCommandWord(words))
 	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""
@@ -97,6 +101,7 @@ func secretOperandViolation(clause, root string) string {
 		operandRoot = effectiveGitRoot
 	}
 
+	unbound := ""
 	for i := 0; i < len(words); i++ {
 		text := words[i].text
 		if target, isRedirect := redirectionPrefix(text); isRedirect {
@@ -112,8 +117,14 @@ func secretOperandViolation(clause, root string) string {
 				i++
 			}
 			if strings.Contains(text, "<") && !strings.Contains(text, "<<") && operand != "" {
+				// words[i] is the operand's word: the operator's own when the
+				// operand is attached, else the one just stepped onto.
+				if unbound == "" && unboundOperand(words[i]) {
+					unbound = fmt.Sprintf("an input redirection names an operand (`%s`) holding an expansion the gate "+
+						"cannot resolve to a value, so the file it reads was not judged. Spell the operand out.", operand)
+				}
 				if reason := secretOperandReason(operand, root); reason != "" {
-					return fmt.Sprintf("an input redirection names %s", reason)
+					return fmt.Sprintf("an input redirection names %s", reason), false
 				}
 			}
 			continue
@@ -131,6 +142,11 @@ func secretOperandViolation(clause, root string) string {
 		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
 			continue
 		}
+		if unbound == "" && !written[text] && operandFromFile(command, words[i]) {
+			unbound = fmt.Sprintf("`%s` has an operand (`%s`) holding an expansion the gate cannot resolve to a "+
+				"value (a variable nothing binds, a parameter operator or a brace expansion), so the file it "+
+				"names was not judged. Spell the operand out.", command, text)
+		}
 		operands := []string{text}
 		if _, value, ok := strings.Cut(text, "="); ok {
 			// `--file=.env`, `if=.env`: the value is the operand.
@@ -143,16 +159,71 @@ func secretOperandViolation(clause, root string) string {
 			if carriesSubstitution(operand) {
 				if fileReaders[command] {
 					return fmt.Sprintf("`%s` has an operand (`%s`) that a command substitution chooses, so "+
-						"the file it reads cannot be judged.", command, text)
+						"the file it reads cannot be judged.", command, text), false
 				}
 				continue
 			}
 			if reason := secretOperandReason(operand, operandRoot); reason != "" {
-				return fmt.Sprintf("`%s` names %s", command, reason)
+				return fmt.Sprintf("`%s` names %s", command, reason), false
 			}
 		}
 	}
-	return ""
+	return unbound, unbound != ""
+}
+
+// operandFromFile reports whether w is an operand of command that sh expands
+// to a value the gate cannot name, for a command whose operands are files it
+// reads. A file reader (cat, head, cp …) is refused on any such expansion,
+// including a plain unbound variable: its operand is the file and nothing else.
+// Every other reading program, and git, keep the owner's 2026-10-24 decision to
+// judge a bare unbound variable by its spelling and refuse only the computed
+// forms (computedOperand). Programs that are neither — a harness command, eval,
+// an unmodelled tool — have their own rungs and are not asked here.
+func operandFromFile(command string, w shellWord) bool {
+	if fileReaders[command] {
+		return unboundOperand(w)
+	}
+	return computedOperand(w)
+}
+
+// readerBehindWrapper moves the command word past the program wrappers
+// (commandWrappers, the one list the harness-only rung reads) to the reading
+// program they run: `nice -n 5 cat $zz` hands $zz to cat. A wrapper's own
+// options have an arity the gate does not know, so the reader is the first
+// later word that names one; with none, the wrapper stays the command word.
+// at is -1 when argumentCommandWord stopped at a wrapper followed by an option.
+func readerBehindWrapper(words []shellWord, at int) int {
+	start := at
+	if start < 0 {
+		for i, w := range words {
+			if !w.quotedHead && commandWrappers[wrapperName(w.text)] {
+				start = i
+				break
+			}
+		}
+		if start < 0 {
+			return at
+		}
+	}
+	for start < len(words) && !words[start].quotedHead && commandWrappers[wrapperName(words[start].text)] {
+		next := -1
+		for j := start + 1; j < len(words); j++ {
+			name := wrapperName(words[j].text)
+			if fileReaders[name] || readsOnlyCommands[name] || isGitWord(words[j].text) || commandWrappers[name] {
+				next = j
+				break
+			}
+		}
+		if next < 0 {
+			return at
+		}
+		start = next
+	}
+	return start
+}
+
+func wrapperName(word string) string {
+	return strings.TrimSuffix(strings.ToLower(path.Base(word)), ".exe")
 }
 
 // gitSubcommand is the first non-option word after `git`, stepping over the

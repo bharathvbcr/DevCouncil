@@ -131,3 +131,49 @@ func TestTemporaryDirectoryWrites(t *testing.T) {
 		}
 	}
 }
+
+// unboundOperand names the expansions the gate cannot resolve (ft-ee1b04e7) and
+// leaves literals, quoted text and revision syntax alone.
+func TestUnboundOperand(t *testing.T) {
+	for word, want := range map[string]bool{
+		"$zz": true, "${zz:-.env}": true, "${f/a/.env}": true, "${f%a}.env": true, "${!v}": true,
+		"$1": true, "$@": true, "--file=$zz": true, "{.env,x}": true, "x{,.env}": true, "{a..c}": true,
+		"'$zz'": false, "'{.env,x}'": false, "a$": false, "README.md": false, "{}": false,
+		"HEAD@{1}": false, "HEAD@{2.days.ago}": false, "*.go": false, "a\\$b": false,
+	} {
+		words := shellWords("cat " + word)
+		if len(words) != 2 {
+			t.Fatalf("%q read as %d words", word, len(words))
+		}
+		if got := unboundOperand(words[1]); got != want {
+			t.Errorf("unboundOperand(%q) = %v, want %v", word, got, want)
+		}
+	}
+}
+
+// computedOperand keeps the owner's judge-by-spelling decision for a bare
+// unbound variable and refuses the computed forms.
+func TestComputedOperandSparesBareUnboundVariables(t *testing.T) {
+	for word, want := range map[string]bool{
+		"$b": false, "${b}": false, "main..$b": false, "$c:README.md": false, "$OUT/x": false,
+		"${b:-x}": true, "${b/a/b}": true, "$1": true, "$@": true, "{a,b}": true, "${#b}": true,
+	} {
+		words := shellWords("cat " + word)
+		if got := computedOperand(words[1]); got != want {
+			t.Errorf("computedOperand(%q) = %v, want %v", word, got, want)
+		}
+	}
+}
+
+func TestComputedOperandSpecialsAndANSIC(t *testing.T) {
+	for word, want := range map[string]bool{
+		"$_": true, "${_}": true, "$0": true, "$$": true, "$-": true, "$!": true, "$?": true,
+		"$_x": false, "$__": false, "${_x}": false,
+		"$'.env'": true, "$'\\x2eenv'": true, "HEAD:$'.env'": true, "'a$'": false,
+	} {
+		words := shellWords("cat " + word)
+		if got := computedOperand(words[1]); got != want {
+			t.Errorf("computedOperand(%q) = %v, want %v", word, got, want)
+		}
+	}
+}
