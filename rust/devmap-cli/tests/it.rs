@@ -52,6 +52,7 @@ mod blast_names_what_a_change_reaches;
 mod blast_reads_once_and_names_every_path;
 mod budget_refusal_attack;
 mod build_lsp_opt_in;
+mod build_lsp_paths_are_anchored;
 mod build_ms_is_the_locked_build;
 mod caller_assets_over_stdin;
 mod claude_config_dir;
