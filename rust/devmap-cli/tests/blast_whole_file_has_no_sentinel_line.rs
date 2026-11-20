@@ -235,3 +235,66 @@ fn a_whole_file_target_that_does_not_exist_reports_its_length_as_unknown() {
     assert_eq!(row["lines"], 0, "{report:#}");
     assert_eq!(row["lines_unknown_ranges"], 1, "{report:#}");
 }
+
+fn devmap_text(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(args)
+        .arg("--root")
+        .arg(repo)
+        .output()
+        .expect("devmap runs");
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn human_renderers_never_print_the_sentinel_for_a_missing_file() {
+    let (repo, _base) = setup("render");
+    for extra in [&[][..], &["--format", "markdown"][..]] {
+        let mut args = vec!["blast", "--at", "src/absent.rs"];
+        args.extend_from_slice(extra);
+        let text = devmap_text(&repo, &args);
+        assert!(
+            !text.contains("4294967295"),
+            "{extra:?} printed the sentinel:\n{text}"
+        );
+        assert!(text.contains("src/absent.rs:1-EOF"), "{extra:?}:\n{text}");
+    }
+}
+
+#[test]
+fn an_explicit_end_past_the_file_reports_the_real_length() {
+    let (repo, _base) = setup("clamp");
+    // Unindexed: README.txt has two lines.
+    let report = devmap_json(&repo, &["blast", "--at", "README.txt:1-4294967294"]);
+    assert_no_huge_line_numbers(&report);
+    assert_eq!(unattributed_lines(&report), Some(2), "{report:#}");
+    assert_eq!(report["unattributed"][0]["end_line"], 2, "{report:#}");
+    assert_eq!(
+        report["changed_files"][0]["ranges"][0]["end_line"], 2,
+        "{report:#}"
+    );
+    // Indexed: src/lib.rs has seven lines.
+    let report = devmap_json(&repo, &["blast", "--at", "src/lib.rs:1-4294967294"]);
+    assert_no_huge_line_numbers(&report);
+    assert_eq!(
+        report["changed_files"][0]["ranges"][0]["end_line"], 7,
+        "{report:#}"
+    );
+}
+
+#[test]
+fn a_start_beyond_the_end_of_an_unindexed_file_is_beyond_end_of_file() {
+    let (repo, _base) = setup("beyond");
+    let report = devmap_json(&repo, &["blast", "--at", "README.txt:5-4294967295"]);
+    assert_no_huge_line_numbers(&report);
+    assert_eq!(unattributed_lines(&report), Some(0), "{report:#}");
+    assert_eq!(
+        report["unattributed"][0]["reason"]["kind"], "beyond_end_of_file",
+        "{report:#}"
+    );
+}

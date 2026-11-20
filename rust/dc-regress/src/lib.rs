@@ -76,7 +76,9 @@ pub use blast::{
 };
 pub use blob::BlobReader;
 pub use budget::{Budget, Exhausted};
-pub use change::{ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange};
+pub use change::{
+    ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange, WHOLE_FILE_END_LINE,
+};
 pub use join::{attribute, Attribution, SymbolBlame};
 pub use rank::{rank, EvidenceClass, RankInputs, Suspect, TouchedSymbol};
 pub use suspects::{suspects, DEFAULT_CONE_DEPTH};

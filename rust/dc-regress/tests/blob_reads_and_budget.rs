@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use dc_regress::blast::{blast_change_bounded, UnattributedReason};
+use dc_regress::blast::{blast_bounded, blast_change_bounded, UnattributedReason};
 use dc_regress::history::{HistoryRefusal, CONTENT_CAP};
 use dc_regress::{
     AffectedTestFile, BlobIdentity, BlobReader, Budget, ChangeSet, ChangeStatus, ChangedRange,
@@ -389,4 +389,68 @@ fn a_cancel_from_the_caller_stops_the_walk_where_it_is() {
         .unattributed
         .iter()
         .any(|u| matches!(u.reason, UnattributedReason::ContentUnavailable { .. })));
+}
+
+/// A graph that indexes nothing and shares no reader, so the blast reads
+/// whatever it reads through the program it was handed.
+struct EmptyGraph;
+
+impl CodeGraph for EmptyGraph {
+    fn symbols_in(&self, _file: &str) -> (Vec<GraphSymbol>, BlobIdentity) {
+        (Vec::new(), BlobIdentity::Unknown)
+    }
+    fn cone(&self, _symbol: &str, _depth: u32) -> (Vec<ConeEntry>, bool) {
+        (Vec::new(), false)
+    }
+    fn impacted(&self, _seeds: &[String], _depth: u32) -> (Vec<ConeEntry>, bool) {
+        (Vec::new(), false)
+    }
+    fn affected_tests(&self, _seeds: &[String], _depth: u32) -> (Vec<AffectedTestFile>, bool) {
+        (Vec::new(), false)
+    }
+    fn resolve_symptom(&self, _symptom: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Git's own ranges never exceed their file, so a `--since` blast does not
+/// read an unindexed file's blob; a caller-typed `--at` range is checked.
+#[test]
+fn a_since_blast_does_not_read_unindexed_blobs_but_an_at_blast_does() {
+    let (fx, head) = fixture("since", 1);
+    std::fs::write(fx.repo.join("notes.txt"), "one\ntwo\n").unwrap();
+    git(&fx.repo, &["add", "-A"]);
+    git(&fx.repo, &["commit", "-m", "notes", "--no-gpg-sign"]);
+    let next = git(&fx.repo, &["rev-parse", "HEAD"]);
+
+    let report = blast_bounded(
+        fx.counting.as_os_str(),
+        &fx.repo,
+        &EmptyGraph,
+        &head,
+        &next,
+        3,
+        &Budget::default(),
+    );
+    assert_eq!(report.unattributed.len(), 1, "{report:#?}");
+    assert_eq!(
+        fx.count("cat-file") + fx.count("show"),
+        0,
+        "no blob read for a git range: {:?}",
+        fx.spawns()
+    );
+
+    let at = ChangeSet::at("notes.txt", 1, 5);
+    let report = blast_change_bounded(
+        fx.counting.as_os_str(),
+        &fx.repo,
+        &EmptyGraph,
+        &at,
+        "notes.txt:1-5",
+        &next,
+        3,
+        &Budget::default(),
+    );
+    assert_eq!(report.unattributed[0].end_line, 2, "{report:#?}");
+    assert!(fx.count("cat-file") >= 1, "{:?}", fx.spawns());
 }
