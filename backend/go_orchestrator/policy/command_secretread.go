@@ -61,7 +61,7 @@ const maxGlobMatchesJudged = 1024
 // elsewhere in the clause takes precedence over it.
 func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
-	at := readerBehindWrapper(words, argumentCommandWord(words))
+	at, judgedFrom := readerBehindWrapper(words, argumentCommandWord(words))
 	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""
@@ -129,7 +129,9 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 			}
 			continue
 		}
-		if framing || at < 0 || i <= at {
+		// Every word after the command word as written is judged, whatever
+		// program it is handed to: the reader only classifies the command.
+		if framing || at < 0 || i <= judgedFrom {
 			continue
 		}
 		reads := !nonReadingCommands[command]
@@ -142,7 +144,8 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
 			continue
 		}
-		if unbound == "" && !written[text] && operandFromFile(command, words[i]) {
+		if unbound == "" && !written[text] && !inertCommands[command] &&
+			!computedOptionValue(command, words, i) && operandFromFile(command, words[i]) {
 			unbound = fmt.Sprintf("`%s` has an operand (`%s`) holding an expansion the gate cannot resolve to a "+
 				"value (a variable nothing binds, a parameter operator or a brace expansion), so the file it "+
 				"names was not judged. Spell the operand out.", command, text)
@@ -186,23 +189,31 @@ func operandFromFile(command string, w shellWord) bool {
 	return computedOperand(w)
 }
 
-// readerBehindWrapper moves the command word past the program wrappers
-// (commandWrappers, the one list the harness-only rung reads) to the reading
-// program they run: `nice -n 5 cat $zz` hands $zz to cat. A wrapper's own
-// options have an arity the gate does not know, so the reader is the first
-// later word that names one; with none, the wrapper stays the command word.
-// at is -1 when argumentCommandWord stopped at a wrapper followed by an option.
-func readerBehindWrapper(words []shellWord, at int) int {
+// readerBehindWrapper classifies the command a wrapper runs. It moves the
+// command word past the program wrappers (commandWrappers, the one list the
+// harness-only rung reads) to the reading program they run: `nice -n 5 cat $zz`
+// hands $zz to cat. A wrapper's own options have an arity the gate does not
+// know, so the reader is the first later word that names one; with none, the
+// wrapper stays the command word.
+//
+// reader only CLASSIFIES the command. judgedFrom is the index of the command
+// word as written (the first wrapper when argumentCommandWord stopped at a
+// wrapper followed by an option, -1 when there is none) and bounds which words
+// are judged: every word after it, including the ones between a wrapper and the
+// reader (`nice awk 1 .env cat`, `xargs -a .env cat`).
+func readerBehindWrapper(words []shellWord, at int) (reader, judgedFrom int) {
+	judgedFrom = at
 	start := at
 	if start < 0 {
 		for i, w := range words {
 			if !w.quotedHead && commandWrappers[wrapperName(w.text)] {
 				start = i
+				judgedFrom = i
 				break
 			}
 		}
 		if start < 0 {
-			return at
+			return at, at
 		}
 	}
 	for start < len(words) && !words[start].quotedHead && commandWrappers[wrapperName(words[start].text)] {
@@ -215,11 +226,11 @@ func readerBehindWrapper(words []shellWord, at int) int {
 			}
 		}
 		if next < 0 {
-			return at
+			return at, judgedFrom
 		}
 		start = next
 	}
-	return start
+	return start, judgedFrom
 }
 
 func wrapperName(word string) string {

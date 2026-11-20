@@ -133,11 +133,11 @@ const gitShortOptionsWithValue = "SGUMCBlLIOXn"
 //
 // root may be empty. With a root, paths are judged by ClassifyRead, which also
 // follows symlinks; without one, by their text alone.
-func readOnlyArgumentViolation(clause, root string) string {
+func readOnlyArgumentViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
 	at := argumentCommandWord(words)
 	if at < 0 || !isGitWord(words[at].text) {
-		return ""
+		return "", false
 	}
 	// Global options sit between `git` and the subcommand. Whether the
 	// invocation is a read-only one is only known once the subcommand is found,
@@ -182,18 +182,18 @@ func readOnlyArgumentViolation(clause, root string) string {
 		i = next
 	}
 	if i >= len(words) || !readOnlyGitSubcommands[words[i].text] {
-		return ""
+		return "", false
 	}
 	sub := words[i].text
 	if unsafeGlobal != "" {
 		return fmt.Sprintf("`git %s` here runs with the global option `%s`, which can point git at "+
-			"other configuration, programs or trees and is not part of read-only orientation.", sub, unsafeGlobal)
+			"other configuration, programs or trees and is not part of read-only orientation.", sub, unsafeGlobal), false
 	}
 	for _, w := range words[:at] {
 		if name, value, ok := strings.Cut(w.text, "="); ok && strings.HasPrefix(name, "GIT_") && isAssignmentWord(w.text) &&
 			!safeGitEnvironment(name, value, effectiveRoot) {
 			return fmt.Sprintf("`git %s` here runs with %s set, which redirects git to other "+
-				"programs, configuration or trees than the ones the gate judged.", sub, name)
+				"programs, configuration or trees than the ones the gate judged.", sub, name), false
 		}
 	}
 
@@ -216,37 +216,37 @@ func readOnlyArgumentViolation(clause, root string) string {
 			name, _, _ := strings.Cut(text, "=")
 			if hasExpansion(name) {
 				return fmt.Sprintf("`git %s` has an option (`%s`) that only the shell can spell out, so the "+
-					"gate cannot tell what it is.", sub, text)
+					"gate cannot tell what it is.", sub, text), false
 			}
 			for _, bad := range gitUnsafeLongOptions {
 				if strings.HasPrefix(bad.name, name) {
-					return fmt.Sprintf("`git %s %s` is refused: %s (%s).", sub, text, bad.why, bad.name)
+					return fmt.Sprintf("`git %s %s` is refused: %s (%s).", sub, text, bad.why, bad.name), false
 				}
 			}
 		case !endOfOptions && len(text) > 1 && text[0] == '-':
 			if hasExpansion(text[:2]) {
-				return fmt.Sprintf("`git %s` has an option (`%s`) that only the shell can spell out.", sub, text)
+				return fmt.Sprintf("`git %s` has an option (`%s`) that only the shell can spell out.", sub, text), false
 			}
 			for _, c := range text[1:] {
 				if c == 'O' {
-					return fmt.Sprintf("`git %s %s` is refused: -O reads an order file outside the path rules.", sub, text)
+					return fmt.Sprintf("`git %s %s` is refused: -O reads an order file outside the path rules.", sub, text), false
 				}
 				if strings.ContainsRune(gitShortOptionsWithValue, c) {
 					break // the rest of the cluster is this option's value
 				}
 			}
 		default:
-			if computedOperand(w) {
+			if computedOperand(w) && !computedOptionValue("git", words, idx) {
 				return fmt.Sprintf("`git %s %s` is refused: the operand holds an expansion the gate cannot "+
 					"resolve to a value (a parameter operator, a special parameter or a brace expansion), "+
-					"so the path or revision it names was not judged. Spell the operand out.", sub, text)
+					"so the path or revision it names was not judged. Spell the operand out.", sub, text), true
 			}
 			if reason := readOnlyOperandViolation(text, effectiveRoot); reason != "" {
-				return fmt.Sprintf("`git %s %s` is refused: %s", sub, text, reason)
+				return fmt.Sprintf("`git %s %s` is refused: %s", sub, text, reason), false
 			}
 		}
 	}
-	return ""
+	return "", false
 }
 
 // hasExpansion reports whether a word carries a parameter expansion, a

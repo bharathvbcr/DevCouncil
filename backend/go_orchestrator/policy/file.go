@@ -1359,11 +1359,23 @@ func forbiddenEntries(raw []string) []string {
 		return nil
 	}
 	out := make([]string, 0, len(raw))
-	for _, entry := range raw {
-		entry = dc.NormalizePlanPath(entry)
+	for _, written := range raw {
+		entry := dc.NormalizePlanPath(written)
+		if entry == "" && strings.TrimSpace(written) != "" {
+			// "./" normalises to nothing; it names the root.
+			out = append(out, "**")
+			continue
+		}
 		dir := strings.HasSuffix(entry, "/") || strings.HasSuffix(entry, "/.") || entry == "."
 		if strings.Contains(entry, "..") || dir {
-			if cleaned := pathpkg.Clean(entry); cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../") && !strings.HasPrefix(cleaned, "/") {
+			cleaned := pathpkg.Clean(entry)
+			if cleaned == "." && strings.TrimSpace(written) != "" {
+				// An entry that names the root forbids everything under it.
+				// Kept as written it matched nothing and voided the prohibition.
+				out = append(out, "**")
+				continue
+			}
+			if cleaned != "." && cleaned != ".." && !strings.HasPrefix(cleaned, "../") && !strings.HasPrefix(cleaned, "/") {
 				entry = cleaned
 			}
 		}

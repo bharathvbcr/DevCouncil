@@ -28,7 +28,7 @@ var inertCommands = map[string]bool{
 	":": true, "export": true, "unset": true, "set": true, "read": true, "pwd": true, "sleep": true,
 	"date": true, "which": true, "whoami": true, "uname": true, "hostname": true, "id": true,
 	"seq": true, "expr": true, "basename": true, "dirname": true, "type": true, "alias": true,
-	"wait": true, "exit": true, "return": true, "shift": true, "local": true, "declare": true,
+	"wait": true, "kill": true, "exit": true, "return": true, "shift": true, "local": true, "declare": true,
 }
 
 // pathWritingCommands are the programs commandWrites reads the files of: the
@@ -39,6 +39,55 @@ var pathWritingCommands = map[string]bool{
 	"shred": true, "mkdir": true, "chmod": true, "chown": true, "chgrp": true, "curl": true,
 	"wget": true, "ruby": true, "perl": true, "truncate": true, "touch": true, "install": true,
 	"ln": true, "rsync": true, "patch": true, "dd": true, "xargs": true, "find": true,
+}
+
+// numericOptions are the options of well-known programs whose argument is a
+// count, a duration or a port, never a path: `make -j${N:-4}`,
+// `go test -count=${C:-1}`, `head -n ${N:-5} README.md`. A value an expansion
+// computes for one of them is not a file operand. An option is spelled with its
+// dashes; a program not listed here has none.
+var numericOptions = map[string]map[string]bool{
+	"make":   {"-j": true, "-l": true, "--jobs": true, "--load-average": true},
+	"gmake":  {"-j": true, "-l": true, "--jobs": true, "--load-average": true},
+	"ninja":  {"-j": true, "-l": true},
+	"cargo":  {"-j": true, "--jobs": true},
+	"head":   {"-n": true, "-c": true, "--lines": true, "--bytes": true},
+	"tail":   {"-n": true, "-c": true, "--lines": true, "--bytes": true},
+	"pytest": {"-n": true, "--maxfail": true},
+	"git":    {"-n": true, "-U": true, "--max-count": true, "--skip": true, "--abbrev": true, "--unified": true},
+	"go": {"-count": true, "-p": true, "-parallel": true, "-cpu": true, "-timeout": true,
+		"-benchtime": true, "-shuffle": true, "-fuzztime": true},
+}
+
+// numericLongOptions are long options of any program that name a count, a
+// duration or a port by convention (`npm run dev -- --port ${PORT:-3000}`).
+var numericLongOptions = map[string]bool{
+	"--port": true, "--jobs": true, "--workers": true, "--threads": true, "--timeout": true,
+	"--retries": true, "--concurrency": true, "--parallel": true, "--max-count": true,
+	"--depth": true, "--limit": true, "--count": true,
+}
+
+// computedOptionValue reports whether words[i] is the argument of a numeric
+// option of command: the next word after the option (`-n ${N:-5}`), or attached
+// to it (`-j${N:-4}`, `--port=${PORT:-3000}`). It is not asked of a file
+// position: a computed word anywhere else stays a computed operand.
+func computedOptionValue(command string, words []shellWord, i int) bool {
+	isNumeric := func(opt string) bool {
+		return numericLongOptions[opt] || numericOptions[command][opt]
+	}
+	plain := func(opt string) bool { return !strings.ContainsAny(opt, "$`{~*?[") }
+	text := words[i].text
+	if i > 0 && !words[i-1].quotedHead && plain(words[i-1].text) && isNumeric(words[i-1].text) &&
+		!strings.HasPrefix(text, "-") {
+		return true
+	}
+	if name, _, ok := strings.Cut(text, "="); ok && strings.HasPrefix(name, "-") && plain(name) && isNumeric(name) {
+		return true
+	}
+	if len(text) > 2 && text[0] == '-' && text[1] != '-' && plain(text[:2]) && isNumeric(text[:2]) {
+		return true
+	}
+	return false
 }
 
 // unverifiableOperand reports why a clause runs a program the gate does not
@@ -80,7 +129,7 @@ func unverifiableOperand(clause, root string, mt matching) string {
 				continue
 			}
 		}
-		if computedOperand(words[i]) {
+		if computedOperand(words[i]) && !computedOptionValue(name, words, i) {
 			return fmt.Sprintf("`%s` is handed an operand (`%s`) holding an expansion the gate cannot resolve "+
 				"to a value (a parameter operator, a special parameter, a brace expansion or ANSI-C quoting), so "+
 				"the path it names was not judged and the gate cannot tell a read from a write. Spell the operand out.", name, text)

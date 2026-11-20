@@ -21,7 +21,7 @@ const (
 // expandBindings returns the lines the ladder judges in place of command:
 // command with every variable it can name rewritten to its value.
 //
-// What it can name: a leading tilde, $HOME and $TMPDIR, from this process's
+// What it can name: a leading tilde, $HOME, $TMPDIR and $PWD, from this process's
 // environment, which the shell running the command inherits; and every
 // variable the line itself gives a literal value — `f=README.md; head $f`,
 // `export W=/tmp/x`, and each item of a `for` loop's list, every one of which
@@ -105,6 +105,11 @@ func lineBindings(command string) (values map[string][]string, dropped map[strin
 	}
 	if tmp := os.Getenv("TMPDIR"); tmp != "" {
 		add("TMPDIR", tmp)
+	}
+	// $PWD is where the command runs, which is inside the repository the
+	// gate judges; $OLDPWD is whatever a previous cd left and stays unbound.
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		add("PWD", wd)
 	}
 	for _, clause := range SplitCommandChain(command) {
 		words := shellWords(clause)

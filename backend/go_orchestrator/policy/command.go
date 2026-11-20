@@ -187,12 +187,26 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 	readings, truncated := expandBindings(command)
 	if truncated {
 		// A reading past the caps was never judged, so the line is refused
-		// rather than judged on the readings that fit.
-		return g.noteHardRules(deny(RuleCommandOperandUnverifiable,
+		// rather than judged on the readings that fit. That refusal is about
+		// the gate's reach (an unreadable rule), so it ranks below any hard
+		// refusal for what the line does: the line as written and every reading
+		// that fit are judged first, and a force push or a credential read among
+		// them is reported as itself (see unreadableRules).
+		truncation := g.noteHardRules(deny(RuleCommandOperandUnverifiable,
 			"A loop or variable in this command takes more values than the gate judges (at most "+
 				fmt.Sprint(maxBindingValues)+" values per name and "+fmt.Sprint(maxBindingVariants)+
 				" combinations), so some of what it would run was not examined. Split it into smaller loops or name the files.",
 			command, taskID))
+		decisions := []Decision{truncation}
+		for _, reading := range append([]string{command}, readings...) {
+			d := g.evaluate(reading, task, 0)
+			decisions = append(decisions, d)
+			if refusesForWhatItDoes(d) {
+				break
+			}
+		}
+		d, _ := mostImportant(decisions)
+		return d
 	}
 	if len(readings) == 1 {
 		return g.evaluate(readings[0], task, 0)
@@ -279,8 +293,15 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		// that admits it never read. Hard and ahead of the allowlists for the
 		// same reason git safety is: no lease, grant or posture negotiates it.
 		// See RuleCommandGitReadArgument.
-		if reason := readOnlyArgumentViolation(command, g.Root); reason != "" {
-			return g.noteHardRules(deny(RuleCommandGitReadArgument, reason, normalized, taskID))
+		// An operand it could not resolve is not a refusal for what git was
+		// told to do: it is recorded as unreadable below, so a hard refusal
+		// elsewhere in the clause outranks it.
+		if reason, unverifiable := readOnlyArgumentViolation(command, g.Root); reason != "" {
+			if !unverifiable {
+				return g.noteHardRules(deny(RuleCommandGitReadArgument, reason, normalized, taskID))
+			}
+			unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
+			hasUnreadableOperand = true
 		}
 		// What any command is told to read: an operand naming a credential
 		// file. See RuleCommandSecretRead.
@@ -292,8 +313,10 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 			// the clause does: the harness-only and substitution rungs below
 			// still run, and the finding is recorded as unreadable, as the
 			// operand rung's is, so a hard refusal elsewhere outranks it.
-			unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
-			hasUnreadableOperand = true
+			if !hasUnreadableOperand {
+				unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
+				hasUnreadableOperand = true
+			}
 		}
 		// A write of evidence about the agent's own work. See
 		// RuleCommandHarnessOnly.
