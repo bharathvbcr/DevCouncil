@@ -268,7 +268,7 @@ func bindingTemplate(command string, values map[string][]string) ([]bindingSegme
 // word with a quoted `$` beside an unquoted glob reads as expanding, because
 // shellWord records only whether any expansion character was live.
 func unboundOperand(w shellWord) bool {
-	return w.expands && (hasParameterReference(w.text, true) || hasBraceExpansion(w.text))
+	return w.ansiC || (w.expands && (hasParameterReference(w.text, true) || hasBraceExpansion(w.text)))
 }
 
 // computedOperand is unboundOperand without the plain unbound variable: it
@@ -278,7 +278,7 @@ func unboundOperand(w shellWord) bool {
 // decision, 2026-10-24, pinned by TestCommonReadOnlyGitOrientationPasses), so
 // the rungs that keep that decision ask this narrower question.
 func computedOperand(w shellWord) bool {
-	return w.expands && (hasParameterReference(w.text, false) || hasBraceExpansion(w.text))
+	return w.ansiC || (w.expands && (hasParameterReference(w.text, false) || hasBraceExpansion(w.text)))
 }
 
 // hasParameterReference reports a `$` that opens a parameter expansion the
@@ -294,13 +294,17 @@ func hasParameterReference(text string, plain bool) bool {
 		c := text[i+1]
 		switch {
 		case c == '{':
-			if _, width := parameterReference([]rune(text[i+1:])); width > 0 {
-				if plain {
+			if name, width := parameterReference([]rune(text[i+1:])); width > 0 {
+				// $_ is the previous command's last argument: a value the
+				// line did not bind and the gate cannot know.
+				if plain || name == "_" {
 					return true
 				}
 				continue
 			}
 			return true
+		case c == '_' && (i+2 >= len(text) || !isNameByte(text[i+2])):
+			return true // $_
 		case c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'):
 			if plain {
 				return true
@@ -310,6 +314,10 @@ func hasParameterReference(text string, plain bool) bool {
 		}
 	}
 	return false
+}
+
+func isNameByte(c byte) bool {
+	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
 }
 
 // hasBraceExpansion reports a `{…}` span holding a top-level comma or a `..`

@@ -164,3 +164,16 @@ func TestComputedOperandSparesBareUnboundVariables(t *testing.T) {
 		}
 	}
 }
+
+func TestComputedOperandSpecialsAndANSIC(t *testing.T) {
+	for word, want := range map[string]bool{
+		"$_": true, "${_}": true, "$0": true, "$$": true, "$-": true, "$!": true, "$?": true,
+		"$_x": false, "$__": false, "${_x}": false,
+		"$'.env'": true, "$'\\x2eenv'": true, "HEAD:$'.env'": true, "'a$'": false,
+	} {
+		words := shellWords("cat " + word)
+		if got := computedOperand(words[1]); got != want {
+			t.Errorf("computedOperand(%q) = %v, want %v", word, got, want)
+		}
+	}
+}

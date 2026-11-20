@@ -61,7 +61,7 @@ const maxGlobMatchesJudged = 1024
 // elsewhere in the clause takes precedence over it.
 func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
-	at := argumentCommandWord(words)
+	at := readerBehindWrapper(words, argumentCommandWord(words))
 	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""
@@ -117,6 +117,12 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 				i++
 			}
 			if strings.Contains(text, "<") && !strings.Contains(text, "<<") && operand != "" {
+				// words[i] is the operand's word: the operator's own when the
+				// operand is attached, else the one just stepped onto.
+				if unbound == "" && unboundOperand(words[i]) {
+					unbound = fmt.Sprintf("an input redirection names an operand (`%s`) holding an expansion the gate "+
+						"cannot resolve to a value, so the file it reads was not judged. Spell the operand out.", operand)
+				}
 				if reason := secretOperandReason(operand, root); reason != "" {
 					return fmt.Sprintf("an input redirection names %s", reason), false
 				}
@@ -174,13 +180,50 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 // forms (computedOperand). Programs that are neither — a harness command, eval,
 // an unmodelled tool — have their own rungs and are not asked here.
 func operandFromFile(command string, w shellWord) bool {
-	switch {
-	case fileReaders[command]:
+	if fileReaders[command] {
 		return unboundOperand(w)
-	case readsOnlyCommands[command], command == "git":
-		return computedOperand(w)
 	}
-	return false
+	return computedOperand(w)
+}
+
+// readerBehindWrapper moves the command word past the program wrappers
+// (commandWrappers, the one list the harness-only rung reads) to the reading
+// program they run: `nice -n 5 cat $zz` hands $zz to cat. A wrapper's own
+// options have an arity the gate does not know, so the reader is the first
+// later word that names one; with none, the wrapper stays the command word.
+// at is -1 when argumentCommandWord stopped at a wrapper followed by an option.
+func readerBehindWrapper(words []shellWord, at int) int {
+	start := at
+	if start < 0 {
+		for i, w := range words {
+			if !w.quotedHead && commandWrappers[wrapperName(w.text)] {
+				start = i
+				break
+			}
+		}
+		if start < 0 {
+			return at
+		}
+	}
+	for start < len(words) && !words[start].quotedHead && commandWrappers[wrapperName(words[start].text)] {
+		next := -1
+		for j := start + 1; j < len(words); j++ {
+			name := wrapperName(words[j].text)
+			if fileReaders[name] || readsOnlyCommands[name] || isGitWord(words[j].text) || commandWrappers[name] {
+				next = j
+				break
+			}
+		}
+		if next < 0 {
+			return at
+		}
+		start = next
+	}
+	return start
+}
+
+func wrapperName(word string) string {
+	return strings.TrimSuffix(strings.ToLower(path.Base(word)), ".exe")
 }
 
 // gitSubcommand is the first non-option word after `git`, stepping over the

@@ -269,6 +269,8 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	// as a heredoc and the force push was never named. A refusal for what the
 	// line does must never be hidden behind one for what the gate could not
 	// read (see evaluate).
+	var unreadableOperand Decision
+	hasUnreadableOperand := false
 	if g.HardRules {
 		if d, fired := gitSafety(normalized, taskID); fired && d.Action == Deny {
 			return d
@@ -283,10 +285,15 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		// What any command is told to read: an operand naming a credential
 		// file. See RuleCommandSecretRead.
 		if reason, unverifiable := secretOperandViolation(command, g.Root); reason != "" {
-			if unverifiable {
-				return g.noteHardRules(deny(RuleCommandOperandUnverifiable, reason, normalized, taskID))
+			if !unverifiable {
+				return g.noteHardRules(deny(RuleCommandSecretRead, reason, normalized, taskID))
 			}
-			return g.noteHardRules(deny(RuleCommandSecretRead, reason, normalized, taskID))
+			// What the gate could not read must not hide a refusal for what
+			// the clause does: the harness-only and substitution rungs below
+			// still run, and the finding is recorded as unreadable, as the
+			// operand rung's is, so a hard refusal elsewhere outranks it.
+			unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
+			hasUnreadableOperand = true
 		}
 		// A write of evidence about the agent's own work. See
 		// RuleCommandHarnessOnly.
@@ -296,6 +303,9 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	}
 
 	var f clauseFindings
+	if hasUnreadableOperand {
+		f.noteUnreadable(g.noteHardRules(unreadableOperand))
+	}
 	g.noteOpaqueConstructs(&f, raw, normalized, taskID)
 	if d, hard := g.judgeSubstitutions(&f, raw, normalized, task, taskID, depth); hard {
 		return d
@@ -1332,6 +1342,12 @@ type shellWord struct {
 	// single quotes and not backslash-escaped (inside double quotes only `$`
 	// and the backtick do). `'*.go'` is a literal; `*.go` is a glob.
 	expands bool
+	// ansiC reports whether an unquoted `$` is immediately followed by a
+	// quote (`$'.env'`, `$"x"`). The scan drops the quote like any other, so
+	// the text reads `$.env`; sh decodes the escapes inside `$'…'` and the
+	// scan does not, so the value the command is handed is not the text. The
+	// operand rungs treat such a word as computed (computedOperand).
+	ansiC bool
 }
 
 type shellWordSpan struct {
@@ -1362,7 +1378,7 @@ func shellWords(command string) []shellWord {
 func scanShellWords(command string) []shellWordSpan {
 	var spans []shellWordSpan
 	var cur, raw strings.Builder
-	started, quotedHead, anyQuoted, expands := false, false, false, false
+	started, quotedHead, anyQuoted, expands, ansiC := false, false, false, false, false
 	quote := rune(0)
 	runes := []rune(command)
 	flush := func() {
@@ -1370,12 +1386,12 @@ func scanShellWords(command string) []shellWordSpan {
 			return
 		}
 		spans = append(spans, shellWordSpan{
-			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands},
+			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC},
 			raw:       raw.String(),
 		})
 		cur.Reset()
 		raw.Reset()
-		started, quotedHead, anyQuoted, expands = false, false, false, false
+		started, quotedHead, anyQuoted, expands, ansiC = false, false, false, false, false
 	}
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
@@ -1392,6 +1408,9 @@ func scanShellWords(command string) []shellWordSpan {
 			i++
 			started = true
 		case quote == 0 && (r == '\'' || r == '"'):
+			if i > 0 && runes[i-1] == '$' && started {
+				ansiC = true
+			}
 			quotedHead = quotedHead || !started
 			anyQuoted = true
 			raw.WriteRune(r)
