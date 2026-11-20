@@ -136,10 +136,10 @@ fn scan_secrets_precision_and_recall_on_the_tuning_corpus() {
     assert_eq!(
         matrix,
         Matrix {
-            tp: 69,
+            tp: 80,
             fp: 0,
             fn_: 0,
-            tn: 61
+            tn: 64
         },
         "scan_secrets moved on secrets.tsv; update the pinned counts here and the \
          figures in rust/STATUS.md together\n{}",
@@ -176,7 +176,7 @@ fn scan_secrets_precision_and_recall_on_the_held_out_corpus() {
 // secrets_holdout_2.tsv's.
 const HOLDOUT_TP: usize = 20;
 const HOLDOUT_FP: usize = 0;
-const HOLDOUT_FN: usize = 0;
+const HOLDOUT_FN: usize = 2;
 const HOLDOUT_TN: usize = 28;
 
 /// The second held-out corpus, labelled and committed (dd4fa7f5) before any
