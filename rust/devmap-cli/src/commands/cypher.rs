@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_json, open_for_read};
+use crate::output::{emit_store_answer, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Cypher")]
@@ -19,7 +19,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let graph = devmap_query::graph_core_for_store(&store)?;
     let result = devmap_query::cypher::run(&graph, query, *limit);
     if cli.json {
-        emit_json(cli, &result)?;
+        emit_store_answer(cli, &store, result)?;
     } else if result["ok"].as_bool() == Some(true) {
         for row in result["rows"].as_array().into_iter().flatten() {
             match row.get("rel").and_then(serde_json::Value::as_str) {

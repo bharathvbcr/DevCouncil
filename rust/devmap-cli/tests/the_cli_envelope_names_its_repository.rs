@@ -217,3 +217,99 @@ fn the_reported_store_is_the_one_the_command_opened() {
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
 }
+
+
+fn named_corpus(dir_name: &str) -> PathBuf {
+    let parent = corpus("hostile-parent");
+    let root = parent.join(dir_name);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("lib.py"), "def helper(rows):\n    return rows\n").unwrap();
+    let built = Command::new(devmap())
+        .args(["build", "."])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    root.canonicalize().unwrap()
+}
+
+/// Attack: every read command that prints a store-backed answer names its
+/// repository, not only the ones that go through `ReadStore::emit_answer`.
+/// `routes`, `api-impact`, `suspects` and `cypher` open the whole store and
+/// printed through `emit_json`, so they had none while the MCP tools of the
+/// same names carried it.
+#[test]
+fn whole_store_read_commands_name_their_repository_like_their_mcp_tools() {
+    let root = corpus("whole-store");
+    for (label, cli_args, tool, arguments) in [
+        ("routes", vec!["--json", "routes"], "devmap_routes", json!({})),
+        (
+            "api-impact",
+            vec!["--json", "api-impact", "/x"],
+            "devmap_api_impact",
+            json!({"route": "/x"}),
+        ),
+        (
+            "suspects",
+            vec!["--json", "suspects", "helper", "--since", "HEAD"],
+            "devmap_suspects",
+            json!({"symptom": "helper", "since": "HEAD"}),
+        ),
+        (
+            "cypher",
+            vec!["--json", "cypher", "MATCH (a)-[r:calls]->(b) RETURN a, b LIMIT 1"],
+            "devmap_cypher",
+            json!({"query": "MATCH (a)-[r:calls]->(b) RETURN a, b LIMIT 1"}),
+        ),
+    ] {
+        let from_cli = cli(&root, &cli_args);
+        let from_mcp = mcp(&root, tool, arguments);
+        assert_eq!(
+            from_cli["repository"]["root"], from_mcp["repository"]["root"],
+            "{label}: CLI {from_cli}"
+        );
+        assert_eq!(
+            from_cli["repository"]["store"], from_mcp["repository"]["store"],
+            "{label}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Attack: a root with a space, a double quote, non-ASCII characters. The CLI
+/// and MCP must report the same strings (JSON-escaped, not mangled).
+#[test]
+fn hostile_root_names_are_reported_exactly_as_the_mcp_envelope_reports_them() {
+    for dir in ["a b c", "q\"uote", "r\u{e9}p\u{f6}-\u{65e5}\u{672c}-\u{1f600}"] {
+        let root = named_corpus(dir);
+        let from_cli = cli(&root, &["--json", "search", "helper"]);
+        let from_mcp = mcp(&root, "devmap_search", json!({"query": "helper"}));
+        assert_eq!(from_cli["repository"]["root"], json!(root.display().to_string()), "{dir}");
+        assert_eq!(from_cli["repository"]["root"], from_mcp["repository"]["root"], "{dir}");
+        assert_eq!(from_cli["repository"]["store"], from_mcp["repository"]["store"], "{dir}");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+}
+
+/// Attack: a relative `--db` from a cwd that is not the repository is reported
+/// as one absolute file, and `--db` wins over a `--root` naming another repo.
+#[test]
+fn a_relative_db_from_another_cwd_is_reported_absolute_and_beats_root() {
+    let a = corpus("reldb-a");
+    let b = corpus("reldb-b");
+    let db = devmap_extract::paths::store_path(&b).canonicalize().unwrap();
+    let rel = db
+        .strip_prefix(a.parent().unwrap())
+        .unwrap()
+        .display()
+        .to_string();
+    let v = cli(
+        a.parent().unwrap(),
+        &["--root", a.to_str().unwrap(), "--db", &rel, "--json", "search", "helper"],
+    );
+    assert_eq!(v["repository"]["resolved_from"], json!("db"), "{v}");
+    assert_eq!(v["repository"]["store"], json!(db.display().to_string()), "{v}");
+    assert_eq!(v["repository"]["root"], json!(b.display().to_string()), "{v}");
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
