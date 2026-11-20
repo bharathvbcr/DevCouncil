@@ -140,3 +140,291 @@ fn a_kotlin_inherited_sdk_member_still_binds_to_no_repo_namesake() {
         calls_from(&result, "app/Svc.kt::PollService.label")
     );
 }
+
+// ---- Attack round: the rung must not promote or add a wrong edge. ----------
+//
+// Where the rung cannot prove the member, it abstains and the call falls to the
+// rungs after it, exactly as before the rung existed. So each case asserts that
+// no `ReceiverType` edge leaves the caller, not what the later rungs then say.
+
+fn no_receiver_type_edge(result: &ResolutionResult, caller: &str, why: &str) {
+    let rows = calls_from(result, caller);
+    assert!(
+        rows.iter().all(|(_, rung)| rung != "ReceiverType"),
+        "{why}: {rows:?}"
+    );
+}
+
+fn receiver_type_edge(result: &ResolutionResult, caller: &str, target: &str, why: &str) {
+    let rows = calls_from(result, caller);
+    assert!(
+        rows.iter()
+            .any(|(t, rung)| t == target && rung == "ReceiverType"),
+        "{why}: {rows:?}"
+    );
+}
+
+#[test]
+fn a_private_member_of_a_java_superclass_is_not_inherited() {
+    let result = resolve(&[
+        (
+            "a/Base.java",
+            "package a;\npublic class Base { private int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Child.java",
+            "package a;\npublic class Child extends Base { int go() { return helper(); } }\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Child.java::Child.go", "J7");
+}
+
+#[test]
+fn a_private_member_of_a_kotlin_superclass_is_not_inherited() {
+    let result = resolve(&[
+        (
+            "a/Base.kt",
+            "package a\nopen class Base { private fun helper(): Int = 1 }\n",
+        ),
+        (
+            "a/Child.kt",
+            "package a\nclass Child : Base() { fun go(): Int = helper() }\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Child.kt::Child.go", "P1");
+}
+
+#[test]
+fn a_private_superclass_member_does_not_beat_the_lexically_enclosing_class() {
+    let result = resolve(&[
+        (
+            "a/Base.java",
+            "package a;\npublic class Base { private int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Outer.java",
+            "package a;\npublic class Outer {\n int helper() { return 2; }\n \
+             class Child extends Base { int go() { return helper(); } }\n}\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Outer.java::Child.go", "Q22");
+}
+
+#[test]
+fn a_member_declared_on_two_levels_is_an_overload_set_the_rung_cannot_pick_from_kotlin() {
+    let result = resolve(&[
+        (
+            "a/Base.kt",
+            "package a\nopen class Base { fun helper(a: Int): Int = 1 }\n",
+        ),
+        (
+            "a/Mid.kt",
+            "package a\nopen class Mid : Base() { fun helper(a: Int, b: Int): Int = 2 }\n",
+        ),
+        (
+            "a/Child.kt",
+            "package a\nclass Child : Mid() { fun go(): Int = helper(1) }\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Child.kt::Child.go", "Q1");
+}
+
+#[test]
+fn a_member_declared_on_two_levels_is_an_overload_set_the_rung_cannot_pick_from_java() {
+    let result = resolve(&[
+        (
+            "a/Base.java",
+            "package a;\npublic class Base { int helper(int a) { return 1; } }\n",
+        ),
+        (
+            "a/Mid.java",
+            "package a;\npublic class Mid extends Base { int helper(int a, int b) { return 2; } }\n",
+        ),
+        (
+            "a/Child.java",
+            "package a;\npublic class Child extends Mid { int go() { return helper(1); } }\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Child.java::Child.go", "Q2");
+}
+
+#[test]
+fn a_member_found_only_through_an_interface_does_not_outrank_an_external_class_base() {
+    for (name, files, caller) in [
+        (
+            "Q23 Java",
+            vec![
+                (
+                    "a/Strings.java",
+                    "package a;\npublic interface Strings { default String getString(int id) { return \"\"; } }\n",
+                ),
+                (
+                    "a/C.java",
+                    "package a;\nimport android.app.Service;\npublic class C extends Service implements Strings { String go() { return getString(1); } }\n",
+                ),
+            ],
+            "a/C.java::C.go",
+        ),
+        (
+            "Q23k Kotlin",
+            vec![
+                (
+                    "a/Strings.kt",
+                    "package a\ninterface Strings { fun getString(id: Int): String = \"\" }\n",
+                ),
+                (
+                    "a/C.kt",
+                    "package a\nimport android.app.Service\nclass C : Service(), Strings { fun go(): String = getString(1) }\n",
+                ),
+            ],
+            "a/C.kt::C.go",
+        ),
+        (
+            "Q24 Java through an in-repo base",
+            vec![
+                (
+                    "a/Strings.java",
+                    "package a;\npublic interface Strings { default String getString(int id) { return \"\"; } }\n",
+                ),
+                (
+                    "a/Base.java",
+                    "package a;\nimport android.app.Service;\npublic class Base extends Service { }\n",
+                ),
+                (
+                    "a/C.java",
+                    "package a;\npublic class C extends Base implements Strings { String go() { return getString(1); } }\n",
+                ),
+            ],
+            "a/C.java::C.go",
+        ),
+        (
+            "Q25 Kotlin through an in-repo base",
+            vec![
+                (
+                    "a/Strings.kt",
+                    "package a\ninterface Strings { fun getString(id: Int): String = \"\" }\n",
+                ),
+                (
+                    "a/Base.kt",
+                    "package a\nimport android.app.Service\nopen class Base : Service()\n",
+                ),
+                (
+                    "a/C.kt",
+                    "package a\nclass C : Base(), Strings { fun go(): String = getString(1) }\n",
+                ),
+            ],
+            "a/C.kt::C.go",
+        ),
+    ] {
+        let result = resolve(&files);
+        no_receiver_type_edge(&result, caller, name);
+    }
+}
+
+#[test]
+fn what_the_attack_round_left_bound_is_still_bound() {
+    // K8: an interface default with no external base.
+    let result = resolve(&[
+        (
+            "a/I.kt",
+            "package a\ninterface I { fun helper(): Int = 1 }\n",
+        ),
+        (
+            "a/C.kt",
+            "package a\nclass C : I { fun go(): Int = helper() }\n",
+        ),
+        ("z/Decoy.kt", "package z\n\nfun helper(): Int = 99\n"),
+    ]);
+    receiver_type_edge(&result, "a/C.kt::C.go", "a/I.kt::I.helper", "K8");
+
+    // K10: a generic base.
+    let result = resolve(&[
+        (
+            "a/Base.kt",
+            "package a\nopen class Base<T> { fun helper(): Int = 1 }\n",
+        ),
+        (
+            "a/Child.kt",
+            "package a\nclass Child : Base<String>() { fun go(): Int = helper() }\n",
+        ),
+        ("z/Decoy.kt", "package z\n\nfun helper(): Int = 99\n"),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Child.kt::Child.go",
+        "a/Base.kt::Base.helper",
+        "K10",
+    );
+
+    // J6: a Java interface default.
+    let result = resolve(&[
+        (
+            "a/I.java",
+            "package a;\npublic interface I { default int helper() { return 1; } }\n",
+        ),
+        (
+            "a/C.java",
+            "package a;\npublic class C implements I { int go() { return helper(); } }\n",
+        ),
+    ]);
+    receiver_type_edge(&result, "a/C.java::C.go", "a/I.java::I.helper", "J6");
+
+    // Q14: the inherited member beats a same-package top-level function.
+    let result = resolve(&[
+        (
+            "a/Base.kt",
+            "package a\nopen class Base { fun helper(): Int = 1 }\n",
+        ),
+        ("a/Top.kt", "package a\nfun helper(): Int = 2\n"),
+        (
+            "a/Child.kt",
+            "package a\nclass Child : Base() { fun go(): Int = helper() }\n",
+        ),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Child.kt::Child.go",
+        "a/Base.kt::Base.helper",
+        "Q14",
+    );
+
+    // Q16: Java, same-package static namesake in an unrelated class.
+    let result = resolve(&[
+        (
+            "a/Base.java",
+            "package a;\npublic class Base { int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Other.java",
+            "package a;\npublic class Other { static int helper() { return 2; } }\n",
+        ),
+        (
+            "a/Child.java",
+            "package a;\npublic class Child extends Base { int go() { return helper(); } }\n",
+        ),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Child.java::Child.go",
+        "a/Base.java::Base.helper",
+        "Q16",
+    );
+
+    // A Kotlin protected member is inherited.
+    let result = resolve(&[
+        (
+            "a/Base.kt",
+            "package a\nopen class Base { protected fun helper(): Int = 1 }\n",
+        ),
+        (
+            "a/Child.kt",
+            "package a\nclass Child : Base() { fun go(): Int = helper() }\n",
+        ),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Child.kt::Child.go",
+        "a/Base.kt::Base.helper",
+        "Q20",
+    );
+}

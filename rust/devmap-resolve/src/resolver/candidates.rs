@@ -25,7 +25,7 @@ impl Resolver {
         });
         let view = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
             Self::parent_dir(file)
-        } else if hidden_somewhere && Self::visibility_is_enforced(family) {
+        } else if hidden_somewhere && Self::visibility_hides_from_global_rung(family) {
             match family {
                 LangFamily::Rust => self.rust_crate_src_root(file),
                 _ => file.to_string(),
@@ -175,7 +175,20 @@ impl Resolver {
     /// `private`/`fileprivate` declaration is invisible outside its file, a
     /// non-exported TS/JS module binding outside its module, and a non-`pub`
     /// Rust item outside its crate.
+    ///
+    /// Kotlin and Java are recorded too (`unexported_symbols` is filled from
+    /// this), but only the bare member rung reads them: a Java `protected`
+    /// member is `is_exported == false` as well as a `private` one, so hiding
+    /// them from the global rung would drop a subclass's reach to a base
+    /// declared in another file. See [`Self::visibility_hides_from_global_rung`].
     pub(super) fn visibility_is_enforced(family: LangFamily) -> bool {
+        Self::visibility_hides_from_global_rung(family)
+            || matches!(family, LangFamily::Kotlin | LangFamily::Java)
+    }
+
+    /// Families whose unexported declarations the global rung may not offer to
+    /// another file.
+    pub(super) fn visibility_hides_from_global_rung(family: LangFamily) -> bool {
         matches!(
             family,
             LangFamily::Swift | LangFamily::JsTs | LangFamily::Rust
@@ -207,7 +220,7 @@ impl Resolver {
         identity: &str,
     ) -> bool {
         if path == file
-            || !Self::visibility_is_enforced(family)
+            || !Self::visibility_hides_from_global_rung(family)
             || !self
                 .unexported_symbols
                 .contains(&(path.to_string(), identity.to_string()))

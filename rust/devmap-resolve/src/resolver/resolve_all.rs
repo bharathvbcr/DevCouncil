@@ -1747,11 +1747,23 @@ impl Resolver {
                                 caller,
                                 &call.callee_name,
                             ) {
-                                resolution = Some(Arc::new(Resolution::ReceiverType {
-                                    target_symbol,
-                                    target_file,
-                                    receiver_type,
-                                }));
+                                if family == LangFamily::Swift
+                                    || self.jvm_bare_member_is_provable(
+                                        &ext.file_path,
+                                        family,
+                                        caller,
+                                        &call.callee_name,
+                                        &target_file,
+                                        &target_symbol,
+                                        &receiver_type,
+                                    )
+                                {
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol,
+                                        target_file,
+                                        receiver_type,
+                                    }));
+                                }
                             }
                         }
                     }
