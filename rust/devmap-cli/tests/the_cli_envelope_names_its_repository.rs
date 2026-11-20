@@ -179,3 +179,41 @@ fn a_named_root_is_the_reported_repository_not_the_cwd() {
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
 }
+
+/// `repository.store` is the file the command opened: `--db` beats `--root`,
+/// and the root is then inferred from the db, as for a pinned MCP server.
+#[test]
+fn the_reported_store_is_the_one_the_command_opened() {
+    let a = corpus("store-a");
+    let b = corpus("store-b");
+    let db = devmap_extract::paths::store_path(&b);
+    let copy = a.join("copy.sqlite");
+    std::fs::copy(&db, &copy).unwrap();
+    let copy = copy.canonicalize().unwrap();
+    let v = cli(
+        &a,
+        &[
+            "--root",
+            a.to_str().unwrap(),
+            "--db",
+            copy.to_str().unwrap(),
+            "--json",
+            "search",
+            "helper",
+        ],
+    );
+    assert_eq!(v["repository"]["store"], json!(copy.display().to_string()), "{v}");
+    assert_eq!(v["repository"]["resolved_from"], json!("db"));
+
+    let plain = cli(&a, &["--root", b.to_str().unwrap(), "--json", "search", "helper"]);
+    assert_eq!(
+        plain["repository"]["store"],
+        json!(devmap_extract::paths::store_path(&b)
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string())
+    );
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}

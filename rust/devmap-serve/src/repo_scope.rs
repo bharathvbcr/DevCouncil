@@ -72,32 +72,28 @@ pub struct RepositoryRef {
 }
 
 impl RepositoryRef {
-    /// The repository a CLI read command answers from, in the shape the MCP
-    /// envelope reports it. `explicit_db` pins the store (root inferred from
-    /// it, as a pinned MCP server does); `explicit_root` is `--root`;
-    /// neither means the root came from the working directory. A lane with no
-    /// store file of its own reports its base snapshot, as the MCP slot does.
+    /// The repository a CLI read command answered from, in the shape the MCP
+    /// envelope reports it. `store` is the path the command actually opened
+    /// (the caller owns that fact; nothing is re-resolved here). `explicit_db`
+    /// pins the store and the root is inferred from it, as a pinned MCP server
+    /// does; `explicit_root` is `--root`; neither means the working directory.
     pub fn for_cli_read(
+        store: &Path,
         root_hint: &Path,
         explicit_root: bool,
-        explicit_db: Option<&Path>,
+        explicit_db: bool,
     ) -> RepositoryRef {
-        if let Some(db) = explicit_db {
-            let store = canonicalize_path(db);
+        let store = canonicalize_path(store);
+        if explicit_db {
             return RepositoryRef {
                 root: infer_root_from_store(&store),
                 store,
                 resolved_from: "db",
             };
         }
-        let root = canonicalize_path(root_hint);
-        let store = crate::root_resolve::effective_store_for_root(&root)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| devmap_extract::paths::store_path(&root));
         RepositoryRef {
-            root,
-            store: canonicalize_path(&store),
+            root: canonicalize_path(root_hint),
+            store,
             resolved_from: if explicit_root { "root" } else { "cwd" },
         }
     }

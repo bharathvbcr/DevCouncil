@@ -38,12 +38,18 @@ impl ReadStore {
         // The MCP envelope names the repository every answer came from; the CLI
         // does the same, through the same builder. Additive: an answer that
         // already carries a `repository` key keeps it.
-        if let Some(object) = answer.as_object_mut() {
+        // The store is the path this command opened, never a second resolution.
+        let opened = match self {
+            Self::Plain(store) => store.path(),
+            Self::Stacked(stacked) => stacked.base_store().path(),
+        };
+        if let (Some(object), Some(store)) = (answer.as_object_mut(), opened) {
             object.entry("repository").or_insert_with(|| {
                 devmap_serve::repo_scope::RepositoryRef::for_cli_read(
+                    store,
                     &cli.root_hint(),
                     cli.root.is_some(),
-                    cli.db.as_deref(),
+                    cli.db.is_some(),
                 )
                 .to_json()
             });
