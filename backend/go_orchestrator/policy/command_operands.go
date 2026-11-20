@@ -214,6 +214,10 @@ func collectJSONStrings(v any, depth int, out *[]string) bool {
 // protectedOperand describes why an operand is a path the hard rules refuse to
 // let a write reach, or "".
 func protectedOperand(operand, root string, mt matching) string {
+	if expansionBeforeDotDot(operand) {
+		// Not judged by its literal text: the ".." may cancel nothing at all.
+		return fmt.Sprintf("a path an expansion could steer outside the repository or onto a protected path (`%s`)", operand)
+	}
 	if operand == "" || operand == "-" || operand == "--" || hasExpansion(operand) ||
 		strings.Contains(operand, "://") || strings.IndexFunc(operand, isSpace) >= 0 ||
 		IsStreamDevice(operand) {
