@@ -359,7 +359,11 @@ func TestHeadlessRepoWithSubmoduleDoesNotError(t *testing.T) {
 	root := t.TempDir()
 	runGitIn(t, root, "init", "-q")
 	addSubmodule(t, root, freshSource(t, "head-src", "ok\n"), "sub")
-	o := attackRun(t, root, "TASK-GL-HEADLESS")
+	// The gitlink and .gitmodules are staged, which is work against the empty
+	// tree: planned here so the gate reports the gitlink and nothing else.
+	o := attackRun(t, root, "TASK-GL-HEADLESS",
+		dc.PlannedFile{Path: ".gitmodules", AllowedChange: dc.ChangeCreate},
+		dc.PlannedFile{Path: "sub", AllowedChange: dc.ChangeCreate})
 	requireGitlink(t, key, o, "sub", "added")
 }
 
