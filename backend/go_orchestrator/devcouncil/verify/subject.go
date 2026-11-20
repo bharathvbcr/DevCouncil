@@ -84,7 +84,10 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	headless := hasNoHead(ctx, git)
+	headless, err := hasNoHead(ctx, git)
+	if err != nil {
+		return "", fmt.Errorf("reading HEAD: %w", err)
+	}
 	scratchDir, err := os.MkdirTemp("", "devcouncil-subject-")
 	if err != nil {
 		return "", err
