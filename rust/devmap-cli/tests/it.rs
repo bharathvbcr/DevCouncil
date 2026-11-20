@@ -128,6 +128,7 @@ mod test_store;
 mod test_stress;
 mod test_workspace;
 mod the_churn_window_is_an_artifact_input;
+mod the_cli_envelope_names_its_repository;
 mod the_map_reads_the_repository_inventory;
 mod the_workspace_registry_stays_with_the_repository;
 mod tsconfig_path_mapping;

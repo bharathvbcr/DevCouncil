@@ -35,6 +35,19 @@ impl ReadStore {
         if let Self::Stacked(stacked) = self {
             stacked.attach_incompleteness(&mut answer)?;
         }
+        // The MCP envelope names the repository every answer came from; the CLI
+        // does the same, through the same builder. Additive: an answer that
+        // already carries a `repository` key keeps it.
+        if let Some(object) = answer.as_object_mut() {
+            object.entry("repository").or_insert_with(|| {
+                devmap_serve::repo_scope::RepositoryRef::for_cli_read(
+                    &cli.root_hint(),
+                    cli.root.is_some(),
+                    cli.db.as_deref(),
+                )
+                .to_json()
+            });
+        }
         emit_json(cli, &answer)
     }
 
