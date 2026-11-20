@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -368,17 +369,71 @@ func TestDecidedHeadlessGitlinks(t *testing.T) {
 }
 
 // A staged gitlink whose path holds a CR is a change against the empty tree
-// like any other, and the substance reader refuses such a path: the run must
-// stop, not read as verified.
+// like any other, and the planner or substance reader refuses such a path: the
+// run must block with the one blocking gap type "rigor_check_unavailable"
+// (spelled as a literal at orchestrate.go, no constant), whose description gives
+// the cause, and not for any other reason (scope, a missing plan entry).
+//
+// The blocked verdict carries no degraded_reasons today (ft-5823c9bf, "Verify
+// verdict drops degraded_reasons whenever status is not verified"), so the
+// "submodule commit range not scanned" reason is not asserted on o.result; that
+// the gitlink IS seen is asserted on the git state report instead. When
+// ft-5823c9bf lands, assert the reason here too.
 func TestDecidedHeadlessGitlinkWithControlBytePath(t *testing.T) {
-	for _, name := range []string{"cr\rx", "z\nnl", "bad\xffbytes", "nul-free\x1bescape", "tab\there"} {
-		root := t.TempDir()
-		runGitIn(t, root, "init", "-q")
-		indexInfo(t, root, [][3]string{{"160000", sha('a'), name}})
-		o := attackRun(t, root, "TASK-D-GL-HL-CR", dc.PlannedFile{Path: name, AllowedChange: dc.ChangeCreate})
-		if class := decidedClass(o); class == "verified" {
-			t.Fatalf("a staged gitlink named %q read as verified: %s", name, class)
-		}
+	for _, tc := range []struct {
+		name   string
+		cause  string
+		quoted bool // the description names the path in %q form (display-safe)
+	}{
+		{"cr\rx", "contains a line break", true},
+		{"z\nnl", "contains a line break", true},
+		{"nul-free\x1bescape", "contains a control byte (0x1b)", true},
+		{"tab\there", "contains a control byte (0x09)", true},
+		// git hands this one to dcverify as an argument, whose refusal does not
+		// echo the path.
+		{"bad\xffbytes", "is not valid UTF-8", false},
+	} {
+		t.Run(fmt.Sprintf("%q", tc.name), func(t *testing.T) {
+			root := t.TempDir()
+			runGitIn(t, root, "init", "-q")
+			indexInfo(t, root, [][3]string{{"160000", sha('a'), tc.name}})
+
+			state, err := verify.CollectGitStateReport(context.Background(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := false
+			for _, g := range state.MovedGitlinks {
+				seen = seen || (g.Path == tc.name && g.Shape == "added")
+			}
+			if !seen {
+				t.Fatalf("the staged gitlink is not in the git state report: %+v", state.MovedGitlinks)
+			}
+
+			o := attackRun(t, root, "TASK-D-GL-HL-CR", dc.PlannedFile{Path: tc.name, AllowedChange: dc.ChangeCreate})
+			if class := decidedClass(o); class != "blocked" {
+				t.Fatalf("class=%s, want blocked: types=%v degraded=%q refused=%v", class, advTypes(o.gaps), o.result.DegradedReasons, o.refused)
+			}
+			var blocking []verify.Gap
+			for _, g := range o.gaps {
+				if g.Blocking {
+					blocking = append(blocking, g)
+				}
+			}
+			if len(blocking) != 1 || blocking[0].GapType != "rigor_check_unavailable" {
+				t.Fatalf("want exactly one blocking rigor_check_unavailable gap, got types=%v", advTypes(o.gaps))
+			}
+			desc := blocking[0].Description
+			if !strings.Contains(desc, tc.cause) {
+				t.Fatalf("the gap does not give the cause %q: %q", tc.cause, desc)
+			}
+			if tc.quoted && !strings.Contains(desc, strconv.Quote(tc.name)) {
+				t.Fatalf("the gap does not name the path as %s: %q", strconv.Quote(tc.name), desc)
+			}
+			if strings.ContainsAny(desc, "\n\r\t\x1b") || !utf8.ValidString(desc) {
+				t.Fatalf("the gap description holds a raw control byte or invalid UTF-8: %q", desc)
+			}
+		})
 	}
 }
 
