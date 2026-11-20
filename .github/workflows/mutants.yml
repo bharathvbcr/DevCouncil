@@ -58,11 +58,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           workspaces: rust
@@ -98,9 +98,9 @@ jobs:
           - devmap-analyze
           - dc-glob
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           workspaces: rust
@@ -116,8 +116,10 @@ jobs:
         # unmutated tree fails) and everything else fail the shard.
         timeout-minutes: 330
         working-directory: rust
-        run: cargo mutants -p "${{ matrix.crate }}" --timeout 60 --no-shuffle --in-place || { c=$?; test $c -eq 2 -o $c -eq 3; }
-      - uses: actions/upload-artifact@v7
+        env:
+          CRATE: ${{ matrix.crate }}
+        run: cargo mutants -p "$CRATE" --timeout 60 --no-shuffle --in-place || { c=$?; test $c -eq 2 -o $c -eq 3; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: ${{ always() }}
         with:
           name: mutants-out-${{ matrix.crate }}
@@ -126,12 +128,14 @@ jobs:
       - name: Compare the missed mutants with the baseline
         id: compare
         working-directory: rust
+        env:
+          CRATE: ${{ matrix.crate }}
         run: |
           set -euo pipefail
-          baseline="mutants-baseline/${{ matrix.crate }}.txt"
+          baseline="mutants-baseline/${CRATE}.txt"
           test -f mutants.out/missed.txt || { echo "::error::cargo-mutants wrote no missed.txt; the run did not complete"; exit 1; }
           if [ ! -f "$baseline" ]; then
-            echo "::error::rust/$baseline is not committed. Download the mutants-out-${{ matrix.crate }} artifact and commit missed.txt plus timeout.txt (sorted, unique) as rust/$baseline."
+            echo "::error::rust/$baseline is not committed. Download the mutants-out-${CRATE} artifact and commit missed.txt plus timeout.txt (sorted, unique) as rust/$baseline."
             exit 1
           fi
           cat mutants.out/missed.txt mutants.out/timeout.txt | sort -u > "$RUNNER_TEMP/now.txt"
@@ -149,7 +153,10 @@ jobs:
           fi
       - name: Say so when the shard did not finish
         if: ${{ always() && steps.compare.outcome != 'success' && steps.mutate.outcome != 'success' }}
-        run: echo "::error::NOT RUN. The ${{ matrix.crate }} shard did not complete its mutants (step outcome ${{ steps.mutate.outcome }}); that is a failure, not a pass."
+        env:
+          CRATE: ${{ matrix.crate }}
+          MUTATE_OUTCOME: ${{ steps.mutate.outcome }}
+        run: echo "::error::NOT RUN. The ${CRATE} shard did not complete its mutants (step outcome ${MUTATE_OUTCOME}); that is a failure, not a pass."
 
   weekly:
     name: full run against the baselines

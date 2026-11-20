@@ -26,16 +26,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "20"
 
@@ -56,8 +56,17 @@ jobs:
 
       - name: Install actionlint
         run: |
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          echo "$PWD" >> "$GITHUB_PATH"
+          set -euo pipefail
+          version="1.7.12"
+          name="actionlint_${version}_linux_amd64.tar.gz"
+          sha="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          archive="${RUNNER_TEMP}/${name}"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" "https://github.com/rhysd/actionlint/releases/download/v${version}/${name}"
+          echo "${sha}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          mkdir -p "${RUNNER_TEMP}/bin"
+          install -m 0755 "${RUNNER_TEMP}/actionlint" "${RUNNER_TEMP}/bin/actionlint"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
       - name: Script tests
         run: npm run test:scripts
