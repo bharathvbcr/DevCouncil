@@ -236,6 +236,11 @@ func readOnlyArgumentViolation(clause, root string) string {
 				}
 			}
 		default:
+			if computedOperand(w) {
+				return fmt.Sprintf("`git %s %s` is refused: the operand holds an expansion the gate cannot "+
+					"resolve to a value (a parameter operator, a special parameter or a brace expansion), "+
+					"so the path or revision it names was not judged. Spell the operand out.", sub, text)
+			}
 			if reason := readOnlyOperandViolation(text, effectiveRoot); reason != "" {
 				return fmt.Sprintf("`git %s %s` is refused: %s", sub, text, reason)
 			}

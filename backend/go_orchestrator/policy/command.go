@@ -282,7 +282,10 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		}
 		// What any command is told to read: an operand naming a credential
 		// file. See RuleCommandSecretRead.
-		if reason := secretOperandViolation(command, g.Root); reason != "" {
+		if reason, unverifiable := secretOperandViolation(command, g.Root); reason != "" {
+			if unverifiable {
+				return g.noteHardRules(deny(RuleCommandOperandUnverifiable, reason, normalized, taskID))
+			}
 			return g.noteHardRules(deny(RuleCommandSecretRead, reason, normalized, taskID))
 		}
 		// A write of evidence about the agent's own work. See
