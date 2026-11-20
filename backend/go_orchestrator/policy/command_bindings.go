@@ -21,7 +21,7 @@ const (
 // expandBindings returns the lines the ladder judges in place of command:
 // command with every variable it can name rewritten to its value.
 //
-// What it can name: a leading tilde, $HOME, $TMPDIR and $PWD, from this process's
+// What it can name: a leading tilde, $HOME and $TMPDIR, from this process's
 // environment, which the shell running the command inherits; and every
 // variable the line itself gives a literal value — `f=README.md; head $f`,
 // `export W=/tmp/x`, and each item of a `for` loop's list, every one of which
@@ -43,16 +43,10 @@ const (
 // so a long value repeated many times cannot make the gate judge more text than
 // the length rung allows.
 func expandBindings(command string) (readings []string, truncated bool) {
-	return expandBindingsInRoot(command, "")
-}
-
-// expandBindingsInRoot is expandBindings with the root the gate judges relative
-// paths against, which is what $PWD names; with no root $PWD stays unbound.
-func expandBindingsInRoot(command, root string) (readings []string, truncated bool) {
 	if !strings.ContainsAny(command, "$~") {
 		return []string{command}, false
 	}
-	values, dropped := lineBindings(command, root)
+	values, dropped := lineBindings(command)
 	segments, refs := bindingTemplate(command, values)
 	if refs == 0 {
 		return []string{command}, false
@@ -84,7 +78,7 @@ type bindingSegment struct {
 // lineBindings collects the values each name can take in command: the
 // well-known environment, then every pure assignment clause and `for` list.
 // dropped names the variables that had a value refused for the cap.
-func lineBindings(command, root string) (values map[string][]string, dropped map[string]bool) {
+func lineBindings(command string) (values map[string][]string, dropped map[string]bool) {
 	values = map[string][]string{}
 	dropped = map[string]bool{}
 	home, _ := os.UserHomeDir()
@@ -111,14 +105,6 @@ func lineBindings(command, root string) (values map[string][]string, dropped map
 	}
 	if tmp := os.Getenv("TMPDIR"); tmp != "" {
 		add("TMPDIR", tmp)
-	}
-	// $PWD is the root the gate judges relative paths against (never the
-	// gate process's own working directory, which can differ), and only while
-	// the line reads it: any other mention of PWD (PWD=$(…), printf -v PWD,
-	// read PWD, unset PWD, declare/export PWD) may set it to a value the gate
-	// cannot know, so it stays unbound. $OLDPWD is never bound.
-	if root != "" && onlyReadsPWD(command) {
-		add("PWD", root)
 	}
 	for _, clause := range SplitCommandChain(command) {
 		words := shellWords(clause)
@@ -494,21 +480,4 @@ func mostImportant(decisions []Decision) (Decision, bool) {
 // decision about the same line can outrank, so judging the rest can stop.
 func refusesForWhatItDoes(d Decision) bool {
 	return d.Action == Deny && d.Severity == Hard && !IsUnreadableRule(d.Rule)
-}
-
-// onlyReadsPWD reports whether every mention of PWD in command is a read of it
-// ($PWD or ${PWD…}). A literal assignment (PWD=src) is collected as a binding
-// of its own and judged by the value it gives.
-func onlyReadsPWD(command string) bool {
-	for from := 0; ; {
-		at := strings.Index(command[from:], "PWD")
-		if at < 0 {
-			return true
-		}
-		at += from
-		if !(at >= 1 && command[at-1] == '$') && !(at >= 2 && command[at-2:at] == "${") {
-			return false
-		}
-		from = at + 3
-	}
 }

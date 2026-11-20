@@ -141,7 +141,7 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		if !reads {
 			continue
 		}
-		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
+		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") && !words[i].bareExpands {
 			continue
 		}
 		if unbound == "" && !written[text] && !inertCommands[command] &&

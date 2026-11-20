@@ -91,9 +91,9 @@ func TestLandControlRowsStayAllowed(t *testing.T) {
 			"npm run *", "head *", "cat *", "git log *", "git show *", "git diff *"}
 		for _, c := range []string{
 			"exit $?", "kill $!", "wait $!", "sleep ${D:-1}", "seq 1 ${N:-3}",
-			"make -j${N:-4}", "go test -count=${COUNT:-1} ./...",
-			"head -n ${N:-5} README.md", "git log -n ${N:-5}", "git log --max-count=${N:-5}", "git log -n${N:-5}",
-			"cat \"$PWD/README.md\"", "cat ${PWD}/README.md",
+			"make -j\"${N:-4}\"", "go test -count=\"${COUNT:-1}\" ./...",
+			"head -n \"${N:-5}\" README.md", "git log -n \"${N:-5}\"", "git log --max-count=\"${N:-5}\"",
+			"head -n \"$N\" README.md",
 		} {
 			d, err := g.EvaluateCommand(c, task)
 			if err != nil {
@@ -177,17 +177,45 @@ func TestLandFixRoundRowsRefuse(t *testing.T) {
 				t.Errorf("%s %q: train refused this under a non-softenable rule, got unreadable %q", posture, c, d.Rule)
 			}
 		}
-		// Gate root is not the process working directory: $PWD names the root.
-		viaPWD, err := g.EvaluateCommand("cat $PWD/src/sl", task)
-		if err != nil {
-			t.Fatal(err)
-		}
-		direct, err := g.EvaluateCommand("cat src/sl", task)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if viaPWD.Rule != direct.Rule || direct.Rule != policy.RuleCommandSecretRead {
-			t.Errorf("%s: cat $PWD/src/sl = %q, cat src/sl = %q, want both command.secret_read", posture, viaPWD.Rule, direct.Rule)
+		// The gate root is not the process working directory, and $PWD is
+		// unbound: cat $PWD/src/sl (src/sl is a symlink to .env) is in rows.
+	}
+}
+
+// Round 3: an unquoted computed value word-splits (head -n ${x:-1 .env} reads
+// .env), so it is exempt in no form; only an expansion wholly inside double
+// quotes is. $PWD is unbound as on the train. A gitHard row was a hard,
+// unsoftenable refusal on the train and must stay one.
+func TestLandRound3RowsRefuse(t *testing.T) {
+	gitHard := map[string]bool{
+		"git log -p -n ${x:-1 .env}": true, "git log -p --max-count=${x:-1 .env}": true,
+		"git log -p -U${x:-0 .env}": true, "git log -n ${N:-5}": true,
+		"git log --max-count=${N:-5}": true, "git log -n${N:-5}": true,
+	}
+	rows := []string{
+		"head -n ${x:-1 .env}", "N=$(echo 1 .env); head -n $N README.md", "read N < list1.txt; head -n $N README.md",
+		"head -n $N README.md", "head -n ${N:-5} README.md", "tail -c ${x:-1 .env}", "head -n ${x:-1 .e*}",
+		"pytest -n ${x:-1 .env}", "make -j ${x:-4 -f.env}", "head -n${x:-1 .env}", "make -j${N:-4}",
+		"go test -count=${COUNT:-1} ./...", "cat \"$PWD/README.md\"", "cat ${PWD}/README.md", "cat $PWD/src/sl",
+	}
+	for c := range gitHard {
+		rows = append(rows, c)
+	}
+	for _, posture := range []string{flags.PostureStrict, flags.PostureDev} {
+		g, _ := landGate(t, posture)
+		task := testTask()
+		task.AllowedCommands = []string{"*"}
+		for _, c := range rows {
+			d, err := g.EvaluateCommand(c, task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Blocked() || d.Severity != policy.Hard {
+				t.Errorf("LEAK %s %q: want hard refusal, got %s %q", posture, c, d.Action, d.Rule)
+			}
+			if gitHard[c] && d.Rule != policy.RuleCommandGitReadArgument {
+				t.Errorf("%s %q: want %s as on the train, got %q", posture, c, policy.RuleCommandGitReadArgument, d.Rule)
+			}
 		}
 	}
 }

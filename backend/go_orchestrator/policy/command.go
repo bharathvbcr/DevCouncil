@@ -184,7 +184,7 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 	// Each reading of the line with its variables bound (expandBindings) is
 	// judged in full, and the most important refusal among them is the answer,
 	// ranked exactly as evaluate ranks clauses.
-	readings, truncated := expandBindingsInRoot(command, g.Root)
+	readings, truncated := expandBindings(command)
 	if truncated {
 		// A reading past the caps was never judged, so the line is refused
 		// rather than judged on the readings that fit. That refusal is about
@@ -1364,6 +1364,11 @@ type shellWord struct {
 	// scan does not, so the value the command is handed is not the text. The
 	// operand rungs treat such a word as computed (computedOperand).
 	ansiC bool
+	// bareExpands reports whether an expansion character appears outside any
+	// quotes. An unquoted expansion is word-split and globbed by sh, so one
+	// word of text may be several words at run time; an expansion wholly
+	// inside double quotes is always exactly one.
+	bareExpands bool
 }
 
 type shellWordSpan struct {
@@ -1394,7 +1399,7 @@ func shellWords(command string) []shellWord {
 func scanShellWords(command string) []shellWordSpan {
 	var spans []shellWordSpan
 	var cur, raw strings.Builder
-	started, quotedHead, anyQuoted, expands, ansiC := false, false, false, false, false
+	started, quotedHead, anyQuoted, expands, ansiC, bareExpands := false, false, false, false, false, false
 	quote := rune(0)
 	runes := []rune(command)
 	flush := func() {
@@ -1402,12 +1407,12 @@ func scanShellWords(command string) []shellWordSpan {
 			return
 		}
 		spans = append(spans, shellWordSpan{
-			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC},
+			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC, bareExpands: bareExpands},
 			raw:       raw.String(),
 		})
 		cur.Reset()
 		raw.Reset()
-		started, quotedHead, anyQuoted, expands, ansiC = false, false, false, false, false
+		started, quotedHead, anyQuoted, expands, ansiC, bareExpands = false, false, false, false, false, false
 	}
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
@@ -1452,6 +1457,7 @@ func scanShellWords(command string) []shellWordSpan {
 		default:
 			if strings.ContainsRune("$`{}*?[", r) {
 				expands = true
+				bareExpands = true
 			}
 			raw.WriteRune(r)
 			cur.WriteRune(r)

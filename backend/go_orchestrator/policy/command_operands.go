@@ -76,10 +76,15 @@ var gitAttachedOnlyOptions = map[string]bool{"-U": true, "--unified": true, "--a
 // computedOptionValue reports whether words[i] is the value of a numeric option
 // of command (and, for git, subcommand sub): the next word after an option that
 // requires one (`-n ${N:-5}`), or attached to it (`-j${N:-4}`,
-// `--max-count=${N:-5}`, `-U${N:-3}`). Nothing after a bare "--" is a value:
+// `--max-count=${N:-5}`, `-U${N:-3}`), and only when the whole expansion is inside
+// double quotes (an unquoted one word-splits). Nothing after a bare "--" is a value:
 // there every word is an operand. A computed word anywhere else stays a
 // computed operand.
 func computedOptionValue(command, sub string, words []shellWord, i int) bool {
+	if words[i].bareExpands {
+		// An unquoted expansion word-splits: `head -n ${x:-1 .env}` is head -n 1 .env.
+		return false
+	}
 	for _, w := range words[:i] {
 		if w.text == "--" {
 			return false
