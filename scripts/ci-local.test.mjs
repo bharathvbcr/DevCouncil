@@ -186,6 +186,52 @@ describe("rust/dc-sparse-encode/ci-test.sh", () => {
     assert.match(gpu.stdout, /NOT RUN: .*no Metal-capable device/);
   });
 
+  it("checks formatting before the probes, so a NOT RUN runner still fails on unformatted code", () => {
+    const fake = mkdtempSync(path.join(tmpdir(), "fake-cargo-"));
+    try {
+      writeFileSync(path.join(fake, "cargo"), '#!/bin/sh\necho "cargo $*"\n[ "$1" = fmt ] && exit "${FAKE_FMT_EXIT:-0}"\nexit 0\n', { mode: 0o755 });
+      const base = { ...ok, DC_SPARSE_METAL_PROBE: "false", PATH: `${fake}:/usr/bin:/bin` };
+      const clean = run(base);
+      assert.equal(clean.status, 0);
+      assert.match(clean.stdout, /cargo fmt -- --check/);
+      assert.match(clean.stdout, /NOT RUN/);
+      assert.doesNotMatch(clean.stdout, /cargo test/);
+      const dirty = run({ ...base, FAKE_FMT_EXIT: "1" });
+      assert.equal(dirty.status, 1);
+      assert.doesNotMatch(dirty.stdout, /NOT RUN/);
+    } finally {
+      rmSync(fake, { recursive: true, force: true });
+    }
+  });
+
+  it("appends the NOT RUN reason to GITHUB_STEP_SUMMARY, and an unset or unwritable one never fails", () => {
+    const fake = mkdtempSync(path.join(tmpdir(), "fake-cargo-"));
+    try {
+      writeFileSync(path.join(fake, "cargo"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const base = { ...ok, PATH: `${fake}:/usr/bin:/bin` };
+      const summary = path.join(fake, "summary.md");
+      const cases = [
+        [{ DC_SPARSE_METAL_PROBE: "false" }, /no Metal toolchain/],
+        [{ DC_SPARSE_SDK_VERSION: "echo 15.5" }, /SDK 15\.5/],
+        [{ DC_SPARSE_GPU_PROBE: "echo 'no display'" }, /no Metal-capable device/],
+      ];
+      for (const [probe, reason] of cases) {
+        writeFileSync(summary, "");
+        const r = run({ ...base, ...probe, GITHUB_STEP_SUMMARY: summary });
+        assert.equal(r.status, 0);
+        assert.match(readFileSync(summary, "utf8"), reason);
+        assert.match(readFileSync(summary, "utf8"), /NOT RUN/);
+      }
+      const env = { ...base, DC_SPARSE_METAL_PROBE: "false" };
+      const unset = { ...process.env, ...env };
+      delete unset.GITHUB_STEP_SUMMARY;
+      assert.equal(spawnSync("bash", [script], { encoding: "utf8", env: unset }).status, 0);
+      assert.equal(run({ ...env, GITHUB_STEP_SUMMARY: "/nonexistent-dir/summary.md" }).status, 0);
+    } finally {
+      rmSync(fake, { recursive: true, force: true });
+    }
+  });
+
   it("fails, not NOT RUN, when the SDK version cannot be read", () => {
     const r = run({ ...ok, DC_SPARSE_SDK_VERSION: "echo unreadable" });
     assert.equal(r.status, 2);
