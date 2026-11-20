@@ -2,6 +2,10 @@ package verify
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -16,10 +20,19 @@ import (
 // that read added lines run regardless; only the diff∩coverage gate needs one,
 // and without it the report says so rather than reporting a diff as exercised.
 func RunCLI(ctx context.Context, root string, client *store.Client, taskID string, gate GateState, sandbox, coveragePath string, jsonOut bool) int {
+	if gate.Mode == "" {
+		gate.Mode = "off"
+	}
+	cli := CLIResult{
+		OK:             true,
+		GateMode:       gate.Mode,
+		GateModeOrigin: gateOriginIfInvalid(gate),
+		GateModeError:  gateErrorIfInvalid(gate),
+		Tasks:          []TaskCLIResult{},
+	}
 	if client == nil {
-		payload := map[string]any{"ok": false, "error": "DevCouncil state is unavailable in this directory."}
-		writeJSON(payload)
-		return 1
+		return reportNotRun(cli, NotRunStoreUnavailable, taskID,
+			"DevCouncil state is unavailable in this directory.", jsonOut)
 	}
 	sandbox, err := ParseSandbox(sandbox)
 	if err != nil {
@@ -28,10 +41,6 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID strin
 		writeJSON(map[string]any{"ok": false, "error": err.Error()})
 		return 2
 	}
-	if gate.Mode == "" {
-		gate.Mode = "off"
-	}
-
 	var taskIDs []string
 	if taskID != "" {
 		taskIDs = []string{taskID}
@@ -52,21 +61,12 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID strin
 		}
 	}
 
-	cli := CLIResult{
-		OK:                           true,
-		GateMode:                     gate.Mode,
-		GateModeOrigin:               gateOriginIfInvalid(gate),
-		GateModeError:                gateErrorIfInvalid(gate),
-		ProcessedTasks:               0,
-		VerifiedTasks:                0,
-		BlockedTasks:                 0,
-		CompletedWithoutVerification: 0,
-		TotalGaps:                    0,
-		Tasks:                        []TaskCLIResult{},
-	}
 	for _, id := range taskIDs {
 		mcp, gaps, err := VerifyTask(ctx, root, client, id, gate, sandbox, coveragePath)
 		if err != nil {
+			if reason, notRun := notRunReason(err); notRun {
+				return reportNotRun(cli, reason, id, err.Error(), jsonOut)
+			}
 			cli.OK = false
 			cli.Error = err.Error()
 			writeJSON(cli)
@@ -115,15 +115,80 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID strin
 			return 1
 		}
 	} else {
-		console.Printf("verified=%d skipped=%d blocked=%d degraded=%d gaps=%d\n", cli.VerifiedTasks, cli.CompletedWithoutVerification, cli.BlockedTasks, cli.DegradedTasks, cli.TotalGaps)
-		for _, t := range cli.Tasks {
-			console.Printf("  %s status=%s gaps=%d blocking=%d\n", t.TaskID, t.Status, t.GapCount, t.BlockingGapCount)
-		}
+		printHuman(cli)
 	}
 	if !cli.OK {
 		return 1
 	}
 	return 0
+}
+
+// printHuman is the human-mode verdict summary: the totals, then one line per
+// task that was judged or not run.
+func printHuman(cli CLIResult) {
+	console.Printf("verified=%d skipped=%d blocked=%d degraded=%d gaps=%d\n", cli.VerifiedTasks, cli.CompletedWithoutVerification, cli.BlockedTasks, cli.DegradedTasks, cli.TotalGaps)
+	for _, t := range cli.Tasks {
+		console.Printf("  %s status=%s gaps=%d blocking=%d\n", humanText(t.TaskID), t.Status, t.GapCount, t.BlockingGapCount)
+	}
+}
+
+// reportNotRun ends a verify that stopped without judging the task it was on.
+//
+// When nothing was judged before it (ProcessedTasks == 0) the whole result is a
+// not-run: top-level not_run, and in human mode one stderr line. When earlier
+// tasks were judged their verdicts are kept (tasks[] and the human summary) and
+// the failed task is reported as its own tasks[] entry with status "not_run"
+// and a not_run object, and top-level not_run stays absent: not_run is absent
+// on any run that judged something. Either way ok is false and the exit is 1.
+func reportNotRun(cli CLIResult, reason, taskID, message string, jsonOut bool) int {
+	cli.OK = false
+	cli.Error = message
+	nr := &NotRun{Reason: reason, TaskID: taskID}
+	if cli.ProcessedTasks == 0 {
+		cli.NotRun = nr
+	} else {
+		cli.Tasks = append(cli.Tasks, TaskCLIResult{
+			TaskID: taskID, Status: "not_run", NotRun: nr, GateMode: cli.GateMode,
+			GateModeOrigin: cli.GateModeOrigin, GateModeError: cli.GateModeError,
+			RigorApplied: []string{}, Gaps: []Gap{}, NextActions: []NextAction{}, AdvisoryActions: []NextAction{},
+		})
+	}
+	if jsonOut {
+		writeJSON(cli)
+		return 1
+	}
+	if cli.ProcessedTasks > 0 {
+		printHuman(cli)
+	}
+	if reason == NotRunTaskNotFound {
+		message = fmt.Sprintf("no task %q in this repository's task store", taskID)
+	} else {
+		message = humanText(message)
+	}
+	console.Errorf("verify: NOT RUN (%s): %s\n", reason, message)
+	return 1
+}
+
+// humanText makes store-supplied text safe for a terminal: control characters
+// (C0, C1, DEL), bidi and other non-printing runes are written as escapes, so
+// a store error or a task id cannot move the cursor or rewrite the line.
+func humanText(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == utf8.RuneError, r != ' ' && !unicode.IsPrint(r):
+			if r > 0xffff {
+				fmt.Fprintf(&b, "\\U%08x", r)
+			} else if r > 0xff || r == utf8.RuneError {
+				fmt.Fprintf(&b, "\\u%04x", r)
+			} else {
+				fmt.Fprintf(&b, "\\x%02x", r)
+			}
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func writeJSON(v any) bool {

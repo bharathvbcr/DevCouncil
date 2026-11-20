@@ -1055,14 +1055,14 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		return MCPResult{}, nil, err
 	}
 	if client == nil {
-		return MCPResult{}, nil, fmt.Errorf("store unavailable")
+		return MCPResult{}, nil, ErrStoreUnavailable
 	}
 	task, err := client.Task(ctx, taskID)
 	if err != nil {
-		return MCPResult{}, nil, err
+		return MCPResult{}, nil, storeReadError{err}
 	}
 	if task == nil {
-		return MCPResult{}, nil, fmt.Errorf("task %s not found", taskID)
+		return MCPResult{}, nil, taskNotFoundError{taskID}
 	}
 	state, gitErr := CollectGitStateReport(ctx, root)
 	if gitErr != nil {
