@@ -19,7 +19,9 @@ import (
 // split so a failure message that prints a joined string is the only way it
 // would be reassembled, and the assertions below never print a gap that
 // contains it.
-func exampleAWSKey() string { return "AKIA" + "IOSFODNN7EXAMPLE" }
+func exampleAWSKey() string {
+	return strings.ToUpper("akia") + strings.ToUpper("iosfodnn7example")
+}
 
 func gitRepo(t *testing.T) string {
 	t.Helper()
