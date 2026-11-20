@@ -55,7 +55,10 @@ fn idle() -> String {
         retry: Duration::from_secs(60),
         retry_total: Duration::from_secs(600),
     });
-    assert_eq!(report.first_pass_refused, 0, "the idle baseline was refused");
+    assert_eq!(
+        report.first_pass_refused, 0,
+        "the idle baseline was refused"
+    );
     let edges = edges_of(&out);
     assert_ne!(edges, "[]", "equality over no edges is vacuous");
     edges
