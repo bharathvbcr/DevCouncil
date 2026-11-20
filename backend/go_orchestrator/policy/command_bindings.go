@@ -8,7 +8,11 @@ import (
 // maxBindingVariants bounds the readings of one line expandBindings returns,
 // and maxBindingValues the values one name collects. Each reading is judged in
 // full, so together they bound how much more work a line with loops costs the
-// gate than the same line without them.
+// gate than the same line without them. A line that would exceed either bound
+// is not truncated: expandBindings reports it and the callers refuse it
+// (RuleCommandOperandUnverifiable), because a dropped value is a reading nobody
+// judged. maxBindingValues is also the most literal items one `for` header
+// may carry and still be bounded compound framing.
 const (
 	maxBindingVariants = 16
 	maxBindingValues   = 16
@@ -30,23 +34,38 @@ const (
 // leading `~` in it, which refused the loops and scratch variables agents
 // write on almost every task, and `cat ~/x` while `ls ~/x` passed. A variable
 // it cannot bind is left in the text and judged by its spelling
-// (carriesSubstitution); a reading past maxBindingVariants is not produced, and
-// leaves its names unbound in the same way — no worse than a line that never
-// assigned them.
+// (carriesSubstitution). A referenced name that would take more than
+// maxBindingValues values, or a line whose readings would pass
+// maxBindingVariants, is reported as truncated and refused by the callers;
+// readings are never silently dropped.
 //
 // A rendering longer than maxCommandBytes is replaced by the line as written,
 // so a long value repeated many times cannot make the gate judge more text than
 // the length rung allows.
-func expandBindings(command string) []string {
+func expandBindings(command string) (readings []string, truncated bool) {
 	if !strings.ContainsAny(command, "$~") {
-		return []string{command}
+		return []string{command}, false
 	}
-	values := lineBindings(command)
+	values, dropped := lineBindings(command)
 	segments, refs := bindingTemplate(command, values)
 	if refs == 0 {
-		return []string{command}
+		return []string{command}, false
 	}
-	return renderBindings(command, segments, values)
+	return renderBindings(command, segments, values, dropped)
+}
+
+// forHeader reads a `for NAME in` clause: the loop variable and every word
+// after `in` is an item, exactly as sh iterates them (a reserved word such as
+// `do` inside the list is an item, not the end of it). It is the one parser
+// for the binding rung and for isBoundedShellCompoundFraming, so the items the
+// framing rung admits are the items that get bound.
+func forHeader(words []shellWord) (name string, items []shellWord, ok bool) {
+	if len(words) < 3 || words[0].anyQuoted || words[0].text != "for" ||
+		words[1].anyQuoted || !bindingName(words[1].text) ||
+		words[2].anyQuoted || words[2].text != "in" {
+		return "", nil, false
+	}
+	return words[1].text, words[3:], true
 }
 
 // bindingSegment is one piece of a line's template: literal text, or a
@@ -58,20 +77,26 @@ type bindingSegment struct {
 
 // lineBindings collects the values each name can take in command: the
 // well-known environment, then every pure assignment clause and `for` list.
-func lineBindings(command string) map[string][]string {
-	values := map[string][]string{}
+// dropped names the variables that had a value refused for the cap.
+func lineBindings(command string) (values map[string][]string, dropped map[string]bool) {
+	values = map[string][]string{}
+	dropped = map[string]bool{}
 	home, _ := os.UserHomeDir()
 	add := func(name, value string) {
 		if home != "" && (value == "~" || strings.HasPrefix(value, "~/")) {
 			value = home + value[1:]
 		}
-		if !literalBindingValue(value) || len(values[name]) >= maxBindingValues {
+		if !literalBindingValue(value) {
 			return
 		}
 		for _, have := range values[name] {
 			if have == value {
 				return
 			}
+		}
+		if len(values[name]) >= maxBindingValues {
+			dropped[name] = true
+			return
 		}
 		values[name] = append(values[name], value)
 	}
@@ -91,12 +116,9 @@ func lineBindings(command string) map[string][]string {
 		if len(words) == 0 {
 			continue
 		}
-		if words[0].text == "for" && len(words) >= 3 && words[2].text == "in" && bindingName(words[1].text) {
-			for _, w := range words[3:] {
-				if w.text == "do" {
-					break
-				}
-				add(words[1].text, w.text)
+		if name, items, ok := forHeader(words); ok {
+			for _, w := range items {
+				add(name, w.text)
 			}
 			continue
 		}
@@ -124,7 +146,7 @@ func lineBindings(command string) map[string][]string {
 		}
 	}
 	values["~"] = values["HOME"]
-	return values
+	return values, dropped
 }
 
 // compoundKeywords open a list inside a compound command, ahead of the clause
@@ -253,9 +275,11 @@ func parameterReference(rs []rune) (string, int) {
 	return string(rs[:j]), j
 }
 
-// renderBindings writes every reading of the template, up to
-// maxBindingVariants, each name taking one of its values per reading.
-func renderBindings(command string, segments []bindingSegment, values map[string][]string) []string {
+// renderBindings writes every reading of the template, each name taking one of
+// its values per reading. truncated is true, and the readings incomplete, when
+// a referenced name lost a value to maxBindingValues or the combinations pass
+// maxBindingVariants.
+func renderBindings(command string, segments []bindingSegment, values map[string][]string, dropped map[string]bool) (readings []string, truncated bool) {
 	var names []string
 	index := map[string]int{}
 	total := 1
@@ -268,14 +292,18 @@ func renderBindings(command string, segments []bindingSegment, values map[string
 		}
 		index[s.name] = len(names)
 		names = append(names, s.name)
-		if total < maxBindingVariants {
+		if dropped[s.name] {
+			truncated = true
+		}
+		if total <= maxBindingVariants {
 			total *= len(values[s.name])
 		}
 	}
 	if total > maxBindingVariants {
 		total = maxBindingVariants
+		truncated = true
 	}
-	readings := make([]string, 0, total)
+	readings = make([]string, 0, total)
 	seen := map[string]bool{}
 	choice := make([]int, len(names))
 	for k := 0; k < total; k++ {
@@ -301,7 +329,7 @@ func renderBindings(command string, segments []bindingSegment, values map[string
 			readings = append(readings, line)
 		}
 	}
-	return readings
+	return readings, truncated
 }
 
 // mostImportant is the refusal a gate reports for a set of decisions about
