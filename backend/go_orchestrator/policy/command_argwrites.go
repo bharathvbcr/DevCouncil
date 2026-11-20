@@ -83,16 +83,6 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 	return all
 }
 
-// argumentWrappers run the command named by the following words. Stepped over
-// when looking for the command word, like command/builtin in
-// reparsingCommandWord. A wrapper followed by an option stops the search: its
-// options may take arguments, and guessing which word is the command would
-// name a write that does not happen or miss one that does.
-var argumentWrappers = map[string]bool{
-	"command": true, "builtin": true, "exec": true, "env": true,
-	"sudo": true, "nohup": true, "time": true,
-}
-
 // shellReservedPrefixes are the reserved words that may stand before a simple
 // command in a clause the chain splitter produced: `if tee f; then …`,
 // `then tee f`, `{ tee f; }`, `! tee f`.
@@ -103,12 +93,23 @@ var shellReservedPrefixes = map[string]bool{
 
 // argumentCommandWord returns the index of the word sh would run in one
 // clause, or -1. Assignments and redirections before it are stepped over as in
-// reparsingCommandWord; so are reserved words and argumentWrappers.
+// reparsingCommandWord; so are reserved words and the wrappers of wrapperSpecs
+// together with their own options. See argumentCommandWordPeeled for the
+// wrapper option that cannot be stepped over.
 func argumentCommandWord(words []shellWord) int {
+	at, _ := argumentCommandWordPeeled(words)
+	return at
+}
+
+// argumentCommandWordPeeled is argumentCommandWord that also reports the first
+// wrapper option wrapperSpecs does not describe (and -1 for the word): the
+// command behind it is unknowable, so a rung that refuses what it cannot read
+// must refuse it rather than skip the clause.
+func argumentCommandWordPeeled(words []shellWord) (at int, unknownOption string) {
 	for i := 0; i < len(words); i++ {
 		word := words[i]
 		if word.quotedHead {
-			return i
+			return i, ""
 		}
 		if isAssignmentWord(word.text) || shellReservedPrefixes[word.text] {
 			continue
@@ -119,15 +120,17 @@ func argumentCommandWord(words []shellWord) int {
 			}
 			continue
 		}
-		if argumentWrappers[word.text] {
-			if i+1 < len(words) && strings.HasPrefix(words[i+1].text, "-") {
-				return -1
+		if spec, ok := wrapperSpecs[wrapperName(word.text)]; ok {
+			next, unknown := peelWrapper(words, i, spec)
+			if next < 0 {
+				return -1, unknown
 			}
+			i = next - 1
 			continue
 		}
-		return i
+		return i, ""
 	}
-	return -1
+	return -1, ""
 }
 
 // sedWrites reads a sed argument list the way GNU sed does — options may

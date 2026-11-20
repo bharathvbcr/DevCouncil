@@ -57,6 +57,107 @@ var commandWrappers = map[string]bool{
 	"chrt": true, "taskset": true, "unbuffer": true, "time.exe": true,
 }
 
+// wrapperSpec says how to step over one program wrapper's own options to the
+// command it runs. A wrapper in commandWrappers without a spec (xargs, flock,
+// watch, find -exec …) is classified only: its operand grammar is not one
+// option table, and every word after it stays a candidate.
+type wrapperSpec struct {
+	// value and flags are short option letters that do and do not take a
+	// value (attached, or the next word). digits allows nice's legacy -N.
+	value, flags string
+	digits       bool
+	// long maps a long option to whether it takes a value in the next word
+	// (--name=value always carries its own).
+	long map[string]bool
+	// operands are the words after the options that belong to the wrapper
+	// (timeout's duration).
+	operands int
+	// assigns steps over NAME=value words (env, sudo).
+	assigns bool
+	// noRun lists short options after which nothing is run (command -v).
+	noRun string
+}
+
+// wrapperSpecs is the option table of the wrappers argumentCommandWord peels.
+// Its keys are a subset of commandWrappers. A wrapper option missing here is
+// not guessed at: see peelWrapper.
+var wrapperSpecs = map[string]wrapperSpec{
+	"command": {flags: "p", noRun: "vV"},
+	"builtin": {},
+	"exec":    {value: "a", flags: "cl"},
+	"nohup":   {},
+	"time":    {value: "fo", flags: "pvalqV", long: map[string]bool{"format": true, "output": true, "portability": false, "append": false, "verbose": false, "quiet": false}},
+	"env": {value: "uCP", flags: "i0v", assigns: true, long: map[string]bool{
+		"ignore-environment": false, "null": false, "unset": true, "chdir": true, "debug": false}},
+	"sudo": {value: "ugCDhprRtTUc", flags: "EHnSbkKAPBvlLsi", assigns: true, long: map[string]bool{
+		"user": true, "group": true, "chdir": true, "preserve-env": false, "set-home": false, "non-interactive": false,
+		"stdin": false, "login": false, "shell": false, "background": false, "reset-timestamp": false,
+		"remove-timestamp": false, "askpass": false, "close-from": true, "host": true, "prompt": true, "role": true,
+		"type": true, "command-timeout": true, "other-user": true, "chroot": true, "login-class": true}},
+	"doas":    {value: "uC", flags: "nsL"},
+	"nice":    {value: "n", digits: true, long: map[string]bool{"adjustment": true}},
+	"ionice":  {value: "cnpPu", flags: "ti", long: map[string]bool{"class": true, "classdata": true, "pid": true, "pgid": true, "uid": true, "ignore": false}},
+	"timeout": {value: "sk", flags: "pvf", operands: 1, long: map[string]bool{"signal": true, "kill-after": true, "foreground": false, "preserve-status": false, "verbose": false}},
+	"stdbuf":  {value: "ioe", long: map[string]bool{"input": true, "output": true, "error": true}},
+	"setsid":  {flags: "cfwv", long: map[string]bool{"ctty": false, "fork": false, "wait": false, "verbose": false}},
+}
+
+// peelWrapper steps over the options of the wrapper at words[i] and returns
+// the index of the command it runs. at is -1 with unknown empty when nothing
+// runs (the line ends, or an option such as `command -v` says so); unknown
+// names the first option the spec does not describe, which leaves the wrapped
+// command unknowable: a caller must refuse it, never skip it.
+func peelWrapper(words []shellWord, i int, spec wrapperSpec) (at int, unknown string) {
+	j := i + 1
+	operands := spec.operands
+	for ; j < len(words); j++ {
+		text := words[j].text
+		switch {
+		case text == "--":
+			j++
+			goto afterOptions
+		case spec.assigns && isAssignmentWord(text):
+		case strings.HasPrefix(text, "--"):
+			name, _, attached := strings.Cut(text[2:], "=")
+			takes, known := spec.long[name]
+			if !known {
+				return -1, text
+			}
+			if takes && !attached {
+				j++
+			}
+		case strings.HasPrefix(text, "-") && text != "-":
+			cluster := text[1:]
+			for c := 0; c < len(cluster); c++ {
+				switch {
+				case strings.IndexByte(spec.noRun, cluster[c]) >= 0:
+					return -1, ""
+				case strings.IndexByte(spec.value, cluster[c]) >= 0:
+					if c == len(cluster)-1 {
+						j++
+					}
+					c = len(cluster)
+				case strings.IndexByte(spec.flags, cluster[c]) >= 0:
+				case spec.digits && cluster[c] >= '0' && cluster[c] <= '9':
+				default:
+					return -1, text
+				}
+			}
+		case text == "-" && spec.assigns:
+		default:
+			goto afterOptions
+		}
+	}
+afterOptions:
+	for ; operands > 0 && j < len(words); operands-- {
+		j++
+	}
+	if j >= len(words) {
+		return -1, ""
+	}
+	return j, ""
+}
+
 // maxHarnessDepth bounds the recursion into quoted command lines.
 const maxHarnessDepth = 4
 
