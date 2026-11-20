@@ -8,7 +8,7 @@ description: Use DevMap to plan and verify renames, extractions, moves, splits, 
 
 Resolve this checkout with `devmap paths --json`, then check `devmap status --json`. Read the returned `repo_map` path; do not assume `.devcouncil` rather than `.devmap`. A missing, stale, or partially parsed index is not complete evidence. Rebuild with `devmap build --manifest` when needed and authorized, then recheck status.
 
-Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. Always pass `repo_path` (the absolute repository path) on every `devmap_*` and `gitpulse_codeintel_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one `devmap mcp` process across tabs. Discover the actual tool names and schemas; a host need not expose every CLI capability.
+Lead with the CLI: `devmap <cmd> … --json --root <absolute repo path>` works in any host and reads this checkout's own store. The `devmap_*` MCP tools named below are the alternative when the MCP server is connected and targets this checkout; on those calls (and `gitpulse_codeintel_*`) always pass `repo_path` (the absolute repository path) and check `repository.root` in the envelope before trusting the answer — Cursor shares one `devmap mcp` process across tabs. A host need not expose every CLI capability or MCP tool; check `devmap --help` and the tool schemas.
 
 1. Explore and assess impact with `devmap explore <name> --json` and `devmap impact <target> --json`.
 2. Find all references using symbol search and direct source inspection, including registries, generated bindings, and dynamic calls the graph may miss.
