@@ -160,7 +160,13 @@ dcverify health
 dcgrep health
 ```
 
-Task verification needs a task in this repository's task store. A task is a
+Task verification needs a task in this repository's task store. A board card
+(a GitPulse `ft-...` id) is not a task in this store: `devcouncil verify ft-...`
+finds nothing and reports `not_run` (`task_not_found`) rather than a verdict. A
+card's verification is the board's own gate: `gitpulse_complete_task` with status
+done lands the card in `review`, and the GitPulse app's verification driver then
+runs Manvi `work.verify.task` and moves it to `done` on a pass. Report a `not_run` as not run, never as
+verified or passed. A task is a
 workbench item: create one with `devcouncil task create` (installing or mapping
 does not create one), and check what the host will hand out with
 `devcouncil doctor`.
@@ -197,8 +203,8 @@ only `local` (verification commands run on the host); any other value exits 2
 The task store is `.devcouncil/state.sqlite`, or the path named by the
 `workbench.db` key in `.devcouncil/config.yaml`. That path must be a file inside
 `.devcouncil/`: the host reads only a repo-local store and never opens another
-application's database. A board such as GitPulse's reaches this store by syncing
-items into it, addressed to the repository `this-repo`.
+application's database. No host syncs a board's
+items into this store yet, so a board card never appears here on its own.
 
 Whether a task is *blocked* is derived from its blocking gaps, not stored:
 under `enforce` `devcouncil_next_task` never offers a task with a blocking gap;
