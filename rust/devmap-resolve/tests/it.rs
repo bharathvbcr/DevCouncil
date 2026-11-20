@@ -34,6 +34,8 @@ mod adversarial_resolve;
 #[cfg(feature = "parse")]
 mod ambiguity_budget;
 #[cfg(feature = "parse")]
+mod an_inherited_in_repo_member_is_not_an_external_supertype_miss;
+#[cfg(feature = "parse")]
 mod attack_ccf_edges;
 #[cfg(feature = "parse")]
 mod attack_ccf_lsp;

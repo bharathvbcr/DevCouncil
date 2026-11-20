@@ -1712,8 +1712,19 @@ impl Resolver {
                     // another file, or a supertype's. Asked before the module's
                     // free functions, because a member shadows a function of the
                     // same name.
+                    //
+                    // Kotlin and Java read the same way: a bare call inside a
+                    // class is first a member of that class or of a supertype
+                    // (ft-0e6cc90f). It must be asked before the global rung,
+                    // whose guard abstains for any class whose chain reaches a
+                    // base the index does not declare (`extends Service`), so
+                    // an in-repo member inherited through such a chain would
+                    // otherwise have no edge at all.
                     if resolution.is_none()
-                        && family == LangFamily::Swift
+                        && matches!(
+                            family,
+                            LangFamily::Swift | LangFamily::Kotlin | LangFamily::Java
+                        )
                         && call.receiver_expr.is_none()
                         && ext
                             .local_binding_at(call.span.start_byte, &call.callee_name)
