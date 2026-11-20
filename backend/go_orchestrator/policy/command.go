@@ -500,6 +500,17 @@ func matchesAnyCandidate(m matching, patterns, candidates []string) bool {
 	return false
 }
 
+// allowlistCandidates lists the spellings of a clause an allowlist pattern is
+// tried against.
+//
+// Security impact (ft-cb00d69d). The leading do/then/else/{/! words and a
+// validated `git -C <registered worktree>` option are stripped only to add a
+// candidate, never to replace the clause: the stripped text is what the shell
+// runs after the keyword, so a pattern for `git push *` admits `then git push`
+// exactly as it admits `git push`. Every earlier rung has already judged the
+// unstripped clause, and a -C that leaves the registered worktrees is refused
+// before this point (RuleCommandDirectoryChange), so stripping widens no
+// pattern beyond the command it names. Pinned by TestCompoundFramingAttackRound.
 func allowlistCandidates(command, raw, normalized, root string) []string {
 	var out []string
 	add := func(s string) {
@@ -549,6 +560,17 @@ var boundedCompoundKeywords = map[string]bool{
 // delimiter/closer (`done`, `fi`, `esac`, `}`, `do`, `then`, `else`) or a
 // `for <var> in <literal...>` header with at most maxBindingValues literal
 // items (matching expandBindings's expansion cap).
+//
+// Security impact (ft-cb00d69d). What it admits: a clause with no executable
+// word at all — a lone delimiter, or a for-header whose items are literals —
+// and nothing else; any other word, quoted keyword, expansion, glob, operator
+// or redirection makes it false. Why it may be consulted before the no-lease
+// refusal in matchAllowlists: the clause runs nothing and its items are only
+// bound as words, never read, so there is nothing a lease would gate; the
+// commands in the loop body are separate clauses and each meets every rung
+// (secret operands via expandBindings, redirects, the lease refusal) itself.
+// Refusing framing without a task would instead break every no-task loop whose
+// body is a bootstrap command. Pinned by TestCompoundFramingAttackRound.
 func isBoundedShellCompoundFraming(clause string) bool {
 	words := shellWords(clause)
 	if len(words) == 0 {
