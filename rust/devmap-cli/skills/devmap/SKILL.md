@@ -38,7 +38,7 @@ const [imp, aff] = await Promise.all([q(['impact', 'Sym']), q(['affected', 'Sym'
   impact: imp.items?.slice(0, 20),
   tests: aff.tests?.items,
   truncated: [imp.truncated, aff.tests?.truncated],
-  walk_incomplete: imp.walk_incomplete ?? aff.tests?.walk_incomplete,
+  walk_incomplete: [imp.walk_incomplete, aff.tests?.walk_incomplete],
 })
 ```
 
