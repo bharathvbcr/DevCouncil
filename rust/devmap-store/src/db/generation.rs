@@ -437,46 +437,56 @@ impl Store {
             .iter()
             .map(|name| (name.clone(), (Vec::new(), false)))
             .collect();
-        if keys.is_empty() {
-            return Ok(Some(found));
-        }
-        let sql = keyed_ledger_sql(key, keys.len(), unattributed_only);
-        let mut stmt = snapshot.prepare(&sql)?;
+        // Each key is a bind parameter, and a list past SQLite's variable limit
+        // used to fail to prepare. Chunked, never truncated: the ranking
+        // partitions by key, so a key's rows all come from its own chunk and
+        // the per-key cap and truncation flag are what one statement gave. The
+        // snapshot is the one taken above, so every chunk reads one generation.
+        // A repeated key is read once; it would otherwise land in two chunks
+        // and push its rows twice.
+        let unique: Vec<&String> = {
+            let mut seen = std::collections::BTreeSet::new();
+            keys.iter().filter(|name| seen.insert(*name)).collect()
+        };
         let generation = i64::from(generation);
         let cap = sqlite_limit(limit_per_key.saturating_add(1));
-        let mut values: Vec<rusqlite::types::Value> = keys
-            .iter()
-            .map(|name| rusqlite::types::Value::Text(name.clone()))
-            .collect();
-        values.push(rusqlite::types::Value::Integer(generation));
-        values.push(rusqlite::types::Value::Integer(generation));
-        if unattributed_only {
-            values.extend(
-                devmap_resolve::UNATTRIBUTED_LABELS
-                    .iter()
-                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
-            );
+        for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
+            let sql = keyed_ledger_sql(key, chunk.len(), unattributed_only);
+            let mut stmt = snapshot.prepare(&sql)?;
+            let mut values: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|name| rusqlite::types::Value::Text((*name).clone()))
+                .collect();
             values.push(rusqlite::types::Value::Integer(generation));
-        }
-        values.push(rusqlite::types::Value::Integer(cap));
-        let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(0)?;
-            let rank: i64 = row.get(5)?;
-            let Some((sites, truncated)) = found.get_mut(&name) else {
-                continue;
-            };
-            if usize::try_from(rank).unwrap_or(usize::MAX) > limit_per_key {
-                *truncated = true;
-                continue;
+            values.push(rusqlite::types::Value::Integer(generation));
+            if unattributed_only {
+                values.extend(
+                    devmap_resolve::UNATTRIBUTED_LABELS
+                        .iter()
+                        .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+                );
+                values.push(rusqlite::types::Value::Integer(generation));
             }
-            sites.push(UnresolvedSiteRow {
-                source_file: row.get(1)?,
-                source_symbol: row.get(2)?,
-                receiver: row.get(3)?,
-                classification: row.get(4)?,
-                callee_name: row.get(6)?,
-            });
+            values.push(rusqlite::types::Value::Integer(cap));
+            let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(0)?;
+                let rank: i64 = row.get(5)?;
+                let Some((sites, truncated)) = found.get_mut(&name) else {
+                    continue;
+                };
+                if usize::try_from(rank).unwrap_or(usize::MAX) > limit_per_key {
+                    *truncated = true;
+                    continue;
+                }
+                sites.push(UnresolvedSiteRow {
+                    source_file: row.get(1)?,
+                    source_symbol: row.get(2)?,
+                    receiver: row.get(3)?,
+                    classification: row.get(4)?,
+                    callee_name: row.get(6)?,
+                });
+            }
         }
         Ok(Some(found))
     }
