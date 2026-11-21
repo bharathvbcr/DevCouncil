@@ -2602,6 +2602,12 @@ impl StackedStore {
         let Some((gen_id, _root, base_files)) = self.base.latest_scope_inputs()? else {
             return Ok(None);
         };
+        Ok(Some(self.merge_indexed_files(gen_id, base_files)))
+    }
+
+    /// The base generation's file list with the overlay applied: tombstoned and
+    /// modified files out, added files in, rooted at the worktree.
+    fn merge_indexed_files(&self, gen_id: u32, base_files: Vec<(String, String)>) -> ScopeInputs {
         let mut by_path: std::collections::BTreeMap<String, String> = base_files
             .into_iter()
             .filter(|(p, _)| {
@@ -2614,13 +2620,34 @@ impl StackedStore {
             by_path.insert(path.clone(), ext.language.clone());
         }
         let wt_root = Some(self.worktree_root.to_string_lossy().into_owned());
-        Ok(Some((gen_id, wt_root, by_path.into_iter().collect())))
+        (gen_id, wt_root, by_path.into_iter().collect())
     }
 
     pub fn all_merged_symbols(&self) -> Result<Option<SearchPage>> {
-        let Some(mut page) = self.base.all_symbols_page()? else {
+        let Some(page) = self.base.all_symbols_page()? else {
             return Ok(None);
         };
+        Ok(Some(self.merge_symbols(page)))
+    }
+
+    /// The merged symbols and the merged file list, both read from one base
+    /// snapshot.
+    ///
+    /// Two reads — one for the rows, one for the files — each resolved "the
+    /// latest generation" for itself, so a commit landing between them left
+    /// rows from one generation beside a file list from another. A scope
+    /// resolved against the second then admitted or refused paths the first
+    /// does not hold. `Store::all_symbols_page_with_files` reads both inside one
+    /// deferred transaction.
+    pub(crate) fn merged_corpus(&self) -> Result<Option<(SearchPage, ScopeInputs)>> {
+        let Some((page, base_files)) = self.base.all_symbols_page_with_files()? else {
+            return Ok(None);
+        };
+        let files = self.merge_indexed_files(page.generation, base_files);
+        Ok(Some((self.merge_symbols(page), files)))
+    }
+
+    fn merge_symbols(&self, mut page: SearchPage) -> SearchPage {
         page.rows.retain(|sym| {
             let p = Path::new(&sym.path);
             !self.overlay.is_file_tombstoned(p)
@@ -2647,7 +2674,7 @@ impl StackedStore {
         }
         page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
         page.repo_root = Some(self.worktree_root.to_string_lossy().into_owned());
-        Ok(Some(page))
+        page
     }
 
     pub fn keyword_page(
@@ -2656,10 +2683,7 @@ impl StackedStore {
         pool: usize,
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> Result<Option<SearchPage>> {
-        let Some(mut page) = self.all_merged_symbols()? else {
-            return Ok(None);
-        };
-        let Some((_, root, all_files)) = self.all_indexed_files()? else {
+        let Some((mut page, (_, root, all_files))) = self.merged_corpus()? else {
             return Ok(None);
         };
         let corpus_files = u32::try_from(all_files.len()).unwrap_or(u32::MAX);
@@ -2749,13 +2773,10 @@ impl StackedStore {
         &self,
         scope: Option<&crate::scope::SymbolScope>,
     ) -> Result<Option<(SearchPage, Option<crate::scope::ResolvedScope>)>> {
-        let Some(mut page) = self.all_merged_symbols()? else {
-            return Ok(None);
-        };
         let Some(scope) = scope else {
-            return Ok(Some((page, None)));
+            return Ok(self.all_merged_symbols()?.map(|page| (page, None)));
         };
-        let Some((_, root, files)) = self.all_indexed_files()? else {
+        let Some((mut page, (_, root, files))) = self.merged_corpus()? else {
             return Ok(None);
         };
         let mut resolved = scope.resolve(&files, root.as_deref())?;
@@ -3922,6 +3943,152 @@ mod tests {
             )
             .unwrap();
         let _ = store.write_latest_csr_sidecar().unwrap();
+    }
+
+    #[cfg(feature = "parse")]
+    thread_local! {
+        static SNAPSHOT_PAUSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(feature = "parse")]
+    fn count_snapshot_pause() {
+        SNAPSHOT_PAUSES.with(|fires| fires.set(fires.get() + 1));
+    }
+
+    /// Counts the base reads that pin a snapshot (the ft-9450b451 seam fires
+    /// once per pinned snapshot) until dropped.
+    #[cfg(feature = "parse")]
+    struct SnapshotPauseCount;
+
+    #[cfg(feature = "parse")]
+    impl SnapshotPauseCount {
+        fn install() -> Self {
+            SNAPSHOT_PAUSES.with(|fires| fires.set(0));
+            devmap_store::db::set_generation_read_pause(Some(count_snapshot_pause));
+            Self
+        }
+
+        fn fires(&self) -> u32 {
+            SNAPSHOT_PAUSES.with(std::cell::Cell::get)
+        }
+    }
+
+    #[cfg(feature = "parse")]
+    impl Drop for SnapshotPauseCount {
+        fn drop(&mut self) {
+            devmap_store::db::set_generation_read_pause(None);
+        }
+    }
+
+    /// A lane with one dirty file, so reads take the merged (stacked) path.
+    #[cfg(feature = "parse")]
+    fn dirty_stacked_lane(tag: &str) -> (PathBuf, StackedStore) {
+        let root = temp_repo_dir(tag);
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = root.join("lane-1");
+        run_git_ok(
+            &anchor,
+            &["worktree", "add", "-b", "lane-1", lane.to_str().unwrap()],
+        );
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        fs::write(
+            lane.join("src/svc.go"),
+            "package svc\n\ntype Server struct{}\n\nfunc (s *Server) Handle() int { return 99 }\n",
+        )
+        .unwrap();
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        stacked.sync_worktree().unwrap();
+        assert!(stacked.has_delta_changes());
+        (root, stacked)
+    }
+
+    /// The keyword page over a stacked store paired two independent
+    /// "latest generation" reads: the rows, then the file list the scope is
+    /// resolved against. A commit between them left rows from one generation
+    /// beside files from another. One read of the base is one snapshot, so the
+    /// seam sees exactly one pin.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn keyword_page_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("keyword-one-snapshot");
+        let filter = crate::scope::NameQueryFilter::new(&["src".to_string()], &[], &[]).unwrap();
+
+        let pauses = SnapshotPauseCount::install();
+        let page = stacked
+            .keyword_page("Handle", 10, filter.as_ref())
+            .unwrap()
+            .expect("the base holds a generation");
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
+        );
+        assert!(page.rows.iter().any(|row| row.name == "Handle"));
+        assert_eq!(
+            page.narrowing.as_ref().map(|n| n.corpus_files),
+            Some(3),
+            "the scope was resolved against a different file list than the rows"
+        );
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `doc_drift_report_with_stacked` paired the same two reads over a dirty
+    /// worktree: the merged rows, then the merged file list.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn doc_drift_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("docdrift-one-snapshot");
+        let options = crate::doc_drift::DocDriftOptions {
+            paths: &[],
+            exclude: &[],
+            token_budget: 8_000,
+            default_excludes: true,
+            limits: crate::doc_drift::Limits::default(),
+        };
+
+        let pauses = SnapshotPauseCount::install();
+        let report = crate::doc_drift::doc_drift_report_with_stacked(
+            &stacked.base,
+            Some(&stacked),
+            &crate::cancel::Cancel::default(),
+            &options,
+        )
+        .unwrap();
+        assert!(report.available, "{:?}", report.walk_incomplete);
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
+        );
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `ranking_corpus` pairs the same two reads when it is scoped.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn a_scoped_ranking_corpus_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("ranking-one-snapshot");
+        let scope = crate::scope::SymbolScope::new(&["src".to_string()], &[])
+            .unwrap()
+            .expect("a path scope");
+
+        let pauses = SnapshotPauseCount::install();
+        let (page, resolved) = stacked
+            .ranking_corpus(Some(&scope))
+            .unwrap()
+            .expect("the base holds a generation");
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
+        );
+        assert!(resolved.is_some());
+        assert!(!page.rows.is_empty());
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
     }
 
     #[cfg(feature = "parse")]

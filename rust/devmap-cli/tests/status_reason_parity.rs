@@ -467,3 +467,210 @@ fn p7_mcp_devmap_status_carries_the_cli_degraded_reason() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Rewrites the latest generation's head stamp, as a build does when
+/// `git rev-parse HEAD` fails (`"unavailable"`).
+fn stamp_head(db: &Path, head: &str) {
+    Store::open(db).unwrap().restamp_latest_head(head).unwrap();
+}
+
+/// A git working tree with no commit: `git init`, whose HEAD names a branch
+/// that does not exist yet, so `git rev-parse HEAD` fails.
+fn make_unborn_git_tree(dir: &Path) {
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(init.success(), "git init failed");
+}
+
+/// Probe 8: a generation stamped `"unavailable"` inside a git tree whose HEAD
+/// file is corrupt is named by both surfaces, still reports its head, and is not
+/// a reason to auto-rebuild; outside a git tree, on an unborn branch and with a
+/// readable head, nothing is said.
+#[test]
+fn p8_an_unreadable_head_in_a_git_tree_is_named_by_cli_and_daemon() {
+    let dir = scratch("p8");
+    let db = build_store(&dir, AnalysisStatus::Ok, CLEAN);
+    stamp_head(&db, "unavailable");
+
+    let outside = cli_status(&dir, &db);
+    assert!(
+        outside["degraded_reason"].is_null(),
+        "no .git: there is no HEAD to read: {outside}"
+    );
+    assert_eq!(outside["head_sha"], json!("unavailable"), "{outside}");
+
+    // An unborn branch (`git init`, no commit) is every repository's first
+    // state, not a fault: the head field says `unavailable`, the reason is silent.
+    make_unborn_git_tree(&dir);
+    let unborn = cli_status(&dir, &db);
+    assert!(
+        unborn["degraded_reason"].is_null(),
+        "an unborn branch is ordinary: {unborn}"
+    );
+    assert_eq!(unborn["head_sha"], json!("unavailable"), "{unborn}");
+
+    // A HEAD file that names neither a branch nor an object is a corrupt lane.
+    std::fs::write(dir.join(".git/HEAD"), "garbage\n").unwrap();
+    let cli = cli_status(&dir, &db);
+    let reason = cli["degraded_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an unreadable HEAD in a git tree reads clean: {cli}"));
+    assert!(reason.contains("HEAD"), "{reason}");
+    assert_eq!(cli["head_sha"], json!("unavailable"), "{cli}");
+    assert_eq!(cli["rebuild_required"], json!(false), "{cli}");
+    assert_eq!(cli["query_ready"], json!(true), "{cli}");
+    let (daemon_reason, _) = daemon(&db, &unapplied(false));
+    assert_eq!(
+        daemon_reason.as_deref(),
+        Some(reason),
+        "daemon and CLI must say the same thing"
+    );
+
+    stamp_head(&db, "0123456789abcdef0123456789abcdef01234567");
+    let readable = cli_status(&dir, &db);
+    assert!(readable["degraded_reason"].is_null(), "{readable}");
+    assert_eq!(readable["is_fresh"], json!(true), "{readable}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Forges the latest generation's resolver stamp, as a store written by an
+/// older (or newer) devmap carries it.
+fn stamp_resolver_epoch(db: &Path, epoch: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', ?1)",
+            [epoch],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "one generation to forge");
+}
+
+/// Probe 9: a store whose edges an older resolver wrote is named as such even
+/// while something else already makes it not fresh. `Store::status` only asks
+/// the resolver question of a store with an empty queue and no other reason, so
+/// a stale store with a pending change read as merely "1 source change(s) are
+/// pending", and the reader who drained the queue found the staleness
+/// afterwards. Both surfaces, one string, and the staleness stated once.
+#[test]
+fn p9_a_resolver_stale_store_is_named_beside_another_reason() {
+    for stale in [false, true] {
+        let dir = scratch("p9");
+        let db = build_store(
+            &dir,
+            AnalysisStatus::Ok,
+            Shape {
+                stale,
+                budget: false,
+            },
+        );
+        stamp_resolver_epoch(&db, "0");
+        let older = devmap_store::ResolverStamp::Older.reason();
+
+        let cli = cli_status(&dir, &db);
+        let reason = cli["degraded_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(older),
+            "stale={stale}: a resolver-stale store must say so: {cli}"
+        );
+        assert_eq!(
+            reason.matches(older).count(),
+            1,
+            "stale={stale}: said once, not once per check: {reason}"
+        );
+        assert_eq!(cli["is_fresh"], json!(false), "stale={stale}: {cli}");
+        let (daemon_reason, daemon_fresh) = daemon(&db, &unapplied(false));
+        assert_eq!(
+            daemon_reason.as_deref(),
+            Some(reason),
+            "stale={stale}: daemon and CLI must say the same thing"
+        );
+        assert!(!daemon_fresh, "stale={stale}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `cli_status` with a `PATH` that holds no `git`: a surface a health check
+/// polls must read the HEAD file, not spawn `git rev-parse`.
+fn cli_status_without_git(dir: &Path, db: &Path) -> Value {
+    let empty_path = dir.join("no-bin");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let out = Command::new(devmap())
+        .arg("--db")
+        .arg(db)
+        .args(["--json", "status"])
+        .env("PATH", &empty_path)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "status is not JSON without git on PATH ({e}): {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// Probe 10: every reason at once (a pending change, a partial analysis with a
+/// 100 KB reason, a budget refusal, a resolver-stale store, an unreadable HEAD in
+/// a git tree) is named in one bounded string, and the HEAD clause neither
+/// changes `rebuild_required` nor needs a `git` binary.
+#[test]
+fn p10_every_reason_at_once_is_present_bounded_and_does_not_move_rebuild_required() {
+    let dir = scratch("p10");
+    let db = build_store(
+        &dir,
+        AnalysisStatus::Partial {
+            reason: "x".repeat(100_000),
+        },
+        Shape {
+            stale: true,
+            budget: true,
+        },
+    );
+    stamp_resolver_epoch(&db, "0");
+    stamp_head(&db, "unavailable");
+
+    // HEAD unreadable but not in a git tree: no HEAD clause. The baseline.
+    let before = cli_status_without_git(&dir, &db);
+    make_unborn_git_tree(&dir);
+    std::fs::write(dir.join(".git/HEAD"), "garbage\n").unwrap();
+    let after = cli_status_without_git(&dir, &db);
+
+    let reason = after["degraded_reason"].as_str().expect("a reason");    let older = devmap_store::ResolverStamp::Older.reason();
+    assert!(reason.contains(older), "resolver-stale is missing: {reason}");
+    assert!(reason.contains("HEAD"), "the HEAD clause is missing: {reason}");
+    assert!(
+        reason.contains("pending") || reason.contains("source change"),
+        "the pending change is missing: {reason}"
+    );
+    assert!(
+        reason.contains("refused") || reason.contains("budget"),
+        "the budget refusal is missing: {reason}"
+    );
+    assert!(
+        reason.contains("partial") || reason.contains("Partial") || reason.contains("xxxx"),
+        "the partial analysis is missing: {reason}"
+    );
+    assert!(
+        reason.len() <= 8 * 1024,
+        "the combined reason is unbounded: {} bytes",
+        reason.len()
+    );
+    assert_eq!(
+        before["rebuild_required"], after["rebuild_required"],
+        "naming HEAD moved rebuild_required: {before} vs {after}"
+    );
+    assert_eq!(after["is_fresh"], json!(false), "{after}");
+    let (daemon_reason, _) = daemon(&db, &unapplied(false));
+    assert_eq!(
+        daemon_reason.as_deref(),
+        Some(reason),
+        "daemon and CLI must say the same thing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
