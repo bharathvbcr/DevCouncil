@@ -390,15 +390,16 @@ fn run_hook_inner(
             }
             // A refused or failed spawn is exit 1 with its reason, as for every
             // other PostToolUse detach, never silence.
-            let (exit_code, stderr_line) = match detach_build_with(executable, &wt, Some(&main), wait) {
-                Ok(()) => {
-                    if shell_post && wait.is_none() {
-                        claim_shell_build_window(&wt);
+            let (exit_code, stderr_line) =
+                match detach_build_with(executable, &wt, Some(&main), wait) {
+                    Ok(spawned) => {
+                        if spawned && shell_post && wait.is_none() {
+                            claim_shell_build_window(&wt);
+                        }
+                        (0, None)
                     }
-                    (0, None)
-                }
-                Err(error) => (1, Some(format!("devmap hook post-tool-use: {error}"))),
-            };
+                    Err(error) => (1, Some(format!("devmap hook post-tool-use: {error}"))),
+                };
             return Ok(HookOutcome {
                 exit_code,
                 stdout: None,
@@ -485,10 +486,11 @@ fn run_hook_inner(
                     if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
                         return Ok(());
                     }
-                    detach_post_tool_root(executable, root, wait)?;
+                    let spawned = detach_post_tool_root(executable, root, wait)?;
                     // A held-back start is not a start: the window it waits out
-                    // is still the previous one.
-                    if shell_post && wait.is_none() {
+                    // is still the previous one. Nor is a call that only
+                    // marked a running build dirty.
+                    if spawned && shell_post && wait.is_none() {
                         claim_shell_build_window(root);
                     }
                     Ok(())
@@ -1082,7 +1084,7 @@ fn catch_up_note(executable: &Path, root: &Path, started: Instant, budget: Durat
         );
     }
     match detach_post_tool_root(executable, root, None) {
-        Ok(()) => format!("index stale, rebuilding in the background ({LOWER_BOUND})"),
+        Ok(_) => format!("index stale, rebuilding in the background ({LOWER_BOUND})"),
         Err(error) => format!(
             "index stale, rebuild failed to start ({}); run `devmap build` ({LOWER_BOUND})",
             context_line(&truncate(&error.to_string(), 40))
@@ -2782,7 +2784,7 @@ fn detach_post_tool_root(
     executable: &Path,
     root: &Path,
     delay: Option<Duration>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if has_stack_lease(root) && !has_sqlite_store(root) {
         return detach_stack_sync(executable, root, delay);
     }
@@ -2798,12 +2800,12 @@ fn detach_stack_sync(
     executable: &Path,
     root: &Path,
     delay: Option<Duration>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let executable = canonical_hook_executable(executable, root, "detach")?;
     let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "stack-sync");
     if !acquire_or_mark_dirty(root, &lock_dir)? {
-        return Ok(());
+        return Ok(false);
     }
     let args: Vec<std::ffi::OsString> = vec![
         "--root".into(),
@@ -2853,7 +2855,7 @@ fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, 
 
 /// A build of a linked worktree that starts from its main checkout's store.
 fn detach_seeded_build(executable: &Path, root: &Path, main: &Path) -> anyhow::Result<()> {
-    detach_build_with(executable, root, Some(main), None)
+    detach_build_with(executable, root, Some(main), None).map(|_| ())
 }
 
 fn detach_build_with(
@@ -2861,12 +2863,12 @@ fn detach_build_with(
     root: &Path,
     seed_from: Option<&Path>,
     delay: Option<Duration>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let executable = canonical_hook_executable_with_seed(executable, root, seed_from, "detach")?;
     let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "build");
     if !acquire_or_mark_dirty(root, &lock_dir)? {
-        return Ok(());
+        return Ok(false);
     }
     let args = build_args(root, seed_from);
     let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
@@ -2874,14 +2876,14 @@ fn detach_build_with(
 }
 
 /// Spawn the detached build, holding it back by `delay` and scheduling the
-/// shell window to start when it does.
+/// shell window to start when it does. `true`: a builder was spawned.
 fn spawn_build_detached(
     root: &Path,
     lock_dir: &Path,
     executable: &Path,
     args: &[&OsStr],
     delay: Option<Duration>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let options = SpawnOptions {
         delay,
         rerun_when_dirty: true,
@@ -2890,7 +2892,7 @@ fn spawn_build_detached(
     if let Some(wait) = delay {
         schedule_shell_build_window(root, wait);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Take the coalescing lock, or — when a build holds it — leave
@@ -3625,10 +3627,14 @@ struct SpawnOptions {
     /// Wait this long (whole seconds, rounded up) before the first run, holding
     /// the lock meanwhile, so triggers arriving in the wait coalesce onto it.
     delay: Option<Duration>,
-    /// Run once more when [`BUILD_DIRTY_MARKER`] reappears during a run: one
-    /// trailing run per build, never a loop.
+    /// Run again when [`BUILD_DIRTY_MARKER`] reappears during a run: up to
+    /// [`MAX_TRAILING_RUNS`] reruns per build, never an unbounded loop.
     rerun_when_dirty: bool,
 }
+
+/// Most reruns one detached build makes for markers set while it ran.
+#[cfg(unix)]
+const MAX_TRAILING_RUNS: u32 = 3;
 
 pub const OWNED_LOCK_ENV: &str = "DEVMAP_HOOK_OWNED_LOCK";
 
@@ -3676,10 +3682,25 @@ fn detached_shell_command(
             .and_then(|dir| dir.join(BUILD_DIRTY_MARKER).to_str().map(str::to_owned))
             .ok_or_else(|| anyhow!("lock path is not UTF-8"))?;
         let marker = shell_single_quote(&marker);
+        // Bounded: at most MAX_TRAILING_RUNS reruns in all. A marker that
+        // lands after the last test and before the lock goes (a hook that saw
+        // the lock held touches the marker and spawns nothing) is caught by
+        // looking once more after the lock is removed and taking it again with
+        // `/bin/mkdir`; if that fails, another hook holds the lock and has
+        // its own builder. Only a spent budget leaves a marker, and the next
+        // trigger finds the lock free and builds.
+        let lock_quoted = shell_single_quote(lock);
         script.push_str(&format!(
-            "/bin/rm -f {marker}; {run}; status=$?; \
-             if [ -e {marker} ]; then /bin/rm -f {marker}; {run}; status=$?; fi; "
+            "/bin/rm -f {marker}; {run}; status=$?; reruns=0; \
+             while :; do \
+             while [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ]; do \
+             reruns=$((reruns+1)); /bin/rm -f {marker}; {run}; status=$?; done; \
+             /bin/rm -rf {lock_quoted}; \
+             [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ] \
+             && /bin/mkdir {lock_quoted} 2>/dev/null || break; \
+             done; exit $status"
         ));
+        return finish_detached_shell(script);
     } else {
         script.push_str(&format!("{run}; status=$?; "));
     }
@@ -3687,6 +3708,12 @@ fn detached_shell_command(
         "/bin/rm -rf {}; exit $status",
         shell_single_quote(lock)
     ));
+    finish_detached_shell(script)
+}
+
+/// `script` under `/bin/sh -c` in a new session.
+#[cfg(unix)]
+fn finish_detached_shell(script: String) -> anyhow::Result<Command> {
     // By absolute path: a bare `sh` is looked up on PATH, and the hook runs
     // in the agent's environment, where a PATH entry can name a directory
     // inside the repository.
@@ -4120,10 +4147,10 @@ mod tests {
         write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
 
         let results = [
-            detach_build_with(&exe, &repo, None, None),
-            detach_stack_sync(&exe, &repo, None),
+            detach_build_with(&exe, &repo, None, None).map(|_| ()),
+            detach_stack_sync(&exe, &repo, None).map(|_| ()),
             detach_session_report(&exe, &repo, Some("s1")),
-            detach_post_tool_root(&exe, &repo, None),
+            detach_post_tool_root(&exe, &repo, None).map(|_| ()),
         ];
         std::thread::sleep(Duration::from_millis(300));
         let ran = marker.exists();
@@ -6300,7 +6327,7 @@ mod tests {
     }
 
     /// Writers that never stop cannot make a build loop: one running build
-    /// earns at most one trailing run, and a marker left behind by a crash
+    /// earns at most MAX_TRAILING_RUNS trailing runs, and a marker left behind by a crash
     /// neither wedges the next build nor triggers a phantom rerun.
     #[cfg(unix)]
     #[test]
@@ -6331,7 +6358,44 @@ mod tests {
         assert!(eventually(|| lane.builds_started() > before));
         assert!(eventually(|| !lane.main_lock().exists()));
         thread::sleep(Duration::from_millis(500));
-        assert_eq!(lane.builds_started() - before, 2, "one build plus one trailing run, no more");
+        assert_eq!(
+            lane.builds_started() - before,
+            1 + MAX_TRAILING_RUNS as usize,
+            "one build plus the bounded trailing runs, no more"
+        );
+    }
+
+    /// A trigger that lands while the trailing run itself is running must not be
+    /// stranded: the marker it leaves is acted on before the builder exits, so
+    /// no marker survives its builder (bounded: a few reruns, never a loop).
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_set_during_the_last_rerun_is_not_left_without_a_builder() {
+        let lane = Lane::new("trail-last-rerun", true);
+        let marker = state_dir(&lane.main).join("codeintel").join(BUILD_DIRTY_MARKER);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        // Runs one and two (the build and its first rerun) each dirty the tree;
+        // run three does not.
+        let script = fs::read_to_string(&lane.exe).unwrap();
+        write_script(
+            &lane.exe,
+            &script.replace(
+                "printf '%s\\n' \"$@\"",
+                &format!(
+                    "[ \"$(/usr/bin/wc -l < '{}')\" -le 2 ] && : > '{}'\nprintf '%s\\n' \"$@\"",
+                    lane.starts.display(),
+                    marker.display()
+                ),
+            ),
+        );
+        assert_ne!(script, fs::read_to_string(&lane.exe).unwrap(), "the stand-in was not rewritten");
+        fs::write(&lane.release, b"").unwrap();
+        run_hook(HookEvent::PostToolUse, &edit_in_main(&lane), &lane.exe, None);
+        assert!(eventually(|| lane.builds_started() >= 1), "no build started");
+        assert!(eventually(|| !lane.main_lock().exists()), "the lock outlived its builder");
+        thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "a marker survived its builder with {} builds run", lane.builds_started());
+        assert_eq!(lane.builds_started(), 3, "the rerun's own marker earned no further run");
     }
 
     /// A SessionStart catch-up and PostToolUse edits racing on one root share
