@@ -50,6 +50,7 @@ mod attack_rb_resolution_budget;
 mod binary_digests_are_memoised;
 mod blast_names_what_a_change_reaches;
 mod blast_reads_once_and_names_every_path;
+mod blast_whole_file_has_no_sentinel_line;
 mod budget_refusal_attack;
 mod build_lsp_opt_in;
 mod build_lsp_paths_are_anchored;
