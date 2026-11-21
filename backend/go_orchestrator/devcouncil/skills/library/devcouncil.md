@@ -55,7 +55,7 @@ so `devmap --help` lists the rest.
 | Verify a task | `dev verify TASK-ID --json` | `devcouncil_verify_task` |
 | Persisted gaps, diff | `dev tool call devcouncil_get_gaps --args '{"task_id":"T-1"}'` | `devcouncil_get_gaps`, `devcouncil_get_diff` |
 | Health | `dev doctor --json` | none |
-| Code navigation | `devmap … --json --root <abs>` | `devmap_*` tools |
+| Code navigation | `devmap search … --json --root <abs>` | `devmap_*` tools |
 
 MCP tool names in Claude Code are prefixed: `mcp__devcouncil__devcouncil_<name>`.
 Install the MCP server for a host with `dev integrate claude --apply`.
