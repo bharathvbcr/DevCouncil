@@ -73,8 +73,10 @@ pub enum ResolutionAvailability {
 ///
 /// - A `fresh: true` verdict **no watcher backs** (the CLI, or an MCP-only
 ///   process) older than 60 seconds is reported as `fresh: null` with a reason
-///   naming its age and `status` as the way to re-verify. `status` is what
-///   re-stamps it.
+///   naming its age and `status` as the way to re-verify. `status` re-stamps
+///   it, and so does the next query in a long-lived reader (the MCP server),
+///   which re-runs the read-only source walk itself, at most once a minute and
+///   within a time budget; a walk that overruns leaves the null and its reason.
 /// - A verdict a **live watcher backs** (the daemon, from the walk it runs
 ///   after each drain) does not age out: an edit the watcher sees queues a
 ///   path and ends the verdict at once, so a healthy idle daemon keeps

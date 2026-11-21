@@ -753,6 +753,31 @@ pub struct Store {
     /// A verdict remembered while it was true is not aged out (see
     /// [`SOURCE_FRESHNESS_MAX_AGE`]).
     source_freshness_watcher_live: std::sync::atomic::AtomicBool,
+    /// Whether a query that finds its unwatched verdict aged out (or absent)
+    /// may re-run the read-only source-freshness walk itself. Set by long-lived
+    /// readers ([`Store::enable_lazy_source_verification`], the MCP server's
+    /// store cache); a one-shot CLI process or hook never walks on a query.
+    lazy_source_verification: std::sync::atomic::AtomicBool,
+    /// Serialises those walks and remembers when the last one started, so a
+    /// store walks at most once per [`SOURCE_FRESHNESS_MAX_AGE`] however many
+    /// queries ask. Held across the walk: concurrent queries wait for it (at
+    /// most [`SOURCE_FRESHNESS_WALK_BUDGET`]) and then read what it stamped.
+    lazy_walk: Mutex<LazyWalk>,
+}
+
+/// State behind [`Store::query_source_freshness`]'s lazy re-walk.
+#[derive(Default)]
+pub(crate) struct LazyWalk {
+    pub(crate) last_attempt: Option<std::time::Instant>,
+    /// Walks started, for tests.
+    #[cfg(test)]
+    pub(crate) walks: usize,
+    /// Runs in the walk's thread before the walk, with its cancel flag.
+    #[cfg(test)]
+    pub(crate) probe: Option<std::sync::Arc<dyn Fn(&std::sync::atomic::AtomicBool) + Send + Sync>>,
+    /// Overrides [`SOURCE_FRESHNESS_WALK_BUDGET`].
+    #[cfg(test)]
+    pub(crate) budget: Option<std::time::Duration>,
 }
 
 /// How long a held integrity answer may stand before it is read again.
@@ -785,13 +810,22 @@ const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_
 /// the store already accepts for an unreported fault. What re-stamps a verdict
 /// where no watcher backs it: `Store::status` (`devmap status`, the
 /// `devmap_status` tool, the daemon's post-drain walk), the only caller of
-/// the remember step. A build in another process (a hook-triggered one) moves
-/// the generation, which leaves the cached verdict describing an older one, so
-/// the envelope reads as unverified and names `status` until it runs here. A
-/// poller calling `status` once a minute keeps verdicts verified. A
-/// `fresh: false` verdict is never aged out: it only ends when `status` runs
-/// again.
+/// the remember step, and in a long-lived reader (the MCP server's stores, see
+/// [`Store::enable_lazy_source_verification`]) the query itself: a verdict
+/// that is aged out, absent, or left describing an older generation by a build
+/// in another process (a hook-triggered one) is re-walked on the next query, at
+/// most once per bound per store, within [`SOURCE_FRESHNESS_WALK_BUDGET`]. A
+/// walk that does not finish leaves the envelope unverified with the reason. A
+/// one-shot process never walks on a query. A `fresh: false` verdict is not
+/// aged into null: it stays false until a walk (`status`, or the lazy one past
+/// the bound) says otherwise.
 pub const SOURCE_FRESHNESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest a query waits for its own lazy source-freshness re-walk. Past
+/// it the walk is cancelled and the query answers `fresh: null` with the age
+/// and the reason, as it did before the walk existed.
+pub const SOURCE_FRESHNESS_WALK_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(1500);
 
 #[cfg(test)]
 thread_local! {

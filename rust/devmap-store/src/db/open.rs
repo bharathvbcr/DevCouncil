@@ -1,6 +1,6 @@
 use super::{
-    refusal, sidecar_links, GenerationChecks, ReaderMemory, SidecarLinks, Store, WriterLock,
-    CONNECTION_SETUP,
+    refusal, sidecar_links, GenerationChecks, LazyWalk, ReaderMemory, SidecarLinks, Store,
+    WriterLock, CONNECTION_SETUP,
 };
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
@@ -351,6 +351,8 @@ impl Store {
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only: true,
             full_text_damage,
@@ -529,6 +531,8 @@ impl Store {
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only,
             full_text_damage: None,
@@ -1282,6 +1286,8 @@ impl Store {
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only: true,
             full_text_damage: None,
@@ -1303,6 +1309,8 @@ impl Store {
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: None,
             read_only: false,
             full_text_damage: None,
