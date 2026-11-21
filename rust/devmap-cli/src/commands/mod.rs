@@ -53,7 +53,36 @@ pub(crate) mod trace;
 pub(crate) mod version;
 pub(crate) mod workspace;
 
+/// Run the command and, when it is one an agent uses to query the index, put
+/// it on the session's record the way the MCP server does (live-log row and
+/// queried marker), so a session that asks through the CLI is not told it has
+/// asked nothing. One place covers text output, `--json` and the error path;
+/// a failed write never changes the command's outcome.
 pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
+    let Some(tag) = cli.command.query_tag() else {
+        return dispatch(cli, progress).await;
+    };
+    let started = std::time::Instant::now();
+    let outcome = dispatch(cli, progress).await;
+    let tool = devmap_serve::tool_for_command(tag)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("devmap_{tag}"));
+    let error = outcome.as_ref().err().map(|error| error.to_string());
+    let answer = crate::output::take_answered();
+    devmap_serve::session_log::append_query_from(
+        Some(devmap_serve::session_log::ORIGIN_CLI),
+        &cli.db(),
+        devmap_serve::session_log::host_session_id(),
+        &tool,
+        None,
+        answer.as_ref(),
+        error.as_deref(),
+        started.elapsed().as_millis() as u64,
+    );
+    outcome
+}
+
+async fn dispatch(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build(args) => build::run(cli, progress, args),
         Commands::Seed(args) => seed::run(cli, args),

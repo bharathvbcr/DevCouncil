@@ -1051,6 +1051,15 @@ one of the codes it defines"
     }
 }
 
+/// The MCP tool name for a command tag (`search`, `deps`, `ask_evidence`, …),
+/// so a caller that is not the server labels its rows in the server's own
+/// vocabulary instead of inventing one.
+pub fn tool_for_command(tag: &str) -> Option<&'static str> {
+    TOOLS
+        .iter()
+        .find_map(|(name, command)| (*command == tag).then_some(*name))
+}
+
 /// The declared tool surface, as `(mcp tool name, ipc cmd tag)`.
 ///
 /// A single array so the two lists cannot fall out of step: `tool_specs` builds
