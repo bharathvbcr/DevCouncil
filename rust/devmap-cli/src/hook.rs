@@ -2312,6 +2312,10 @@ const READ_ONLY_GIT: &[&str] = &[
     "fetch",
 ];
 
+/// Directories whose `ls`, `cat`, `git` are the system's, not a script the
+/// repository or the user put on the path.
+const SYSTEM_BIN_DIRS: &[&str] = &["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+
 fn segment_cannot_change_tree(words: &[String]) -> bool {
     let is_assignment = |word: &String| {
         word.split_once('=').is_some_and(|(name, _)| {
@@ -2326,13 +2330,22 @@ fn segment_cannot_change_tree(words: &[String]) -> bool {
         // Only `VAR=value`: sets a variable, runs nothing.
         return true;
     };
-    let verb = verb.rsplit('/').next().unwrap_or(verb);
+    // A path names the program that runs: `./scripts/test` is the repository's
+    // script, not the `test` builtin. Only a system binary directory keeps the
+    // verb's meaning.
+    let verb = match verb.rsplit_once('/') {
+        None => verb.as_str(),
+        Some((dir, name)) if SYSTEM_BIN_DIRS.contains(&dir) => name,
+        Some(_) => return false,
+    };
     let args: Vec<&str> = rest.map(String::as_str).collect();
     match verb {
         "git" => git_cannot_change_tree(&args),
         "sed" => sed_cannot_change_tree(&args),
-        // `--pre` runs a command over every file.
-        "rg" => !args.iter().any(|arg| arg.starts_with("--pre")),
+        // `--pre` runs a command over every file; `--hostname-bin` runs one too.
+        "rg" => !args
+            .iter()
+            .any(|arg| arg.starts_with("--pre") || arg.starts_with("--hostname-bin")),
         "find" => !args.iter().any(|arg| {
             matches!(
                 *arg,
@@ -2357,9 +2370,13 @@ fn git_cannot_change_tree(args: &[&str]) -> bool {
     while let Some(arg) = iter.next() {
         match arg {
             // Options that take the next word as their value.
-            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => {
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
                 iter.next();
             }
+            // A config value can name a program git then runs (`core.fsmonitor`,
+            // `diff.external`): not a read.
+            "-c" | "--config-env" => return false,
+            flag if flag.starts_with("--config-env=") => return false,
             flag if flag.starts_with('-') => {}
             name => {
                 sub = Some(name);
@@ -2371,11 +2388,14 @@ fn git_cannot_change_tree(args: &[&str]) -> bool {
         return false;
     };
     let rest: Vec<&str> = iter.collect();
-    // `--output` writes the result to a path.
-    if rest
-        .iter()
-        .any(|arg| *arg == "--output" || arg.starts_with("--output="))
-    {
+    // `--output` writes the result to a path; `grep -O` opens the matches in a
+    // program.
+    if rest.iter().any(|arg| {
+        *arg == "--output"
+            || arg.starts_with("--output=")
+            || arg.starts_with("--open-files-in-pager")
+            || (sub == "grep" && arg.starts_with("-O"))
+    }) {
         return false;
     }
     let first = rest.iter().copied().find(|arg| !arg.starts_with('-'));
@@ -5610,6 +5630,260 @@ mod tests {
             "the call after a refusal was held back by a window nothing started"
         );
         assert!(stamp.is_file(), "a successful detach claims the window");
+    }
+
+    /// Every way a shell line can change the tree that the classifier must not
+    /// read as safe. Each is a possible write, so each must start a build.
+    #[cfg(unix)]
+    #[test]
+    fn the_classifier_reads_every_bypass_as_a_possible_write() {
+        let bypasses: &[&str] = &[
+            "git status; rm x.rs",
+            "git status && sed -i s/a/b/ x.rs",
+            "git status || rm x.rs",
+            "git status & rm x.rs",
+            "git status\nrm x.rs",
+            "git status\r\nrm x.rs",
+            "(rm x.rs)",
+            "{ rm x.rs; }",
+            "! rm x.rs",
+            "cat x | tee y.rs",
+            "cat x |& tee y.rs",
+            "echo > y.rs",
+            "echo >y.rs",
+            "echo 1>y.rs",
+            "echo 2>y.rs",
+            "echo &>y.rs",
+            "echo >| y.rs",
+            "echo <> y.rs",
+            "ls >&y.rs",
+            "ls | xargs rm",
+            "find . -name '*.rs' -delete",
+            "FOO=1 sed -i s/a/b/ x.rs",
+            "FOO=1 BAR=2 rm x.rs",
+            "env sed -i s/a/b/ x.rs",
+            "env FOO=1 rm x.rs",
+            "command rm x.rs",
+            "builtin cd . && rm x",
+            "exec rm x.rs",
+            "time rm x.rs",
+            "nohup rm x.rs",
+            "sudo rm x.rs",
+            "\\rm x.rs",
+            "'rm' x.rs",
+            "r\"\"m x.rs",
+            "bash -c 'echo > y'",
+            "bash -c 'git status'",
+            "sh -c 'echo hi'",
+            "zsh -c 'ls'",
+            "eval 'rm x'",
+            "eval ls",
+            "source ./gen.sh",
+            ". ./gen.sh",
+            "cat <<EOF > y.rs\nhi\nEOF",
+            "cat <<EOF\nhi\nEOF",
+            "cat <<< hi > y.rs",
+            "git checkout -- .",
+            "git restore .",
+            "git clean -fd",
+            "git stash pop",
+            "git stash",
+            "git apply p.diff",
+            "git am p.mbox",
+            "git pull",
+            "git switch other",
+            "git rm x.rs",
+            "git mv a b",
+            "git reset --hard",
+            "git -c core.fsmonitor='rm x' status",
+            "git -c diff.external='rm x' diff",
+            "git grep -O'rm x' foo",
+            "git grep --open-files-in-pager='rm x' foo",
+            "git log --output=y.txt",
+            "git show --output y.txt HEAD",
+            "git diff --output=y.patch",
+            "git",
+            "git ",
+            "npx prettier --write .",
+            "cargo fmt",
+            "cargo build",
+            "gofmt -w .",
+            "perl -pi -e s/a/b/ x.rs",
+            "perl -e 'unlink q(x)'",
+            "python -c 'open(\"f\",\"w\")'",
+            "python3 gen.py",
+            "node gen.js",
+            "cp a b",
+            "mv a b",
+            "ln -s a b",
+            "touch x",
+            "truncate -s 0 x",
+            "dd of=x if=/dev/zero count=1",
+            "install a b",
+            "mkdir d",
+            "rmdir d",
+            "chmod +x x",
+            "patch -p1 < p.diff",
+            "tar xf a.tar",
+            "unzip a.zip",
+            "curl -o x http://h",
+            "wget http://h",
+            "make",
+            "awk '{print > \"y\"}' x",
+            "./scripts/test",
+            "./test",
+            "scripts/diff",
+            "./cat x",
+            "../ls",
+            "/tmp/evil/cat x",
+            "~/bin/echo hi",
+            "rg --pre 'rm x' foo",
+            "rg --pre=./gen foo",
+            "rg --hostname-bin 'rm x' foo --hyperlink-format default",
+            "rg --hostname-bin=./h foo",
+            "ｒｍ x.rs",
+            "r\u{200b}m x.rs",
+            "rm\u{00a0}x.rs",
+            "\u{202e}rm x.rs",
+            "ls $(rm x)",
+            "ls `rm x`",
+            "ls <(rm x)",
+            "ls >(tee y)",
+            "echo $((1))",
+            "echo \"$(rm x)\"",
+            "for f in *; do rm $f; done",
+            "while true; do rm x; done",
+            "if true; then rm x; fi",
+            "case x in x) rm x;; esac",
+            "f() { rm x; }; f",
+            "alias ls='rm'; ls",
+            "xargs rm",
+            "tee y.rs",
+            "sed -i.bak s/a/b/ x.rs",
+            "sed -i'' s/a/b/ x.rs",
+            "sed --in-place s/a/b/ x.rs",
+            "sed -ni p x.rs",
+            "sed -n 'w y' x.rs",
+            "sed -n '1,5p;1e' x.rs",
+            "sed -f script.sed x.rs",
+            "sed -n -e p x.rs",
+            "sed p x.rs",
+            "sed",
+            "echo hi | sed -i s/a/b/ x.rs",
+            "diff a b > patch",
+            "jq . a > b",
+            "cat a > /dev/null > b",
+            "cat a 2> /dev/null > b",
+            "ls > /dev/null; rm x",
+            "ls >/dev/null/../../tmp/x",
+            "ls > /dev/nullx",
+            "ls > /dev/./null",
+            "ls > ../dev/null",
+        ];
+        let mut missed = Vec::new();
+        for command in bypasses {
+            if command_cannot_change_tree(command) {
+                missed.push(*command);
+            }
+        }
+        assert!(missed.is_empty(), "classified read-only but may write: {missed:#?}");
+    }
+
+    /// Lines that really cannot change the tree stay silent, so the guard above
+    /// is not bought by building on everything.
+    #[cfg(unix)]
+    #[test]
+    fn the_classifier_keeps_real_read_only_lines_silent() {
+        let readers: &[&str] = &[
+            "git status",
+            "git log --oneline",
+            "git diff",
+            "git show HEAD",
+            "git diff --stat HEAD~1",
+            "git -C /x status",
+            "rg foo",
+            "rg -n 'a;b' src",
+            "cat a.rs",
+            "ls",
+            "ls -la src",
+            "head -n 5 a.rs",
+            "tail -f a.log",
+            "sed -n p a.rs",
+            "sed -n '1,5p' a.rs",
+            "sed -n '$p' a.rs",
+            "wc -l a.rs",
+            "echo hi",
+            "echo \"a > b\"",
+            "echo 'a | rm'",
+            "ls > /dev/null",
+            "ls 2>/dev/null",
+            "ls >/dev/null 2>&1",
+            "ls 2>&1",
+            "echo hi >&2",
+            "/bin/ls",
+            "/usr/bin/git status",
+            "git status | head",
+            "git status && git log -1",
+            "FOO=1 rg foo",
+            "pwd; ls",
+            "ls  \t ",
+        ];
+        let mut noisy = Vec::new();
+        for command in readers {
+            if !command_cannot_change_tree(command) {
+                noisy.push(*command);
+            }
+        }
+        assert!(noisy.is_empty(), "read-only lines that would build: {noisy:#?}");
+    }
+
+    /// Payloads that cannot be classified are possible writes: empty and
+    /// oversized commands, a command that is not a string, and a shell tool with
+    /// no tool_input at all.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_shell_payloads_are_possible_writes() {
+        assert!(!command_cannot_change_tree(""));
+        assert!(!command_cannot_change_tree("   \n\t"));
+        assert!(!command_cannot_change_tree(&format!("ls {}", "a".repeat(1 << 20))));
+        assert!(!command_cannot_change_tree(&format!("ls {}", "a".repeat(MAX_COMMAND_CLASSIFY_BYTES))));
+        assert!(!command_cannot_change_tree("ls 'unterminated"));
+        assert!(!command_cannot_change_tree("ls \\"));
+        for tool_input in [
+            json!(null),
+            json!({}),
+            json!({"command": 7}),
+            json!({"command": ["rm", "x"]}),
+            json!({"command": null}),
+            json!({"cmd": "rm x"}),
+        ] {
+            let lane = Lane::new("shell-unreadable", true);
+            let payload = json!({
+                "session_id": "s",
+                "hook_event_name": "PostToolUse",
+                "cwd": &lane.main,
+                "tool_name": "Bash",
+                "tool_input": tool_input,
+            })
+            .to_string()
+            .into_bytes();
+            let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+            assert_eq!(outcome.exit_code, 0, "{tool_input}: {:?}", outcome.stderr_line);
+            assert!(
+                eventually(|| lane.builds_started() == 1),
+                "{tool_input}: an unreadable shell payload must count as a possible write"
+            );
+        }
+        let lane = Lane::new("shell-no-input", true);
+        let payload = json!({
+            "session_id": "s", "hook_event_name": "PostToolUse",
+            "cwd": &lane.main, "tool_name": "Bash",
+        })
+        .to_string()
+        .into_bytes();
+        let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(eventually(|| lane.builds_started() == 1), "no tool_input: possible write");
     }
 
     /// A SessionStart catch-up and PostToolUse edits racing on one root share
