@@ -281,9 +281,15 @@ pub struct UnresolvedSite {
     pub source_file: String,
     pub source_symbol: String,
     pub callee_name: String,
+    /// The receiver expression, copied out of the file (a content-bearing
+    /// key). Empty when `withheld` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
     pub classification: String,
+    /// `"secret_path"` when `source_file` is a secret path and the receiver
+    /// text was blanked; absent otherwise. Same convention as the hit builders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// JSON keys, in any `--json` answer or MCP envelope, whose string values are
@@ -312,6 +318,9 @@ pub const CONTENT_BEARING_KEYS: &[&str] = &[
     "signature",
     // `literals`: the constant as the file writes it.
     "value",
+    // `impact` `unresolved_namesakes.sites`: the expression a call was made on,
+    // up to 64 characters of the file. Never repeated in prose.
+    "receiver",
 ];
 
 /// Whether the string at JSON path `path` (dot-joined keys, array indices

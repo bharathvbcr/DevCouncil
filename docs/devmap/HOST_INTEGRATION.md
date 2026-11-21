@@ -224,6 +224,12 @@ list is `devmap_query::model::CONTENT_BEARING_KEYS`:
 | `source_indent` | the same hits | Whitespace the span lost on its first line. |
 | `signature` | `skeleton` items | Declaration text. |
 | `value` | `literals` sites | The constant as the file writes it. |
+| `receiver` | `impact` `unresolved_namesakes.sites` | The expression an unresolved call was made on, as the file writes it (at most 64 characters, one line). |
+
+Receiver text is published only under `receiver`. No prose field (`walk_incomplete`,
+`coverage_gap`, `note`, `notes`) embeds it: the unresolved-call samples there name
+the callee only. A site in a secret path keeps `receiver` as `""` and carries
+`"withheld": "secret_path"`, like every other content key.
 
 Every other string is metadata: names, paths, reasons, and provenance. Match on
 the path, not the bare key name: `devmap_query::model::is_content_bearing_path`

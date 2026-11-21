@@ -1502,12 +1502,20 @@ impl<'a> StoreQueryEngine<'a> {
                     namesakes.other_language_sites += 1;
                     continue;
                 }
+                let withheld = devmap_extract::secret::is_secret_path(&row.source_file)
+                    .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
+                // Same rule as the hit builders: the key stays, the text goes.
+                let receiver = match (&withheld, row.receiver) {
+                    (Some(_), Some(_)) => Some(String::new()),
+                    (_, receiver) => receiver,
+                };
                 namesakes.sites.push(UnresolvedSite {
                     source_file: row.source_file,
                     source_symbol: row.source_symbol,
                     callee_name: name.clone(),
-                    receiver: row.receiver,
+                    receiver,
                     classification: row.classification,
+                    withheld,
                 });
             }
             namesakes.names.push(name);

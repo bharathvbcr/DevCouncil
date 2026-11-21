@@ -1071,16 +1071,17 @@ pub(super) fn radius_note(
                     continue;
                 }
             }
-            if let Some(path) = row.receiver.as_deref().filter(|r| r.contains("::")) {
+            // The receiver is text copied out of the file: it decides which
+            // reason applies, but is never written into the prose. A host that
+            // gates reads on `CONTENT_BEARING_KEYS` treats every other string
+            // as metadata, and a secret path's text is withheld outright.
+            if row.receiver.as_deref().is_some_and(|r| r.contains("::")) {
                 path_sites += 1;
-                path_labels.insert(format!("{path}::{}", row.callee_name));
+                path_labels.insert(row.callee_name);
                 continue;
             }
             sites += 1;
-            labels.insert(match &row.receiver {
-                Some(receiver) => format!("{receiver}.{}", row.callee_name),
-                None => row.callee_name,
-            });
+            labels.insert(row.callee_name);
         }
     }
     let mut notes = Vec::new();
@@ -1458,7 +1459,11 @@ mod radius_note_tests {
     fn a_qualified_path_is_not_called_an_untyped_receiver() {
         let note = note_for(Some("gitpulse_lib::hooks"));
         assert!(note.contains("not mapped to an indexed root"), "{note}");
-        assert!(note.contains("gitpulse_lib::hooks::dispatch"), "{note}");
+        assert!(note.contains("(dispatch)"), "{note}");
+        assert!(
+            !note.contains("gitpulse_lib"),
+            "receiver text is not prose: {note}"
+        );
         assert!(
             !note.contains("an untyped receiver, a local binding"),
             "{note}"
@@ -1468,6 +1473,10 @@ mod radius_note_tests {
     #[test]
     fn a_value_receiver_keeps_the_untyped_receiver_reason() {
         let note = note_for(Some("state"));
+        assert!(
+            !note.contains("state."),
+            "receiver text is not prose: {note}"
+        );
         assert!(
             note.contains("an untyped receiver, a local binding"),
             "{note}"

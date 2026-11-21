@@ -221,7 +221,7 @@ type Inputs struct {
 // DefaultRustExcludes is rust.yml's `--exclude` list for its `Test` step: the
 // analysis-plane crates that analysis-plane.yml tests. The universe of this
 // job's full suite is the workspace less these, exactly as rust.yml's.
-var DefaultRustExcludes = []string{"dc-glob", "dc-proc", "dc-redact", "dc-grep", "dc-store", "dc-verify", "dc-evidence"}
+var DefaultRustExcludes = []string{"dc-glob", "dc-proc", "dc-redact", "dc-redact-cli", "dc-grep", "dc-store", "dc-verify", "dc-evidence"}
 
 const (
 	maxSeedsKept   = 100

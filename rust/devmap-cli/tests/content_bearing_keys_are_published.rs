@@ -20,6 +20,10 @@ const BODY_TOKEN: &str = "bodytoken_zq81";
 const LITERAL_TOKEN: &str = "literaltoken_zq82";
 const SIGNATURE_TOKEN: &str = "sigtoken_zq83";
 const SECRET_TOKEN: &str = "secrettoken_zq84";
+/// A call's receiver is the expression the call was made on, copied out of the
+/// file (up to 64 characters), in an ordinary file and in a secret path.
+const RECEIVER_TOKEN: &str = "rcvtoken_zq93";
+const SECRET_RECEIVER_TOKEN: &str = "secrettoken_zq97";
 
 const SOURCES: &[(&str, &str)] = &[
     ("go.mod", "module fx\n\ngo 1.22\n"),
@@ -34,6 +38,14 @@ const SOURCES: &[(&str, &str)] = &[
     (
         "src/app_test.go",
         "package src\n\nimport \"testing\"\n\nfunc TestMain1(t *testing.T) {\n\tMain()\n}\n",
+    ),
+    (
+        "src/recv.rs",
+        "pub fn resolve_with(v: u8) -> u8 {\n    v\n}\n\npub fn plain(v: u8) -> u8 {\n    External { key: \"rcvtoken_zq93\" }.resolve_with(v)\n}\n",
+    ),
+    (
+        "secrets/keys.rs",
+        "pub fn unseal() -> u8 {\n    Vault { token: \"secrettoken_zq97\" }.resolve_with(1)\n}\n",
     ),
     (
         "secrets/vault.go",
@@ -152,7 +164,14 @@ fn carried(value: &Value, tokens: &[&str]) -> Vec<String> {
         .collect()
 }
 
-const ALL_TOKENS: &[&str] = &[BODY_TOKEN, LITERAL_TOKEN, SIGNATURE_TOKEN, SECRET_TOKEN];
+const ALL_TOKENS: &[&str] = &[
+    BODY_TOKEN,
+    LITERAL_TOKEN,
+    SIGNATURE_TOKEN,
+    SECRET_TOKEN,
+    RECEIVER_TOKEN,
+    SECRET_RECEIVER_TOKEN,
+];
 
 /// The walker is only worth anything if it can fail: file text under an
 /// unlisted key is reported, under a listed key it is not.
@@ -175,6 +194,14 @@ fn file_text_appears_only_under_published_content_keys() {
         ("explore OpenVault", json(&root, &["explore", "OpenVault"])),
         ("impact LoadConfig", json(&root, &["impact", "LoadConfig"])),
         ("impact OpenVault", json(&root, &["impact", "OpenVault"])),
+        (
+            "impact resolve_with",
+            json(&root, &["impact", "resolve_with"]),
+        ),
+        (
+            "explore resolve_with",
+            json(&root, &["explore", "resolve_with"]),
+        ),
         ("trace", json(&root, &["trace", "Main", "OpenVault"])),
         ("affected", json(&root, &["affected", "LoadConfig"])),
         (
@@ -199,6 +226,11 @@ fn file_text_appears_only_under_published_content_keys() {
     assert!(!carried(by("ask --evidence"), &[BODY_TOKEN, LITERAL_TOKEN]).is_empty());
     assert!(!carried(by("skeleton"), &[SIGNATURE_TOKEN]).is_empty());
     assert!(!carried(by("literals"), &[LITERAL_TOKEN]).is_empty());
+    // A receiver is file text and is published as such.
+    assert_eq!(
+        carried(by("impact resolve_with"), &[RECEIVER_TOKEN]),
+        vec!["$.unresolved_namesakes.sites.receiver".to_string()]
+    );
     // Graph answers carry no content key at all.
     for label in ["impact LoadConfig", "trace", "affected"] {
         let mut found = Vec::new();
@@ -271,6 +303,41 @@ fn a_secret_path_definition_carries_the_withheld_marker_and_a_normal_one_does_no
         assert!(
             !answer.to_string().contains(SECRET_TOKEN),
             "secret text reached the answer"
+        );
+    }
+}
+
+/// An unresolved site in a secret path keeps its (empty) receiver and says why;
+/// one in an ordinary file carries the receiver text and no marker. No prose in
+/// the answer repeats either.
+#[test]
+fn a_secret_path_receiver_is_withheld_and_an_ordinary_one_is_published() {
+    let root = fixture();
+    let impact = json(&root, &["impact", "resolve_with"]);
+    let sites = impact["unresolved_namesakes"]["sites"].as_array().unwrap();
+    let secret = sites
+        .iter()
+        .find(|site| site["source_file"] == "secrets/keys.rs")
+        .unwrap_or_else(|| panic!("no unresolved site in secrets/keys.rs: {impact}"));
+    assert_eq!(secret["receiver"], "", "{secret}");
+    assert_eq!(secret["withheld"], "secret_path", "{secret}");
+    let plain = sites
+        .iter()
+        .find(|site| site["source_file"] == "src/recv.rs")
+        .unwrap_or_else(|| panic!("no unresolved site in src/recv.rs: {impact}"));
+    assert!(
+        plain["receiver"].as_str().unwrap().contains(RECEIVER_TOKEN),
+        "{plain}"
+    );
+    assert!(plain.get("withheld").is_none(), "{plain}");
+    for answer in [
+        &impact,
+        &json(&root, &["ask", "--evidence", "resolve with"]),
+        &json(&root, &["explore", "resolve_with"]),
+    ] {
+        assert!(
+            !answer.to_string().contains(SECRET_RECEIVER_TOKEN),
+            "secret receiver text reached the answer: {answer}"
         );
     }
 }

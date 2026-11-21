@@ -490,7 +490,7 @@ func TestTheFullSuiteIsTheWorkspaceLessTheExcludesAndEveryGoPackage(t *testing.T
 	if len(p.Full) != 2 {
 		t.Fatalf("full = %+v", p.Full)
 	}
-	want := "cargo test --locked --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --no-fail-fast"
+	want := "cargo test --locked --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-redact-cli --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --no-fail-fast"
 	if p.Full[0].Display != want || p.Full[0].Dir != "rust" || p.Full[0].Log == "" {
 		t.Errorf("rust full = %+v", p.Full[0])
 	}
