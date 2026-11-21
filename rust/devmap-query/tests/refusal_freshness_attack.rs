@@ -829,3 +829,34 @@ fn p2c_preview_on_an_empty_store_says_no_generation() {
         r.broken_callers.source_freshness
     );
 }
+
+// Probe 8 (resolver-stale): a tree that matches the stored hashes over edges an
+// older resolver wrote is never `fresh: true` on any surface, success or refusal,
+// and every surface still carries exactly the store's own verdict.
+#[test]
+fn p8_a_resolver_stale_base_is_never_fresh_on_any_surface() {
+    let dir = tmp_dir("p8-db");
+    let db = dir.join("devmap.sqlite");
+    let fx = fixture("p8", Some(&db));
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', '0')",
+                [],
+            )
+            .unwrap();
+        assert!(changed > 0, "precondition: a generation to age");
+    }
+    let status = fx.store.status(&db.to_string_lossy()).unwrap();
+    eprintln!("status: {:?}", status.source_freshness);
+    let want = expected(&fx.store);
+    assert_ne!(want.fresh, Some(true), "the store itself says fresh over a stale resolver: {want:?}");
+    let engine = StoreQueryEngine::new(&fx.store);
+    let (seen, _) = sweep(&engine);
+    assert!(!seen.is_empty());
+    assert_all_match(&seen, &want, "resolver-stale");
+    for (name, row_refused, f) in flagged_surfaces(&engine) {
+        assert_ne!(f.fresh, Some(true), "{name} (refused={row_refused}): {f:?}");
+    }
+}

@@ -464,3 +464,28 @@ fn an_unretained_generation_is_none_for_a_long_key_list() {
         .unwrap()
         .is_none());
 }
+
+/// No keys is an empty answer for a retained generation, and a list that is one
+/// key repeated past the chunk size is that key once, with its own rows once.
+#[test]
+fn an_empty_key_list_and_a_repeated_key_are_answered_once() {
+    let (store, [first, _]) = two_generations();
+    let none = store
+        .unresolved_sites_naming(first, &[], 100)
+        .unwrap()
+        .expect("a retained generation answers an empty list");
+    assert!(none.is_empty());
+    let reference = store
+        .unresolved_sites_naming(first, &strings(&["hub"]), 100)
+        .unwrap()
+        .unwrap();
+    for total in [Store::MAX_CALLER_BATCH, Store::MAX_CALLER_BATCH + 1, 1_500] {
+        let keys = vec!["hub".to_string(); total];
+        let answer = store
+            .unresolved_sites_naming(first, &keys, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.len(), 1, "{total}");
+        assert_eq!(answer["hub"], reference["hub"], "{total}: rows doubled or lost");
+    }
+}
