@@ -1611,11 +1611,22 @@ generation {latest}; run `devmap status` to re-verify",
         let (sender, receiver) = std::sync::mpsc::channel();
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
-                #[cfg(test)]
-                if let Some(probe) = &probe {
-                    probe(&cancel);
-                }
-                let _ = sender.send(self.source_snapshot_mismatch(generation, Some(&cancel)));
+                // A panic in the walk must end as a refused verdict, not
+                // unwind through the scope into the query while the gate is
+                // held (which would panic the caller and poison the gate).
+                let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if let Some(probe) = &probe {
+                        probe(&cancel);
+                    }
+                    self.source_snapshot_mismatch(generation, Some(&cancel))
+                }))
+                .unwrap_or_else(|_| {
+                    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other("the walk panicked"),
+                    )))
+                });
+                let _ = sender.send(walked);
             });
             match receiver.recv_timeout(budget) {
                 Ok(Ok((Some(fresh), reason, _))) => Ok((fresh, reason)),
@@ -3109,6 +3120,124 @@ mod lazy_source_verification {
         let verdict = f.store.query_source_freshness();
         assert_eq!(verdict.fresh, None, "{verdict:?}");
         assert_eq!(walks(&f.store), 0);
+    }
+
+    // ---- adversarial probes (atk/wave-a-fresh-seed) ----
+
+    /// Query-time state a probe needs: lazy walk gate with a probe and budget.
+    fn arm(store: &Store, budget: std::time::Duration, probe: impl Fn(&AtomicBool) + Send + Sync + 'static) {
+        let mut gate = store.lazy_walk.lock().expect("gate");
+        gate.budget = Some(budget);
+        gate.probe = Some(Arc::new(probe));
+    }
+
+    #[test]
+    fn a_walk_that_panics_does_not_panic_the_query_poison_the_gate_or_stamp_a_verdict() {
+        let f = indexed("panic");
+        arm(&f.store, std::time::Duration::from_secs(5), |_| {
+            panic!("the walk blew up")
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f.store.query_source_freshness()
+        }));
+        let verdict = outcome.expect("a panicking walk must not panic the query");
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        assert!(
+            f.store.lazy_walk.lock().is_ok(),
+            "a panicking walk poisoned the gate"
+        );
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("lazy re-verification"), "{reason}");
+    }
+
+    #[test]
+    fn a_generation_written_during_the_walk_is_never_certified_fresh() {
+        let f = indexed("moved");
+        let store_ptr = &f.store as *const Store as usize;
+        arm(&f.store, std::time::Duration::from_secs(5), move |_| {
+            // SAFETY: the store outlives the scoped walk thread.
+            let store = unsafe { &*(store_ptr as *const Store) };
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json) VALUES (99, 1.0, 'x', '{}')",
+                [],
+            )
+            .expect("generation");
+        });
+        let verdict = f.store.query_source_freshness();
+        assert_ne!(verdict.fresh, Some(true), "{verdict:?}");
+        let again = f.store.query_source_freshness();
+        assert_ne!(again.fresh, Some(true), "{again:?}");
+    }
+
+    #[test]
+    fn a_stale_verdict_is_not_upgraded_by_a_walk_that_did_not_decide() {
+        let _reset = ResetClock;
+        let f = indexed("stale-undecided");
+        std::fs::write(f.root.join("a.py"), "def a():\n    return 2\n").expect("edit");
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 2);
+        assert_eq!(f.store.query_source_freshness().fresh, Some(false));
+        // The tree is repaired, but the next walk is cancelled before it can say so.
+        std::fs::write(f.root.join("a.py"), "def a():\n    return 1\n").expect("revert");
+        arm(&f.store, std::time::Duration::ZERO, |cancel| {
+            while !cancel.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 4);
+        let verdict = f.store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(false), "{verdict:?}");
+        assert!(verdict.reason.expect("reason").contains("cancelled"));
+    }
+
+    #[test]
+    fn a_deleted_source_file_is_never_fresh_at_the_lazy_walk() {
+        let f = indexed("deleted");
+        std::fs::remove_file(f.root.join("a.py")).expect("delete");
+        let verdict = f.store.query_source_freshness();
+        assert_ne!(verdict.fresh, Some(true), "{verdict:?}");
+    }
+
+    #[test]
+    fn sixty_four_concurrent_queries_across_two_stores_walk_once_each() {
+        let a = indexed("many-a");
+        let b = indexed("many-b");
+        let barrier = std::sync::Barrier::new(64);
+        let verdicts: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..64)
+                .map(|n| {
+                    let store = if n % 2 == 0 { &a.store } else { &b.store };
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.query_source_freshness()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("query")).collect()
+        });
+        assert_eq!(walks(&a.store), 1);
+        assert_eq!(walks(&b.store), 1);
+        assert!(verdicts.iter().all(|v| v.fresh == Some(true)), "{verdicts:?}");
+    }
+
+
+    #[test]
+    fn a_watcher_that_dies_mid_session_lets_the_verdict_age_out_and_re_walk() {
+        let _reset = ResetClock;
+        let f = indexed("watcher-dies");
+        f.store.set_watcher_live(true);
+        let id = f.store.latest_generation_id().expect("read").expect("id");
+        f.store.remember_source_freshness(id, Some(true), None);
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 10);
+        assert_eq!(f.store.query_source_freshness().fresh, Some(true));
+        assert_eq!(walks(&f.store), 0, "a watched verdict needs no walk");
+        f.store.set_watcher_live(false);
+        // The cached verdict was watcher-backed; with the watcher gone the age
+        // bound applies again, and the next query walks to re-verify.
+        let verdict = f.store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
+        assert_eq!(walks(&f.store), 1);
     }
 }
 
