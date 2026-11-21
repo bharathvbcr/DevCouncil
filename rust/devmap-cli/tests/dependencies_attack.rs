@@ -55,6 +55,8 @@ fn strip_volatile(mut v: serde_json::Value) -> serde_json::Value {
     if let Some(o) = v.as_object_mut() {
         o.remove("source_freshness");
         o.remove("tokens_used");
+        // Stamped by the transport (CLI and MCP both), never by the engine.
+        o.remove("repository");
     }
     v
 }

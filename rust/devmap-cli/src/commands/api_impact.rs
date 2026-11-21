@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::cli::{default_root_hint, root_parser, Cli};
 use crate::commands::routes::{repo_root_for, report_scan, scan_budget};
-use crate::output::{emit_json, open_for_read};
+use crate::output::{emit_store_answer, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "ApiImpact")]
@@ -30,7 +30,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let root = repo_root_for(&store, path)?;
     let impact = devmap_query::api_routes::api_impact(&root, &graph, &budget, route);
     if cli.json {
-        emit_json(cli, &impact)?;
+        emit_store_answer(cli, &store, impact)?;
     } else {
         report_api_impact(&impact);
     }

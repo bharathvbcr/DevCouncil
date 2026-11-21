@@ -72,6 +72,32 @@ pub struct RepositoryRef {
 }
 
 impl RepositoryRef {
+    /// The repository a CLI read command answered from, in the shape the MCP
+    /// envelope reports it. `store` is the path the command actually opened
+    /// (the caller owns that fact; nothing is re-resolved here). `explicit_db`
+    /// pins the store and the root is inferred from it, as a pinned MCP server
+    /// does; `explicit_root` is `--root`; neither means the working directory.
+    pub fn for_cli_read(
+        store: &Path,
+        root_hint: &Path,
+        explicit_root: bool,
+        explicit_db: bool,
+    ) -> RepositoryRef {
+        let store = canonicalize_path(store);
+        if explicit_db {
+            return RepositoryRef {
+                root: infer_root_from_store(&store),
+                store,
+                resolved_from: "db",
+            };
+        }
+        RepositoryRef {
+            root: canonicalize_path(root_hint),
+            store,
+            resolved_from: if explicit_root { "root" } else { "cwd" },
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "root": self.root.display().to_string(),
