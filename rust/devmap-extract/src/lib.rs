@@ -127,7 +127,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 pub use gomod::{
-    collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
+    collect_go_modules, collect_project_manifests, collect_project_manifests_cancellable,
+    git_worktree_root, go_dirs_with_unindexed_files,
     is_resolution_input_name, parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings,
     ProjectManifests, RustCrateManifest, RustDependency,
 };

@@ -1,6 +1,6 @@
 use super::{
-    refusal, sidecar_links, GenerationChecks, ReaderMemory, SidecarLinks, Store, WriterLock,
-    CONNECTION_SETUP,
+    refusal, sidecar_links, GenerationChecks, LazyWalk, ReaderMemory, SidecarLinks, Store,
+    WriterLock, CONNECTION_SETUP,
 };
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
@@ -350,6 +350,9 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only: true,
             full_text_damage,
@@ -461,6 +464,17 @@ impl Store {
         let _setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // A store is being created at `path`: the consumer sidecars beside it
+        // (`.csr`, `.artifacts.json`) were written by an earlier store at this
+        // path, never by this one, and each describes the store it sat beside.
+        // Readers accept a CSR on its generation number alone, so an orphan
+        // stamped with the new store's generation would be served as its graph.
+        if matches!(
+            std::fs::symlink_metadata(path),
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            Self::remove_foreign_sidecars(path)?;
+        }
         let mut conn = Connection::open(path)?;
         Self::harden_connection(&conn)?;
         let store = path.display().to_string();
@@ -527,11 +541,34 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only,
             full_text_damage: None,
             repo_root_override: None,
         })
+    }
+
+    /// Unlink each consumer sidecar of the not-yet-created store `db_path`. A
+    /// symlink is unlinked, never followed; an absent sidecar is fine and any
+    /// other failure is returned, because a store created beside an orphan it
+    /// could not remove would be served the orphan.
+    fn remove_foreign_sidecars(db_path: &Path) -> Result<()> {
+        for suffix in crate::seed::STORE_SIDECARS {
+            let sidecar = crate::seed::sidecar(db_path, suffix);
+            crate::seed::remove_file_if_present(&sidecar).map_err(|error| {
+                refusal(format!(
+                    "a new devmap store at {} would sit beside {}, which an earlier store left \
+                     and which describes that store, not this one; it could not be removed: \
+                     {error:#}",
+                    db_path.display(),
+                    sidecar.display()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// `SQLITE_READONLY_DIRECTORY`: the database is read-only because the
@@ -664,10 +701,17 @@ impl Store {
         };
         // Schema 7 is the first that records an owner. Older than that, and a
         // version this kernel cannot migrate, are reported by the open itself.
-        if stamped < 7 || !Self::schema_is_migratable(stamped) {
+        // Stamp 0 is read for whatever owner record the file already holds.
+        if (stamped != 0 && stamped < 7) || !Self::schema_is_migratable(stamped) {
             return Ok(());
         }
-        match Self::stored_repo_root(&conn, stamped) {
+        let owner_schema = match Self::owner_schema_of(&conn, stamped) {
+            Ok(Some(schema)) => schema,
+            Ok(None) => return Ok(()),
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
+            Err(_) => return Ok(()),
+        };
+        match Self::stored_repo_root(&conn, owner_schema) {
             Ok(_) => Ok(()),
             Err(error) => Err(error),
         }
@@ -1272,6 +1316,9 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only: true,
             full_text_damage: None,
@@ -1292,6 +1339,9 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: None,
             read_only: false,
             full_text_damage: None,

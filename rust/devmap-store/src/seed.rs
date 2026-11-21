@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
+use devmap_extract::paths::csr_path_for_store;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+
+use crate::csr::CsrGraphReader;
 
 /// How the staged file was produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +49,14 @@ impl SeedMethod {
         }
     }
 }
+
+/// The sidecars that follow a store: its CSR graph and the artifact stamp the
+/// manifest writes beside it. Each describes the one store it sits beside.
+pub const STORE_SIDECARS: [&str; 2] = [".csr", ".artifacts.json"];
+
+/// The SQLite files that follow a store while it is open or after a crash.
+/// A left-over one is replayed into whatever store is next placed beside it.
+pub const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// `path` with `suffix` appended to its file name (`devmap.sqlite` + `-wal`).
 pub fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -681,6 +692,87 @@ pub fn settle_staged(staged: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What became of a donor's CSR sidecar when it was staged beside a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DonorCsr {
+    /// The staged copy is a CSR stamped with the generation it was checked
+    /// against, and is kept.
+    Kept,
+    /// Nothing was placed: the donor has no regular CSR file, or a sidecar of
+    /// unknown generation already sits at the staged path.
+    Absent,
+    /// The staged copy was unreadable or stamped for another generation (an
+    /// orphan left by an earlier store at the donor's path) and was removed.
+    Rejected { reason: String },
+}
+
+/// Copy `donor_csr` to `staged_csr` and keep that copy only if it is a CSR
+/// stamped with `generation`. The copy, not the donor's path, is what is
+/// checked, so a donor renamed or rewritten after the copy cannot be placed
+/// unchecked. Readers accept a sidecar on its generation number alone, so a
+/// copy stamped for another store's generation would be served as this store's
+/// graph. A rejected copy is removed; the caller decides what replaces it.
+///
+/// This is the one place a donor CSR is copied: `devmap seed`,
+/// `build --seed-from` and the stacked base's provisioning all go through it.
+pub fn copy_donor_csr_checked(
+    donor_csr: &Path,
+    staged_csr: &Path,
+    generation: u32,
+) -> Result<DonorCsr> {
+    let copied = seed_artifact(donor_csr, staged_csr)
+        .with_context(|| format!("cannot stage CSR sidecar from {}", donor_csr.display()))?
+        .is_some();
+    if !copied {
+        return Ok(DonorCsr::Absent);
+    }
+    let reason = match CsrGraphReader::open_mmap(staged_csr) {
+        Ok(reader) if reader.generation() == u64::from(generation) => return Ok(DonorCsr::Kept),
+        Ok(reader) => format!(
+            "it is stamped for generation {}, not {generation}",
+            reader.generation()
+        ),
+        Err(error) => format!("it is unreadable ({error:#})"),
+    };
+    remove_file_if_present(staged_csr)?;
+    Ok(DonorCsr::Rejected { reason })
+}
+
+/// Give a staged store a CSR sidecar: the donor's when it passes
+/// [`copy_donor_csr_checked`], otherwise a fresh one written from the staged
+/// store. Returns what happened to the donor's, so the caller can say so.
+pub fn stage_donor_csr(
+    staged_store: &crate::Store,
+    donor_csr: &Path,
+    staged_db: &Path,
+) -> Result<DonorCsr> {
+    let Some(latest) = staged_store.latest_generation_id()? else {
+        return Ok(DonorCsr::Absent);
+    };
+    let outcome = copy_donor_csr_checked(donor_csr, &csr_path_for_store(staged_db), latest)?;
+    if outcome != DonorCsr::Kept {
+        staged_store.write_latest_csr_sidecar_strict()?;
+    }
+    Ok(outcome)
+}
+
+/// The generation a CSR sidecar is stamped with, read through the descriptor
+/// the caller holds (so a path swapped after the open cannot answer for it).
+pub fn csr_generation_of_open_file(file: &std::fs::File) -> Result<u64> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut offset = 0u64;
+    loop {
+        let n = read_file_at(file, &mut buf, offset).context("cannot read the CSR sidecar")?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        offset += n as u64;
+    }
+    Ok(CsrGraphReader::from_bytes(bytes)?.generation())
 }
 
 #[cfg(test)]

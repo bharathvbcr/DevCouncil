@@ -36,6 +36,23 @@ impl<T> Drop for AbortTaskOnDrop<T> {
     }
 }
 
+/// Marks the store watcher-live while the daemon's file watcher runs, and
+/// clears the mark when the daemon leaves, however it does.
+struct WatcherLive(Arc<Store>);
+
+impl WatcherLive {
+    fn mark(store: &Arc<Store>) -> Self {
+        store.set_watcher_live(true);
+        Self(Arc::clone(store))
+    }
+}
+
+impl Drop for WatcherLive {
+    fn drop(&mut self) {
+        self.0.set_watcher_live(false);
+    }
+}
+
 /// Abort the IPC task and *wait* for it to be gone.
 ///
 /// `abort()` only schedules the task's future to be dropped, and the socket
@@ -1900,6 +1917,10 @@ impl Daemon {
             },
             watch_backlog,
         )?;
+        // From here an edit the watcher sees queues a path and ends the
+        // store's remembered freshness verdict, so verdicts remembered now are
+        // not aged out. The guard clears it however this loop leaves.
+        let _watching = WatcherLive::mark(&self.store);
 
         #[cfg(unix)]
         let mut ipc_task = AbortTaskOnDrop({
@@ -6541,6 +6562,37 @@ mod tests {
             "{walks} freshness walks over {drains} drains from {EDITS} edits"
         );
         assert!(verified.is_ok(), "the settled tree never read fresh:true");
+    }
+
+    /// The 60 s age bound is for verdicts no watcher backs. A daemon marks its
+    /// store watcher-live for as long as its watcher runs, so the verdicts its
+    /// drains certify are exempt from the bound, and the mark is gone once it
+    /// has left (the store-level tests advance the clock past the bound).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_daemon_marks_its_store_watcher_live_and_clears_it_on_exit() {
+        let (daemon, task, root) =
+            freshness_fixture("watcher-live", Duration::from_millis(20), None, false).await;
+        let store = Arc::clone(&daemon.store);
+        assert!(
+            store.watcher_live(),
+            "the watcher is running, so the store must say a watcher backs its verdicts"
+        );
+        wait_for_drained_generation(&store).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while store.query_source_freshness().fresh != Some(true) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the settled tree never read fresh:true");
+        daemon.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !store.watcher_live(),
+            "a daemon that has left must not leave its store marked as watched"
+        );
     }
 
     /// A shutdown that arrives while a walk is running must not wait for it.

@@ -48,6 +48,25 @@ fn corpus() -> Arc<StoreSlot> {
     Arc::new(StoreSlot::ready("in-memory", corpus_store()))
 }
 
+/// Removes every `verified_age_ms`: the moment a verdict was read differs
+/// between two transports even when both report the same verdict.
+fn strip_verified_age(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("verified_age_ms");
+            map.values_mut().for_each(strip_verified_age);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_verified_age),
+        Value::String(text) if text.starts_with('{') || text.starts_with('[') => {
+            if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
+                strip_verified_age(&mut inner);
+                *text = inner.to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn call(store: &Arc<StoreSlot>, tool: &str, arguments: Value) -> Value {
     let frame = json!({
         "jsonrpc": "2.0",
@@ -515,8 +534,12 @@ async fn the_two_transports_answer_the_same_question_identically() {
             object.remove("candidate_roots");
             object.remove("ambiguous");
         }
+        let mut socket_body = envelope["result"].clone();
+        // The age is when each transport read the verdict, not what it says.
+        strip_verified_age(&mut mcp_body);
+        strip_verified_age(&mut socket_body);
         assert_eq!(
-            mcp_body, envelope["result"],
+            mcp_body, socket_body,
             "{tool} answered differently on the two transports"
         );
     }

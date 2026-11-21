@@ -69,11 +69,17 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 /// Every `source_freshness` object anywhere in `value`, serialised and sorted.
+/// `verified_age_ms` is when each process read its verdict, not what it says, so
+/// it is dropped before comparing.
 fn freshness_objects(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, inner) in map {
                 if key == "source_freshness" {
+                    let mut inner = inner.clone();
+                    if let Some(object) = inner.as_object_mut() {
+                        object.remove("verified_age_ms");
+                    }
                     out.push(inner.to_string());
                 } else {
                     freshness_objects(inner, out);
