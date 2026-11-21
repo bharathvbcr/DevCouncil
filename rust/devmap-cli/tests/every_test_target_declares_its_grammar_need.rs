@@ -152,9 +152,13 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",
+            // Both compile feature-off, checked with
+            // `cargo check -p devmap-store --no-default-features --all-targets`.
+            "a_donor_csr_is_kept_only_for_the_generation_it_was_checked_against",
             // Store opens and the WAL lock protocol; no extraction anywhere.
             "a_second_open_keeps_the_first_connections_locks",
             "a_refusal_names_its_reason_not_a_parameter",
+            "a_store_created_beside_foreign_sidecars_removes_them",
             "adversarial_store_without_grammars",
             // The mapped-CSR reader and writer tests and the reader memory
             // bound: store files and sidecars only. Verified with
