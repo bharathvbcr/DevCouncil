@@ -445,6 +445,10 @@ pub(crate) fn store_status_fields(
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
+        // The structured half of the head clause in `degraded_reason`: the
+        // commit the generation was built from, `"unavailable"` when git could
+        // not say, `null` with no generation. Same field as the daemon's.
+        "head_sha": store.latest_generation_head_sha()?,
         // The structured half of the full-text clause in `degraded_reason`,
         // from the probe `devmap build` runs: a reader must not parse prose to
         // learn that `search` will fail.

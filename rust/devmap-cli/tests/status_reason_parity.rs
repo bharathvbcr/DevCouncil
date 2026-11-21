@@ -468,6 +468,74 @@ fn p7_mcp_devmap_status_carries_the_cli_degraded_reason() {
     }
 }
 
+/// Rewrites the latest generation's head stamp, as a build does when
+/// `git rev-parse HEAD` fails (`"unavailable"`).
+fn stamp_head(db: &Path, head: &str) {
+    Store::open(db).unwrap().restamp_latest_head(head).unwrap();
+}
+
+/// A git working tree with no commit: `git init`, whose HEAD names a branch
+/// that does not exist yet, so `git rev-parse HEAD` fails.
+fn make_unborn_git_tree(dir: &Path) {
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(init.success(), "git init failed");
+}
+
+/// Probe 8: a generation stamped `"unavailable"` inside a git tree whose HEAD
+/// file is corrupt is named by both surfaces, still reports its head, and is not
+/// a reason to auto-rebuild; outside a git tree, on an unborn branch and with a
+/// readable head, nothing is said.
+#[test]
+fn p8_an_unreadable_head_in_a_git_tree_is_named_by_cli_and_daemon() {
+    let dir = scratch("p8");
+    let db = build_store(&dir, AnalysisStatus::Ok, CLEAN);
+    stamp_head(&db, "unavailable");
+
+    let outside = cli_status(&dir, &db);
+    assert!(
+        outside["degraded_reason"].is_null(),
+        "no .git: there is no HEAD to read: {outside}"
+    );
+    assert_eq!(outside["head_sha"], json!("unavailable"), "{outside}");
+
+    // An unborn branch (`git init`, no commit) is every repository's first
+    // state, not a fault: the head field says `unavailable`, the reason is silent.
+    make_unborn_git_tree(&dir);
+    let unborn = cli_status(&dir, &db);
+    assert!(
+        unborn["degraded_reason"].is_null(),
+        "an unborn branch is ordinary: {unborn}"
+    );
+    assert_eq!(unborn["head_sha"], json!("unavailable"), "{unborn}");
+
+    // A HEAD file that names neither a branch nor an object is a corrupt lane.
+    std::fs::write(dir.join(".git/HEAD"), "garbage\n").unwrap();
+    let cli = cli_status(&dir, &db);
+    let reason = cli["degraded_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an unreadable HEAD in a git tree reads clean: {cli}"));
+    assert!(reason.contains("HEAD"), "{reason}");
+    assert_eq!(cli["head_sha"], json!("unavailable"), "{cli}");
+    assert_eq!(cli["rebuild_required"], json!(false), "{cli}");
+    assert_eq!(cli["query_ready"], json!(true), "{cli}");
+    let (daemon_reason, _) = daemon(&db, &unapplied(false));
+    assert_eq!(
+        daemon_reason.as_deref(),
+        Some(reason),
+        "daemon and CLI must say the same thing"
+    );
+
+    stamp_head(&db, "0123456789abcdef0123456789abcdef01234567");
+    let readable = cli_status(&dir, &db);
+    assert!(readable["degraded_reason"].is_null(), "{readable}");
+    assert_eq!(readable["is_fresh"], json!(true), "{readable}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Forges the latest generation's resolver stamp, as a store written by an
 /// older (or newer) devmap carries it.
 fn stamp_resolver_epoch(db: &Path, epoch: &str) {

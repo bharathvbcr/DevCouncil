@@ -1260,6 +1260,12 @@ pub fn source_delta_json(delta: &devmap_store::SourceTreeDelta) -> serde_json::V
     })
 }
 
+/// The head a build or drain stamps when `git rev-parse HEAD` cannot be read.
+///
+/// Spelled by `devmap build` and the daemon's drain as a literal of its own;
+/// this is the one place the status surfaces name it.
+pub const UNAVAILABLE_HEAD: &str = "unavailable";
+
 pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
     status.freshness_reason()
 }
@@ -1332,12 +1338,15 @@ pub fn store_degraded_reason(
     Ok(devmap_analyze::combine_reasons(
         devmap_analyze::combine_reasons(
             devmap_analyze::combine_reasons(
-                freshness.map(|reason| bounded_reason(&reason)),
-                analysis_degraded_clause(store)?,
+                devmap_analyze::combine_reasons(
+                    freshness.map(|reason| bounded_reason(&reason)),
+                    analysis_degraded_clause(store)?,
+                ),
+                budget_degraded_clause(budget_refused),
             ),
-            budget_degraded_clause(budget_refused),
+            resolver,
         ),
-        resolver,
+        head_degraded_clause(store)?,
     ))
 }
 
@@ -1366,6 +1375,80 @@ fn resolver_degraded_clause(store: &Store, freshness: Option<&str>) -> Option<St
     freshness
         .is_none_or(|text| !text.contains(reason))
         .then(|| reason.to_string())
+}
+
+/// The git directory of the working tree `root` is in: a `.git` directory in it
+/// or an ancestor, or the directory a linked worktree's `.git` file names.
+/// `None` outside a git working tree, or when the pointer cannot be followed.
+fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    root.ancestors().find_map(|dir| {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        let pointer = read_bounded(&dot_git)?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        (!target.is_empty()).then(|| dir.join(target))
+    })
+}
+
+/// The first 256 bytes of a small file as text, `None` when it cannot be read.
+fn read_bounded(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut text = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(256)
+        .read_to_end(&mut text)
+        .ok()?;
+    Some(String::from_utf8_lossy(&text).into_owned())
+}
+
+/// Whether the `HEAD` file of the git directory `git_dir` is missing or names
+/// neither a branch (`ref: ...`) nor an object id. A directory walk and a
+/// bounded read and never a git spawn, because `status` is a surface a health
+/// check polls.
+fn git_head_file_is_broken(git_dir: &std::path::Path) -> bool {
+    let Some(head) = read_bounded(&git_dir.join("HEAD")) else {
+        return true;
+    };
+    let head = head.trim();
+    let names_a_branch = head
+        .strip_prefix("ref:")
+        .is_some_and(|name| !name.trim().is_empty());
+    let names_an_object =
+        matches!(head.len(), 40 | 64) && head.bytes().all(|b| b.is_ascii_hexdigit());
+    !(names_a_branch || names_an_object)
+}
+
+/// The clause for a latest generation stamped [`UNAVAILABLE_HEAD`] inside a git
+/// working tree whose `HEAD` file is missing or malformed, which is what
+/// `git rev-parse HEAD` fails on in a corrupt lane. The commit the graph was
+/// built from is then unknown. The graph is intact and `devmap build` still
+/// indexes such a tree on purpose (the SessionStart hook runs it where git does
+/// not resolve), but `is_fresh: true, degraded_reason: null` hid the one fact
+/// only the `generations` row held. Not named, because they are ordinary:
+/// outside a git tree there is no HEAD to read, and a well-formed `HEAD` that
+/// git cannot resolve is an unborn branch, the state of every repository until
+/// its first commit (the typed `head_sha` field still says `"unavailable"`).
+/// Worded to match none of the phrases `rebuild_required_reason` keys on: a
+/// rebuild cannot cure it.
+pub fn head_degraded_clause(store: &Store) -> anyhow::Result<Option<String>> {
+    if store.latest_generation_head_sha()?.as_deref() != Some(UNAVAILABLE_HEAD) {
+        return Ok(None);
+    }
+    let Some(root) = store.latest_repo_root()? else {
+        return Ok(None);
+    };
+    let broken = git_dir_of(std::path::Path::new(&root))
+        .is_some_and(|git_dir| git_head_file_is_broken(&git_dir));
+    Ok(broken.then(|| {
+        format!(
+            "git HEAD is unreadable here, so this generation was stamped (head_sha \
+             \"{UNAVAILABLE_HEAD}\") and the commit it was built from is unknown; the graph is \
+             intact; once HEAD is repaired, run `devmap build` to restamp it"
+        )
+    }))
 }
 
 /// Appends the daemon's unapplied-edits fact to a store-level reason.
@@ -1460,6 +1543,9 @@ pub(crate) fn dispatch_with_stacked(
                 "source_freshness": status.source_freshness,
                 "analyzer_freshness": status.analyzer_freshness,
                 "degraded_reason": daemon_status_reason(store, &status, unapplied)?,
+                // The commit this generation was built from, or `"unavailable"`
+                // when git could not say; `null` with no generation.
+                "head_sha": store.latest_generation_head_sha()?,
                 "delta": status.source_delta.as_ref().map(source_delta_json),
                 "quarantined_count": status.quarantined_count,
                 // The paths behind the numbers `degraded_reason` states
@@ -3983,6 +4069,82 @@ mod tests {
             value["is_fresh"], true,
             "a built, drained store is current: {value}"
         );
+    }
+
+    /// The daemon's `status` over a generation whose HEAD could not be read.
+    ///
+    /// `devmap build` and the drain stamp `"unavailable"` when `git rev-parse
+    /// HEAD` fails, and the store answered `is_fresh: true, degraded_reason:
+    /// null` about it: the one fact that the provenance commit is unknown was
+    /// visible only in the `generations` row. Inside a git working tree that is
+    /// a fault worth naming when the checkout's `HEAD` file is itself broken;
+    /// outside one, or on an unborn branch, there is nothing to repair.
+    #[test]
+    fn a_head_that_could_not_be_read_inside_a_git_tree_is_named_by_the_daemons_status() {
+        let status_of = |store: &Store| {
+            dispatch(
+                store,
+                IpcRequest {
+                    version: PROTOCOL_VERSION,
+                    command: IpcCommand::Status,
+                },
+                &devmap_query::Cancel::new(),
+                &UnappliedEdits::default(),
+            )
+            .expect("status must answer")
+        };
+        let root = std::env::temp_dir().join(format!(
+            "devmap-protocol-head-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let store = corpus_store(4, Some(&root));
+        store.restamp_latest_head(UNAVAILABLE_HEAD).unwrap();
+
+        // Not a git tree: an unreadable HEAD is the normal case, not a fault.
+        let outside = status_of(&store);
+        assert!(
+            outside["degraded_reason"].is_null(),
+            "a tree with no .git has no HEAD to read: {outside}"
+        );
+        assert_eq!(outside["head_sha"], UNAVAILABLE_HEAD, "{outside}");
+
+        // An unborn branch is the state of every repository before its first
+        // commit: git cannot resolve HEAD, but nothing is broken.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let unborn = status_of(&store);
+        assert!(
+            unborn["degraded_reason"].is_null(),
+            "an unborn branch is ordinary: {unborn}"
+        );
+        assert_eq!(unborn["head_sha"], UNAVAILABLE_HEAD, "{unborn}");
+
+        // A HEAD file that names neither a branch nor an object is a corrupt lane.
+        std::fs::write(root.join(".git/HEAD"), "garbage\n").unwrap();
+        let inside = status_of(&store);
+        let reason = inside["degraded_reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an unreadable HEAD in a git tree reads clean: {inside}"));
+        assert!(reason.contains("HEAD"), "{reason}");
+        assert_eq!(inside["head_sha"], UNAVAILABLE_HEAD, "{inside}");
+        assert_eq!(
+            crate::root_resolve::rebuild_required_reason(Some(reason), false),
+            None,
+            "an unreadable HEAD must not read as a reason SessionStart auto-rebuilds: {reason}"
+        );
+
+        // A readable HEAD in the same tree is clean again.
+        store
+            .restamp_latest_head("0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+        let readable = status_of(&store);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(readable["degraded_reason"].is_null(), "{readable}");
+        assert_eq!(readable["is_fresh"], true, "{readable}");
     }
 }
 
