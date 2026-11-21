@@ -1400,7 +1400,8 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
         if kind.is_dir() {
             return Some(dot_git);
         }
-        let Some(pointer) = devmap_query::stat_memo::read_bounded(&dot_git, GITFILE_READ_CAP) else {
+        let Some(pointer) = devmap_query::stat_memo::read_bounded(&dot_git, GITFILE_READ_CAP)
+        else {
             return Some(dot_git);
         };
         // A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
@@ -1429,7 +1430,8 @@ const GITFILE_READ_CAP: u64 = 4096;
 /// bounded read and never a git spawn, because `status` is a surface a health
 /// check polls.
 fn git_head_file_is_broken(git_dir: &std::path::Path) -> bool {
-    let Some(head) = devmap_query::stat_memo::read_bounded(&git_dir.join("HEAD"), HEAD_READ_CAP) else {
+    let Some(head) = devmap_query::stat_memo::read_bounded(&git_dir.join("HEAD"), HEAD_READ_CAP)
+    else {
         return true;
     };
     let head = head.trim();
@@ -4444,7 +4446,10 @@ mod tests {
             )
             .unwrap();
         });
-        assert!(gitfile.is_some(), "a .git pointer past the 4096-byte cap read clean");
+        assert!(
+            gitfile.is_some(),
+            "a .git pointer past the 4096-byte cap read clean"
+        );
     }
 
     /// A `.git` file that is not a `gitdir:` pointer is a broken checkout, and

@@ -641,9 +641,16 @@ fn p10_every_reason_at_once_is_present_bounded_and_does_not_move_rebuild_require
     std::fs::write(dir.join(".git/HEAD"), "garbage\n").unwrap();
     let after = cli_status_without_git(&dir, &db);
 
-    let reason = after["degraded_reason"].as_str().expect("a reason");    let older = devmap_store::ResolverStamp::Older.reason();
-    assert!(reason.contains(older), "resolver-stale is missing: {reason}");
-    assert!(reason.contains("HEAD"), "the HEAD clause is missing: {reason}");
+    let reason = after["degraded_reason"].as_str().expect("a reason");
+    let older = devmap_store::ResolverStamp::Older.reason();
+    assert!(
+        reason.contains(older),
+        "resolver-stale is missing: {reason}"
+    );
+    assert!(
+        reason.contains("HEAD"),
+        "the HEAD clause is missing: {reason}"
+    );
     assert!(
         reason.contains("pending") || reason.contains("source change"),
         "the pending change is missing: {reason}"

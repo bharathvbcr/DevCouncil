@@ -1079,9 +1079,7 @@ fn catch_up_note(executable: &Path, root: &Path, started: Instant, budget: Durat
     // summary after it (symbols/edges/gen) must stay readable beside it.
     const LOWER_BOUND: &str = "answers are a lower bound";
     if started.elapsed() >= budget {
-        return format!(
-            "index stale, no time left to rebuild; run `devmap build` ({LOWER_BOUND})"
-        );
+        return format!("index stale, no time left to rebuild; run `devmap build` ({LOWER_BOUND})");
     }
     match detach_post_tool_root(executable, root, None) {
         Ok(_) => format!("index stale, rebuilding in the background ({LOWER_BOUND})"),
@@ -3896,15 +3894,27 @@ mod tests {
             },
         )
         .unwrap();
-        let script = cmd.get_args().nth(1).unwrap().to_string_lossy().into_owned();
-        assert!(script.starts_with("/bin/sleep 2; /bin/rm -f '/tmp/codeintel/hook-build.dirty'; "), "{script}");
+        let script = cmd
+            .get_args()
+            .nth(1)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            script.starts_with("/bin/sleep 2; /bin/rm -f '/tmp/codeintel/hook-build.dirty'; "),
+            "{script}"
+        );
         assert!(
             !script
                 .split([';', ' '])
                 .any(|word| matches!(word, "sleep" | "rm" | "touch")),
             "a bare program name in {script}"
         );
-        assert_eq!(script.matches("'/opt/devmap/bin/devmap' 'build'").count(), 2, "{script}");
+        assert_eq!(
+            script.matches("'/opt/devmap/bin/devmap' 'build'").count(),
+            2,
+            "{script}"
+        );
     }
 
     #[cfg(unix)]
@@ -5137,10 +5147,7 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     let text = session_start_context(&lane);
-                    assert!(
-                        text.contains("rebuilding in the background"),
-                        "{text:?}"
-                    );
+                    assert!(text.contains("rebuilding in the background"), "{text:?}");
                 });
             }
         });
@@ -5182,7 +5189,10 @@ mod tests {
             refused.contains("failed") && refused.contains("refusing to detach"),
             "{refused}"
         );
-        assert!(!refused.contains("rebuilding in the background"), "{refused}");
+        assert!(
+            !refused.contains("rebuilding in the background"),
+            "{refused}"
+        );
     }
 
     // ---- Attack on the hook-freshness change: forged linkage, hostile paths,
@@ -5204,7 +5214,11 @@ mod tests {
 
     #[cfg(unix)]
     fn expected_seed_args(root: &Path, main: &Path) -> String {
-        format!("--root\n{}\nbuild\n--seed-from\n{}\n", root.display(), main.display())
+        format!(
+            "--root\n{}\nbuild\n--seed-from\n{}\n",
+            root.display(),
+            main.display()
+        )
     }
 
     /// A linked worktree whose linkage is forged, in each way git's own layout
@@ -5220,8 +5234,11 @@ mod tests {
                 fs::create_dir_all(&other).unwrap();
                 fs::write(other.join(".git"), "x").unwrap();
                 let gitdir = lane.main.join(".git/worktrees/lane");
-                fs::write(gitdir.join("gitdir"), format!("{}\n", other.join(".git").display()))
-                    .unwrap();
+                fs::write(
+                    gitdir.join("gitdir"),
+                    format!("{}\n", other.join(".git").display()),
+                )
+                .unwrap();
                 None
             }),
             ("commondir names a different indexed repository", |lane| {
@@ -5230,20 +5247,36 @@ mod tests {
                 fs::create_dir_all(other.join(".devcouncil/codeintel")).unwrap();
                 fs::write(other.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
                 let gitdir = lane.main.join(".git/worktrees/lane");
-                fs::write(gitdir.join("commondir"), format!("{}\n", other.join(".git").display()))
-                    .unwrap();
+                fs::write(
+                    gitdir.join("commondir"),
+                    format!("{}\n", other.join(".git").display()),
+                )
+                .unwrap();
                 None
             }),
-            ("gitdir is not registered under a worktrees directory", |lane| {
-                let loose = lane.parent.join("loose");
-                fs::create_dir_all(&loose).unwrap();
-                fs::write(loose.join("commondir"), format!("{}\n", lane.main.join(".git").display()))
+            (
+                "gitdir is not registered under a worktrees directory",
+                |lane| {
+                    let loose = lane.parent.join("loose");
+                    fs::create_dir_all(&loose).unwrap();
+                    fs::write(
+                        loose.join("commondir"),
+                        format!("{}\n", lane.main.join(".git").display()),
+                    )
                     .unwrap();
-                fs::write(loose.join("gitdir"), format!("{}\n", lane.lane.join(".git").display()))
+                    fs::write(
+                        loose.join("gitdir"),
+                        format!("{}\n", lane.lane.join(".git").display()),
+                    )
                     .unwrap();
-                fs::write(lane.lane.join(".git"), format!("gitdir: {}\n", loose.display())).unwrap();
-                None
-            }),
+                    fs::write(
+                        lane.lane.join(".git"),
+                        format!("gitdir: {}\n", loose.display()),
+                    )
+                    .unwrap();
+                    None
+                },
+            ),
             ("the .git link is a symlink to a valid link file", |lane| {
                 let real = lane.lane.join("real-git-link");
                 fs::rename(lane.lane.join(".git"), &real).unwrap();
@@ -5253,28 +5286,51 @@ mod tests {
             ("the gitdir is a symlink loop", |lane| {
                 let looped = lane.lane.join("loop");
                 symlink(&looped, &looped).unwrap();
-                fs::write(lane.lane.join(".git"), format!("gitdir: {}\n", looped.display())).unwrap();
+                fs::write(
+                    lane.lane.join(".git"),
+                    format!("gitdir: {}\n", looped.display()),
+                )
+                .unwrap();
                 None
             }),
-            ("the .git link names another repository's registered worktree", |lane| {
-                let other = Lane::new("forge-other", true);
-                let theirs = other.main.join(".git/worktrees/lane");
-                fs::write(lane.lane.join(".git"), format!("gitdir: {}\n", theirs.display())).unwrap();
-                // Kept alive, so its scratch tree is removed after the forged hook ran.
-                Some(other)
-            }),
+            (
+                "the .git link names another repository's registered worktree",
+                |lane| {
+                    let other = Lane::new("forge-other", true);
+                    let theirs = other.main.join(".git/worktrees/lane");
+                    fs::write(
+                        lane.lane.join(".git"),
+                        format!("gitdir: {}\n", theirs.display()),
+                    )
+                    .unwrap();
+                    // Kept alive, so its scratch tree is removed after the forged hook ran.
+                    Some(other)
+                },
+            ),
         ];
         for (case, forge) in cases {
             let lane = Lane::new("forged", true);
             let _other_repository = forge(&lane);
-            for (event, tool) in [(HookEvent::PostToolUse, "Edit"), (HookEvent::SessionStart, "")] {
+            for (event, tool) in [
+                (HookEvent::PostToolUse, "Edit"),
+                (HookEvent::SessionStart, ""),
+            ] {
                 let outcome = run_hook(
                     event,
-                    &payload_at(event.as_str(), tool, &lane.lane, Some(&lane.lane.join("a.rs"))),
+                    &payload_at(
+                        event.as_str(),
+                        tool,
+                        &lane.lane,
+                        Some(&lane.lane.join("a.rs")),
+                    ),
                     &lane.exe,
                     None,
                 );
-                assert_eq!(outcome.exit_code, 0, "{case} {event:?}: {:?}", outcome.stderr_line);
+                assert_eq!(
+                    outcome.exit_code, 0,
+                    "{case} {event:?}: {:?}",
+                    outcome.stderr_line
+                );
                 let said_seeded = outcome
                     .stdout
                     .as_ref()
@@ -5288,7 +5344,10 @@ mod tests {
                 "{case}: a build was scheduled from a forged linkage"
             );
             assert_eq!(lane.builds_started(), 0, "{case}: the stand-in was started");
-            assert!(!lane.lane.join(".devcouncil").exists(), "{case}: a store was created");
+            assert!(
+                !lane.lane.join(".devcouncil").exists(),
+                "{case}: a store was created"
+            );
         }
     }
 
@@ -5297,7 +5356,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_seed_survives_hostile_worktree_paths_and_a_symlinked_entry() {
-        for name in ["my lane", "l\u{e4}ne-\u{fc}\u{6f22}", "-dash", "--root", "new\nline", "tab\tname"] {
+        for name in [
+            "my lane",
+            "l\u{e4}ne-\u{fc}\u{6f22}",
+            "-dash",
+            "--root",
+            "new\nline",
+            "tab\tname",
+        ] {
             let lane = Lane::with_names("hostile-path", true, "{}", "main", name);
             let outcome = run_hook(
                 HookEvent::PostToolUse,
@@ -5341,7 +5407,12 @@ mod tests {
         type PayloadShape = (&'static str, fn(&Lane) -> Vec<u8>);
         let shapes: [PayloadShape; 3] = [
             ("file_path in the worktree, cwd in main", |lane| {
-                payload_at("PostToolUse", "Edit", &lane.main, Some(&lane.lane.join("a.rs")))
+                payload_at(
+                    "PostToolUse",
+                    "Edit",
+                    &lane.main,
+                    Some(&lane.lane.join("a.rs")),
+                )
             }),
             ("apply_patch path in the worktree, cwd in main", |lane| {
                 json!({
@@ -5354,17 +5425,20 @@ mod tests {
                 .to_string()
                 .into_bytes()
             }),
-            ("cwd in the worktree, main named only as a workspace root", |lane| {
-                json!({
-                    "session_id": "attack",
-                    "cwd": &lane.lane,
-                    "workspace_roots": [&lane.main],
-                    "tool_name": "Bash",
-                    "tool_input": {},
-                })
-                .to_string()
-                .into_bytes()
-            }),
+            (
+                "cwd in the worktree, main named only as a workspace root",
+                |lane| {
+                    json!({
+                        "session_id": "attack",
+                        "cwd": &lane.lane,
+                        "workspace_roots": [&lane.main],
+                        "tool_name": "Bash",
+                        "tool_input": {},
+                    })
+                    .to_string()
+                    .into_bytes()
+                },
+            ),
         ];
         for (case, payload) in shapes {
             let lane = Lane::new("edit-tree", true);
@@ -5395,7 +5469,12 @@ mod tests {
         fs::write(lane.main.join("a.rs"), "fn a() {}\n").unwrap();
         let outcome = run_hook(
             HookEvent::PostToolUse,
-            &payload_at("PostToolUse", "Edit", &lane.lane, Some(&lane.main.join("a.rs"))),
+            &payload_at(
+                "PostToolUse",
+                "Edit",
+                &lane.lane,
+                Some(&lane.main.join("a.rs")),
+            ),
             &lane.exe,
             None,
         );
@@ -5424,10 +5503,20 @@ mod tests {
                 });
             }
         });
-        assert!(eventually(|| lane.builds_started() >= 1), "no seeded build started");
+        assert!(
+            eventually(|| lane.builds_started() >= 1),
+            "no seeded build started"
+        );
         fs::write(&lane.release, b"").unwrap();
-        assert!(eventually(|| !lane.lock().exists()), "the lock outlived its build");
-        assert_eq!(lane.builds_started(), 1, "the lock did not coalesce the seeds");
+        assert!(
+            eventually(|| !lane.lock().exists()),
+            "the lock outlived its build"
+        );
+        assert_eq!(
+            lane.builds_started(),
+            1,
+            "the lock did not coalesce the seeds"
+        );
     }
 
     // ---- Shell (Bash) payloads: git operations and in-place edits -----------------
@@ -5453,20 +5542,34 @@ mod tests {
     #[test]
     fn a_failed_shell_write_starts_a_build_and_a_failed_read_does_not() {
         let failure = |lane: &Lane, command: &str| {
-            let mut payload: Value = serde_json::from_slice(&shell_payload(&lane.main, command)).unwrap();
+            let mut payload: Value =
+                serde_json::from_slice(&shell_payload(&lane.main, command)).unwrap();
             payload["hook_event_name"] = json!("PostToolUseFailure");
             payload["error"] = json!("Command exited with non-zero status code 1");
             payload.to_string().into_bytes()
         };
         let lane = Lane::new("shell-failure", true);
-        let outcome = run_hook(HookEvent::PostToolUse, &failure(&lane, "git status"), &lane.exe, None);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &failure(&lane, "git status"),
+            &lane.exe,
+            None,
+        );
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
         thread::sleep(Duration::from_millis(300));
         assert_eq!(lane.builds_started(), 0, "a failed read-only command built");
 
-        let outcome = run_hook(HookEvent::PostToolUse, &failure(&lane, "git merge feature"), &lane.exe, None);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &failure(&lane, "git merge feature"),
+            &lane.exe,
+            None,
+        );
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-        assert!(eventually(|| lane.builds_started() == 1), "a failed write-shaped command started no build");
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "a failed write-shaped command started no build"
+        );
         fs::write(&lane.release, b"").unwrap();
         assert!(eventually(|| !lane.main_lock().exists()));
     }
@@ -5786,7 +5889,10 @@ mod tests {
         let stamp = state_dir(&lane.main)
             .join("codeintel")
             .join(SHELL_BUILD_STAMP);
-        assert!(shell_build_window_remaining(&lane.main).is_none(), "no stamp: open");
+        assert!(
+            shell_build_window_remaining(&lane.main).is_none(),
+            "no stamp: open"
+        );
         assert!(!stamp.exists(), "checking the window must not claim it");
         claim_shell_build_window(&lane.main);
         assert!(stamp.is_file());
@@ -6011,7 +6117,10 @@ mod tests {
                 missed.push(*command);
             }
         }
-        assert!(missed.is_empty(), "classified read-only but may write: {missed:#?}");
+        assert!(
+            missed.is_empty(),
+            "classified read-only but may write: {missed:#?}"
+        );
     }
 
     /// Lines that really cannot change the tree stay silent, so the guard above
@@ -6059,7 +6168,10 @@ mod tests {
                 noisy.push(*command);
             }
         }
-        assert!(noisy.is_empty(), "read-only lines that would build: {noisy:#?}");
+        assert!(
+            noisy.is_empty(),
+            "read-only lines that would build: {noisy:#?}"
+        );
     }
 
     /// Payloads that cannot be classified are possible writes: empty and
@@ -6070,8 +6182,14 @@ mod tests {
     fn unreadable_shell_payloads_are_possible_writes() {
         assert!(!command_cannot_change_tree(""));
         assert!(!command_cannot_change_tree("   \n\t"));
-        assert!(!command_cannot_change_tree(&format!("ls {}", "a".repeat(1 << 20))));
-        assert!(!command_cannot_change_tree(&format!("ls {}", "a".repeat(MAX_COMMAND_CLASSIFY_BYTES))));
+        assert!(!command_cannot_change_tree(&format!(
+            "ls {}",
+            "a".repeat(1 << 20)
+        )));
+        assert!(!command_cannot_change_tree(&format!(
+            "ls {}",
+            "a".repeat(MAX_COMMAND_CLASSIFY_BYTES)
+        )));
         assert!(!command_cannot_change_tree("ls 'unterminated"));
         assert!(!command_cannot_change_tree("ls \\"));
         for tool_input in [
@@ -6093,7 +6211,11 @@ mod tests {
             .to_string()
             .into_bytes();
             let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
-            assert_eq!(outcome.exit_code, 0, "{tool_input}: {:?}", outcome.stderr_line);
+            assert_eq!(
+                outcome.exit_code, 0,
+                "{tool_input}: {:?}",
+                outcome.stderr_line
+            );
             assert!(
                 eventually(|| lane.builds_started() == 1),
                 "{tool_input}: an unreadable shell payload must count as a possible write"
@@ -6108,7 +6230,10 @@ mod tests {
         .into_bytes();
         let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-        assert!(eventually(|| lane.builds_started() == 1), "no tool_input: possible write");
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "no tool_input: possible write"
+        );
     }
 
     /// The stamp and the dirty marker are files the hook creates and touches in a
@@ -6147,11 +6272,22 @@ mod tests {
             let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
             assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
         }
-        assert!(eventually(|| lane.builds_started() == 1), "a linked stamp blocked the build");
-        assert_eq!(observed(), untouched, "a link was followed out of the state directory");
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "a linked stamp blocked the build"
+        );
+        assert_eq!(
+            observed(),
+            untouched,
+            "a link was followed out of the state directory"
+        );
         fs::write(&lane.release, b"").unwrap();
         assert!(eventually(|| !lane.main_lock().exists()));
-        assert_eq!(observed(), untouched, "the build's own cleanup followed the link");
+        assert_eq!(
+            observed(),
+            untouched,
+            "the build's own cleanup followed the link"
+        );
         assert!(victim.exists());
     }
 
@@ -6203,7 +6339,11 @@ mod tests {
             edit_in_main(&lane),
         ] {
             let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
-            assert!(outcome.exit_code == 0 || outcome.exit_code == 1, "{}", outcome.exit_code);
+            assert!(
+                outcome.exit_code == 0 || outcome.exit_code == 1,
+                "{}",
+                outcome.exit_code
+            );
         }
         fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(lane.builds_started(), 0);
@@ -6304,7 +6444,9 @@ mod tests {
         type Trigger = (&'static str, fn(&Lane) -> Vec<u8>);
         let triggers: [Trigger; 2] = [
             ("edit", edit_in_main),
-            ("shell", |lane| shell_payload(&lane.main, "git merge feature")),
+            ("shell", |lane| {
+                shell_payload(&lane.main, "git merge feature")
+            }),
         ];
         for (name, trigger) in triggers {
             let lane = Lane::new("trail-running", true);
@@ -6319,7 +6461,10 @@ mod tests {
             let begun = Instant::now();
             let second = run_hook(HookEvent::PostToolUse, &trigger(&lane), &lane.exe, None);
             assert_eq!(second.exit_code, 0, "{name}: {:?}", second.stderr_line);
-            assert!(begun.elapsed() < Duration::from_secs(1), "{name}: the hook waited");
+            assert!(
+                begun.elapsed() < Duration::from_secs(1),
+                "{name}: the hook waited"
+            );
             fs::write(&lane.release, b"").unwrap();
             assert!(
                 eventually(|| snapshots(&snaps).contains("W2")),
@@ -6327,7 +6472,10 @@ mod tests {
                 snapshots(&snaps)
             );
             assert!(eventually(|| !lane.main_lock().exists()), "{name}: lock");
-            assert!(lane.builds_started() <= 2, "{name}: more than one trailing run");
+            assert!(
+                lane.builds_started() <= 2,
+                "{name}: more than one trailing run"
+            );
         }
     }
 
@@ -6348,7 +6496,10 @@ mod tests {
         let begun = Instant::now();
         let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-        assert!(begun.elapsed() < Duration::from_secs(1), "the hook waited out the window");
+        assert!(
+            begun.elapsed() < Duration::from_secs(1),
+            "the hook waited out the window"
+        );
         assert!(
             eventually(|| snapshots(&snaps).contains("W2")),
             "W2 landed inside the window and no build ever saw it: {:?}",
@@ -6364,13 +6515,23 @@ mod tests {
     #[test]
     fn trailing_runs_are_bounded_and_a_stale_marker_never_wedges() {
         let lane = Lane::new("trail-bound", true);
-        let marker = state_dir(&lane.main).join("codeintel").join(BUILD_DIRTY_MARKER);
+        let marker = state_dir(&lane.main)
+            .join("codeintel")
+            .join(BUILD_DIRTY_MARKER);
         // A stale marker from a crashed build, then a normal trigger.
         fs::create_dir_all(marker.parent().unwrap()).unwrap();
         fs::write(&marker, b"").unwrap();
         fs::write(&lane.release, b"").unwrap();
-        run_hook(HookEvent::PostToolUse, &edit_in_main(&lane), &lane.exe, None);
-        assert!(eventually(|| lane.builds_started() >= 1), "a stale marker wedged the build");
+        run_hook(
+            HookEvent::PostToolUse,
+            &edit_in_main(&lane),
+            &lane.exe,
+            None,
+        );
+        assert!(
+            eventually(|| lane.builds_started() >= 1),
+            "a stale marker wedged the build"
+        );
         assert!(eventually(|| !lane.main_lock().exists()));
         thread::sleep(Duration::from_millis(300));
         assert_eq!(lane.builds_started(), 1, "a stale marker caused a rerun");
@@ -6385,7 +6546,12 @@ mod tests {
             ),
         );
         let before = lane.builds_started();
-        run_hook(HookEvent::PostToolUse, &edit_in_main(&lane), &lane.exe, None);
+        run_hook(
+            HookEvent::PostToolUse,
+            &edit_in_main(&lane),
+            &lane.exe,
+            None,
+        );
         assert!(eventually(|| lane.builds_started() > before));
         assert!(eventually(|| !lane.main_lock().exists()));
         thread::sleep(Duration::from_millis(500));
@@ -6403,7 +6569,9 @@ mod tests {
     #[test]
     fn a_marker_set_during_the_last_rerun_is_not_left_without_a_builder() {
         let lane = Lane::new("trail-last-rerun", true);
-        let marker = state_dir(&lane.main).join("codeintel").join(BUILD_DIRTY_MARKER);
+        let marker = state_dir(&lane.main)
+            .join("codeintel")
+            .join(BUILD_DIRTY_MARKER);
         fs::create_dir_all(marker.parent().unwrap()).unwrap();
         // Runs one and two (the build and its first rerun) each dirty the tree;
         // run three does not.
@@ -6419,14 +6587,37 @@ mod tests {
                 ),
             ),
         );
-        assert_ne!(script, fs::read_to_string(&lane.exe).unwrap(), "the stand-in was not rewritten");
+        assert_ne!(
+            script,
+            fs::read_to_string(&lane.exe).unwrap(),
+            "the stand-in was not rewritten"
+        );
         fs::write(&lane.release, b"").unwrap();
-        run_hook(HookEvent::PostToolUse, &edit_in_main(&lane), &lane.exe, None);
-        assert!(eventually(|| lane.builds_started() >= 1), "no build started");
-        assert!(eventually(|| !lane.main_lock().exists()), "the lock outlived its builder");
+        run_hook(
+            HookEvent::PostToolUse,
+            &edit_in_main(&lane),
+            &lane.exe,
+            None,
+        );
+        assert!(
+            eventually(|| lane.builds_started() >= 1),
+            "no build started"
+        );
+        assert!(
+            eventually(|| !lane.main_lock().exists()),
+            "the lock outlived its builder"
+        );
         thread::sleep(Duration::from_millis(300));
-        assert!(!marker.exists(), "a marker survived its builder with {} builds run", lane.builds_started());
-        assert_eq!(lane.builds_started(), 3, "the rerun's own marker earned no further run");
+        assert!(
+            !marker.exists(),
+            "a marker survived its builder with {} builds run",
+            lane.builds_started()
+        );
+        assert_eq!(
+            lane.builds_started(),
+            3,
+            "the rerun's own marker earned no further run"
+        );
     }
 
     /// The lock a builder retakes after its post-unlock marker re-check names
@@ -6436,18 +6627,35 @@ mod tests {
     fn a_retaken_build_lock_names_its_live_owner() {
         let lane = Lane::new("retake-pid", true);
         let lock = lane.main_lock();
-        let marker = state_dir(&lane.main).join("codeintel").join(BUILD_DIRTY_MARKER);
+        let marker = state_dir(&lane.main)
+            .join("codeintel")
+            .join(BUILD_DIRTY_MARKER);
         fs::create_dir_all(marker.parent().unwrap()).unwrap();
         fs::create_dir_all(&lock).unwrap();
         let cmd = detached_shell_command(
             &lane.exe,
-            &[OsStr::new("--root"), lane.main.as_os_str(), OsStr::new("build")],
+            &[
+                OsStr::new("--root"),
+                lane.main.as_os_str(),
+                OsStr::new("build"),
+            ],
             &lock,
-            SpawnOptions { delay: None, rerun_when_dirty: true },
+            SpawnOptions {
+                delay: None,
+                rerun_when_dirty: true,
+            },
         )
         .unwrap();
-        let script = cmd.get_args().nth(1).unwrap().to_string_lossy().into_owned();
-        let unlock = format!("/bin/rm -rf {}; ", shell_single_quote(lock.to_str().unwrap()));
+        let script = cmd
+            .get_args()
+            .nth(1)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unlock = format!(
+            "/bin/rm -rf {}; ",
+            shell_single_quote(lock.to_str().unwrap())
+        );
         assert_eq!(script.matches(&unlock).count(), 1, "{script}");
         // Once, right after the lock is released: a trigger lands in the window
         // between the last in-loop test and the removal, and the next run blocks.
@@ -6467,7 +6675,10 @@ mod tests {
             .stderr(Stdio::null());
         fs::write(&lane.release, b"").unwrap();
         let mut child = shell.spawn().unwrap();
-        assert!(eventually(|| done.exists() && lane.builds_started() >= 2), "no retaken rerun");
+        assert!(
+            eventually(|| done.exists() && lane.builds_started() >= 2),
+            "no retaken rerun"
+        );
         let owner = fs::read_to_string(lock.join("pid")).unwrap_or_default();
         let pid: i32 = owner.trim().parse().unwrap_or(0);
         // The lock has been held longer than the unknown-owner grace.
@@ -6491,15 +6702,22 @@ mod tests {
     #[test]
     fn a_shell_call_that_spawned_no_builder_does_not_start_the_rate_window() {
         let lane = Lane::new("shell-no-spawn", true);
-        let stamp = state_dir(&lane.main).join("codeintel").join(SHELL_BUILD_STAMP);
+        let stamp = state_dir(&lane.main)
+            .join("codeintel")
+            .join(SHELL_BUILD_STAMP);
         let payload = shell_payload(&lane.main, "git merge feature");
         run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
-        assert!(eventually(|| lane.builds_started() == 1 && lane.main_lock().exists()));
+        assert!(eventually(
+            || lane.builds_started() == 1 && lane.main_lock().exists()
+        ));
         assert!(stamp.is_file(), "a spawned builder claims the window");
         fs::remove_file(&stamp).unwrap();
         let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-        assert!(!stamp.exists(), "a call that spawned nothing claimed the window");
+        assert!(
+            !stamp.exists(),
+            "a call that spawned nothing claimed the window"
+        );
         fs::write(&lane.release, b"").unwrap();
         assert!(eventually(|| !lane.main_lock().exists()));
     }
@@ -6511,7 +6729,12 @@ mod tests {
     fn a_session_start_catch_up_and_post_tool_builds_coalesce_onto_one_build() {
         let lane = Lane::with_status("catch-up-race", true, DRIFTED_BY_SOURCE);
         fs::write(lane.main.join("a.rs"), "fn a() {}\n").unwrap();
-        let edit = payload_at("PostToolUse", "Edit", &lane.main, Some(&lane.main.join("a.rs")));
+        let edit = payload_at(
+            "PostToolUse",
+            "Edit",
+            &lane.main,
+            Some(&lane.main.join("a.rs")),
+        );
         thread::scope(|scope| {
             for _ in 0..6 {
                 scope.spawn(|| {
@@ -6522,13 +6745,19 @@ mod tests {
                 });
             }
         });
-        assert!(eventually(|| lane.builds_started() >= 1), "no build started");
+        assert!(
+            eventually(|| lane.builds_started() >= 1),
+            "no build started"
+        );
         // While that build runs, the racers are one build; the skipped ones
         // earn one trailing run after it, never a build each.
         thread::sleep(Duration::from_millis(200));
         assert_eq!(lane.builds_started(), 1, "the racers did not share a build");
         fs::write(&lane.release, b"").unwrap();
-        assert!(eventually(|| !lane.main_lock().exists()), "the lock outlived its build");
+        assert!(
+            eventually(|| !lane.main_lock().exists()),
+            "the lock outlived its build"
+        );
         assert!(lane.builds_started() <= 2, "more than one trailing run");
     }
 
@@ -6554,37 +6783,88 @@ mod tests {
             ),
         ];
         let stays: [(&str, &str); 19] = [
-            ("freshness as a string", r#"{"query_ready":true,"source_freshness":"false","pending_count":0}"#),
-            ("pending -1", r#"{"query_ready":true,"source_freshness":true,"pending_count":-1}"#),
-            ("pending float", r#"{"query_ready":true,"source_freshness":true,"pending_count":2.5}"#),
-            ("pending 1e30", r#"{"query_ready":true,"source_freshness":true,"pending_count":1e30}"#),
-            ("pending string", r#"{"query_ready":true,"source_freshness":true,"pending_count":"3"}"#),
-            ("pending null", r#"{"query_ready":true,"source_freshness":true,"pending_count":null}"#),
-            ("query_ready string", r#"{"query_ready":"true","source_freshness":false}"#),
-            ("query_ready missing", r#"{"source_freshness":false,"pending_count":3}"#),
-            ("query_ready false", r#"{"query_ready":false,"source_freshness":false,"pending_count":3}"#),
-            ("rebuild required", r#"{"query_ready":true,"rebuild_required":true,"source_freshness":false}"#),
-            ("stacked null", r#"{"query_ready":true,"source_freshness":false,"stacked":null}"#),
-            ("stacked object", r#"{"query_ready":true,"source_freshness":false,"stacked":{"base":"x"}}"#),
-            ("fresh", r#"{"query_ready":true,"source_freshness":true,"pending_count":0}"#),
+            (
+                "freshness as a string",
+                r#"{"query_ready":true,"source_freshness":"false","pending_count":0}"#,
+            ),
+            (
+                "pending -1",
+                r#"{"query_ready":true,"source_freshness":true,"pending_count":-1}"#,
+            ),
+            (
+                "pending float",
+                r#"{"query_ready":true,"source_freshness":true,"pending_count":2.5}"#,
+            ),
+            (
+                "pending 1e30",
+                r#"{"query_ready":true,"source_freshness":true,"pending_count":1e30}"#,
+            ),
+            (
+                "pending string",
+                r#"{"query_ready":true,"source_freshness":true,"pending_count":"3"}"#,
+            ),
+            (
+                "pending null",
+                r#"{"query_ready":true,"source_freshness":true,"pending_count":null}"#,
+            ),
+            (
+                "query_ready string",
+                r#"{"query_ready":"true","source_freshness":false}"#,
+            ),
+            (
+                "query_ready missing",
+                r#"{"source_freshness":false,"pending_count":3}"#,
+            ),
+            (
+                "query_ready false",
+                r#"{"query_ready":false,"source_freshness":false,"pending_count":3}"#,
+            ),
+            (
+                "rebuild required",
+                r#"{"query_ready":true,"rebuild_required":true,"source_freshness":false}"#,
+            ),
+            (
+                "stacked null",
+                r#"{"query_ready":true,"source_freshness":false,"stacked":null}"#,
+            ),
+            (
+                "stacked object",
+                r#"{"query_ready":true,"source_freshness":false,"stacked":{"base":"x"}}"#,
+            ),
+            (
+                "fresh",
+                r#"{"query_ready":true,"source_freshness":true,"pending_count":0}"#,
+            ),
             ("no drift fields", r#"{"query_ready":true}"#),
             ("garbage", "not json at all"),
             ("empty", ""),
             ("truncated", r#"{"query_ready":true,"source_freshness":fal"#),
-            ("array", r#"[{"query_ready":true,"source_freshness":false}]"#),
+            (
+                "array",
+                r#"[{"query_ready":true,"source_freshness":false}]"#,
+            ),
             ("scalar", "false"),
         ];
         for (case, status) in fires {
             let lane = Lane::with_status("catch-up-fires", true, status);
             let text = session_start_context(&lane);
-            assert!(lane.main_lock().is_dir(), "{case}: no rebuild started: {text:?}");
+            assert!(
+                lane.main_lock().is_dir(),
+                "{case}: no rebuild started: {text:?}"
+            );
         }
         for (case, status) in stays {
             let lane = Lane::with_status("catch-up-stays", true, status);
             let text = session_start_context(&lane);
-            assert!(!lane.main_lock().exists(), "{case}: a rebuild started: {text:?}");
+            assert!(
+                !lane.main_lock().exists(),
+                "{case}: a rebuild started: {text:?}"
+            );
             assert_eq!(lane.builds_started(), 0, "{case}");
-            assert!(!text.contains("rebuilding"), "{case}: the clause claims one: {text:?}");
+            assert!(
+                !text.contains("rebuilding"),
+                "{case}: the clause claims one: {text:?}"
+            );
         }
     }
 
@@ -6622,13 +6902,19 @@ mod tests {
             let context =
                 session_start_within(&lane.exe, &selection, Duration::from_millis(600)).unwrap();
             let took = began.elapsed();
-            assert!(took < Duration::from_secs(10), "{case}: overran the budget: {took:?}");
+            assert!(
+                took < Duration::from_secs(10),
+                "{case}: overran the budget: {took:?}"
+            );
             let text = context
                 .pointer("/hookSpecificOutput/additionalContext")
                 .and_then(Value::as_str)
                 .unwrap();
             assert!(text.contains("stopped after"), "{case}: {text:?}");
-            assert!(!lane.main_lock().exists(), "{case}: a catch-up started past the budget");
+            assert!(
+                !lane.main_lock().exists(),
+                "{case}: a catch-up started past the budget"
+            );
             assert_eq!(lane.builds_started(), 0, "{case}");
         }
     }
@@ -6640,8 +6926,12 @@ mod tests {
     fn no_event_exits_two_and_only_edits_and_session_start_build() {
         type Payload = fn(&Lane) -> Vec<u8>;
         let payloads: [(&str, Payload); 6] = [
-            ("edit in the worktree", |lane| lane.edit_payload("X", "Edit")),
-            ("search in the worktree", |lane| lane.edit_payload("X", "Grep")),
+            ("edit in the worktree", |lane| {
+                lane.edit_payload("X", "Edit")
+            }),
+            ("search in the worktree", |lane| {
+                lane.edit_payload("X", "Grep")
+            }),
             ("cwd that does not exist", |lane| {
                 let nowhere = lane.parent.join("does-not-exist");
                 payload_at("X", "Edit", &nowhere, Some(&nowhere.join("f.rs")))
@@ -6708,7 +6998,9 @@ mod tests {
             "{hostile_text:?}"
         );
         assert!(
-            !hostile_text.contains('\u{2028}') && !hostile_text.contains('\u{202e}') && !hostile_text.contains('\r'),
+            !hostile_text.contains('\u{2028}')
+                && !hostile_text.contains('\u{202e}')
+                && !hostile_text.contains('\r'),
             "{hostile_text:?}"
         );
     }
@@ -6732,9 +7024,14 @@ mod tests {
         let text = session_start_context(&lane);
         let clause = text.lines().next().unwrap();
         assert!(clause.chars().count() <= REPO_CLAUSE_CAP, "{clause}");
-        assert!(clause.contains("rebuilding"), "the drift note was cut: {clause}");
         assert!(
-            clause.contains("symbols/") && clause.contains("edges") && clause.contains("(gen 123456)"),
+            clause.contains("rebuilding"),
+            "the drift note was cut: {clause}"
+        );
+        assert!(
+            clause.contains("symbols/")
+                && clause.contains("edges")
+                && clause.contains("(gen 123456)"),
             "the status summary was cut: {clause}"
         );
     }

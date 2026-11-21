@@ -443,7 +443,10 @@ fn status_answers_over_every_combination_of_full_text_index_damage() {
         let _ = fs::remove_dir_all(&root);
     }
 
-    for tables in [&["payload_nodes"][..], &["nodes_fts_config", "payload_nodes"][..]] {
+    for tables in [
+        &["payload_nodes"][..],
+        &["nodes_fts_config", "payload_nodes"][..],
+    ] {
         let root = fixture("fts-matrix-outside");
         let db = root.join("devmap.sqlite");
         assert!(devmap_at(&root, &db, &["build", "."]).ok);

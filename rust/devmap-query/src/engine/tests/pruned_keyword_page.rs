@@ -228,7 +228,10 @@ fn a_prune_inside_the_pinned_page_snapshot_does_not_change_the_answer() {
         response.resolution
     );
     assert!(
-        response.items.iter().any(|item| item.symbol_name == "alpha"),
+        response
+            .items
+            .iter()
+            .any(|item| item.symbol_name == "alpha"),
         "the pinned generation {generation} still holds alpha"
     );
     drop(_guard);

@@ -155,12 +155,18 @@ fn a_fifo_or_a_dangling_symlink_at_a_sidecar_name_is_unlinked() {
 
     drop(Store::open(&db).unwrap());
 
-    assert!(fs::symlink_metadata(sidecar(&db, ".csr")).is_err(), "fifo survived");
+    assert!(
+        fs::symlink_metadata(sidecar(&db, ".csr")).is_err(),
+        "fifo survived"
+    );
     assert!(
         fs::symlink_metadata(sidecar(&db, ".artifacts.json")).is_err(),
         "dangling link survived"
     );
-    assert!(!dir.join("nowhere").exists(), "the dangling target was created");
+    assert!(
+        !dir.join("nowhere").exists(),
+        "the dangling target was created"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -200,7 +206,11 @@ fn a_store_created_through_a_dangling_symlink_does_not_inherit_an_orphan_csr() {
     give_generation_one(&link);
     let store = Store::open(&link).unwrap();
     if let Some(reader) = store.open_latest_csr_sidecar().unwrap() {
-        assert_eq!(reader.node_count(), 0, "an orphan CSR was served as the new store's graph");
+        assert_eq!(
+            reader.node_count(),
+            0,
+            "an orphan CSR was served as the new store's graph"
+        );
     }
     let _ = fs::remove_dir_all(dir);
 }
@@ -222,7 +232,10 @@ fn a_read_only_parent_with_an_orphan_sidecar_refuses_and_changes_nothing() {
     }
     let result = Store::open(&db);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(result.is_err(), "a store was created beside an orphan it could not remove");
+    assert!(
+        result.is_err(),
+        "a store was created beside an orphan it could not remove"
+    );
     assert!(csr.is_file(), "the orphan was changed");
     assert!(!db.exists());
     let _ = fs::remove_dir_all(dir);

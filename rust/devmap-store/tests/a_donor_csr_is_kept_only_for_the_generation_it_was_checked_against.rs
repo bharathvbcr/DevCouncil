@@ -96,7 +96,13 @@ fn a_corrupted_or_truncated_donor_csr_is_rejected_without_panicking() {
     let bytes = fs::read(&valid).unwrap();
     let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
     for offset in (0..bytes.len().min(160)).step_by(8) {
-        for word in [u64::MAX, (1u64 << 63) - 1, 0, 1 << 32, u64::from(u32::MAX) + 1] {
+        for word in [
+            u64::MAX,
+            (1u64 << 63) - 1,
+            0,
+            1 << 32,
+            u64::from(u32::MAX) + 1,
+        ] {
             let mut mutated = bytes.clone();
             let end = (offset + 8).min(mutated.len());
             mutated[offset..end].copy_from_slice(&word.to_le_bytes()[..end - offset]);
@@ -140,7 +146,11 @@ fn a_donor_csr_that_is_a_symlink_a_directory_or_a_fifo_places_nothing() {
     let directory = dir.join("dir.csr");
     fs::create_dir(&directory).unwrap();
     let fifo = dir.join("fifo.csr");
-    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
     for donor in [&link, &directory, &fifo] {
         let staged = dir.join("staged.csr");
         let outcome = copy_donor_csr_checked(donor, &staged, 4).unwrap();

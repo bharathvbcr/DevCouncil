@@ -340,7 +340,6 @@ fn the_ownership_peek_is_not_atomic_with_the_open() {
     );
 }
 
-
 /// Adversarial owner rows: an empty string, `./`, a home-relative spelling and a
 /// non-ASCII relative name are all relative, and none may read as a vanished
 /// owner the store is then taken over from.
@@ -348,19 +347,39 @@ fn the_ownership_peek_is_not_atomic_with_the_open() {
 fn every_spelling_of_a_relative_owner_is_refused_and_none_is_taken_over() {
     let owner = scratch("relative-spellings-a");
     let root = scratch("relative-spellings-b");
-    for relative in ["", "./", "./x", "../", "~", "~/x", "名前/ディレクトリ", " ", "x\u{0}y"] {
+    for relative in [
+        "",
+        "./",
+        "./x",
+        "../",
+        "~",
+        "~/x",
+        "名前/ディレクトリ",
+        " ",
+        "x\u{0}y",
+    ] {
         let path = store_owned_by("relative-spellings", &owner);
         set_owner_row(&path, relative);
-        let error = Store::refuse_a_live_foreign_owner_before_open(&path, &root)
-            .expect_err(&format!("relative owner {relative:?} was accepted by the peek"));
-        assert!(error.to_string().contains("relative path"), "{relative:?}: {error}");
+        let error = Store::refuse_a_live_foreign_owner_before_open(&path, &root).expect_err(
+            &format!("relative owner {relative:?} was accepted by the peek"),
+        );
+        assert!(
+            error.to_string().contains("relative path"),
+            "{relative:?}: {error}"
+        );
         let store = Store::open(&path).expect("the open does not judge ownership");
-        assert!(store.bind_repo_root(&root).is_err(), "{relative:?}: bound over it");
+        assert!(
+            store.bind_repo_root(&root).is_err(),
+            "{relative:?}: bound over it"
+        );
         assert_eq!(
             rusqlite::Connection::open(&path)
                 .unwrap()
-                .query_row("SELECT repo_root FROM pending_state WHERE singleton = 1", [], |r| r
-                    .get::<_, String>(0))
+                .query_row(
+                    "SELECT repo_root FROM pending_state WHERE singleton = 1",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
                 .unwrap(),
             relative,
             "{relative:?}: the owner row was rewritten by a refused bind"
@@ -403,7 +422,9 @@ fn a_live_owner_with_a_non_ascii_path_is_refused() {
     let error = Store::refuse_a_live_foreign_owner_before_open(&path, &root)
         .expect_err("a live unicode owner was passed");
     assert!(
-        error.to_string().contains("one store cannot serve two live worktrees"),
+        error
+            .to_string()
+            .contains("one store cannot serve two live worktrees"),
         "{error}"
     );
     Store::refuse_a_live_foreign_owner_before_open(&path, &owner).expect("the owner itself");
@@ -430,7 +451,9 @@ fn a_stamp_zero_store_with_only_a_generations_owner_column_is_still_checked() {
     let error = Store::refuse_a_live_foreign_owner_before_open(&path, &root)
         .expect_err("a stamp-0 file owned through generations.repo_root was passed");
     assert!(
-        error.to_string().contains("one store cannot serve two live worktrees"),
+        error
+            .to_string()
+            .contains("one store cannot serve two live worktrees"),
         "{error}"
     );
 }
@@ -441,13 +464,7 @@ fn a_stamp_zero_store_with_only_a_generations_owner_column_is_still_checked() {
 #[test]
 fn the_owners_own_root_in_another_case_is_not_a_foreign_owner() {
     let owner = scratch("CaseOwnerRoot");
-    let swapped = owner.with_file_name(
-        owner
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_uppercase(),
-    );
+    let swapped = owner.with_file_name(owner.file_name().unwrap().to_string_lossy().to_uppercase());
     if !swapped.exists() {
         return;
     }

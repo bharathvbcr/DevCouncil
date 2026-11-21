@@ -486,6 +486,9 @@ fn an_empty_key_list_and_a_repeated_key_are_answered_once() {
             .unwrap()
             .unwrap();
         assert_eq!(answer.len(), 1, "{total}");
-        assert_eq!(answer["hub"], reference["hub"], "{total}: rows doubled or lost");
+        assert_eq!(
+            answer["hub"], reference["hub"],
+            "{total}: rows doubled or lost"
+        );
     }
 }

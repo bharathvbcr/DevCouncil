@@ -128,9 +128,9 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, collect_project_manifests_cancellable,
-    git_worktree_root, go_dirs_with_unindexed_files,
-    is_resolution_input_name, parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings,
-    ProjectManifests, RustCrateManifest, RustDependency,
+    git_worktree_root, go_dirs_with_unindexed_files, is_resolution_input_name,
+    parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings, ProjectManifests,
+    RustCrateManifest, RustDependency,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,

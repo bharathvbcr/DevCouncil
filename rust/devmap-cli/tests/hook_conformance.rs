@@ -2319,9 +2319,7 @@ fn session_start_catches_up_a_drifted_index_in_the_background() {
     let run = run_hook("session-start", payload.as_bytes(), &[]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(
-        run.stdout
-            .contains("rebuilding in the background")
-            && run.stdout.contains("lower bound"),
+        run.stdout.contains("rebuilding in the background") && run.stdout.contains("lower bound"),
         "the context does not say a rebuild was started: {}",
         run.stdout
     );

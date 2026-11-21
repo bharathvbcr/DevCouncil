@@ -851,7 +851,11 @@ fn p8_a_resolver_stale_base_is_never_fresh_on_any_surface() {
     let status = fx.store.status(&db.to_string_lossy()).unwrap();
     eprintln!("status: {:?}", status.source_freshness);
     let want = expected(&fx.store);
-    assert_ne!(want.fresh, Some(true), "the store itself says fresh over a stale resolver: {want:?}");
+    assert_ne!(
+        want.fresh,
+        Some(true),
+        "the store itself says fresh over a stale resolver: {want:?}"
+    );
     let engine = StoreQueryEngine::new(&fx.store);
     let (seen, _) = sweep(&engine);
     assert!(!seen.is_empty());
