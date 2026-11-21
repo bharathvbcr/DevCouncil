@@ -3690,6 +3690,10 @@ fn detached_shell_command(
         // its own builder. Only a spent budget leaves a marker, and the next
         // trigger finds the lock free and builds.
         let lock_quoted = shell_single_quote(lock);
+        // A retaken lock names its owner like any other: without a pid file
+        // the next hook calls it stale after LOCK_PID_GRACE and starts a second
+        // builder. `$$` is this shell, the pid `spawn` records for the child.
+        let pid_quoted = shell_single_quote(&format!("{lock}/pid"));
         script.push_str(&format!(
             "/bin/rm -f {marker}; {run}; status=$?; reruns=0; \
              while :; do \
@@ -3697,7 +3701,8 @@ fn detached_shell_command(
              reruns=$((reruns+1)); /bin/rm -f {marker}; {run}; status=$?; done; \
              /bin/rm -rf {lock_quoted}; \
              [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ] \
-             && /bin/mkdir {lock_quoted} 2>/dev/null || break; \
+             && /bin/mkdir {lock_quoted} 2>/dev/null \
+             && echo $$ > {pid_quoted} || break; \
              done; exit $status"
         ));
         return finish_detached_shell(script);
@@ -6422,6 +6427,81 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(!marker.exists(), "a marker survived its builder with {} builds run", lane.builds_started());
         assert_eq!(lane.builds_started(), 3, "the rerun's own marker earned no further run");
+    }
+
+    /// The lock a builder retakes after its post-unlock marker re-check names
+    /// the builder as its owner, so a long rerun is not reclaimed as stale.
+    #[cfg(unix)]
+    #[test]
+    fn a_retaken_build_lock_names_its_live_owner() {
+        let lane = Lane::new("retake-pid", true);
+        let lock = lane.main_lock();
+        let marker = state_dir(&lane.main).join("codeintel").join(BUILD_DIRTY_MARKER);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::create_dir_all(&lock).unwrap();
+        let cmd = detached_shell_command(
+            &lane.exe,
+            &[OsStr::new("--root"), lane.main.as_os_str(), OsStr::new("build")],
+            &lock,
+            SpawnOptions { delay: None, rerun_when_dirty: true },
+        )
+        .unwrap();
+        let script = cmd.get_args().nth(1).unwrap().to_string_lossy().into_owned();
+        let unlock = format!("/bin/rm -rf {}; ", shell_single_quote(lock.to_str().unwrap()));
+        assert_eq!(script.matches(&unlock).count(), 1, "{script}");
+        // Once, right after the lock is released: a trigger lands in the window
+        // between the last in-loop test and the removal, and the next run blocks.
+        let done = lane.parent.join("injected");
+        let injection = format!(
+            "{unlock}[ ! -e '{done}' ] && : > '{done}' && : > '{marker}' && /bin/rm -f '{release}'; ",
+            done = done.display(),
+            marker = marker.display(),
+            release = lane.release.display()
+        );
+        let mut shell = Command::new("/bin/sh");
+        shell
+            .arg("-c")
+            .arg(script.replacen(&unlock, &injection, 1))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        fs::write(&lane.release, b"").unwrap();
+        let mut child = shell.spawn().unwrap();
+        assert!(eventually(|| done.exists() && lane.builds_started() >= 2), "no retaken rerun");
+        let owner = fs::read_to_string(lock.join("pid")).unwrap_or_default();
+        let pid: i32 = owner.trim().parse().unwrap_or(0);
+        // The lock has been held longer than the unknown-owner grace.
+        fs::File::open(&lock)
+            .unwrap()
+            .set_modified(SystemTime::now() - LOCK_PID_GRACE - Duration::from_secs(60))
+            .unwrap();
+        let live = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+        let stale = lock_dir_is_stale(&lock);
+        fs::write(&lane.release, b"").unwrap();
+        let status = child.wait().unwrap();
+        assert!(live, "the retaken lock names no live owner: {owner:?}");
+        assert!(!stale, "a long rerun's lock was called stale");
+        assert!(status.success(), "{status}");
+        assert!(!lock.exists());
+    }
+
+    /// A hook call that only marked a running build dirty spawned nothing, so
+    /// it does not start the shell rate window.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_call_that_spawned_no_builder_does_not_start_the_rate_window() {
+        let lane = Lane::new("shell-no-spawn", true);
+        let stamp = state_dir(&lane.main).join("codeintel").join(SHELL_BUILD_STAMP);
+        let payload = shell_payload(&lane.main, "git merge feature");
+        run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        assert!(eventually(|| lane.builds_started() == 1 && lane.main_lock().exists()));
+        assert!(stamp.is_file(), "a spawned builder claims the window");
+        fs::remove_file(&stamp).unwrap();
+        let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(!stamp.exists(), "a call that spawned nothing claimed the window");
+        fs::write(&lane.release, b"").unwrap();
+        assert!(eventually(|| !lane.main_lock().exists()));
     }
 
     /// A SessionStart catch-up and PostToolUse edits racing on one root share
