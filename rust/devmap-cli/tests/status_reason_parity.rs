@@ -592,3 +592,85 @@ fn p9_a_resolver_stale_store_is_named_beside_another_reason() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// `cli_status` with a `PATH` that holds no `git`: a surface a health check
+/// polls must read the HEAD file, not spawn `git rev-parse`.
+fn cli_status_without_git(dir: &Path, db: &Path) -> Value {
+    let empty_path = dir.join("no-bin");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let out = Command::new(devmap())
+        .arg("--db")
+        .arg(db)
+        .args(["--json", "status"])
+        .env("PATH", &empty_path)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "status is not JSON without git on PATH ({e}): {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// Probe 10: every reason at once (a pending change, a partial analysis with a
+/// 100 KB reason, a budget refusal, a resolver-stale store, an unreadable HEAD in
+/// a git tree) is named in one bounded string, and the HEAD clause neither
+/// changes `rebuild_required` nor needs a `git` binary.
+#[test]
+fn p10_every_reason_at_once_is_present_bounded_and_does_not_move_rebuild_required() {
+    let dir = scratch("p10");
+    let db = build_store(
+        &dir,
+        AnalysisStatus::Partial {
+            reason: "x".repeat(100_000),
+        },
+        Shape {
+            stale: true,
+            budget: true,
+        },
+    );
+    stamp_resolver_epoch(&db, "0");
+    stamp_head(&db, "unavailable");
+
+    // HEAD unreadable but not in a git tree: no HEAD clause. The baseline.
+    let before = cli_status_without_git(&dir, &db);
+    make_unborn_git_tree(&dir);
+    std::fs::write(dir.join(".git/HEAD"), "garbage\n").unwrap();
+    let after = cli_status_without_git(&dir, &db);
+
+    let reason = after["degraded_reason"].as_str().expect("a reason");    let older = devmap_store::ResolverStamp::Older.reason();
+    assert!(reason.contains(older), "resolver-stale is missing: {reason}");
+    assert!(reason.contains("HEAD"), "the HEAD clause is missing: {reason}");
+    assert!(
+        reason.contains("pending") || reason.contains("source change"),
+        "the pending change is missing: {reason}"
+    );
+    assert!(
+        reason.contains("refused") || reason.contains("budget"),
+        "the budget refusal is missing: {reason}"
+    );
+    assert!(
+        reason.contains("partial") || reason.contains("Partial") || reason.contains("xxxx"),
+        "the partial analysis is missing: {reason}"
+    );
+    assert!(
+        reason.len() <= 8 * 1024,
+        "the combined reason is unbounded: {} bytes",
+        reason.len()
+    );
+    assert_eq!(
+        before["rebuild_required"], after["rebuild_required"],
+        "naming HEAD moved rebuild_required: {before} vs {after}"
+    );
+    assert_eq!(after["is_fresh"], json!(false), "{after}");
+    let (daemon_reason, _) = daemon(&db, &unapplied(false));
+    assert_eq!(
+        daemon_reason.as_deref(),
+        Some(reason),
+        "daemon and CLI must say the same thing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
