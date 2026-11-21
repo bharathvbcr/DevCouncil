@@ -84,7 +84,7 @@ impl Store {
     /// source root and analysis. No lock is held while the caller ranks them.
     pub fn all_symbols_page(&self) -> Result<Option<SearchPage>> {
         let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
             return Ok(None);
         };
         let rows = Self::all_symbols_in(&snapshot, generation)?;
@@ -108,7 +108,7 @@ impl Store {
     /// derived from the rows, so a file is listed whatever it declares.
     pub fn all_symbols_page_with_files(&self) -> Result<Option<(SearchPage, IndexedFiles)>> {
         let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
             return Ok(None);
         };
         let rows = Self::all_symbols_in(&snapshot, generation)?;
@@ -352,7 +352,7 @@ impl Store {
     /// so the refusal and the page describe one snapshot.
     pub fn latest_scope_inputs(&self) -> Result<Option<(u32, Option<String>, IndexedFiles)>> {
         let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
             return Ok(None);
         };
         let files = Self::indexed_files_in(&snapshot, generation)?;
@@ -1825,6 +1825,23 @@ impl Store {
             Some(generation) => Ok(Some((snapshot, generation))),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::latest_snapshot`] with the generation-read pause fired once the
+    /// snapshot is taken, as [`Self::generation_snapshot`] fires it.
+    ///
+    /// Only for the readers whose snapshot a test must race: the corpus reads
+    /// a stacked store pairs (`all_symbols_page`, `all_symbols_page_with_files`,
+    /// `latest_scope_inputs`). `search_page` stays on the plain
+    /// [`Self::latest_snapshot`] and never pauses; a test pins that.
+    fn latest_snapshot_paused(
+        conn: &Connection,
+    ) -> Result<Option<(rusqlite::Transaction<'_>, u32)>> {
+        let pinned = Self::latest_snapshot(conn)?;
+        if pinned.is_some() {
+            super::fire_generation_read_pause();
+        }
+        Ok(pinned)
     }
 
     /// [`Self::latest_snapshot`] for a generation the caller already holds.
