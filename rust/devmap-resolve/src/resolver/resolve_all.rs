@@ -17,7 +17,10 @@ use super::*;
 ///
 /// 3: the binding changes of commit 7767f7cf (bare-name candidates, receiver
 /// types, the sibling-field fallbacks) altered edges while this stayed at 2.
-pub const RESOLUTION_REUSE_EPOCH: &str = "3";
+///
+/// 4: a Java bare call reaches an inherited in-repo member before the global
+/// rung (ft-0e6cc90f).
+pub const RESOLUTION_REUSE_EPOCH: &str = "4";
 
 /// One file's resolution before the whole-tree post-pass.
 ///
