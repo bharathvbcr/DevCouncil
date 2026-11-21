@@ -1383,10 +1383,26 @@ fn resolver_degraded_clause(store: &Store, freshness: Option<&str>) -> Option<St
 fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
     root.ancestors().find_map(|dir| {
         let dot_git = dir.join(".git");
-        if dot_git.is_dir() {
+        // Only "there is no `.git` here" lets the walk go on. A `.git` that
+        // exists but cannot be examined (permission denied, a dangling symlink)
+        // or is not a directory or regular file (a FIFO, a socket) is a broken
+        // checkout, and git stops there rather than judging an enclosing
+        // repository. It is returned unopened, so it has no `HEAD` beneath it
+        // and reads broken.
+        match std::fs::symlink_metadata(&dot_git) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(dot_git),
+            Ok(_) => {}
+        }
+        let Ok(kind) = std::fs::metadata(&dot_git) else {
+            return Some(dot_git);
+        };
+        if kind.is_dir() {
             return Some(dot_git);
         }
-        let pointer = read_bounded(&dot_git)?;
+        let Some(pointer) = read_bounded(&dot_git, GITFILE_READ_CAP) else {
+            return Some(dot_git);
+        };
         // A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
         // git stops there ("invalid gitfile format"): the walk must not step
         // over it and judge an enclosing repository's HEAD. The file itself is
@@ -1400,13 +1416,25 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
     })
 }
 
-/// The first 256 bytes of a small file as text, `None` when it cannot be read.
-fn read_bounded(path: &std::path::Path) -> Option<String> {
+/// Bytes read of a `HEAD` file: a branch name or an object id fits.
+const HEAD_READ_CAP: u64 = 256;
+/// Bytes read of a `.git` pointer file: it holds a whole path (`PATH_MAX` is 4096
+/// on Linux), which the `HEAD` cap would truncate.
+const GITFILE_READ_CAP: u64 = 4096;
+
+/// The first `cap` bytes of a regular file as text. `None` when it cannot be
+/// read, and when it is not a regular file (after following symlinks, as git
+/// does): a FIFO with no writer blocks `open` forever, and `status` is a
+/// surface a health check polls, so such a file is never opened.
+fn read_bounded(path: &std::path::Path, cap: u64) -> Option<String> {
     use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     let mut text = Vec::new();
     std::fs::File::open(path)
         .ok()?
-        .take(256)
+        .take(cap)
         .read_to_end(&mut text)
         .ok()?;
     Some(String::from_utf8_lossy(&text).into_owned())
@@ -1417,7 +1445,7 @@ fn read_bounded(path: &std::path::Path) -> Option<String> {
 /// bounded read and never a git spawn, because `status` is a surface a health
 /// check polls.
 fn git_head_file_is_broken(git_dir: &std::path::Path) -> bool {
-    let Some(head) = read_bounded(&git_dir.join("HEAD")) else {
+    let Some(head) = read_bounded(&git_dir.join("HEAD"), HEAD_READ_CAP) else {
         return true;
     };
     let head = head.trim();
@@ -4157,10 +4185,7 @@ mod tests {
 
     /// What `head_degraded_clause` says over one git layout built by `lay` inside
     /// `root`, for a generation stamped `"unavailable"`.
-    fn head_clause_over(
-        label: &str,
-        lay: impl FnOnce(&std::path::Path),
-    ) -> Option<String> {
+    fn head_clause_over(label: &str, lay: impl FnOnce(&std::path::Path)) -> Option<String> {
         let parent = std::env::temp_dir().join(format!(
             "devmap-head-probe-{label}-{}-{:?}",
             std::process::id(),
@@ -4192,29 +4217,41 @@ mod tests {
             let clause = head_clause_over(label, lay);
             let text = clause.unwrap_or_else(|| panic!("{label}: a broken HEAD was not named"));
             assert!(text.len() < 400, "{label}: the clause is bounded: {text}");
-            assert!(!text.contains("SECRET"), "{label}: HEAD content leaked: {text}");
+            assert!(
+                !text.contains("SECRET"),
+                "{label}: HEAD content leaked: {text}"
+            );
         };
         let silent = |label: &str, lay: &dyn Fn(&std::path::Path)| {
             let clause = head_clause_over(label, lay);
-            assert!(clause.is_none(), "{label}: an ordinary state was named: {clause:?}");
+            assert!(
+                clause.is_none(),
+                "{label}: an ordinary state was named: {clause:?}"
+            );
         };
 
         // A HEAD file of garbage: broken. 1 MiB of it: read in 256 bytes, still broken.
-        named("garbage", &|r| std::fs::write(git(r).join("HEAD"), "SECRET\n").unwrap());
+        named("garbage", &|r| {
+            std::fs::write(git(r).join("HEAD"), "SECRET\n").unwrap()
+        });
         named("one-mib", &|r| {
             std::fs::write(git(r).join("HEAD"), vec![b'x'; 1 << 20]).unwrap();
         });
         named("non-utf8", &|r| {
             std::fs::write(git(r).join("HEAD"), [0xff, 0xfe, 0x00, 0x80, b'\n']).unwrap();
         });
-        named("empty", &|r| std::fs::write(git(r).join("HEAD"), "").unwrap());
+        named("empty", &|r| {
+            std::fs::write(git(r).join("HEAD"), "").unwrap()
+        });
         named("missing", &|r| {
             git(r);
         });
         named("head-is-a-directory", &|r| {
             std::fs::create_dir_all(git(r).join("HEAD")).unwrap();
         });
-        named("ref-with-no-name", &|r| std::fs::write(git(r).join("HEAD"), "ref:\n").unwrap());
+        named("ref-with-no-name", &|r| {
+            std::fs::write(git(r).join("HEAD"), "ref:\n").unwrap()
+        });
         named("41-hex", &|r| {
             std::fs::write(git(r).join("HEAD"), "0".repeat(41)).unwrap();
         });
@@ -4276,14 +4313,128 @@ mod tests {
             };
             std::fs::write(root.join(".git"), format!("gitdir: {target}\n")).unwrap();
         };
-        named("linked-broken-head", &|r| linked(r, false, Some("garbage\n")));
+        named("linked-broken-head", &|r| {
+            linked(r, false, Some("garbage\n"))
+        });
         named("linked-missing-head", &|r| linked(r, false, None));
-        named("linked-relative-broken-head", &|r| linked(r, true, Some("garbage\n")));
-        silent("linked-valid-head", &|r| linked(r, false, Some("ref: refs/heads/x\n")));
-        silent("linked-relative-valid-head", &|r| linked(r, true, Some("ref: refs/heads/x\n")));
+        named("linked-relative-broken-head", &|r| {
+            linked(r, true, Some("garbage\n"))
+        });
+        silent("linked-valid-head", &|r| {
+            linked(r, false, Some("ref: refs/heads/x\n"))
+        });
+        silent("linked-relative-valid-head", &|r| {
+            linked(r, true, Some("ref: refs/heads/x\n"))
+        });
         named("linked-gitdir-gone", &|r| {
             std::fs::write(r.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
         });
+    }
+
+    /// Lays an enclosing repository with a healthy HEAD above `root`, so a walk
+    /// that steps over `root`'s own broken `.git` is told apart from one that stops.
+    fn healthy_enclosing_repo(root: &std::path::Path) {
+        let enclosing = root.parent().unwrap().join(".git");
+        std::fs::create_dir_all(&enclosing).unwrap();
+        std::fs::write(enclosing.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// A FIFO `.git` has no writer: opening it blocks forever, which hung `devmap
+    /// status`. Run in a thread so a regression fails instead of hanging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_dot_git_or_head_is_broken_and_never_opened() {
+        for (label, at_head) in [("fifo-dot-git", false), ("fifo-head", true)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let clause = head_clause_over(label, |root| {
+                    healthy_enclosing_repo(root);
+                    let fifo = if at_head {
+                        std::fs::create_dir_all(root.join(".git")).unwrap();
+                        root.join(".git/HEAD")
+                    } else {
+                        root.join(".git")
+                    };
+                    let made = std::process::Command::new("/usr/bin/mkfifo")
+                        .arg(&fifo)
+                        .status()
+                        .unwrap();
+                    assert!(made.success());
+                });
+                let _ = tx.send(clause);
+            });
+            let clause = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{label}: the HEAD reader blocked on a FIFO"));
+            assert!(clause.is_some(), "{label}: a FIFO was not named broken");
+        }
+    }
+
+    /// A `.git` that exists but cannot be read ends the walk as broken; only
+    /// "not found" steps up to the enclosing repository (same class as a
+    /// malformed gitfile).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_or_dangling_dot_git_is_not_stepped_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dangling = head_clause_over("dot-git-dangling", |root| {
+            healthy_enclosing_repo(root);
+            std::os::unix::fs::symlink("/nonexistent/gitdir", root.join(".git")).unwrap();
+        });
+        assert!(
+            dangling.is_some(),
+            "a dangling .git symlink was stepped over"
+        );
+
+        let probe = std::env::temp_dir().join(format!("devmap-euid-probe-{}", std::process::id()));
+        std::fs::write(&probe, "x").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let can_read_anyway = std::fs::File::open(&probe).is_ok();
+        std::fs::remove_file(&probe).unwrap();
+        if can_read_anyway {
+            return; // root ignores file modes: the case cannot be built.
+        }
+        let unreadable = head_clause_over("dot-git-unreadable", |root| {
+            healthy_enclosing_repo(root);
+            let worktree_git = root.parent().unwrap().join("gitdirs/repo");
+            std::fs::create_dir_all(&worktree_git).unwrap();
+            std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+            let pointer = root.join(".git");
+            std::fs::write(&pointer, format!("gitdir: {}\n", worktree_git.display())).unwrap();
+            std::fs::set_permissions(&pointer, std::fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        assert!(
+            unreadable.is_some(),
+            "an unreadable .git file was stepped over"
+        );
+    }
+
+    /// The `.git` pointer holds a whole path: one longer than the 256-byte HEAD
+    /// cap must still resolve to its valid worktree git directory.
+    #[test]
+    fn a_long_gitdir_pointer_is_read_whole() {
+        let clause = head_clause_over("long-gitdir", |root| {
+            let gitdir = root
+                .parent()
+                .unwrap()
+                .join("gitdirs")
+                .join("d".repeat(40))
+                .join("e".repeat(40))
+                .join("f".repeat(40))
+                .join("g".repeat(40))
+                .join("h".repeat(40))
+                .join("i".repeat(40))
+                .join("repo");
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+            let pointer = format!("gitdir: {}\n", gitdir.display());
+            assert!(pointer.len() > 256, "the fixture must exceed the HEAD cap");
+            std::fs::write(root.join(".git"), pointer).unwrap();
+        });
+        assert!(
+            clause.is_none(),
+            "a valid worktree HEAD read as broken: {clause:?}"
+        );
     }
 
     /// A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
