@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -344,13 +345,18 @@ func TestDecidedGitlinkBoundary(t *testing.T) {
 func TestDecidedHeadlessGitlinks(t *testing.T) {
 	root := t.TempDir()
 	runGitIn(t, root, "init", "-q")
-	awkward := []string{"z\nnl", "tab\there", "bad\xffbytes", "cr\rx", "nul-free\x1bescape", "\u202ertl"}
+	// Line breaks in a name are covered by TestDecidedHeadlessGitlinkWithControlBytePath:
+	// staged gitlinks are real changes against the empty tree, and a path with a
+	// LF or CR is one the planner and the substance reader refuse.
+	awkward := []string{"\u202ertl"}
 	entries := [][3]string{{"160000", sha('a'), ".devcouncil/g"}}
+	var plan []dc.PlannedFile
 	for _, p := range awkward {
 		entries = append(entries, [3]string{"160000", sha('a'), p})
+		plan = append(plan, dc.PlannedFile{Path: p, AllowedChange: dc.ChangeCreate})
 	}
 	indexInfo(t, root, entries)
-	o := attackRun(t, root, "TASK-D-GL-HL")
+	o := attackRun(t, root, "TASK-D-GL-HL", plan...)
 	requireGitlinkNotSilent(t, "", o, ".devcouncil/g")
 	if len(o.result.DegradedReasons) != len(entries) {
 		t.Fatalf("want one reason per gitlink (%d), got %d: %q", len(entries), len(o.result.DegradedReasons), o.result.DegradedReasons)
@@ -359,6 +365,75 @@ func TestDecidedHeadlessGitlinks(t *testing.T) {
 		if strings.ContainsAny(r, "\n\r\t\x1b\x00") {
 			t.Fatalf("a reason holds a raw control byte: %q", r)
 		}
+	}
+}
+
+// A staged gitlink whose path holds a CR is a change against the empty tree
+// like any other, and the planner or substance reader refuses such a path: the
+// run must block with the one blocking gap type "rigor_check_unavailable"
+// (spelled as a literal at orchestrate.go, no constant), whose description gives
+// the cause, and not for any other reason (scope, a missing plan entry).
+//
+// The blocked verdict carries no degraded_reasons today (ft-5823c9bf, "Verify
+// verdict drops degraded_reasons whenever status is not verified"), so the
+// "submodule commit range not scanned" reason is not asserted on o.result; that
+// the gitlink IS seen is asserted on the git state report instead. When
+// ft-5823c9bf lands, assert the reason here too.
+func TestDecidedHeadlessGitlinkWithControlBytePath(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cause  string
+		quoted bool // the description names the path in %q form (display-safe)
+	}{
+		{"cr\rx", "contains a line break", true},
+		{"z\nnl", "contains a line break", true},
+		{"nul-free\x1bescape", "contains a control byte (0x1b)", true},
+		{"tab\there", "contains a control byte (0x09)", true},
+		// git hands this one to dcverify as an argument, whose refusal does not
+		// echo the path.
+		{"bad\xffbytes", "is not valid UTF-8", false},
+	} {
+		t.Run(fmt.Sprintf("%q", tc.name), func(t *testing.T) {
+			root := t.TempDir()
+			runGitIn(t, root, "init", "-q")
+			indexInfo(t, root, [][3]string{{"160000", sha('a'), tc.name}})
+
+			state, err := verify.CollectGitStateReport(context.Background(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := false
+			for _, g := range state.MovedGitlinks {
+				seen = seen || (g.Path == tc.name && g.Shape == "added")
+			}
+			if !seen {
+				t.Fatalf("the staged gitlink is not in the git state report: %+v", state.MovedGitlinks)
+			}
+
+			o := attackRun(t, root, "TASK-D-GL-HL-CR", dc.PlannedFile{Path: tc.name, AllowedChange: dc.ChangeCreate})
+			if class := decidedClass(o); class != "blocked" {
+				t.Fatalf("class=%s, want blocked: types=%v degraded=%q refused=%v", class, advTypes(o.gaps), o.result.DegradedReasons, o.refused)
+			}
+			var blocking []verify.Gap
+			for _, g := range o.gaps {
+				if g.Blocking {
+					blocking = append(blocking, g)
+				}
+			}
+			if len(blocking) != 1 || blocking[0].GapType != "rigor_check_unavailable" {
+				t.Fatalf("want exactly one blocking rigor_check_unavailable gap, got types=%v", advTypes(o.gaps))
+			}
+			desc := blocking[0].Description
+			if !strings.Contains(desc, tc.cause) {
+				t.Fatalf("the gap does not give the cause %q: %q", tc.cause, desc)
+			}
+			if tc.quoted && !strings.Contains(desc, strconv.Quote(tc.name)) {
+				t.Fatalf("the gap does not name the path as %s: %q", strconv.Quote(tc.name), desc)
+			}
+			if strings.ContainsAny(desc, "\n\r\t\x1b") || !utf8.ValidString(desc) {
+				t.Fatalf("the gap description holds a raw control byte or invalid UTF-8: %q", desc)
+			}
+		})
 	}
 }
 
@@ -1112,7 +1187,7 @@ func TestDecidedOrdinaryStagedSecretThenRevertedForComparison(t *testing.T) {
 		o := attackRun(t, root, "TASK-D-ORD-REV", benignChange(t, root))
 		t.Logf("ordinary: class=%s empty=%v diffHasKey=%v", decidedClass(o), o.empty, strings.Contains(o.diff, key))
 		if decidedClass(o) == "verified" {
-			t.Skip("ft-c397c278 (pre-existing on main a76e963f, verified there): `git diff HEAD` compares the worktree to HEAD, so a secret staged and then reverted on disk is in the index (and the next commit) and in no diff; the same basis serves tool state below")
+			t.Fatalf("staged secret reverted on disk was verified clean (the gate read the worktree, not the index)")
 		}
 	})
 	t.Run("headless repo, staged secret file", func(t *testing.T) {
@@ -1123,7 +1198,7 @@ func TestDecidedOrdinaryStagedSecretThenRevertedForComparison(t *testing.T) {
 		o := attackRun(t, root, "TASK-D-ORD-HL")
 		t.Logf("headless staged: class=%s empty=%v diffHasKey=%v types=%v", decidedClass(o), o.empty, strings.Contains(o.diff, key), advTypes(o.gaps))
 		if decidedClass(o) == "verified" {
-			t.Skip("ft-c397c278 (pre-existing on main): a repository with no HEAD collects only untracked files and `ls-files --others` omits staged ones, so a staged secret is in no listing (the headless branch of CollectGitStateReport is unchanged by the lane except for tool state)")
+			t.Fatalf("headless staged secret was verified clean (the gate read only untracked files)")
 		}
 	})
 }
