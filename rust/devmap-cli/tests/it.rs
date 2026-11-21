@@ -59,6 +59,7 @@ mod claude_integration;
 mod cli_json_contract;
 mod closed_pipe_is_not_a_panic;
 mod common;
+mod content_bearing_keys_are_published;
 mod coverage_invariants;
 mod crash_consistency;
 mod cstyle_reuse_epoch;

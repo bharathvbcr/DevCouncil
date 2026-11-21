@@ -286,6 +286,49 @@ pub struct UnresolvedSite {
     pub classification: String,
 }
 
+/// JSON keys, in any `--json` answer or MCP envelope, whose string values are
+/// text copied out of a repository file.
+///
+/// A host that gates reads (Manvi's read gate) must treat a value under one of
+/// these keys as file content, and must treat every other string as metadata:
+/// names, paths, counts, reasons and provenance (`evidence.source` is
+/// `Resolver | Stored | Reconstructed`, never file text). Adding a field that
+/// carries file text means adding its key here; `docs/devmap/HOST_INTEGRATION.md`
+/// and `rust/devmap-cli/tests/content_bearing_keys_are_published.rs` hold the
+/// list to the real output.
+///
+/// Key names alone are not enough: use [`is_content_bearing_path`], because an
+/// edge's `evidence.source` is provenance.
+///
+/// A secret-path file's text is withheld: the key stays, its value is empty,
+/// and a sibling `withheld` key says why (`"secret_path"`).
+pub const CONTENT_BEARING_KEYS: &[&str] = &[
+    // `explore` definitions and `ask --evidence` units: the symbol's text.
+    "source",
+    "source_span",
+    // The whitespace a mid-line span lost: still bytes of the file.
+    "source_indent",
+    // `skeleton`: declaration text.
+    "signature",
+    // `literals`: the constant as the file writes it.
+    "value",
+];
+
+/// Whether the string at JSON path `path` (dot-joined keys, array indices
+/// elided, e.g. `$.definitions.items.callers.items.evidence.source`) is file
+/// text under [`CONTENT_BEARING_KEYS`].
+///
+/// One key is ambiguous: an edge's `evidence.source` shares the name `source`
+/// with an explore definition's text but is provenance (`Resolver`, `Stored` or
+/// `Reconstructed`). Matching on the key alone would call it content.
+pub fn is_content_bearing_path(path: &str) -> bool {
+    if path.ends_with(".evidence.source") {
+        return false;
+    }
+    let key = path.rsplit('.').next().unwrap_or(path);
+    CONTENT_BEARING_KEYS.contains(&key)
+}
+
 /// Distinct target names an `impact` answer looks up in the ledger.
 pub const MAX_NAMESAKE_NAMES: usize = 8;
 /// Ledger rows read per name. A generic name (`get`, `run`) matches thousands;

@@ -211,6 +211,40 @@ The Antigravity sidecar (`antigravity/sidecars/devmap/sidecar.json`) launches
 `/map_preview.html`. A test pins the manifest's flags and path to the real CLI
 and route.
 
+## Content-bearing JSON keys
+
+A host that gates what an agent may read (Manvi's read gate) needs to know which
+strings in a `--json` answer are text copied out of a repository file. The
+list is `devmap_query::model::CONTENT_BEARING_KEYS`:
+
+| Key | Appears in | Value |
+|---|---|---|
+| `source` | `explore` definitions | The symbol's text. |
+| `source_span` | `ask --evidence` units, `search` and `ask` hits | The symbol's text. |
+| `source_indent` | the same hits | Whitespace the span lost on its first line. |
+| `signature` | `skeleton` items | Declaration text. |
+| `value` | `literals` sites | The constant as the file writes it. |
+
+Every other string is metadata: names, paths, reasons, and provenance. Match on
+the path, not the bare key name: `devmap_query::model::is_content_bearing_path`
+is the one rule. An edge's `evidence.source` shares the name `source` and is
+not content; it is `Resolver`, `Stored` or `Reconstructed`, where the edge
+came from and never file text. And `impact`, `trace` and
+`affected` carry no content-bearing key at all. A new field that carries file
+text is added to the list in the same change; the contract test
+`rust/devmap-cli/tests/content_bearing_keys_are_published.rs` walks real
+`explore`, `impact`, `trace`, `affected`, `ask --evidence`, `search`,
+`skeleton` and `literals` output and fails when file text shows up under any
+other key.
+
+A file under a secret path is located but not read out. The content key stays
+and its value is empty, and a sibling `"withheld": "secret_path"` says that
+the emptiness is a withholding. An empty content value *without* `withheld`
+is a genuinely empty span, or one whose file could not be read
+(`source_unavailable_reason`). A host must treat `withheld` as "content
+exists and was refused", never as an empty function. The key is absent on every
+other file.
+
 ## Marker inventory coverage
 
 The repository map keeps marker coverage separate from extraction and graph
