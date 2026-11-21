@@ -4299,6 +4299,10 @@ mod pruned_generation_namesake;
 #[path = "engine/tests/pruned_keyword_page.rs"]
 mod pruned_keyword_page;
 
+#[cfg(test)]
+#[path = "engine/tests/radius_key_bounds.rs"]
+mod radius_key_bounds;
+
 #[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/tests.rs"]
 mod tests;
