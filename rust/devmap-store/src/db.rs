@@ -747,6 +747,12 @@ pub struct Store {
     /// generation they answered from, or an explicit unverified reason when
     /// nothing has been checked in this process.
     source_freshness_cache: Mutex<Option<CachedSourceFreshness>>,
+    /// Whether a live file watcher is reporting this store's edits. Set by the
+    /// daemon for as long as its watcher runs ([`Store::set_watcher_live`]);
+    /// false for the CLI and for an MCP-only process, which nothing watches.
+    /// A verdict remembered while it was true is not aged out (see
+    /// [`SOURCE_FRESHNESS_MAX_AGE`]).
+    source_freshness_watcher_live: std::sync::atomic::AtomicBool,
 }
 
 /// How long a held integrity answer may stand before it is read again.
@@ -766,14 +772,25 @@ const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_
 /// How long a `fresh: true` verdict from [`Store::status`] may be repeated on
 /// query envelopes before it is reported as unverified.
 ///
-/// Edits the watcher sees end the verdict at once (a non-empty pending queue
-/// blocks the cached answer), so this bound only covers changes nothing
-/// reported: a missed filesystem event, a tool writing around the watcher, or
-/// a long-lived MCP server with no watcher at all. It is the same sixty
-/// seconds as [`GENERATION_CHECK_MAX_AGE`], the longest the store already
-/// accepts for an unreported fault; a poller calling `status` once a minute
-/// keeps verdicts verified. A `fresh: false` verdict is never aged out: it
-/// only ends when `status` runs again.
+/// The bound applies only to a verdict **no watcher backs**: the CLI, and an
+/// MCP-only process, where nothing reports an edit made after the walk. The
+/// daemon marks the store watcher-live while its watcher runs, and a verdict
+/// it remembers then is not aged out: an edit the watcher sees queues a path
+/// and ends the verdict at once (a non-empty pending queue blocks the cached
+/// answer), so a healthy watched daemon idle for an hour still answers
+/// `fresh: true`. A watcher that stops, or a verdict remembered before it
+/// started, falls back to this bound.
+///
+/// It is the same sixty seconds as [`GENERATION_CHECK_MAX_AGE`], the longest
+/// the store already accepts for an unreported fault. What re-stamps a verdict
+/// where no watcher backs it: `Store::status` (`devmap status`, the
+/// `devmap_status` tool, the daemon's post-drain walk), the only caller of
+/// the remember step. A build in another process (a hook-triggered one) moves
+/// the generation, which leaves the cached verdict describing an older one, so
+/// the envelope reads as unverified and names `status` until it runs here. A
+/// poller calling `status` once a minute keeps verdicts verified. A
+/// `fresh: false` verdict is never aged out: it only ends when `status` runs
+/// again.
 pub const SOURCE_FRESHNESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(test)]
@@ -865,6 +882,8 @@ struct GenerationChecks {
 struct CachedSourceFreshness {
     /// When `status` finished the walk, on the memo clock.
     verified_at: std::time::Instant,
+    /// A live watcher was reporting this store's edits when the walk finished.
+    watcher_backed: bool,
     generation_id: u32,
     fresh: Option<bool>,
     reason: Option<String>,

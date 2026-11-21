@@ -69,12 +69,29 @@ pub enum ResolutionAvailability {
 ///
 /// **Age.** A verdict is only as good as the moment `status` walked the tree.
 /// `verified_age_ms` is the time since that walk, measured by the process
-/// answering (monotonic, so a wall-clock jump cannot move it). A `fresh: true`
-/// verdict older than 60 seconds is reported as `fresh: null` with a reason
-/// that names its age; a `fresh: false` verdict stays `false` however old,
-/// until `status` runs again. The field is absent when no walk backs the
-/// answer (never verified, or the verdict came from somewhere other than the
-/// store's cached walk), and absence means "unknown age", not "fresh".
+/// answering (monotonic, so a wall-clock jump cannot move it).
+///
+/// - A `fresh: true` verdict **no watcher backs** (the CLI, or an MCP-only
+///   process) older than 60 seconds is reported as `fresh: null` with a reason
+///   naming its age and `status` as the way to re-verify. `status` is what
+///   re-stamps it.
+/// - A verdict a **live watcher backs** (the daemon, from the walk it runs
+///   after each drain) does not age out: an edit the watcher sees queues a
+///   path and ends the verdict at once, so a healthy idle daemon keeps
+///   answering `fresh: true` with a growing `verified_age_ms`.
+/// - A `fresh: false` verdict stays `false` however old, until `status` runs
+///   again.
+/// - A `fresh: true` walk over a **resolver-stale base** (the stored edges
+///   were written by another resolver epoch, or the extraction payload is
+///   obsolete) is reported as `fresh: null` with a reason naming the
+///   resolver-stale base: the tree matched the stored hashes, but the index
+///   is not the one this binary would build.
+///
+/// The field is absent when no walk backs the answer (never verified, or the
+/// verdict came from somewhere other than the store's cached walk), and
+/// absence means "unknown age", not "fresh". Readers that predate the field
+/// ignore it; a reader that builds this struct by literal must add
+/// `verified_age_ms: None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceFreshness {
     /// `Some(true/false)` when verified against the working tree; `None` when

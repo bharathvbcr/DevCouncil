@@ -1444,25 +1444,54 @@ impl Store {
             Some(cached) if cached.generation_id == latest => {
                 let age = crate::db::memo_now().saturating_duration_since(cached.verified_at);
                 let verified_age_ms = Some(u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
-                if cached.fresh == Some(true) && age > crate::db::SOURCE_FRESHNESS_MAX_AGE {
-                    QuerySourceFreshness {
-                        fresh: None,
-                        generation_id: Some(cached.generation_id),
-                        reason: Some(format!(
-                            "source freshness was verified {}s ago, older than the {}s bound; \
-run `devmap status` (or call `devmap_status`) to re-verify",
+                let verdict = |fresh: Option<bool>, reason: Option<String>| QuerySourceFreshness {
+                    fresh,
+                    generation_id: Some(cached.generation_id),
+                    reason,
+                    verified_age_ms,
+                };
+                // A false or null verdict never gets better with time; only
+                // `status` ends it.
+                if cached.fresh != Some(true) {
+                    return verdict(cached.fresh, cached.reason.clone());
+                }
+                // The walk compared the tree with the stored hashes. It said
+                // nothing about whether the stored edges are the ones this
+                // binary would write, so a resolver-stale base is not fresh.
+                match self.stale_payload_reason() {
+                    Ok(None) => {}
+                    Ok(Some(why)) => {
+                        return verdict(
+                            None,
+                            Some(format!(
+                                "source freshness unverified: the indexed generation is a \
+resolver-stale base ({why})"
+                            )),
+                        );
+                    }
+                    Err(error) => {
+                        return verdict(
+                            None,
+                            Some(format!(
+                                "source freshness unverified: could not ask whether the \
+generation's stored edges are current ({error})"
+                            )),
+                        );
+                    }
+                }
+                let watched = cached.watcher_backed && self.watcher_live();
+                if !watched && age > crate::db::SOURCE_FRESHNESS_MAX_AGE {
+                    verdict(
+                        None,
+                        Some(format!(
+                            "source freshness was verified {}s ago, older than the {}s bound, \
+and no watcher is reporting edits; run `devmap status` (or call `devmap_status`) to re-verify",
                             age.as_secs(),
                             crate::db::SOURCE_FRESHNESS_MAX_AGE.as_secs()
                         )),
-                        verified_age_ms,
-                    }
+                    )
                 } else {
-                    QuerySourceFreshness {
-                        fresh: cached.fresh,
-                        generation_id: Some(cached.generation_id),
-                        reason: cached.reason,
-                        verified_age_ms,
-                    }
+                    verdict(Some(true), cached.reason.clone())
                 }
             }
             Some(cached) => QuerySourceFreshness::unverified(format!(
@@ -1475,6 +1504,41 @@ generation {latest}; run `devmap status` to re-verify",
 (or call `devmap_status`) for a verified verdict",
             ),
         }
+    }
+
+    /// Mark this store's edits as reported by a live file watcher (or not).
+    ///
+    /// The daemon sets it for as long as its watcher runs. A verdict remembered
+    /// while it is set is exempt from [`SOURCE_FRESHNESS_MAX_AGE`], because an
+    /// edit the watcher sees ends the verdict through the pending queue. A
+    /// store nothing watches never sets it, and its verdicts age out.
+    pub fn set_watcher_live(&self, live: bool) {
+        self.source_freshness_watcher_live
+            .store(live, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::set_watcher_live`] is currently set.
+    pub fn watcher_live(&self) -> bool {
+        self.source_freshness_watcher_live
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Why the latest generation's stored edges are not the ones this binary
+    /// would write, or `None` when they are. The cached
+    /// [`Self::latest_generation_payload_is_current`] answers whether; the reason
+    /// is read only on the stale path.
+    fn stale_payload_reason(&self) -> Result<Option<String>> {
+        if self.latest_generation_payload_is_current()? {
+            return Ok(None);
+        }
+        let conn = lock_conn(&self.conn)?;
+        if !Self::extraction_is_current_on(&conn)? {
+            return Ok(Some(
+                "stored extraction payload is obsolete; rebuild with the current analyzer"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(Self::resolver_stamp_on(&conn)?.reason().to_string()))
     }
 
     pub(super) fn clear_source_freshness_cache(&self) {
@@ -1492,6 +1556,7 @@ generation {latest}; run `devmap status` to re-verify",
         if let Ok(mut cache) = self.source_freshness_cache.lock() {
             *cache = Some(CachedSourceFreshness {
                 verified_at: crate::db::memo_now(),
+                watcher_backed: self.watcher_live(),
                 generation_id,
                 fresh,
                 reason,
@@ -2377,8 +2442,8 @@ mod freshness_race {
             let conn = lock_conn(&store.conn).expect("connection");
             conn.execute(
                 "INSERT INTO generations (id, created_at, head_sha, analysis_json)
-                 VALUES (7, 1.0, 'seed', '{}')",
-                [],
+                 VALUES (7, 1.0, 'seed', ?1)",
+                rusqlite::params![current_resolver_stamp()],
             )
             .expect("generation");
         }
@@ -2388,6 +2453,25 @@ mod freshness_race {
             .expect("generation id");
         store.remember_source_freshness(id, Some(true), None);
         store
+    }
+
+    /// The `analysis_json` a generation this binary wrote carries. A verdict
+    /// over a generation without it is a resolver-stale base and is never fresh.
+    fn current_resolver_stamp() -> String {
+        format!(
+            r#"{{"resolver_epoch":"{}"}}"#,
+            devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+        )
+    }
+
+    fn insert_generation(store: &Store, id: u32, analysis_json: &str) {
+        let conn = lock_conn(&store.conn).expect("connection");
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+             VALUES (?1, 1.0, 'seed', ?2)",
+            rusqlite::params![id, analysis_json],
+        )
+        .expect("generation");
     }
 
     fn enqueue_one(store: &Store) {
@@ -2504,6 +2588,101 @@ mod freshness_race {
         assert_eq!(verdict.fresh, Some(false), "{verdict:?}");
         assert_eq!(verdict.reason.as_deref(), Some("tree differs"));
         assert!(verdict.verified_age_ms.expect("age") >= 3_600_000);
+    }
+
+    /// A store whose watcher was live when `status` walked the tree.
+    fn seeded_watched() -> Store {
+        let store = Store::open_in_memory().expect("store");
+        insert_generation(&store, 7, &current_resolver_stamp());
+        store.set_watcher_live(true);
+        store.remember_source_freshness(7, Some(true), None);
+        store
+    }
+
+    #[test]
+    fn a_watcher_backed_verdict_idle_past_the_bound_is_still_fresh() {
+        let _reset = ResetClock;
+        let store = seeded_watched();
+        advance_clock(std::time::Duration::from_secs(3600));
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
+        assert!(verdict.verified_age_ms.expect("age") >= 3_600_000);
+    }
+
+    #[test]
+    fn a_watcher_backed_verdict_still_ends_at_a_queued_edit() {
+        let _reset = ResetClock;
+        let store = seeded_watched();
+        enqueue_one(&store);
+        assert_eq!(store.query_source_freshness().fresh, None);
+    }
+
+    #[test]
+    fn a_verdict_outlives_neither_a_stopped_watcher_nor_one_that_started_late() {
+        let _reset = ResetClock;
+        // The watcher stopped after the walk.
+        let stopped = seeded_watched();
+        stopped.set_watcher_live(false);
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 2);
+        assert_eq!(stopped.query_source_freshness().fresh, None);
+        // The walk ran before any watcher: it was never backed, whatever
+        // started watching afterwards.
+        let late = seeded();
+        late.set_watcher_live(true);
+        assert_eq!(late.query_source_freshness().fresh, Some(true));
+        // The clock is set, not added to, and `late` was stamped at the
+        // earlier setting.
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 4);
+        let verdict = late.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        assert!(verdict.reason.expect("reason").contains("no watcher"));
+    }
+
+    #[test]
+    fn an_unwatched_verdict_is_restamped_by_status_and_not_by_a_new_generation() {
+        let _reset = ResetClock;
+        let store = seeded();
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 2);
+        assert_eq!(store.query_source_freshness().fresh, None);
+        // A build elsewhere (a hook-detached `devmap build`) moves the
+        // generation: the verdict described an older one, so it says so and
+        // names the command that re-verifies.
+        insert_generation(&store, 8, &current_resolver_stamp());
+        let moved = store.query_source_freshness();
+        assert_eq!(moved.fresh, None);
+        let reason = moved.reason.expect("reason");
+        assert!(
+            reason.contains("generation 7") && reason.contains("devmap status"),
+            "{reason}"
+        );
+        // `status` is what remembers a verdict, and the age restarts.
+        store.remember_source_freshness(8, Some(true), None);
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
+        assert_eq!(verdict.generation_id, Some(8));
+    }
+
+    #[test]
+    fn a_resolver_stale_base_is_never_fresh_on_an_envelope() {
+        for (label, analysis) in [
+            ("older epoch", r#"{"resolver_epoch":"2"}"#.to_string()),
+            ("no stamp", "{}".to_string()),
+        ] {
+            let store = Store::open_in_memory().expect("store");
+            insert_generation(&store, 7, &analysis);
+            // What `status` remembers for a tree that matches the stored hashes
+            // while the edges were written by another resolver.
+            store.remember_source_freshness(7, Some(true), Some("analyzer stale".to_string()));
+            let verdict = store.query_source_freshness();
+            assert_eq!(verdict.fresh, None, "{label}: {verdict:?}");
+            let reason = verdict.reason.expect("reason");
+            assert!(reason.contains("resolver-stale base"), "{label}: {reason}");
+        }
+        // Control: the same verdict over a current stamp stays fresh.
+        let store = Store::open_in_memory().expect("store");
+        insert_generation(&store, 7, &current_resolver_stamp());
+        store.remember_source_freshness(7, Some(true), None);
+        assert_eq!(store.query_source_freshness().fresh, Some(true));
     }
 
     #[test]
