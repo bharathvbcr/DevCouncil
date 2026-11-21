@@ -357,11 +357,11 @@ fn run_hook_inner(
         // cannot answer, and `pre_tool_use_never_emits_a_permission_decision`
         // guards what it may emit. This says nothing there.
         let stderr_line = Some("devmap hook: no indexed repository found; no-op".to_string());
-        let mut stdout = None;
-        match event {
-            HookEvent::SessionStart => stdout = unindexed_worktree_notice(&payload, executable),
-            _ => {}
-        }
+        let stdout = if event == HookEvent::SessionStart {
+            unindexed_worktree_notice(&payload, executable)
+        } else {
+            None
+        };
         return Ok(HookOutcome {
             exit_code: 0,
             stdout,
@@ -4697,7 +4697,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_worktree_edit_seeds_the_worktree_not_the_main_checkout_the_session_sits_in() {
-        let shapes: [(&str, fn(&Lane) -> Vec<u8>); 3] = [
+        type PayloadShape = (&'static str, fn(&Lane) -> Vec<u8>);
+        let shapes: [PayloadShape; 3] = [
             ("file_path in the worktree, cwd in main", |lane| {
                 payload_at("PostToolUse", "Edit", &lane.main, Some(&lane.lane.join("a.rs")))
             }),
