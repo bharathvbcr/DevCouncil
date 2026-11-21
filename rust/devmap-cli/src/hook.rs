@@ -140,14 +140,21 @@ const MAX_COMMAND_CLASSIFY_BYTES: usize = 4096;
 /// build finishes before the next call, so the coalescing lock alone would not
 /// hold them; short enough that the next call of an agent, whose model
 /// round-trip is seconds, always gets its own. A call suppressed inside the
-/// window is not retried: a write landing in the same window as the previous
-/// call's build start waits for the next trigger (an edit, a later shell call,
-/// or SessionStart's catch-up).
+/// window is not dropped: its build starts when the window ends (on unix), so a
+/// write landing in the same window as the previous call's build start is still
+/// indexed. Calls suppressed meanwhile coalesce onto that one start.
 const SHELL_BUILD_WINDOW: Duration = Duration::from_secs(2);
 
 /// File whose mtime is the last shell-triggered build start, beside the
 /// coalescing locks in `<state>/codeintel/`.
 const SHELL_BUILD_STAMP: &str = "hook-shell-build.stamp";
+
+/// File beside the coalescing locks whose existence says a trigger was skipped
+/// because a build already held the lock. The detached child removes it as it
+/// starts a run and, if it is back when the run ends, makes one more run, so a
+/// write that landed after the run's snapshot is still indexed. A marker left
+/// behind by a crash is removed by the next run's start and wedges nothing.
+const BUILD_DIRTY_MARKER: &str = "hook-build.dirty";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -368,7 +375,12 @@ fn run_hook_inner(
         {
             // Inside a shell call's rate window the previous start already
             // covers this root; say nothing.
-            if shell_post && !shell_build_window_is_open(&wt) {
+            let wait = if shell_post {
+                shell_build_window_remaining(&wt)
+            } else {
+                None
+            };
+            if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
                 return Ok(HookOutcome {
                     exit_code: 0,
                     stdout: None,
@@ -378,9 +390,9 @@ fn run_hook_inner(
             }
             // A refused or failed spawn is exit 1 with its reason, as for every
             // other PostToolUse detach, never silence.
-            let (exit_code, stderr_line) = match detach_seeded_build(executable, &wt, &main) {
+            let (exit_code, stderr_line) = match detach_build_with(executable, &wt, Some(&main), wait) {
                 Ok(()) => {
-                    if shell_post {
+                    if shell_post && wait.is_none() {
                         claim_shell_build_window(&wt);
                     }
                     (0, None)
@@ -465,11 +477,18 @@ fn run_hook_inner(
                 &selection.roots,
                 DETACH_BUDGET,
                 |executable, root| {
-                    if shell_post && !shell_build_window_is_open(root) {
+                    let wait = if shell_post {
+                        shell_build_window_remaining(root)
+                    } else {
+                        None
+                    };
+                    if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
                         return Ok(());
                     }
-                    detach_post_tool_root(executable, root)?;
-                    if shell_post {
+                    detach_post_tool_root(executable, root, wait)?;
+                    // A held-back start is not a start: the window it waits out
+                    // is still the previous one.
+                    if shell_post && wait.is_none() {
                         claim_shell_build_window(root);
                     }
                     Ok(())
@@ -1062,7 +1081,7 @@ fn catch_up_note(executable: &Path, root: &Path, started: Instant, budget: Durat
             "index stale, no time left to rebuild; run `devmap build` ({LOWER_BOUND})"
         );
     }
-    match detach_post_tool_root(executable, root) {
+    match detach_post_tool_root(executable, root, None) {
         Ok(()) => format!("index stale, rebuilding in the background ({LOWER_BOUND})"),
         Err(error) => format!(
             "index stale, rebuild failed to start ({}); run `devmap build` ({LOWER_BOUND})",
@@ -2441,45 +2460,66 @@ fn sed_cannot_change_tree(args: &[&str]) -> bool {
         })
 }
 
-/// Whether a shell-triggered build may start for `root` now: no stamp, a stamp
-/// older than [`SHELL_BUILD_WINDOW`], or one that cannot be read.
+/// How much of [`SHELL_BUILD_WINDOW`] is left for `root`, or `None` when a
+/// shell-triggered build may start now: no stamp, a stamp older than the window,
+/// or one that cannot be read.
 ///
 /// Read-only. Fails open: a marker directory the hook may not use (a link, a
 /// read-only tree), a stamp that cannot be read, or a clock that moved backwards
 /// all allow the build, because an unreadable limiter must cost a no-change
 /// build, not a stale index. The coalescing lock still bounds the concurrent
 /// case in every one of them.
-fn shell_build_window_is_open(root: &Path) -> bool {
+fn shell_build_window_remaining(root: &Path) -> Option<Duration> {
     use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
-    let Ok(dir) = PinnedDir::open(&state_dir(root).join("codeintel"), false) else {
-        return true;
-    };
-    let Ok(stamp) = dir.open_file(OsStr::new(SHELL_BUILD_STAMP), Access::Read, Creation::Never)
-    else {
-        return true;
-    };
-    let Ok(modified) = stamp.metadata().and_then(|meta| meta.modified()) else {
-        return true;
-    };
-    !modified.elapsed().is_ok_and(|age| age < SHELL_BUILD_WINDOW)
+    let dir = PinnedDir::open(&state_dir(root).join("codeintel"), false).ok()?;
+    let stamp = dir
+        .open_file(OsStr::new(SHELL_BUILD_STAMP), Access::Read, Creation::Never)
+        .ok()?;
+    let modified = stamp.metadata().and_then(|meta| meta.modified()).ok()?;
+    match modified.elapsed() {
+        Ok(age) => SHELL_BUILD_WINDOW
+            .checked_sub(age)
+            .filter(|left| !left.is_zero()),
+        // A stamp in the future is the start a held-back build was scheduled
+        // for (see [`schedule_shell_build_window`]): its window ends one
+        // window after that. Beyond what a held-back build can schedule it is a
+        // clock that jumped, and it must not hold the window shut: open.
+        Err(error) => {
+            let ahead = error.duration();
+            (ahead <= SHELL_BUILD_WINDOW_MAX_WAIT - SHELL_BUILD_WINDOW)
+                .then(|| ahead + SHELL_BUILD_WINDOW)
+        }
+    }
 }
+
+/// Longest a held-back build waits: the rest of a window that itself starts at a
+/// held-back build's scheduled start.
+const SHELL_BUILD_WINDOW_MAX_WAIT: Duration = Duration::from_secs(4);
 
 /// Start the rate window for `root`: the stamp's mtime becomes now. Called only
 /// after a detach that succeeded, so a refused or failed spawn leaves the next
 /// shell call free to try again instead of being silenced for the window.
 fn claim_shell_build_window(root: &Path) {
+    // A stamp that cannot be touched only costs the limiter, never the build.
+    let _ = touch_state_file(root, SHELL_BUILD_STAMP, SystemTime::now());
+}
+
+/// Start the rate window for a build held back `wait`: the stamp becomes the
+/// start it was scheduled for, so later calls see the window as running from
+/// then and coalesce onto the held-back build instead of each scheduling another.
+fn schedule_shell_build_window(root: &Path, wait: Duration) {
+    let _ = touch_state_file(root, SHELL_BUILD_STAMP, SystemTime::now() + wait);
+}
+
+/// Create `name` in `<state>/codeintel/` if missing and set its mtime to `at`,
+/// through a pinned directory so no link component is followed out of the tree.
+fn touch_state_file(root: &Path, name: &str, at: SystemTime) -> Option<()> {
     use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
-    let Ok(dir) = PinnedDir::open(&state_dir(root).join("codeintel"), true) else {
-        return;
-    };
-    if let Ok(stamp) = dir.open_file(
-        OsStr::new(SHELL_BUILD_STAMP),
-        Access::Append,
-        Creation::IfMissing,
-    ) {
-        // A stamp that cannot be touched only costs the limiter, never the build.
-        let _ = stamp.set_modified(SystemTime::now());
-    }
+    let dir = PinnedDir::open(&state_dir(root).join("codeintel"), true).ok()?;
+    let file = dir
+        .open_file(OsStr::new(name), Access::Append, Creation::IfMissing)
+        .ok()?;
+    file.set_modified(at).ok()
 }
 
 /// Where a repository keeps hook bookkeeping.
@@ -2736,18 +2776,33 @@ fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
     }
 }
 
-fn detach_post_tool_root(executable: &Path, root: &Path) -> anyhow::Result<()> {
+/// `delay` is the rest of a shell call's rate window: the start is held back
+/// until it ends instead of being dropped (see [`SHELL_BUILD_WINDOW`]).
+fn detach_post_tool_root(
+    executable: &Path,
+    root: &Path,
+    delay: Option<Duration>,
+) -> anyhow::Result<()> {
     if has_stack_lease(root) && !has_sqlite_store(root) {
-        return detach_stack_sync(executable, root);
+        return detach_stack_sync(executable, root, delay);
     }
-    detach_build(executable, root)
+    detach_build_with(executable, root, None, delay)
 }
 
-fn detach_stack_sync(executable: &Path, root: &Path) -> anyhow::Result<()> {
+/// Whether the rest of a shell call's rate window can be waited out in the
+/// detached child. Only unix has a shell to wait in; elsewhere a call inside the
+/// window is dropped, as it was before.
+const WINDOW_CAN_BE_WAITED_OUT: bool = cfg!(unix);
+
+fn detach_stack_sync(
+    executable: &Path,
+    root: &Path,
+    delay: Option<Duration>,
+) -> anyhow::Result<()> {
     let executable = canonical_hook_executable(executable, root, "detach")?;
     let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "stack-sync");
-    if !try_acquire_lock_dir(&lock_dir)? {
+    if !acquire_or_mark_dirty(root, &lock_dir)? {
         return Ok(());
     }
     let args: Vec<std::ffi::OsString> = vec![
@@ -2757,7 +2812,7 @@ fn detach_stack_sync(executable: &Path, root: &Path) -> anyhow::Result<()> {
         "--sync-delta".into(),
     ];
     let args_ref: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
-    spawn_detached_with_cleanup(executable, &args_ref, &lock_dir)
+    spawn_build_detached(root, &lock_dir, executable, &args_ref, delay)
 }
 
 fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, PathBuf)> {
@@ -2796,29 +2851,63 @@ fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, 
     None
 }
 
-fn detach_build(executable: &Path, root: &Path) -> anyhow::Result<()> {
-    detach_build_with(executable, root, None)
-}
-
 /// A build of a linked worktree that starts from its main checkout's store.
 fn detach_seeded_build(executable: &Path, root: &Path, main: &Path) -> anyhow::Result<()> {
-    detach_build_with(executable, root, Some(main))
+    detach_build_with(executable, root, Some(main), None)
 }
 
 fn detach_build_with(
     executable: &Path,
     root: &Path,
     seed_from: Option<&Path>,
+    delay: Option<Duration>,
 ) -> anyhow::Result<()> {
     let executable = canonical_hook_executable_with_seed(executable, root, seed_from, "detach")?;
     let executable = executable.as_path();
     let lock_dir = coalesce_lock_dir(root, "build");
-    if !try_acquire_lock_dir(&lock_dir)? {
+    if !acquire_or_mark_dirty(root, &lock_dir)? {
         return Ok(());
     }
     let args = build_args(root, seed_from);
     let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
-    spawn_detached_with_cleanup(executable, &args, &lock_dir)
+    spawn_build_detached(root, &lock_dir, executable, &args, delay)
+}
+
+/// Spawn the detached build, holding it back by `delay` and scheduling the
+/// shell window to start when it does.
+fn spawn_build_detached(
+    root: &Path,
+    lock_dir: &Path,
+    executable: &Path,
+    args: &[&OsStr],
+    delay: Option<Duration>,
+) -> anyhow::Result<()> {
+    let options = SpawnOptions {
+        delay,
+        rerun_when_dirty: true,
+    };
+    spawn_detached_with(executable, args, lock_dir, options)?;
+    if let Some(wait) = delay {
+        schedule_shell_build_window(root, wait);
+    }
+    Ok(())
+}
+
+/// Take the coalescing lock, or — when a build holds it — leave
+/// [`BUILD_DIRTY_MARKER`] so that build runs once more, and try once again.
+///
+/// The second attempt closes the gap where the holder finished between the first
+/// attempt and the marker: the marker then has no one to read it, so this hook
+/// starts the build itself. The holder's own end-of-run check is a shell test
+/// before its `rm`; a marker landing in that few-instruction gap is left for the
+/// next run to clear, which is the one write this does not cover.
+fn acquire_or_mark_dirty(root: &Path, lock_dir: &Path) -> anyhow::Result<bool> {
+    if try_acquire_lock_dir(lock_dir)? {
+        return Ok(true);
+    }
+    // A marker that cannot be written costs the trailing run, never the hook.
+    let _ = touch_state_file(root, BUILD_DIRTY_MARKER, SystemTime::now());
+    try_acquire_lock_dir(lock_dir)
 }
 
 /// `build`'s argument vector; `--seed-from` is present exactly when a main
@@ -3530,6 +3619,17 @@ pub(crate) fn canonical_hook_executable_with_seed(
 /// Environment variable naming the coalescing lock a detached child owns and
 /// must remove when it exits. Set only on Windows, where there is no shell to
 /// do it; see [`OwnedLock`].
+/// What a detached build does beyond running once.
+#[derive(Debug, Default, Clone, Copy)]
+struct SpawnOptions {
+    /// Wait this long (whole seconds, rounded up) before the first run, holding
+    /// the lock meanwhile, so triggers arriving in the wait coalesce onto it.
+    delay: Option<Duration>,
+    /// Run once more when [`BUILD_DIRTY_MARKER`] reappears during a run: one
+    /// trailing run per build, never a loop.
+    rerun_when_dirty: bool,
+}
+
 pub const OWNED_LOCK_ENV: &str = "DEVMAP_HOOK_OWNED_LOCK";
 
 /// The unix half of [`spawn_detached_with_cleanup`]: `executable args…` under
@@ -3540,6 +3640,7 @@ fn detached_shell_command(
     executable: &Path,
     args: &[&OsStr],
     lock_dir: &Path,
+    options: SpawnOptions,
 ) -> anyhow::Result<Command> {
     let exe = executable
         .to_str()
@@ -3558,12 +3659,34 @@ fn detached_shell_command(
     // hooks coalesce onto one build. The shell removes it when the child
     // exits, with `/bin/rm` by absolute path for the reason `/bin/sh` is
     // below: the shell searches the inherited PATH for a bare `rm`.
-    let script = format!(
-        "{} {}; status=$?; /bin/rm -rf {}; exit $status",
-        shell_single_quote(exe),
-        quoted.join(" "),
+    let run = format!("{} {}", shell_single_quote(exe), quoted.join(" "));
+    let mut script = String::new();
+    if let Some(delay) = options.delay {
+        // `/bin/sleep` takes whole seconds on every platform; round up so the
+        // run never starts inside the window it is waiting out.
+        let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
+        script.push_str(&format!("/bin/sleep {seconds}; "));
+    }
+    if options.rerun_when_dirty {
+        // The marker is cleared before a run starts, so one that is present
+        // when the run ends was set by a trigger that may have missed its
+        // snapshot. `[` is a shell builtin, not a PATH lookup.
+        let marker = lock_dir
+            .parent()
+            .and_then(|dir| dir.join(BUILD_DIRTY_MARKER).to_str().map(str::to_owned))
+            .ok_or_else(|| anyhow!("lock path is not UTF-8"))?;
+        let marker = shell_single_quote(&marker);
+        script.push_str(&format!(
+            "/bin/rm -f {marker}; {run}; status=$?; \
+             if [ -e {marker} ]; then /bin/rm -f {marker}; {run}; status=$?; fi; "
+        ));
+    } else {
+        script.push_str(&format!("{run}; status=$?; "));
+    }
+    script.push_str(&format!(
+        "/bin/rm -rf {}; exit $status",
         shell_single_quote(lock)
-    );
+    ));
     // By absolute path: a bare `sh` is looked up on PATH, and the hook runs
     // in the agent's environment, where a PATH entry can name a directory
     // inside the repository.
@@ -3594,6 +3717,17 @@ fn spawn_detached_with_cleanup(
     args: &[&OsStr],
     lock_dir: &Path,
 ) -> anyhow::Result<()> {
+    spawn_detached_with(executable, args, lock_dir, SpawnOptions::default())
+}
+
+/// [`spawn_detached_with_cleanup`] with [`SpawnOptions`]. Windows has no shell
+/// to loop in, so it runs once at once: no delay, no trailing run.
+fn spawn_detached_with(
+    executable: &Path,
+    args: &[&OsStr],
+    lock_dir: &Path,
+    options: SpawnOptions,
+) -> anyhow::Result<()> {
     // `/bin/rm -rf` follows an intermediate symlink. The path it receives has
     // already been pinned to a real directory inside the repository.
     let lock_dir = pinned_lock_dir(lock_dir)?;
@@ -3605,9 +3739,10 @@ fn spawn_detached_with_cleanup(
     }
     let lock_dir = lock_dir.as_path();
     #[cfg(unix)]
-    let mut cmd = detached_shell_command(executable, args, lock_dir)?;
+    let mut cmd = detached_shell_command(executable, args, lock_dir, options)?;
     #[cfg(windows)]
     let mut cmd = {
+        let _ = options;
         use std::os::windows::process::CommandExt;
         stop_standard_handles_from_being_inherited();
         const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -3705,6 +3840,7 @@ mod tests {
             Path::new("/opt/devmap/bin/devmap"),
             &[OsStr::new("build")],
             Path::new("/tmp/devmap-lock"),
+            SpawnOptions::default(),
         )
         .unwrap();
         assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
@@ -3713,6 +3849,32 @@ mod tests {
     /// The shell's cleanup runs no program found on PATH either. A planted
     /// `rm` first on PATH — one that records it ran and removes nothing —
     /// is never started, and the lock is still removed.
+    /// The held-back and trailing-run script names every program by absolute
+    /// path, as the plain one does: no PATH lookup of `sleep`, `rm` or `[`.
+    #[cfg(unix)]
+    #[test]
+    fn the_held_back_build_script_looks_nothing_up_on_path() {
+        let cmd = detached_shell_command(
+            Path::new("/opt/devmap/bin/devmap"),
+            &[OsStr::new("build")],
+            Path::new("/tmp/codeintel/hook-build.running"),
+            SpawnOptions {
+                delay: Some(Duration::from_millis(1500)),
+                rerun_when_dirty: true,
+            },
+        )
+        .unwrap();
+        let script = cmd.get_args().nth(1).unwrap().to_string_lossy().into_owned();
+        assert!(script.starts_with("/bin/sleep 2; /bin/rm -f '/tmp/codeintel/hook-build.dirty'; "), "{script}");
+        assert!(
+            !script
+                .split([';', ' '])
+                .any(|word| matches!(word, "sleep" | "rm" | "touch")),
+            "a bare program name in {script}"
+        );
+        assert_eq!(script.matches("'/opt/devmap/bin/devmap' 'build'").count(), 2, "{script}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_detached_build_cleanup_does_not_run_paths_rm() {
@@ -3742,6 +3904,7 @@ mod tests {
             Path::new("/bin/sh"),
             &[OsStr::new("-c"), OsStr::new("exit 0")],
             &lock,
+            SpawnOptions::default(),
         )
         .unwrap();
         cmd.env("PATH", &planted_dir)
@@ -3943,7 +4106,7 @@ mod tests {
     }
 
     /// Every detached spawn shares the probe's containment owner: PostToolUse
-    /// (`detach_build`, `detach_stack_sync`) and SessionEnd
+    /// (`detach_build_with`, `detach_stack_sync`) and SessionEnd
     /// (`detach_session_report`) refuse a binary inside the repository, take no
     /// lock, and spawn nothing.
     #[cfg(unix)]
@@ -3957,10 +4120,10 @@ mod tests {
         write_script(&exe, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
 
         let results = [
-            detach_build(&exe, &repo),
-            detach_stack_sync(&exe, &repo),
+            detach_build_with(&exe, &repo, None, None),
+            detach_stack_sync(&exe, &repo, None),
             detach_session_report(&exe, &repo, Some("s1")),
-            detach_post_tool_root(&exe, &repo),
+            detach_post_tool_root(&exe, &repo, None),
         ];
         std::thread::sleep(Duration::from_millis(300));
         let ran = marker.exists();
@@ -4059,7 +4222,7 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let missing = base.join("no-such-devmap");
 
-        let result = detach_build(&missing, &repo);
+        let result = detach_build_with(&missing, &repo, None, None);
         let locked = coalesce_lock_dir(&repo, "build").exists();
         let _ = fs::remove_dir_all(&base);
         let message = result
@@ -4953,16 +5116,20 @@ mod tests {
             eventually(|| lane.builds_started() >= 1),
             "no rebuild started"
         );
-        fs::write(&lane.release, b"").unwrap();
-        assert!(
-            eventually(|| !lane.main_lock().exists()),
-            "the lock outlived its build"
-        );
+        // While that build runs, the eight starts are one build. The skipped
+        // seven left a marker, so one trailing run follows it and no more.
+        thread::sleep(Duration::from_millis(200));
         assert_eq!(
             lane.builds_started(),
             1,
             "the lock did not coalesce the starts"
         );
+        fs::write(&lane.release, b"").unwrap();
+        assert!(
+            eventually(|| !lane.main_lock().exists()),
+            "the lock outlived its build"
+        );
+        assert!(lane.builds_started() <= 2, "more than one trailing run");
     }
 
     /// A spent budget starts nothing and says so; a refused spawn is named in
@@ -5561,12 +5728,12 @@ mod tests {
         let stamp = state_dir(&lane.main)
             .join("codeintel")
             .join(SHELL_BUILD_STAMP);
-        assert!(shell_build_window_is_open(&lane.main), "no stamp: open");
+        assert!(shell_build_window_remaining(&lane.main).is_none(), "no stamp: open");
         assert!(!stamp.exists(), "checking the window must not claim it");
         claim_shell_build_window(&lane.main);
         assert!(stamp.is_file());
         assert!(
-            !shell_build_window_is_open(&lane.main),
+            !shell_build_window_remaining(&lane.main).is_none(),
             "inside the window: closed"
         );
 
@@ -5580,18 +5747,18 @@ mod tests {
         };
         set(SystemTime::now() - SHELL_BUILD_WINDOW - Duration::from_secs(1));
         assert!(
-            shell_build_window_is_open(&lane.main),
+            shell_build_window_remaining(&lane.main).is_none(),
             "past the window: open"
         );
         claim_shell_build_window(&lane.main);
         assert!(
-            !shell_build_window_is_open(&lane.main),
+            !shell_build_window_remaining(&lane.main).is_none(),
             "and the claim restarts it"
         );
 
         set(SystemTime::now() + Duration::from_secs(3600));
         assert!(
-            shell_build_window_is_open(&lane.main),
+            shell_build_window_remaining(&lane.main).is_none(),
             "a future stamp must not pin it shut"
         );
 
@@ -5599,7 +5766,7 @@ mod tests {
         fs::remove_file(&stamp).unwrap();
         fs::create_dir(&stamp).unwrap();
         assert!(
-            shell_build_window_is_open(&lane.main),
+            shell_build_window_remaining(&lane.main).is_none(),
             "an unusable stamp is open"
         );
     }
@@ -5886,6 +6053,287 @@ mod tests {
         assert!(eventually(|| lane.builds_started() == 1), "no tool_input: possible write");
     }
 
+    /// The stamp and the dirty marker are files the hook creates and touches in a
+    /// directory the repository's own tree controls. A link in either place must
+    /// never carry the touch to its target, and must not stop builds.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_stamp_or_marker_is_never_followed_and_never_blocks_a_build() {
+        let lane = Lane::new("trail-links", true);
+        let codeintel = state_dir(&lane.main).join("codeintel");
+        fs::create_dir_all(&codeintel).unwrap();
+        let victim = lane.parent.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(3600);
+        let pin = || {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&victim)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        };
+        pin();
+        let observed = || {
+            let meta = fs::metadata(&victim).unwrap();
+            (fs::read(&victim).unwrap(), meta.modified().unwrap())
+        };
+        let untouched = observed();
+        std::os::unix::fs::symlink(&victim, codeintel.join(SHELL_BUILD_STAMP)).unwrap();
+        std::os::unix::fs::symlink(&victim, codeintel.join(BUILD_DIRTY_MARKER)).unwrap();
+
+        let payload = shell_payload(&lane.main, "git merge feature");
+        // The first hook builds (holding the lock, the stand-in blocks), the next
+        // finds the lock held and tries to leave the marker through the link.
+        for _ in 0..3 {
+            let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+            assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        }
+        assert!(eventually(|| lane.builds_started() == 1), "a linked stamp blocked the build");
+        assert_eq!(observed(), untouched, "a link was followed out of the state directory");
+        fs::write(&lane.release, b"").unwrap();
+        assert!(eventually(|| !lane.main_lock().exists()));
+        assert_eq!(observed(), untouched, "the build's own cleanup followed the link");
+        assert!(victim.exists());
+    }
+
+    /// A stamp dated in the future (a clock that jumped) must not silence shell
+    /// triggers: a payload builds, at once, however far ahead it reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_future_stamp_does_not_silence_a_shell_trigger() {
+        for ahead in [5, 3600, 86_400 * 365] {
+            let lane = Lane::new("trail-skew", true);
+            let codeintel = state_dir(&lane.main).join("codeintel");
+            fs::create_dir_all(&codeintel).unwrap();
+            let stamp = codeintel.join(SHELL_BUILD_STAMP);
+            fs::write(&stamp, b"").unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&stamp)
+                .unwrap()
+                .set_modified(SystemTime::now() + Duration::from_secs(ahead))
+                .unwrap();
+            let begun = Instant::now();
+            let outcome = run_hook(
+                HookEvent::PostToolUse,
+                &shell_payload(&lane.main, "git merge feature"),
+                &lane.exe,
+                None,
+            );
+            assert_eq!(outcome.exit_code, 0, "{ahead}: {:?}", outcome.stderr_line);
+            assert!(begun.elapsed() < Duration::from_secs(1));
+            assert!(
+                eventually(|| lane.builds_started() == 1),
+                "a stamp {ahead} s ahead silenced the trigger"
+            );
+        }
+    }
+
+    /// A state directory the hook may not write is exit 1 with a reason, as for
+    /// an Edit, never a panic and never the exit code that blocks the tool.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_state_directory_is_reported_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let lane = Lane::new("trail-ro", true);
+        let codeintel = state_dir(&lane.main).join("codeintel");
+        fs::create_dir_all(&codeintel).unwrap();
+        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o555)).unwrap();
+        for payload in [
+            shell_payload(&lane.main, "git merge feature"),
+            edit_in_main(&lane),
+        ] {
+            let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+            assert!(outcome.exit_code == 0 || outcome.exit_code == 1, "{}", outcome.exit_code);
+        }
+        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(lane.builds_started(), 0);
+    }
+
+    /// A working directory that names no indexed repository starts nothing and
+    /// creates nothing, however it is spelled.
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_shell_cwd_starts_nothing_and_creates_nothing() {
+        let lane = Lane::new("shell-cwd", true);
+        let plain = lane.parent.join("plain");
+        let repo = lane.parent.join("unindexed");
+        let newline = lane.parent.join("new\nline");
+        for dir in [&plain, &repo, &newline] {
+            fs::create_dir_all(dir.join(".git")).unwrap();
+        }
+        fs::remove_dir_all(plain.join(".git")).unwrap();
+        let cwds: Vec<PathBuf> = vec![
+            plain.clone(),
+            repo.clone(),
+            newline.clone(),
+            lane.parent.join("does-not-exist"),
+            lane.parent.join("does\nnot/exist"),
+            PathBuf::from("relative/path"),
+            PathBuf::from(""),
+            lane.main.join("a.rs/not-a-dir"),
+        ];
+        for cwd in cwds {
+            for command in ["git merge feature", "rm x"] {
+                let outcome = run_hook(
+                    HookEvent::PostToolUse,
+                    &shell_payload(&cwd, command),
+                    &lane.exe,
+                    None,
+                );
+                assert!(
+                    outcome.exit_code != 2,
+                    "{cwd:?}: {command}: {:?}",
+                    outcome.stderr_line
+                );
+            }
+        }
+        assert_eq!(lane.builds_started(), 0, "a hostile cwd started a build");
+        for dir in [&plain, &repo, &newline] {
+            assert!(!dir.join(".devcouncil").exists(), "{dir:?}: created state");
+            assert!(!dir.join(".devmap").exists(), "{dir:?}: created state");
+        }
+    }
+
+    // ---- Trailing edge: a write that lands while a build runs is not lost ---------
+
+    /// [Lane]'s stand-in, taught to copy the main checkout's \`a.rs\` into \`snaps\` at
+    /// the start of every build: a write is indexed exactly when some build
+    /// started after it.
+    #[cfg(unix)]
+    fn snapshotting(lane: &Lane) -> PathBuf {
+        let snaps = lane.parent.join("snaps");
+        let script = fs::read_to_string(&lane.exe).unwrap();
+        let marker = format!("echo x >> '{}'", lane.starts.display());
+        assert!(script.contains(&marker), "stand-in changed shape");
+        let patched = script.replace(
+            &marker,
+            &format!(
+                "{marker}\ncat '{}' >> '{}'",
+                lane.main.join("a.rs").display(),
+                snaps.display()
+            ),
+        );
+        write_script(&lane.exe, &patched);
+        snaps
+    }
+
+    #[cfg(unix)]
+    fn edit_in_main(lane: &Lane) -> Vec<u8> {
+        json!({
+            "session_id": "trail",
+            "hook_event_name": "PostToolUse",
+            "cwd": &lane.main,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": lane.main.join("a.rs") },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[cfg(unix)]
+    fn snapshots(snaps: &Path) -> String {
+        fs::read_to_string(snaps).unwrap_or_default()
+    }
+
+    /// Build A is running (the coalescing lock is held) when write W2 arrives
+    /// and no further hook fires: W2 must still be indexed once A ends. Before,
+    /// the skipped trigger left W2 unindexed until some later trigger.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_lands_while_a_build_runs_is_indexed_without_another_trigger() {
+        type Trigger = (&'static str, fn(&Lane) -> Vec<u8>);
+        let triggers: [Trigger; 2] = [
+            ("edit", edit_in_main),
+            ("shell", |lane| shell_payload(&lane.main, "git merge feature")),
+        ];
+        for (name, trigger) in triggers {
+            let lane = Lane::new("trail-running", true);
+            let snaps = snapshotting(&lane);
+            fs::write(lane.main.join("a.rs"), "W1\n").unwrap();
+            let first = run_hook(HookEvent::PostToolUse, &trigger(&lane), &lane.exe, None);
+            assert_eq!(first.exit_code, 0, "{name}: {:?}", first.stderr_line);
+            assert!(eventually(|| lane.builds_started() == 1), "{name}: build A");
+            assert!(eventually(|| snapshots(&snaps).contains("W1")), "{name}");
+            // A is mid-build: the write below is after its snapshot.
+            fs::write(lane.main.join("a.rs"), "W2\n").unwrap();
+            let begun = Instant::now();
+            let second = run_hook(HookEvent::PostToolUse, &trigger(&lane), &lane.exe, None);
+            assert_eq!(second.exit_code, 0, "{name}: {:?}", second.stderr_line);
+            assert!(begun.elapsed() < Duration::from_secs(1), "{name}: the hook waited");
+            fs::write(&lane.release, b"").unwrap();
+            assert!(
+                eventually(|| snapshots(&snaps).contains("W2")),
+                "{name}: W2 landed during build A and no build ever saw it: {:?}",
+                snapshots(&snaps)
+            );
+            assert!(eventually(|| !lane.main_lock().exists()), "{name}: lock");
+            assert!(lane.builds_started() <= 2, "{name}: more than one trailing run");
+        }
+    }
+
+    /// The previous shell trigger's build already ended inside the 2 s window:
+    /// no lock is held, so a write inside the window must still be indexed.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_inside_the_shell_window_is_indexed_when_the_window_ends() {
+        let lane = Lane::new("trail-window", true);
+        let snaps = snapshotting(&lane);
+        fs::write(&lane.release, b"").unwrap();
+        fs::write(lane.main.join("a.rs"), "W1\n").unwrap();
+        let payload = shell_payload(&lane.main, "git merge feature");
+        run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        assert!(eventually(|| snapshots(&snaps).contains("W1")));
+        assert!(eventually(|| !lane.main_lock().exists()));
+        fs::write(lane.main.join("a.rs"), "W2\n").unwrap();
+        let begun = Instant::now();
+        let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(begun.elapsed() < Duration::from_secs(1), "the hook waited out the window");
+        assert!(
+            eventually(|| snapshots(&snaps).contains("W2")),
+            "W2 landed inside the window and no build ever saw it: {:?}",
+            snapshots(&snaps)
+        );
+        assert!(eventually(|| !lane.main_lock().exists()));
+    }
+
+    /// Writers that never stop cannot make a build loop: one running build
+    /// earns at most one trailing run, and a marker left behind by a crash
+    /// neither wedges the next build nor triggers a phantom rerun.
+    #[cfg(unix)]
+    #[test]
+    fn trailing_runs_are_bounded_and_a_stale_marker_never_wedges() {
+        let lane = Lane::new("trail-bound", true);
+        let marker = state_dir(&lane.main).join("codeintel").join(BUILD_DIRTY_MARKER);
+        // A stale marker from a crashed build, then a normal trigger.
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"").unwrap();
+        fs::write(&lane.release, b"").unwrap();
+        run_hook(HookEvent::PostToolUse, &edit_in_main(&lane), &lane.exe, None);
+        assert!(eventually(|| lane.builds_started() >= 1), "a stale marker wedged the build");
+        assert!(eventually(|| !lane.main_lock().exists()));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(lane.builds_started(), 1, "a stale marker caused a rerun");
+
+        // A writer that dirties the tree during every run.
+        let script = fs::read_to_string(&lane.exe).unwrap();
+        write_script(
+            &lane.exe,
+            &script.replace(
+                "echo x >>",
+                &format!(": > '{}'; echo x >>", marker.display()),
+            ),
+        );
+        let before = lane.builds_started();
+        run_hook(HookEvent::PostToolUse, &edit_in_main(&lane), &lane.exe, None);
+        assert!(eventually(|| lane.builds_started() > before));
+        assert!(eventually(|| !lane.main_lock().exists()));
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(lane.builds_started() - before, 2, "one build plus one trailing run, no more");
+    }
+
     /// A SessionStart catch-up and PostToolUse edits racing on one root share
     /// the one build lock.
     #[cfg(unix)]
@@ -5905,9 +6353,13 @@ mod tests {
             }
         });
         assert!(eventually(|| lane.builds_started() >= 1), "no build started");
+        // While that build runs, the racers are one build; the skipped ones
+        // earn one trailing run after it, never a build each.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(lane.builds_started(), 1, "the racers did not share a build");
         fs::write(&lane.release, b"").unwrap();
         assert!(eventually(|| !lane.main_lock().exists()), "the lock outlived its build");
-        assert_eq!(lane.builds_started(), 1, "the racers did not share a build");
+        assert!(lane.builds_started() <= 2, "more than one trailing run");
     }
 
     /// Catch-up fires only for a well-formed status that is queryable, not
@@ -9386,7 +9838,7 @@ mod lock_tests {
     #[test]
     fn a_plain_detached_build_is_not_seeded() {
         let fx = Detached::new("plain-argv", true);
-        detach_build(&fx.fake, &fx.lane).expect("detach");
+        detach_build_with(&fx.fake, &fx.lane, None, None).expect("detach");
         assert_eq!(
             fx.argv(),
             vec![
