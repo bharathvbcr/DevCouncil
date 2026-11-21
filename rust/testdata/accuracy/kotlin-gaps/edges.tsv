@@ -30,6 +30,8 @@ kg.K31b	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events
 kg.K32	K32	src/main/kotlin/gaps/Events.kt::useFactory	src/main/kotlin/gaps/Events.kt::Factory.build	edge	must		companion object call
 kg.K33	K33	src/main/kotlin/gaps/Events.kt::mk	src/main/kotlin/gaps/Events.kt::Res.Ok	edge	must	Ok	nested class constructor Res.Ok(1)
 kg.G1	G1	src/main/kotlin/gaps/Svc.kt::PollService.label	src/main/kotlin/gaps/util/Strings.kt::getString	forbid	must		getString(1) is the member inherited from android.app.Service, not a repo top-level fun
+kg.H1	H1	src/main/kotlin/gaps/Inherit.kt::ChildSvc.go	src/main/kotlin/gaps/Inherit.kt::BaseSvc.inheritedHelper	edge	must		inheritedHelper() is the in-repo member ChildSvc inherits from BaseSvc, though BaseSvc itself extends android.app.Service (positive control for the kg.G1 guard)
+kg.H1.not	H1	src/main/kotlin/gaps/Inherit.kt::ChildSvc.go	src/main/kotlin/gaps/util/InheritDecoy.kt::inheritedHelper	forbid	must		the same-named top-level fun in another package is not the inherited member
 kg.OV1	overload	src/main/kotlin/gaps/Overloads.kt::Calc.add	src/main/kotlin/gaps/Overloads.kt::Calc.add	forbid_any_tier	must		add(String) calls add(Int), a different declaration: two overloads must keep distinct identities, so no edge may join a symbol to itself
 kg.OV2	overload	src/main/kotlin/gaps/Overloads.kt::useCalc	src/main/kotlin/gaps/Overloads.kt::Calc.add	edge	must		c.add(1) and c.add("two") on a Calc-typed parameter reach Calc.add (either overload)
 kg.Z1	Z1	src/main/kotlin/gaps/zq/ZqRecall.kt::zqLocalFromStdlib	src/main/kotlin/gaps/zq/ZqRecall.kt::String.zqShout	edge	must		local initialised by a stdlib String method (title.lowercase()) is a String: the String extension is called
