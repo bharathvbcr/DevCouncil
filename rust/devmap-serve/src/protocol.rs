@@ -1417,13 +1417,13 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
     })
 }
 
-/// Largest `HEAD` file read: a branch name or an object id fits. A larger file
-/// is refused (reads broken), not truncated. Read by
+/// Largest `HEAD` file read: a legal `ref:` line (nested components of up to 255
+/// bytes each) or an object id fits. A larger file is refused (reads broken), not truncated. Read by
 /// `devmap_query::stat_memo::read_bounded`, which never blocks on a FIFO.
-const HEAD_READ_CAP: u64 = 256;
-/// Largest `.git` pointer file read, refused when larger: it holds a whole path (`PATH_MAX` is 4096
-/// on Linux), which the `HEAD` cap would truncate.
-const GITFILE_READ_CAP: u64 = 4096;
+const HEAD_READ_CAP: u64 = 4096;
+/// Largest `.git` pointer file read, refused when larger: it holds `gitdir: ` plus a whole path
+/// (`PATH_MAX` is 4096 on Linux) and a newline, which must not be truncated.
+const GITFILE_READ_CAP: u64 = 8192;
 
 /// Whether the `HEAD` file of the git directory `git_dir` is missing or names
 /// neither a branch (`ref: ...`) nor an object id. A directory walk and a
@@ -4423,23 +4423,36 @@ mod tests {
         );
     }
 
-    /// Over the cap a file is refused, not truncated: a `HEAD` past 256 bytes and a
-    /// `.git` pointer past 4096 both read broken.
+    /// A legal `HEAD` naming a long branch (components may reach 255 bytes, and
+    /// nested ones more) is an ordinary unborn branch, not a fault. Only a file past
+    /// the cap is refused, not truncated: a `HEAD` past 4096 bytes and a `.git`
+    /// pointer past 8192 both read broken.
     #[test]
     fn an_over_cap_head_or_gitfile_reads_broken() {
-        let head = head_clause_over("head-over-cap", |root| {
+        let long_branch = head_clause_over("head-long-branch", |root| {
             let dir = root.join(".git");
             std::fs::create_dir_all(&dir).unwrap();
             let name = "x".repeat(300);
             std::fs::write(dir.join("HEAD"), format!("ref: refs/heads/{name}\n")).unwrap();
         });
-        assert!(head.is_some(), "a HEAD past the 256-byte cap read clean");
+        assert!(
+            long_branch.is_none(),
+            "a legal ~300-byte branch name read as a broken HEAD: {long_branch:?}"
+        );
+
+        let head = head_clause_over("head-over-cap", |root| {
+            let dir = root.join(".git");
+            std::fs::create_dir_all(&dir).unwrap();
+            let name = "x".repeat(5000);
+            std::fs::write(dir.join("HEAD"), format!("ref: refs/heads/{name}\n")).unwrap();
+        });
+        assert!(head.is_some(), "a HEAD past the 4096-byte cap read clean");
 
         let gitfile = head_clause_over("gitfile-over-cap", |root| {
             let gitdir = root.parent().unwrap().join("gitdirs/repo");
             std::fs::create_dir_all(&gitdir).unwrap();
             std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
-            let padding = " ".repeat(5000);
+            let padding = " ".repeat(9000);
             std::fs::write(
                 root.join(".git"),
                 format!("gitdir: {}{padding}\n", gitdir.display()),
@@ -4448,7 +4461,7 @@ mod tests {
         });
         assert!(
             gitfile.is_some(),
-            "a .git pointer past the 4096-byte cap read clean"
+            "a .git pointer past the 8192-byte cap read clean"
         );
     }
 
