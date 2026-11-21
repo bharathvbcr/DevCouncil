@@ -54,6 +54,10 @@ impl SeedMethod {
 /// manifest writes beside it. Each describes the one store it sits beside.
 pub const STORE_SIDECARS: [&str; 2] = [".csr", ".artifacts.json"];
 
+/// The SQLite files that follow a store while it is open or after a crash.
+/// A left-over one is replayed into whatever store is next placed beside it.
+pub const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
 /// `path` with `suffix` appended to its file name (`devmap.sqlite` + `-wal`).
 pub fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();

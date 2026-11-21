@@ -573,7 +573,7 @@ fn ensure_target_absent(target_db: &Path) -> anyhow::Result<()> {
 /// path after.
 fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
     ensure_target_absent(final_db)?;
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for suffix in seed::SQLITE_SIDECARS {
         seed::remove_file_if_present(&seed::sidecar(final_db, suffix))?;
     }
     let mut placed: Vec<PathBuf> = Vec::new();

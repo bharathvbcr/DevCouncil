@@ -49,7 +49,7 @@ use devmap_store::seed::{
     clone_or_copy_file, copy_donor_csr_checked, csr_generation_of_open_file, discard_staged,
     prepare_immutable_snapshot, promote_immutable_base_to_store, read_file_at,
     remove_file_if_present, seed_artifact, seed_directory_cow, set_file_readonly,
-    set_file_writable, sidecar, stage_seed_healing_wal, DonorCsr, STORE_SIDECARS,
+    set_file_writable, sidecar, stage_seed_healing_wal, DonorCsr, SQLITE_SIDECARS, STORE_SIDECARS,
 };
 use devmap_store::{
     CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
@@ -2264,8 +2264,11 @@ impl StackedStore {
     ///
     /// Clones the base this store admitted (the held descriptor, a clone of a
     /// clone), places `devmap.sqlite` by atomic rename and only then retires the
-    /// lease: a store beside a lease means the lease is stale. A failure before
-    /// the store is placed leaves the lane exactly as the call found it.
+    /// lease: a store beside a lease means the lease is stale. Before placing it,
+    /// sweeps the SQLite (`-wal`, `-shm`, `-journal`) and store sidecars an earlier
+    /// store left at the target path, as `place_staged` does. A failure leaves
+    /// the lease, the base and any store that was there untouched; only those
+    /// orphaned sidecars (which describe no store) may already be gone.
     pub fn materialize_seeded_store_waiting(&self, wait: std::time::Duration) -> Result<PathBuf> {
         let target_db = store_path(&self.worktree_root);
         if let Some(parent) = target_db.parent() {
@@ -2312,7 +2315,7 @@ impl StackedStore {
             // never runs: a sidecar an earlier store left at this path would sit
             // beside the placed one. Swept as `place_staged` sweeps; a symlink is
             // unlinked, not followed.
-            for suffix in STORE_SIDECARS {
+            for suffix in SQLITE_SIDECARS.into_iter().chain(STORE_SIDECARS) {
                 remove_file_if_present(&sidecar(&target_db, suffix))?;
             }
             promote_immutable_base_to_store(&self.base_file, &target_db, &self.worktree_root)?;
@@ -2327,7 +2330,7 @@ impl StackedStore {
             let _ = fs::remove_file(&dst_csr);
             discard_staged(&target_db);
             return Err(err.context(format!(
-                "materialize failed and changed nothing; {}",
+                "materialize failed: no store was placed and the lease is intact (stale sidecars at the target path may have been removed); {}",
                 restack_hint(&lease_path)
             )));
         }
@@ -6172,9 +6175,26 @@ mod tests {
         fs::write(&outside, b"not the lane's").unwrap();
         let stale_artifacts = devmap_store::seed::sidecar(&target, ".artifacts.json");
         std::os::unix::fs::symlink(&outside, &stale_artifacts).unwrap();
+        // SQLite would replay a stale log into the placed store on first open.
+        let stale_wal = devmap_store::seed::sidecar(&target, "-wal");
+        fs::write(&stale_wal, b"a log an earlier store left").unwrap();
+        let stale_journal = devmap_store::seed::sidecar(&target, "-journal");
+        fs::write(&stale_journal, b"a journal an earlier store left").unwrap();
+        let outside_shm = root.join("outside-shm");
+        fs::write(&outside_shm, b"not the lane's either").unwrap();
+        let stale_shm = devmap_store::seed::sidecar(&target, "-shm");
+        std::os::unix::fs::symlink(&outside_shm, &stale_shm).unwrap();
         let stacked = StackedStore::open(&lane).unwrap();
         let placed = stacked.materialize_seeded_store().unwrap();
         assert_eq!(placed, target);
+        for stale in [&stale_wal, &stale_journal, &stale_shm] {
+            assert!(
+                fs::symlink_metadata(stale).is_err(),
+                "{} survived beside the placed store",
+                stale.display()
+            );
+        }
+        assert_eq!(fs::read(&outside_shm).unwrap(), b"not the lane's either");
         assert!(
             fs::symlink_metadata(&stale_csr).is_err(),
             "the stale CSR survived beside the placed store"
