@@ -2964,6 +2964,13 @@ mod tests {
             value.get("failClosed").is_none() && nav.get("failClosed").is_none(),
             "failClosed would turn a crash into a blocked Read: {value}"
         );
+        // `afterFileEdit` never fires for a shell write, so Cursor's terminal tool
+        // ("Shell") gets the refresh handler on its own postToolUse entry.
+        let shell = &value["hooks"]["postToolUse"][1];
+        assert_eq!(shell["matcher"], "Shell");
+        let shell_cmd = shell["command"].as_str().unwrap();
+        assert!(shell_cmd.contains("hook post-tool-use"), "{shell_cmd}");
+        assert_eq!(value["hooks"]["postToolUse"].as_array().unwrap().len(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

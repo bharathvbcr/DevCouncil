@@ -789,6 +789,122 @@ pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
     ))
 }
 
+/// Dev Map's PostToolUse hook is installed with a matcher older than the one
+/// this binary writes.
+///
+/// A matcher without `Bash` still refreshes the index after an Edit-tool write
+/// and misses every git operation, in-place edit and formatter run through the
+/// shell. That is outdated, not broken, so it is a warning that names the fix.
+/// Looks where Claude Code would: the active profile's settings.json, the
+/// project's `.claude/settings*.json`, and an enabled plugin's hooks.json.
+pub(crate) fn post_tool_use_matcher_warning(cwd: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let config_dir = claude::claude_config_dir(&home);
+    let project_settings = cwd.join(".claude");
+    let mut documents = vec![
+        config_dir.join("settings.json"),
+        project_settings.join("settings.json"),
+        project_settings.join("settings.local.json"),
+    ];
+    let install = claude::claude_plugin_install(&home);
+    if install.enabled == Some(true) {
+        for plugin in &install.loaded {
+            documents.push(plugin.dir.join("hooks").join("hooks.json"));
+        }
+    }
+    outdated_post_tool_use_matcher(&documents)
+}
+
+/// [`post_tool_use_matcher_warning`] over an explicit list of documents.
+///
+/// A document that exists and cannot be read is reported as unchecked when
+/// nothing outdated was found, never as current: a check that could not run must
+/// not read as one that passed. A matcher that matches every tool (`""`, `*`) or
+/// names `Bash` is current; a regular-expression matcher cannot be checked
+/// statically and is left alone.
+fn outdated_post_tool_use_matcher(documents: &[PathBuf]) -> Option<String> {
+    let mut outdated = Vec::new();
+    let mut unchecked = Vec::new();
+    for path in documents {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                unchecked.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+            unchecked.push(format!("{} is not JSON", path.display()));
+            continue;
+        };
+        let Some(groups) = document
+            .pointer("/hooks/PostToolUse")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for group in groups {
+            let runs_ours = group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|handlers| handlers.iter().any(is_devmap_post_tool_use_handler));
+            if !runs_ours {
+                continue;
+            }
+            let matcher = group
+                .get("matcher")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let covers_shell = match claude::classify_matcher("PostToolUse", matcher) {
+                claude::MatcherKind::All | claude::MatcherKind::Regex => true,
+                claude::MatcherKind::Exact(tools) => tools.iter().any(|tool| tool == "Bash"),
+            };
+            if !covers_shell {
+                outdated.push(format!("{} (matcher {matcher:?})", path.display()));
+            }
+        }
+    }
+    if !outdated.is_empty() {
+        return Some(format!(
+            "Dev Map's PostToolUse hook is outdated in {}: its matcher does not include Bash, so \
+             git operations, in-place edits and formatters run through the shell do not refresh \
+             the index until the next Edit-tool write or session start. Reinstall the Dev Map \
+             plugin or re-run `devmap integrate` to get {:?}",
+            outdated.join(", "),
+            claude::WRITE_TOOL_MATCHER
+        ));
+    }
+    (!unchecked.is_empty()).then(|| {
+        format!(
+            "cannot read {}; whether Dev Map's PostToolUse matcher covers shell calls is unchecked",
+            unchecked.join(", ")
+        )
+    })
+}
+
+/// A hook handler that runs `devmap hook post-tool-use`, as a shell-form
+/// `command` or as `command` plus `args`, wherever the `devmap` binary lives.
+fn is_devmap_post_tool_use_handler(handler: &serde_json::Value) -> bool {
+    let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let args = handler
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let line = format!("{command} {args}");
+    // Both words: another tool's own `hook post-tool-use` (the DevCouncil CLI has
+    // one) is not Dev Map's and says nothing about Dev Map's matcher.
+    line.contains("devmap") && line.contains("hook post-tool-use")
+}
+
 /// Cache directories from earlier installs that Claude Code no longer loads.
 ///
 /// Kept out of [`plugin_warning`] on purpose. Checking every directory under
