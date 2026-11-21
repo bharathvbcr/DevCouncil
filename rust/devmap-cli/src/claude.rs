@@ -1184,11 +1184,19 @@ pub const SESSION_START_MATCHER: &str = "startup|resume|clear|compact|fork";
 
 /// The tools that change files on disk, and so can move the index out of date.
 ///
-/// `Bash` is deliberately absent: a shell command may or may not write, and
-/// firing a rebuild after every `ls` would pay for the index on every read.
+/// `Bash` is here because the shell is how git operations (merge, rebase,
+/// checkout, stash), in-place edits and formatters reach the tree, and none of
+/// them passes through an Edit tool. A matcher cannot tell `git merge` from
+/// `ls`, so the handler does: `devmap hook post-tool-use` returns at once for a
+/// command that cannot change the tree and rate-limits the rest per root. Codex
+/// names its shell tool `Bash` too, and this table is also its hooks.json.
 /// `MultiEdit` is absent because it is not in the tool table — an exact matcher
 /// naming it would be a dead alternative dressed as coverage.
-pub const WRITE_TOOL_MATCHER: &str = "Edit|Write|NotebookEdit";
+pub const WRITE_TOOL_MATCHER: &str = "Edit|Write|NotebookEdit|Bash";
+
+/// The tool whose failure can still have written: a shell command's exit code
+/// says nothing about what it changed before it stopped.
+pub const SHELL_TOOL_MATCHER: &str = "Bash";
 
 /// One hook Dev Map installs, and why that event.
 #[derive(Debug, Clone, Copy)]
@@ -1243,9 +1251,24 @@ pub const DEVMAP_HOOKS: &[DevmapHook] = &[
         hook_event: "post-tool-use",
         timeout_secs: Some(5),
         status_message: "",
-        purpose: "An incremental rebuild after a write. `devmap hook post-tool-use` \
+        purpose: "An incremental rebuild after a write, including one made through the \
+                  shell (git merge, sed -i, a formatter). `devmap hook post-tool-use` \
                   returns within ~100 ms and spawns a detached, coalesced build so \
-                  hosts without `async` never block the agent loop.",
+                  hosts without `async` never block the agent loop; a shell command \
+                  that cannot change the tree spawns nothing.",
+    },
+    DevmapHook {
+        event: "PostToolUseFailure",
+        matcher: SHELL_TOOL_MATCHER,
+        hook_event: "post-tool-use",
+        timeout_secs: Some(5),
+        status_message: "",
+        purpose: "A shell command that writes and then exits non-zero (git merge stopped \
+                  on conflicts, git rebase at a conflict, git stash pop with a conflict) \
+                  fires PostToolUseFailure, not PostToolUse, yet leaves a changed tree. \
+                  Routed to the same `devmap hook post-tool-use`, which only spawns for a \
+                  command that may change the tree. Bash only: Edit, Write and \
+                  NotebookEdit that failed wrote nothing to index.",
     },
     DevmapHook {
         event: "SessionEnd",
@@ -1302,7 +1325,6 @@ pub fn event_coverage() -> Vec<(&'static str, Option<&'static DevmapHook>, &'sta
                      watches the tree directly, which covers the same changes without a hook \
                      per event."
                 }
-                "PostToolUseFailure" => "Not handled: a tool that failed wrote nothing to index.",
                 _ => "Not handled.",
             });
             (*event, hook, reason)
@@ -1610,11 +1632,14 @@ pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
 /// completions excluded — they are not repository edits Dev Map should index).
 /// `postToolUse` with matcher `Read|Grep` is the first-nav nudge: Cursor's
 /// `preToolUse` is a permission hook, and a schema mismatch there blocks the
-/// tool, so the directive is injected after the first read instead.
+/// tool, so the directive is injected after the first read instead. Its second
+/// `postToolUse` entry, matcher `Shell` (Cursor's name for the terminal tool),
+/// is the shell-write refresh; `afterFileEdit` never fires for a shell write.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
     let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
     let session_start = hook_shell_command(&exe, "session-start")?;
     let after_file_edit = hook_shell_command(&exe, "post-tool-use")?;
+    let shell_write = after_file_edit.clone();
     let post_tool_use = hook_shell_command(&exe, "pre-tool-use")?;
     let session_end = hook_shell_command(&exe, "session-end")?;
     Ok(json!({
@@ -1623,10 +1648,16 @@ pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
         "hooks": {
             "sessionStart": [{ "command": session_start }],
             "afterFileEdit": [{ "command": after_file_edit }],
-            "postToolUse": [{
-                "command": post_tool_use,
-                "matcher": "Read|Grep",
-            }],
+            "postToolUse": [
+                {
+                    "command": post_tool_use,
+                    "matcher": "Read|Grep",
+                },
+                {
+                    "command": shell_write,
+                    "matcher": "Shell",
+                },
+            ],
             "sessionEnd": [{
                 "command": session_end,
                 "timeout": SESSION_END_MAX_TIMEOUT_SECS,
@@ -2855,6 +2886,86 @@ mod tests {
                 "'{ambiguous}' resolved to {:?} instead of being refused; an address \
                  the user did not clearly specify must not be guessed into a bind",
                 resolve(ambiguous)
+            );
+        }
+    }
+
+    /// Shell calls reach the index: `Bash` is on the PostToolUse matcher Claude
+    /// Code and Codex both read, spelled exactly (a regex would be unchecked),
+    /// every alternative is a documented tool, and nothing moved onto a
+    /// permission event.
+    #[test]
+    fn the_post_tool_use_matcher_covers_shell_calls_and_stays_off_permission_events() {
+        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
+            .expect("normal emission");
+        let matcher = block["hooks"]["PostToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        assert_eq!(matcher, "Edit|Write|NotebookEdit|Bash");
+        let MatcherKind::Exact(tools) = classify_matcher("PostToolUse", matcher) else {
+            panic!("{matcher:?} must be an exact list, not a regular expression");
+        };
+        assert!(tools.iter().any(|tool| tool == "Bash"), "{tools:?}");
+        for tool in &tools {
+            assert!(
+                BUILTIN_TOOLS.contains(&tool.as_str()),
+                "{tool} is not a documented tool"
+            );
+        }
+        for event in PERMISSION_DECIDING_EVENTS {
+            assert!(
+                block["hooks"].get(*event).is_none(),
+                "{event} must stay unhandled"
+            );
+        }
+        assert_ne!(matcher, "Edit|Write|NotebookEdit", "the pre-shell matcher");
+    }
+
+    /// A shell command that wrote and then failed (a merge stopped on conflicts)
+    /// fires PostToolUseFailure: it is routed to the post-tool-use hook for
+    /// Bash only, on a non-permission event, and its coverage row says handled.
+    #[test]
+    fn a_failed_shell_call_reaches_the_post_tool_use_hook() {
+        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
+            .expect("normal emission");
+        let group = &block["hooks"]["PostToolUseFailure"][0];
+        assert_eq!(group["matcher"], "Bash");
+        let command = group["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.ends_with(" hook post-tool-use"), "{command}");
+        assert!(!PERMISSION_DECIDING_EVENTS.contains(&"PostToolUseFailure"));
+        let (_, hook, reason) = event_coverage()
+            .into_iter()
+            .find(|(event, _, _)| *event == "PostToolUseFailure")
+            .unwrap();
+        assert!(hook.is_some(), "{reason}");
+        assert!(!reason.contains("wrote nothing to index.\""), "{reason}");
+    }
+
+    /// Both bundles that carry a hooks.json (Claude's and Codex's) are rendered
+    /// from the one table, so both pick up the shell matcher.
+    #[test]
+    fn every_rendered_hooks_json_carries_the_shell_matcher() {
+        let files = render_plugin_bundle(
+            Path::new("/usr/local/bin/devmap"),
+            Path::new("/tmp/devmap.sqlite"),
+            Some("0.0.0"),
+            &["hook".to_string()],
+        )
+        .expect("bundle renders");
+        let hooks: Vec<_> = files
+            .iter()
+            .filter(|(path, _)| path.file_name().is_some_and(|name| name == "hooks.json"))
+            .collect();
+        assert_eq!(hooks.len(), 2, "Claude and Codex each ship a hooks.json");
+        for (path, text) in hooks {
+            let document: Value = serde_json::from_str(text).unwrap();
+            let matcher = document["hooks"]["PostToolUse"][0]["matcher"]
+                .as_str()
+                .unwrap();
+            assert!(
+                matcher.split('|').any(|tool| tool == "Bash"),
+                "{}: {matcher}",
+                path.display()
             );
         }
     }

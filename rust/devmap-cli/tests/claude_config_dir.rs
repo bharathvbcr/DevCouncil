@@ -250,3 +250,146 @@ fn a_plugin_without_a_session_end_hook_is_warned_about_and_a_bad_one_is_unchecke
         assert!(text.contains(expect), "{body}: {text}");
     }
 }
+
+/// Dev Map's PostToolUse hook written before shell calls were covered.
+const LEGACY_HOOKS: &str = r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|NotebookEdit","hooks":[{"type":"command","command":"'/abs/devmap' hook post-tool-use"}]}]}}"#;
+const CURRENT_HOOKS: &str = r#"{"hooks":{"PostToolUse":[{"matcher":"Edit|Write|NotebookEdit|Bash","hooks":[{"type":"command","command":"'/abs/devmap' hook post-tool-use"}]}]}}"#;
+
+fn matcher_warning(payload: &Value) -> Option<String> {
+    payload["post_tool_use_matcher_warning"]
+        .as_str()
+        .map(str::to_string)
+}
+
+#[test]
+fn an_install_whose_matcher_lacks_bash_is_outdated_not_broken() {
+    let cwd = scratch("matcher-cwd");
+    for place in ["profile", "project", "project-local"] {
+        let home = scratch("matcher-home");
+        let profile = home.join("profile");
+        let target = match place {
+            "profile" => profile.join("settings.json"),
+            "project" => cwd.join(".claude/settings.json"),
+            _ => cwd.join(".claude/settings.local.json"),
+        };
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, LEGACY_HOOKS).unwrap();
+        let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+        let text = matcher_warning(&payload).unwrap_or_else(|| panic!("{place}: not flagged"));
+        assert!(text.contains("outdated"), "{place}: {text}");
+        assert!(text.contains(target.to_str().unwrap()), "{place}: {text}");
+        assert!(
+            text.contains("Edit|Write|NotebookEdit|Bash"),
+            "{place}: {text}"
+        );
+        let _ = fs::remove_file(&target);
+        // Current, the same file is clean.
+        fs::write(&target, CURRENT_HOOKS).unwrap();
+        let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+        assert_eq!(
+            matcher_warning(&payload),
+            None,
+            "{place}: current matcher flagged"
+        );
+        let _ = fs::remove_file(&target);
+    }
+}
+
+#[test]
+fn a_matcher_that_matches_every_tool_or_belongs_to_another_hook_is_not_outdated() {
+    let cwd = scratch("matcher-other-cwd");
+    for (case, hooks) in [
+        (
+            "no matcher",
+            r#"{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"/abs/devmap hook post-tool-use"}]}]}}"#,
+        ),
+        (
+            "star",
+            r#"{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/abs/devmap hook post-tool-use"}]}]}}"#,
+        ),
+        (
+            "someone else's hook",
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"/abs/lint --fix"}]}]}}"#,
+        ),
+        ("no PostToolUse", r#"{"hooks":{"SessionEnd":[]}}"#),
+        (
+            "another tool's own post-tool-use hook",
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"/abs/devcouncil hook post-tool-use"}]}]}}"#,
+        ),
+        (
+            "args form naming another tool",
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"/abs/devcouncil","args":["hook","post-tool-use"]}]}]}}"#,
+        ),
+    ] {
+        let home = scratch("matcher-other-home");
+        let profile = home.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("settings.json"), hooks).unwrap();
+        let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+        assert_eq!(matcher_warning(&payload), None, "{case}");
+    }
+}
+
+/// A regular-expression matcher cannot be read statically, so whether it covers
+/// Bash is unchecked, never reported as current.
+#[test]
+fn a_regex_matcher_is_unchecked_not_clean() {
+    let home = scratch("matcher-regex-home");
+    let cwd = scratch("matcher-regex-cwd");
+    let profile = home.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(
+        profile.join("settings.json"),
+        r#"{"hooks":{"PostToolUse":[{"matcher":"^(Edit|Write)$","hooks":[{"type":"command","command":"/abs/devmap hook post-tool-use"}]}]}}"#,
+    )
+    .unwrap();
+    let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+    let text = matcher_warning(&payload).expect("a regex matcher must not read as current");
+    assert!(text.contains("unchecked"), "{text}");
+    assert!(text.contains("regular expression"), "{text}");
+    assert!(!text.contains("outdated"), "{text}");
+}
+
+/// A settings file that cannot be read is not a current matcher.
+#[test]
+fn an_unreadable_hooks_document_is_unchecked_not_clean() {
+    let home = scratch("matcher-bad-home");
+    let cwd = scratch("matcher-bad-cwd");
+    let profile = home.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(profile.join("settings.json"), "{not json").unwrap();
+    let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+    let text = matcher_warning(&payload).expect("an unreadable document must say so");
+    assert!(text.contains("unchecked"), "{text}");
+    assert!(!text.contains("outdated"), "{text}");
+}
+
+#[test]
+fn an_enabled_plugin_with_the_old_matcher_is_outdated() {
+    let home = scratch("matcher-plugin-home");
+    let cwd = scratch("matcher-plugin-cwd");
+    let profile = home.join("profile");
+    let bundle = profile.join("plugins/cache/devmap-local/devmap/0.0.1");
+    fs::create_dir_all(bundle.join("hooks")).unwrap();
+    fs::write(bundle.join("hooks/hooks.json"), LEGACY_HOOKS).unwrap();
+    fs::write(bundle.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    fs::write(
+        profile.join("plugins/installed_plugins.json"),
+        json!({"version": 2, "plugins": {"devmap@devmap-local": [
+            {"scope": "user", "installPath": bundle}
+        ]}})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        profile.join("settings.json"),
+        r#"{"enabledPlugins":{"devmap@devmap-local":true}}"#,
+    )
+    .unwrap();
+    let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+    let text = matcher_warning(&payload).expect("the plugin's hooks.json is outdated");
+    assert!(
+        text.contains("outdated") && text.contains("hooks.json"),
+        "{text}"
+    );
+}
