@@ -1327,13 +1327,45 @@ pub fn store_degraded_reason(
     status: &StoreStatus,
     budget_refused: Option<&devmap_store::CoverageGapSample>,
 ) -> anyhow::Result<Option<String>> {
+    let freshness = freshness_degraded_reason(status);
+    let resolver = resolver_degraded_clause(store, freshness.as_deref());
     Ok(devmap_analyze::combine_reasons(
         devmap_analyze::combine_reasons(
-            freshness_degraded_reason(status).map(|reason| bounded_reason(&reason)),
-            analysis_degraded_clause(store)?,
+            devmap_analyze::combine_reasons(
+                freshness.map(|reason| bounded_reason(&reason)),
+                analysis_degraded_clause(store)?,
+            ),
+            budget_degraded_clause(budget_refused),
         ),
-        budget_degraded_clause(budget_refused),
+        resolver,
     ))
+}
+
+/// The clause for a latest generation whose edges a different resolver wrote,
+/// when `freshness` has not already said so.
+///
+/// `Store::status` asks the resolver question only of a store with an empty
+/// queue and no other reason, so a stale store that also had a pending change,
+/// a quarantined path or a damaged index read as that one thing and the
+/// staleness surfaced only after the reader had cleared it. The stamp is read
+/// here, from the accessor the status check itself uses, so every surface that
+/// joins reasons through [`store_degraded_reason`] names it. A stamp that
+/// cannot be read is said to be unverified, as the status check says it, and
+/// never taken for current.
+fn resolver_degraded_clause(store: &Store, freshness: Option<&str>) -> Option<String> {
+    let stamp = match store.latest_generation_resolver_stamp() {
+        Ok(devmap_store::ResolverStamp::Current) => return None,
+        Ok(stamp) => stamp,
+        Err(error) => {
+            return Some(bounded_reason(&format!(
+                "resolver epoch unverified: {error}"
+            )));
+        }
+    };
+    let reason = stamp.reason();
+    freshness
+        .is_none_or(|text| !text.contains(reason))
+        .then(|| reason.to_string())
 }
 
 /// Appends the daemon's unapplied-edits fact to a store-level reason.

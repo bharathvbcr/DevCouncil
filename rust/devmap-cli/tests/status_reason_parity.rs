@@ -467,3 +467,60 @@ fn p7_mcp_devmap_status_carries_the_cli_degraded_reason() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Forges the latest generation's resolver stamp, as a store written by an
+/// older (or newer) devmap carries it.
+fn stamp_resolver_epoch(db: &Path, epoch: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', ?1)",
+            [epoch],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "one generation to forge");
+}
+
+/// Probe 9: a store whose edges an older resolver wrote is named as such even
+/// while something else already makes it not fresh. `Store::status` only asks
+/// the resolver question of a store with an empty queue and no other reason, so
+/// a stale store with a pending change read as merely "1 source change(s) are
+/// pending", and the reader who drained the queue found the staleness
+/// afterwards. Both surfaces, one string, and the staleness stated once.
+#[test]
+fn p9_a_resolver_stale_store_is_named_beside_another_reason() {
+    for stale in [false, true] {
+        let dir = scratch("p9");
+        let db = build_store(
+            &dir,
+            AnalysisStatus::Ok,
+            Shape {
+                stale,
+                budget: false,
+            },
+        );
+        stamp_resolver_epoch(&db, "0");
+        let older = devmap_store::ResolverStamp::Older.reason();
+
+        let cli = cli_status(&dir, &db);
+        let reason = cli["degraded_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(older),
+            "stale={stale}: a resolver-stale store must say so: {cli}"
+        );
+        assert_eq!(
+            reason.matches(older).count(),
+            1,
+            "stale={stale}: said once, not once per check: {reason}"
+        );
+        assert_eq!(cli["is_fresh"], json!(false), "stale={stale}: {cli}");
+        let (daemon_reason, daemon_fresh) = daemon(&db, &unapplied(false));
+        assert_eq!(
+            daemon_reason.as_deref(),
+            Some(reason),
+            "stale={stale}: daemon and CLI must say the same thing"
+        );
+        assert!(!daemon_fresh, "stale={stale}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
