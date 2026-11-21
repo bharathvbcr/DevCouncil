@@ -943,6 +943,62 @@ const LOSSY_COVERAGE_BUCKETS: &[&str] = &[
     "partial_parse",
 ];
 
+/// The `devmap status` document in `raw`: whole-document first
+/// (pretty-printed), then line-wise (compact, possibly preceded by a
+/// diagnostic line).
+fn parse_status(raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw.trim()).ok().or_else(|| {
+        raw.lines()
+            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+    })
+}
+
+/// Whether a queryable index describes a tree that has since moved on.
+///
+/// Typed fields only: `source_freshness == false` (the store compared the tree
+/// with the indexed generation and they differ) or `pending_count > 0` (edits
+/// recorded and not yet indexed). Not `is_fresh`, which is also false for a
+/// resolver mismatch and when freshness could not be measured, and not any
+/// substring of `degraded_reason`. A `rebuild_required` store is excluded:
+/// `status --auto-rebuild`, run just before this, already owns that case. A
+/// stacked lane is excluded because its status describes the base store, not
+/// the lane's tree, and its own sync-delta path keeps it current.
+fn index_is_behind_the_tree(status: &Value) -> bool {
+    let flag = |key: &str| status.get(key).and_then(Value::as_bool);
+    flag("query_ready") == Some(true)
+        && flag("rebuild_required") != Some(true)
+        && status.get("stacked").is_none()
+        && (flag("source_freshness") == Some(false)
+            || status
+                .get("pending_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|pending| pending > 0))
+}
+
+/// Start the catch-up build for an index that is behind its tree, and say so.
+///
+/// `devmap status` stays report-only (no write on a read path); the hook is the
+/// one place that starts the build, through the same detach every PostToolUse
+/// uses, so concurrent SessionStarts coalesce onto one build through its lock
+/// and a build the serve daemon's drain races is serialised by the store's
+/// writer lock. The build is bounded by what is left of the hook's budget: a
+/// spent budget starts nothing and says so rather than overrunning the host.
+fn catch_up_note(executable: &Path, root: &Path, started: Instant, budget: Duration) -> String {
+    const LOWER_BOUND: &str = "answers are a lower bound until `devmap status` reports fresh";
+    if started.elapsed() >= budget {
+        return format!(
+            "index is stale; no time left to start a rebuild, run `devmap build` ({LOWER_BOUND})"
+        );
+    }
+    match detach_post_tool_root(executable, root) {
+        Ok(()) => format!("index is stale; a rebuild is running in the background ({LOWER_BOUND})"),
+        Err(error) => format!(
+            "index is stale; starting a background rebuild failed ({}), run `devmap build` ({LOWER_BOUND})",
+            context_line(&truncate(&error.to_string(), 60))
+        ),
+    }
+}
+
 /// Render `devmap status` output as one clause an agent can act on.
 ///
 /// The status payload is JSON — compact with `--json`, pretty-printed without
@@ -952,13 +1008,7 @@ const LOSSY_COVERAGE_BUCKETS: &[&str] = &[
 /// way, instead of 3 KB of pretty JSON or a 160-character slice through the
 /// middle of a key.
 fn summarize_status(raw: &str) -> String {
-    // Whole-document first (pretty-printed), then line-wise (compact, possibly
-    // preceded by a diagnostic line).
-    let parsed = serde_json::from_str::<Value>(raw.trim()).ok().or_else(|| {
-        raw.lines()
-            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-    });
-    let Some(status) = parsed else {
+    let Some(status) = parse_status(raw) else {
         // Never paste an unparsed blob. A mid-token JSON fragment costs the
         // same tokens as a sentence and carries none of the meaning.
         let detail = raw.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1161,11 +1211,15 @@ fn session_start_within(
             Err(_) => (None, true),
         };
         completed_roots += 1;
-        let mut clause = format!(
-            "{}: {}",
-            repo_context_label(root, "repo"),
-            summarize_status(&status_text)
-        );
+        let catch_up = parse_status(&status_text)
+            .filter(index_is_behind_the_tree)
+            .map(|_| catch_up_note(executable, root, started, budget));
+        let label = repo_context_label(root, "repo");
+        let summary = summarize_status(&status_text);
+        let mut clause = match catch_up {
+            Some(note) => format!("{label}: {note}; {summary}"),
+            None => format!("{label}: {summary}"),
+        };
         if let Some(suffix) = last_session_suffix(last_text.as_deref(), last_failed) {
             clause.push_str(&suffix);
         }
@@ -4088,12 +4142,20 @@ mod tests {
         lane: PathBuf,
         exe: PathBuf,
         args: PathBuf,
+        starts: PathBuf,
         release: PathBuf,
     }
 
     #[cfg(unix)]
     impl Lane {
         fn new(tag: &str, main_indexed: bool) -> Self {
+            Self::with_status(tag, main_indexed, "{}")
+        }
+
+        /// `status_json` is what the stand-in prints for `status`; any other
+        /// subcommand but `session-report` is a build, which appends a line to
+        /// `starts`, records its arguments, and waits for the release.
+        fn with_status(tag: &str, main_indexed: bool, status_json: &str) -> Self {
             let parent = scratch_dir(tag).canonicalize().unwrap();
             let main = parent.join("main");
             let gitdir = main.join(".git/worktrees/lane");
@@ -4113,15 +4175,21 @@ mod tests {
             fs::write(lane.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
             fs::write(lane.join("a.rs"), "fn a() {}\n").unwrap();
             let args = parent.join("args");
+            let starts = parent.join("starts");
             let release = parent.join("release");
             let exe = parent.join("bin/fake-devmap.sh");
             write_script(
                 &exe,
                 &format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ni=0\n\
-                     while [ ! -e '{}' ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done\n",
-                    args.display(),
-                    release.display()
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                     *\" status \"*) cat <<'EOF'\n{status_json}\nEOF\n;;\n\
+                     *\" session-report \"*) ;;\n\
+                     *) echo x >> '{starts}'\nprintf '%s\\n' \"$@\" > '{args}'\ni=0\n\
+                     while [ ! -e '{release}' ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done\n;;\n\
+                     esac\n",
+                    starts = starts.display(),
+                    args = args.display(),
+                    release = release.display(),
                 ),
             );
             Self {
@@ -4130,8 +4198,18 @@ mod tests {
                 lane,
                 exe,
                 args,
+                starts,
                 release,
             }
+        }
+
+        /// The main checkout's coalescing lock: held while a build it started runs.
+        fn main_lock(&self) -> PathBuf {
+            coalesce_lock_dir(&self.main, "build")
+        }
+
+        fn builds_started(&self) -> usize {
+            fs::read_to_string(&self.starts).map_or(0, |text| text.lines().count())
         }
 
         fn lock(&self) -> PathBuf {
@@ -4159,7 +4237,7 @@ mod tests {
     impl Drop for Lane {
         fn drop(&mut self) {
             let _ = fs::write(&self.release, b"");
-            eventually(|| !self.lock().exists());
+            eventually(|| !self.lock().exists() && !self.main_lock().exists());
             let _ = fs::remove_dir_all(&self.parent);
         }
     }
@@ -4295,6 +4373,154 @@ mod tests {
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
         assert!(outcome.stdout.is_none(), "{:?}", outcome.stdout);
         assert!(lane.nothing_was_created_in_the_lane());
+    }
+
+    // ---- SessionStart catching an index up to a tree that has moved ----------------
+
+    const DRIFTED_BY_SOURCE: &str = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
+        "source_freshness":false,"pending_count":0,"generation_id":7,"node_count":3,"edge_count":2}"#;
+    const DRIFTED_BY_PENDING_EDITS: &str = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
+        "source_freshness":true,"pending_count":4,"generation_id":7,"node_count":3,"edge_count":2}"#;
+
+    #[cfg(unix)]
+    fn session_start_context(lane: &Lane) -> String {
+        let selection = RootSelection::whole(vec![lane.main.clone()]);
+        let context = session_start_within(&lane.exe, &selection, SESSION_START_BUDGET)
+            .expect("session start answers");
+        context
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext")
+            .to_string()
+    }
+
+    /// An index whose tree has moved gets one background rebuild, and the clause
+    /// the agent reads says so. Both typed drift signals count: the store's own
+    /// source comparison and recorded-but-unindexed edits.
+    #[cfg(unix)]
+    #[test]
+    fn session_start_starts_a_rebuild_for_a_drifted_index_and_says_so() {
+        for (case, status) in [
+            ("source drift", DRIFTED_BY_SOURCE),
+            ("pending edits", DRIFTED_BY_PENDING_EDITS),
+        ] {
+            let lane = Lane::with_status("start-drift", true, status);
+            let text = session_start_context(&lane);
+            assert!(
+                lane.main_lock().is_dir(),
+                "{case}: no rebuild was started: {text:?}"
+            );
+            let expected = format!("--root\n{}\nbuild\n", lane.main.display());
+            assert!(
+                eventually(|| fs::read_to_string(&lane.args).is_ok_and(|got| got == expected)),
+                "{case}: the rebuild was not an incremental build of the root: {:?}",
+                fs::read_to_string(&lane.args)
+            );
+            assert!(
+                text.contains("a rebuild is running in the background")
+                    && text
+                        .contains("answers are a lower bound until `devmap status` reports fresh"),
+                "{case}: the clause does not say a rebuild was started: {text:?}"
+            );
+        }
+    }
+
+    /// Nothing is started when the index is current, when freshness could not
+    /// be measured, for a resolver mismatch, or when the store wants a full
+    /// rebuild that `status --auto-rebuild` already handles.
+    #[cfg(unix)]
+    #[test]
+    fn session_start_leaves_an_index_that_is_not_behind_its_tree_alone() {
+        for (case, status) in [
+            (
+                "current",
+                r#"{"query_ready":true,"rebuild_required":false,"is_fresh":true,"source_freshness":true,"pending_count":0}"#,
+            ),
+            (
+                "freshness unmeasured",
+                r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,"source_freshness":null,"pending_count":0}"#,
+            ),
+            (
+                "resolver mismatch",
+                r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,"analyzer_freshness":false,"source_freshness":true,"pending_count":0}"#,
+            ),
+            (
+                "rebuild required",
+                r#"{"query_ready":true,"rebuild_required":true,"rebuild_reason":"payload obsolete","is_fresh":false,"source_freshness":false,"pending_count":0}"#,
+            ),
+            (
+                "not queryable",
+                r#"{"query_ready":false,"is_fresh":false,"source_freshness":false,"pending_count":3}"#,
+            ),
+            (
+                "stacked lane",
+                r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,"source_freshness":false,"pending_count":0,"stacked":{}}"#,
+            ),
+        ] {
+            let lane = Lane::with_status("start-current", true, status);
+            let text = session_start_context(&lane);
+            assert!(
+                !lane.main_lock().exists(),
+                "{case}: a rebuild was started: {text:?}"
+            );
+            assert!(
+                !text.contains("rebuild is running"),
+                "{case}: the clause claims a rebuild: {text:?}"
+            );
+        }
+    }
+
+    /// Many sessions starting while one rebuild runs start at most one.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_session_starts_coalesce_onto_one_rebuild() {
+        let lane = Lane::with_status("start-coalesce", true, DRIFTED_BY_SOURCE);
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let text = session_start_context(&lane);
+                    assert!(
+                        text.contains("a rebuild is running in the background"),
+                        "{text:?}"
+                    );
+                });
+            }
+        });
+        assert!(
+            eventually(|| lane.builds_started() >= 1),
+            "no rebuild started"
+        );
+        fs::write(&lane.release, b"").unwrap();
+        assert!(
+            eventually(|| !lane.main_lock().exists()),
+            "the lock outlived its build"
+        );
+        assert_eq!(
+            lane.builds_started(),
+            1,
+            "the lock did not coalesce the starts"
+        );
+    }
+
+    /// A spent budget starts nothing and says so; a refused spawn is named in
+    /// the clause rather than reported as a rebuild that is running.
+    #[cfg(unix)]
+    #[test]
+    fn catch_up_names_a_spent_budget_and_a_refused_spawn() {
+        let lane = Lane::with_status("start-refusals", true, DRIFTED_BY_SOURCE);
+
+        let spent = catch_up_note(&lane.exe, &lane.main, Instant::now(), Duration::ZERO);
+        assert!(spent.contains("no time left"), "{spent}");
+        assert!(!lane.main_lock().exists(), "a spent budget started a build");
+
+        let inside = lane.main.join("devmap");
+        write_script(&inside, "#!/bin/sh\nexit 0\n");
+        let refused = catch_up_note(&inside, &lane.main, Instant::now(), SESSION_START_BUDGET);
+        assert!(
+            refused.contains("failed") && refused.contains("refusing to detach"),
+            "{refused}"
+        );
+        assert!(!refused.contains("is running"), "{refused}");
     }
 
     use serde_json::json;

@@ -2134,3 +2134,99 @@ fn a_linked_hooks_directory_is_reported_at_session_start_only() {
     );
     assert_eq!(written, 0, "a marker was written through the link");
 }
+
+/// `devmap status` stays report-only on a drifted tree: even with
+/// `--auto-rebuild`, which covers only payload-obsolete and schema-behind
+/// stores, a moved tree is reported and not rebuilt. The SessionStart hook is
+/// the one that starts the catch-up (next test).
+#[test]
+fn status_reports_a_drifted_tree_and_does_not_rebuild_it() {
+    let root = scratch("status-drift");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    let before = generation_id(&root).expect("a built store reports a generation");
+    std::fs::write(
+        root.join("a.py"),
+        "def a():\n    return 2\n\n\ndef b():\n    return a() + 1\n",
+    )
+    .unwrap();
+
+    let out = Command::new(DEVMAP)
+        .arg("--root")
+        .arg(&root)
+        .args(["--json", "status", "--auto-rebuild"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("status prints one JSON document");
+
+    assert_eq!(
+        status.get("source_freshness"),
+        Some(&json!(false)),
+        "the edit was not seen as drift: {status}"
+    );
+    assert_eq!(status.get("is_fresh"), Some(&json!(false)), "{status}");
+    assert_eq!(
+        generation_id(&root),
+        Some(before),
+        "status rebuilt a drifted tree: a read path wrote the store"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// SessionStart on a tree edited since the last build (a Bash-style edit no
+/// PostToolUse saw) starts a background rebuild, says so in the context it
+/// returns, and `status` then reaches fresh on a higher generation.
+#[test]
+fn session_start_catches_up_a_drifted_index_in_the_background() {
+    let root = scratch("session-start-drift");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    let before = generation_id(&root).expect("a built store reports a generation");
+    std::fs::write(
+        root.join("a.py"),
+        "def a():\n    return 2\n\n\ndef b():\n    return a() + 1\n",
+    )
+    .unwrap();
+
+    let payload = serde_json::to_string(&json!({
+        "cwd": root.to_string_lossy(),
+        "session_id": "drift-catch-up",
+        "hook_event_name": "SessionStart",
+    }))
+    .unwrap();
+    let run = run_hook("session-start", payload.as_bytes(), &[]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout
+            .contains("a rebuild is running in the background")
+            && run.stdout.contains("lower bound"),
+        "the context does not say a rebuild was started: {}",
+        run.stdout
+    );
+
+    let after = wait_for_quiescence(&root);
+    assert!(
+        after > before,
+        "no rebuild ran: generation {before} -> {after}"
+    );
+    let status = Command::new(DEVMAP)
+        .arg("--root")
+        .arg(&root)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status.get("is_fresh"), Some(&json!(true)), "{status}");
+    let _ = std::fs::remove_dir_all(&root);
+}
