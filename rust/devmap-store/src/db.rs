@@ -765,6 +765,10 @@ pub struct Store {
     lazy_walk: Mutex<LazyWalk>,
 }
 
+/// A test's stand-in for the start of a lazy walk; see [`LazyWalk::probe`].
+#[cfg(test)]
+pub(crate) type WalkProbe = std::sync::Arc<dyn Fn(&std::sync::atomic::AtomicBool) + Send + Sync>;
+
 /// State behind [`Store::query_source_freshness`]'s lazy re-walk.
 #[derive(Default)]
 pub(crate) struct LazyWalk {
@@ -774,7 +778,7 @@ pub(crate) struct LazyWalk {
     pub(crate) walks: usize,
     /// Runs in the walk's thread before the walk, with its cancel flag.
     #[cfg(test)]
-    pub(crate) probe: Option<std::sync::Arc<dyn Fn(&std::sync::atomic::AtomicBool) + Send + Sync>>,
+    pub(crate) probe: Option<WalkProbe>,
     /// Overrides [`SOURCE_FRESHNESS_WALK_BUDGET`].
     #[cfg(test)]
     pub(crate) budget: Option<std::time::Duration>,
