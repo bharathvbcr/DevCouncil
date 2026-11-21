@@ -332,14 +332,32 @@ fn run_hook_inner(
         // outcome, its handler is contracted to stay silent when the index
         // cannot answer, and `pre_tool_use_never_emits_a_permission_decision`
         // guards what it may emit. This says nothing there.
-        let stdout = match event {
-            HookEvent::SessionStart => unindexed_worktree_notice(&payload, executable),
-            _ => None,
-        };
+        let mut exit_code = 0;
+        let mut stderr_line = Some("devmap hook: no indexed repository found; no-op".to_string());
+        let mut stdout = None;
+        match event {
+            HookEvent::SessionStart => stdout = unindexed_worktree_notice(&payload, executable),
+            // The one place PostToolUse starts a build for a tree with no
+            // store: a linked worktree of an indexed checkout, seeded from
+            // that checkout. A refused or failed spawn is exit 1 with its
+            // reason, as for every other PostToolUse detach, never silence.
+            HookEvent::PostToolUse if pinned_root.is_none() => {
+                if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
+                    match detach_seeded_build(executable, &wt, &main) {
+                        Ok(()) => stderr_line = None,
+                        Err(error) => {
+                            exit_code = 1;
+                            stderr_line = Some(format!("devmap hook post-tool-use: {error}"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         return Ok(HookOutcome {
-            exit_code: 0,
+            exit_code,
             stdout,
-            stderr_line: Some("devmap hook: no indexed repository found; no-op".into()),
+            stderr_line,
             roots: selection.roots,
         });
     }
@@ -384,28 +402,17 @@ fn run_hook_inner(
             // A refused or failed detach is reported, but it must not drop the
             // in-process work below that needs no spawn: the blast note.
             let mut detach_error: Option<anyhow::Error> = None;
-            let budget_note = if !selection.roots.is_empty() {
-                match detach_roots(
-                    executable,
-                    &selection.roots,
-                    DETACH_BUDGET,
-                    detach_post_tool_root,
-                ) {
-                    Ok(note) => note,
-                    Err(error) => {
-                        detach_error = Some(error);
-                        None
-                    }
+            let budget_note = match detach_roots(
+                executable,
+                &selection.roots,
+                DETACH_BUDGET,
+                detach_post_tool_root,
+            ) {
+                Ok(note) => note,
+                Err(error) => {
+                    detach_error = Some(error);
+                    None
                 }
-            } else if pinned_root.is_none() {
-                if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
-                    if let Err(error) = detach_seeded_build(executable, &wt, &main) {
-                        detach_error = Some(error);
-                    }
-                }
-                None
-            } else {
-                None
             };
             // After the detach is scheduled: short blast from the generation
             // already on disk. Never waits for the rebuild. Budget miss says
@@ -4052,6 +4059,242 @@ mod tests {
             text.contains("refusing to probe") && text.contains("canonicalize"),
             "{text}"
         );
+    }
+
+    // ---- A hook starting an index build for a tree that has none ----------------
+
+    /// Poll until `ready` holds or ten seconds pass. This waits on a fact, not
+    /// on a guessed duration: it returns the moment the fact is true.
+    #[cfg(unix)]
+    fn eventually(ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        ready()
+    }
+
+    /// A linked worktree `lane` registered by `main`, laid out the way git
+    /// registers one, and a stand-in `devmap` outside both that records its
+    /// arguments and then stays alive until released, so the coalescing lock a
+    /// hook takes is still on disk when the hook returns.
+    #[cfg(unix)]
+    struct Lane {
+        parent: PathBuf,
+        main: PathBuf,
+        lane: PathBuf,
+        exe: PathBuf,
+        args: PathBuf,
+        release: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Lane {
+        fn new(tag: &str, main_indexed: bool) -> Self {
+            let parent = scratch_dir(tag).canonicalize().unwrap();
+            let main = parent.join("main");
+            let gitdir = main.join(".git/worktrees/lane");
+            fs::create_dir_all(&gitdir).unwrap();
+            if main_indexed {
+                fs::create_dir_all(main.join(".devcouncil/codeintel")).unwrap();
+                fs::write(main.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+            }
+            fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            let lane = parent.join("lane");
+            fs::create_dir_all(&lane).unwrap();
+            fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", lane.join(".git").display()),
+            )
+            .unwrap();
+            fs::write(lane.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+            fs::write(lane.join("a.rs"), "fn a() {}\n").unwrap();
+            let args = parent.join("args");
+            let release = parent.join("release");
+            let exe = parent.join("bin/fake-devmap.sh");
+            write_script(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ni=0\n\
+                     while [ ! -e '{}' ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done\n",
+                    args.display(),
+                    release.display()
+                ),
+            );
+            Self {
+                parent,
+                main,
+                lane,
+                exe,
+                args,
+                release,
+            }
+        }
+
+        fn lock(&self) -> PathBuf {
+            coalesce_lock_dir(&self.lane, "build")
+        }
+
+        fn edit_payload(&self, event: &str, tool: &str) -> Vec<u8> {
+            json!({
+                "session_id": "lane-seed",
+                "hook_event_name": event,
+                "cwd": &self.lane,
+                "tool_name": tool,
+                "tool_input": { "file_path": self.lane.join("a.rs") },
+            })
+            .to_string()
+            .into_bytes()
+        }
+
+        fn nothing_was_created_in_the_lane(&self) -> bool {
+            !self.lane.join(".devcouncil").exists() && !self.lock().exists()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Lane {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release, b"");
+            eventually(|| !self.lock().exists());
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    /// The edit that reaches an unindexed linked worktree of an indexed checkout
+    /// starts that worktree's seeded build. Before, the empty-selection return
+    /// ahead of the PostToolUse arm made the seeding branch unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn post_tool_use_seeds_an_unindexed_linked_worktree() {
+        let lane = Lane::new("post-seed", true);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &lane.edit_payload("PostToolUse", "Edit"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            lane.lock().is_dir(),
+            "no seeded build was scheduled for the unindexed worktree: {:?}",
+            outcome.stderr_line
+        );
+        let expected = format!(
+            "--root\n{}\nbuild\n--seed-from\n{}\n",
+            lane.lane.display(),
+            lane.main.display()
+        );
+        assert!(
+            eventually(|| fs::read_to_string(&lane.args).is_ok_and(|got| got == expected)),
+            "the build was not seeded from the main checkout: {:?}",
+            fs::read_to_string(&lane.args)
+        );
+    }
+
+    /// A hook never creates a store except for a linked worktree whose main
+    /// checkout has one: a worktree of an unindexed repository, a plain
+    /// repository, and a pinned root with no store all stay untouched.
+    #[cfg(unix)]
+    #[test]
+    fn post_tool_use_never_creates_a_store_outside_an_indexed_mains_worktree() {
+        let unindexed_main = Lane::new("post-seed-unindexed-main", false);
+        let pinned = Lane::new("post-seed-pinned", true);
+
+        let solo = Lane::new("post-seed-solo", true);
+        let plain = solo.parent.join("plain");
+        fs::create_dir_all(plain.join(".git")).unwrap();
+        fs::write(plain.join("a.rs"), "fn a() {}\n").unwrap();
+        assert!(
+            devmap_extract::git_worktree_root(&plain.canonicalize().unwrap()).is_some(),
+            "the plain repository fixture is not recognized as a repository"
+        );
+        let plain_payload = json!({
+            "session_id": "lane-seed",
+            "cwd": &plain,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": plain.join("a.rs") },
+        })
+        .to_string()
+        .into_bytes();
+
+        let outcomes = [
+            (
+                "linked worktree of an unindexed main",
+                run_hook(
+                    HookEvent::PostToolUse,
+                    &unindexed_main.edit_payload("PostToolUse", "Edit"),
+                    &unindexed_main.exe,
+                    None,
+                ),
+                unindexed_main.nothing_was_created_in_the_lane(),
+            ),
+            (
+                "pinned root with no store",
+                run_hook(
+                    HookEvent::PostToolUse,
+                    &pinned.edit_payload("PostToolUse", "Edit"),
+                    &pinned.exe,
+                    Some(&pinned.lane),
+                ),
+                pinned.nothing_was_created_in_the_lane(),
+            ),
+            (
+                "plain repository, no linked worktree",
+                run_hook(HookEvent::PostToolUse, &plain_payload, &solo.exe, None),
+                !plain.join(".devcouncil").exists(),
+            ),
+        ];
+        for (case, outcome, untouched) in outcomes {
+            assert_eq!(outcome.exit_code, 0, "{case}: {:?}", outcome.stderr_line);
+            assert!(untouched, "{case}: the hook created state in the tree");
+        }
+    }
+
+    /// A seed whose spawn is refused is exit 1 with the reason, not a silent 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_post_tool_use_seed_is_exit_one_with_a_stderr_line() {
+        let lane = Lane::new("post-seed-refused", true);
+        let inside = lane.lane.join("devmap");
+        write_script(&inside, "#!/bin/sh\nexit 0\n");
+
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &lane.edit_payload("PostToolUse", "Edit"),
+            &inside,
+            None,
+        );
+
+        assert_eq!(outcome.exit_code, 1, "{:?}", outcome.stderr_line);
+        let line = outcome
+            .stderr_line
+            .expect("a refused seed is a stderr diagnostic");
+        assert!(
+            line.contains("refusing to detach") && line.contains("inside"),
+            "{line}"
+        );
+        assert!(!lane.lock().exists(), "a refused seed left a lock behind");
+    }
+
+    /// PreToolUse decides an authorization outcome and stays silent: it neither
+    /// starts a build nor says anything in a tree the index cannot answer for.
+    #[cfg(unix)]
+    #[test]
+    fn pre_tool_use_never_seeds_an_unindexed_linked_worktree() {
+        let lane = Lane::new("pre-no-seed", true);
+        let outcome = run_hook(
+            HookEvent::PreToolUse,
+            &lane.edit_payload("PreToolUse", "Grep"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(outcome.stdout.is_none(), "{:?}", outcome.stdout);
+        assert!(lane.nothing_was_created_in_the_lane());
     }
 
     use serde_json::json;
