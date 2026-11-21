@@ -213,7 +213,23 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         emit_json(cli, &payload)?;
         return Ok(());
     }
-    let Some(store) = Store::open_existing(cli.db())? else {
+    // A store whose only fault is its full-text index may be unopenable by the
+    // strict read (a damaged `nodes_fts_config` page fails the index's own
+    // constructor), and `status` used to exit 1 with no JSON there, which a
+    // host reading readiness cannot use. The tolerant open is for exactly this:
+    // everything but search still answers, and the damage is reported below
+    // rather than refused. Damage that is not provably the index's alone still
+    // fails the open, here as before.
+    let opened = match Store::open_existing(cli.db()) {
+        Err(error) if Store::sqlite_error_is_full_text_damage(&error) => {
+            Some(Store::open_read_only_with(
+                cli.db(),
+                devmap_store::ReaderMemory::CURRENT.tolerating_full_text_damage(),
+            )?)
+        }
+        other => other?,
+    };
+    let Some(store) = opened else {
         anyhow::bail!(
             "the devmap store at {} vanished between the schema probe and the read",
             cli.db().display()
@@ -429,6 +445,10 @@ pub(crate) fn store_status_fields(
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
+        // The structured half of the head clause in `degraded_reason`: the
+        // commit the generation was built from, `"unavailable"` when git could
+        // not say, `null` with no generation. Same field as the daemon's.
+        "head_sha": store.latest_generation_head_sha()?,
         // The structured half of the full-text clause in `degraded_reason`,
         // from the probe `devmap build` runs: a reader must not parse prose to
         // learn that `search` will fail.
