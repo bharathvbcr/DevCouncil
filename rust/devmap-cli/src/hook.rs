@@ -321,6 +321,30 @@ fn run_hook_inner(
     }
 
     let selection = select_roots(&payload, pinned_root)?;
+    // The tree the tool touched wins over the tree the session sits in. A
+    // worktree edit with the session's cwd (or a workspace root) in the indexed
+    // main checkout selects main's store, so deciding on the selection alone
+    // rebuilt main for an edit that was made elsewhere and never indexed the
+    // worktree. A selected root inside the worktree (a sub-project store) keeps
+    // the ordinary path.
+    if event == HookEvent::PostToolUse && pinned_root.is_none() {
+        if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload)
+            .filter(|(wt, _)| !selection.roots.iter().any(|root| root.starts_with(wt)))
+        {
+            // A refused or failed spawn is exit 1 with its reason, as for every
+            // other PostToolUse detach, never silence.
+            let (exit_code, stderr_line) = match detach_seeded_build(executable, &wt, &main) {
+                Ok(()) => (0, None),
+                Err(error) => (1, Some(format!("devmap hook post-tool-use: {error}"))),
+            };
+            return Ok(HookOutcome {
+                exit_code,
+                stdout: None,
+                stderr_line,
+                roots: vec![wt],
+            });
+        }
+    }
     if selection.is_empty() {
         // SessionStart only. Bounding the walk at the working tree turned a
         // false "ready" into silence, and silence is its own failure: the
@@ -332,30 +356,14 @@ fn run_hook_inner(
         // outcome, its handler is contracted to stay silent when the index
         // cannot answer, and `pre_tool_use_never_emits_a_permission_decision`
         // guards what it may emit. This says nothing there.
-        let mut exit_code = 0;
-        let mut stderr_line = Some("devmap hook: no indexed repository found; no-op".to_string());
+        let stderr_line = Some("devmap hook: no indexed repository found; no-op".to_string());
         let mut stdout = None;
         match event {
             HookEvent::SessionStart => stdout = unindexed_worktree_notice(&payload, executable),
-            // The one place PostToolUse starts a build for a tree with no
-            // store: a linked worktree of an indexed checkout, seeded from
-            // that checkout. A refused or failed spawn is exit 1 with its
-            // reason, as for every other PostToolUse detach, never silence.
-            HookEvent::PostToolUse if pinned_root.is_none() => {
-                if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
-                    match detach_seeded_build(executable, &wt, &main) {
-                        Ok(()) => stderr_line = None,
-                        Err(error) => {
-                            exit_code = 1;
-                            stderr_line = Some(format!("devmap hook post-tool-use: {error}"));
-                        }
-                    }
-                }
-            }
             _ => {}
         }
         return Ok(HookOutcome {
-            exit_code,
+            exit_code: 0,
             stdout,
             stderr_line,
             roots: selection.roots,
@@ -984,17 +992,19 @@ fn index_is_behind_the_tree(status: &Value) -> bool {
 /// writer lock. The build is bounded by what is left of the hook's budget: a
 /// spent budget starts nothing and says so rather than overrunning the host.
 fn catch_up_note(executable: &Path, root: &Path, started: Instant, budget: Duration) -> String {
-    const LOWER_BOUND: &str = "answers are a lower bound until `devmap status` reports fresh";
+    // Short on purpose: the clause is capped at REPO_CLAUSE_CAP, and the status
+    // summary after it (symbols/edges/gen) must stay readable beside it.
+    const LOWER_BOUND: &str = "answers are a lower bound";
     if started.elapsed() >= budget {
         return format!(
-            "index is stale; no time left to start a rebuild, run `devmap build` ({LOWER_BOUND})"
+            "index stale, no time left to rebuild; run `devmap build` ({LOWER_BOUND})"
         );
     }
     match detach_post_tool_root(executable, root) {
-        Ok(()) => format!("index is stale; a rebuild is running in the background ({LOWER_BOUND})"),
+        Ok(()) => format!("index stale, rebuilding in the background ({LOWER_BOUND})"),
         Err(error) => format!(
-            "index is stale; starting a background rebuild failed ({}), run `devmap build` ({LOWER_BOUND})",
-            context_line(&truncate(&error.to_string(), 60))
+            "index stale, rebuild failed to start ({}); run `devmap build` ({LOWER_BOUND})",
+            context_line(&truncate(&error.to_string(), 40))
         ),
     }
 }
@@ -4429,9 +4439,8 @@ mod tests {
                 fs::read_to_string(&lane.args)
             );
             assert!(
-                text.contains("a rebuild is running in the background")
-                    && text
-                        .contains("answers are a lower bound until `devmap status` reports fresh"),
+                text.contains("rebuilding in the background")
+                    && text.contains("answers are a lower bound"),
                 "{case}: the clause does not say a rebuild was started: {text:?}"
             );
         }
@@ -4476,7 +4485,7 @@ mod tests {
                 "{case}: a rebuild was started: {text:?}"
             );
             assert!(
-                !text.contains("rebuild is running"),
+                !text.contains("rebuilding in the background"),
                 "{case}: the clause claims a rebuild: {text:?}"
             );
         }
@@ -4492,7 +4501,7 @@ mod tests {
                 scope.spawn(|| {
                     let text = session_start_context(&lane);
                     assert!(
-                        text.contains("a rebuild is running in the background"),
+                        text.contains("rebuilding in the background"),
                         "{text:?}"
                     );
                 });
@@ -4532,7 +4541,7 @@ mod tests {
             refused.contains("failed") && refused.contains("refusing to detach"),
             "{refused}"
         );
-        assert!(!refused.contains("is running"), "{refused}");
+        assert!(!refused.contains("rebuilding in the background"), "{refused}");
     }
 
     // ---- Attack on the hook-freshness change: forged linkage, hostile paths,
@@ -4680,6 +4689,59 @@ mod tests {
             "a symlinked entry built the wrong tree: {:?}",
             fs::read_to_string(&lane.args)
         );
+    }
+
+    /// An edit in an unindexed linked worktree is built in that worktree, even
+    /// when the session's cwd (or a workspace root) is the indexed main checkout.
+    /// The main checkout's store is never rebuilt for a worktree edit.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_edit_seeds_the_worktree_not_the_main_checkout_the_session_sits_in() {
+        let shapes: [(&str, fn(&Lane) -> Vec<u8>); 3] = [
+            ("file_path in the worktree, cwd in main", |lane| {
+                payload_at("PostToolUse", "Edit", &lane.main, Some(&lane.lane.join("a.rs")))
+            }),
+            ("apply_patch path in the worktree, cwd in main", |lane| {
+                json!({
+                    "session_id": "attack",
+                    "cwd": &lane.main,
+                    "tool_name": "apply_patch",
+                    "tool_input": { "command": format!(
+                        "*** Begin Patch\n*** Update File: {}\n*** End Patch", lane.lane.join("a.rs").display()) },
+                })
+                .to_string()
+                .into_bytes()
+            }),
+            ("cwd in the worktree, main named only as a workspace root", |lane| {
+                json!({
+                    "session_id": "attack",
+                    "cwd": &lane.lane,
+                    "workspace_roots": [&lane.main],
+                    "tool_name": "Bash",
+                    "tool_input": {},
+                })
+                .to_string()
+                .into_bytes()
+            }),
+        ];
+        for (case, payload) in shapes {
+            let lane = Lane::new("edit-tree", true);
+            fs::write(lane.main.join("a.rs"), "fn a() {}\n").unwrap();
+            let outcome = run_hook(HookEvent::PostToolUse, &payload(&lane), &lane.exe, None);
+            assert_eq!(outcome.exit_code, 0, "{case}: {:?}", outcome.stderr_line);
+            assert!(
+                !lane.main_lock().exists(),
+                "{case}: the main checkout's index was rebuilt for a worktree edit"
+            );
+            assert!(lane.lock().is_dir(), "{case}: the worktree was not seeded");
+            let expected = expected_seed_args(&lane.lane, &lane.main);
+            assert!(
+                eventually(|| fs::read_to_string(&lane.args).is_ok_and(|got| got == expected)),
+                "{case}: wrong build: {:?}",
+                fs::read_to_string(&lane.args)
+            );
+            assert_eq!(lane.builds_started(), 1, "{case}");
+        }
     }
 
     /// The converse: an edit in the indexed main checkout rebuilds main, and an
@@ -4928,6 +4990,32 @@ mod tests {
         assert!(
             !hostile_text.contains('\u{2028}') && !hostile_text.contains('\u{202e}') && !hostile_text.contains('\r'),
             "{hostile_text:?}"
+        );
+    }
+
+    /// The repository clause stays within its cap, and the cap does not push
+    /// the drift note or the symbols/edges/gen summary out: a long root name
+    /// and large counts still leave both readable.
+    #[cfg(unix)]
+    #[test]
+    fn the_catch_up_clause_keeps_its_drift_note_and_its_summary_inside_the_cap() {
+        let status = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
+            "source_freshness":false,"pending_count":0,"generation_id":123456,
+            "node_count":4567890,"edge_count":12345678}"#;
+        let lane = Lane::with_names(
+            "cap",
+            true,
+            status,
+            "agent-a295c342df740a84e-long-name-xxxxxxxx",
+            "lane",
+        );
+        let text = session_start_context(&lane);
+        let clause = text.lines().next().unwrap();
+        assert!(clause.chars().count() <= REPO_CLAUSE_CAP, "{clause}");
+        assert!(clause.contains("rebuilding"), "the drift note was cut: {clause}");
+        assert!(
+            clause.contains("symbols/") && clause.contains("edges") && clause.contains("(gen 123456)"),
+            "the status summary was cut: {clause}"
         );
     }
 
