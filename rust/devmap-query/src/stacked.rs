@@ -46,9 +46,9 @@ use devmap_resolve::model::LangFamily;
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
-    clone_or_copy_file, discard_staged, prepare_immutable_snapshot,
-    promote_immutable_base_to_store, read_file_at, seed_artifact, seed_directory_cow,
-    set_file_readonly, set_file_writable, stage_seed_healing_wal,
+    clone_or_copy_file, copy_donor_csr_checked, csr_generation_of_open_file, discard_staged,
+    prepare_immutable_snapshot, promote_immutable_base_to_store, read_file_at, seed_artifact,
+    seed_directory_cow, set_file_readonly, set_file_writable, stage_seed_healing_wal, DonorCsr,
 };
 use devmap_store::{
     CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
@@ -520,11 +520,16 @@ fn publish_base_snapshot_with(source_root: &Path, reuse: bool) -> Result<(PathBu
 
         let src_csr = csr_path_for_store(&source_db);
         let staged_csr = csr_path_for_store(&staged_sqlite);
-        let csr_sha256 = if src_csr.is_file() && seed_artifact(&src_csr, &staged_csr)?.is_some() {
-            set_file_readonly(&staged_csr)?;
-            Some(sha256_file_hex(&staged_csr)?)
-        } else {
-            None
+        // The donor's CSR is a base's too only if it is stamped with this
+        // generation: a sidecar left by an earlier store at the donor's path
+        // would be served as the base's graph. The sealed base is never
+        // repaired, so one that fails the check leaves the base without a CSR.
+        let csr_sha256 = match copy_donor_csr_checked(&src_csr, &staged_csr, key.generation_id)? {
+            DonorCsr::Kept => {
+                set_file_readonly(&staged_csr)?;
+                Some(sha256_file_hex(&staged_csr)?)
+            }
+            DonorCsr::Absent | DonorCsr::Rejected { .. } => None,
         };
 
         let manifest = BaseManifest {
@@ -2286,6 +2291,19 @@ impl StackedStore {
         if let (Some(file), Some(record)) = (&self.csr_file, &self.lease.csr) {
             check_identity(file, record, "CSR sidecar", &lease_path)?;
             verify_csr_content(file, record)?;
+            // Readers take a CSR on its generation alone, and the placed store
+            // keeps this base's generation: a CSR stamped for another one would
+            // be served as the store's graph. The base is sealed, so refuse
+            // rather than repair.
+            let stamped = csr_generation_of_open_file(file)?;
+            if stamped != u64::from(self.lease.generation_id) {
+                bail!(
+                    "the lane's CSR sidecar is stamped for generation {stamped} but its base store is generation {}; \
+                     refusing to place a store beside it. {}",
+                    self.lease.generation_id,
+                    restack_hint(&lease_path)
+                );
+            }
         }
         let dst_csr = csr_path_for_store(&target_db);
         let placed = (|| -> Result<()> {
@@ -4583,6 +4601,88 @@ mod tests {
             served.is_err(),
             "a csr from another repository (len {tampered_len} vs {honest_len}) was mapped and served: {served:?}"
         );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A CSR of generation `generation` with one node, written over `path`.
+    #[cfg(all(feature = "parse", unix))]
+    fn write_csr_stamped(path: &Path, generation: u64) {
+        let mut writer = devmap_store::csr::CsrGraphWriter::new(generation);
+        writer.add_node(devmap_store::csr::CsrNodeRecord::default());
+        writer.write_to_file(path).unwrap();
+    }
+
+    /// C-1: a donor's CSR left by an earlier store at its path, stamped for a
+    /// generation the donor's store is not at, must not become the base's CSR.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn provision_does_not_admit_a_donor_csr_stamped_for_another_generation() {
+        let root = temp_repo_dir("c1-orphan-csr");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let donor_csr = csr_path_for_store(store_path(&anchor));
+        let donor_generation = devmap_store::csr::CsrGraphReader::open_mmap(&donor_csr)
+            .unwrap()
+            .generation();
+        write_csr_stamped(&donor_csr, donor_generation + 7);
+
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        assert!(
+            lease.csr.is_none(),
+            "the orphan CSR was admitted into the lease: {:?}",
+            lease.csr
+        );
+        assert!(
+            !csr_path_for_store(lease.base_dir().join("base.sqlite")).exists(),
+            "the orphan CSR was copied into the lane's base"
+        );
+        StackedStore::open(&lane).expect("a base without a CSR is served from its store");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// C-1: materialize refuses a CSR whose generation is not the base's, and
+    /// changes nothing. The lease is rewritten to admit the swapped file, so
+    /// only the generation check can catch it.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn materialize_refuses_a_csr_stamped_for_another_generation_and_changes_nothing() {
+        let root = temp_repo_dir("c1-materialize-gen");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let mut lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let canon = lane.canonicalize().unwrap();
+        let base_dir = lease.base_dir();
+        let csr = csr_path_for_store(base_dir.join("base.sqlite"));
+        // Only the directory entry for the CSR is opened up: chmod-ing the base
+        // itself would change the identity the lease recorded for it.
+        set_dir_mode(&base_dir, 0o755).unwrap();
+        set_file_writable(&csr).unwrap();
+        fs::remove_file(&csr).unwrap();
+        write_csr_stamped(&csr, u64::from(lease.generation_id) + 7);
+        set_file_readonly(&csr).unwrap();
+        set_dir_mode(&base_dir, 0o555).unwrap();
+        lease.csr =
+            Some(file_record(&File::open(&csr).unwrap(), sha256_file_hex(&csr).unwrap()).unwrap());
+        fs::write(
+            stack_lease_path(&canon),
+            serde_json::to_vec_pretty(&lease).unwrap(),
+        )
+        .unwrap();
+
+        let stacked = StackedStore::open(&lane).expect("the swapped CSR is admitted by its lease");
+        let err = format!(
+            "{:#}",
+            stacked
+                .materialize_seeded_store()
+                .expect_err("a CSR of another generation must not be copied into a store")
+        );
+        assert!(err.contains("generation"), "unexpected error: {err}");
+        assert!(!store_path(&canon).exists(), "no store may be placed");
+        assert!(stack_lease_path(&canon).is_file(), "the lease must remain");
+        drop(stacked);
         let _ = remove_readonly_tree(&root);
     }
 

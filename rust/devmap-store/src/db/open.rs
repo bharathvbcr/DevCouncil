@@ -464,6 +464,17 @@ impl Store {
         let _setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // A store is being created at `path`: the consumer sidecars beside it
+        // (`.csr`, `.artifacts.json`) were written by an earlier store at this
+        // path, never by this one, and each describes the store it sat beside.
+        // Readers accept a CSR on its generation number alone, so an orphan
+        // stamped with the new store's generation would be served as its graph.
+        if matches!(
+            std::fs::symlink_metadata(path),
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            Self::remove_foreign_sidecars(path)?;
+        }
         let mut conn = Connection::open(path)?;
         Self::harden_connection(&conn)?;
         let store = path.display().to_string();
@@ -538,6 +549,26 @@ impl Store {
             full_text_damage: None,
             repo_root_override: None,
         })
+    }
+
+    /// Unlink each consumer sidecar of the not-yet-created store `db_path`. A
+    /// symlink is unlinked, never followed; an absent sidecar is fine and any
+    /// other failure is returned, because a store created beside an orphan it
+    /// could not remove would be served the orphan.
+    fn remove_foreign_sidecars(db_path: &Path) -> Result<()> {
+        for suffix in crate::seed::STORE_SIDECARS {
+            let sidecar = crate::seed::sidecar(db_path, suffix);
+            crate::seed::remove_file_if_present(&sidecar).map_err(|error| {
+                refusal(format!(
+                    "a new devmap store at {} would sit beside {}, which an earlier store left \
+                     and which describes that store, not this one; it could not be removed: \
+                     {error:#}",
+                    db_path.display(),
+                    sidecar.display()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// `SQLITE_READONLY_DIRECTORY`: the database is read-only because the
