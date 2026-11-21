@@ -176,14 +176,13 @@ impl Resolver {
     /// non-exported TS/JS module binding outside its module, and a non-`pub`
     /// Rust item outside its crate.
     ///
-    /// Kotlin and Java are recorded too (`unexported_symbols` is filled from
-    /// this), but only the bare member rung reads them: a Java `protected`
-    /// member is `is_exported == false` as well as a `private` one, so hiding
-    /// them from the global rung would drop a subclass's reach to a base
-    /// declared in another file. See [`Self::visibility_hides_from_global_rung`].
+    /// Java is recorded too (`unexported_symbols` is filled from this), but
+    /// only the bare member rung reads it: a Java `protected` member is
+    /// `is_exported == false` as well as a `private` one, so hiding them from
+    /// the global rung would drop a subclass's reach to a base declared in
+    /// another file. See [`Self::visibility_hides_from_global_rung`].
     pub(super) fn visibility_is_enforced(family: LangFamily) -> bool {
-        Self::visibility_hides_from_global_rung(family)
-            || matches!(family, LangFamily::Kotlin | LangFamily::Java)
+        Self::visibility_hides_from_global_rung(family) || family == LangFamily::Java
     }
 
     /// Families whose unexported declarations the global rung may not offer to

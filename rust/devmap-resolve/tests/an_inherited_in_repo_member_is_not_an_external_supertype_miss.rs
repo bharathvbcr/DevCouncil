@@ -3,9 +3,13 @@
 //! extends `android.app.Service` from binding a bare `getString(..)` to a repo
 //! top-level `getString`. It must not also cost recall:
 //!
-//! * a Kotlin or Java class that inherits an in-repo member through an in-repo
-//!   base that itself extends an external class calls that member bare, and the
-//!   member is the receiver's own, found before the global rung is asked.
+//! * a Java class that inherits an in-repo member through an in-repo base that
+//!   itself extends an external class calls that member bare, and the member is
+//!   the receiver's own, found before the global rung is asked.
+//!
+//! The Kotlin cases are `#[ignore]`d: Kotlin has no such rung until the
+//! extraction carries lambda-literal spans (ft-87b28bb6). The Kotlin tests left
+//! active assert that nothing wrong is bound meanwhile.
 //!
 //! Each case pairs the recall with the guard it must not trip over: the
 //! same-named namesake elsewhere in the repo never receives the call.
@@ -44,6 +48,7 @@ fn calls_from(result: &ResolutionResult, caller: &str) -> Vec<(String, String)> 
 }
 
 #[test]
+#[ignore = "ft-87b28bb6: needs Kotlin lambda-literal spans (extractor fact)"]
 fn a_kotlin_bare_call_reaches_a_member_inherited_through_an_external_root() {
     let result = resolve(&[
         (
@@ -322,7 +327,162 @@ fn a_member_found_only_through_an_interface_does_not_outrank_an_external_class_b
 }
 
 #[test]
-fn what_the_attack_round_left_bound_is_still_bound() {
+fn what_stays_bound_in_java() {
+    // J6: an interface default.
+    let result = resolve(&[
+        (
+            "a/I.java",
+            "package a;\npublic interface I { default int helper() { return 1; } }\n",
+        ),
+        (
+            "a/C.java",
+            "package a;\npublic class C implements I { int go() { return helper(); } }\n",
+        ),
+    ]);
+    receiver_type_edge(&result, "a/C.java::C.go", "a/I.java::I.helper", "J6");
+
+    // Q16: a same-package static namesake in an unrelated class.
+    let result = resolve(&[
+        (
+            "a/Base.java",
+            "package a;\npublic class Base { int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Other.java",
+            "package a;\npublic class Other { static int helper() { return 2; } }\n",
+        ),
+        (
+            "a/Child.java",
+            "package a;\npublic class Child extends Base { int go() { return helper(); } }\n",
+        ),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Child.java::Child.go",
+        "a/Base.java::Base.helper",
+        "Q16",
+    );
+
+    // J1: a static import of the same name does not beat the inherited member.
+    let result = resolve(&[
+        (
+            "a/Base.java",
+            "package a;\npublic class Base { int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Child.java",
+            "package a;\nimport static z.Decoy.helper;\npublic class Child extends Base { int go() { return helper(); } }\n",
+        ),
+        (
+            "z/Decoy.java",
+            "package z;\npublic class Decoy { static int helper() { return 9; } }\n",
+        ),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Child.java::Child.go",
+        "a/Base.java::Base.helper",
+        "J1",
+    );
+
+    // J2a: an inner class's own superclass member beats the outer class's.
+    let result = resolve(&[
+        (
+            "a/Sup.java",
+            "package a;\npublic class Sup { int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Outer.java",
+            "package a;\npublic class Outer {\n int helper() { return 2; }\n \
+             class In extends Sup { int go() { return helper(); } }\n}\n",
+        ),
+    ]);
+    receiver_type_edge(
+        &result,
+        "a/Outer.java::In.go",
+        "a/Sup.java::Sup.helper",
+        "J2a",
+    );
+}
+
+#[test]
+fn the_java_rung_leaves_lexical_scope_to_the_rungs_after_it() {
+    // J2b: an inner class with no own member calls the outer class's.
+    let result = resolve(&[(
+        "a/Outer.java",
+        "package a;\npublic class Outer {\n int helper() { return 2; }\n \
+         class In { int go() { return helper(); } }\n}\n",
+    )]);
+    no_receiver_type_edge(&result, "a/Outer.java::In.go", "J2b");
+
+    // J3b: an anonymous subclass of an in-repo class, inside a class with its
+    // own helper.
+    let result = resolve(&[
+        (
+            "a/Sup.java",
+            "package a;\npublic class Sup { int helper() { return 1; } }\n",
+        ),
+        (
+            "a/Outer.java",
+            "package a;\npublic class Outer {\n int helper() { return 2; }\n \
+             void m() { Object o = new Sup() { int go() { return helper(); } }; }\n}\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Outer.java::Outer.m", "J3b");
+
+    // J3c: an anonymous Runnable calls the outer class's helper.
+    let result = resolve(&[(
+        "a/Outer.java",
+        "package a;\npublic class Outer {\n int helper() { return 2; }\n \
+         void m() { Runnable r = new Runnable() { public void run() { helper(); } }; }\n}\n",
+    )]);
+    no_receiver_type_edge(&result, "a/Outer.java::run", "J3c");
+
+    // J4: a static nested class has no outer instance to call.
+    let result = resolve(&[
+        (
+            "a/Outer.java",
+            "package a;\npublic class Outer {\n int helper() { return 2; }\n \
+             static class N { int go() { return helper(); } }\n}\n",
+        ),
+        (
+            "z/Decoy.java",
+            "package z;\npublic class Decoy { static int helper() { return 9; } }\n",
+        ),
+    ]);
+    no_receiver_type_edge(&result, "a/Outer.java::N.go", "J4");
+}
+
+/// Q8, the reason Kotlin is parked (ft-87b28bb6): `helper()` inside a lambda
+/// whose receiver is `Other` names `Other.helper`, not the enclosing class's
+/// inherited one, and the extraction records no lambda-literal span to tell.
+#[test]
+fn a_kotlin_lambda_with_receiver_binds_no_member_of_the_enclosing_class() {
+    let result = resolve(&[
+        (
+            "a/Base.kt",
+            "package a\nopen class Base { fun helper(): Int = 1 }\n",
+        ),
+        (
+            "a/Other.kt",
+            "package a\nclass Other { fun helper(): Int = 3 }\n",
+        ),
+        (
+            "a/Child.kt",
+            "package a\nclass Child : Base() {\n fun build(block: Other.() -> Unit) {}\n \
+             fun go() { build { helper() } }\n}\n",
+        ),
+    ]);
+    let rows = calls_from(&result, "a/Child.kt::Child.go");
+    assert!(
+        rows.iter().all(|(target, _)| !target.ends_with("::helper")),
+        "Q8: {rows:?}"
+    );
+}
+
+#[test]
+#[ignore = "ft-87b28bb6: needs Kotlin lambda-literal spans (extractor fact)"]
+fn what_stays_bound_in_kotlin() {
     // K8: an interface default with no external base.
     let result = resolve(&[
         (
@@ -356,19 +516,6 @@ fn what_the_attack_round_left_bound_is_still_bound() {
         "K10",
     );
 
-    // J6: a Java interface default.
-    let result = resolve(&[
-        (
-            "a/I.java",
-            "package a;\npublic interface I { default int helper() { return 1; } }\n",
-        ),
-        (
-            "a/C.java",
-            "package a;\npublic class C implements I { int go() { return helper(); } }\n",
-        ),
-    ]);
-    receiver_type_edge(&result, "a/C.java::C.go", "a/I.java::I.helper", "J6");
-
     // Q14: the inherited member beats a same-package top-level function.
     let result = resolve(&[
         (
@@ -386,28 +533,6 @@ fn what_the_attack_round_left_bound_is_still_bound() {
         "a/Child.kt::Child.go",
         "a/Base.kt::Base.helper",
         "Q14",
-    );
-
-    // Q16: Java, same-package static namesake in an unrelated class.
-    let result = resolve(&[
-        (
-            "a/Base.java",
-            "package a;\npublic class Base { int helper() { return 1; } }\n",
-        ),
-        (
-            "a/Other.java",
-            "package a;\npublic class Other { static int helper() { return 2; } }\n",
-        ),
-        (
-            "a/Child.java",
-            "package a;\npublic class Child extends Base { int go() { return helper(); } }\n",
-        ),
-    ]);
-    receiver_type_edge(
-        &result,
-        "a/Child.java::Child.go",
-        "a/Base.java::Base.helper",
-        "Q16",
     );
 
     // A Kotlin protected member is inherited.

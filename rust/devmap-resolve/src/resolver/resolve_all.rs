@@ -1713,18 +1713,22 @@ impl Resolver {
                     // free functions, because a member shadows a function of the
                     // same name.
                     //
-                    // Kotlin and Java read the same way: a bare call inside a
-                    // class is first a member of that class or of a supertype
+                    // Java reads the same way: a bare call inside a class is
+                    // first a member of that class or of a supertype
                     // (ft-0e6cc90f). It must be asked before the global rung,
                     // whose guard abstains for any class whose chain reaches a
                     // base the index does not declare (`extends Service`), so
                     // an in-repo member inherited through such a chain would
                     // otherwise have no edge at all.
+                    //
+                    // Kotlin is parked (ft-87b28bb6f7ee8702a35b06117e7efc0b):
+                    // inside a lambda with receiver (`build { helper() }`,
+                    // `build(block: Other.() -> Unit)`) the bare call names
+                    // the lambda's receiver, and the extraction records no
+                    // lambda-literal spans, so the rung would bind the
+                    // enclosing class's member at ReceiverType 1.0 wrongly.
                     if resolution.is_none()
-                        && matches!(
-                            family,
-                            LangFamily::Swift | LangFamily::Kotlin | LangFamily::Java
-                        )
+                        && matches!(family, LangFamily::Swift | LangFamily::Java)
                         && call.receiver_expr.is_none()
                         && ext
                             .local_binding_at(call.span.start_byte, &call.callee_name)

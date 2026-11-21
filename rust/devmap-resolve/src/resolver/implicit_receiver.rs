@@ -179,9 +179,9 @@ impl Resolver {
         total
     }
 
-    /// Kotlin and Java: whether the member the bare-call rung found is the one
-    /// the call names, which the language's own rules decide and this resolver
-    /// can only partly see. Where it cannot prove it the rung abstains and the
+    /// Java: whether the member the bare-call rung found is the one the call
+    /// names, which the language's own rules decide and this resolver can only
+    /// partly see. (Kotlin does not use this rung: ft-87b28bb6f7ee8702a35b06117e7efc0b.) Where it cannot prove it the rung abstains and the
     /// call is left to the rungs after it, as it was before the rung existed.
     ///
     /// * **One declaration on the chain.** The call's arity is not extracted, so
@@ -189,10 +189,10 @@ impl Resolver {
     ///   whose members differ by arity, and the nearest is not necessarily the
     ///   callee.
     /// * **Not private on a supertype.** A `private` member is not inherited.
-    ///   The extractor's `is_exported` is false for Kotlin `private` and for
-    ///   Java `private` *and* `protected` (it cannot tell them apart), so a Java
-    ///   protected member of a superclass also abstains. A Java package-private
-    ///   member read from another package is exported as true and is not caught.
+    ///   The extractor's `is_exported` is false for Java `private` *and*
+    ///   `protected` (it cannot tell them apart), so a Java protected member of
+    ///   a superclass also abstains. A Java package-private member read from
+    ///   another package is exported as true and is not caught.
     /// * **Not an interface member under an external class.** An external
     ///   superclass may declare the name itself and the superclass wins over an
     ///   interface default, so a member found only on an interface, while the
