@@ -325,6 +325,52 @@ impl Resolver {
         )
     }
 
+    /// Whether the bare-name rung must decline the one namesake it found
+    /// because the call is written in provably plain C and the namesake is a
+    /// method.
+    ///
+    /// C has no methods and no implicit `this`, so a bare `name()` in a `.c`
+    /// file never calls a `SymbolKind::Method` of C++, Objective-C or CUDA,
+    /// although `CStyle` is one family for all four. The caller must be a
+    /// lowercase `.c` file: extraction reads every `.h` as C although a header
+    /// may be C++, and `.C` is C++ by convention, so neither proves the caller
+    /// has no implicit `this` (ft-915ee323, an extractor change, owns that
+    /// residual).
+    ///
+    /// This is a post-lookup refusal, never a change to the candidate set: the
+    /// set is built and charged exactly as before (one cache entry and one
+    /// budget charge per name, whoever calls it), the gate runs only on a set
+    /// that already reduced to one declaration, and so it can only remove an
+    /// edge. The kind is read from `symbol_index`, which carries it per
+    /// declaration. A mixed method-and-function set has two declarations,
+    /// never reaches here, and stays ambiguous as before.
+    pub(super) fn plain_c_caller_declines_method(
+        &self,
+        family: LangFamily,
+        file: &str,
+        name: &str,
+        target_file: &str,
+        target_identity: &str,
+    ) -> bool {
+        if family != LangFamily::CStyle
+            || std::path::Path::new(file)
+                .extension()
+                .is_none_or(|extension| extension != "c")
+        {
+            return false;
+        }
+        let mut kinds = self
+            .symbol_index
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(path, _, _, identity)| path == target_file && &**identity == target_identity)
+            .map(|(_, kind, _, _)| *kind);
+        kinds.next().is_some_and(|first| {
+            first == SymbolKind::Method && kinds.all(|kind| kind == SymbolKind::Method)
+        })
+    }
+
     /// Whether `caller_symbol` is inside a type that inherits (directly or
     /// transitively) from a supertype not declared in the index.
     pub(super) fn has_external_supertype(

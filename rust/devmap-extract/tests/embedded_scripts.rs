@@ -1124,7 +1124,7 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // adds a file-wide veto row when a module-level insert's directory cannot
     // be read (see cache.rs).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "100",
+        EXTRACTION_SCHEMA_VERSION, "101",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

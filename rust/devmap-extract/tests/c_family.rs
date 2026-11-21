@@ -692,3 +692,44 @@ fn a_function_like_macro_is_a_symbol_and_an_object_like_macro_is_not() {
         callees(&extraction)
     );
 }
+
+/// A C function written between `@implementation` and `@end` is still a C
+/// function: it belongs to no class, and C code can call it by its bare name.
+/// Only a `- (...)` / `+ (...)` definition is a method of the class. A C++
+/// in-class definition, by contrast, is a member and stays a method.
+#[test]
+fn a_c_function_inside_an_objc_implementation_is_a_free_function() {
+    let extraction = extract_file(
+        "o/T.m",
+        "@implementation T\nint bar(void){ return 1; }\n- (int)x{ return bar(); }\n@end\n",
+    );
+    let kind_of = |qualified: &str| {
+        extraction
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .map(|symbol| symbol.kind)
+    };
+    assert_eq!(
+        kind_of("o/T.m::bar"),
+        Some(SymbolKind::Function),
+        "the C function is unqualified: {:?}",
+        symbol_names(&extraction)
+    );
+    assert_eq!(
+        kind_of("o/T.m::T.x"),
+        Some(SymbolKind::Method),
+        "the ObjC method keeps its class: {:?}",
+        symbol_names(&extraction)
+    );
+    assert_eq!(kind_of("o/T.m::T.bar"), None, "no method named bar");
+
+    let cpp = extract_file("w.cpp", "struct W { friend int f(W) { return 1; } };\n");
+    assert!(
+        cpp.symbols
+            .iter()
+            .any(|symbol| symbol.kind == SymbolKind::Method),
+        "an in-class C++ definition stays a member: {:?}",
+        symbol_names(&cpp)
+    );
+}

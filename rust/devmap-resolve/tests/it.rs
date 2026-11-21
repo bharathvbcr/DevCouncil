@@ -16,6 +16,8 @@
 //!   fails until it is declared here or isolated.
 
 #[cfg(feature = "parse")]
+mod a_c_bare_call_never_binds_a_method;
+#[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
 mod a_kotlin_property_is_not_a_call_target;

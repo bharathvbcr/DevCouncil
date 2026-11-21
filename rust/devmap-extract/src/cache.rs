@@ -864,7 +864,12 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// different lengths no longer read as the same file. `ipc_identity_for` and
 /// the artifact fingerprint stay on plain FNV (`fnv1a64`). The value moves
 /// with no DDL, so the store schema constants do not move.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "100";
+///
+/// v101 extracts a C function written between `@implementation` and `@end` as
+/// a free function (`file::name`, `Function`) instead of a method of the class
+/// (`file::T.name`, `Method`). A v100 row holds the method spelling, so a warm
+/// cache would keep serving it.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "101";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

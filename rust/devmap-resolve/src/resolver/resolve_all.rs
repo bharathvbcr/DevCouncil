@@ -17,7 +17,9 @@ use super::*;
 ///
 /// 3: the binding changes of commit 7767f7cf (bare-name candidates, receiver
 /// types, the sibling-field fallbacks) altered edges while this stayed at 2.
-pub const RESOLUTION_REUSE_EPOCH: &str = "3";
+/// 4: a bare call in a plain `.c` file no longer binds a method namesake, so a
+/// stored `UniqueGlobal` edge to a C++/ObjC/CUDA method is stale.
+pub const RESOLUTION_REUSE_EPOCH: &str = "4";
 
 /// One file's resolution before the whole-tree post-pass.
 ///
@@ -1881,6 +1883,13 @@ impl Resolver {
                                     target_identity,
                                 );
                             if !out_of_scope
+                                && !self.plain_c_caller_declines_method(
+                                    family,
+                                    &ext.file_path,
+                                    &call.callee_name,
+                                    target_f,
+                                    target_identity,
+                                )
                                 && !self.rust_unique_rung_declines(
                                     family,
                                     &ext.file_path,
