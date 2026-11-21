@@ -821,7 +821,7 @@ pub(crate) fn post_tool_use_matcher_warning(cwd: &Path) -> Option<String> {
 /// nothing outdated was found, never as current: a check that could not run must
 /// not read as one that passed. A matcher that matches every tool (`""`, `*`) or
 /// names `Bash` is current; a regular-expression matcher cannot be checked
-/// statically and is left alone.
+/// statically, so it is reported as unchecked, not as current.
 fn outdated_post_tool_use_matcher(documents: &[PathBuf]) -> Option<String> {
     let mut outdated = Vec::new();
     let mut unchecked = Vec::new();
@@ -857,7 +857,17 @@ fn outdated_post_tool_use_matcher(documents: &[PathBuf]) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             let covers_shell = match claude::classify_matcher("PostToolUse", matcher) {
-                claude::MatcherKind::All | claude::MatcherKind::Regex => true,
+                claude::MatcherKind::All => true,
+                // Claude Code reads it as a regular expression; whether that
+                // matches Bash is not decidable here, and an unknown must not
+                // read as current.
+                claude::MatcherKind::Regex => {
+                    unchecked.push(format!(
+                        "{} (matcher {matcher:?} is a regular expression)",
+                        path.display()
+                    ));
+                    continue;
+                }
                 claude::MatcherKind::Exact(tools) => tools.iter().any(|tool| tool == "Bash"),
             };
             if !covers_shell {
@@ -877,7 +887,7 @@ fn outdated_post_tool_use_matcher(documents: &[PathBuf]) -> Option<String> {
     }
     (!unchecked.is_empty()).then(|| {
         format!(
-            "cannot read {}; whether Dev Map's PostToolUse matcher covers shell calls is unchecked",
+            "cannot check {}; whether Dev Map's PostToolUse matcher covers shell calls is unchecked",
             unchecked.join(", ")
         )
     })

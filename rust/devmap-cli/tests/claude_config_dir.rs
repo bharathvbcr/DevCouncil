@@ -330,6 +330,26 @@ fn a_matcher_that_matches_every_tool_or_belongs_to_another_hook_is_not_outdated(
     }
 }
 
+/// A regular-expression matcher cannot be read statically, so whether it covers
+/// Bash is unchecked, never reported as current.
+#[test]
+fn a_regex_matcher_is_unchecked_not_clean() {
+    let home = scratch("matcher-regex-home");
+    let cwd = scratch("matcher-regex-cwd");
+    let profile = home.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(
+        profile.join("settings.json"),
+        r#"{"hooks":{"PostToolUse":[{"matcher":"^(Edit|Write)$","hooks":[{"type":"command","command":"/abs/devmap hook post-tool-use"}]}]}}"#,
+    )
+    .unwrap();
+    let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
+    let text = matcher_warning(&payload).expect("a regex matcher must not read as current");
+    assert!(text.contains("unchecked"), "{text}");
+    assert!(text.contains("regular expression"), "{text}");
+    assert!(!text.contains("outdated"), "{text}");
+}
+
 /// A settings file that cannot be read is not a current matcher.
 #[test]
 fn an_unreadable_hooks_document_is_unchecked_not_clean() {
