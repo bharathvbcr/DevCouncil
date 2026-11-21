@@ -1194,6 +1194,10 @@ pub const SESSION_START_MATCHER: &str = "startup|resume|clear|compact|fork";
 /// naming it would be a dead alternative dressed as coverage.
 pub const WRITE_TOOL_MATCHER: &str = "Edit|Write|NotebookEdit|Bash";
 
+/// The tool whose failure can still have written: a shell command's exit code
+/// says nothing about what it changed before it stopped.
+pub const SHELL_TOOL_MATCHER: &str = "Bash";
+
 /// One hook Dev Map installs, and why that event.
 #[derive(Debug, Clone, Copy)]
 pub struct DevmapHook {
@@ -1254,6 +1258,19 @@ pub const DEVMAP_HOOKS: &[DevmapHook] = &[
                   that cannot change the tree spawns nothing.",
     },
     DevmapHook {
+        event: "PostToolUseFailure",
+        matcher: SHELL_TOOL_MATCHER,
+        hook_event: "post-tool-use",
+        timeout_secs: Some(5),
+        status_message: "",
+        purpose: "A shell command that writes and then exits non-zero (git merge stopped \
+                  on conflicts, git rebase at a conflict, git stash pop with a conflict) \
+                  fires PostToolUseFailure, not PostToolUse, yet leaves a changed tree. \
+                  Routed to the same `devmap hook post-tool-use`, which only spawns for a \
+                  command that may change the tree. Bash only: Edit, Write and \
+                  NotebookEdit that failed wrote nothing to index.",
+    },
+    DevmapHook {
         event: "SessionEnd",
         matcher: "",
         hook_event: "session-end",
@@ -1308,7 +1325,6 @@ pub fn event_coverage() -> Vec<(&'static str, Option<&'static DevmapHook>, &'sta
                      watches the tree directly, which covers the same changes without a hook \
                      per event."
                 }
-                "PostToolUseFailure" => "Not handled: a tool that failed wrote nothing to index.",
                 _ => "Not handled.",
             });
             (*event, hook, reason)
@@ -2903,6 +2919,26 @@ mod tests {
             );
         }
         assert_ne!(matcher, "Edit|Write|NotebookEdit", "the pre-shell matcher");
+    }
+
+    /// A shell command that wrote and then failed (a merge stopped on conflicts)
+    /// fires PostToolUseFailure: it is routed to the post-tool-use hook for
+    /// Bash only, on a non-permission event, and its coverage row says handled.
+    #[test]
+    fn a_failed_shell_call_reaches_the_post_tool_use_hook() {
+        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
+            .expect("normal emission");
+        let group = &block["hooks"]["PostToolUseFailure"][0];
+        assert_eq!(group["matcher"], "Bash");
+        let command = group["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.ends_with(" hook post-tool-use"), "{command}");
+        assert!(!PERMISSION_DECIDING_EVENTS.contains(&"PostToolUseFailure"));
+        let (_, hook, reason) = event_coverage()
+            .into_iter()
+            .find(|(event, _, _)| *event == "PostToolUseFailure")
+            .unwrap();
+        assert!(hook.is_some(), "{reason}");
+        assert!(!reason.contains("wrote nothing to index.\""), "{reason}");
     }
 
     /// Both bundles that carry a hooks.json (Claude's and Codex's) are rendered

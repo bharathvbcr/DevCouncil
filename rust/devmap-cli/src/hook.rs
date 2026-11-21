@@ -5440,6 +5440,32 @@ mod tests {
         .into_bytes()
     }
 
+    /// A `git merge` that stops on conflicts has written the tree and exits
+    /// non-zero, so the host fires PostToolUseFailure, routed to this same
+    /// handler. Its payload (an `error` in place of a response) starts a build
+    /// for a write-shaped command and none for a read-only one.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_shell_write_starts_a_build_and_a_failed_read_does_not() {
+        let failure = |lane: &Lane, command: &str| {
+            let mut payload: Value = serde_json::from_slice(&shell_payload(&lane.main, command)).unwrap();
+            payload["hook_event_name"] = json!("PostToolUseFailure");
+            payload["error"] = json!("Command exited with non-zero status code 1");
+            payload.to_string().into_bytes()
+        };
+        let lane = Lane::new("shell-failure", true);
+        let outcome = run_hook(HookEvent::PostToolUse, &failure(&lane, "git status"), &lane.exe, None);
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(lane.builds_started(), 0, "a failed read-only command built");
+
+        let outcome = run_hook(HookEvent::PostToolUse, &failure(&lane, "git merge feature"), &lane.exe, None);
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(eventually(|| lane.builds_started() == 1), "a failed write-shaped command started no build");
+        fs::write(&lane.release, b"").unwrap();
+        assert!(eventually(|| !lane.main_lock().exists()));
+    }
+
     /// Commands that change, or may change, the working tree. Each must reach
     /// the index: a git operation or an in-place edit made through the shell is
     /// invisible to the Edit-tool matcher.
