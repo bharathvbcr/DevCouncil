@@ -1379,7 +1379,7 @@ fn resolver_degraded_clause(store: &Store, freshness: Option<&str>) -> Option<St
 
 /// The git directory of the working tree `root` is in: a `.git` directory in it
 /// or an ancestor, or the directory a linked worktree's `.git` file names.
-/// `None` outside a git working tree, or when the pointer cannot be followed.
+/// `None` outside a git working tree.
 fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
     root.ancestors().find_map(|dir| {
         let dot_git = dir.join(".git");
@@ -1387,8 +1387,16 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
             return Some(dot_git);
         }
         let pointer = read_bounded(&dot_git)?;
-        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
-        (!target.is_empty()).then(|| dir.join(target))
+        // A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
+        // git stops there ("invalid gitfile format"): the walk must not step
+        // over it and judge an enclosing repository's HEAD. The file itself is
+        // returned, which has no `HEAD` beneath it, so the checkout reads broken.
+        let target = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|target| !target.is_empty());
+        Some(target.map_or(dot_git, |target| dir.join(target)))
     })
 }
 
@@ -4145,6 +4153,154 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert!(readable["degraded_reason"].is_null(), "{readable}");
         assert_eq!(readable["is_fresh"], true, "{readable}");
+    }
+
+    /// What `head_degraded_clause` says over one git layout built by `lay` inside
+    /// `root`, for a generation stamped `"unavailable"`.
+    fn head_clause_over(
+        label: &str,
+        lay: impl FnOnce(&std::path::Path),
+    ) -> Option<String> {
+        let parent = std::env::temp_dir().join(format!(
+            "devmap-head-probe-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        let root = parent.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let root = root.canonicalize().unwrap();
+        let store = corpus_store(2, Some(&root));
+        store.restamp_latest_head(UNAVAILABLE_HEAD).unwrap();
+        lay(&root);
+        let clause = head_degraded_clause(&store).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        clause
+    }
+
+    /// Probe: the HEAD layouts a corrupt lane can be in. A fault is named only
+    /// when the checkout's own HEAD is broken; the clause is a bounded read of
+    /// files and carries nothing from them into the string.
+    #[test]
+    fn the_head_clause_over_each_git_layout() {
+        let git = |root: &std::path::Path| {
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            root.join(".git")
+        };
+        let named = |label: &str, lay: &dyn Fn(&std::path::Path)| {
+            let clause = head_clause_over(label, lay);
+            let text = clause.unwrap_or_else(|| panic!("{label}: a broken HEAD was not named"));
+            assert!(text.len() < 400, "{label}: the clause is bounded: {text}");
+            assert!(!text.contains("SECRET"), "{label}: HEAD content leaked: {text}");
+        };
+        let silent = |label: &str, lay: &dyn Fn(&std::path::Path)| {
+            let clause = head_clause_over(label, lay);
+            assert!(clause.is_none(), "{label}: an ordinary state was named: {clause:?}");
+        };
+
+        // A HEAD file of garbage: broken. 1 MiB of it: read in 256 bytes, still broken.
+        named("garbage", &|r| std::fs::write(git(r).join("HEAD"), "SECRET\n").unwrap());
+        named("one-mib", &|r| {
+            std::fs::write(git(r).join("HEAD"), vec![b'x'; 1 << 20]).unwrap();
+        });
+        named("non-utf8", &|r| {
+            std::fs::write(git(r).join("HEAD"), [0xff, 0xfe, 0x00, 0x80, b'\n']).unwrap();
+        });
+        named("empty", &|r| std::fs::write(git(r).join("HEAD"), "").unwrap());
+        named("missing", &|r| {
+            git(r);
+        });
+        named("head-is-a-directory", &|r| {
+            std::fs::create_dir_all(git(r).join("HEAD")).unwrap();
+        });
+        named("ref-with-no-name", &|r| std::fs::write(git(r).join("HEAD"), "ref:\n").unwrap());
+        named("41-hex", &|r| {
+            std::fs::write(git(r).join("HEAD"), "0".repeat(41)).unwrap();
+        });
+        named("40-non-hex", &|r| {
+            std::fs::write(git(r).join("HEAD"), "z".repeat(40)).unwrap();
+        });
+
+        // Well-formed HEADs are ordinary: unborn branch, packed refs only,
+        // detached at a sha of either object-id width.
+        silent("unborn", &|r| {
+            std::fs::write(git(r).join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        });
+        silent("packed-refs-only", &|r| {
+            let dir = git(r);
+            std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(
+                dir.join("packed-refs"),
+                format!("{} refs/heads/main\n", "a".repeat(40)),
+            )
+            .unwrap();
+        });
+        silent("detached-sha1", &|r| {
+            std::fs::write(git(r).join("HEAD"), format!("{}\n", "a".repeat(40))).unwrap();
+        });
+        silent("detached-sha256", &|r| {
+            std::fs::write(git(r).join("HEAD"), format!("{}\n", "b".repeat(64))).unwrap();
+        });
+
+        // A HEAD symlink is followed. Dangling: broken. Into a well-formed file
+        // outside the repository: ordinary, and what it holds goes nowhere.
+        #[cfg(unix)]
+        {
+            named("dangling-symlink", &|r| {
+                std::os::unix::fs::symlink("/nonexistent/HEAD", git(r).join("HEAD")).unwrap();
+            });
+            silent("symlink-to-outside-valid", &|r| {
+                let outside = r.parent().unwrap().join("outside-head");
+                std::fs::write(&outside, "ref: refs/heads/main\n").unwrap();
+                std::os::unix::fs::symlink(&outside, git(r).join("HEAD")).unwrap();
+            });
+            named("symlink-to-outside-garbage", &|r| {
+                let outside = r.parent().unwrap().join("outside-head");
+                std::fs::write(&outside, "SECRET garbage\n").unwrap();
+                std::os::unix::fs::symlink(&outside, git(r).join("HEAD")).unwrap();
+            });
+        }
+
+        // A linked worktree: `.git` is a file naming the real git directory.
+        let linked = |root: &std::path::Path, relative: bool, head: Option<&str>| {
+            let gitdir = root.parent().unwrap().join("gitdirs").join("repo");
+            std::fs::create_dir_all(&gitdir).unwrap();
+            if let Some(head) = head {
+                std::fs::write(gitdir.join("HEAD"), head).unwrap();
+            }
+            let target = if relative {
+                "../gitdirs/repo".to_string()
+            } else {
+                gitdir.to_string_lossy().into_owned()
+            };
+            std::fs::write(root.join(".git"), format!("gitdir: {target}\n")).unwrap();
+        };
+        named("linked-broken-head", &|r| linked(r, false, Some("garbage\n")));
+        named("linked-missing-head", &|r| linked(r, false, None));
+        named("linked-relative-broken-head", &|r| linked(r, true, Some("garbage\n")));
+        silent("linked-valid-head", &|r| linked(r, false, Some("ref: refs/heads/x\n")));
+        silent("linked-relative-valid-head", &|r| linked(r, true, Some("ref: refs/heads/x\n")));
+        named("linked-gitdir-gone", &|r| {
+            std::fs::write(r.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
+        });
+    }
+
+    /// A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
+    /// git stops there ("invalid gitfile format"). The walk used to step over it
+    /// and judge an enclosing repository's HEAD instead.
+    #[test]
+    fn a_malformed_gitfile_is_not_stepped_over_to_an_enclosing_repository() {
+        let clause = head_clause_over("gitfile-garbage", |root| {
+            let enclosing = root.parent().unwrap().join(".git");
+            std::fs::create_dir_all(&enclosing).unwrap();
+            std::fs::write(enclosing.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(root.join(".git"), "this is not a gitfile\n").unwrap();
+        });
+        assert!(
+            clause.is_some(),
+            "a malformed .git file in the checkout was judged by the enclosing repository's HEAD"
+        );
     }
 }
 
