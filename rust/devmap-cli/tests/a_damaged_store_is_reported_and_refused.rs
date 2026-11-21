@@ -247,6 +247,43 @@ fn status_is_not_ready_over_a_smashed_search_index_page() {
     }
 }
 
+/// A damaged `nodes_fts_config` page fails the index's own constructor, so the
+/// store cannot be opened at all, and `status` used to exit 1 with a bare error
+/// and no JSON: a host that reads `status` for readiness got nothing to read.
+/// The index is the only thing wrong, so `status` answers, names the damage and
+/// the repair, and is neither ready nor fresh. Damage to the file as a whole
+/// (`payload_nodes`, `file_rows`) is not the index's and still refuses.
+#[test]
+fn status_answers_when_a_damaged_index_config_page_stops_the_store_opening() {
+    let root = fixture("config-status");
+    let db = root.join("devmap.sqlite");
+    assert!(devmap_at(&root, &db, &["build", "."]).ok);
+    smash_page_of(&db, "nodes_fts_config");
+    drop_sidecars(&db);
+
+    let status = devmap_at(&root, &db, &["status"]);
+    assert!(
+        status.ok,
+        "status refused instead of reporting: {}",
+        status.stderr
+    );
+    let json = &status.json;
+    assert_eq!(json["search_index_damaged"], true, "{json}");
+    assert_eq!(json["query_ready"], false, "{json}");
+    assert_eq!(json["is_fresh"], false, "{json}");
+    assert_eq!(json["schema_relation"], "current", "{json}");
+    let reason = json["degraded_reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("full-text index") && reason.contains("devmap repair --fts"),
+        "the reason names the damage and the repair: {json}"
+    );
+    assert_eq!(
+        json["rebuild_required"], false,
+        "a rebuild cannot cure a damaged page: {json}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Honesty half 2: `build` does not answer "unchanged" over the damage, and does
 /// not write to it. It refuses, naming the store, the finding and what to do.
 #[test]

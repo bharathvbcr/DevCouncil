@@ -213,7 +213,23 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         emit_json(cli, &payload)?;
         return Ok(());
     }
-    let Some(store) = Store::open_existing(cli.db())? else {
+    // A store whose only fault is its full-text index may be unopenable by the
+    // strict read (a damaged `nodes_fts_config` page fails the index's own
+    // constructor), and `status` used to exit 1 with no JSON there, which a
+    // host reading readiness cannot use. The tolerant open is for exactly this:
+    // everything but search still answers, and the damage is reported below
+    // rather than refused. Damage that is not provably the index's alone still
+    // fails the open, here as before.
+    let opened = match Store::open_existing(cli.db()) {
+        Err(error) if Store::sqlite_error_is_full_text_damage(&error) => {
+            Some(Store::open_read_only_with(
+                cli.db(),
+                devmap_store::ReaderMemory::CURRENT.tolerating_full_text_damage(),
+            )?)
+        }
+        other => other?,
+    };
+    let Some(store) = opened else {
         anyhow::bail!(
             "the devmap store at {} vanished between the schema probe and the read",
             cli.db().display()
