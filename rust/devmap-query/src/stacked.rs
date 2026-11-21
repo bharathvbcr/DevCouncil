@@ -2639,7 +2639,7 @@ impl StackedStore {
     /// resolved against the second then admitted or refused paths the first
     /// does not hold. `Store::all_symbols_page_with_files` reads both inside one
     /// deferred transaction.
-    fn merged_corpus(&self) -> Result<Option<(SearchPage, ScopeInputs)>> {
+    pub(crate) fn merged_corpus(&self) -> Result<Option<(SearchPage, ScopeInputs)>> {
         let Some((page, base_files)) = self.base.all_symbols_page_with_files()? else {
             return Ok(None);
         };
@@ -4029,6 +4029,38 @@ mod tests {
             page.narrowing.as_ref().map(|n| n.corpus_files),
             Some(3),
             "the scope was resolved against a different file list than the rows"
+        );
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `doc_drift_report_with_stacked` paired the same two reads over a dirty
+    /// worktree: the merged rows, then the merged file list.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn doc_drift_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("docdrift-one-snapshot");
+        let options = crate::doc_drift::DocDriftOptions {
+            paths: &[],
+            exclude: &[],
+            token_budget: 8_000,
+            default_excludes: true,
+            limits: crate::doc_drift::Limits::default(),
+        };
+
+        let pauses = SnapshotPauseCount::install();
+        let report = crate::doc_drift::doc_drift_report_with_stacked(
+            &stacked.base,
+            Some(&stacked),
+            &crate::cancel::Cancel::default(),
+            &options,
+        )
+        .unwrap();
+        assert!(report.available, "{:?}", report.walk_incomplete);
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
         );
         drop(pauses);
         let _ = remove_readonly_tree(&root);
