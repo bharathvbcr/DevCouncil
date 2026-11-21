@@ -30,6 +30,11 @@ checkout_task ─▶ (agent implements) ─▶ verify_task ─▶ passed? ─▶
 
 ## Step-by-step workflow
 
+Each step below names the MCP tool; from a shell run the same tool as
+`dev tool call <name> --args '<json>'` (for example
+`dev tool call devcouncil_checkout_task --args '{"task_id":"T-1","client_id":"me"}'`).
+Reuse one `client_id` across MCP and shell so the lease is yours in both.
+
 ### 1. Pick up work
 
 ```
@@ -99,8 +104,8 @@ Report: task ID, what changed, verification result, and any advisory (non-blocki
 | Entry | When |
 |---|---|
 | Subagent `devcouncil-implementer` | Delegate the entire loop |
+| `dev tool call <name> --args '<json>'` | Lead with this from a shell or a Code Mode REPL script (see the **devcouncil** skill): same registry, answer text and lease as MCP, which stays the alternative. Exit 0 answered, 1 refused, 2 malformed, 3 could not run here. Say that you used the shell when MCP was unreliable |
 | `dev verify TASK-ID --json` | Scripting or CI: the same verifier, from a shell |
-| `dev tool call <name> --args '<json>'` | Any step above when its MCP call errors or times out; same answer text, same lease. Report that you fell back |
 
 DevCouncil has no command that plans a goal into tasks or drives the loop for you;
 Manvi is the harness that runs it end to end.
