@@ -251,6 +251,20 @@ func healthCheck(id, bin string, p Prober) error {
 		if !reports(reply, `"id":"dcgrep"`) {
 			return fmt.Errorf("dcgrep health did not report id: %s", reply)
 		}
+	case "dcredact":
+		if err := versionReply("--version"); err != nil {
+			return err
+		}
+		reply, err := ask("health")
+		if err != nil {
+			return err
+		}
+		if !reports(reply, `"ok":true`) {
+			return fmt.Errorf("dcredact health failed: %s", reply)
+		}
+		if !reports(reply, `"id":"dcredact"`) {
+			return fmt.Errorf("dcredact health did not report id: %s", reply)
+		}
 	case "devmap":
 		if _, err := ask("--version"); err != nil {
 			return err

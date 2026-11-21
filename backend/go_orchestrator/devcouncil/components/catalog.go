@@ -77,13 +77,21 @@ var Catalog = []Component{
 		Package:     "dc-grep",
 		Description: "Ignore-aware repository search (also installed as `devc-grep` and `dc-grep`)",
 	},
+	{
+		ID:          "dcredact",
+		Binary:      "dcredact",
+		Aliases:     []string{"devc-redact", "dc-redact"},
+		Kind:        KindRust,
+		Package:     "dc-redact-cli",
+		Description: "Credential redaction over JSON-on-stdio (also installed as `devc-redact` and `dc-redact`)",
+	},
 }
 
 // Preset expands a named bundle. Preset names win over component IDs when both
 // could match (devmap is both).
 var Presets = map[string][]string{
-	"all":       {"host", "devmap", "dcstore", "dcverify", "dcgrep"},
-	"analysis":  {"devmap", "dcstore", "dcverify", "dcgrep"},
+	"all":       {"host", "devmap", "dcstore", "dcverify", "dcgrep", "dcredact"},
+	"analysis":  {"devmap", "dcstore", "dcverify", "dcgrep", "dcredact"},
 	"codeintel": {"devmap"},
 	"devmap":    {"devmap"},
 	"host":      {"host"},

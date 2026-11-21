@@ -239,7 +239,7 @@ func TestInstallSavesHostReceiptIfRustFails(t *testing.T) {
 
 func TestConcurrentSaveStateLeavesValidJSON(t *testing.T) {
 	prefix := t.TempDir()
-	ids := []string{"host", "devmap", "dcstore", "dcverify", "dcgrep"}
+	ids := []string{"host", "devmap", "dcstore", "dcverify", "dcgrep", "dcredact"}
 	var wg sync.WaitGroup
 	for i := 0; i < 40; i++ {
 		wg.Add(1)

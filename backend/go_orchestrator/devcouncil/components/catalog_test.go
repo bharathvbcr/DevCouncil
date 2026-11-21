@@ -10,7 +10,7 @@ func TestResolveEmptyIsAll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"host", "devmap", "dcstore", "dcverify", "dcgrep"}
+	want := []string{"host", "devmap", "dcstore", "dcverify", "dcgrep", "dcredact"}
 	if ids := idsOf(got); !reflect.DeepEqual(ids, want) {
 		t.Fatalf("ids=%v want %v", ids, want)
 	}
@@ -37,7 +37,7 @@ func TestResolveAnalysisSkipsHost(t *testing.T) {
 	if IncludesHost(got) {
 		t.Fatalf("analysis included host: %v", idsOf(got))
 	}
-	if !reflect.DeepEqual(idsOf(got), []string{"devmap", "dcstore", "dcverify", "dcgrep"}) {
+	if !reflect.DeepEqual(idsOf(got), []string{"devmap", "dcstore", "dcverify", "dcgrep", "dcredact"}) {
 		t.Fatalf("%v", idsOf(got))
 	}
 }
@@ -70,6 +70,8 @@ func TestResolveUnifiedDevcAndDcAliases(t *testing.T) {
 		"dc-verify":   "dcverify",
 		"devc-grep":   "dcgrep",
 		"dc-grep":     "dcgrep",
+		"devc-redact": "dcredact",
+		"dc-redact":   "dcredact",
 	}
 	for alias, wantID := range cases {
 		got, err := Resolve([]string{alias})
