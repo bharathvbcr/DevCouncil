@@ -397,3 +397,71 @@ fn a_healthy_store_is_never_refused() {
     assert!(set_aside(&root).is_empty());
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Probe: every combination of damage confined to the full-text index answers
+/// with JSON that names it, however many of its shadow pages are smashed and
+/// whether or not the virtual-table constructor can still run; damage that is
+/// not provably the index's alone (`payload_nodes`) still refuses.
+#[test]
+fn status_answers_over_every_combination_of_full_text_index_damage() {
+    let confined: &[&[&str]] = &[
+        &["nodes_fts_config"],
+        &["nodes_fts_config", "nodes_fts_data"],
+        &["nodes_fts_config", "nodes_fts_content"],
+        &["nodes_fts_config", "nodes_fts_idx", "nodes_fts_docsize"],
+        &[
+            "nodes_fts_content",
+            "nodes_fts_data",
+            "nodes_fts_idx",
+            "nodes_fts_docsize",
+            "nodes_fts_config",
+        ],
+        &["nodes_fts_content"],
+        &["nodes_fts_idx"],
+        &["nodes_fts_docsize"],
+    ];
+    for tables in confined {
+        let root = fixture("fts-matrix");
+        let db = root.join("devmap.sqlite");
+        assert!(devmap_at(&root, &db, &["build", "."]).ok);
+        for table in *tables {
+            smash_page_of(&db, table);
+        }
+        drop_sidecars(&db);
+        let status = devmap_at(&root, &db, &["status"]);
+        assert!(status.ok, "{tables:?}: status refused: {}", status.stderr);
+        let json = &status.json;
+        assert_eq!(json["search_index_damaged"], true, "{tables:?}: {json}");
+        assert_eq!(json["query_ready"], false, "{tables:?}: {json}");
+        assert_eq!(json["is_fresh"], false, "{tables:?}: {json}");
+        assert_eq!(json["rebuild_required"], false, "{tables:?}: {json}");
+        let reason = json["degraded_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("devmap repair --fts") && reason.contains("devmap build"),
+            "{tables:?}: the reason names the repair and what to do when it fails: {json}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    for tables in [&["payload_nodes"][..], &["nodes_fts_config", "payload_nodes"][..]] {
+        let root = fixture("fts-matrix-outside");
+        let db = root.join("devmap.sqlite");
+        assert!(devmap_at(&root, &db, &["build", "."]).ok);
+        for table in tables {
+            smash_page_of(&db, table);
+        }
+        drop_sidecars(&db);
+        let status = devmap_at(&root, &db, &["status"]);
+        assert!(
+            !status.ok,
+            "{tables:?}: damage outside the index must still refuse, not answer: {}",
+            status.json
+        );
+        assert!(
+            status.stderr.contains("malformed"),
+            "{tables:?}: the refusal names the damage: {}",
+            status.stderr
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
