@@ -676,6 +676,41 @@ fn ownership_serve_unreadable_current_owner_is_not_written() {
     assert_no_new_sidecars_or_lock("B's serve of an unreadable owner", &db);
 }
 
+/// A relative owner row names no worktree: it resolved against the working
+/// directory of whoever asked. `serve` refuses it before the open, and writes
+/// nothing.
+#[test]
+fn ownership_serve_refuses_a_relative_owner_row() {
+    let a = fixture("serve-relative-a");
+    let b = fixture("serve-relative-b");
+    let db = a.join("devmap.sqlite");
+    assert!(devmap_at(&a, &db, &["build", "."]).ok, "A's build");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE pending_state SET repo_root = 'not/absolute' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+    }
+    drop_sidecars(&db);
+    clear_writer_locks(&db);
+    let before = identity(&db);
+    let socket = short_socket("serverelative");
+
+    let served = serve_until_exit_or_guard(&b, &db, &socket);
+    let _ = std::fs::remove_file(&socket);
+    let (ok, stderr) = served.expect("serve ran on over a relative owner row");
+    assert!(
+        !ok && stderr.contains("relative path"),
+        "a relative owner is refused, not resolved against the cwd: ok={ok} {stderr}"
+    );
+    assert_untouched("the store after B's serve", &db, &before);
+    assert_no_new_sidecars_or_lock("B's serve of a relative owner", &db);
+}
+
 /// Positive control: the owner's own `serve` of its schema-27 store is not
 /// refused, and it migrates the store before it binds.
 #[test]

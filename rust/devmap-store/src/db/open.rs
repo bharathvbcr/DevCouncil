@@ -666,10 +666,17 @@ impl Store {
         };
         // Schema 7 is the first that records an owner. Older than that, and a
         // version this kernel cannot migrate, are reported by the open itself.
-        if stamped < 7 || !Self::schema_is_migratable(stamped) {
+        // Stamp 0 is read for whatever owner record the file already holds.
+        if (stamped != 0 && stamped < 7) || !Self::schema_is_migratable(stamped) {
             return Ok(());
         }
-        match Self::stored_repo_root(&conn, stamped) {
+        let owner_schema = match Self::owner_schema_of(&conn, stamped) {
+            Ok(Some(schema)) => schema,
+            Ok(None) => return Ok(()),
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
+            Err(_) => return Ok(()),
+        };
+        match Self::stored_repo_root(&conn, owner_schema) {
             Ok(_) => Ok(()),
             Err(error) => Err(error),
         }

@@ -235,3 +235,107 @@ fn the_ownership_read_before_open_does_not_run_a_view_standing_for_the_owner_tab
         started.elapsed()
     );
 }
+
+/// A store owned by a live worktree, at `path`: built, then bound to `owner`.
+fn store_owned_by(label: &str, owner: &std::path::Path) -> std::path::PathBuf {
+    let dir = scratch(label);
+    let path = dir.join("devmap.sqlite");
+    let store = Store::open(&path).expect("fresh store");
+    store.bind_repo_root(owner).expect("bind owner");
+    drop(store);
+    path
+}
+
+fn set_owner_row(path: &std::path::Path, owner: &str) {
+    let conn = rusqlite::Connection::open(path).expect("plain connection");
+    conn.execute(
+        "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
+        [owner],
+    )
+    .expect("set owner");
+}
+
+/// A relative owner is read against the working directory of whoever asks, so
+/// it named nobody (a vanished directory the store then took over) or the
+/// requester itself. It is refused by the read made before the open, which is
+/// the one `serve`, `build` and `repair` make, and by the opened store.
+#[test]
+fn a_store_whose_owner_row_is_a_relative_path_is_refused() {
+    let owner = scratch("relative-owner-a");
+    let root = scratch("relative-owner-b");
+    for relative in ["somewhere/else", ".", "../x"] {
+        let path = store_owned_by("relative-owner", &owner);
+        set_owner_row(&path, relative);
+        let error = Store::refuse_a_live_foreign_owner_before_open(&path, &root)
+            .expect_err(&format!("relative owner {relative:?} was accepted"));
+        assert!(
+            error.to_string().contains("relative path"),
+            "{relative}: {error}"
+        );
+        let store = Store::open(&path).expect("the open does not judge ownership");
+        let error = store
+            .validate_repo_root(&root)
+            .expect_err("opened store accepted it");
+        assert!(
+            error.to_string().contains("relative path"),
+            "{relative}: {error}"
+        );
+        assert!(
+            store.bind_repo_root(&root).is_err(),
+            "{relative}: bound over it"
+        );
+    }
+}
+
+/// Stamp 0 reads as "no schema yet", but the open heals a stamp-0 file in
+/// place, so one that already records an owner is not provably fresh.
+#[test]
+fn a_stamp_zero_store_does_not_skip_the_ownership_check() {
+    let owner = scratch("stamp-zero-owner");
+    let root = scratch("stamp-zero-root");
+    let path = store_owned_by("stamp-zero", &owner);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("plain connection");
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .expect("checkpoint");
+        conn.execute_batch("PRAGMA user_version = 0;")
+            .expect("reset stamp");
+    }
+    let error = Store::refuse_a_live_foreign_owner_before_open(&path, &root)
+        .expect_err("a stamp-0 store owned by a live worktree was passed");
+    assert!(
+        error
+            .to_string()
+            .contains("one store cannot serve two live worktrees"),
+        "{error}"
+    );
+    // Positive controls: the owner's own request, and a file with no schema at
+    // all, are not refused.
+    Store::refuse_a_live_foreign_owner_before_open(&path, &owner).expect("owner's own");
+    let empty = scratch("stamp-zero-empty").join("devmap.sqlite");
+    drop(rusqlite::Connection::open(&empty).expect("empty file"));
+    Store::refuse_a_live_foreign_owner_before_open(&empty, &root).expect("no schema, no owner");
+}
+
+/// The ownership read and the open are separate connections with no lock
+/// between them. This pins the failure that allows, so the documented window
+/// cannot widen unnoticed: the peek passes an unbound store, another worktree
+/// binds it, and the open still succeeds; only the bind refuses.
+#[test]
+fn the_ownership_peek_is_not_atomic_with_the_open() {
+    let a = scratch("window-a");
+    let b = scratch("window-b");
+    let dir = scratch("window-store");
+    let path = dir.join("devmap.sqlite");
+    drop(Store::open(&path).expect("fresh store"));
+    Store::refuse_a_live_foreign_owner_before_open(&path, &b).expect("unbound at the peek");
+    Store::open(&path)
+        .expect("a")
+        .bind_repo_root(&a)
+        .expect("a binds between B's peek and B's open");
+    let opened = Store::open(&path).expect("B's open does not re-check ownership: the window");
+    assert!(
+        opened.bind_repo_root(&b).is_err(),
+        "the bind is the backstop: B still cannot take A's rows"
+    );
+}
