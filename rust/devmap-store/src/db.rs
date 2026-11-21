@@ -760,8 +760,8 @@ pub struct Store {
     lazy_source_verification: std::sync::atomic::AtomicBool,
     /// Serialises those walks and remembers when the last one started, so a
     /// store walks at most once per [`SOURCE_FRESHNESS_MAX_AGE`] however many
-    /// queries ask. Held across the walk: concurrent queries wait for it (at
-    /// most [`SOURCE_FRESHNESS_WALK_BUDGET`]) and then read what it stamped.
+    /// queries ask. Held across the walk: a concurrent query does not wait for
+    /// it, it answers its own fallback verdict (`try_lock`).
     lazy_walk: Mutex<LazyWalk>,
 }
 

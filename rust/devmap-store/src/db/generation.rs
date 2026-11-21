@@ -1573,9 +1573,9 @@ generation {latest}; run `devmap status` to re-verify",
     /// the cache, for a query whose verdict is aged out or absent.
     ///
     /// At most once per [`crate::db::SOURCE_FRESHNESS_MAX_AGE`] per store: the
-    /// attempt time is kept whether or not the walk finished, and concurrent
-    /// queries queue on the same lock and read what the first one left. The wait
-    /// is bounded by [`crate::db::SOURCE_FRESHNESS_WALK_BUDGET`]: a walk that is
+    /// attempt time is kept whether or not the walk finished, and a
+    /// concurrent query does not wait for the walk, it answers its own fallback
+    /// verdict. The walking query's wait is bounded by [`crate::db::SOURCE_FRESHNESS_WALK_BUDGET`]: a walk that is
     /// not done by then is cancelled and the query answers `fallback` (the
     /// verdict it had) with the reason appended. A walk that could not decide
     /// (no root, an unreadable tree) is not remembered, so it cannot pin a null.
@@ -1583,8 +1583,23 @@ generation {latest}; run `devmap status` to re-verify",
         let Ok(Some(generation)) = self.latest_generation_id() else {
             return fallback;
         };
-        let Ok(mut gate) = self.lazy_walk.lock() else {
-            return fallback;
+        // A walk already running answers the query: waiting for it is what the
+        // budget below exists to prevent, and a phase that ignores the cancel
+        // flag would make that wait unbounded.
+        let mut gate = match self.lazy_walk.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return QuerySourceFreshness {
+                    reason: Some(match fallback.reason {
+                        Some(reason) => {
+                            format!("{reason}; lazy re-verification: a walk is already running")
+                        }
+                        None => "lazy re-verification: a walk is already running".to_string(),
+                    }),
+                    ..fallback
+                };
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return fallback,
         };
         let now = crate::db::memo_now();
         let walked_recently = gate.last_attempt.is_some_and(|started| {
@@ -1735,6 +1750,18 @@ generation {latest}; run `devmap status` to re-verify",
                 None,
             ));
         };
+        let stopped = || {
+            cancel
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                .then(|| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        devmap_extract::BuildCancelled,
+                    ))
+                })
+        };
+        if let Some(error) = stopped() {
+            return Err(error);
+        }
         let hashes = self.latest_file_hashes_shared()?;
         let stored = self.latest_discovery_inventory()?;
         let scan = match cancel {
@@ -1759,6 +1786,9 @@ generation {latest}; run `devmap status` to re-verify",
                 ));
             }
         };
+        if let Some(error) = stopped() {
+            return Err(error);
+        }
         let (delta, sample_paths) =
             scanned.file_delta_with_samples(&hashes, SourceTreeDelta::SAMPLE);
         if !delta.is_unchanged() {
@@ -1781,8 +1811,22 @@ generation {latest}; run `devmap status` to re-verify",
         // could not read, so a comparison against discovery alone would call
         // every such generation stale, and miss a manifest that broke or was
         // repaired while no source moved.
-        let manifests = match devmap_extract::collect_project_manifests(Path::new(&root)) {
+        if let Some(error) = stopped() {
+            return Err(error);
+        }
+        let manifests = match cancel {
+            Some(flag) => {
+                devmap_extract::collect_project_manifests_cancellable(Path::new(&root), flag)
+            }
+            None => devmap_extract::collect_project_manifests(Path::new(&root)),
+        };
+        let manifests = match manifests {
             Ok(manifests) => manifests,
+            Err(error) if error.is::<devmap_extract::BuildCancelled>() => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    devmap_extract::BuildCancelled,
+                )));
+            }
             Err(error) => {
                 return Ok((
                     None,
@@ -3076,8 +3120,18 @@ mod lazy_source_verification {
                 .collect()
         });
         assert_eq!(walks(&f.store), 1, "{verdicts:?}");
+        // A query that arrives while the walk runs answers its fallback (null,
+        // naming the running walk) instead of waiting; the rest read the stamp.
         assert!(
-            verdicts.iter().all(|v| v.fresh == Some(true)),
+            verdicts.iter().any(|v| v.fresh == Some(true)),
+            "{verdicts:?}"
+        );
+        assert!(
+            verdicts.iter().all(|v| v.fresh == Some(true)
+                || (v.fresh.is_none()
+                    && v.reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("already running")))),
             "{verdicts:?}"
         );
     }
@@ -3125,7 +3179,11 @@ mod lazy_source_verification {
     // ---- adversarial probes (atk/wave-a-fresh-seed) ----
 
     /// Query-time state a probe needs: lazy walk gate with a probe and budget.
-    fn arm(store: &Store, budget: std::time::Duration, probe: impl Fn(&AtomicBool) + Send + Sync + 'static) {
+    fn arm(
+        store: &Store,
+        budget: std::time::Duration,
+        probe: impl Fn(&AtomicBool) + Send + Sync + 'static,
+    ) {
         let mut gate = store.lazy_walk.lock().expect("gate");
         gate.budget = Some(budget);
         gate.probe = Some(Arc::new(probe));
@@ -3190,6 +3248,71 @@ mod lazy_source_verification {
         assert!(verdict.reason.expect("reason").contains("cancelled"));
     }
 
+    // ---- the walk's budget bounds a concurrent query's wait ----
+
+    #[test]
+    fn a_query_beside_a_running_walk_answers_the_fallback_without_waiting_for_it() {
+        let f = indexed("beside");
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            // A phase that ignores cancellation: it ends when released, or
+            // after 1.5 s so a failing run still ends.
+            arm(
+                &f.store,
+                std::time::Duration::from_millis(100),
+                move |_cancel| {
+                    started.store(true, Ordering::SeqCst);
+                    let limit = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+                    while !release.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                },
+            );
+        }
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| f.store.query_source_freshness());
+            while !started.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let asked = std::time::Instant::now();
+            let second = f.store.query_source_freshness();
+            let waited = asked.elapsed();
+            release.store(true, Ordering::SeqCst);
+            first.join().expect("first query");
+            assert!(
+                waited < std::time::Duration::from_millis(1000),
+                "the second query waited {waited:?} behind the walk"
+            );
+            assert_ne!(second.fresh, Some(true), "{second:?}");
+            let reason = second.reason.expect("reason");
+            assert!(reason.contains("already running"), "{reason}");
+        });
+    }
+
+    #[test]
+    fn a_cancelled_walk_stops_before_reading_the_stored_hashes() {
+        let f = indexed("phase-cancel");
+        let generation = f.store.latest_generation_id().expect("read").expect("id");
+        // A read of the stored hashes would fail on the dropped view; a walk
+        // that checks its flag first never reaches it.
+        {
+            let conn = lock_conn(&f.store.conn).expect("connection");
+            conn.execute("DROP VIEW generation_files", [])
+                .expect("drop");
+        }
+        let cancel = AtomicBool::new(true);
+        let error = f
+            .store
+            .source_snapshot_mismatch(generation, Some(&cancel))
+            .expect_err("a cancelled walk has no verdict");
+        assert!(
+            error.to_string().contains("cancel"),
+            "the walk read the store after it was cancelled: {error}"
+        );
+    }
+
     #[test]
     fn a_deleted_source_file_is_never_fresh_at_the_lazy_walk() {
         let f = indexed("deleted");
@@ -3214,13 +3337,26 @@ mod lazy_source_verification {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("query")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("query"))
+                .collect()
         });
         assert_eq!(walks(&a.store), 1);
         assert_eq!(walks(&b.store), 1);
-        assert!(verdicts.iter().all(|v| v.fresh == Some(true)), "{verdicts:?}");
+        assert!(
+            verdicts.iter().all(|v| v.fresh == Some(true)
+                || (v.fresh.is_none()
+                    && v.reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("already running")))),
+            "{verdicts:?}"
+        );
+        assert!(
+            verdicts.iter().any(|v| v.fresh == Some(true)),
+            "{verdicts:?}"
+        );
     }
-
 
     #[test]
     fn a_watcher_that_dies_mid_session_lets_the_verdict_age_out_and_re_walk() {
