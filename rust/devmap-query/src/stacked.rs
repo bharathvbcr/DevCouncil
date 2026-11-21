@@ -47,8 +47,9 @@ use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
     clone_or_copy_file, copy_donor_csr_checked, csr_generation_of_open_file, discard_staged,
-    prepare_immutable_snapshot, promote_immutable_base_to_store, read_file_at, seed_artifact,
-    seed_directory_cow, set_file_readonly, set_file_writable, stage_seed_healing_wal, DonorCsr,
+    prepare_immutable_snapshot, promote_immutable_base_to_store, read_file_at,
+    remove_file_if_present, seed_artifact, seed_directory_cow, set_file_readonly,
+    set_file_writable, sidecar, stage_seed_healing_wal, DonorCsr, STORE_SIDECARS,
 };
 use devmap_store::{
     CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
@@ -2307,6 +2308,13 @@ impl StackedStore {
         }
         let dst_csr = csr_path_for_store(&target_db);
         let placed = (|| -> Result<()> {
+            // The placement is a rename, so `Store::open`'s creation-time sweep
+            // never runs: a sidecar an earlier store left at this path would sit
+            // beside the placed one. Swept as `place_staged` sweeps; a symlink is
+            // unlinked, not followed.
+            for suffix in STORE_SIDECARS {
+                remove_file_if_present(&sidecar(&target_db, suffix))?;
+            }
             promote_immutable_base_to_store(&self.base_file, &target_db, &self.worktree_root)?;
             if let Some(csr_file) = &self.csr_file {
                 clone_or_copy_file(csr_file, &dst_csr)?;
@@ -6136,6 +6144,46 @@ mod tests {
         let head = s.latest_generation_head_sha().unwrap();
         let honest_head = stacked.base_store().latest_generation_head_sha().unwrap();
         assert_eq!(head, honest_head, "materialized store holds the impostor's graph (head {head:?}) not the opened base's ({honest_head:?})");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A lease with no CSR places a store by rename, which never runs the
+    /// creation-time sidecar sweep: a `.csr` or `.artifacts.json` an earlier
+    /// store left at the lane's path would be served beside the placed one.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn materializing_a_lease_without_a_csr_sweeps_the_stale_sidecars_at_the_lane_path() {
+        let root = temp_repo_dir("materialize-sweeps-sidecars");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let _ = fs::remove_file(csr_path_for_store(store_path(&anchor)));
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        assert!(
+            lease.csr.is_none(),
+            "fixture: a donor without a CSR sidecar"
+        );
+        let target = store_path(lane.canonicalize().unwrap());
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let stale_csr = csr_path_for_store(&target);
+        fs::write(&stale_csr, b"a CSR an earlier store left").unwrap();
+        // A symlinked sidecar is unlinked, never followed.
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"not the lane's").unwrap();
+        let stale_artifacts = devmap_store::seed::sidecar(&target, ".artifacts.json");
+        std::os::unix::fs::symlink(&outside, &stale_artifacts).unwrap();
+        let stacked = StackedStore::open(&lane).unwrap();
+        let placed = stacked.materialize_seeded_store().unwrap();
+        assert_eq!(placed, target);
+        assert!(
+            fs::symlink_metadata(&stale_csr).is_err(),
+            "the stale CSR survived beside the placed store"
+        );
+        assert!(
+            fs::symlink_metadata(&stale_artifacts).is_err(),
+            "the stale artifacts stamp survived beside the placed store"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"not the lane's");
         let _ = remove_readonly_tree(&root);
     }
 
