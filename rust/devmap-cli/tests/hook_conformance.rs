@@ -358,6 +358,117 @@ fn post_tool_use_returns_under_200ms_while_detached() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A shell payload is held to the same budget as an edit, and to the same
+/// silence: it names no edited file, so it carries no blast note either.
+#[test]
+fn a_shell_post_tool_use_returns_under_200ms_and_says_nothing() {
+    let root = scratch("latency-shell");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    let build = Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    // Warm the loader and the page cache, as the sibling edit-path test does by
+    // accident, so the timed run measures the hook.
+    let _ = run_hook("post-tool-use", b"{}", &[]);
+    std::fs::write(root.join("a.py"), "def a():\n    return 2\n").unwrap();
+    for command in ["git merge feature", "git status", "printf x > a.py"] {
+        let payload = json!({
+            "cwd": root.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        });
+        let run = run_hook(
+            "post-tool-use",
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            &[],
+        );
+        assert_eq!(run.code, Some(0), "{command}: {}", run.stderr);
+        assert!(
+            run.elapsed < Duration::from_millis(200),
+            "{command}: expected <200ms, got {:?}",
+            run.elapsed
+        );
+        assert!(
+            run.stdout.trim().is_empty(),
+            "{command}: a shell payload has no blast to report: {}",
+            run.stdout
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// End to end, with the real binary: a file written by the shell reaches the
+/// index through a Bash PostToolUse alone, with no Edit payload and no
+/// SessionStart, and the generation moves on.
+#[test]
+fn a_shell_write_reaches_the_index_through_a_bash_post_tool_use_alone() {
+    let root = scratch("shell-e2e");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    let devmap = |args: &[&str]| {
+        Command::new(DEVMAP)
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap()
+    };
+    assert!(devmap(&["--json", "build", "."]).status.success());
+    let status = || -> serde_json::Value {
+        let out = devmap(&["--json", "status"]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        serde_json::from_str(text.trim())
+            .ok()
+            .or_else(|| {
+                text.lines()
+                    .find_map(|line| serde_json::from_str(line).ok())
+            })
+            .unwrap_or_else(|| panic!("status is not JSON: {text}"))
+    };
+    let before = status();
+    assert_eq!(before["is_fresh"], true, "{before}");
+    let generation = before["generation_id"].as_u64().unwrap();
+
+    // The shell writes a new file; nothing tells the index.
+    std::fs::write(root.join("b.py"), "def b():\n    return 2\n").unwrap();
+    assert_eq!(status()["is_fresh"], false, "the write must read as drift");
+
+    let payload = json!({
+        "cwd": root.to_string_lossy(),
+        "tool_name": "Bash",
+        "tool_input": {"command": "printf 'def b():\\n    return 2\\n' > b.py"},
+    });
+    let run = run_hook(
+        "post-tool-use",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let after = loop {
+        let now = status();
+        if now["is_fresh"] == true || Instant::now() > deadline {
+            break now;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        after["is_fresh"], true,
+        "the index never caught up: {after}"
+    );
+    assert!(
+        after["generation_id"].as_u64().unwrap() > generation,
+        "the generation did not advance: {after}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The hook's detached build must index the repository it names, from anywhere.
 ///
 /// `detach_build` spawns `devmap --root <project> build` from whatever

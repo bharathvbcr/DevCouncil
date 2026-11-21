@@ -128,6 +128,27 @@ const READ_COMMANDS: &[&str] = &[
 /// Shell tool names whose payload carries a command to sniff.
 const SHELL_TOOLS: &[&str] = &["bash", "shell", "run_terminal_cmd", "terminal"];
 
+/// Longest shell command [`command_cannot_change_tree`] will classify. A command
+/// it cannot read to the end is a possible write, so a bound here can only cost
+/// a build, never an index that silently stays behind.
+const MAX_COMMAND_CLASSIFY_BYTES: usize = 4096;
+
+/// At most one shell-triggered build start per root per this window.
+///
+/// Why 2 s: long enough that a burst of shell calls (parallel tool calls, a
+/// script of quick commands) collapses to one start even when each no-change
+/// build finishes before the next call, so the coalescing lock alone would not
+/// hold them; short enough that the next call of an agent, whose model
+/// round-trip is seconds, always gets its own. A call suppressed inside the
+/// window is not retried: a write landing in the same window as the previous
+/// call's build start waits for the next trigger (an edit, a later shell call,
+/// or SessionStart's catch-up).
+const SHELL_BUILD_WINDOW: Duration = Duration::from_secs(2);
+
+/// File whose mtime is the last shell-triggered build start, beside the
+/// coalescing locks in `<state>/codeintel/`.
+const SHELL_BUILD_STAMP: &str = "hook-shell-build.stamp";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     SessionStart,
@@ -320,6 +341,20 @@ fn run_hook_inner(
         });
     }
 
+    // A shell call is a write only if its command may be one. `git status` and
+    // `rg` change nothing, so they cost a string scan and no root selection;
+    // a command that cannot be read counts as a possible write.
+    let shell_post = event == HookEvent::PostToolUse
+        && payload_tool(&payload).is_some_and(|tool| is_shell_tool(&tool));
+    if shell_post && payload_command(&payload).is_some_and(command_cannot_change_tree) {
+        return Ok(HookOutcome {
+            exit_code: 0,
+            stdout: None,
+            stderr_line: None,
+            roots: Vec::new(),
+        });
+    }
+
     let selection = select_roots(&payload, pinned_root)?;
     // The tree the tool touched wins over the tree the session sits in. A
     // worktree edit with the session's cwd (or a workspace root) in the indexed
@@ -331,10 +366,25 @@ fn run_hook_inner(
         if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload)
             .filter(|(wt, _)| !selection.roots.iter().any(|root| root.starts_with(wt)))
         {
+            // Inside a shell call's rate window the previous start already
+            // covers this root; say nothing.
+            if shell_post && !shell_build_window_is_open(&wt) {
+                return Ok(HookOutcome {
+                    exit_code: 0,
+                    stdout: None,
+                    stderr_line: None,
+                    roots: vec![wt],
+                });
+            }
             // A refused or failed spawn is exit 1 with its reason, as for every
             // other PostToolUse detach, never silence.
             let (exit_code, stderr_line) = match detach_seeded_build(executable, &wt, &main) {
-                Ok(()) => (0, None),
+                Ok(()) => {
+                    if shell_post {
+                        claim_shell_build_window(&wt);
+                    }
+                    (0, None)
+                }
                 Err(error) => (1, Some(format!("devmap hook post-tool-use: {error}"))),
             };
             return Ok(HookOutcome {
@@ -414,7 +464,16 @@ fn run_hook_inner(
                 executable,
                 &selection.roots,
                 DETACH_BUDGET,
-                detach_post_tool_root,
+                |executable, root| {
+                    if shell_post && !shell_build_window_is_open(root) {
+                        return Ok(());
+                    }
+                    detach_post_tool_root(executable, root)?;
+                    if shell_post {
+                        claim_shell_build_window(root);
+                    }
+                    Ok(())
+                },
             ) {
                 Ok(note) => note,
                 Err(error) => {
@@ -426,9 +485,12 @@ fn run_hook_inner(
             // already on disk. Never waits for the rebuild. Budget miss says
             // so and still exits 0.
             let leftover = POST_TOOL_BLAST_BUDGET.saturating_sub(started.elapsed());
+            // A shell payload names no edited file or range, so there is nothing
+            // to walk from and nothing to say.
             let blast = selection
                 .roots
                 .first()
+                .filter(|_| !shell_post)
                 .and_then(|root| compose_write_blast(root, &payload, leftover));
             // The exit code stays what a refused detach always gave: 1.
             let exit_code = if detach_error.is_some() { 1 } else { 0 };
@@ -1952,23 +2014,33 @@ fn repo_relative_path(root: &Path, absolute: &Path) -> Option<String> {
 /// the `git status` that opens most sessions — is not a moment where the index
 /// has anything to add.
 fn is_navigation_payload(payload: &Value) -> bool {
-    let Some(tool) = payload_str(payload, &["tool_name", "toolName", "tool"]) else {
+    let Some(tool) = payload_tool(payload) else {
         return false;
     };
-    let tool = tool.trim().to_ascii_lowercase();
     if NAVIGATION_TOOLS.contains(&tool.as_str()) {
         return true;
     }
-    if !SHELL_TOOLS.contains(&tool.as_str()) {
-        return false;
-    }
+    is_shell_tool(&tool) && payload_command(payload).is_some_and(command_is_search)
+}
+
+/// The payload's tool name, trimmed and lowercased.
+fn payload_tool(payload: &Value) -> Option<String> {
+    payload_str(payload, &["tool_name", "toolName", "tool"])
+        .map(|tool| tool.trim().to_ascii_lowercase())
+}
+
+fn is_shell_tool(tool: &str) -> bool {
+    SHELL_TOOLS.contains(&tool)
+}
+
+/// The shell command a payload carries, under any host's spelling of it.
+fn payload_command(payload: &Value) -> Option<&str> {
     payload
         .pointer("/tool_input/command")
         .or_else(|| payload.pointer("/toolInput/command"))
         .or_else(|| payload.pointer("/tool_input/cmd"))
         .or_else(|| payload.pointer("/command"))
         .and_then(Value::as_str)
-        .is_some_and(command_is_search)
 }
 
 /// First string present under any of `keys`, at the payload's top level.
@@ -2038,6 +2110,356 @@ fn segment_reads_source(segment: &str) -> bool {
                 && devmap_extract::languages::find_spec_by_extension(ext).is_some()
         })
     })
+}
+
+/// Whether a shell command line provably cannot change the working tree.
+///
+/// The question is the opposite of [`command_is_search`], and the two must not
+/// share an answer: that one asks whether the agent is *looking* at source, and
+/// calls `sed -i x.rs`, `find . -delete` and `cat x > y.rs` navigation because
+/// they name a search verb or a source file. Here every one of them is a write.
+///
+/// Fails toward "may write", which costs a no-change build, never toward silence,
+/// which costs an index that stays behind. So a command is read-only only when
+/// the whole line is read to the end and every segment is a verb on the
+/// allowlist: an unknown verb, an unterminated quote, a command substitution, a
+/// subshell, a redirect to anything but `/dev/null`, or a line past
+/// [`MAX_COMMAND_CLASSIFY_BYTES`] is a possible write.
+fn command_cannot_change_tree(command: &str) -> bool {
+    if command.trim().is_empty() || command.len() > MAX_COMMAND_CLASSIFY_BYTES {
+        return false;
+    }
+    match split_shell_segments(command) {
+        Some(segments) => {
+            !segments.is_empty()
+                && segments
+                    .iter()
+                    .all(|words| segment_cannot_change_tree(words))
+        }
+        None => false,
+    }
+}
+
+/// Words of each pipeline/list segment, quote-aware, or `None` when the line
+/// holds something this reader will not interpret (see
+/// [`command_cannot_change_tree`]). A `|` or `;` inside quotes is part of a
+/// word, so `rg 'a|b' src` is one segment.
+fn split_shell_segments(command: &str) -> Option<Vec<Vec<String>>> {
+    let chars: Vec<char> = command.chars().collect();
+    let at = |index: usize| chars.get(index).copied();
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut i = 0;
+
+    fn end_word(words: &mut Vec<String>, word: &mut String, in_word: &mut bool) {
+        if *in_word {
+            words.push(std::mem::take(word));
+            *in_word = false;
+        }
+    }
+    fn end_segment(
+        segments: &mut Vec<Vec<String>>,
+        words: &mut Vec<String>,
+        word: &mut String,
+        in_word: &mut bool,
+    ) {
+        end_word(words, word, in_word);
+        if !words.is_empty() {
+            segments.push(std::mem::take(words));
+        }
+    }
+
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                in_word = true;
+                i += 1;
+                loop {
+                    match at(i)? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '"' => {
+                in_word = true;
+                i += 1;
+                loop {
+                    match at(i)? {
+                        '"' => break,
+                        '\\' => {
+                            word.push(at(i + 1)?);
+                            i += 1;
+                        }
+                        '`' => return None,
+                        '$' if at(i + 1) == Some('(') => return None,
+                        c => word.push(c),
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '\\' => {
+                in_word = true;
+                word.push(at(i + 1)?);
+                i += 2;
+            }
+            '`' | '(' | ')' => return None,
+            '$' if at(i + 1) == Some('(') => return None,
+            '>' => {
+                // A digit just before the operator is the file descriptor
+                // (`2>`), not an argument.
+                if in_word && word.chars().all(|c| c.is_ascii_digit()) {
+                    word.clear();
+                    in_word = false;
+                } else {
+                    end_word(&mut words, &mut word, &mut in_word);
+                }
+                let mut j = i + 1;
+                if at(j) == Some('>') {
+                    j += 1;
+                }
+                if at(j) == Some('&') {
+                    // `2>&1` and `>&-` duplicate or close a descriptor; `>&file`
+                    // writes one.
+                    j += 1;
+                    if !at(j).is_some_and(|c| c.is_ascii_digit() || c == '-') {
+                        return None;
+                    }
+                    while at(j).is_some_and(|c| c.is_ascii_digit() || c == '-') {
+                        j += 1;
+                    }
+                } else {
+                    while at(j).is_some_and(|c| c == ' ' || c == '\t') {
+                        j += 1;
+                    }
+                    let start = j;
+                    while at(j).is_some_and(|c| !c.is_whitespace() && !"|;&<>()".contains(c)) {
+                        j += 1;
+                    }
+                    let target: String = chars[start..j].iter().collect();
+                    if target != "/dev/null" {
+                        return None;
+                    }
+                }
+                i = j;
+            }
+            '&' if at(i + 1) == Some('>') => i += 1,
+            '<' => {
+                end_word(&mut words, &mut word, &mut in_word);
+                i += 1;
+            }
+            '|' | ';' | '&' | '\n' => {
+                end_segment(&mut segments, &mut words, &mut word, &mut in_word);
+                i += 1;
+            }
+            c if c.is_whitespace() => {
+                end_word(&mut words, &mut word, &mut in_word);
+                i += 1;
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+                i += 1;
+            }
+        }
+    }
+    end_segment(&mut segments, &mut words, &mut word, &mut in_word);
+    Some(segments)
+}
+
+/// Verbs that read, print or change directory and nothing else. Anything that
+/// can write through an argument (`sort -o`, `tree -o`, `awk`, `tee`, `xargs`)
+/// or run another command (`env`, `time`, `sudo`) is absent on purpose.
+const READ_ONLY_VERBS: &[&str] = &[
+    "ls", "cat", "head", "tail", "nl", "wc", "less", "more", "bat", "grep", "egrep", "fgrep",
+    "ugrep", "ag", "ack", "pwd", "echo", "printf", "which", "whoami", "date", "uname", "stat",
+    "file", "du", "df", "id", "hostname", "basename", "dirname", "realpath", "readlink", "test",
+    "[", "true", "false", "sleep", "diff", "cmp", "cd", "pushd", "popd", "jq",
+];
+
+/// Git subcommands that never change the working tree. `branch`, `tag` and
+/// `fetch` move refs or objects, not files.
+const READ_ONLY_GIT: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "rev-parse",
+    "rev-list",
+    "ls-files",
+    "ls-tree",
+    "cat-file",
+    "blame",
+    "describe",
+    "shortlog",
+    "grep",
+    "branch",
+    "tag",
+    "merge-base",
+    "name-rev",
+    "for-each-ref",
+    "show-ref",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "whatchanged",
+    "count-objects",
+    "fetch",
+];
+
+fn segment_cannot_change_tree(words: &[String]) -> bool {
+    let is_assignment = |word: &String| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let mut rest = words.iter().skip_while(|word| is_assignment(word));
+    let Some(verb) = rest.next() else {
+        // Only `VAR=value`: sets a variable, runs nothing.
+        return true;
+    };
+    let verb = verb.rsplit('/').next().unwrap_or(verb);
+    let args: Vec<&str> = rest.map(String::as_str).collect();
+    match verb {
+        "git" => git_cannot_change_tree(&args),
+        "sed" => sed_cannot_change_tree(&args),
+        // `--pre` runs a command over every file.
+        "rg" => !args.iter().any(|arg| arg.starts_with("--pre")),
+        "find" => !args.iter().any(|arg| {
+            matches!(
+                *arg,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        }),
+        verb => READ_ONLY_VERBS.contains(&verb),
+    }
+}
+
+fn git_cannot_change_tree(args: &[&str]) -> bool {
+    let mut iter = args.iter().copied();
+    let mut sub = None;
+    while let Some(arg) = iter.next() {
+        match arg {
+            // Options that take the next word as their value.
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => {
+                iter.next();
+            }
+            flag if flag.starts_with('-') => {}
+            name => {
+                sub = Some(name);
+                break;
+            }
+        }
+    }
+    let Some(sub) = sub else {
+        return false;
+    };
+    let rest: Vec<&str> = iter.collect();
+    // `--output` writes the result to a path.
+    if rest
+        .iter()
+        .any(|arg| *arg == "--output" || arg.starts_with("--output="))
+    {
+        return false;
+    }
+    let first = rest.iter().copied().find(|arg| !arg.starts_with('-'));
+    match sub {
+        "stash" => matches!(first, Some("list" | "show")),
+        "worktree" => first == Some("list"),
+        "config" => rest
+            .iter()
+            .any(|arg| matches!(*arg, "--get" | "--get-all" | "--list" | "-l")),
+        sub => READ_ONLY_GIT.contains(&sub),
+    }
+}
+
+/// `sed -n 'N,Mp'` prints lines. Anything else — in-place edits, a script file,
+/// `-e`, a script with commands beyond addresses and `p` — may write (`w`, `e`).
+fn sed_cannot_change_tree(args: &[&str]) -> bool {
+    let mut quiet = false;
+    let mut script = None;
+    for arg in args {
+        if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "quiet" | "silent" => quiet = true,
+                _ => return false,
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
+            if cluster
+                .chars()
+                .any(|c| !matches!(c, 'n' | 'E' | 'r' | 's' | 'u' | 'z'))
+            {
+                return false;
+            }
+            quiet |= cluster.contains('n');
+        } else if script.is_none() {
+            script = Some(*arg);
+        }
+    }
+    quiet
+        && script.is_some_and(|script| {
+            !script.is_empty()
+                && script
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || " ,;$p+~!".contains(c))
+        })
+}
+
+/// Whether a shell-triggered build may start for `root` now: no stamp, a stamp
+/// older than [`SHELL_BUILD_WINDOW`], or one that cannot be read.
+///
+/// Read-only. Fails open: a marker directory the hook may not use (a link, a
+/// read-only tree), a stamp that cannot be read, or a clock that moved backwards
+/// all allow the build, because an unreadable limiter must cost a no-change
+/// build, not a stale index. The coalescing lock still bounds the concurrent
+/// case in every one of them.
+fn shell_build_window_is_open(root: &Path) -> bool {
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    let Ok(dir) = PinnedDir::open(&state_dir(root).join("codeintel"), false) else {
+        return true;
+    };
+    let Ok(stamp) = dir.open_file(OsStr::new(SHELL_BUILD_STAMP), Access::Read, Creation::Never)
+    else {
+        return true;
+    };
+    let Ok(modified) = stamp.metadata().and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    !modified.elapsed().is_ok_and(|age| age < SHELL_BUILD_WINDOW)
+}
+
+/// Start the rate window for `root`: the stamp's mtime becomes now. Called only
+/// after a detach that succeeded, so a refused or failed spawn leaves the next
+/// shell call free to try again instead of being silenced for the window.
+fn claim_shell_build_window(root: &Path) {
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    let Ok(dir) = PinnedDir::open(&state_dir(root).join("codeintel"), true) else {
+        return;
+    };
+    if let Ok(stamp) = dir.open_file(
+        OsStr::new(SHELL_BUILD_STAMP),
+        Access::Append,
+        Creation::IfMissing,
+    ) {
+        // A stamp that cannot be touched only costs the limiter, never the build.
+        let _ = stamp.set_modified(SystemTime::now());
+    }
 }
 
 /// Where a repository keeps hook bookkeeping.
@@ -4787,6 +5209,407 @@ mod tests {
         fs::write(&lane.release, b"").unwrap();
         assert!(eventually(|| !lane.lock().exists()), "the lock outlived its build");
         assert_eq!(lane.builds_started(), 1, "the lock did not coalesce the seeds");
+    }
+
+    // ---- Shell (Bash) payloads: git operations and in-place edits -----------------
+
+    #[cfg(unix)]
+    fn shell_payload(cwd: &Path, command: &str) -> Vec<u8> {
+        json!({
+            "session_id": "shell-lane",
+            "hook_event_name": "PostToolUse",
+            "cwd": cwd,
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Commands that change, or may change, the working tree. Each must reach
+    /// the index: a git operation or an in-place edit made through the shell is
+    /// invisible to the Edit-tool matcher.
+    #[cfg(unix)]
+    const SHELL_WRITERS: &[&str] = &[
+        "git merge feature",
+        "git rebase main",
+        "git checkout other",
+        "git cherry-pick abc123",
+        "git stash",
+        "git stash pop",
+        "git reset --hard HEAD~1",
+        "git apply fix.patch",
+        "git -C /somewhere/else checkout y",
+        "sed -i 's/a/b/' a.rs",
+        "sed -n '1,5p' a.rs | sed -i 's/a/b/' b.rs",
+        "printf 'x' > a.py",
+        "echo y >> a.py",
+        "cat a.rs | tee b.rs",
+        "cargo fmt",
+        "rustfmt a.rs",
+        "gofmt -w .",
+        "./scripts/codegen.sh",
+        "find . -name '*.orig' -delete",
+        "ls && rm a.rs",
+        "rg foo | xargs sed -i s/a/b/",
+    ];
+
+    /// Commands that cannot change the tree. None may start a build.
+    #[cfg(unix)]
+    const SHELL_READERS: &[&str] = &[
+        "rg TODO src/",
+        "grep -rn foo .",
+        "cat a.rs",
+        "ls -la",
+        "head -20 a.rs",
+        "sed -n '1,5p' a.rs",
+        "git status --short",
+        "git log --oneline -5",
+        "git diff HEAD",
+        "git show HEAD:a.rs",
+        "git rev-parse --show-toplevel",
+        "git branch --list",
+        "find . -name '*.rs'",
+        "rg 'a|b' src 2>&1 | head -5",
+        "ls > /dev/null 2>&1",
+        "cd src && git status",
+        "git -C /somewhere/else log -1",
+        "wc -l a.rs",
+        "pwd",
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_command_that_may_write_starts_one_build() {
+        for command in SHELL_WRITERS {
+            let lane = Lane::new("shell-writer", true);
+            let outcome = run_hook(
+                HookEvent::PostToolUse,
+                &shell_payload(&lane.main, command),
+                &lane.exe,
+                None,
+            );
+            assert_eq!(outcome.exit_code, 0, "{command}: {:?}", outcome.stderr_line);
+            assert!(
+                outcome.stdout.is_none(),
+                "{command}: a shell payload names no edited file, so there is no blast to report: {:?}",
+                outcome.stdout
+            );
+            assert!(
+                lane.main_lock().is_dir(),
+                "{command}: no build was scheduled"
+            );
+            let expected = format!("--root\n{}\nbuild\n", lane.main.display());
+            assert!(
+                eventually(|| fs::read_to_string(&lane.args).is_ok_and(|got| got == expected)),
+                "{command}: wrong build: {:?}",
+                fs::read_to_string(&lane.args)
+            );
+            assert_eq!(lane.builds_started(), 1, "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_command_that_cannot_write_starts_nothing() {
+        assert!(SHELL_READERS.len() >= 10);
+        for command in SHELL_READERS {
+            let lane = Lane::new("shell-reader", true);
+            let outcome = run_hook(
+                HookEvent::PostToolUse,
+                &shell_payload(&lane.main, command),
+                &lane.exe,
+                None,
+            );
+            assert_eq!(outcome.exit_code, 0, "{command}: {:?}", outcome.stderr_line);
+            assert!(outcome.stdout.is_none(), "{command}: {:?}", outcome.stdout);
+            // The lock is taken before the spawn and held until the stand-in is
+            // released, so its absence proves no build was scheduled.
+            assert!(
+                !lane.main_lock().exists(),
+                "{command}: a read-only command started a build"
+            );
+            assert_eq!(lane.builds_started(), 0, "{command}");
+        }
+    }
+
+    /// A command that cannot be read is treated as a possible write: rebuilding
+    /// too often costs a no-change build, staying silent costs a stale index.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_command_that_cannot_be_classified_is_a_possible_write() {
+        let long = format!("rg {}", "x".repeat(10_000));
+        let cases: Vec<(&str, Value)> = vec![
+            ("no command", json!({"tool_name": "Bash", "tool_input": {}})),
+            (
+                "null command",
+                json!({"tool_name": "Bash", "tool_input": {"command": null}}),
+            ),
+            (
+                "numeric command",
+                json!({"tool_name": "Bash", "tool_input": {"command": 7}}),
+            ),
+            (
+                "empty command",
+                json!({"tool_name": "Bash", "tool_input": {"command": ""}}),
+            ),
+            (
+                "blank command",
+                json!({"tool_name": "Bash", "tool_input": {"command": "  \n "}}),
+            ),
+            (
+                "unknown verb",
+                json!({"tool_name": "Bash", "tool_input": {"command": "frobnicate --all"}}),
+            ),
+            (
+                "unterminated quote",
+                json!({"tool_name": "Bash", "tool_input": {"command": "rg \"foo"}}),
+            ),
+            (
+                "command substitution",
+                json!({"tool_name": "Bash", "tool_input": {"command": "cat $(rm a.rs)"}}),
+            ),
+            (
+                "backticks",
+                json!({"tool_name": "Bash", "tool_input": {"command": "cat `rm a.rs`"}}),
+            ),
+            (
+                "substitution in quotes",
+                json!({"tool_name": "Bash", "tool_input": {"command": "echo \"$(rm a.rs)\""}}),
+            ),
+            (
+                "redirect to a file",
+                json!({"tool_name": "Bash", "tool_input": {"command": "cat a.rs > b.rs"}}),
+            ),
+            (
+                "fd dup into a file",
+                json!({"tool_name": "Bash", "tool_input": {"command": "cat a.rs >& b.rs"}}),
+            ),
+            (
+                "past the read bound",
+                json!({"tool_name": "Bash", "tool_input": {"command": long}}),
+            ),
+        ];
+        for (case, mut payload) in cases {
+            let lane = Lane::new("shell-unknown", true);
+            payload["cwd"] = json!(lane.main);
+            let outcome = run_hook(
+                HookEvent::PostToolUse,
+                payload.to_string().as_bytes(),
+                &lane.exe,
+                None,
+            );
+            assert_eq!(outcome.exit_code, 0, "{case}: {:?}", outcome.stderr_line);
+            assert!(lane.main_lock().is_dir(), "{case}: no build was scheduled");
+            assert!(
+                eventually(|| lane.builds_started() == 1),
+                "{case}: the build never started"
+            );
+        }
+    }
+
+    /// Twenty shell payloads in a burst start at most one build per rate
+    /// window. The stand-in is pre-released, so each build finishes before the
+    /// next payload and the coalescing lock alone cannot be what held them back.
+    #[cfg(unix)]
+    #[test]
+    fn a_burst_of_shell_payloads_starts_at_most_one_build_per_window() {
+        let lane = Lane::new("shell-burst", true);
+        fs::write(&lane.release, b"").unwrap();
+        let begun = Instant::now();
+        for _ in 0..20 {
+            let outcome = run_hook(
+                HookEvent::PostToolUse,
+                &shell_payload(&lane.main, "git merge feature"),
+                &lane.exe,
+                None,
+            );
+            assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+            assert!(eventually(|| !lane.main_lock().exists()));
+        }
+        let elapsed = begun.elapsed();
+        thread::sleep(Duration::from_millis(300));
+        let windows = 1 + (elapsed.as_secs_f64() / 2.0) as usize;
+        assert!(lane.builds_started() >= 1, "the first payload must build");
+        assert!(
+            lane.builds_started() <= windows,
+            "{} builds in {elapsed:?}: the window did not hold",
+            lane.builds_started()
+        );
+    }
+
+    /// A shell command in an unindexed linked worktree of an indexed main
+    /// seeds that worktree, as an Edit does; a read-only one creates nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_command_in_an_unindexed_worktree_seeds_it_only_when_it_may_write() {
+        let lane = Lane::new("shell-seed", true);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &shell_payload(&lane.lane, "git merge feature"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(lane.lock().is_dir(), "the worktree was not seeded");
+        assert!(
+            !lane.main_lock().exists(),
+            "main was rebuilt for a worktree command"
+        );
+        let expected = expected_seed_args(&lane.lane, &lane.main);
+        assert!(
+            eventually(|| fs::read_to_string(&lane.args).is_ok_and(|got| got == expected)),
+            "{:?}",
+            fs::read_to_string(&lane.args)
+        );
+
+        let reader = Lane::new("shell-seed-read", true);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &shell_payload(&reader.lane, "git status"),
+            &reader.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            reader.nothing_was_created_in_the_lane(),
+            "a read-only command seeded the worktree"
+        );
+        assert_eq!(reader.builds_started(), 0);
+    }
+
+    /// The classifier directly, on shapes the payload tests do not reach.
+    #[test]
+    fn command_cannot_change_tree_reads_the_whole_line() {
+        for command in [
+            "rg 'a|b; c' src",
+            "git --no-pager -C /x log -3",
+            "git stash list",
+            "git worktree list",
+            "git config --get user.name",
+            "FOO=bar git status",
+            "cat a.rs | head -3 && git diff --stat",
+            "sed -n '10,20p;30p' a.rs",
+            "echo hi 2>&1",
+            "ls &> /dev/null",
+            "cat < a.rs",
+            "sleep 1; true",
+        ] {
+            assert!(command_cannot_change_tree(command), "{command}");
+        }
+        for command in [
+            "sed -n 's/a/b/w out' a.rs",
+            "sed -ni 5p a.rs",
+            "sed --in-place s/a/b/ a.rs",
+            "sed -n -e p a.rs",
+            "sed 's/a/b/' a.rs",
+            "git stash drop",
+            "git worktree add ../x",
+            "git config user.name x",
+            "git diff --output=out.patch",
+            "git",
+            "git -C",
+            "rg --pre ./transform foo",
+            "find . -exec rm {} +",
+            "find . -fprint out.txt",
+            "sort -o out.txt in.txt",
+            "awk '{print > \"f\"}' a.rs",
+            "env rm a.rs",
+            "echo a > b",
+            "echo a >b",
+            "echo a 1>b",
+            "echo a >> b",
+            "echo a &>b",
+            "(cd x && rm y)",
+            "echo $(cat a)",
+            "echo \"a\\\"",
+            "x=1 && frob",
+            ";",
+            "",
+        ] {
+            assert!(!command_cannot_change_tree(command), "{command}");
+        }
+    }
+
+    /// The window is a stamp's age, so it reopens: a build is not suppressed
+    /// forever, and a stamp from the future (a clock set back) does not pin it
+    /// shut.
+    #[cfg(unix)]
+    #[test]
+    fn the_shell_build_window_reopens_and_fails_open() {
+        let lane = Lane::new("shell-window", true);
+        let stamp = state_dir(&lane.main)
+            .join("codeintel")
+            .join(SHELL_BUILD_STAMP);
+        assert!(shell_build_window_is_open(&lane.main), "no stamp: open");
+        assert!(!stamp.exists(), "checking the window must not claim it");
+        claim_shell_build_window(&lane.main);
+        assert!(stamp.is_file());
+        assert!(
+            !shell_build_window_is_open(&lane.main),
+            "inside the window: closed"
+        );
+
+        let set = |at: SystemTime| {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&stamp)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        set(SystemTime::now() - SHELL_BUILD_WINDOW - Duration::from_secs(1));
+        assert!(
+            shell_build_window_is_open(&lane.main),
+            "past the window: open"
+        );
+        claim_shell_build_window(&lane.main);
+        assert!(
+            !shell_build_window_is_open(&lane.main),
+            "and the claim restarts it"
+        );
+
+        set(SystemTime::now() + Duration::from_secs(3600));
+        assert!(
+            shell_build_window_is_open(&lane.main),
+            "a future stamp must not pin it shut"
+        );
+
+        // A stamp the hook may not use fails toward building.
+        fs::remove_file(&stamp).unwrap();
+        fs::create_dir(&stamp).unwrap();
+        assert!(
+            shell_build_window_is_open(&lane.main),
+            "an unusable stamp is open"
+        );
+    }
+
+    /// A shell call whose detach is refused is reported (exit 1, with its
+    /// reason) and does not start the window: the next call is not silenced for
+    /// something that never ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_shell_detach_does_not_start_the_rate_window() {
+        let lane = Lane::new("shell-refused", true);
+        let inside = lane.main.join("devmap-inside");
+        fs::copy(&lane.exe, &inside).unwrap();
+        let payload = shell_payload(&lane.main, "git merge feature");
+        let refused = run_hook(HookEvent::PostToolUse, &payload, &inside, None);
+        assert_eq!(refused.exit_code, 1, "{:?}", refused.stderr_line);
+        let line = refused.stderr_line.expect("the refusal is reported");
+        assert!(line.contains("refusing to detach"), "{line}");
+        let stamp = state_dir(&lane.main)
+            .join("codeintel")
+            .join(SHELL_BUILD_STAMP);
+        assert!(!stamp.exists(), "a refused detach claimed the window");
+
+        let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "the call after a refusal was held back by a window nothing started"
+        );
+        assert!(stamp.is_file(), "a successful detach claims the window");
     }
 
     /// A SessionStart catch-up and PostToolUse edits racing on one root share
