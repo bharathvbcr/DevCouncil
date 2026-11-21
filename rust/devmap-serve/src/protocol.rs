@@ -1400,7 +1400,7 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
         if kind.is_dir() {
             return Some(dot_git);
         }
-        let Some(pointer) = read_bounded(&dot_git, GITFILE_READ_CAP) else {
+        let Some(pointer) = devmap_query::stat_memo::read_bounded(&dot_git, GITFILE_READ_CAP) else {
             return Some(dot_git);
         };
         // A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
@@ -1416,36 +1416,20 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
     })
 }
 
-/// Bytes read of a `HEAD` file: a branch name or an object id fits.
+/// Largest `HEAD` file read: a branch name or an object id fits. A larger file
+/// is refused (reads broken), not truncated. Read by
+/// `devmap_query::stat_memo::read_bounded`, which never blocks on a FIFO.
 const HEAD_READ_CAP: u64 = 256;
-/// Bytes read of a `.git` pointer file: it holds a whole path (`PATH_MAX` is 4096
+/// Largest `.git` pointer file read, refused when larger: it holds a whole path (`PATH_MAX` is 4096
 /// on Linux), which the `HEAD` cap would truncate.
 const GITFILE_READ_CAP: u64 = 4096;
-
-/// The first `cap` bytes of a regular file as text. `None` when it cannot be
-/// read, and when it is not a regular file (after following symlinks, as git
-/// does): a FIFO with no writer blocks `open` forever, and `status` is a
-/// surface a health check polls, so such a file is never opened.
-fn read_bounded(path: &std::path::Path, cap: u64) -> Option<String> {
-    use std::io::Read;
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut text = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(cap)
-        .read_to_end(&mut text)
-        .ok()?;
-    Some(String::from_utf8_lossy(&text).into_owned())
-}
 
 /// Whether the `HEAD` file of the git directory `git_dir` is missing or names
 /// neither a branch (`ref: ...`) nor an object id. A directory walk and a
 /// bounded read and never a git spawn, because `status` is a surface a health
 /// check polls.
 fn git_head_file_is_broken(git_dir: &std::path::Path) -> bool {
-    let Some(head) = read_bounded(&git_dir.join("HEAD"), HEAD_READ_CAP) else {
+    let Some(head) = devmap_query::stat_memo::read_bounded(&git_dir.join("HEAD"), HEAD_READ_CAP) else {
         return true;
     };
     let head = head.trim();
@@ -4435,6 +4419,32 @@ mod tests {
             clause.is_none(),
             "a valid worktree HEAD read as broken: {clause:?}"
         );
+    }
+
+    /// Over the cap a file is refused, not truncated: a `HEAD` past 256 bytes and a
+    /// `.git` pointer past 4096 both read broken.
+    #[test]
+    fn an_over_cap_head_or_gitfile_reads_broken() {
+        let head = head_clause_over("head-over-cap", |root| {
+            let dir = root.join(".git");
+            std::fs::create_dir_all(&dir).unwrap();
+            let name = "x".repeat(300);
+            std::fs::write(dir.join("HEAD"), format!("ref: refs/heads/{name}\n")).unwrap();
+        });
+        assert!(head.is_some(), "a HEAD past the 256-byte cap read clean");
+
+        let gitfile = head_clause_over("gitfile-over-cap", |root| {
+            let gitdir = root.parent().unwrap().join("gitdirs/repo");
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+            let padding = " ".repeat(5000);
+            std::fs::write(
+                root.join(".git"),
+                format!("gitdir: {}{padding}\n", gitdir.display()),
+            )
+            .unwrap();
+        });
+        assert!(gitfile.is_some(), "a .git pointer past the 4096-byte cap read clean");
     }
 
     /// A `.git` file that is not a `gitdir:` pointer is a broken checkout, and
