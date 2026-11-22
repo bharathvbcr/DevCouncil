@@ -22,6 +22,15 @@
 //     exec'ing can vanish because a *different* package rebuilt it. cargoBin
 //     hands out a stable copy instead. See its comment for the measurements.
 //
+// Prebuilt binaries. cargoBin otherwise runs `cargo build` once per binary per
+// test process, and under a cargo slot gate each call can queue for many
+// minutes. A gate script that has built dcstore, dcverify and dcgrep once sets
+// DEVCOUNCIL_TEST_NO_CARGO=1 (see NoCargoEnv) to make every helper here use
+// them with zero cargo calls, or DCSTORE_BIN / DCVERIFY_BIN / DCGREP_BIN to name
+// one binary. A missing binary, or one older than the workspace sources, fails
+// the test; nothing falls back to building. Never bypass the slot gate to make
+// the build faster: it protects the machine's interactive session.
+//
 // devcouncil: allow-unwired
 //
 // Every importer of this package is a `_test.go` file, and `unwired_candidates`
@@ -372,6 +381,12 @@ func cargoBin(t testing.TB, crate, binary string) string {
 	// second skips the Do entirely, so a root check placed in there would
 	// pass for every caller but the first.
 	crates := RustWorkspace(t)
+
+	// A prebuilt binary, when the caller asked for one, ends the call here:
+	// no build, no lock, no cargo. See NoCargoEnv.
+	if path, ok := prebuiltBinary(t, crates, binary); ok {
+		return path
+	}
 
 	buildsMu.Lock()
 	b, ok := builds[binary]
