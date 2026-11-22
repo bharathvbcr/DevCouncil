@@ -143,6 +143,44 @@ fn the_version_line_names_the_extraction_schema() {
     );
 }
 
+/// The version line names the resolution reuse epoch this binary carries.
+///
+/// Cross-app parity checks judge an installed `devmap` by its `--version` line
+/// alone, and the epoch is what decides whether a store built by an older
+/// binary reuses its resolved edges. The number must be this binary's own
+/// `RESOLUTION_REUSE_EPOCH`, sit after the extraction schema (so the
+/// first-`schema` parsers keep reading the store number and the
+/// `extract schema N` readers still find a standalone token), and before the
+/// build identifier.
+#[test]
+fn the_version_line_names_the_resolution_reuse_epoch() {
+    let root = fixture("version-epoch");
+    let output = run(&root, &["--version"]);
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let phrase = format!(
+        "resolution reuse epoch {}",
+        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+    );
+    let at = text
+        .find(&phrase)
+        .unwrap_or_else(|| panic!("the epoch must be named as {phrase:?}: {text:?}"));
+    let extract = text
+        .find("extract schema")
+        .unwrap_or_else(|| panic!("the extraction schema must be named: {text:?}"));
+    let build = text
+        .find(", build ")
+        .unwrap_or_else(|| panic!("the build identifier must be named: {text:?}"));
+    assert!(
+        extract < at && at < build,
+        "the epoch goes after the extraction schema and before the build id: {text:?}"
+    );
+    assert!(
+        text[at + phrase.len()..].starts_with(", build "),
+        "the epoch number must stand alone, ended by a comma: {text:?}"
+    );
+}
+
 /// The no-op build carries `timings` like every other build result.
 ///
 /// The unchanged early return is the most frequent build in the system — a

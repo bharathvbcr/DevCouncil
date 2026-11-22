@@ -51,6 +51,11 @@ fn non_empty(value: &Option<String>) -> Option<String> {
 /// parity check (`check-vendor-schema.mjs`) reads exactly that phrase and
 /// reports a build without it as unverifiable.
 ///
+/// `resolution reuse epoch N` follows the extraction schema so a parity check
+/// can verify an installed binary's resolver epoch; every reader of this line
+/// matches a labelled, standalone number (or the first `schema`), so the new
+/// item sits before `build` without moving any of them.
+///
 /// The store number stays first. `devmap_health.probe` parses this line by
 /// splitting on the first `"schema"` and taking the first integer after it
 /// (`src/devcouncil/devmap_health.py`), so the store schema must remain the
@@ -64,11 +69,12 @@ pub(crate) fn version_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| {
         format!(
-            "{} (store schema {}, code graph schema {}, extract schema {}, build {})",
+            "{} (store schema {}, code graph schema {}, extract schema {}, resolution reuse epoch {}, build {})",
             env!("CARGO_PKG_VERSION"),
             devmap_store::CURRENT_SCHEMA_VERSION,
             devmap_query::CODE_GRAPH_SCHEMA_VERSION,
             devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
+            devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH,
             env!("DEVMAP_BUILD_ID")
         )
     })
