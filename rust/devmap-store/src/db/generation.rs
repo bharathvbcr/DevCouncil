@@ -36,6 +36,34 @@ pub fn set_source_freshness_interleave(hook: Option<fn(&Store)>) {
     FRESHNESS_INTERLEAVE.with(|slot| slot.set(hook));
 }
 
+/// `verdict` with what the lazy re-walk said appended to its reason.
+fn with_lazy_note(verdict: QuerySourceFreshness, why: &str) -> QuerySourceFreshness {
+    QuerySourceFreshness {
+        reason: Some(match verdict.reason {
+            Some(reason) => format!("{reason}; lazy re-verification: {why}"),
+            None => format!("lazy re-verification: {why}"),
+        }),
+        ..verdict
+    }
+}
+
+/// Ends a lazy walk's bookkeeping when dropped, whatever way the walking query
+/// leaves: the walk is no longer running, and `failure` (when it could not
+/// decide) is kept for the rest of the age window.
+struct EndLazyWalk<'a> {
+    gate: &'a std::sync::Mutex<crate::db::LazyWalk>,
+    failure: Option<String>,
+}
+
+impl Drop for EndLazyWalk<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut gate) = self.gate.lock() {
+            gate.in_flight = false;
+            gate.last_failure = self.failure.take();
+        }
+    }
+}
+
 /// `Ok(0)` means the cached verdict may still be returned. Any other count,
 /// and any read error, is an unverified answer whose reason names the queue.
 fn queue_blocks_cached_freshness(queued: Result<i64>) -> Option<QuerySourceFreshness> {
@@ -1368,7 +1396,7 @@ impl Store {
                     Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
                 };
                 let (source_freshness, source_reason, source_delta) =
-                    self.source_snapshot_mismatch(generation, cancel)?;
+                    self.source_snapshot_mismatch(generation, cancel, None)?;
                 status.source_freshness = source_freshness;
                 status.source_delta = source_delta;
                 status.analyzer_freshness = analyzer_freshness;
@@ -1573,33 +1601,29 @@ generation {latest}; run `devmap status` to re-verify",
     /// the cache, for a query whose verdict is aged out or absent.
     ///
     /// At most once per [`crate::db::SOURCE_FRESHNESS_MAX_AGE`] per store: the
-    /// attempt time is kept whether or not the walk finished, and a
-    /// concurrent query does not wait for the walk, it answers its own fallback
-    /// verdict. The walking query's wait is bounded by [`crate::db::SOURCE_FRESHNESS_WALK_BUDGET`]: a walk that is
-    /// not done by then is cancelled and the query answers `fallback` (the
-    /// verdict it had) with the reason appended. A walk that could not decide
-    /// (no root, an unreadable tree) is not remembered, so it cannot pin a null.
+    /// attempt time is kept whether or not the walk finished, and a query that
+    /// arrives after it does not walk or wait for the walk, it reads the cached
+    /// verdict, with the walk's state appended when that verdict is not fresh
+    /// (still running, or why it could not decide). A walk that could not decide
+    /// (no root, an unreadable tree, cancelled, over the memory bound) is not
+    /// remembered as a verdict, so it cannot pin a null, but its reason is kept
+    /// for the window. At most [`crate::db::MAX_CONCURRENT_LAZY_WALKS`] walks run
+    /// in the process; past that the query answers `fallback` and the store's
+    /// window is left unspent.
+    ///
+    /// The walking query cancels its walk once [`crate::db::SOURCE_FRESHNESS_WALK_BUDGET`]
+    /// passes, but joins the walk's thread, so its wait is that budget plus the
+    /// longest step that does not read the cancel flag (see the budget's doc).
     fn reverify_lazily(&self, fallback: QuerySourceFreshness) -> QuerySourceFreshness {
         let Ok(Some(generation)) = self.latest_generation_id() else {
             return fallback;
         };
-        // A walk already running answers the query: waiting for it is what the
-        // budget below exists to prevent, and a phase that ignores the cancel
-        // flag would make that wait unbounded.
-        let mut gate = match self.lazy_walk.try_lock() {
+        // The gate is held only to read and write the walk bookkeeping, never
+        // across the walk, so no query is turned away because another is
+        // merely checking the clock.
+        let mut gate = match self.lazy_walk.lock() {
             Ok(gate) => gate,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return QuerySourceFreshness {
-                    reason: Some(match fallback.reason {
-                        Some(reason) => {
-                            format!("{reason}; lazy re-verification: a walk is already running")
-                        }
-                        None => "lazy re-verification: a walk is already running".to_string(),
-                    }),
-                    ..fallback
-                };
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => return fallback,
+            Err(_) => return fallback,
         };
         let now = crate::db::memo_now();
         let walked_recently = gate.last_attempt.is_some_and(|started| {
@@ -1607,42 +1631,99 @@ generation {latest}; run `devmap status` to re-verify",
         });
         if walked_recently {
             // Another query's walk (or its refusal to finish) is the answer.
-            return self.cached_source_freshness(&mut false);
+            let running = gate.in_flight;
+            let failure = gate.last_failure.clone();
+            drop(gate);
+            let cached = self.cached_source_freshness(&mut false);
+            if cached.fresh == Some(true) {
+                return cached;
+            }
+            return match (running, failure) {
+                (true, _) => with_lazy_note(cached, "a walk is already running"),
+                (false, Some(why)) => with_lazy_note(cached, &why),
+                (false, None) => cached,
+            };
         }
+        #[cfg(test)]
+        let test_slots = gate.slots.clone();
+        let slots: &crate::db::WalkSlots = {
+            #[cfg(test)]
+            {
+                test_slots
+                    .as_deref()
+                    .unwrap_or(&crate::db::TEST_UNCAPPED_WALK_SLOTS)
+            }
+            #[cfg(not(test))]
+            {
+                &crate::db::PROCESS_WALK_SLOTS
+            }
+        };
+        let Some(_slot) = slots.acquire() else {
+            drop(gate);
+            return with_lazy_note(
+                fallback,
+                "too many source walks are running in this process; try again shortly",
+            );
+        };
         gate.last_attempt = Some(now);
+        gate.in_flight = true;
+        gate.last_failure = None;
         #[cfg(test)]
         {
             gate.walks += 1;
         }
         #[cfg(test)]
-        let (budget, probe) = (
+        let (budget, probe, max_source_bytes) = (
             gate.budget
                 .unwrap_or(crate::db::SOURCE_FRESHNESS_WALK_BUDGET),
             gate.probe.clone(),
+            gate.max_source_bytes
+                .unwrap_or(crate::db::SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES),
         );
         #[cfg(not(test))]
-        let budget = crate::db::SOURCE_FRESHNESS_WALK_BUDGET;
+        let (budget, max_source_bytes) = (
+            crate::db::SOURCE_FRESHNESS_WALK_BUDGET,
+            crate::db::SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES,
+        );
+        drop(gate);
+        // Ends the walk's bookkeeping on every exit, a panic included.
+        let mut ending = EndLazyWalk {
+            gate: &self.lazy_walk,
+            failure: None,
+        };
+        let was_poisoned = self.conn.is_poisoned();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let (sender, receiver) = std::sync::mpsc::channel();
         let outcome = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                // A panic in the walk must end as a refused verdict, not
-                // unwind through the scope into the query while the gate is
-                // held (which would panic the caller and poison the gate).
-                let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    #[cfg(test)]
-                    if let Some(probe) = &probe {
-                        probe(&cancel);
-                    }
-                    self.source_snapshot_mismatch(generation, Some(&cancel))
-                }))
-                .unwrap_or_else(|_| {
-                    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        std::io::Error::other("the walk panicked"),
-                    )))
+            let spawned = std::thread::Builder::new()
+                .name("devmap-lazy-walk".to_string())
+                .spawn_scoped(scope, || {
+                    // A panic in the walk must end as a refused verdict, not
+                    // unwind through the scope into the query.
+                    let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if let Some(probe) = &probe {
+                            probe(&cancel);
+                        }
+                        self.source_snapshot_mismatch(
+                            generation,
+                            Some(&cancel),
+                            Some(max_source_bytes),
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        // The walk only reads, so a panic inside it leaves the
+                        // connection usable; the unwind poisoned its mutex.
+                        self.recover_connection_after_walk_panic(was_poisoned);
+                        Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                            std::io::Error::other("the walk panicked"),
+                        )))
+                    });
+                    let _ = sender.send(walked);
                 });
-                let _ = sender.send(walked);
-            });
+            if let Err(error) = spawned {
+                return Err(format!("the walk thread could not be started ({error})"));
+            }
             match receiver.recv_timeout(budget) {
                 Ok(Ok((Some(fresh), reason, _))) => Ok((fresh, reason)),
                 Ok(Ok((None, reason, _))) => {
@@ -1664,14 +1745,34 @@ generation {latest}; run `devmap status` to re-verify",
                 self.remember_source_freshness(generation, Some(fresh), reason);
                 self.cached_source_freshness(&mut false)
             }
-            Err(why) => QuerySourceFreshness {
-                reason: Some(match fallback.reason {
-                    Some(reason) => format!("{reason}; lazy re-verification: {why}"),
-                    None => format!("lazy re-verification: {why}"),
-                }),
-                ..fallback
-            },
+            Err(why) => {
+                ending.failure = Some(why.clone());
+                with_lazy_note(fallback, &why)
+            }
         }
+    }
+
+    /// After a panic inside the read-only lazy walk, make the connection usable
+    /// again instead of leaving every later query on this cached store refused
+    /// by [`lock_conn`]'s fail-closed poison check.
+    ///
+    /// Only for a mutex the walk itself poisoned (`was_poisoned` is the state
+    /// before it started: a connection some other panic poisoned stays refused).
+    /// A transaction the unwind left open is rolled back; if that fails the
+    /// connection stays poisoned.
+    fn recover_connection_after_walk_panic(&self, was_poisoned: bool) {
+        if was_poisoned {
+            return;
+        }
+        let guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.is_autocommit() && guard.execute_batch("ROLLBACK").is_err() {
+            return;
+        }
+        drop(guard);
+        self.conn.clear_poison();
     }
 
     /// Mark this store's edits as reported by a live file watcher (or not).
@@ -1739,6 +1840,7 @@ generation {latest}; run `devmap status` to re-verify",
         &self,
         generation: u32,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        max_source_bytes: Option<u64>,
     ) -> Result<(Option<bool>, Option<String>, Option<SourceTreeDelta>)> {
         let Some(root) = self.latest_repo_root()? else {
             return Ok((
@@ -1764,9 +1866,12 @@ generation {latest}; run `devmap status` to re-verify",
         }
         let hashes = self.latest_file_hashes_shared()?;
         let stored = self.latest_discovery_inventory()?;
-        let scan = match cancel {
-            Some(flag) => devmap_extract::scan_tree_cancellable(Path::new(&root), flag),
-            None => devmap_extract::scan_tree(Path::new(&root)),
+        let scan = match (cancel, max_source_bytes) {
+            (Some(flag), Some(limit)) => {
+                devmap_extract::scan_tree_bounded(Path::new(&root), flag, limit)
+            }
+            (Some(flag), None) => devmap_extract::scan_tree_cancellable(Path::new(&root), flag),
+            (None, _) => devmap_extract::scan_tree(Path::new(&root)),
         };
         let scanned = match scan {
             Ok(scanned) => scanned,
@@ -3120,6 +3225,10 @@ mod lazy_source_verification {
                 .collect()
         });
         assert_eq!(walks(&f.store), 1, "{verdicts:?}");
+        // Once every query has joined, the walk is over and its stamp stands.
+        let after = f.store.query_source_freshness();
+        assert_eq!(after.fresh, Some(true), "{after:?}");
+        assert_eq!(walks(&f.store), 1, "the stamp is read, not walked again");
         // A query that arrives while the walk runs answers its fallback (null,
         // naming the running walk) instead of waiting; the rest read the stamp.
         assert!(
@@ -3160,8 +3269,15 @@ mod lazy_source_verification {
             saw_cancel.load(Ordering::SeqCst),
             "the query returned without cancelling the walk"
         );
-        // Inside the bound the refusal stands without walking again.
-        assert_eq!(f.store.query_source_freshness().fresh, None);
+        // Inside the bound the refusal stands without walking again, and the
+        // reason it stands for is still told.
+        let again = f.store.query_source_freshness();
+        assert_eq!(again.fresh, None, "{again:?}");
+        let remembered = again.reason.expect("reason");
+        assert!(
+            remembered.contains("did not finish within 0ms"),
+            "a later query lost the cancelled walk's reason: {remembered}"
+        );
         assert_eq!(walks(&f.store), 1);
     }
 
@@ -3211,21 +3327,145 @@ mod lazy_source_verification {
     #[test]
     fn a_generation_written_during_the_walk_is_never_certified_fresh() {
         let f = indexed("moved");
+        let root = f.root.to_string_lossy().into_owned();
         let store_ptr = &f.store as *const Store as usize;
         arm(&f.store, std::time::Duration::from_secs(5), move |_| {
             // SAFETY: the store outlives the scoped walk thread.
             let store = unsafe { &*(store_ptr as *const Store) };
             let conn = lock_conn(&store.conn).expect("connection");
+            // A generation of this binary's resolver, over the same tree: the
+            // walk finds nothing wrong with it, so only the generation it was
+            // asked about moving can keep its verdict from being certified.
+            let stamp = format!(
+                r#"{{"resolver_epoch":"{}"}}"#,
+                devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+            );
             conn.execute(
-                "INSERT INTO generations (id, created_at, head_sha, analysis_json) VALUES (99, 1.0, 'x', '{}')",
-                [],
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root) VALUES (99, 1.0, 'x', ?1, ?2)",
+                rusqlite::params![stamp, root],
             )
             .expect("generation");
         });
         let verdict = f.store.query_source_freshness();
         assert_ne!(verdict.fresh, Some(true), "{verdict:?}");
+        assert_eq!(walks(&f.store), 1);
+        let reason = verdict.reason.expect("reason");
+        assert!(
+            reason.contains("index changed during source verification"),
+            "{reason}"
+        );
         let again = f.store.query_source_freshness();
         assert_ne!(again.fresh, Some(true), "{again:?}");
+        assert_eq!(walks(&f.store), 1, "the second query read the cache");
+    }
+
+    #[test]
+    fn a_query_that_finds_the_gate_briefly_held_reads_the_cached_verdict() {
+        let f = indexed("brief");
+        verified_by_status(&f);
+        f.store.lazy_walk.lock().expect("gate").last_attempt = Some(crate::db::memo_now());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let verdict = std::thread::scope(|scope| {
+            // Another query inside its "walked recently" check, holding the gate.
+            let store = &f.store;
+            let holder = scope.spawn(move || {
+                let _gate = store.lazy_walk.lock().expect("gate");
+                held_tx.send(()).expect("held");
+                let _ = release_rx.recv();
+            });
+            held_rx.recv().expect("held");
+            // A query that read a stale verdict just before the stamp landed.
+            let asked = scope.spawn(|| {
+                f.store
+                    .reverify_lazily(QuerySourceFreshness::unverified("stale"))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            release_tx.send(()).expect("release");
+            holder.join().expect("holder");
+            asked.join().expect("query")
+        });
+        assert_eq!(verdict.fresh, Some(true), "{verdict:?}");
+        assert_eq!(walks(&f.store), 0, "it read the stamp; nothing walked");
+    }
+
+    #[test]
+    fn a_walk_that_panics_holding_the_connection_leaves_the_store_usable() {
+        let _reset = ResetClock;
+        let f = indexed("poison");
+        let store_ptr = &f.store as *const Store as usize;
+        arm(&f.store, std::time::Duration::from_secs(5), move |_| {
+            // SAFETY: the store outlives the scoped walk thread.
+            let store = unsafe { &*(store_ptr as *const Store) };
+            let _conn = lock_conn(&store.conn).expect("connection");
+            panic!("the walk blew up holding the connection");
+        });
+        let verdict = f.store.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        assert!(verdict.reason.expect("reason").contains("panicked"));
+        assert!(
+            f.store.latest_generation_id().is_ok(),
+            "the walk's panic left every later query on this store refused"
+        );
+        // The next window walks for real and certifies the tree.
+        f.store.lazy_walk.lock().expect("gate").probe = None;
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 4);
+        let after = f.store.query_source_freshness();
+        assert_eq!(after.fresh, Some(true), "{after:?}");
+    }
+
+    #[test]
+    fn the_process_cap_turns_a_walk_away_without_spending_the_stores_window() {
+        let a = indexed("cap-a");
+        let b = indexed("cap-b");
+        let slots = Arc::new(crate::db::WalkSlots::new(1));
+        for store in [&a.store, &b.store] {
+            store.lazy_walk.lock().expect("gate").slots = Some(Arc::clone(&slots));
+        }
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            // Ends when released, or after 5 s so a failing run still ends.
+            arm(&a.store, std::time::Duration::from_secs(30), move |_| {
+                started.store(true, Ordering::SeqCst);
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+        }
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| a.store.query_source_freshness());
+            while !started.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let turned_away = b.store.query_source_freshness();
+            release.store(true, Ordering::SeqCst);
+            first.join().expect("first query");
+            assert_eq!(turned_away.fresh, None, "{turned_away:?}");
+            let reason = turned_away.reason.expect("reason");
+            assert!(reason.contains("too many source walks"), "{reason}");
+        });
+        assert_eq!(walks(&b.store), 0, "the capped store did not walk");
+        // Its window was not spent, so the next query walks now that a place is free.
+        assert_eq!(b.store.query_source_freshness().fresh, Some(true));
+        assert_eq!(walks(&b.store), 1);
+    }
+
+    #[test]
+    fn a_tree_over_the_walks_memory_bound_is_not_walked_and_says_why() {
+        let f = indexed("bounded");
+        f.store.lazy_walk.lock().expect("gate").max_source_bytes = Some(1);
+        let verdict = f.store.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("larger than the 1 byte limit"), "{reason}");
+        // Inside the window the refusal stands, with its reason.
+        let again = f.store.query_source_freshness();
+        assert_eq!(again.fresh, None, "{again:?}");
+        assert!(again.reason.expect("reason").contains("larger than the 1 byte limit"));
+        assert_eq!(walks(&f.store), 1);
     }
 
     #[test]
@@ -3305,7 +3545,7 @@ mod lazy_source_verification {
         let cancel = AtomicBool::new(true);
         let error = f
             .store
-            .source_snapshot_mismatch(generation, Some(&cancel))
+            .source_snapshot_mismatch(generation, Some(&cancel), None)
             .expect_err("a cancelled walk has no verdict");
         assert!(
             error.to_string().contains("cancel"),
@@ -3315,10 +3555,17 @@ mod lazy_source_verification {
 
     #[test]
     fn a_deleted_source_file_is_never_fresh_at_the_lazy_walk() {
+        let _reset = ResetClock;
         let f = indexed("deleted");
+        verified_by_status(&f);
         std::fs::remove_file(f.root.join("a.py")).expect("delete");
+        advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 2);
+        // Only the walk can say false: with lazy verification off the aged
+        // verdict reads null, so this pins the walk and not the absence of one.
         let verdict = f.store.query_source_freshness();
-        assert_ne!(verdict.fresh, Some(true), "{verdict:?}");
+        assert_eq!(verdict.fresh, Some(false), "{verdict:?}");
+        assert!(verdict.reason.expect("reason").contains("differs"));
+        assert_eq!(walks(&f.store), 1);
     }
 
     #[test]
