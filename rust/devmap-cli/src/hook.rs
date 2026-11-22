@@ -373,27 +373,20 @@ fn run_hook_inner(
         if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload)
             .filter(|(wt, _)| !selection.roots.iter().any(|root| root.starts_with(wt)))
         {
-            // Inside a shell call's rate window the previous start already
-            // covers this root; say nothing.
-            let wait = if shell_post {
-                shell_build_window_remaining(&wt)
-            } else {
-                None
-            };
-            if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
-                return Ok(HookOutcome {
-                    exit_code: 0,
-                    stdout: None,
-                    stderr_line: None,
-                    roots: vec![wt],
-                });
-            }
+            // Inside a shell call's rate window: held back until it ends where
+            // the platform can wait, started at once where it cannot.
+            let plan = window_plan(
+                shell_post
+                    .then(|| shell_build_window_remaining(&wt))
+                    .flatten(),
+                WINDOW_CAN_BE_WAITED_OUT,
+            );
             // A refused or failed spawn is exit 1 with its reason, as for every
             // other PostToolUse detach, never silence.
             let (exit_code, stderr_line) =
-                match detach_build_with(executable, &wt, Some(&main), wait) {
+                match detach_build_with(executable, &wt, Some(&main), plan.delay) {
                     Ok(spawned) => {
-                        if spawned && shell_post && wait.is_none() {
+                        if spawned && shell_post && plan.claims {
                             claim_shell_build_window(&wt);
                         }
                         (0, None)
@@ -478,19 +471,17 @@ fn run_hook_inner(
                 &selection.roots,
                 DETACH_BUDGET,
                 |executable, root| {
-                    let wait = if shell_post {
-                        shell_build_window_remaining(root)
-                    } else {
-                        None
-                    };
-                    if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
-                        return Ok(());
-                    }
-                    let spawned = detach_post_tool_root(executable, root, wait)?;
+                    let plan = window_plan(
+                        shell_post
+                            .then(|| shell_build_window_remaining(root))
+                            .flatten(),
+                        WINDOW_CAN_BE_WAITED_OUT,
+                    );
+                    let spawned = detach_post_tool_root(executable, root, plan.delay)?;
                     // A held-back start is not a start: the window it waits out
                     // is still the previous one. Nor is a call that only
                     // marked a running build dirty.
-                    if spawned && shell_post && wait.is_none() {
+                    if spawned && shell_post && plan.claims {
                         claim_shell_build_window(root);
                     }
                     Ok(())
@@ -2833,9 +2824,41 @@ fn detach_post_tool_root(
 }
 
 /// Whether the rest of a shell call's rate window can be waited out in the
-/// detached child. Only unix has a shell to wait in; elsewhere a call inside the
-/// window is dropped, as it was before.
+/// detached child. Only unix has a shell to wait in.
 const WINDOW_CAN_BE_WAITED_OUT: bool = cfg!(unix);
+
+/// What a shell call does about the rate window, decided from the window left
+/// and whether the platform can hold a start back.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowPlan {
+    /// How long the detached build is held back before it starts.
+    delay: Option<Duration>,
+    /// Whether this start opens the window. A held-back start is not a start,
+    /// and neither is one made inside a window it could not wait out.
+    claims: bool,
+}
+
+/// Where the window has time left and the platform cannot wait it out, the
+/// call starts a build at once and leaves the earlier window as it was. The
+/// alternative, dropping the call, left a write made inside the window
+/// unindexed with nothing said; the coalescing lock still bounds the cost to
+/// one running build.
+fn window_plan(remaining: Option<Duration>, can_wait: bool) -> WindowPlan {
+    match remaining {
+        None => WindowPlan {
+            delay: None,
+            claims: true,
+        },
+        Some(left) if can_wait => WindowPlan {
+            delay: Some(left),
+            claims: false,
+        },
+        Some(_) => WindowPlan {
+            delay: None,
+            claims: false,
+        },
+    }
+}
 
 fn detach_stack_sync(
     executable: &Path,
@@ -8984,6 +9007,41 @@ mod tests {
             first.chars().count() < 260,
             "{} chars",
             first.chars().count()
+        );
+    }
+
+    /// The rate window's decision on every platform: where a start cannot be
+    /// held back, the call starts at once and does not claim the window.
+    #[test]
+    fn the_window_plan_never_drops_a_call_and_claims_only_a_fresh_window() {
+        let left = Some(Duration::from_millis(1500));
+        assert_eq!(
+            window_plan(None, true),
+            WindowPlan {
+                delay: None,
+                claims: true
+            }
+        );
+        assert_eq!(
+            window_plan(None, false),
+            WindowPlan {
+                delay: None,
+                claims: true
+            }
+        );
+        assert_eq!(
+            window_plan(left, true),
+            WindowPlan {
+                delay: left,
+                claims: false
+            }
+        );
+        assert_eq!(
+            window_plan(left, false),
+            WindowPlan {
+                delay: None,
+                claims: false
+            }
         );
     }
 
