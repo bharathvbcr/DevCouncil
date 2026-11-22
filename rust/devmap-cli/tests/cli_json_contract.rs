@@ -90,10 +90,9 @@ fn the_version_line_names_both_schemas_and_says_which_is_which() {
         "the artifact number must be the one this binary writes: {text:?}"
     );
 
-    // `src/devcouncil/devmap_health.py` parses this line by splitting on the
-    // first occurrence of "schema" and taking the first integer after it. That
-    // parser must keep reading the *store* schema, so the store number has to
-    // stay first. Reproduced here rather than described, because a rewording
+    // Readers that split this line on the first occurrence of "schema" and
+    // take the first integer after it (GitPulse's `scrape_schema`) must keep
+    // reading the *store* schema, so the store number has to stay first. Reproduced here rather than described, because a rewording
     // that breaks it is silent on the Rust side.
     let tail = text.split("schema").nth(1).expect("a schema is named");
     let first_number: String = tail
@@ -140,6 +139,50 @@ fn the_version_line_names_the_extraction_schema() {
     assert!(
         store < at,
         "the store schema must stay first, before the extraction schema: {text:?}"
+    );
+}
+
+/// The version line names the resolution reuse epoch this binary carries.
+///
+/// Cross-app parity checks judge an installed `devmap` by its `--version` line
+/// alone, and the epoch is what decides whether a store built by an older
+/// binary reuses its resolved edges. The number must be this binary's own
+/// `RESOLUTION_REUSE_EPOCH`, sit after the extraction schema (so the
+/// first-`schema` parsers keep reading the store number and the
+/// `extract schema N` readers still find a standalone token), and before the
+/// build identifier.
+#[test]
+fn the_version_line_names_the_resolution_reuse_epoch() {
+    let root = fixture("version-epoch");
+    let output = run(&root, &["--version"]);
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    assert!(
+        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+            .parse::<u32>()
+            .is_ok(),
+        "GitPulse's parity parser reads \\d+, so the epoch must be a plain unsigned integer"
+    );
+    let phrase = format!(
+        "resolution reuse epoch {}",
+        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+    );
+    let at = text
+        .find(&phrase)
+        .unwrap_or_else(|| panic!("the epoch must be named as {phrase:?}: {text:?}"));
+    let extract = text
+        .find("extract schema")
+        .unwrap_or_else(|| panic!("the extraction schema must be named: {text:?}"));
+    let build = text
+        .find(", build ")
+        .unwrap_or_else(|| panic!("the build identifier must be named: {text:?}"));
+    assert!(
+        extract < at && at < build,
+        "the epoch goes after the extraction schema and before the build id: {text:?}"
+    );
+    assert!(
+        text[at + phrase.len()..].starts_with(", build "),
+        "the epoch number must stand alone, ended by a comma: {text:?}"
     );
 }
 
