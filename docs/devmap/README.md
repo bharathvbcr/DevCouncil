@@ -996,7 +996,10 @@ on `Bash`):
 - Shell calls are rate-limited to one build start per 2 s window per tree. On
   unix a call inside the window is held back until the window ends; Windows has
   no shell to wait in, so such a call starts a build at once (still coalesced
-  onto a running one) and does not open a new window.
+  onto a running one) and does not open a new window. Windows also has no
+  trailing rerun: a write that coalesces onto a build already running there is
+  not rerun after it (the dirty marker is only read by the unix shell wrapper),
+  so it is indexed by the next build.
 - A command is skipped only when the whole line provably cannot change the
   tree. A leading `VAR=value` other than `LANG`/`LC_*` (`GIT_PAGER`,
   `LD_PRELOAD`, ...), `bat --pager`, `file -C` and `git --exec-path=` count as
