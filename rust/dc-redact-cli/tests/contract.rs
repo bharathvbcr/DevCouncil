@@ -96,12 +96,47 @@ fn redacts_a_credential_and_says_redaction_ran() {
         "line endings are kept: {out:?}"
     );
     assert_eq!(run.json["redacted_lines"], 2);
+    // `GH_TOKEN=<token>` matches two shapes over one span (the vendor token
+    // and a credential assigned to a named key). The earlier expectation named
+    // only the first, which was the undercount this field used to have.
+    assert_eq!(run.json["redacted_spans"], 2);
     assert_eq!(
         run.json["kinds"],
-        serde_json::json!(["github personal access token"])
+        serde_json::json!([
+            "credential assigned to a named key",
+            "github personal access token"
+        ])
     );
     assert_eq!(run.json["input_bytes"], text.len());
     assert_eq!(run.json["output_bytes"], out.len());
+}
+
+/// A second vendor shape, assembled at run time like the first.
+fn aws_key_id() -> String {
+    format!("{}{}", "AK", "IAQYPD7W3KXN2MZB5T")
+}
+
+#[test]
+fn counts_every_span_and_names_every_kind_on_one_line() {
+    let github = github_token();
+    let aws = aws_key_id();
+    let text = format!("export A={github} B={aws}\nplain\nthird {github}\n");
+    let run = run(&["redact"], &request(&text));
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    let out = run.json["text"].as_str().expect("text");
+    assert!(!out.contains(&github) && !out.contains(&aws), "{out:?}");
+    assert_eq!(run.json["redacted_lines"], 2);
+    assert_eq!(
+        run.json["redacted_spans"], 3,
+        "two spans on line one and one on line three: {}",
+        run.stdout
+    );
+    assert_eq!(
+        run.json["kinds"],
+        serde_json::json!(["aws access key id", "github personal access token"]),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -111,6 +146,7 @@ fn clean_text_still_reports_that_redaction_ran() {
     assert_eq!(run.json["redaction_ran"], true);
     assert_eq!(run.json["text"], "nothing to hide here\n");
     assert_eq!(run.json["redacted_lines"], 0);
+    assert_eq!(run.json["redacted_spans"], 0);
     assert_eq!(run.json["kinds"], serde_json::json!([]));
 }
 

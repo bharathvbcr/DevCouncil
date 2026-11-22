@@ -2510,6 +2510,46 @@ pub fn find_secret(line: &str) -> Option<SecretMatch> {
 /// gate reports. A token is replaced wherever it appears, not only at its
 /// first occurrence.
 pub fn redact_secrets(text: &str) -> String {
+    redact_text(text, None)
+}
+
+/// What [`redact_secrets_report`] answers: the redacted text and an exact
+/// account of what was replaced in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionReport {
+    /// Exactly [`redact_secrets`]`(text)`, byte for byte.
+    pub text: String,
+    /// Replacements made, counting every merged span of every pass. A line
+    /// that never converged and was redacted whole counts that whole-line
+    /// replacement as one more span.
+    pub spans: usize,
+    /// Every vendor shape a detection matched, sorted and de-duplicated. A
+    /// shape whose match overlapped another's, and so shared its span, is
+    /// still named.
+    pub kinds: Vec<&'static str>,
+}
+
+/// [`redact_secrets`] that also reports how many spans it replaced and which
+/// shapes it matched, where [`find_secret`] names only the first shape on a
+/// line. Additive: the output text is identical to `redact_secrets`.
+pub fn redact_secrets_report(text: &str) -> RedactionReport {
+    let mut tally = Tally::default();
+    let text = redact_text(text, Some(&mut tally));
+    RedactionReport {
+        text,
+        spans: tally.spans,
+        kinds: tally.kinds.into_iter().collect(),
+    }
+}
+
+/// What a report accumulates while a redaction runs.
+#[derive(Default)]
+struct Tally {
+    spans: usize,
+    kinds: std::collections::BTreeSet<&'static str>,
+}
+
+fn redact_text(text: &str, mut tally: Option<&mut Tally>) -> String {
     // One line at a time, exactly as `contains_secret` reads. Every detector
     // is a one-line rule; run over a whole text, one line's `${` made the next
     // line's password look like template syntax, so the password was found by
@@ -2518,7 +2558,7 @@ pub fn redact_secrets(text: &str) -> String {
     for segment in text.split_inclusive('\n') {
         let line = segment.trim_suffix('\n');
         let line = line.trim_suffix('\r');
-        out.push_str(&redact_line(line));
+        out.push_str(&redact_line(line, tally.as_deref_mut()));
         out.push_str(&segment[line.len()..]);
     }
     out
@@ -2538,17 +2578,20 @@ const MAX_REDACTION_PASSES: usize = 16;
 /// a single pass. Redaction must leave nothing a scan would still stop, so it
 /// runs until a scan stops nothing. A line that has not converged at the cap
 /// is redacted whole: fail closed, never return a line still carrying one.
-fn redact_line(line: &str) -> String {
-    let mut text = redact_pass(line);
+fn redact_line(line: &str, mut tally: Option<&mut Tally>) -> String {
+    let mut text = redact_pass(line, tally.as_deref_mut());
     if text == line {
         return text;
     }
     for _ in 1..MAX_REDACTION_PASSES {
-        let next = redact_pass(&text);
+        let next = redact_pass(&text, tally.as_deref_mut());
         if next == text {
             return text;
         }
         text = next;
+    }
+    if let Some(tally) = tally {
+        tally.spans += 1;
     }
     redact(line, 0)
 }
@@ -2560,23 +2603,35 @@ fn redact_line(line: &str) -> String {
 /// are merged in line coordinates exactly as a line with no join is, and a
 /// merged span's marker is rendered from the whole merged text, so a line
 /// with no join comes out byte for byte as it always did.
-fn redact_pass(text: &str) -> String {
+fn redact_pass(text: &str, mut tally: Option<&mut Tally>) -> String {
     // (span in `text`, bytes kept, found on the joined copy)
-    let mut hits: Vec<(std::ops::Range<usize>, usize, bool)> = detections(text)
-        .map(|(_, span, keep)| (span, keep, false))
-        .collect();
+    let mut hits: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
+    for (name, span, keep) in detections(text) {
+        if let Some(tally) = tally.as_deref_mut() {
+            tally.kinds.insert(name);
+        }
+        hits.push((span, keep, false));
+    }
     let joined = join_quoted_literals(text);
     if let Some(joined) = &joined {
         let boundary = |p: usize| joined.is_piece_start(p);
-        for (_, span, keep) in detections_at(&joined.shadow, &boundary) {
+        for (name, span, keep) in detections_at(&joined.shadow, &boundary) {
             if !joined.crosses(&span) {
                 continue;
+            }
+            if let Some(tally) = tally.as_deref_mut() {
+                tally.kinds.insert(name);
             }
             match joined.orig_range(&span) {
                 Some(orig) if orig.end <= text.len() => hits.push((orig, keep, true)),
                 // A span that cannot be placed on the line is still a
                 // credential: redact the line whole rather than leave it.
-                _ => return redact(text, 0),
+                _ => {
+                    if let Some(tally) = tally {
+                        tally.spans += 1;
+                    }
+                    return redact(text, 0);
+                }
             }
         }
     }
@@ -2603,6 +2658,9 @@ fn redact_pass(text: &str) -> String {
             continue;
         }
         merged.push((span, keep, on_copy));
+    }
+    if let Some(tally) = tally {
+        tally.spans += merged.len();
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
@@ -2670,6 +2728,21 @@ mod redaction_tests {
     /// A GitHub classic token shape, split so that no source line is one (see
     /// `no_line_of_this_file_is_itself_a_vendor_token`).
     const GITHUB_TOKEN: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyzA");
+
+    #[test]
+    fn report_counts_every_span_and_names_every_shape_on_one_line() {
+        let aws = concat!("AK", "IAQYPD7W3KXN2MZB5T");
+        let text = format!("A={GITHUB_TOKEN} B={aws}\nplain\nC={GITHUB_TOKEN}\n");
+        let report = redact_secrets_report(&text);
+        assert_eq!(report.text, redact_secrets(&text));
+        assert_eq!(report.spans, 3, "{}", report.text);
+        assert_eq!(
+            report.kinds,
+            vec!["aws access key id", "github personal access token"]
+        );
+        let clean = redact_secrets_report("nothing here\n");
+        assert_eq!((clean.spans, clean.kinds.len()), (0, 0));
+    }
 
     #[test]
     fn redacts_a_credential_in_an_argv_line() {
