@@ -127,7 +127,6 @@ func TestSeatPinnedConfigDirIsNeverReached(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("CLAUDE_CONFIG_DIR", seat)
-	t.Setenv("CODEX_HOME", filepath.Join(seat, "codex"))
 
 	bin := devmapForTest(t)
 	home := os.Getenv("HOME")

@@ -10,7 +10,7 @@ import (
 
 // HostConfigEnv is every environment variable that decides where a real devmap
 // (or a host CLI it configures) finds the developer's user-level configuration.
-// IsolateHostConfig redirects each one, so a test that drives the real binary
+// IsolateHostConfig points HOME at scratch and unsets the rest, so a test that drives the real binary
 // cannot reach the developer's own files, and so the answer to "what does a
 // test have to isolate?" lives here rather than in each test's comment.
 //
@@ -68,6 +68,25 @@ func IsolateHostConfig(t testing.TB) HostConfig {
 		}
 	}
 	return HostConfig{Home: home}
+}
+
+// HostConfigChildEnv is the environment for a child process a test launches
+// with an explicit Env: the process environment with HOME set to home and every
+// HostConfigEnv variable removed. Building Env from os.Environ() with only HOME
+// overridden hands the child the developer's CLAUDE_CONFIG_DIR.
+func HostConfigChildEnv(home string) []string {
+	drop := map[string]bool{"HOME": true}
+	for _, name := range HostConfigEnv {
+		drop[name] = true
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if !drop[name] {
+			env = append(env, kv)
+		}
+	}
+	return append(env, "HOME="+home)
 }
 
 // AssertWithin fails the test for every path that does not lie under one of

@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // contractPath is protocols/devmap/stdio.v1.json, the document that says what
@@ -89,7 +91,7 @@ func conforms(doc map[string]any, want contractDoc) []string {
 func devmapStdout(t *testing.T, bin, home string, stdin []byte, args ...string) map[string]any {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), "HOME="+home)
+	cmd.Env = testsupport.HostConfigChildEnv(home)
 	cmd.Stdin = bytes.NewReader(stdin)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -99,6 +101,41 @@ func devmapStdout(t *testing.T, bin, home string, stdin []byte, args ...string) 
 		t.Fatalf("devmap %v wrote no JSON document on stdout: %v", args, err)
 	}
 	return doc
+}
+
+// A seat-pinned session exports CLAUDE_CONFIG_DIR, and devmap writes the Claude
+// host's global config there. devmapStdout must not hand that variable to the
+// child: the planted seat comes out byte for byte as it went in, and every file
+// the apply reports lies under the scratch roots.
+func TestStdioHarnessNeverReachesSeatConfig(t *testing.T) {
+	bin := devmapBinary(t)
+	seat := t.TempDir()
+	planted := filepath.Join(seat, ".claude.json")
+	const body = `{"projects":{},"sentinel":"seat-config-do-not-touch"}` + "\n"
+	if err := os.WriteFile(planted, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", seat)
+	home := t.TempDir()
+	root := fixtureRepo(t)
+	servers := []byte(`{"servers":[{"name":"contract-probe","command":"/opt/probe/bin/probe","args":["mcp"]}]}`)
+
+	doc := devmapStdout(t, bin, home, servers,
+		"--json", "integrate", "claude", "--project-root", root, "--servers-stdin")
+	if files, ok := doc["files"].(map[string]any); ok {
+		paths := make([]string, 0, len(files))
+		for path := range files {
+			paths = append(paths, path)
+		}
+		testsupport.AssertWithin(t, []string{root, home}, paths...)
+	}
+	after, err := os.ReadFile(planted)
+	if err != nil || string(after) != body {
+		t.Fatalf("the seat-pinned %s changed (err %v):\n%s", planted, err, after)
+	}
+	if entries, _ := os.ReadDir(seat); len(entries) != 1 {
+		t.Fatalf("the seat-pinned directory gained files: %v", entries)
+	}
 }
 
 // TestTheLiveStdioContractReplay replays protocols/devmap/stdio.v1.json against
