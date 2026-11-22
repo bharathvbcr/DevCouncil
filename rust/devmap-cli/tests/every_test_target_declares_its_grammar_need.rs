@@ -190,6 +190,10 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "page_size_and_index_contracts",
             // Store opens and hand-stamped schema rows; no extraction anywhere.
             "reader_floor",
+            // Compares two crate constants with protocols/schema-versions/v1.json;
+            // no store, no extraction. Verified with
+            // `cargo check -p devmap-store --no-default-features --all-targets`.
+            "schema_versions_manifest",
             "store_hardening_without_grammars",
             "write_breakdown_without_grammars",
         ],
