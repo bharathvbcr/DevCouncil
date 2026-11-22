@@ -56,11 +56,10 @@ fn non_empty(value: &Option<String>) -> Option<String> {
 /// matches a labelled, standalone number (or the first `schema`), so the new
 /// item sits before `build` without moving any of them.
 ///
-/// The store number stays first. `devmap_health.probe` parses this line by
-/// splitting on the first `"schema"` and taking the first integer after it
-/// (`src/devcouncil/devmap_health.py`), so the store schema must remain the
-/// first one named or that probe silently starts reporting the artifact
-/// version as the store's.
+/// The store number stays first. Readers that split this line on the first
+/// `"schema"` and take the first integer after it (GitPulse's
+/// `scrape_schema` does) need the store schema to remain the first one named,
+/// or they silently start reporting the artifact version as the store's.
 ///
 /// Built once into a process-lifetime `OnceLock` rather than formatted per
 /// call: clap's `version` takes a `&'static str`, and the schema number is only
