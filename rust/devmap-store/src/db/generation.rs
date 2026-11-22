@@ -52,15 +52,19 @@ fn with_lazy_note(verdict: QuerySourceFreshness, why: &str) -> QuerySourceFreshn
 /// decide) is kept for the rest of the age window.
 struct EndLazyWalk<'a> {
     gate: &'a std::sync::Mutex<crate::db::LazyWalk>,
-    failure: Option<String>,
+    failure: Option<(u32, String)>,
 }
 
 impl Drop for EndLazyWalk<'_> {
     fn drop(&mut self) {
-        if let Ok(mut gate) = self.gate.lock() {
-            gate.in_flight = false;
-            gate.last_failure = self.failure.take();
-        }
+        // A poisoned gate is still ended: a stuck `in_flight` would turn every
+        // later query away for good.
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.in_flight = false;
+        gate.last_failure = self.failure.take();
     }
 }
 
@@ -1629,10 +1633,16 @@ generation {latest}; run `devmap status` to re-verify",
         let walked_recently = gate.last_attempt.is_some_and(|started| {
             now.saturating_duration_since(started) <= crate::db::SOURCE_FRESHNESS_MAX_AGE
         });
-        if walked_recently {
+        // A walk still running past the window (a slow one) is the answer too:
+        // a second walk would clear the first one's bookkeeping when it ends.
+        if walked_recently || gate.in_flight {
             // Another query's walk (or its refusal to finish) is the answer.
             let running = gate.in_flight;
-            let failure = gate.last_failure.clone();
+            let failure = gate
+                .last_failure
+                .as_ref()
+                .filter(|(failed_generation, _)| *failed_generation == generation)
+                .map(|(_, why)| why.clone());
             drop(gate);
             let cached = self.cached_source_freshness(&mut false);
             if cached.fresh == Some(true) {
@@ -1725,12 +1735,15 @@ generation {latest}; run `devmap status` to re-verify",
                 return Err(format!("the walk thread could not be started ({error})"));
             }
             match receiver.recv_timeout(budget) {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("the walk thread ended without a verdict".to_string())
+                }
                 Ok(Ok((Some(fresh), reason, _))) => Ok((fresh, reason)),
                 Ok(Ok((None, reason, _))) => {
                     Err(reason.unwrap_or_else(|| "the walk could not decide".to_string()))
                 }
                 Ok(Err(error)) => Err(format!("the walk failed ({error})")),
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // The scope joins the thread, which stops at its next check.
                     cancel.store(true, std::sync::atomic::Ordering::SeqCst);
                     Err(format!(
@@ -1746,7 +1759,7 @@ generation {latest}; run `devmap status` to re-verify",
                 self.cached_source_freshness(&mut false)
             }
             Err(why) => {
-                ending.failure = Some(why.clone());
+                ending.failure = Some((generation, why.clone()));
                 with_lazy_note(fallback, &why)
             }
         }
@@ -1756,10 +1769,13 @@ generation {latest}; run `devmap status` to re-verify",
     /// again instead of leaving every later query on this cached store refused
     /// by [`lock_conn`]'s fail-closed poison check.
     ///
-    /// Only for a mutex the walk itself poisoned (`was_poisoned` is the state
-    /// before it started: a connection some other panic poisoned stays refused).
-    /// A transaction the unwind left open is rolled back; if that fails the
-    /// connection stays poisoned.
+    /// Only for a mutex that was not already poisoned when the walk started
+    /// (`was_poisoned`): a connection some earlier panic poisoned stays refused.
+    /// The poison is not attributed to the walk's own thread, so a panic by
+    /// another thread holding the connection during the walk is cleared too;
+    /// that is bounded by the rollback below, which leaves the database in its
+    /// last committed state. A transaction the unwind left open is rolled back;
+    /// if that fails the connection stays poisoned.
     fn recover_connection_after_walk_panic(&self, was_poisoned: bool) {
         if was_poisoned {
             return;
@@ -3380,8 +3396,22 @@ mod lazy_source_verification {
                 f.store
                     .reverify_lazily(QuerySourceFreshness::unverified("stale"))
             });
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Release the gate only once the query has answered or has been
+            // kept waiting for it by a bounded number of polls. A query that
+            // turns away on a held gate answers at once, so it is finished
+            // here; one that waits for the gate is not, and is released.
+            for _ in 0..2000 {
+                if asked.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let answered_while_held = asked.is_finished();
             release_tx.send(()).expect("release");
+            assert!(
+                !answered_while_held,
+                "the query answered without waiting for the gate"
+            );
             holder.join().expect("holder");
             asked.join().expect("query")
         });
@@ -3412,6 +3442,108 @@ mod lazy_source_verification {
         advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 4);
         let after = f.store.query_source_freshness();
         assert_eq!(after.fresh, Some(true), "{after:?}");
+    }
+
+    #[test]
+    fn a_walk_that_panics_inside_a_transaction_leaves_the_connection_in_autocommit() {
+        let f = indexed("txn-panic");
+        let store_ptr = &f.store as *const Store as usize;
+        arm(&f.store, std::time::Duration::from_secs(5), move |_| {
+            // SAFETY: the store outlives the scoped walk thread.
+            let store = unsafe { &*(store_ptr as *const Store) };
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute_batch("BEGIN").expect("begin");
+            panic!("the walk blew up inside a transaction");
+        });
+        let verdict = f.store.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        let conn = lock_conn(&f.store.conn).expect("the connection is usable");
+        assert!(conn.is_autocommit(), "the unwind left a transaction open");
+    }
+
+    #[test]
+    fn a_connection_poisoned_before_the_walk_stays_refused() {
+        let f = indexed("pre-poisoned");
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _conn = f.store.conn.lock().expect("connection");
+                    panic!("an earlier panic poisons the connection");
+                })
+                .join();
+        });
+        assert!(f.store.conn.is_poisoned(), "premise");
+        f.store.recover_connection_after_walk_panic(true);
+        assert!(
+            f.store.conn.is_poisoned(),
+            "a walk's panic cleared a poison it did not cause"
+        );
+        assert!(f.store.latest_generation_id().is_err());
+        // The same call for a walk that started on a healthy connection clears it.
+        f.store.recover_connection_after_walk_panic(false);
+        assert!(f.store.latest_generation_id().is_ok());
+    }
+
+    #[test]
+    fn a_walk_still_running_past_the_window_is_not_started_twice() {
+        let _reset = ResetClock;
+        let f = indexed("slow-past-window");
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            // Ends when released, or after 5 s so a failing run still ends.
+            arm(&f.store, std::time::Duration::from_secs(30), move |_| {
+                started.store(true, Ordering::SeqCst);
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+        }
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| f.store.query_source_freshness());
+            while !started.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // This thread's clock is past the window while the first walk runs.
+            advance_clock(crate::db::SOURCE_FRESHNESS_MAX_AGE * 4);
+            let second = f.store.query_source_freshness();
+            release.store(true, Ordering::SeqCst);
+            first.join().expect("first query");
+            assert_eq!(walks(&f.store), 1, "a second walk started beside the first");
+            assert_ne!(second.fresh, Some(true), "{second:?}");
+            let reason = second.reason.expect("reason");
+            assert!(reason.contains("already running"), "{reason}");
+        });
+        let gate = f.store.lazy_walk.lock().expect("gate");
+        assert!(!gate.in_flight, "the walk's bookkeeping did not end");
+    }
+
+    #[test]
+    fn a_failure_is_told_only_for_the_generation_it_was_recorded_for() {
+        let f = indexed("failure-generation");
+        arm(&f.store, std::time::Duration::ZERO, |cancel| {
+            while !cancel.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        let first = f.store.query_source_freshness();
+        assert!(first.reason.expect("reason").contains("cancelled"));
+        {
+            let conn = lock_conn(&f.store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json) VALUES (99, 1.0, 'x', '{}')",
+                [],
+            )
+            .expect("generation");
+        }
+        let later = f.store.query_source_freshness();
+        let reason = later.reason.unwrap_or_default();
+        assert!(
+            !reason.contains("cancelled"),
+            "a failure on the old generation was told for the new one: {reason}"
+        );
     }
 
     #[test]

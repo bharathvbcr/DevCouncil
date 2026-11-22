@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use devmap_store::csr::{CsrGraphWriter, CsrNodeRecord};
+use devmap_store::csr::{CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord};
 use devmap_store::seed::{copy_donor_csr_checked, csr_generation_of_open_file, DonorCsr};
 
 fn tmp_dir(label: &str) -> PathBuf {
@@ -94,7 +94,7 @@ fn the_generation_is_read_from_the_header_without_reading_the_body() {
     let path = dir.join("g.csr");
     write_csr(&path, 23);
     let bytes = fs::read(&path).unwrap();
-    let header_len = 80;
+    let header_len = std::mem::size_of::<CsrHeader>();
     assert!(bytes.len() > header_len, "premise: the file has a body");
     fs::write(&path, &bytes[..header_len]).unwrap();
     let file = fs::File::open(&path).unwrap();
@@ -155,6 +155,12 @@ fn a_corrupted_or_truncated_donor_csr_is_rejected_without_panicking() {
                 // Kept is only right when the bytes still read as generation 4.
                 let file = fs::File::open(&staged).unwrap();
                 assert_eq!(csr_generation_of_open_file(&file).unwrap(), 4, "{label}");
+                // The header alone names the generation; a kept copy must
+                // also be a CSR a reader can open.
+                assert!(
+                    CsrGraphReader::open_mmap(&staged).is_ok(),
+                    "{label}: kept a copy no reader can open"
+                );
             }
             Ok(_) => assert!(!staged.exists(), "{label}: a rejected copy stayed"),
         }

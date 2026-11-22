@@ -777,10 +777,10 @@ pub(crate) struct LazyWalk {
     /// A walk is running now (set when it starts, cleared when it ends).
     pub(crate) in_flight: bool,
     /// Why the last walk could not decide (cancelled, failed, panicked, over
-    /// the memory bound), kept for the age window so a later query says so
-    /// rather than reading as if no walk had been tried. Cleared when a walk
-    /// starts.
-    pub(crate) last_failure: Option<String>,
+    /// the memory bound) and the generation it was walking, kept for the age
+    /// window so a later query on that generation says so rather than reading
+    /// as if no walk had been tried. Cleared when a walk starts.
+    pub(crate) last_failure: Option<(u32, String)>,
     /// Walks started, for tests.
     #[cfg(test)]
     pub(crate) walks: usize,
