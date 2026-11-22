@@ -2293,12 +2293,14 @@ fn split_shell_segments(command: &str) -> Option<Vec<Vec<String>>> {
 
 /// Verbs that read, print or change directory and nothing else. Anything that
 /// can write through an argument (`sort -o`, `tree -o`, `awk`, `tee`, `xargs`)
-/// or run another command (`env`, `time`, `sudo`) is absent on purpose.
+/// or run another command (`env`, `time`, `sudo`) is absent on purpose, as are
+/// `ag`, `ack` and `ugrep`: `--pager`/`--filter` name a program to run and
+/// `ugrep --save-config` writes `.ugrep`.
 const READ_ONLY_VERBS: &[&str] = &[
     "ls", "cat", "head", "tail", "nl", "wc", "less", "more", "bat", "grep", "egrep", "fgrep",
-    "ugrep", "ag", "ack", "pwd", "echo", "printf", "which", "whoami", "date", "uname", "stat",
-    "file", "du", "df", "id", "hostname", "basename", "dirname", "realpath", "readlink", "test",
-    "[", "true", "false", "sleep", "diff", "cmp", "cd", "pushd", "popd", "jq",
+    "pwd", "echo", "printf", "which", "whoami", "date", "uname", "stat", "file", "du", "df", "id",
+    "hostname", "basename", "dirname", "realpath", "readlink", "test", "[", "true", "false",
+    "sleep", "diff", "cmp", "cd", "pushd", "popd", "jq",
 ];
 
 /// Git subcommands that never change the working tree. `branch`, `tag` and
@@ -2344,7 +2346,17 @@ fn segment_cannot_change_tree(words: &[String]) -> bool {
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
     };
-    let mut rest = words.iter().skip_while(|word| is_assignment(word));
+    // A leading `VAR=value` changes what the verb runs: `GIT_PAGER`,
+    // `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND` and `LD_PRELOAD` all name a
+    // program or library the verb then loads. Only locale variables, which pick
+    // a language and a collation order, keep the verb's meaning.
+    let mut rest = words.iter().peekable();
+    while let Some(word) = rest.next_if(|word| is_assignment(word)) {
+        let name = word.split_once('=').map_or("", |(name, _)| name);
+        if name != "LANG" && !name.starts_with("LC_") {
+            return false;
+        }
+    }
     let Some(verb) = rest.next() else {
         // Only `VAR=value`: sets a variable, runs nothing.
         return true;
@@ -2379,6 +2391,15 @@ fn segment_cannot_change_tree(words: &[String]) -> bool {
                     | "-fls"
             )
         }),
+        // `--pager` names a program `bat` runs on its output.
+        "bat" => !args.iter().any(|arg| arg.starts_with("--pager")),
+        // `-C` compiles a magic file and writes `<file>.mgc`; it may sit in a
+        // cluster of short flags (`-bC`). GNU long options match by prefix, so
+        // `--co` up to `--compile` is the same flag.
+        "file" => !args.iter().any(|arg| {
+            (arg.len() >= 4 && "--compile".starts_with(*arg))
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('C'))
+        }),
         verb => READ_ONLY_VERBS.contains(&verb),
     }
 }
@@ -2396,6 +2417,8 @@ fn git_cannot_change_tree(args: &[&str]) -> bool {
             // `diff.external`): not a read.
             "-c" | "--config-env" => return false,
             flag if flag.starts_with("--config-env=") => return false,
+            // `--exec-path=<dir>` makes git run its subcommands from `<dir>`.
+            flag if flag.starts_with("--exec-path=") => return false,
             flag if flag.starts_with('-') => {}
             name => {
                 sub = Some(name);
@@ -3691,16 +3714,27 @@ fn detached_shell_command(
         // A retaken lock names its owner like any other: without a pid file
         // the next hook calls it stale after LOCK_PID_GRACE and starts a second
         // builder. `$$` is this shell, the pid `spawn` records for the child.
+        // If the pid cannot be written the lock is removed and the loop ends,
+        // rather than leaving an owner-less lock for the grace window.
         let pid_quoted = shell_single_quote(&format!("{lock}/pid"));
+        // The age ceiling reads the lock directory's mtime, which a rerun
+        // would otherwise leave at the first run's start: a build plus reruns
+        // past LOCK_MAX_AGE would let another hook reclaim a live lock. Making
+        // and removing an entry stamps the directory. `mkdir` neither follows
+        // a symlink planted at the name nor is a POSIX special builtin, whose
+        // redirection failure (`: > missing/x`) exits dash.
+        let beat = shell_single_quote(&format!("{lock}/beat"));
         script.push_str(&format!(
             "/bin/rm -f {marker}; {run}; status=$?; reruns=0; \
              while :; do \
              while [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ]; do \
-             reruns=$((reruns+1)); /bin/rm -f {marker}; {run}; status=$?; done; \
+             reruns=$((reruns+1)); /bin/rm -rf -- {beat}; /bin/mkdir {beat} && /bin/rm -rf -- {beat}; \
+             /bin/rm -f {marker}; {run}; status=$?; done; \
              /bin/rm -rf {lock_quoted}; \
              [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ] \
              && /bin/mkdir {lock_quoted} 2>/dev/null \
-             && echo $$ > {pid_quoted} || break; \
+             && {{ echo $$ > {pid_quoted} || {{ /bin/rm -rf -- {lock_quoted}; break; }}; }} \
+             || break; \
              done; exit $status"
         ));
         return finish_detached_shell(script);
@@ -5534,6 +5568,50 @@ mod tests {
         .into_bytes()
     }
 
+    /// Cursor's `postToolUse` for its `Shell` tool carries `cwd` and
+    /// `tool_input.command` (https://cursor.com/docs/agent/hooks, read
+    /// 2026-11-21): a write-shaped command starts a build for that cwd's tree
+    /// and a read-only one starts none.
+    #[cfg(unix)]
+    #[test]
+    fn a_cursor_shell_payload_is_classified_like_a_bash_one() {
+        let cursor = |lane: &Lane, command: &str| {
+            json!({
+                "conversation_id": "c",
+                "hook_event_name": "postToolUse",
+                // Not the tree under test, so only `cwd` can select it.
+                "workspace_roots": [&lane.parent],
+                "cwd": &lane.main,
+                "tool_name": "Shell",
+                "tool_input": { "command": command },
+                "tool_output": "{}",
+                "duration": 12,
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let lane = Lane::new("cursor-shell", true);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &cursor(&lane, "git status"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(outcome.roots.is_empty(), "{:?}", outcome.roots);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &cursor(&lane, "git merge feature"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "a Cursor Shell write started no build"
+        );
+    }
+
     /// A `git merge` that stops on conflicts has written the tree and exits
     /// non-zero, so the host fires PostToolUseFailure, routed to this same
     /// handler. Its payload (an `error` in place of a response) starts a build
@@ -5835,7 +5913,10 @@ mod tests {
             "git stash list",
             "git worktree list",
             "git config --get user.name",
-            "FOO=bar git status",
+            "LC_ALL=C git status",
+            "LANG=C LC_ALL=C ls",
+            "bat --plain a.rs",
+            "file -b a.rs",
             "cat a.rs | head -3 && git diff --stat",
             "sed -n '10,20p;30p' a.rs",
             "echo hi 2>&1",
@@ -5858,6 +5939,25 @@ mod tests {
             "git",
             "git -C",
             "rg --pre ./transform foo",
+            "GIT_PAGER='rm x' git log",
+            "GIT_EXTERNAL_DIFF=./d git diff",
+            "LD_PRELOAD=./evil.so ls",
+            "LC_ALL=C GIT_PAGER=./p git log",
+            "PATH=./bin ls",
+            "bat --pager 'rm x' a.rs",
+            "bat --pager=./p a.rs",
+            "file -C -m magic",
+            "file -bC magic",
+            "file --compile -m magic",
+            "file --comp -m magic",
+            "file --co -m magic",
+            "ag --pager 'rm x' foo",
+            "ack --pager=./p foo",
+            "ugrep --filter=./f foo",
+            "ugrep --save-config foo",
+            "ag foo",
+            "FOO=bar git status",
+            "git --exec-path=./bin status",
             "find . -exec rm {} +",
             "find . -fprint out.txt",
             "sort -o out.txt in.txt",
@@ -6158,7 +6258,7 @@ mod tests {
             "/usr/bin/git status",
             "git status | head",
             "git status && git log -1",
-            "FOO=1 rg foo",
+            "LC_ALL=C rg foo",
             "pwd; ls",
             "ls  \t ",
         ];
@@ -9856,6 +9956,145 @@ mod lock_tests {
                 .as_nanos(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    /// Runs the rerun loop's script with `first_run` as the program's first
+    /// run, which asks for a rerun, and returns the shell.
+    fn rerun_script_child(
+        base: &Path,
+        lock: &Path,
+        marker: &Path,
+        first_run: &str,
+        edit_script: impl Fn(String) -> String,
+    ) -> std::process::Child {
+        let exe = base.join("devmap-stand-in");
+        let body = format!(
+            "#!/bin/sh\nd='{dir}'\nif [ ! -e \"$d/first\" ]; then : > \"$d/first\"; : > '{marker}'; {first_run}; exit 0; fi\n: > \"$d/second\"\nwhile [ -e \"$d/release\" ]; do /bin/sleep 0.05; done\n",
+            dir = base.display(),
+            marker = marker.display(),
+        );
+        fs::write(&exe, body).unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = detached_shell_command(
+            &exe,
+            &[],
+            lock,
+            SpawnOptions {
+                delay: None,
+                rerun_when_dirty: true,
+            },
+        )
+        .unwrap();
+        let script = cmd
+            .get_args()
+            .nth(1)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(edit_script(script))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for(ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ready()
+    }
+
+    /// A build whose first run began over LOCK_MAX_AGE ago and which is now in a
+    /// rerun still holds its lock: the rerun stamps the lock directory, so the
+    /// age ceiling measures the rerun, not the first run.
+    #[test]
+    fn a_rerun_refreshes_the_lock_age_the_ceiling_reads() {
+        let base = scratch("rerun-age");
+        let codeintel = base.join("codeintel");
+        let lock = codeintel.join("hook-build.running");
+        fs::create_dir_all(&lock).unwrap();
+        fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+        let marker = codeintel.join(BUILD_DIRTY_MARKER);
+        fs::write(base.join("release"), b"").unwrap();
+        let first_run = format!("touch -t 200001010000 '{}'", lock.display());
+        let mut child = rerun_script_child(&base, &lock, &marker, &first_run, |script| script);
+        assert!(wait_for(|| base.join("second").exists()), "no rerun");
+        let stale = lock_dir_is_stale(&lock);
+        fs::remove_file(base.join("release")).unwrap();
+        child.wait().unwrap();
+        assert!(!stale, "a lock whose owner is mid-rerun was called stale");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The stamp neither writes through a symlink planted at its name nor
+    /// depends on a redirection that can fail.
+    #[test]
+    fn a_rerun_stamp_does_not_write_through_a_planted_symlink() {
+        let base = scratch("rerun-beat-link");
+        let codeintel = base.join("codeintel");
+        let lock = codeintel.join("hook-build.running");
+        fs::create_dir_all(&lock).unwrap();
+        let victim = base.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, lock.join("beat")).unwrap();
+        let marker = codeintel.join(BUILD_DIRTY_MARKER);
+        let mut child = rerun_script_child(&base, &lock, &marker, ":", |script| script);
+        child.wait().unwrap();
+        assert!(base.join("second").exists(), "no rerun");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"keep",
+            "the stamp wrote through the link"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// If the retaken lock's pid cannot be written, the lock is removed rather
+    /// than left owner-less for LOCK_PID_GRACE.
+    #[test]
+    fn a_retaken_lock_whose_pid_cannot_be_written_is_removed() {
+        let base = scratch("retake-nopid");
+        let codeintel = base.join("codeintel");
+        let lock = codeintel.join("hook-build.running");
+        fs::create_dir_all(&lock).unwrap();
+        let marker = codeintel.join(BUILD_DIRTY_MARKER);
+        let quoted = shell_single_quote(lock.to_str().unwrap());
+        let unlock = format!("/bin/rm -rf {quoted}; ");
+        let done = base.join("injected");
+        let mut child = rerun_script_child(&base, &lock, &marker, ":", |script| {
+            // A directory at `pid` makes the write fail; the marker lands once,
+            // after the unlock, so the loop retakes the lock.
+            let injection = format!(
+                "{unlock}[ ! -e '{done}' ] && : > '{done}' && : > '{marker}'; ",
+                done = done.display(),
+                marker = marker.display()
+            );
+            let injected = script.replacen(&unlock, &injection, 1);
+            assert_ne!(injected, script, "the unlock was not found to inject after");
+            let broken = injected.replacen(
+                &format!("/bin/mkdir {quoted} 2>/dev/null"),
+                &format!("/bin/mkdir {quoted} 2>/dev/null && /bin/mkdir {quoted}/pid"),
+                1,
+            );
+            assert_ne!(broken, injected, "the retake mkdir was not found to break");
+            broken
+        });
+        let status = child.wait().unwrap();
+        assert!(done.exists(), "the marker was never injected");
+        assert!(status.success(), "{status}");
+        assert!(
+            !lock.exists(),
+            "an owner-less lock was left behind for the grace window"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A `pid` that is a fifo must not hang the hook.

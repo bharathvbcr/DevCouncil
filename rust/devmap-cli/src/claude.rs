@@ -1452,6 +1452,29 @@ fn hook_shell_command(exe_text: &str, event: &str) -> anyhow::Result<String> {
 /// args, Codex ignores async, and root selection happens inside the hook
 /// from stdin.
 pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
+    hooks_block_without(executable, subcommands, &[])
+}
+
+/// Events in [`DEVMAP_HOOKS`] that Codex does not document
+/// (https://learn.chatgpt.com/docs/hooks lists PreToolUse, PermissionRequest,
+/// PostToolUse, PreCompact, PostCompact, UserPromptSubmit, SubagentStop, Stop,
+/// PreModelRequest, PostModelRequest, Interrupt, SessionStart, SubagentStart
+/// and SessionEnd). Codex has no failure event; it runs `PostToolUse` for Bash after a
+/// non-zero exit too (same page), so a failed shell write is still refreshed.
+const CODEX_UNSUPPORTED_EVENTS: &[&str] = &["PostToolUseFailure"];
+
+/// [`hooks_block`] for Codex's `hooks.json`: the same table minus the events
+/// Codex does not document. Both Codex writers (the plugin bundle and
+/// `devmap integrate`) call this, so they cannot drift.
+pub fn codex_hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
+    hooks_block_without(executable, subcommands, CODEX_UNSUPPORTED_EVENTS)
+}
+
+fn hooks_block_without(
+    executable: &Path,
+    subcommands: &[String],
+    omit: &[&str],
+) -> anyhow::Result<Value> {
     if !subcommands.iter().any(|name| name == "hook") {
         anyhow::bail!(
             "this binary does not register `devmap hook`, so the emitted handlers \
@@ -1466,7 +1489,10 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
     // event+matcher belong in one group. Two groups with the same matcher are
     // refused by Claude Code as a duplicate (both would fire, twice).
     let mut grouped: BTreeMap<(&str, &str), Vec<Value>> = BTreeMap::new();
-    for spec in DEVMAP_HOOKS {
+    for spec in DEVMAP_HOOKS
+        .iter()
+        .filter(|spec| !omit.contains(&spec.event))
+    {
         if PERMISSION_DECIDING_EVENTS.contains(&spec.event) {
             anyhow::bail!(
                 "{} decides an authorization outcome. Dev Map does not install hooks on \
@@ -1901,7 +1927,7 @@ pub fn render_plugin_bundle(
                 .join(".codex-plugin")
                 .join("hooks")
                 .join("hooks.json"),
-            pretty(&hooks_block(executable, subcommands)?),
+            pretty(&codex_hooks_block(executable, subcommands)?),
         ),
     ];
     for (name, body) in PLUGIN_SKILLS {
@@ -2938,7 +2964,60 @@ mod tests {
             .find(|(event, _, _)| *event == "PostToolUseFailure")
             .unwrap();
         assert!(hook.is_some(), "{reason}");
-        assert!(!reason.contains("wrote nothing to index.\""), "{reason}");
+        assert!(reason.contains("PostToolUseFailure"), "{reason}");
+    }
+
+    /// Cursor's shell refresh is a `postToolUse` entry with the exact matcher
+    /// `Shell`, run as `hook post-tool-use`. Cursor documents `Shell` as the
+    /// terminal tool's matcher value and sends `cwd` plus `tool_input.command`
+    /// on `postToolUse` (https://cursor.com/docs/agent/hooks, read 2026-11-21),
+    /// which are the fields the hook reads.
+    #[test]
+    fn cursor_shell_refresh_is_a_post_tool_use_entry_for_shell() {
+        let doc = cursor_hooks_document(Path::new("/usr/local/bin/devmap")).unwrap();
+        let entries = doc["hooks"]["postToolUse"].as_array().unwrap();
+        let shell: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["matcher"] == "Shell")
+            .collect();
+        assert_eq!(shell.len(), 1, "{entries:?}");
+        assert_eq!(
+            shell[0]["command"],
+            "'/usr/local/bin/devmap' hook post-tool-use"
+        );
+        assert!(doc["hooks"].get("afterShellExecution").is_none());
+    }
+
+    /// Codex documents its hook events and `PostToolUseFailure` is not one of
+    /// them (https://learn.chatgpt.com/docs/hooks, read 2026-11-21), so neither
+    /// Codex `hooks.json` carries it; Claude's still does.
+    #[test]
+    fn codex_hooks_json_omits_events_codex_does_not_document() {
+        let files = render_plugin_bundle(
+            Path::new("/usr/local/bin/devmap"),
+            Path::new("/tmp/devmap.sqlite"),
+            Some("0.0.0"),
+            &["hook".to_string()],
+        )
+        .unwrap();
+        let mut codex = 0;
+        for (path, text) in files
+            .iter()
+            .filter(|(path, _)| path.file_name().is_some_and(|name| name == "hooks.json"))
+        {
+            let document: Value = serde_json::from_str(text).unwrap();
+            let is_codex = path
+                .components()
+                .any(|part| part.as_os_str() == ".codex-plugin");
+            if is_codex {
+                codex += 1;
+                assert!(document["hooks"].get("PostToolUseFailure").is_none());
+                assert!(document["hooks"]["PostToolUse"].is_array());
+            } else {
+                assert!(document["hooks"]["PostToolUseFailure"].is_array());
+            }
+        }
+        assert_eq!(codex, 1);
     }
 
     /// Both bundles that carry a hooks.json (Claude's and Codex's) are rendered

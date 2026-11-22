@@ -986,6 +986,26 @@ without matcher support is ignored, an `if` outside a tool event means the
 handler never runs. A writer that only serializes reports the same success for a
 dead install as for a working one.
 
+Known limits of the shell-call refresh (`PostToolUse` / `PostToolUseFailure`
+on `Bash`):
+
+- It rebuilds the tree named by the payload's `cwd`. A shell call that edits
+  *another* tree (`cd ../wt && sed -i ...`, `sed -i ../wt/x`) refreshes the
+  `cwd` tree, not the touched one; the other tree's index catches up on its
+  own next build. The hook does not parse path operands out of the command.
+- A command is skipped only when the whole line provably cannot change the
+  tree. A leading `VAR=value` other than `LANG`/`LC_*` (`GIT_PAGER`,
+  `LD_PRELOAD`, ...), `bat --pager`, `file -C` and `git --exec-path=` count as
+  possible writes.
+- Codex documents no failure event, so its `hooks.json` carries no
+  `PostToolUseFailure`; its `PostToolUse` for Bash also runs after a non-zero
+  exit, so a failed shell write is still refreshed. Codex also re-trusts hooks
+  by hash (`/hooks`) after a reinstall.
+- Cursor documents `postToolUseFailure` (matcher `Shell`) and fires
+  `postToolUse` after a successful execution. Whether a non-zero exit counts as
+  one is undocumented, so no `postToolUseFailure` entry is installed and a
+  failed shell write may not be refreshed under Cursor.
+
 ### Agent guides
 
 Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five
