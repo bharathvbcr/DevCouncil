@@ -505,9 +505,7 @@ fn blast_change_inner<G: CodeGraph>(
         }
     };
     let mut unavailable: Vec<Unavailable> = Vec::new();
-    let mut unattributed: Vec<UnattributedChange> = Vec::new();
-    // qualified name -> (file, span lines, changed lines, deletion-only so far)
-    let mut seeds: BTreeMap<String, SeedSymbol> = BTreeMap::new();
+    let mut placement = Placement::default();
 
     if change.capped {
         unavailable.push(Unavailable::ChangedFilesCapped {
@@ -516,7 +514,6 @@ fn blast_change_inner<G: CodeGraph>(
         });
     }
 
-    let mut reported_ranges: BTreeMap<String, Vec<ChangedRange>> = BTreeMap::new();
     let mut exhausted = false;
     for (placed, file) in change.files.iter().enumerate() {
         if let Err(stop) = budget.check() {
@@ -528,17 +525,13 @@ fn blast_change_inner<G: CodeGraph>(
             exhausted = true;
             break;
         }
-        place_file(
-            blobs,
-            graph,
-            file,
-            until,
-            &mut seeds,
-            &mut unattributed,
-            &mut reported_ranges,
-            verify_extent,
-        );
+        place_file(blobs, graph, file, until, &mut placement, verify_extent);
     }
+    let Placement {
+        seeds,
+        unattributed,
+        mut reported_ranges,
+    } = placement;
     // The report names the file's real extent, not an end line the caller
     // typed. A whole-file range stays open-ended (`null`) on purpose.
     let mut changed_files = change.files.clone();
@@ -673,17 +666,31 @@ fn blast_change_inner<G: CodeGraph>(
     )
 }
 
+/// What placing every changed file accumulates: the seed symbols, the
+/// changes that could not be placed, and the clamped ranges to report.
+#[derive(Default)]
+struct Placement {
+    /// qualified name -> (file, span lines, changed lines, deletion-only so far)
+    seeds: BTreeMap<String, SeedSymbol>,
+    unattributed: Vec<UnattributedChange>,
+    /// path -> the clamped ranges the report names for that file.
+    reported_ranges: BTreeMap<String, Vec<ChangedRange>>,
+}
+
 /// Place one file's changed ranges into the symbols that span them.
 fn place_file<G: CodeGraph>(
     blobs: &BlobReader,
     graph: &G,
     file: &FileChange,
     until: &str,
-    seeds: &mut BTreeMap<String, SeedSymbol>,
-    unattributed: &mut Vec<UnattributedChange>,
-    reported_ranges: &mut BTreeMap<String, Vec<ChangedRange>>,
+    out: &mut Placement,
     verify_extent: bool,
 ) {
+    let Placement {
+        seeds,
+        unattributed,
+        reported_ranges,
+    } = out;
     // A file with no post-image lines cannot be intersected with anything. Its
     // ranges are empty by construction, so there is nothing to mark
     // unattributed either — but the file is still reported as changed, and
