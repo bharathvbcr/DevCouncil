@@ -408,7 +408,11 @@ fn affected_tests_and_explore_carry_a_gap_that_touches_their_radius() {
         .walk_incomplete
         .clone()
         .unwrap_or_else(|| panic!("`widget.helper()` may be a caller: {affected:?}"));
-    assert!(reason.contains("widget.helper"), "{reason}");
+    assert!(reason.contains("(helper)"), "{reason}");
+    assert!(
+        !reason.contains("widget."),
+        "receiver text is not prose (HOST_INTEGRATION.md): {reason}"
+    );
     assert_eq!(
         affected.tests.walk_incomplete,
         affected.blast_radius.layers.walk_incomplete
@@ -420,7 +424,7 @@ fn affected_tests_and_explore_carry_a_gap_that_touches_their_radius() {
             .layers
             .walk_incomplete
             .as_deref()
-            .is_some_and(|reason| reason.contains("widget.helper")),
+            .is_some_and(|reason| reason.contains("(helper)") && !reason.contains("widget.")),
         "{explored:?}"
     );
 }

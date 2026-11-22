@@ -124,7 +124,11 @@ fn a_caller_walk_names_the_unbound_site_that_names_a_reached_symbol() {
     let reason = impact
         .walk_incomplete
         .expect("`widget.middle()` names `middle`");
-    assert!(reason.contains("widget.middle"), "{reason}");
+    assert!(reason.contains("(middle)"), "{reason}");
+    assert!(
+        !reason.contains("widget."),
+        "receiver text is not prose (HOST_INTEGRATION.md): {reason}"
+    );
     assert!(!reason.contains("repository-wide"), "{reason}");
 }
 
@@ -137,12 +141,20 @@ fn a_callee_walk_names_the_unbound_site_inside_what_it_walked() {
         .walk_incomplete
         .clone()
         .unwrap_or_else(|| panic!("`other` holds an unbound call: {trace:?}"));
-    assert!(reason.contains("thing.frobnicate"), "{reason}");
+    assert!(reason.contains("(frobnicate)"), "{reason}");
+    assert!(
+        !reason.contains("thing."),
+        "receiver text is not prose (HOST_INTEGRATION.md): {reason}"
+    );
     let deps = engine.dependencies(request("other.py", 1)).unwrap();
     let reason = deps
         .walk_incomplete
         .expect("`other.py` holds an unbound call");
-    assert!(reason.contains("thing.frobnicate"), "{reason}");
+    assert!(reason.contains("frobnicate"), "{reason}");
+    assert!(
+        !reason.contains("thing."),
+        "receiver text is not prose (HOST_INTEGRATION.md): {reason}"
+    );
 }
 
 /// Method calls on an untyped receiver whose method name no indexed symbol
@@ -230,7 +242,11 @@ def busy(rows, thing):
         .walk_incomplete
         .clone()
         .unwrap_or_else(|| panic!("`thing.frobnicate()` may hide an edge: {trace:?}"));
-    assert!(reason.contains("thing.frobnicate"), "{reason}");
+    assert!(reason.contains("(frobnicate)"), "{reason}");
+    assert!(
+        !reason.contains("thing.") && !reason.contains("rows."),
+        "receiver text is not prose (HOST_INTEGRATION.md): {reason}"
+    );
     assert!(reason.starts_with("1 call site(s)"), "{reason}");
     assert!(!reason.contains("_nothing"), "{reason}");
 }
