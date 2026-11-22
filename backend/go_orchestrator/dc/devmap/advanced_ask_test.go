@@ -102,10 +102,12 @@ func TestAskEvidenceRefusesImpossibleCounts(t *testing.T) {
 }
 
 // TestAskEvidenceAcceptsARealPack pins the validator to devmap's own output,
-// captured from devmap 0.2.5 on 2026-11-20 (`devmap --json ask --evidence
-// --budget 400 "lease renewal"` in this repository). A hand-written pack only
-// agrees with what this file believes; this one is what the producer says, and
-// it has more units than files.
+// re-captured from devmap 0.2.5 (build c749b504) on 2026-11-21 (`devmap --json
+// ask --evidence --budget 400 "lease renewal"` in this repository). The
+// envelope's "repository" object is stripped when recording, because it holds
+// the recording machine's absolute worktree and store paths; do the same on the
+// next re-record. A hand-written pack only agrees with what this file believes;
+// this one is what the producer says, and it has more units than files.
 func TestAskEvidenceAcceptsARealPack(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("testdata", "ask_evidence_pack.json"))
 	if err != nil {

@@ -578,8 +578,9 @@ fn a_nested_symbol_carries_the_indentation_its_first_line_lost() {
 /// The pack's attribution gap is stated once, on the pack; the related-test
 /// list says only where its own walk stopped.
 ///
-/// The gap names the site that causes it — `rows.frobnicate`, an untyped
-/// receiver inside the hit — rather than a repository-wide count that every
+/// The gap names the callee of the site that causes it — `frobnicate`, called
+/// on an untyped receiver inside the hit; the receiver text stays out of prose
+/// (docs/devmap/HOST_INTEGRATION.md) — rather than a repository-wide count that every
 /// answer carried alike (retired 2026-10-07; see `radius_attribution_gap`).
 #[test]
 fn the_packs_gap_is_stated_once_and_names_its_site() {
@@ -614,7 +615,11 @@ fn the_packs_gap_is_stated_once_and_names_its_site() {
         .coverage_gap
         .as_deref()
         .unwrap_or_else(|| panic!("an unresolved call is a coverage gap: {pack:#?}"));
-    assert!(gap.contains("rows.frobnicate"), "{gap}");
+    assert!(gap.contains("(frobnicate)"), "{gap}");
+    assert!(
+        !gap.contains("rows."),
+        "receiver text is not prose (HOST_INTEGRATION.md): {gap}"
+    );
     assert!(!gap.contains("repository-wide"), "{gap}");
     let list = pack.related_tests.walk_incomplete.as_deref().unwrap_or("");
     assert!(

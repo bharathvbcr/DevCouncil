@@ -49,12 +49,12 @@ pub struct Response {
     pub redaction_ran: bool,
     /// `dc_redact::redact_secrets(text)`, byte for byte.
     pub text: String,
-    /// Lines that carried a credential and were rewritten. Line granularity is
-    /// what the library exposes; one line with two keys counts once.
+    /// Lines that carried a credential and were rewritten; one line with two
+    /// keys counts once. See `redacted_spans` for the exact replacement count.
     pub redacted_lines: usize,
-    /// The vendor shape `find_secret` names for each rewritten line, sorted
-    /// and de-duplicated. A line carrying several shapes names the first in
-    /// table order, so this is a lower bound on the shapes present.
+    /// Credential spans replaced, exactly: a line with two keys counts two.
+    pub redacted_spans: usize,
+    /// Every vendor shape a detection matched, sorted and de-duplicated.
     pub kinds: Vec<String>,
     pub input_bytes: usize,
     pub output_bytes: usize,
@@ -69,7 +69,8 @@ pub fn redact(request: &Request) -> Result<Response, String> {
             text.len()
         ));
     }
-    let redacted = dc_redact::redact_secrets(text);
+    let report = dc_redact::redact_secrets_report(text);
+    let redacted = report.text;
     if dc_redact::contains_secret(&redacted) {
         return Err(
             "redaction did not converge: the redacted text still carries a credential, \
@@ -77,20 +78,11 @@ pub fn redact(request: &Request) -> Result<Response, String> {
                 .to_string(),
         );
     }
-    let mut kinds = std::collections::BTreeSet::new();
-    let mut redacted_lines = 0;
-    for (before, after) in text
+    let redacted_lines = text
         .split_inclusive('\n')
         .zip(redacted.split_inclusive('\n'))
-    {
-        if before == after {
-            continue;
-        }
-        redacted_lines += 1;
-        if let Some(found) = dc_redact::find_secret(before.trim_end_matches(['\n', '\r'])) {
-            kinds.insert(found.name.to_string());
-        }
-    }
+        .filter(|(before, after)| before != after)
+        .count();
     Ok(Response {
         ok: true,
         id: "dcredact",
@@ -101,6 +93,7 @@ pub fn redact(request: &Request) -> Result<Response, String> {
         output_bytes: redacted.len(),
         text: redacted,
         redacted_lines,
-        kinds: kinds.into_iter().collect(),
+        redacted_spans: report.spans,
+        kinds: report.kinds.into_iter().map(str::to_string).collect(),
     })
 }
