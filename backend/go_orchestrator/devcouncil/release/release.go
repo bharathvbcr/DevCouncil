@@ -44,6 +44,24 @@ var RequiredArchives = []string{
 	"devmap-cli-x86_64-pc-windows-msvc.zip",
 }
 
+// RequiredInstallers is every installer asset a release must carry. The
+// README's `curl | sh`, `irm | iex` and `brew install` lines download these
+// by name, so a release without one breaks a documented install command.
+var RequiredInstallers = []string{
+	"devmap-cli-installer.sh",
+	"devmap-cli-installer.ps1",
+	"devmap.rb",
+}
+
+// installerAssets maps a dist-workspace.toml installer kind to the asset
+// cargo-dist publishes for it. The formula is named by
+// [package.metadata.dist] formula in rust/devmap-cli/Cargo.toml.
+var installerAssets = map[string]string{
+	"shell":      "devmap-cli-installer.sh",
+	"powershell": "devmap-cli-installer.ps1",
+	"homebrew":   "devmap.rb",
+}
+
 // WithdrawnMarker is what a notes file carries when its version is not in
 // the release line.
 const WithdrawnMarker = "<!-- release: withdrawn -->"
@@ -65,6 +83,8 @@ var (
 	sourceFieldRe   = regexp.MustCompile(`(?m)^source\s*=`)
 	goVersionRe     = regexp.MustCompile(`(?m)^const Version = "([^"]+)"`)
 	distTargetsRe   = regexp.MustCompile(`targets\s*=\s*\[`)
+	distInstallRe   = regexp.MustCompile(`(?m)^installers\s*=\s*\[`)
+	distTapRe       = regexp.MustCompile(`(?m)^tap\s*=\s*"[^"\s]+"`)
 	distFlagRe      = regexp.MustCompile(`^dist\s*=\s*(true|false)\b`)
 	workspaceHdrRe  = regexp.MustCompile(`(?m)^\[workspace\]`)
 	membersRe       = regexp.MustCompile(`members\s*=\s*\[`)
@@ -302,6 +322,20 @@ func ParseDistWorkspaceTargets(source string) []string {
 
 func distWorkspaceTargets(source string) (targets, unreadable []string) {
 	loc := distTargetsRe.FindStringIndex(source)
+	if loc == nil {
+		return nil, nil
+	}
+	return stringArray(source[loc[1]:])
+}
+
+// ParseDistWorkspaceInstallers lists the installer kinds in dist-workspace.toml.
+func ParseDistWorkspaceInstallers(source string) []string {
+	installers, _ := distWorkspaceInstallers(source)
+	return installers
+}
+
+func distWorkspaceInstallers(source string) (installers, unreadable []string) {
+	loc := distInstallRe.FindStringIndex(source)
 	if loc == nil {
 		return nil, nil
 	}
@@ -990,6 +1024,7 @@ func Inspect(src Sources, opts Options) Result {
 				}
 			}
 		}
+		errs = append(errs, distInstallerGaps(distToml)...)
 	}
 
 	if !opts.SkipWorkflows {
@@ -1019,9 +1054,41 @@ func Inspect(src Sources, opts Options) Result {
 		if missing := MissingArchives(opts.ArtifactsDir, RequiredArchives); len(missing) > 0 {
 			errs = append(errs, "required release archives missing: "+strings.Join(missing, ", "))
 		}
+		if missing := MissingArchives(opts.ArtifactsDir, RequiredInstallers); len(missing) > 0 {
+			errs = append(errs, "required release installers missing: "+strings.Join(missing, ", "))
+		}
 	}
 
 	return Result{Version: identity, Errors: errs}
+}
+
+// distInstallerGaps holds dist-workspace.toml's installers to the assets the
+// README promises: every kind must map to a known asset, every required
+// installer must be declared, and homebrew must name the tap it publishes to.
+func distInstallerGaps(distToml string) []string {
+	var errs []string
+	installers, unreadable := distWorkspaceInstallers(distToml)
+	for _, entry := range unreadable {
+		errs = append(errs, fmt.Sprintf("dist-workspace.toml installers has an entry this gate cannot read: %s", entry))
+	}
+	declared := make([]string, 0, len(installers))
+	for _, kind := range installers {
+		asset, known := installerAssets[kind]
+		if !known {
+			errs = append(errs, fmt.Sprintf("dist-workspace.toml installer %s has no asset this gate knows; add it to REQUIRED_INSTALLERS", kind))
+			continue
+		}
+		declared = append(declared, asset)
+	}
+	for _, req := range RequiredInstallers {
+		if !slices.Contains(declared, req) {
+			errs = append(errs, fmt.Sprintf("REQUIRED_INSTALLERS entry %s is not declared in dist-workspace.toml installers", req))
+		}
+	}
+	if slices.Contains(installers, "homebrew") && !distTapRe.MatchString(distToml) {
+		errs = append(errs, "dist-workspace.toml enables the homebrew installer without a tap")
+	}
+	return errs
 }
 
 // FindRoot walks up from dir to the checkout this gate inspects: the nearest

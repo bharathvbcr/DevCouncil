@@ -75,6 +75,8 @@ func scratchTree(t *testing.T, v tree) string {
 		`    "x86_64-apple-darwin",`,
 		`    "x86_64-pc-windows-msvc",`,
 		"]",
+		`installers = ["shell", "powershell", "homebrew"]`,
+		`tap = "owner/homebrew-tap"`,
 		"",
 	}, "\n"))
 	write(t, filepath.Join(dir, ".github", "workflows", "npm-publish.yml"), strings.Join([]string{
@@ -336,6 +338,78 @@ func TestInspectFailsWhenDistWorkspaceTomlMissesARequiredTarget(t *testing.T) {
 	if errs := Inspect(DefaultSources(root), Options{}).Errors; !anyContains(errs, "REQUIRED_ARCHIVES entry", "not declared") {
 		t.Fatalf("errors: %v", errs)
 	}
+}
+
+func distWorkspaceWithInstallers(installers string) string {
+	return "[workspace]\nmembers = [\"cargo:./rust\"]\n\n[dist]\ntargets = [\n" +
+		"    \"x86_64-unknown-linux-gnu\",\n    \"aarch64-apple-darwin\",\n" +
+		"    \"x86_64-apple-darwin\",\n    \"x86_64-pc-windows-msvc\",\n]\n" + installers
+}
+
+func TestParsersParseInstallersFromDistWorkspaceToml(t *testing.T) {
+	source := distWorkspaceWithInstallers("installers = [\"shell\", \"homebrew\"]\n")
+	mustEqual(t, ParseDistWorkspaceInstallers(source), []string{"shell", "homebrew"})
+}
+
+func TestRequiredInstallersNameEveryReadmeInstallRoute(t *testing.T) {
+	// curl | sh, irm | iex and brew install each download one of these.
+	mustEqual(t, RequiredInstallers, []string{"devmap-cli-installer.sh", "devmap-cli-installer.ps1", "devmap.rb"})
+}
+
+func TestInspectFailsWhenDistWorkspaceTomlDropsAnInstaller(t *testing.T) {
+	root := scratchTree(t, defaultTree())
+	write(t, filepath.Join(root, "dist-workspace.toml"),
+		distWorkspaceWithInstallers("installers = [\"shell\", \"homebrew\"]\ntap = \"owner/homebrew-tap\"\n"))
+	if errs := Inspect(DefaultSources(root), Options{}).Errors; !anyContains(errs, "REQUIRED_INSTALLERS entry", "devmap-cli-installer.ps1") {
+		t.Fatalf("errors: %v", errs)
+	}
+}
+
+func TestInspectFailsWhenDistWorkspaceTomlDeclaresNoInstallers(t *testing.T) {
+	root := scratchTree(t, defaultTree())
+	write(t, filepath.Join(root, "dist-workspace.toml"), distWorkspaceWithInstallers("installers = []\n"))
+	errs := Inspect(DefaultSources(root), Options{}).Errors
+	for _, asset := range RequiredInstallers {
+		if !anyContains(errs, "REQUIRED_INSTALLERS entry", asset) {
+			t.Fatalf("%s not named; errors: %v", asset, errs)
+		}
+	}
+}
+
+func TestInspectFailsOnAnInstallerKindThisGateCannotMapToAnAsset(t *testing.T) {
+	root := scratchTree(t, defaultTree())
+	write(t, filepath.Join(root, "dist-workspace.toml"),
+		distWorkspaceWithInstallers("installers = [\"shell\", \"powershell\", \"homebrew\", \"msi\"]\ntap = \"owner/homebrew-tap\"\n"))
+	if errs := Inspect(DefaultSources(root), Options{}).Errors; !anyContains(errs, "installer msi") {
+		t.Fatalf("errors: %v", errs)
+	}
+}
+
+func TestInspectFailsWhenHomebrewHasNoTap(t *testing.T) {
+	root := scratchTree(t, defaultTree())
+	write(t, filepath.Join(root, "dist-workspace.toml"),
+		distWorkspaceWithInstallers("installers = [\"shell\", \"powershell\", \"homebrew\"]\n"))
+	if errs := Inspect(DefaultSources(root), Options{}).Errors; !anyContains(errs, "homebrew", "tap") {
+		t.Fatalf("errors: %v", errs)
+	}
+}
+
+func TestInspectFailsWhenArtifactsCarryEveryArchiveButNoInstaller(t *testing.T) {
+	root := scratchTree(t, defaultTree())
+	art := filepath.Join(root, "artifacts")
+	for _, name := range RequiredArchives {
+		write(t, filepath.Join(art, name), "x")
+	}
+	errs := Inspect(DefaultSources(root), Options{ArtifactsDir: art}).Errors
+	for _, asset := range RequiredInstallers {
+		if !anyContains(errs, "missing", asset) {
+			t.Fatalf("%s not named; errors: %v", asset, errs)
+		}
+	}
+	for _, name := range RequiredInstallers {
+		write(t, filepath.Join(art, name), "x")
+	}
+	mustEqual(t, Inspect(DefaultSources(root), Options{ArtifactsDir: art}).Errors, []string(nil))
 }
 
 func TestInspectReportsUnparseablePackageJSONInsteadOfCrashing(t *testing.T) {

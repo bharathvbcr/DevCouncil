@@ -15,8 +15,13 @@ categories = [
     "development-tools::debugging",
     "parser-implementations",
 ]
+homepage = "https://devcouncil.vbcr.dev/"
 build = "build.rs"
 autotests = false
+
+# The Homebrew formula is named for the binary users type, not the crate.
+[package.metadata.dist]
+formula = "devmap"
 
 [[bin]]
 name = "devmap"
