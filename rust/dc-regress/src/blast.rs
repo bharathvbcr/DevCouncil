@@ -525,14 +525,7 @@ fn blast_change_inner<G: CodeGraph>(
             exhausted = true;
             break;
         }
-        place_file(
-            blobs,
-            graph,
-            file,
-            until,
-            &mut placement,
-            verify_extent,
-        );
+        place_file(blobs, graph, file, until, &mut placement, verify_extent);
     }
     let Placement {
         seeds,
@@ -673,9 +666,8 @@ fn blast_change_inner<G: CodeGraph>(
     )
 }
 
-/// What placing every changed file accumulates: the three outputs
-/// `place_file` writes to, kept together so one call carries them as one
-/// argument.
+/// What placing every changed file accumulates: the seed symbols, the
+/// changes that could not be placed, and the clamped ranges to report.
 #[derive(Default)]
 struct Placement {
     /// qualified name -> (file, span lines, changed lines, deletion-only so far)
