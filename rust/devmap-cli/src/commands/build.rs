@@ -1743,18 +1743,24 @@ fn check_reuse_binding(dir: &std::path::Path, store: &Store) -> Result<(), Strin
     let bound_generation = value["generation_id"]
         .as_u64()
         .ok_or_else(|| format!("{} names no generation", path.display()))?;
-    let bound_created = value["created_at"]
-        .as_f64()
+    // Compared as bits: a decimal float read back through serde_json can land
+    // one ULP away from the value written, which would refuse a valid binding.
+    let bound_bits = value["created_at_bits"]
+        .as_u64()
         .ok_or_else(|| format!("{} names no creation time", path.display()))?;
     let latest = store
         .latest_generation_identity()
         .map_err(|error| format!("could not read the latest generation: {error}"))?;
     match latest {
-        Some((id, created)) if u64::from(id) == bound_generation && created == bound_created => {
+        Some((id, created))
+            if u64::from(id) == bound_generation && created.to_bits() == bound_bits =>
+        {
             Ok(())
         }
         Some((id, created)) => Err(format!(
-            "written for generation {bound_generation} created at {bound_created}, the store is at generation {id} created at {created}"
+            "written for generation {bound_generation} created at {} (bits {bound_bits:#x}), the store is at generation {id} created at {created} (bits {:#x})",
+            f64::from_bits(bound_bits),
+            created.to_bits()
         )),
         None => Err(format!(
             "written for generation {bound_generation}, the store has none"
@@ -1780,6 +1786,8 @@ fn bind_reuse_cache(
         Ok(Some((id, created_at))) if id == generation_id => {
             let bytes = serde_json::to_vec(&serde_json::json!({
                 "generation_id": id,
+                "created_at_bits": created_at.to_bits(),
+                // Human-readable only; never compared.
                 "created_at": created_at,
             }))
             .map_err(|error| format!("could not encode the binding: {error}"))?;

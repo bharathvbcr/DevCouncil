@@ -1567,7 +1567,7 @@ fn a_cache_written_for_another_creation_time_resolves_every_file() {
     assert_unbound_cache_resolves_everything("other-created-at", |root| {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(binding_path(root)).unwrap()).unwrap();
-        value["created_at"] = serde_json::json!(1.0);
+        value["created_at_bits"] = serde_json::json!(1.0f64.to_bits());
         std::fs::write(binding_path(root), serde_json::to_vec(&value).unwrap()).unwrap();
     });
 }
@@ -1609,4 +1609,56 @@ fn a_store_whose_latest_generation_id_matches_but_created_at_differs_is_refused(
     );
     assert_matches_cold(&root);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A creation time with 17 significant digits, as a nanosecond clock produces.
+/// The binding compares exact bits, so a valid binding for such a row is
+/// honoured however the decimal text would round-trip.
+fn assert_exact_created_at_is_reused(label: &str, created_at: f64) {
+    let root = scratch(label);
+    write_independent_tree(&root);
+    build_text(&root);
+    let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE generations SET created_at = ?1
+              WHERE id = (SELECT max(id) FROM generations)",
+            [created_at],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(conn);
+    // The binding the build writes for this row, by the same encoding.
+    let id: i64 = rusqlite::Connection::open(db_path(&root))
+        .unwrap()
+        .query_row("SELECT max(id) FROM generations", [], |row| row.get(0))
+        .unwrap();
+    std::fs::write(
+        binding_path(&root),
+        serde_json::to_vec(&serde_json::json!({
+            "generation_id": id,
+            "created_at_bits": created_at.to_bits(),
+            "created_at": created_at,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 1 of 21 files"),
+        "{label}: a binding for exactly this creation time is reused; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_binding_for_a_seventeen_digit_creation_time_is_reused() {
+    assert_exact_created_at_is_reused("created-at-17", 1795366155.1264899);
+}
+
+#[test]
+fn a_binding_for_a_nanosecond_grained_creation_time_is_reused() {
+    assert_exact_created_at_is_reused("created-at-ns", 1795366155.9876543);
 }

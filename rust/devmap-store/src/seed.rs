@@ -497,18 +497,20 @@ pub const REUSE_BINDING_FILE: &str = "generation.json";
 /// copy and the copied binding is kept only when both reads are the same bytes.
 /// A binding that is absent, unreadable or changed is dropped from the copy,
 /// which makes the copy a cache that resolves every file once, never one that
-/// serves another generation's blobs.
+/// serves another generation's blobs. The decision is made on the staged
+/// directory, before it is renamed into place, so the target never holds a
+/// binding that was not checked; a binding that cannot be removed fails the
+/// seed (and the staged directory is discarded) rather than being placed.
 pub fn seed_reuse_directory(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
     let binding = source_dir.join(REUSE_BINDING_FILE);
     let before = std::fs::read(&binding).ok();
-    let placed = seed_directory_cow(source_dir, target_dir)?;
-    if placed.is_some() {
+    seed_directory_cow_with(source_dir, target_dir, &|staged| {
         let after = std::fs::read(&binding).ok();
         if before.is_none() || before != after {
-            remove_file_if_present(&target_dir.join(REUSE_BINDING_FILE))?;
+            remove_file_if_present(&staged.join(REUSE_BINDING_FILE))?;
         }
-    }
-    Ok(placed)
+        Ok(())
+    })
 }
 
 /// Seed a flat cache directory (such as `resolution-reuse-1/`) via copy-on-write
@@ -518,6 +520,17 @@ pub fn seed_reuse_directory(source_dir: &Path, target_dir: &Path) -> Result<Opti
 /// syscall; on filesystems without directory `clonefile`, creates a staged
 /// directory and clones/copies regular file entries atomically before rename.
 pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    seed_directory_cow_with(source_dir, target_dir, &|_| Ok(()))
+}
+
+/// [`seed_directory_cow`] with `before_place` run on the staged directory once
+/// it is complete and before it is renamed to `target_dir`. An error from it
+/// discards the staged directory and is returned.
+fn seed_directory_cow_with(
+    source_dir: &Path,
+    target_dir: &Path,
+    before_place: &dyn Fn(&Path) -> Result<()>,
+) -> Result<Option<SeedMethod>> {
     // Whatever a killed seed staged for this directory under a pid that is gone.
     let swept = sweep_dead_staging(target_dir);
     for failure in &swept.failures {
@@ -545,6 +558,10 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
     let staged = sidecar(target_dir, &format!(".seed-dir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     if try_clone(source_dir, &staged) {
+        if let Err(error) = before_place(&staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
         if let Err(error) = std::fs::rename(&staged, target_dir) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(error).with_context(|| format!("cannot place {}", target_dir.display()));
@@ -565,6 +582,7 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
                 method = SeedMethod::Copy;
             }
         }
+        before_place(&staged)?;
         std::fs::rename(&staged, target_dir)
             .with_context(|| format!("cannot place {}", target_dir.display()))?;
         Ok(())
