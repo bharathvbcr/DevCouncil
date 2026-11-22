@@ -1455,12 +1455,10 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
     hooks_block_without(executable, subcommands, &[])
 }
 
-/// Events in [`DEVMAP_HOOKS`] that Codex does not document
-/// (https://learn.chatgpt.com/docs/hooks lists PreToolUse, PermissionRequest,
-/// PostToolUse, PreCompact, PostCompact, UserPromptSubmit, SubagentStop, Stop,
-/// PreModelRequest, PostModelRequest, Interrupt, SessionStart, SubagentStart
-/// and SessionEnd). Codex has no failure event; it runs `PostToolUse` for Bash after a
-/// non-zero exit too (same page), so a failed shell write is still refreshed.
+/// Events in [`DEVMAP_HOOKS`] that Codex does not document; the documented
+/// list and its source page are `CODEX_DOCUMENTED_EVENTS` below. Codex has no
+/// failure event; it runs `PostToolUse` for Bash after a non-zero exit too
+/// (same page), so a failed shell write is still refreshed.
 const CODEX_UNSUPPORTED_EVENTS: &[&str] = &["PostToolUseFailure"];
 
 /// The hook events Codex documents (https://learn.chatgpt.com/docs/hooks, read
