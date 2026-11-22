@@ -110,14 +110,10 @@ impl Fingerprint {
 /// the lock in two. A private staged store's lock goes through
 /// [`remove_staged_writer_lock`].
 pub fn discard_staged(path: &Path) {
-    for file in [
-        path.to_path_buf(),
-        sidecar(path, "-wal"),
-        sidecar(path, "-shm"),
-        sidecar(path, "-journal"),
-        sidecar(path, ".csr"),
-        sidecar(path, ".artifacts.json"),
-    ] {
+    let sidecars = SQLITE_SIDECARS.into_iter().chain(STORE_SIDECARS);
+    for file in
+        std::iter::once(path.to_path_buf()).chain(sidecars.map(|suffix| sidecar(path, suffix)))
+    {
         let _ = std::fs::remove_file(file);
     }
 }
@@ -591,7 +587,7 @@ pub fn prepare_immutable_snapshot(staged: &Path) -> Result<()> {
         let _: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
         conn.close().map_err(|(_, error)| error)?;
     }
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_SIDECARS {
         let side = sidecar(staged, suffix);
         let _ = std::fs::remove_file(&side);
     }
@@ -682,7 +678,7 @@ pub fn settle_staged(staged: &Path) -> Result<()> {
         bail!("the staged store could not be checkpointed (busy)");
     }
     conn.close().map_err(|(_, error)| error)?;
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_SIDECARS {
         let side = sidecar(staged, suffix);
         if let Ok(meta) = std::fs::symlink_metadata(&side) {
             if meta.len() != 0 {

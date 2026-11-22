@@ -460,21 +460,20 @@ impl Store {
         // repair after `Connection::open` is a repair the connection never
         // sees. See `repair_sidecar_modes`.
         Self::repair_sidecar_modes(path)?;
-        // Held to the end of this open; see `CONNECTION_SETUP`.
-        let _setup = CONNECTION_SETUP
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         // A store is being created at `path`: the consumer sidecars beside it
         // (`.csr`, `.artifacts.json`) were written by an earlier store at this
         // path, never by this one, and each describes the store it sat beside.
         // Readers accept a CSR on its generation number alone, so an orphan
         // stamped with the new store's generation would be served as its graph.
-        if matches!(
-            std::fs::symlink_metadata(path),
-            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
-        ) {
-            Self::remove_foreign_sidecars(path)?;
-        }
+        // The guard, when one was needed, is held to the end of this open: it
+        // is what keeps a seed from placing its sidecars between the sweep and
+        // the creation. Taken before `CONNECTION_SETUP`, which it must not
+        // be waited on under.
+        let _creation_lock = Self::sweep_foreign_sidecars(path)?;
+        // Held to the end of this open; see `CONNECTION_SETUP`.
+        let _setup = CONNECTION_SETUP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut conn = Connection::open(path)?;
         Self::harden_connection(&conn)?;
         let store = path.display().to_string();
@@ -549,6 +548,60 @@ impl Store {
             full_text_damage: None,
             repo_root_override: None,
         })
+    }
+
+    /// Sweep the consumer sidecars beside a store that does not exist yet,
+    /// holding the store's writer lock while it does.
+    ///
+    /// `CONNECTION_SETUP` serialises one process only. A seed in another
+    /// process places a store's sidecars first and the store last, under this
+    /// same lock, so a sweep that did not take it could delete the CSR and
+    /// artifact stamp a seed had just placed. The lock is taken only when an
+    /// orphan is actually there to remove, and the store's absence is checked
+    /// again under it: a seed that finished while this waited has left a store,
+    /// and its sidecars are its own. A caller that already holds the lock on
+    /// this thread (`devmap build` takes it, then opens the store it is about
+    /// to create) is not asked for it a second time: that would wait on itself.
+    ///
+    /// Returns the guard so the caller can hold it through the creation.
+    fn sweep_foreign_sidecars(db_path: &Path) -> Result<Option<WriterLock>> {
+        let absent = |path: &Path| {
+            matches!(
+                std::fs::symlink_metadata(path),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        };
+        let orphaned = || {
+            crate::seed::STORE_SIDECARS
+                .iter()
+                .any(|suffix| !absent(&crate::seed::sidecar(db_path, suffix)))
+        };
+        if !absent(db_path) || !orphaned() {
+            return Ok(None);
+        }
+        let lock_path = Self::writer_lock_path(db_path);
+        let held_here = super::held_writer_locks()
+            .as_ref()
+            .and_then(|held| held.get(&lock_path))
+            .is_some_and(|holder| *holder == std::thread::current().id());
+        let guard = if held_here {
+            None
+        } else {
+            Some(
+                Self::lock_file_at(&lock_path, Self::WRITER_LOCK_WAIT).map_err(|error| {
+                    refusal(format!(
+                        "a new devmap store at {} would sit beside sidecars an earlier store \
+                         left, and the writer lock that makes removing them safe could not be \
+                         taken: {error:#}",
+                        db_path.display()
+                    ))
+                })?,
+            )
+        };
+        if absent(db_path) {
+            Self::remove_foreign_sidecars(db_path)?;
+        }
+        Ok(guard)
     }
 
     /// Unlink each consumer sidecar of the not-yet-created store `db_path`. A
@@ -1078,6 +1131,9 @@ impl Store {
             &lock_path.with_extension("lock.owner"),
             std::process::id().to_string().as_bytes(),
         )?;
+        super::held_writer_locks()
+            .get_or_insert_with(Default::default)
+            .insert(lock_path.clone(), std::thread::current().id());
         Ok(WriterLock {
             file: Some(file),
             path: Some(lock_path),
@@ -1265,10 +1321,9 @@ impl Store {
                 )));
             }
         }
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let mut sidecar = path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            let sidecar_path = std::path::Path::new(&sidecar);
+        for suffix in crate::seed::SQLITE_SIDECARS {
+            let sidecar = crate::seed::sidecar(path, suffix);
+            let sidecar_path = sidecar.as_path();
             match std::fs::symlink_metadata(sidecar_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => {
