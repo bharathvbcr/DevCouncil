@@ -17,9 +17,6 @@ name = "global_excludes_are_one_rule"
 [[test]]
 name = "a_deadline_reaches_the_children_the_child_started"
 
-[[test]]
-name = "scan_tree_bounded"
-
 [dependencies]
 dc-proc = { path = "../dc-proc" }
 dc-glob = { path = "../dc-glob" }

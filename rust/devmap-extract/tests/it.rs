@@ -166,6 +166,7 @@ mod rust_thread_local_statics;
 #[cfg(feature = "parse")]
 mod rust_use_declarations;
 mod safe_fs_controls;
+mod scan_tree_bounded;
 #[cfg(feature = "parse")]
 mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
