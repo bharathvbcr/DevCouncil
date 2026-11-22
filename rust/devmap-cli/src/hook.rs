@@ -3711,16 +3711,26 @@ fn detached_shell_command(
         // A retaken lock names its owner like any other: without a pid file
         // the next hook calls it stale after LOCK_PID_GRACE and starts a second
         // builder. `$$` is this shell, the pid `spawn` records for the child.
+        // If the pid cannot be written the lock is removed and the loop ends,
+        // rather than leaving an owner-less lock for the grace window.
         let pid_quoted = shell_single_quote(&format!("{lock}/pid"));
+        // The age ceiling reads the lock directory's mtime, which a rerun
+        // would otherwise leave at the first run's start: a build plus reruns
+        // past LOCK_MAX_AGE would let another hook reclaim a live lock. Making
+        // and removing an entry stamps the directory with shell builtins and
+        // `/bin/rm` only.
+        let beat = shell_single_quote(&format!("{lock}/beat"));
         script.push_str(&format!(
             "/bin/rm -f {marker}; {run}; status=$?; reruns=0; \
              while :; do \
              while [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ]; do \
-             reruns=$((reruns+1)); /bin/rm -f {marker}; {run}; status=$?; done; \
+             reruns=$((reruns+1)); : > {beat} && /bin/rm -f {beat}; \
+             /bin/rm -f {marker}; {run}; status=$?; done; \
              /bin/rm -rf {lock_quoted}; \
              [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ] \
              && /bin/mkdir {lock_quoted} 2>/dev/null \
-             && echo $$ > {pid_quoted} || break; \
+             && {{ echo $$ > {pid_quoted} || {{ /bin/rm -rf -- {lock_quoted}; break; }}; }} \
+             || break; \
              done; exit $status"
         ));
         return finish_detached_shell(script);
@@ -9890,6 +9900,118 @@ mod lock_tests {
                 .as_nanos(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    /// Runs the rerun loop's script with `first_run` as the program's first
+    /// run, which asks for a rerun, and returns the shell.
+    fn rerun_script_child(
+        base: &Path,
+        lock: &Path,
+        marker: &Path,
+        first_run: &str,
+        edit_script: impl Fn(String) -> String,
+    ) -> std::process::Child {
+        let exe = base.join("devmap-stand-in");
+        let body = format!(
+            "#!/bin/sh\nd='{dir}'\nif [ ! -e \"$d/first\" ]; then : > \"$d/first\"; : > '{marker}'; {first_run}; exit 0; fi\n: > \"$d/second\"\nwhile [ -e \"$d/release\" ]; do /bin/sleep 0.05; done\n",
+            dir = base.display(),
+            marker = marker.display(),
+        );
+        fs::write(&exe, body).unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = detached_shell_command(
+            &exe,
+            &[],
+            lock,
+            SpawnOptions {
+                delay: None,
+                rerun_when_dirty: true,
+            },
+        )
+        .unwrap();
+        let script = cmd
+            .get_args()
+            .nth(1)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(edit_script(script))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for(ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ready()
+    }
+
+    /// A build whose first run began over LOCK_MAX_AGE ago and which is now in a
+    /// rerun still holds its lock: the rerun stamps the lock directory, so the
+    /// age ceiling measures the rerun, not the first run.
+    #[test]
+    fn a_rerun_refreshes_the_lock_age_the_ceiling_reads() {
+        let base = scratch("rerun-age");
+        let codeintel = base.join("codeintel");
+        let lock = codeintel.join("hook-build.running");
+        fs::create_dir_all(&lock).unwrap();
+        fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+        let marker = codeintel.join(BUILD_DIRTY_MARKER);
+        fs::write(base.join("release"), b"").unwrap();
+        let first_run = format!("touch -t 200001010000 '{}'", lock.display());
+        let mut child = rerun_script_child(&base, &lock, &marker, &first_run, |script| script);
+        assert!(wait_for(|| base.join("second").exists()), "no rerun");
+        let stale = lock_dir_is_stale(&lock);
+        fs::remove_file(base.join("release")).unwrap();
+        child.wait().unwrap();
+        assert!(!stale, "a lock whose owner is mid-rerun was called stale");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// If the retaken lock's pid cannot be written, the lock is removed rather
+    /// than left owner-less for LOCK_PID_GRACE.
+    #[test]
+    fn a_retaken_lock_whose_pid_cannot_be_written_is_removed() {
+        let base = scratch("retake-nopid");
+        let codeintel = base.join("codeintel");
+        let lock = codeintel.join("hook-build.running");
+        fs::create_dir_all(&lock).unwrap();
+        let marker = codeintel.join(BUILD_DIRTY_MARKER);
+        let quoted = shell_single_quote(lock.to_str().unwrap());
+        let unlock = format!("/bin/rm -rf {quoted}; ");
+        let done = base.join("injected");
+        let mut child = rerun_script_child(&base, &lock, &marker, ":", |script| {
+            // A directory at `pid` makes the write fail; the marker lands once,
+            // after the unlock, so the loop retakes the lock.
+            let injection = format!(
+                "{unlock}[ ! -e '{done}' ] && : > '{done}' && : > '{marker}'; ",
+                done = done.display(),
+                marker = marker.display()
+            );
+            script.replacen(&unlock, &injection, 1).replacen(
+                &format!("/bin/mkdir {quoted} 2>/dev/null"),
+                &format!("/bin/mkdir {quoted} 2>/dev/null && /bin/mkdir {quoted}/pid"),
+                1,
+            )
+        });
+        let status = child.wait().unwrap();
+        assert!(done.exists(), "the marker was never injected");
+        assert!(status.success(), "{status}");
+        assert!(
+            !lock.exists(),
+            "an owner-less lock was left behind for the grace window"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A `pid` that is a fifo must not hang the hook.
