@@ -1815,9 +1815,11 @@ fn worktree_build_output_warning_at(path: &Path) -> Option<String> {
 }
 
 /// The `notes` line for a receipt: the warning, but only when an MCP entry
-/// naming `executable` was actually written. Otherwise nothing will break.
-pub(crate) fn mcp_receipt_note(executable: &Path, wrote_mcp_entry: bool) -> Option<String> {
-    if wrote_mcp_entry {
+/// naming `executable` is registered after the run. Otherwise nothing will
+/// break. This covers MCP entries only: the hook and plugin writers also embed
+/// the binary path and are not checked (card ft-502e29ba).
+pub(crate) fn mcp_receipt_note(executable: &Path, registered: bool) -> Option<String> {
+    if registered {
         worktree_build_output_warning(executable)
     } else {
         None
@@ -3454,18 +3456,12 @@ mod tests {
             .collect();
         let accepted: Vec<_> = cases.iter().map(|p| mcp_entry(p, None, None)).collect();
         let primary = worktree_build_output_warning(&primary_bin);
-        let link_dir = root.join("bin");
-        std::fs::create_dir_all(&link_dir).expect("link dir");
-        let link = link_dir.join("devmap");
-        std::fs::create_dir_all(lane.join("rust/target/debug")).expect("lane target");
-        std::fs::write(lane.join("rust/target/debug/devmap"), b"x").expect("lane binary");
-        std::os::unix::fs::symlink(lane.join("rust/target/debug/devmap"), &link).expect("symlink");
-        let via_symlink = worktree_build_output_warning(&link);
         let note_direct = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), true);
-        let note_link = mcp_receipt_note(&link, true);
-        let note_unwritten = mcp_receipt_note(&link, false);
-        let first = first_sighting(&link);
-        let second = first_sighting(&link);
+        let note_unregistered = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), false);
+        // A path no writer above has used, so the set has not seen it yet.
+        let unseen = lane.join("rust/target/debug/unseen-devmap");
+        let first = first_sighting(&unseen);
+        let second = first_sighting(&unseen);
         let source_file = worktree_build_output_warning(&lane.join("rust/src/target"));
         let _ = std::fs::remove_dir_all(&root);
         for (path, warning) in warned {
@@ -3477,15 +3473,31 @@ mod tests {
         for entry in accepted {
             entry.expect("a warning is not a refusal");
         }
-        assert!(
-            via_symlink.is_some(),
-            "a symlink into a lane's build output was not flagged"
-        );
         assert!(first && !second, "stderr warns once per path");
-        assert!(note_direct.is_some() && note_link.is_some(), "receipt note missing");
-        assert!(note_unwritten.is_none(), "nothing was written, nothing will break");
+        assert!(note_direct.is_some(), "receipt note missing");
+        assert!(note_unregistered.is_none(), "nothing registered, nothing will break");
         assert!(primary.is_none(), "the main checkout outlives any lane: {primary:?}");
         assert!(source_file.is_none(), "a file named target is not build output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_a_lanes_build_output_warns_and_notes() {
+        let root = scratch_dir("link");
+        let main = root.join("main");
+        init_repo(&main);
+        let lane = root.join("lane");
+        git_in(&main, &["worktree", "add", "-q", lane.to_str().expect("utf8"), "-b", "lane"]);
+        let binary = lane.join("rust/target/debug/devmap");
+        std::fs::create_dir_all(binary.parent().expect("parent")).expect("lane target");
+        std::fs::write(&binary, b"x").expect("lane binary");
+        let link = root.join("devmap");
+        std::os::unix::fs::symlink(&binary, &link).expect("symlink");
+        let warning = worktree_build_output_warning(&link);
+        let note = mcp_receipt_note(&link, true);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(warning.is_some(), "a symlink into a lane was not flagged");
+        assert!(note.is_some(), "the receipt note is missing for the symlink");
     }
 
     #[test]

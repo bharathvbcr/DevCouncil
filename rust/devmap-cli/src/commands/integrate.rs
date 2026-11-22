@@ -182,17 +182,16 @@ fn run_integrate(
         hand_written,
     )?;
     // The warning `mcp_entry` prints on stderr, kept in the receipt's own
-    // `notes` so a caller reading the JSON sees it too. Only when an MCP entry
-    // naming this executable was written: a dry run, a check, or an unchanged
-    // entry leaves nothing that will break.
-    let wrote_mcp_entry = !dry_run
-        && !check
-        && report
-            .global_mcp
-            .iter()
-            .chain(report.project_mcp.iter())
-            .any(|m| m.changed);
-    if let Some(warning) = claude::mcp_receipt_note(&executable, wrote_mcp_entry) {
+    // `notes` so a caller reading the JSON sees it too. It covers MCP entries
+    // only. It is keyed on the documents as they stand after this run, not on
+    // `changed`: an entry that was already current still breaks, and a removal
+    // (`retire_beside_plugin`) leaves nothing to break.
+    let registered = report
+        .global_mcp
+        .iter()
+        .chain(report.project_mcp.iter())
+        .any(|outcome| document_registers_executable(&outcome.path, &executable));
+    if let Some(warning) = claude::mcp_receipt_note(&executable, registered) {
         report.notes.push(warning);
     }
     if cli.json {
@@ -281,6 +280,48 @@ fn run_integrate(
         anyhow::bail!("integrate --check: assets differ from the expected installation");
     }
     Ok(())
+}
+
+/// True when the host document at `path` registers `devmap` with `executable`
+/// as its command, as written by Claude/Cursor-style JSON (`mcpServers`),
+/// OpenCode (`mcp`, a command array) or Codex TOML (`mcp_servers`).
+///
+/// A document that is missing, oversized or unparsable registers nothing.
+fn document_registers_executable(path: &Path, executable: &Path) -> bool {
+    const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > MAX_DOCUMENT_BYTES {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let command: Option<String> = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        let entry = json
+            .pointer("/mcpServers/devmap/command")
+            .or_else(|| json.pointer("/mcp/devmap/command/0"));
+        entry.and_then(|v| v.as_str()).map(str::to_owned)
+    } else if let Ok(toml) = text.parse::<toml::Table>() {
+        toml.get("mcp_servers")
+            .and_then(|servers| servers.get("devmap"))
+            .and_then(|entry| entry.get("command"))
+            .and_then(|command| command.as_str())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    let Some(command) = command else {
+        return false;
+    };
+    let command = Path::new(&command);
+    command == executable
+        || matches!(
+            (command.canonicalize(), executable.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Map context for integrate: prefer an on-disk repo map, else an empty shell
