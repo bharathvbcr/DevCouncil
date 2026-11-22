@@ -192,6 +192,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     ensure_target_absent(&target_db)?;
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
     seed::discard_staged(&staged);
+    sweep_dead_staging(&target_db);
     let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
         // A seed stamps the lane's HEAD on what it places, whether it keeps the
         // donor's graph or builds the lane's own, so a HEAD that cannot be read
@@ -320,6 +321,19 @@ pub(crate) struct Plan {
     root: PathBuf,
     main: PathBuf,
     source_store: PathBuf,
+}
+
+/// Clear what killed seeds left beside `target`, with its writer lock held.
+/// Hygiene only: a failure is reported and the seed goes on.
+fn sweep_dead_staging(target: &Path) {
+    match seed::sweep_dead_staging(target) {
+        Ok(0) => {}
+        Ok(removed) => eprintln!(
+            "devmap: removed {removed} staging file(s) left beside {} by a seed that did not finish",
+            target.display()
+        ),
+        Err(error) => eprintln!("devmap: could not clear old seed staging files: {error:#}"),
+    }
 }
 
 /// RAII guard for a staged `--seed-from` database (`<db>.seed-<pid>`).
@@ -451,6 +465,7 @@ impl Plan {
         let started = std::time::Instant::now();
         let staged = seed::sidecar(&db, &format!(".seed-{}", std::process::id()));
         seed::discard_staged(&staged);
+        sweep_dead_staging(&db);
         match self.stage_into(&staged) {
             Ok(method) => {
                 self.seed_resolution_reuse();
