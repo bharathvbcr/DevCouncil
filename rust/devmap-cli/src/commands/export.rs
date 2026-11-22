@@ -123,7 +123,7 @@ pub(crate) fn graph_value_for_read(
     let freshness = FreshnessInfo {
         head_sha: store
             .latest_generation_head()?
-            .unwrap_or_else(|| "unavailable".to_string()),
+            .unwrap_or_else(|| devmap_store::UNAVAILABLE_HEAD.to_string()),
         generation_id: gen_id,
         pending_count: store.status(&db.display().to_string())?.pending_count,
         stamped: StampedFreshness::default(),

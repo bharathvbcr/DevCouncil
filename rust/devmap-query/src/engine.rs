@@ -4307,6 +4307,10 @@ mod pruned_generation_namesake;
 #[path = "engine/tests/pruned_keyword_page.rs"]
 mod pruned_keyword_page;
 
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/charged_scope_pairing.rs"]
+mod charged_scope_pairing;
+
 #[cfg(test)]
 #[path = "engine/tests/radius_key_bounds.rs"]
 mod radius_key_bounds;

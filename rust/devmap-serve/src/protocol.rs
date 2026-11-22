@@ -1261,10 +1261,8 @@ pub fn source_delta_json(delta: &devmap_store::SourceTreeDelta) -> serde_json::V
 }
 
 /// The head a build or drain stamps when `git rev-parse HEAD` cannot be read.
-///
-/// Spelled by `devmap build` and the daemon's drain as a literal of its own;
-/// this is the one place the status surfaces name it.
-pub const UNAVAILABLE_HEAD: &str = "unavailable";
+/// Owned by `devmap_store`, which every writer and status surface shares.
+pub use devmap_store::UNAVAILABLE_HEAD;
 
 pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
     status.freshness_reason()
@@ -1334,7 +1332,7 @@ pub fn store_degraded_reason(
     budget_refused: Option<&devmap_store::CoverageGapSample>,
 ) -> anyhow::Result<Option<String>> {
     let freshness = freshness_degraded_reason(status);
-    let resolver = resolver_degraded_clause(store, freshness.as_deref());
+    let resolver = resolver_degraded_clause(&status.resolver_stamp, freshness.as_deref());
     Ok(devmap_analyze::combine_reasons(
         devmap_analyze::combine_reasons(
             devmap_analyze::combine_reasons(
@@ -1346,7 +1344,7 @@ pub fn store_degraded_reason(
             ),
             resolver,
         ),
-        head_degraded_clause(store)?,
+        head_degraded_clause(status),
     ))
 }
 
@@ -1356,15 +1354,19 @@ pub fn store_degraded_reason(
 /// `Store::status` asks the resolver question only of a store with an empty
 /// queue and no other reason, so a stale store that also had a pending change,
 /// a quarantined path or a damaged index read as that one thing and the
-/// staleness surfaced only after the reader had cleared it. The stamp is read
-/// here, from the accessor the status check itself uses, so every surface that
+/// staleness surfaced only after the reader had cleared it. The stamp is the
+/// one the status check itself read, so every surface that
 /// joins reasons through [`store_degraded_reason`] names it. A stamp that
 /// cannot be read is said to be unverified, as the status check says it, and
-/// never taken for current.
-fn resolver_degraded_clause(store: &Store, freshness: Option<&str>) -> Option<String> {
-    let stamp = match store.latest_generation_resolver_stamp() {
+/// never taken for current. The stamp is the one `status` read in its own
+/// snapshot, not a second read that could describe a later generation.
+fn resolver_degraded_clause(
+    stamp: &Result<devmap_store::ResolverStamp, String>,
+    freshness: Option<&str>,
+) -> Option<String> {
+    let stamp = match stamp {
         Ok(devmap_store::ResolverStamp::Current) => return None,
-        Ok(stamp) => stamp,
+        Ok(stamp) => *stamp,
         Err(error) => {
             return Some(bounded_reason(&format!(
                 "resolver epoch unverified: {error}"
@@ -1400,7 +1402,7 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
         if kind.is_dir() {
             return Some(dot_git);
         }
-        let Some(pointer) = devmap_query::stat_memo::read_bounded(&dot_git, GITFILE_READ_CAP)
+        let Some(pointer) = devmap_query::stat_memo::read_bounded_bytes(&dot_git, GITFILE_READ_CAP)
         else {
             return Some(dot_git);
         };
@@ -1408,21 +1410,41 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
         // git stops there ("invalid gitfile format"): the walk must not step
         // over it and judge an enclosing repository's HEAD. The file itself is
         // returned, which has no `HEAD` beneath it, so the checkout reads broken.
+        // Bytes, not text: git allows a path that is not UTF-8.
         let target = pointer
-            .trim()
-            .strip_prefix("gitdir:")
-            .map(str::trim)
+            .trim_ascii()
+            .strip_prefix(b"gitdir:")
+            .map(<[u8]>::trim_ascii)
             .filter(|target| !target.is_empty());
-        Some(target.map_or(dot_git, |target| dir.join(target)))
+        Some(target.map_or(dot_git, |target| dir.join(path_from_bytes(target))))
     })
 }
 
-/// Largest `HEAD` file read: a legal `ref:` line (nested components of up to 255
-/// bytes each) or an object id fits. A larger file is refused (reads broken), not truncated. Read by
-/// `devmap_query::stat_memo::read_bounded`, which never blocks on a FIFO.
+/// A path from the bytes of a `gitdir:` pointer: exact on unix, where a path is
+/// bytes; elsewhere a lossy reading, since a path is not bytes there.
+fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Largest `HEAD` file read: a legal `ref:` line or an object id fits (a branch
+/// name is bounded by the filesystem's component limit per path part, 255 bytes
+/// on the common ones, and the usual nesting stays far under this cap). A larger
+/// file is refused (reads broken), not truncated, which also means a `ref:` line
+/// followed by junk past the cap reads broken here. Read by
+/// `devmap_query::stat_memo::read_bounded_bytes`, which never blocks on a FIFO.
 const HEAD_READ_CAP: u64 = 4096;
 /// Largest `.git` pointer file read, refused when larger: it holds `gitdir: ` plus a whole path
-/// (`PATH_MAX` is 4096 on Linux) and a newline, which must not be truncated.
+/// (`PATH_MAX` is 4096 on Linux) and a newline, which must not be truncated. Sized for
+/// Linux: a Windows checkout with `core.longpaths` can name a longer path, and its pointer
+/// would be refused (read as broken) rather than truncated.
 const GITFILE_READ_CAP: u64 = 8192;
 
 /// Whether the `HEAD` file of the git directory `git_dir` is missing or names
@@ -1430,16 +1452,18 @@ const GITFILE_READ_CAP: u64 = 8192;
 /// bounded read and never a git spawn, because `status` is a surface a health
 /// check polls.
 fn git_head_file_is_broken(git_dir: &std::path::Path) -> bool {
-    let Some(head) = devmap_query::stat_memo::read_bounded(&git_dir.join("HEAD"), HEAD_READ_CAP)
+    // Bytes, not text: git allows a ref name that is not UTF-8, and a branch
+    // spelled that way is a healthy HEAD, not a corrupt one.
+    let Some(head) =
+        devmap_query::stat_memo::read_bounded_bytes(&git_dir.join("HEAD"), HEAD_READ_CAP)
     else {
         return true;
     };
-    let head = head.trim();
+    let head = head.trim_ascii();
     let names_a_branch = head
-        .strip_prefix("ref:")
-        .is_some_and(|name| !name.trim().is_empty());
-    let names_an_object =
-        matches!(head.len(), 40 | 64) && head.bytes().all(|b| b.is_ascii_hexdigit());
+        .strip_prefix(b"ref:")
+        .is_some_and(|name| !name.trim_ascii().is_empty());
+    let names_an_object = matches!(head.len(), 40 | 64) && head.iter().all(u8::is_ascii_hexdigit);
     !(names_a_branch || names_an_object)
 }
 
@@ -1455,22 +1479,30 @@ fn git_head_file_is_broken(git_dir: &std::path::Path) -> bool {
 /// its first commit (the typed `head_sha` field still says `"unavailable"`).
 /// Worded to match none of the phrases `rebuild_required_reason` keys on: a
 /// rebuild cannot cure it.
-pub fn head_degraded_clause(store: &Store) -> anyhow::Result<Option<String>> {
-    if store.latest_generation_head_sha()?.as_deref() != Some(UNAVAILABLE_HEAD) {
-        return Ok(None);
+///
+/// Reads the head, root and stamp `status` took in its own snapshot, so the
+/// clause describes the generation the rest of that status counted.
+///
+/// What it does not name, on purpose: it checks the `HEAD` file's shape and never
+/// resolves it (a git spawn or a ref and object walk, which a polled `status`
+/// must not pay). So a well-formed `HEAD` that names a ref whose branch file is
+/// absent (an unborn branch looks the same), and a detached sha whose object is
+/// missing, read as ordinary, and a `ref:` line with junk past the read cap reads
+/// as broken instead.
+pub fn head_degraded_clause(status: &StoreStatus) -> Option<String> {
+    if status.head_sha.as_deref() != Some(UNAVAILABLE_HEAD) {
+        return None;
     }
-    let Some(root) = store.latest_repo_root()? else {
-        return Ok(None);
-    };
-    let broken = git_dir_of(std::path::Path::new(&root))
+    let root = status.repo_root.as_deref()?;
+    let broken = git_dir_of(std::path::Path::new(root))
         .is_some_and(|git_dir| git_head_file_is_broken(&git_dir));
-    Ok(broken.then(|| {
+    broken.then(|| {
         format!(
             "git HEAD is unreadable here, so this generation was stamped (head_sha \
              \"{UNAVAILABLE_HEAD}\") and the commit it was built from is unknown; the graph is \
              intact; once HEAD is repaired, run `devmap build` to restamp it"
         )
-    }))
+    })
 }
 
 /// Appends the daemon's unapplied-edits fact to a store-level reason.
@@ -1567,7 +1599,7 @@ pub(crate) fn dispatch_with_stacked(
                 "degraded_reason": daemon_status_reason(store, &status, unapplied)?,
                 // The commit this generation was built from, or `"unavailable"`
                 // when git could not say; `null` with no generation.
-                "head_sha": store.latest_generation_head_sha()?,
+                "head_sha": status.head_sha,
                 "delta": status.source_delta.as_ref().map(source_delta_json),
                 "quarantined_count": status.quarantined_count,
                 // The paths behind the numbers `degraded_reason` states
@@ -4185,7 +4217,7 @@ mod tests {
         let store = corpus_store(2, Some(&root));
         store.restamp_latest_head(UNAVAILABLE_HEAD).unwrap();
         lay(&root);
-        let clause = head_degraded_clause(&store).unwrap();
+        let clause = head_degraded_clause(&store.status("test").unwrap());
         std::fs::remove_dir_all(&parent).unwrap();
         clause
     }
@@ -4395,8 +4427,11 @@ mod tests {
         );
     }
 
-    /// The `.git` pointer holds a whole path: one longer than the 256-byte HEAD
-    /// cap must still resolve to its valid worktree git directory.
+    /// The `.git` pointer holds a whole path, and is read under its own cap, not
+    /// the HEAD cap: a pointer longer than `HEAD_READ_CAP` (padded with trailing
+    /// whitespace, which the read trims) must still resolve to its valid worktree
+    /// git directory. A regression that read it under `HEAD_READ_CAP`, or cut
+    /// `GITFILE_READ_CAP` to that size, reads this layout as broken.
     #[test]
     fn a_long_gitdir_pointer_is_read_whole() {
         let clause = head_clause_over("long-gitdir", |root| {
@@ -4413,8 +4448,15 @@ mod tests {
                 .join("repo");
             std::fs::create_dir_all(&gitdir).unwrap();
             std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
-            let pointer = format!("gitdir: {}\n", gitdir.display());
-            assert!(pointer.len() > 256, "the fixture must exceed the HEAD cap");
+            let pointer = format!("gitdir: {}{}\n", gitdir.display(), " ".repeat(5000));
+            assert!(
+                pointer.len() as u64 > HEAD_READ_CAP,
+                "the fixture must exceed the HEAD cap"
+            );
+            assert!(
+                (pointer.len() as u64) < GITFILE_READ_CAP,
+                "and fit the pointer cap"
+            );
             std::fs::write(root.join(".git"), pointer).unwrap();
         });
         assert!(
@@ -4423,12 +4465,43 @@ mod tests {
         );
     }
 
-    /// A legal `HEAD` naming a long branch (components may reach 255 bytes, and
-    /// nested ones more) is an ordinary unborn branch, not a fault. Only a file past
-    /// the cap is refused, not truncated: a `HEAD` past 4096 bytes and a `.git`
-    /// pointer past 8192 both read broken.
+    /// A `gitdir:` pointer whose path is not UTF-8 is legal on unix; it used to
+    /// make the pointer unreadable, so a healthy linked worktree read as broken.
+    #[cfg(unix)]
     #[test]
-    fn an_over_cap_head_or_gitfile_reads_broken() {
+    fn a_non_utf8_gitdir_path_is_followed() {
+        use std::os::unix::ffi::OsStrExt;
+        // APFS (macOS) refuses non-UTF-8 names outright; the case cannot be
+        // built there, only on filesystems that store names as bytes.
+        let probe = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"devmap-probe-caf\xe9"));
+        if std::fs::create_dir_all(&probe).is_err() {
+            eprintln!("skipped: this filesystem refuses non-UTF-8 names");
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&probe);
+        let clause = head_clause_over("gitdir-non-utf8", |root| {
+            let gitdir = root
+                .parent()
+                .unwrap()
+                .join(std::ffi::OsStr::from_bytes(b"gitdir-caf\xe9"));
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+            let mut pointer = b"gitdir: ".to_vec();
+            pointer.extend_from_slice(gitdir.as_os_str().as_bytes());
+            pointer.push(b'\n');
+            std::fs::write(root.join(".git"), pointer).unwrap();
+        });
+        assert!(
+            clause.is_none(),
+            "a valid worktree behind a non-UTF-8 path read as broken: {clause:?}"
+        );
+    }
+
+    /// A legal `HEAD` naming a long branch (one 300-byte component here, over the
+    /// 255 most filesystems allow, so the cap is not what makes it fit) is an
+    /// ordinary unborn branch, not a fault.
+    #[test]
+    fn a_legal_long_branch_head_is_an_ordinary_unborn_branch() {
         let long_branch = head_clause_over("head-long-branch", |root| {
             let dir = root.join(".git");
             std::fs::create_dir_all(&dir).unwrap();
@@ -4439,7 +4512,28 @@ mod tests {
             long_branch.is_none(),
             "a legal ~300-byte branch name read as a broken HEAD: {long_branch:?}"
         );
+    }
 
+    /// A branch whose name is not UTF-8 is legal to git, so its `HEAD` is a
+    /// healthy unborn branch. It used to read broken because the file was read as
+    /// text.
+    #[test]
+    fn a_non_utf8_branch_name_in_head_is_ordinary() {
+        let clause = head_clause_over("head-non-utf8-branch", |root| {
+            let dir = root.join(".git");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("HEAD"), b"ref: refs/heads/caf\xe9\n").unwrap();
+        });
+        assert!(
+            clause.is_none(),
+            "a legal non-UTF-8 branch name read as a broken HEAD: {clause:?}"
+        );
+    }
+
+    /// Only a file past the cap is refused, not truncated: a `HEAD` past 4096
+    /// bytes and a `.git` pointer past 8192 both read broken.
+    #[test]
+    fn an_over_cap_head_or_gitfile_reads_broken() {
         let head = head_clause_over("head-over-cap", |root| {
             let dir = root.join(".git");
             std::fs::create_dir_all(&dir).unwrap();
@@ -4463,6 +4557,73 @@ mod tests {
             gitfile.is_some(),
             "a .git pointer past the 8192-byte cap read clean"
         );
+    }
+
+    /// The degraded reason is derived from the status it is given, not from a
+    /// second read of "the latest generation": a status that described
+    /// generation N must not be joined with the head or resolver stamp a later
+    /// generation holds. The status is taken, then the store moves on.
+    #[test]
+    fn the_degraded_reason_is_the_one_status_read_not_a_later_one() {
+        let parent = std::env::temp_dir().join(format!(
+            "devmap-protocol-pairing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        let root = parent.join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "garbage\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let store = corpus_store(2, Some(&root));
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        store.restamp_latest_head(sha).unwrap();
+
+        // Status read at a generation with a real head, in a corrupt checkout.
+        let before = store.status("test").unwrap();
+        assert_eq!(before.head_sha.as_deref(), Some(sha));
+        assert_eq!(
+            before.resolver_stamp,
+            Ok(devmap_store::ResolverStamp::Current)
+        );
+        // The store then moves to a generation stamped unavailable.
+        store.restamp_latest_head(UNAVAILABLE_HEAD).unwrap();
+        let after_move = store_degraded_reason(&store, &before, None).unwrap();
+        assert!(
+            after_move
+                .as_deref()
+                .is_none_or(|text| !text.contains("HEAD")),
+            "a later generation's head was paired with an earlier status: {after_move:?}"
+        );
+        let fresh = store.status("test").unwrap();
+        assert_eq!(fresh.head_sha.as_deref(), Some(UNAVAILABLE_HEAD));
+        let named = store_degraded_reason(&store, &fresh, None).unwrap();
+        assert!(
+            named.as_deref().is_some_and(|text| text.contains("HEAD")),
+            "the corrupt HEAD is named for the status that read it: {named:?}"
+        );
+
+        // The resolver stamp the status carries is the one it names, whatever
+        // the store holds now (it holds Current here).
+        let mut older = store.status("test").unwrap();
+        older.resolver_stamp = Ok(devmap_store::ResolverStamp::Older);
+        let reason = store_degraded_reason(&store, &older, None).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|text| text.contains(devmap_store::ResolverStamp::Older.reason())),
+            "the resolver stamp was re-read instead of taken from the status: {reason:?}"
+        );
+        let mut unread = store.status("test").unwrap();
+        unread.resolver_stamp = Err("disk I/O error".to_string());
+        let reason = store_degraded_reason(&store, &unread, None).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|text| text.contains("resolver epoch unverified: disk I/O error")),
+            "an unreadable stamp must be said, not taken for current: {reason:?}"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// A `.git` file that is not a `gitdir:` pointer is a broken checkout, and

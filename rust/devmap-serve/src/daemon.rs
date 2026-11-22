@@ -1280,7 +1280,7 @@ impl Daemon {
             Ok(sha) => sha,
             Err(error) => {
                 warn!("cannot read git HEAD for {root:?}: {error}");
-                "unavailable".to_string()
+                devmap_store::UNAVAILABLE_HEAD.to_string()
             }
         };
         // Compared against the *stamp*, not against the raw reading. The two
@@ -2844,7 +2844,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             daemon.drain_pending_batch_with_head(&|_| {
                 sent.send(()).unwrap();
-                Ok("unavailable".into())
+                Ok(devmap_store::UNAVAILABLE_HEAD.into())
             })
         });
         let read_while_locked = received.recv_timeout(Duration::from_millis(500));
@@ -2874,7 +2874,7 @@ mod tests {
     /// `"unknown"` reaches no production store; a fixture that leaves it there
     /// silently moves the test onto the full-rebuild branch and stops
     /// exercising the differential one it was written for.
-    const SCRATCH_HEAD: &str = "unavailable";
+    const SCRATCH_HEAD: &str = devmap_store::UNAVAILABLE_HEAD;
 
     /// `Store::save_generation` with the scratch tree's HEAD recorded. See
     /// [`SCRATCH_HEAD`].
