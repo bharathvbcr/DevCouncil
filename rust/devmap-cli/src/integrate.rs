@@ -3124,6 +3124,12 @@ command = \"x\"\n";
         .unwrap();
         assert!(hooks_doc["hooks"]["PostToolUse"].is_array());
         assert!(hooks_doc["hooks"].get("PostToolUseFailure").is_none());
+        for event in hooks_doc["hooks"].as_object().unwrap().keys() {
+            assert!(
+                crate::claude::CODEX_DOCUMENTED_EVENTS.contains(&event.as_str()),
+                "Codex hooks.json carries {event}, which Codex does not document"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
