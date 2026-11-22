@@ -1777,6 +1777,17 @@ pub(crate) fn path_is_hashed_test_binary(path: &Path) -> bool {
 /// checkout's own `target/` is not matched: it outlives any lane. A deleted
 /// worktree cannot be confirmed, so it is not named.
 pub(crate) fn worktree_build_output_warning(path: &Path) -> Option<String> {
+    worktree_build_output_warning_at(path).or_else(|| {
+        let resolved = path.canonicalize().ok()?;
+        worktree_build_output_warning_at(&resolved)
+    })
+}
+
+/// `worktree_build_output_warning` for one spelling of the path.
+///
+/// A bare-repository common dir is not recognised as a main checkout by
+/// `main_checkout_of`, so a worktree of a bare repo is not named.
+fn worktree_build_output_warning_at(path: &Path) -> Option<String> {
     let components: Vec<_> = path.components().collect();
     let is_target = |c: &std::path::Component<'_>| {
         matches!(c, std::path::Component::Normal(name) if *name == "target")
@@ -1803,25 +1814,39 @@ pub(crate) fn worktree_build_output_warning(path: &Path) -> Option<String> {
     None
 }
 
+/// The `notes` line for a receipt: the warning, but only when an MCP entry
+/// naming `executable` was actually written. Otherwise nothing will break.
+pub(crate) fn mcp_receipt_note(executable: &Path, wrote_mcp_entry: bool) -> Option<String> {
+    if wrote_mcp_entry {
+        worktree_build_output_warning(executable)
+    } else {
+        None
+    }
+}
+
+/// True the first time `path` is seen in this process. A poisoned lock still
+/// holds a valid list, so it is recovered rather than dropping the warning.
+fn first_sighting(path: &Path) -> bool {
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.iter().any(|p| p == path) {
+        return false;
+    }
+    seen.push(path.to_path_buf());
+    true
+}
+
 /// Print `worktree_build_output_warning` once per path per process.
 ///
 /// Stderr only: `mcp --print-config` keeps stdout to the JSON a host consumes.
 fn warn_on_worktree_build_output(executable: &Path) {
-    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-    let canonical = executable.canonicalize().ok();
-    let Some(message) = worktree_build_output_warning(executable).or_else(|| {
-        canonical
-            .as_deref()
-            .and_then(worktree_build_output_warning)
-    }) else {
-        return;
-    };
-    let Ok(mut seen) = SEEN.lock() else { return };
-    if seen.iter().any(|p| p == executable) {
-        return;
+    if let Some(message) = worktree_build_output_warning(executable) {
+        if first_sighting(executable) {
+            eprintln!("warning: {message}");
+        }
     }
-    seen.push(executable.to_path_buf());
-    eprintln!("warning: {message}");
 }
 
 /// Refuse to put a hashed test binary into an MCP command; warn on a linked
@@ -3429,6 +3454,18 @@ mod tests {
             .collect();
         let accepted: Vec<_> = cases.iter().map(|p| mcp_entry(p, None, None)).collect();
         let primary = worktree_build_output_warning(&primary_bin);
+        let link_dir = root.join("bin");
+        std::fs::create_dir_all(&link_dir).expect("link dir");
+        let link = link_dir.join("devmap");
+        std::fs::create_dir_all(lane.join("rust/target/debug")).expect("lane target");
+        std::fs::write(lane.join("rust/target/debug/devmap"), b"x").expect("lane binary");
+        std::os::unix::fs::symlink(lane.join("rust/target/debug/devmap"), &link).expect("symlink");
+        let via_symlink = worktree_build_output_warning(&link);
+        let note_direct = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), true);
+        let note_link = mcp_receipt_note(&link, true);
+        let note_unwritten = mcp_receipt_note(&link, false);
+        let first = first_sighting(&link);
+        let second = first_sighting(&link);
         let source_file = worktree_build_output_warning(&lane.join("rust/src/target"));
         let _ = std::fs::remove_dir_all(&root);
         for (path, warning) in warned {
@@ -3440,6 +3477,13 @@ mod tests {
         for entry in accepted {
             entry.expect("a warning is not a refusal");
         }
+        assert!(
+            via_symlink.is_some(),
+            "a symlink into a lane's build output was not flagged"
+        );
+        assert!(first && !second, "stderr warns once per path");
+        assert!(note_direct.is_some() && note_link.is_some(), "receipt note missing");
+        assert!(note_unwritten.is_none(), "nothing was written, nothing will break");
         assert!(primary.is_none(), "the main checkout outlives any lane: {primary:?}");
         assert!(source_file.is_none(), "a file named target is not build output");
     }

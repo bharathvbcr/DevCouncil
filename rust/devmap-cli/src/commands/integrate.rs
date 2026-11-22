@@ -182,8 +182,17 @@ fn run_integrate(
         hand_written,
     )?;
     // The warning `mcp_entry` prints on stderr, kept in the receipt's own
-    // `notes` so a caller reading the JSON sees it too.
-    if let Some(warning) = claude::worktree_build_output_warning(&executable) {
+    // `notes` so a caller reading the JSON sees it too. Only when an MCP entry
+    // naming this executable was written: a dry run, a check, or an unchanged
+    // entry leaves nothing that will break.
+    let wrote_mcp_entry = !dry_run
+        && !check
+        && report
+            .global_mcp
+            .iter()
+            .chain(report.project_mcp.iter())
+            .any(|m| m.changed);
+    if let Some(warning) = claude::mcp_receipt_note(&executable, wrote_mcp_entry) {
         report.notes.push(warning);
     }
     if cli.json {
