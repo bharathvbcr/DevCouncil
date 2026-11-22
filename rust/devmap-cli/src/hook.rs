@@ -379,7 +379,7 @@ fn run_hook_inner(
                 shell_post
                     .then(|| shell_build_window_remaining(&wt))
                     .flatten(),
-                WINDOW_CAN_BE_WAITED_OUT,
+                window_can_be_waited_out(),
             );
             // A refused or failed spawn is exit 1 with its reason, as for every
             // other PostToolUse detach, never silence.
@@ -475,7 +475,7 @@ fn run_hook_inner(
                         shell_post
                             .then(|| shell_build_window_remaining(root))
                             .flatten(),
-                        WINDOW_CAN_BE_WAITED_OUT,
+                        window_can_be_waited_out(),
                     );
                     let spawned = detach_post_tool_root(executable, root, plan.delay)?;
                     // A held-back start is not a start: the window it waits out
@@ -2846,6 +2846,21 @@ fn detach_post_tool_root(
 /// Whether the rest of a shell call's rate window can be waited out in the
 /// detached child. Only unix has a shell to wait in.
 const WINDOW_CAN_BE_WAITED_OUT: bool = cfg!(unix);
+
+/// [`WINDOW_CAN_BE_WAITED_OUT`], which a test on one platform may override for
+/// its own thread to drive the other platform's path.
+fn window_can_be_waited_out() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = TEST_CAN_WAIT.with(std::cell::Cell::get) {
+        return forced;
+    }
+    WINDOW_CAN_BE_WAITED_OUT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CAN_WAIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// What a shell call does about the rate window, decided from the window left
 /// and whether the platform can hold a start back.
@@ -9055,8 +9070,7 @@ mod tests {
         let plain = |reason: &str| {
             let status = json!({"query_ready": true, "degraded_reason": reason,
                                 "node_count": 10, "is_fresh": true});
-            compose_pre_tool_use(&status.to_string(), Path::new("/repo/Demo"), None)
-                .expect("emits")
+            compose_pre_tool_use(&status.to_string(), Path::new("/repo/Demo"), None).expect("emits")
         };
         for blank in ["", "   ", "\t\n"] {
             let text = plain(blank);
@@ -9087,11 +9101,17 @@ mod tests {
             "generation_id": 3,
             "degraded_reason": format!("{} (stamp 9, this build 4){}",
                 devmap_store::RESOLVER_NEWER_REASON, " x".repeat(200))});
-        let text = compose_pre_tool_use(&newer.to_string(), Path::new("/repo/Demo"), None)
-            .expect("emits");
+        let text =
+            compose_pre_tool_use(&newer.to_string(), Path::new("/repo/Demo"), None).expect("emits");
         let first = text.lines().next().unwrap_or_default();
-        assert!(first.contains(devmap_store::RESOLVER_NEWER_REASON), "{text}");
-        assert!(first.contains("update devmap instead of rebuilding"), "{text}");
+        assert!(
+            first.contains(devmap_store::RESOLVER_NEWER_REASON),
+            "{text}"
+        );
+        assert!(
+            first.contains("update devmap instead of rebuilding"),
+            "{text}"
+        );
         assert!(!text.contains("behind the working tree"), "{text}");
 
         for behind in [
@@ -9121,6 +9141,53 @@ mod tests {
             first.chars().count() < 260,
             "{} chars",
             first.chars().count()
+        );
+    }
+
+    /// Restores the thread's `window_can_be_waited_out` on drop.
+    #[cfg(unix)]
+    struct ForcedCanWait;
+
+    #[cfg(unix)]
+    impl ForcedCanWait {
+        fn new(can_wait: bool) -> Self {
+            TEST_CAN_WAIT.with(|cell| cell.set(Some(can_wait)));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForcedCanWait {
+        fn drop(&mut self) {
+            TEST_CAN_WAIT.with(|cell| cell.set(None));
+        }
+    }
+
+    /// Where a start cannot be held back (Windows), a shell write inside the
+    /// open rate window still starts a build at once. The old early return
+    /// dropped it, so the write was never indexed. Driven on unix by forcing
+    /// the platform answer through `run_hook`.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_write_inside_the_window_starts_a_build_where_it_cannot_wait() {
+        let lane = Lane::new("window-no-wait", true);
+        fs::write(&lane.release, b"").unwrap();
+        claim_shell_build_window(&lane.main);
+        assert!(
+            shell_build_window_remaining(&lane.main).is_some(),
+            "the window was not open"
+        );
+        let _forced = ForcedCanWait::new(false);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &shell_payload(&lane.main, "git merge feature"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "a shell write inside the window was dropped"
         );
     }
 
