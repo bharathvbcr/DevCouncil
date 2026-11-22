@@ -162,10 +162,10 @@ impl DeltaStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .with_context(|| format!("cannot open delta store {}", path.display()))?;
         Self::configure(&conn)?;
-        Self::ensure_schema(&conn)
+        Self::ensure_schema(&mut conn)
             .with_context(|| format!("cannot initialize delta schema at {}", path.display()))?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -179,7 +179,7 @@ impl DeltaStore {
     /// creating batch runs in one transaction, so a reader sees no tables or
     /// every table. A schema that is already complete is re-run as before (it
     /// only repairs a missing index) and takes no write lock.
-    fn ensure_schema(conn: &Connection) -> Result<()> {
+    fn ensure_schema(conn: &mut Connection) -> Result<()> {
         let present: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
              AND name IN ('delta_files', 'delta_symbols', 'delta_edges')",
@@ -189,7 +189,9 @@ impl DeltaStore {
         if present == 3 {
             conn.execute_batch(DELTA_SCHEMA_DDL)?;
         } else {
-            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{DELTA_SCHEMA_DDL}\nCOMMIT;"))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(DELTA_SCHEMA_DDL)?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -831,10 +833,12 @@ mod tests {
     fn a_reader_beside_the_first_creation_of_a_delta_is_never_refused() {
         let dir = temp_dir("first-create");
         let mut refusals: Vec<String> = Vec::new();
+        let mut refused_rounds = 0usize;
         for round in 0..300 {
             let path = dir.join(format!("delta-{round}.sqlite"));
             let barrier = std::sync::Barrier::new(2);
             let done = std::sync::atomic::AtomicBool::new(false);
+            let before = refusals.len();
             std::thread::scope(|scope| {
                 scope.spawn(|| {
                     barrier.wait();
@@ -858,11 +862,12 @@ mod tests {
                     }
                 }
             });
+            refused_rounds += usize::from(refusals.len() > before);
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             refusals.is_empty(),
-            "{} of 300 creations refused a polling reader; first: {:?}",
+            "{refused_rounds} of 300 creations refused a polling reader ({} refusals); first: {:?}",
             refusals.len(),
             refusals.first()
         );
