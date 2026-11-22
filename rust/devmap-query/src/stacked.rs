@@ -48,7 +48,7 @@ use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
     clone_or_copy_file, copy_donor_csr_checked, csr_generation_of_open_file, discard_staged,
     prepare_immutable_snapshot, promote_immutable_base_to_store, read_file_at,
-    remove_file_if_present, seed_artifact, seed_directory_cow, set_file_readonly,
+    remove_file_if_present, seed_artifact, seed_reuse_directory, set_file_readonly,
     set_file_writable, sidecar, stage_seed_healing_wal, DonorCsr, SQLITE_SIDECARS, STORE_SIDECARS,
 };
 use devmap_store::{
@@ -1486,7 +1486,7 @@ pub fn seed_derived_artifacts_and_reuse_caches(
             let name = entry.file_name();
             if let Some(s) = name.to_str() {
                 if s.starts_with("resolution-reuse-") && entry.path().is_dir() {
-                    let _ = seed_directory_cow(&entry.path(), &dst_state.join(s))?;
+                    let _ = seed_reuse_directory(&entry.path(), &dst_state.join(s))?;
                 }
             }
         }

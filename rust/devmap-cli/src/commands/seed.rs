@@ -269,8 +269,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     // The store is placed: nothing after this point may fail the command. When
     // the lane's tree matched the donor's, seed consumer artifacts and reuse
     // caches as a best-effort note; when the lane diverged, `resolution-reuse-*`
-    // was already seeded and updated during the staged incremental build, and
-    // donor artifacts would describe the wrong tree.
+    // was already seeded and, by the staged incremental build, rebound to that
+    // build's generation (the binding names a generation row, which the placed
+    // store keeps, not the staged path), and donor artifacts would describe the
+    // wrong tree.
     if tree_matches_donor {
         if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
             eprintln!(
@@ -445,8 +447,9 @@ pub(crate) fn plan(cli: &Cli, seed_from: &Path) -> anyhow::Result<Plan> {
 
 impl Plan {
     /// Stage a seeded store at `<cli.db()>.seed-<pid>` and clone `resolution-reuse-*`
-    /// directories, or say why not and leave the build to start cold. Call with the
-    /// writer lock held.
+    /// directories (each with its generation binding, kept only if the donor did
+    /// not write during the copy), or say why not and leave the build to start
+    /// cold. Call with the writer lock held.
     pub(crate) fn stage<'a>(
         &'a self,
         cli: &Cli,
@@ -548,7 +551,11 @@ impl Plan {
 }
 
 /// Clone `source_root`'s `resolution-reuse-*` directories into `target_root`'s
-/// state directory. Best-effort: a cache that did not seed costs a cold resolve.
+/// state directory. The donor's `generation.json` binding names the generation
+/// row the seeded store carries, so it stays valid in the copy; the donor's
+/// writer lock is not held here, so [`seed::seed_reuse_directory`] drops the
+/// copied binding unless the donor's was unchanged across the copy.
+/// Best-effort: a cache that did not seed costs a cold resolve.
 fn seed_resolution_reuse_dirs(source_root: &Path, target_root: &Path) {
     let src_state = state_dir(source_root);
     let dst_state = state_dir(target_root);
@@ -557,7 +564,7 @@ fn seed_resolution_reuse_dirs(source_root: &Path, target_root: &Path) {
             let name = entry.file_name();
             if let Some(name_str) = name.to_str() {
                 if name_str.starts_with("resolution-reuse-") && entry.path().is_dir() {
-                    let _ = seed::seed_directory_cow(&entry.path(), &dst_state.join(name_str));
+                    let _ = seed::seed_reuse_directory(&entry.path(), &dst_state.join(name_str));
                 }
             }
         }

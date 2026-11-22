@@ -302,6 +302,20 @@ impl Store {
         rows.collect()
     }
 
+    /// The latest generation's id and `created_at`: the pair that names one
+    /// generation row. An id alone is reused by a store that was deleted and
+    /// rebuilt; a store seeded from a donor carries the donor's row, so it
+    /// carries the donor's pair too.
+    pub fn latest_generation_identity(&self) -> Result<Option<(u32, f64)>> {
+        let conn = lock_conn(&self.conn)?;
+        conn.query_row(
+            "SELECT id, created_at FROM generations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
     pub fn latest_generation_id(&self) -> Result<Option<u32>> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
