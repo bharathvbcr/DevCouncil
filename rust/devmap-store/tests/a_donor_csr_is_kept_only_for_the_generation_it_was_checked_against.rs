@@ -85,6 +85,33 @@ fn the_generation_is_read_through_the_open_descriptor() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The stamp is read from the header alone: a file cut right after the header
+/// (whose sections a full parse would refuse as past the end) still names its
+/// generation, and one too short for a header or with the wrong magic is an error.
+#[test]
+fn the_generation_is_read_from_the_header_without_reading_the_body() {
+    let dir = tmp_dir("header-only");
+    let path = dir.join("g.csr");
+    write_csr(&path, 23);
+    let bytes = fs::read(&path).unwrap();
+    let header_len = 80;
+    assert!(bytes.len() > header_len, "premise: the file has a body");
+    fs::write(&path, &bytes[..header_len]).unwrap();
+    let file = fs::File::open(&path).unwrap();
+    assert_eq!(csr_generation_of_open_file(&file).unwrap(), 23);
+
+    fs::write(&path, &bytes[..header_len - 1]).unwrap();
+    let short = fs::File::open(&path).unwrap();
+    assert!(csr_generation_of_open_file(&short).is_err());
+
+    let mut wrong = bytes.clone();
+    wrong[0] ^= 0xff;
+    fs::write(&path, &wrong).unwrap();
+    let bad_magic = fs::File::open(&path).unwrap();
+    assert!(csr_generation_of_open_file(&bad_magic).is_err());
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Every 8-byte header word set to 2^63-1, u64::MAX and 0, and every truncation:
 /// the check must answer (Kept, Rejected or an error), never panic or allocate
 /// by the claimed size. Debug build, so an unchecked add or multiply panics.

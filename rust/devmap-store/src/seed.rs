@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use devmap_extract::paths::csr_path_for_store;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
-use crate::csr::CsrGraphReader;
+use crate::csr::{CsrGraphReader, CsrHeader, DC_GRAPH_MAGIC, DC_GRAPH_VERSION};
 
 /// How the staged file was produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,19 +760,32 @@ pub fn stage_donor_csr(
 
 /// The generation a CSR sidecar is stamped with, read through the descriptor
 /// the caller holds (so a path swapped after the open cannot answer for it).
+///
+/// Only the header is read: the stamp is one field of it, and the callers that
+/// place a sidecar have already checked its content (a hash of the whole file,
+/// or a full open of the copy) before they ask whose generation it is.
 pub fn csr_generation_of_open_file(file: &std::fs::File) -> Result<u64> {
-    let mut bytes = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut offset = 0u64;
-    loop {
-        let n = read_file_at(file, &mut buf, offset).context("cannot read the CSR sidecar")?;
+    let mut header = [0u8; std::mem::size_of::<CsrHeader>()];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let n = read_file_at(file, &mut header[filled..], filled as u64)
+            .context("cannot read the CSR sidecar")?;
         if n == 0 {
-            break;
+            bail!("Buffer too small for CSR header: {filled} bytes");
         }
-        bytes.extend_from_slice(&buf[..n]);
-        offset += n as u64;
+        filled += n;
     }
-    Ok(CsrGraphReader::from_bytes(bytes)?.generation())
+    // SAFETY: `header` holds exactly `size_of::<CsrHeader>()` initialised bytes
+    // and every bit pattern is a valid `CsrHeader` (integers and a byte array);
+    // `read_unaligned` makes no alignment assumption.
+    let header = unsafe { std::ptr::read_unaligned(header.as_ptr() as *const CsrHeader) };
+    if &header.magic != DC_GRAPH_MAGIC {
+        bail!("Invalid CSR graph magic bytes");
+    }
+    if header.version != DC_GRAPH_VERSION {
+        bail!("Unsupported CSR graph version: {}", header.version);
+    }
+    Ok(header.generation)
 }
 
 #[cfg(test)]
