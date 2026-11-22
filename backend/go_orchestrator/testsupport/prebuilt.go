@@ -70,6 +70,11 @@ func noCargoMode(t testing.TB) bool {
 // is read from the dep-info cargo leaves beside it (<name>.d): every listed
 // path must exist and be older than the binary. A missing or unparseable
 // dep-info is refused as unverifiable.
+//
+// A successful verdict is cached for the life of the process, keyed by the
+// binary's path, mtime and size: this matches cargoBin's once-per-process build,
+// so a source edited later in the same process is not seen. A refusal is never
+// cached.
 func prebuiltBinary(t testing.TB, crates, crate, binary string) (path string, ok bool) {
 	t.Helper()
 	noCargo := noCargoMode(t)
@@ -148,6 +153,9 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 		return "", fmt.Errorf("no dep-info to check it against (%v): without what it was compiled from, "+
 			"whether it is current cannot be told", err)
 	}
+	// The verdict is cached for the life of the process (see prebuiltBinary), the
+	// same once-per-process rule as cargoBin's build: a source edited after this
+	// check, in the same process, is not seen.
 	listed, err := parseDepInfo(string(raw))
 	if err != nil {
 		return "", fmt.Errorf("dep-info %s is unusable (%v), so whether the binary is current cannot be told", depInfo, err)
@@ -162,10 +170,28 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 			return src, nil
 		}
 	}
-	for _, manifest := range []string{
+	// A crate whose source is listed also contributes its manifest — features and
+	// edition live there and dep-info does not list it — so each listed path's
+	// nearest enclosing Cargo.toml is checked too, once per directory.
+	manifests := []string{
 		filepath.Join(crates, "Cargo.toml"), filepath.Join(crates, "Cargo.lock"),
 		filepath.Join(crates, crate, "Cargo.toml"),
-	} {
+	}
+	seen := map[string]bool{}
+	for _, src := range listed {
+		for dir := filepath.Dir(src); !seen[dir]; dir = filepath.Dir(dir) {
+			seen[dir] = true
+			manifest := filepath.Join(dir, "Cargo.toml")
+			if _, err := os.Stat(manifest); err == nil {
+				manifests = append(manifests, manifest)
+				break
+			}
+			if dir == filepath.Dir(dir) {
+				break
+			}
+		}
+	}
+	for _, manifest := range manifests {
 		info, err := os.Stat(manifest)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
@@ -186,6 +212,12 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 // list is an error: a binary compiled from nothing is not a real one.
 func parseDepInfo(text string) ([]string, error) {
 	line, _, _ := strings.Cut(text, "\n")
+	// A line ending in an odd number of backslashes continues onto the next
+	// line, whose dependencies this parser does not read: refuse rather than
+	// accept a list it knows is cut short.
+	if trimmed := strings.TrimRight(line, "\\"); (len(line)-len(trimmed))%2 == 1 {
+		return nil, errors.New("the dependency line ends in a backslash continuation, which is not supported")
+	}
 	// The target path may itself hold escaped spaces, so the separator is the
 	// first ": " that is not escaped.
 	sep := -1
@@ -223,6 +255,14 @@ func parseDepInfo(text string) ([]string, error) {
 		}
 	}
 	flush()
+	for _, dep := range deps {
+		// A backslash that survives unescaping is a literal one in a path; the
+		// escaping rules for it differ between make dialects, so a path holding
+		// one is not trusted to name the file it was meant to.
+		if strings.Contains(dep, "\\") {
+			return nil, fmt.Errorf("path %q holds a literal backslash, which is not supported", dep)
+		}
+	}
 	if len(deps) == 0 {
 		return nil, errors.New("it lists no dependencies")
 	}

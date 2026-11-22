@@ -360,6 +360,28 @@ func TestFreshnessFollowsSymlinkedCrates(t *testing.T) {
 	}
 }
 
+// A dependency crate's own manifest (features, edition) is not in dep-info; the
+// one enclosing each listed source is checked.
+func TestDependencyCrateManifestIsChecked(t *testing.T) {
+	workspace, _ := prebuiltSetup(t)
+	own := plantSource(t, workspace, "dc-store/src/lib.rs", 2*time.Hour)
+	dep := plantSource(t, workspace, "dc-proc/src/lib.rs", 2*time.Hour)
+	plantSource(t, workspace, "dc-proc/Cargo.toml", 2*time.Hour)
+	plantBinary(t, debugBin(workspace, "dcstore"), time.Hour, own, dep)
+	t.Setenv("DEVCOUNCIL_TEST_NO_CARGO", "1")
+	if rec := probe(t, func(tb testing.TB) { DCStore(tb) }); !rec.returned {
+		t.Fatalf("an old dependency manifest refused a fresh binary: %q", rec.fatals)
+	}
+
+	// Fresh result is cached by binary identity, so change the binary to re-check.
+	chtimes(t, debugBin(workspace, "dcstore"), time.Now().Add(-30*time.Minute))
+	manifest := filepath.Join(workspace, "dc-proc", "Cargo.toml")
+	chtimes(t, manifest, time.Now().Add(-time.Minute))
+	if msg := refused(t, "a dependency crate's manifest newer than the binary", DCStore); !strings.Contains(msg, manifest) {
+		t.Errorf("the refusal does not name %s:\n%s", manifest, msg)
+	}
+}
+
 func TestParseDepInfo(t *testing.T) {
 	got, err := parseDepInfo("/t/debug/dcstore: /a/one.rs /a/two\\ words.rs /a/three.sql\n/a/one.rs:\n/a/two\\ words.rs:\n")
 	if err != nil {
@@ -369,7 +391,12 @@ func TestParseDepInfo(t *testing.T) {
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	for _, bad := range []string{"", "no separator", "/t/dcstore: \n"} {
+	for _, bad := range []string{
+		"", "no separator", "/t/dcstore: \n",
+		"/t/dcstore: /a/one.rs /a/b\\\\c.rs\n",  // a literal backslash in a path
+		"/t/dcstore: /a/one.rs \\\n/a/two.rs\n", // a trailing continuation hiding more deps
+		"/t/dcstore: /a/one.rs /a/two.rs\\\n",
+	} {
 		if _, err := parseDepInfo(bad); err == nil {
 			t.Errorf("parseDepInfo(%q) accepted it", bad)
 		}
