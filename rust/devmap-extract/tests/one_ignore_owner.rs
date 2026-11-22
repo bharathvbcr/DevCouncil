@@ -260,3 +260,61 @@ fn an_unreadable_cache_marker_refuses_its_directory_without_failing_the_pass() {
     );
     std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+/// A manifest that is not UTF-8 is a refusal, and a FIFO or directory carrying
+/// a manifest's name is skipped, never a hang and never a failed pass. A FIFO named `tsconfig.json` would block a
+/// plain `read` forever, so the pass runs on a thread with a deadline.
+#[cfg(unix)]
+#[test]
+fn hostile_manifest_shapes_are_refusals_not_hangs_or_failures() {
+    let root = scratch("manifest-hostile", true);
+    write(&root, "ok/go.mod", "module example.com/ok\n");
+    std::fs::create_dir_all(root.join("dirmod/go.mod")).unwrap();
+    std::fs::create_dir_all(root.join("bytes")).unwrap();
+    std::fs::write(root.join("bytes/go.mod"), [0xff, 0xfe, 0x00, 0x9f]).unwrap();
+    std::fs::create_dir_all(root.join("pipe")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(root.join("pipe/tsconfig.json"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !made {
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let walked = root.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(devmap_extract::collect_project_manifests(&walked));
+    });
+    let manifests = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("a FIFO manifest must not hang the manifest pass")
+        .expect("hostile manifests must not fail the pass");
+    let refused: Vec<String> = manifests
+        .refusals
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    // A directory or FIFO carrying a manifest's name is not a manifest (the
+    // walk classes it `Other`, "never a source", by design): neither a refusal
+    // nor a failure, and above all not a blocking read. A manifest whose bytes
+    // cannot be read as text is a named refusal.
+    for not_a_manifest in ["dirmod/go.mod", "pipe/tsconfig.json"] {
+        assert!(
+            refused.iter().all(|path| path != not_a_manifest),
+            "{not_a_manifest} is not a manifest: {refused:?}"
+        );
+    }
+    assert!(
+        refused.iter().any(|path| path == "bytes/go.mod"),
+        "a manifest that is not text is a named refusal: {refused:?}"
+    );
+    assert!(
+        manifests
+            .go_modules
+            .iter()
+            .any(|module| module.prefix == "example.com/ok"),
+        "and the healthy manifest is still read"
+    );
+}
