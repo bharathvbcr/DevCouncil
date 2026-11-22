@@ -1066,13 +1066,18 @@ pub struct StoreStatus {
     /// from a broken one without opening the database by hand. Each list is
     /// capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its own total.
     pub coverage_gaps: CoverageGaps,
-    /// The latest generation's `head_sha`, read in the snapshot every other
-    /// field here describes. A surface that re-read it later could pair
-    /// generation N with generation N+1's head. `None` with no generation.
+    /// The latest generation's `head_sha`, read in the snapshot that fixes the
+    /// generation, counts, gaps and provenance (not the source-freshness walk,
+    /// which runs after it). A surface that re-read it later could pair
+    /// generation N with generation N+1's head. `None` with no generation, or
+    /// when it could not be read (see [`Self::provenance_error`]).
     pub head_sha: Option<String>,
     /// The repository root the latest generation answers to (honouring a
     /// caller's override), read in the same snapshot as [`Self::head_sha`].
     pub repo_root: Option<String>,
+    /// Why `head_sha` or `repo_root` could not be read, when one could not
+    /// (already joined into `degraded_reason`). `None` is a clean read.
+    pub provenance_error: Option<String>,
     /// How the latest generation's resolver stamp relates to this binary,
     /// read once, in the same snapshot. `Err` carries the read failure so a
     /// stamp that could not be read is never taken for current.

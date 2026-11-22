@@ -1946,6 +1946,9 @@ generation {latest}; run `devmap status` to re-verify",
                 |row| row.get(0),
             )
             .optional()?;
+        // Test seam: a hook may commit from another connection here, after the
+        // generation is fixed and before anything else is read from it.
+        super::fire_generation_read_pause();
         let pending_count: usize =
             snapshot.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| {
                 row.get::<_, i64>(0).map(|n| n as usize)
@@ -2027,19 +2030,39 @@ generation {latest}; run `devmap status` to re-verify",
         // Provenance of the generation counted above, read in the same snapshot:
         // a surface that asked the store again afterwards could pair this
         // generation's counts with a later generation's head, root or stamp.
-        let (head_sha, repo_root) = match latest {
-            Some(generation) => (
-                snapshot
+        //
+        // A provenance field that cannot be read (a NULL `head_sha`, a malformed
+        // `seed_rebind` row) must not fail the whole status: that surface exists
+        // to say what is wrong with a store. The error is kept and joined into
+        // `degraded_reason`, so the store reads degraded, never clean.
+        let (head_sha, repo_root, provenance_error) = match latest {
+            Some(generation) => {
+                let head = snapshot
                     .query_row(
                         "SELECT head_sha FROM generations WHERE id = ?1",
                         params![generation],
                         |row| row.get::<_, String>(0),
                     )
-                    .optional()?,
-                self.generation_repo_root_in(&snapshot, generation)?,
-            ),
-            None => (None, None),
+                    .optional();
+                let root = self.generation_repo_root_in(&snapshot, generation);
+                let mut errors = Vec::new();
+                let head = head.unwrap_or_else(|error| {
+                    errors.push(format!("head_sha: {error}"));
+                    None
+                });
+                let root = root.unwrap_or_else(|error| {
+                    errors.push(format!("repository root: {error}"));
+                    None
+                });
+                (head, root, (!errors.is_empty()).then(|| errors.join("; ")))
+            }
+            None => (None, None, None),
         };
+        let provenance_reason = provenance_error.as_ref().map(|error| {
+            format!(
+                "generation provenance is unreadable ({error}); run `devmap build` to rewrite it"
+            )
+        });
         let resolver_stamp = Self::resolver_stamp_on(&snapshot).map_err(|error| error.to_string());
         Ok(StoreStatus {
             db_path: db_path.to_string(),
@@ -2051,14 +2074,18 @@ generation {latest}; run `devmap status` to re-verify",
             source_delta: None,
             analyzer_freshness: None,
             degraded_reason: devmap_analyze::combine_reasons(
-                devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
-                encoding_reason,
+                devmap_analyze::combine_reasons(
+                    devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+                    encoding_reason,
+                ),
+                provenance_reason,
             ),
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
             head_sha,
             repo_root,
+            provenance_error,
             resolver_stamp,
         })
     }
@@ -3969,6 +3996,121 @@ mod resolver_epoch_after_the_binding_rule_changes {
             store.latest_generation_resolver_stamp().expect("stamp"),
             ResolverStamp::Older,
             "epoch \"2\" named the resolver rules before 7767f7cf; this binary resolves differently, so its edges are not current"
+        );
+    }
+}
+
+/// `status` reads the generation's provenance inside the snapshot that fixes the
+/// generation, and a provenance it cannot read degrades the store instead of
+/// failing the status.
+#[cfg(test)]
+mod status_provenance_reads {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static DB: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            crate::db::set_generation_read_pause(None);
+            DB.with(|db| *db.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn store(label: &str, head: Option<&str>) -> (Store, std::path::PathBuf, Scratch) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-status-provenance-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("devmap.sqlite");
+        let store = Store::open(&db).expect("store");
+        lock_conn(&store.conn)
+            .expect("connection")
+            .execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (1, 1.0, ?1, '{}')",
+                rusqlite::params![head],
+            )
+            .expect("generation");
+        (store, db, Scratch(dir))
+    }
+
+    #[test]
+    fn a_null_head_sha_degrades_the_status_instead_of_failing_it() {
+        let (store, _db, _scratch) = store("null-head", None);
+        let status = store.status("test").expect("status must still answer");
+        assert_eq!(status.head_sha, None);
+        assert!(!status.is_fresh());
+        let reason = status
+            .degraded_reason
+            .expect("an unreadable head is degraded");
+        assert!(
+            reason.contains("provenance") && reason.contains("head_sha"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_seed_rebind_row_degrades_the_status_instead_of_failing_it() {
+        let (store, _db, _scratch) = store("bad-rebind", Some("abc123"));
+        lock_conn(&store.conn)
+            .expect("connection")
+            .execute(
+                "INSERT INTO seed_rebind (singleton, seeded_repo_root) VALUES (1, X'41')",
+                [],
+            )
+            .expect("malformed row");
+        let status = store.status("test").expect("status must still answer");
+        assert_eq!(status.head_sha.as_deref(), Some("abc123"));
+        assert_eq!(status.repo_root, None);
+        let reason = status
+            .degraded_reason
+            .expect("an unreadable root is degraded");
+        assert!(
+            reason.contains("provenance") && reason.contains("seed_rebind"),
+            "{reason}"
+        );
+    }
+
+    fn commit_a_newer_generation_with_another_head() {
+        let db = DB
+            .with(|db| db.borrow().clone())
+            .expect("a database to write to");
+        rusqlite::Connection::open(db)
+            .expect("second connection")
+            .execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (2, 2.0, 'newer-head', '{}')",
+                [],
+            )
+            .expect("newer generation");
+    }
+
+    #[test]
+    fn provenance_belongs_to_the_generation_the_snapshot_counted() {
+        let (store, db, _scratch) = store("snapshot", Some("counted-head"));
+        DB.with(|slot| *slot.borrow_mut() = Some(db));
+        crate::db::set_generation_read_pause(Some(commit_a_newer_generation_with_another_head));
+        let status = store.status("test").expect("status");
+        assert_eq!(
+            store.latest_generation_id().expect("latest"),
+            Some(2),
+            "the second connection did not commit a newer generation"
+        );
+        assert_eq!(status.latest_generation, Some(1));
+        assert_eq!(
+            status.head_sha.as_deref(),
+            Some("counted-head"),
+            "the head was read outside the snapshot that counted generation 1"
         );
     }
 }

@@ -1402,7 +1402,7 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
         if kind.is_dir() {
             return Some(dot_git);
         }
-        let Some(pointer) = devmap_query::stat_memo::read_bounded(&dot_git, GITFILE_READ_CAP)
+        let Some(pointer) = devmap_query::stat_memo::read_bounded_bytes(&dot_git, GITFILE_READ_CAP)
         else {
             return Some(dot_git);
         };
@@ -1410,13 +1410,28 @@ fn git_dir_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
         // git stops there ("invalid gitfile format"): the walk must not step
         // over it and judge an enclosing repository's HEAD. The file itself is
         // returned, which has no `HEAD` beneath it, so the checkout reads broken.
+        // Bytes, not text: git allows a path that is not UTF-8.
         let target = pointer
-            .trim()
-            .strip_prefix("gitdir:")
-            .map(str::trim)
+            .trim_ascii()
+            .strip_prefix(b"gitdir:")
+            .map(<[u8]>::trim_ascii)
             .filter(|target| !target.is_empty());
-        Some(target.map_or(dot_git, |target| dir.join(target)))
+        Some(target.map_or(dot_git, |target| dir.join(path_from_bytes(target))))
     })
+}
+
+/// A path from the bytes of a `gitdir:` pointer: exact on unix, where a path is
+/// bytes; elsewhere a lossy reading, since a path is not bytes there.
+fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Largest `HEAD` file read: a legal `ref:` line or an object id fits (a branch
@@ -4447,6 +4462,38 @@ mod tests {
         assert!(
             clause.is_none(),
             "a valid worktree HEAD read as broken: {clause:?}"
+        );
+    }
+
+    /// A `gitdir:` pointer whose path is not UTF-8 is legal on unix; it used to
+    /// make the pointer unreadable, so a healthy linked worktree read as broken.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_gitdir_path_is_followed() {
+        use std::os::unix::ffi::OsStrExt;
+        // APFS (macOS) refuses non-UTF-8 names outright; the case cannot be
+        // built there, only on filesystems that store names as bytes.
+        let probe = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"devmap-probe-caf\xe9"));
+        if std::fs::create_dir_all(&probe).is_err() {
+            eprintln!("skipped: this filesystem refuses non-UTF-8 names");
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&probe);
+        let clause = head_clause_over("gitdir-non-utf8", |root| {
+            let gitdir = root
+                .parent()
+                .unwrap()
+                .join(std::ffi::OsStr::from_bytes(b"gitdir-caf\xe9"));
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+            let mut pointer = b"gitdir: ".to_vec();
+            pointer.extend_from_slice(gitdir.as_os_str().as_bytes());
+            pointer.push(b'\n');
+            std::fs::write(root.join(".git"), pointer).unwrap();
+        });
+        assert!(
+            clause.is_none(),
+            "a valid worktree behind a non-UTF-8 path read as broken: {clause:?}"
         );
     }
 

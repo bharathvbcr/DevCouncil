@@ -363,6 +363,11 @@ struct ChargedHoles {
     /// Attribution did not run (the query names no identifier) over partial
     /// files in scope: said, never silent.
     skipped: Option<String>,
+    /// The scope was resolved against a generation the store no longer holds, so
+    /// its partial-parse files could not be checked. Only a scoped lookup can
+    /// say this, and a scoped lookup that could not check its scope is
+    /// unavailable, not a clean miss: it is the reason, never background.
+    generation_gone: Option<String>,
 }
 
 fn listed(items: Vec<String>) -> String {
@@ -446,6 +451,9 @@ impl ChargedHoles {
     fn split(&self, query: &str) -> (Option<String>, Option<String>) {
         let matched = self.match_sentence(query);
         let unchecked = self.unchecked_sentence();
+        if let Some(gone) = &self.generation_gone {
+            return (Some(gone.clone()), None);
+        }
         if let Some(skipped) = &self.skipped {
             return (None, Some(skipped.clone()));
         }
@@ -819,7 +827,7 @@ impl StoreQueryEngine<'_> {
                 // Attribution is skipped, and with partial files in scope that
                 // must not read as a clean miss.
                 let Some((_, held)) = read_gaps(0)? else {
-                    found.skipped = Some(gaps_gone());
+                    found.generation_gone = Some(gaps_gone());
                     return Ok(found);
                 };
                 if held > 0 {
@@ -833,7 +841,7 @@ impl StoreQueryEngine<'_> {
             }
         };
         let Some((rows, total)) = read_gaps(MAX_CHARGED_FILES_READ)? else {
-            found.skipped = Some(gaps_gone());
+            found.generation_gone = Some(gaps_gone());
             return Ok(found);
         };
         found.files_past_cap = total.saturating_sub(rows.len());
