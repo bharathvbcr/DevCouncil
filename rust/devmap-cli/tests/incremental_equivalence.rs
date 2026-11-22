@@ -1659,6 +1659,37 @@ fn a_binding_for_a_seventeen_digit_creation_time_is_reused() {
 }
 
 #[test]
-fn a_binding_for_a_nanosecond_grained_creation_time_is_reused() {
-    assert_exact_created_at_is_reused("created-at-ns", 1795366155.9876543);
+fn a_binding_for_a_creation_time_a_decimal_round_trip_misreads_is_reused() {
+    // 17 significant digits that serde_json's default parser reads back one ULP
+    // away from the f64 it was written from (found by search, not by hand).
+    assert_exact_created_at_is_reused("created-at-ulp", 1795366155.0000021);
+}
+
+/// A binding written before the exact-bits field existed names only
+/// `created_at`. It is not trusted: the build says so and resolves every file.
+#[test]
+fn a_legacy_binding_with_only_created_at_resolves_every_file() {
+    let root = scratch("legacy-binding");
+    write_independent_tree(&root);
+    build_text(&root);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(binding_path(&root)).unwrap()).unwrap();
+    assert!(
+        value["created_at"].is_number(),
+        "the build wrote created_at"
+    );
+    value.as_object_mut().unwrap().remove("created_at_bits");
+    std::fs::write(binding_path(&root), serde_json::to_vec(&value).unwrap()).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "a binding without exact bits resolves every file; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("names no creation time"),
+        "the diagnostic names the missing field; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
 }
