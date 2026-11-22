@@ -382,6 +382,38 @@ func TestDependencyCrateManifestIsChecked(t *testing.T) {
 	}
 }
 
+// devmap's build.rs lists ../../.git/HEAD and .git/index as rerun triggers. In a
+// linked worktree .git is a file, so the path cannot be opened; the entry is not
+// source and must neither refuse nor be needed.
+func TestGitMetadataEntriesAreNotSources(t *testing.T) {
+	workspace, _ := prebuiltSetup(t)
+	built := plantSource(t, workspace, "devmap-cli/src/main.rs", 2*time.Hour)
+	repo := filepath.Dir(workspace)
+	if err := os.WriteFile(filepath.Join(repo, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	head := filepath.Join(workspace, "devmap-cli", "..", "..", ".git", "HEAD")
+	index := filepath.Join(workspace, "devmap-cli", "..", "..", ".git", "index")
+	plantBinary(t, debugBin(workspace, "devmap"), time.Hour, built, head, index)
+	t.Setenv("DEVCOUNCIL_TEST_NO_CARGO", "1")
+	if rec := probe(t, func(tb testing.TB) { Devmap(tb) }); !rec.returned {
+		t.Fatalf("a .git rerun trigger refused the binary: %q", rec.fatals)
+	}
+}
+
+// A manifest above the workspace is not a dependency manifest, however new.
+func TestManifestOutsideTheWorkspaceIsIgnored(t *testing.T) {
+	workspace, _ := prebuiltSetup(t)
+	built := plantSource(t, workspace, "devmap-cli/src/main.rs", 2*time.Hour)
+	outside := plantSource(t, filepath.Dir(filepath.Dir(workspace)), "stray/src/lib.rs", 2*time.Hour)
+	stray := plantSource(t, filepath.Dir(filepath.Dir(workspace)), "stray/Cargo.toml", time.Second)
+	plantBinary(t, debugBin(workspace, "devmap"), time.Hour, built, outside)
+	t.Setenv("DEVCOUNCIL_TEST_NO_CARGO", "1")
+	if rec := probe(t, func(tb testing.TB) { Devmap(tb) }); !rec.returned {
+		t.Fatalf("a Cargo.toml outside the workspace (%s) refused the binary: %q", stray, rec.fatals)
+	}
+}
+
 func TestParseDepInfo(t *testing.T) {
 	got, err := parseDepInfo("/t/debug/dcstore: /a/one.rs /a/two\\ words.rs /a/three.sql\n/a/one.rs:\n/a/two\\ words.rs:\n")
 	if err != nil {

@@ -71,6 +71,11 @@ func noCargoMode(t testing.TB) bool {
 // path must exist and be older than the binary. A missing or unparseable
 // dep-info is refused as unverifiable.
 //
+// Entries inside git metadata (a .git component) are skipped: they are a build
+// script's rerun triggers for embedded version info, not compiled source, and
+// in a linked worktree .git is a file. Manifests are checked only inside the
+// workspace.
+//
 // A successful verdict is cached for the life of the process, keyed by the
 // binary's path, mtime and size: this matches cargoBin's once-per-process build,
 // so a source edited later in the same process is not seen. A refusal is never
@@ -160,7 +165,17 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 	if err != nil {
 		return "", fmt.Errorf("dep-info %s is unusable (%v), so whether the binary is current cannot be told", depInfo, err)
 	}
+	var sources []string
 	for _, src := range listed {
+		// An entry inside git metadata is a build script's rerun trigger for
+		// embedded version info (devmap-cli's build.rs lists ../../.git/HEAD and
+		// .git/index), not compiled source. In a linked worktree .git is a file,
+		// so the path cannot even be opened, and .git/index changes on most git
+		// operations, which would make the binary look stale constantly.
+		if inGitMetadata(src) {
+			continue
+		}
+		sources = append(sources, filepath.Clean(src))
 		info, err := os.Stat(src)
 		if err != nil {
 			return "", fmt.Errorf("dep-info %s lists %s, which cannot be read (%v): the binary was built from "+
@@ -178,8 +193,11 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 		filepath.Join(crates, crate, "Cargo.toml"),
 	}
 	seen := map[string]bool{}
-	for _, src := range listed {
-		for dir := filepath.Dir(src); !seen[dir]; dir = filepath.Dir(dir) {
+	for _, src := range sources {
+		// Only manifests inside the workspace are dependency manifests: a
+		// source outside it (a registry crate, a path in the home directory)
+		// must not make a stray Cargo.toml further up decide the verdict.
+		for dir := filepath.Dir(src); within(crates, dir) && !seen[dir]; dir = filepath.Dir(dir) {
 			seen[dir] = true
 			manifest := filepath.Join(dir, "Cargo.toml")
 			if _, err := os.Stat(manifest); err == nil {
@@ -203,6 +221,22 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 		}
 	}
 	return "", nil
+}
+
+// inGitMetadata reports whether a path has a .git component.
+func inGitMetadata(path string) bool {
+	for _, part := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
+		if part == ".git" {
+			return true
+		}
+	}
+	return false
+}
+
+// within reports whether dir is root or lies below it, lexically.
+func within(root, dir string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), dir)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // parseDepInfo reads the Makefile-syntax dependency line cargo writes beside a
