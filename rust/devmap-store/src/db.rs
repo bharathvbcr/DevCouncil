@@ -758,10 +758,11 @@ pub struct Store {
     /// readers ([`Store::enable_lazy_source_verification`], the MCP server's
     /// store cache); a one-shot CLI process or hook never walks on a query.
     lazy_source_verification: std::sync::atomic::AtomicBool,
-    /// Serialises those walks and remembers when the last one started, so a
-    /// store walks at most once per [`SOURCE_FRESHNESS_MAX_AGE`] however many
-    /// queries ask. Held across the walk: a concurrent query does not wait for
-    /// it, it answers its own fallback verdict (`try_lock`).
+    /// Remembers when the last lazy walk started, so a store walks at most
+    /// once per [`SOURCE_FRESHNESS_MAX_AGE`] however many queries ask. Held
+    /// only to read and write that bookkeeping, never across the walk: a
+    /// query that arrives during a walk reads the cached verdict (and is told
+    /// a walk is running) instead of waiting for it.
     lazy_walk: Mutex<LazyWalk>,
 }
 
@@ -773,6 +774,13 @@ pub(crate) type WalkProbe = std::sync::Arc<dyn Fn(&std::sync::atomic::AtomicBool
 #[derive(Default)]
 pub(crate) struct LazyWalk {
     pub(crate) last_attempt: Option<std::time::Instant>,
+    /// A walk is running now (set when it starts, cleared when it ends).
+    pub(crate) in_flight: bool,
+    /// Why the last walk could not decide (cancelled, failed, panicked, over
+    /// the memory bound) and the generation it was walking, kept for the age
+    /// window so a later query on that generation says so rather than reading
+    /// as if no walk had been tried. Cleared when a walk starts.
+    pub(crate) last_failure: Option<(u32, String)>,
     /// Walks started, for tests.
     #[cfg(test)]
     pub(crate) walks: usize,
@@ -782,7 +790,60 @@ pub(crate) struct LazyWalk {
     /// Overrides [`SOURCE_FRESHNESS_WALK_BUDGET`].
     #[cfg(test)]
     pub(crate) budget: Option<std::time::Duration>,
+    /// Overrides [`SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES`].
+    #[cfg(test)]
+    pub(crate) max_source_bytes: Option<u64>,
+    /// Stands in for the process-wide walk places.
+    #[cfg(test)]
+    pub(crate) slots: Option<std::sync::Arc<WalkSlots>>,
 }
+
+/// A count of lazy walks running, with the most that may run at once.
+pub(crate) struct WalkSlots {
+    running: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+/// One running walk's place in a [`WalkSlots`]; freed on drop.
+pub(crate) struct WalkSlot<'a>(&'a WalkSlots);
+
+impl WalkSlots {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self {
+            running: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// A place for one more walk, or `None` when `limit` are already running.
+    pub(crate) fn acquire(&self) -> Option<WalkSlot<'_>> {
+        use std::sync::atomic::Ordering;
+        self.running
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |running| {
+                (running < self.limit).then_some(running + 1)
+            })
+            .ok()
+            .map(|_| WalkSlot(self))
+    }
+}
+
+impl Drop for WalkSlot<'_> {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Every cached store in the process shares these places; see
+/// [`MAX_CONCURRENT_LAZY_WALKS`].
+#[cfg(not(test))]
+pub(crate) static PROCESS_WALK_SLOTS: WalkSlots = WalkSlots::new(MAX_CONCURRENT_LAZY_WALKS);
+
+/// Tests run in one process on many threads, so the process cap is replaced
+/// per store ([`LazyWalk::slots`]); a store that sets none is uncapped.
+#[cfg(test)]
+pub(crate) static TEST_UNCAPPED_WALK_SLOTS: WalkSlots = WalkSlots::new(usize::MAX);
 
 /// How long a held integrity answer may stand before it is read again.
 ///
@@ -825,11 +886,34 @@ const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_
 /// the bound) says otherwise.
 pub const SOURCE_FRESHNESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The longest a query waits for its own lazy source-freshness re-walk. Past
-/// it the walk is cancelled and the query answers `fresh: null` with the age
-/// and the reason, as it did before the walk existed.
+/// How long a query waits for its own lazy source-freshness re-walk before it
+/// cancels it and answers `fresh: null` with the age and the reason, as it did
+/// before the walk existed.
+///
+/// This is when the cancel is sent, not a bound on the query's wait: the walk
+/// runs on a scoped thread the query joins, and the walk reads its cancel flag
+/// only between and inside its scan phases, not while it reads the stored
+/// hashes or the discovery inventory (each holds the connection lock for one
+/// SQL read) or compares the delta. The query's wait is this budget plus the
+/// longest of those uncancellable steps. What the query-time path does bound is
+/// everyone else's wait: queries beside a running walk never join it.
 pub const SOURCE_FRESHNESS_WALK_BUDGET: std::time::Duration =
     std::time::Duration::from_millis(1500);
+
+/// The most source text one lazy walk may hold in memory. The scan reads every
+/// indexable source into memory (the comparison needs their hashes), outside
+/// the reader's page-cache bound ([`ReaderMemory`]), so a walk over a larger
+/// tree stops with a reason instead of growing the MCP process; `devmap status`
+/// has no such bound. Overshoot is at most one read ceiling per rayon thread.
+pub const SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The most lazy walks running at once in this process, across every cached
+/// store. A query that finds the cap reached answers its own fallback verdict
+/// and does not start a walk or spend the store's walk window, so the next
+/// query past the cap tries again. Bounds the CPU, descriptors and (with
+/// [`SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES`]) the memory a burst of stale
+/// stores can spend at once.
+pub const MAX_CONCURRENT_LAZY_WALKS: usize = 2;
 
 #[cfg(test)]
 thread_local! {

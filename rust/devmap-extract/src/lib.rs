@@ -963,6 +963,26 @@ impl std::fmt::Display for BuildCancelled {
 
 impl std::error::Error for BuildCancelled {}
 
+/// A bounded scan ([`scan_tree_bounded`]) stopped because the tree's source
+/// text is larger than the caller allowed it to hold in memory. It carries no
+/// tree: a partial one compared with stored hashes would read as deletions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanBudgetExceeded {
+    pub limit_bytes: u64,
+}
+
+impl std::fmt::Display for ScanBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the tree's source text is larger than the {} byte limit this scan may hold in memory",
+            self.limit_bytes
+        )
+    }
+}
+
+impl std::error::Error for ScanBudgetExceeded {}
+
 /// [`extract_all_with_progress`] with explicit budgets, a cancellation flag
 /// for the retry, and the retry's report.
 ///
@@ -1626,7 +1646,7 @@ pub fn scan_tree_with_progress(
     root: &Path,
     progress: Option<&progress::FileProgress>,
 ) -> anyhow::Result<ScannedTree> {
-    scan_tree_inner(root, progress, None)
+    scan_tree_inner(root, progress, None, None)
 }
 
 /// [`scan_tree`] that stops when `cancel` is set, returning [`BuildCancelled`]
@@ -1641,13 +1661,28 @@ pub fn scan_tree_cancellable(
     root: &Path,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<ScannedTree> {
-    scan_tree_inner(root, None, Some(cancel))
+    scan_tree_inner(root, None, Some(cancel), None)
+}
+
+/// [`scan_tree_cancellable`] that also refuses a tree whose source text exceeds
+/// `max_source_bytes`, returning [`ScanBudgetExceeded`] (downcastable from the
+/// error). A scan holds every source it reads in memory, so a caller that runs
+/// beside a long-lived process (the MCP server's lazy freshness walk) bounds it.
+/// Reading stops once the total passes the limit; the overshoot is at most one
+/// file ([`MAX_SOURCE_BYTES`]) per reading thread.
+pub fn scan_tree_bounded(
+    root: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    max_source_bytes: u64,
+) -> anyhow::Result<ScannedTree> {
+    scan_tree_inner(root, None, Some(cancel), Some(max_source_bytes))
 }
 
 fn scan_tree_inner(
     root: &Path,
     progress: Option<&progress::FileProgress>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    max_source_bytes: Option<u64>,
 ) -> anyhow::Result<ScannedTree> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
     let (candidates, mut report) = walk_candidates(root, cancel)?;
@@ -1655,10 +1690,15 @@ fn scan_tree_inner(
         progress.start(candidates.len());
     }
 
+    let held = std::sync::atomic::AtomicU64::new(0);
+    let over_budget = || {
+        max_source_bytes
+            .is_some_and(|limit| held.load(std::sync::atomic::Ordering::Relaxed) > limit)
+    };
     let read: Vec<Result<(String, String), (String, DiscoverySkipReason)>> = candidates
         .into_par_iter()
         .map(|(relative, absolute)| {
-            if cancelled() {
+            if cancelled() || over_budget() {
                 return Err((
                     relative,
                     DiscoverySkipReason::Unreadable {
@@ -1667,7 +1707,10 @@ fn scan_tree_inner(
                 ));
             }
             let result = match read_source(&absolute) {
-                Ok(source) => Ok((relative, source)),
+                Ok(source) => {
+                    held.fetch_add(source.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    Ok((relative, source))
+                }
                 Err(error) => Err((
                     relative,
                     DiscoverySkipReason::Unreadable {
@@ -1683,6 +1726,9 @@ fn scan_tree_inner(
         .collect();
     if cancelled() {
         return Err(BuildCancelled.into());
+    }
+    if let Some(limit_bytes) = max_source_bytes.filter(|_| over_budget()) {
+        return Err(ScanBudgetExceeded { limit_bytes }.into());
     }
 
     let mut sources = Vec::with_capacity(read.len());
