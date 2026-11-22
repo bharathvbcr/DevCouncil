@@ -63,11 +63,9 @@ func (r *recorder) Errorf(format string, args ...any) { r.errs = append(r.errs, 
 // configuration and is handled by IsolateHostConfig itself.
 var nonConfigEnv = []string{
 	"PATH", "TMPDIR", "TERM", "NO_COLOR", "COLUMNS",
-	"DEVMAP_HOME", "DEVMAP_NON_REFLINK_DIR", "RAYON_NUM_THREADS",
-	// Project-root hints (repository-scoped, not user-level), a Cargo
-	// build-time path, and git's own config switches that devmap's tests set.
-	"CLAUDE_PROJECT_DIR", "CURSOR_PROJECT_DIR", "CARGO_MANIFEST_DIR",
-	"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+	"DEVMAP_HOME", "RAYON_NUM_THREADS",
+	// Project-root hints: repository-scoped, not user-level.
+	"CLAUDE_PROJECT_DIR", "CURSOR_PROJECT_DIR",
 }
 
 // devmapCrateSources returns the src directory of devmap-cli and of every crate
@@ -120,9 +118,19 @@ func TestHostConfigEnvCoversWhatDevmapReads(t *testing.T) {
 			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".rs") {
 				return err
 			}
+			// Test code sets variables for git children (GIT_CONFIG_GLOBAL and
+			// friends, which devmap itself never reads) and reads test-only ones
+			// (DEVMAP_NON_REFLINK_DIR, CARGO_MANIFEST_DIR); the shipped binary is
+			// what has to be isolated.
+			if name := d.Name(); name == "tests.rs" || strings.HasSuffix(name, "_tests.rs") {
+				return nil
+			}
 			body, err := os.ReadFile(path)
 			if err != nil {
 				return err
+			}
+			if cut := strings.Index(string(body), "#[cfg(test)]"); cut >= 0 {
+				body = body[:cut] // by convention the test module closes the file
 			}
 			for _, m := range literal.FindAllSubmatch(body, -1) {
 				seen[string(m[1])] = path
