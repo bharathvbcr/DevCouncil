@@ -1,0 +1,29 @@
+[package]
+name = "dc-redact-cli"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+description = "dcredact: the dc-redact credential redactor behind a JSON-on-stdio process contract"
+rust-version.workspace = true
+
+# The process contract lives here and not in `dc-redact` on purpose.
+# `dc-redact` must stay dependency-free (GitPulse vendors it, and
+# tests/no_dependencies.rs keeps it that way); a JSON-on-stdio binary needs
+# `dc-proc`'s CLI helpers and a real JSON parser. This crate takes them and
+# leaves the library's manifest, API and vendored copies untouched.
+[dependencies]
+dc-proc = { path = "../dc-proc" }
+dc-redact = { path = "../dc-redact" }
+
+# serde_json rather than a hand-rolled reader, for the reason dc-grep gives:
+# the request carries arbitrary text, which is the input a hand-written
+# escaper or parser gets wrong.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+# Installed by `devcouncil install`, like dcgrep.
+[package.metadata.dist]
+dist = false

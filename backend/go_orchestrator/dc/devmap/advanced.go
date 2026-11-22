@@ -18,6 +18,11 @@ const (
 	QueryImpact   QueryKind = "impact"
 	QueryTrace    QueryKind = "trace"
 	QueryAffected QueryKind = "affected"
+	// QueryAskEvidence answers a question about a behaviour whose name the
+	// caller does not know: `devmap ask --evidence`, ranked files with their
+	// source, the call edges between the hits and the tests that reach them.
+	// It walks no fixed depth, so Depth must be zero for it.
+	QueryAskEvidence QueryKind = "ask_evidence"
 )
 
 // AdvancedQuery is the bounded, typed subset of devmap's graph API exposed to
@@ -47,7 +52,14 @@ type AdvancedResult struct {
 // configured default; all other bounds are complete here so every adapter can
 // classify caller errors the same way.
 func ValidateAdvancedQuery(q AdvancedQuery) error {
-	if q.Depth < 1 || q.Depth > 64 {
+	if q.Kind == QueryAskEvidence {
+		// ask ranks by PageRank over the whole graph; it takes no depth, and
+		// a depth the producer would ignore is a bound the caller believes in
+		// and nothing enforces.
+		if q.Depth != 0 {
+			return fmt.Errorf("ask_evidence takes no depth, got %d", q.Depth)
+		}
+	} else if q.Depth < 1 || q.Depth > 64 {
 		return fmt.Errorf("depth must be in 1..64, got %d", q.Depth)
 	}
 	if q.Budget < 0 || q.Budget > 1_000_000 {
@@ -74,6 +86,10 @@ func ValidateAdvancedQuery(q AdvancedQuery) error {
 	case QueryTrace:
 		if q.Query == "" || q.To == "" {
 			return fmt.Errorf("trace requires from and to")
+		}
+	case QueryAskEvidence:
+		if strings.TrimSpace(q.Query) == "" {
+			return fmt.Errorf("ask_evidence question is empty")
 		}
 	case QueryAffected:
 		if len(q.Targets) == 0 || len(q.Targets) > 128 {
@@ -109,6 +125,9 @@ func (c *Client) Advanced(ctx context.Context, q AdvancedQuery) (AdvancedResult,
 	}
 
 	args := []string{string(q.Kind), "--budget", strconv.Itoa(budget), "--depth", strconv.Itoa(q.Depth)}
+	if q.Kind == QueryAskEvidence {
+		args = []string{"ask", "--evidence", "--budget", strconv.Itoa(budget)}
+	}
 	switch q.Kind {
 	case QueryExplore:
 		args = append(args, "--min-confidence", strconv.FormatFloat(q.MinConfidence, 'g', -1, 64), "--", q.Query)
@@ -125,6 +144,13 @@ func (c *Client) Advanced(ctx context.Context, q AdvancedQuery) (AdvancedResult,
 	case QueryAffected:
 		args = append(args, "--min-confidence", strconv.FormatFloat(q.MinConfidence, 'g', -1, 64), "--")
 		args = append(args, q.Targets...)
+	case QueryAskEvidence:
+		// MinConfidence zero means the producer's default (the deterministic
+		// rung), not "every speculative edge": an unset float is not a choice.
+		if q.MinConfidence > 0 {
+			args = append(args, "--min-confidence", strconv.FormatFloat(q.MinConfidence, 'g', -1, 64))
+		}
+		args = append(args, "--", q.Query)
 	}
 
 	statusCtx := withCLIStatus(ctx)
@@ -192,6 +218,17 @@ func validateAdvancedEnvelope(kind QueryKind, data json.RawMessage) error {
 		}
 	case QueryImpact, QueryTrace:
 		envelope = trimmed
+	case QueryAskEvidence:
+		// The pack's ranked hits are under files, not items, and its counts
+		// are of units (see validateAskPack). related_tests is a counted
+		// envelope of its own and is checked as one.
+		if err := validateAskPack(kind, trimmed); err != nil {
+			return err
+		}
+		if raw, ok := top["related_tests"]; ok {
+			return validateCountedEnvelope(kind, "related_tests", raw)
+		}
+		return nil
 	case QueryAffected:
 		envelope = top["tests"]
 		if !rawJSONArray(top["targets"]) || !rawJSONObject(top["blast_radius"]) {
@@ -211,8 +248,47 @@ func validateAdvancedEnvelope(kind QueryKind, data json.RawMessage) error {
 }
 
 func validateCountedEnvelope(kind QueryKind, section string, envelope json.RawMessage) error {
+	var list struct {
+		Items json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(envelope, &list); err != nil || !rawJSONArray(list.Items) {
+		return fmt.Errorf("devmap %s %s lacks required completeness fields items, resolution, shown, total, hidden, truncated, or tokens_used", kind, section)
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(list.Items, &items); err != nil {
+		return fmt.Errorf("devmap %s %s items are not an array", kind, section)
+	}
+	return validateCounts(kind, section, envelope, len(items))
+}
+
+// validateAskPack checks an evidence pack. It ranks files but counts units:
+// shown is the number of units across the files it shows, not the number of
+// files — measured against devmap 0.2.5, where three files carried four units
+// and shown said four. Counting files would refuse every real answer.
+func validateAskPack(kind QueryKind, envelope json.RawMessage) error {
+	var pack struct {
+		Files json.RawMessage `json:"files"`
+	}
+	if err := json.Unmarshal(envelope, &pack); err != nil || !rawJSONArray(pack.Files) {
+		return fmt.Errorf("devmap %s result lacks required completeness fields files, resolution, shown, total, hidden, truncated, or tokens_used", kind)
+	}
+	var files []struct {
+		Units []json.RawMessage `json:"units"`
+	}
+	if err := json.Unmarshal(pack.Files, &files); err != nil {
+		return fmt.Errorf("devmap %s files are not an array of files with units", kind)
+	}
+	units := 0
+	for _, file := range files {
+		units += len(file.Units)
+	}
+	return validateCounts(kind, "result", envelope, units)
+}
+
+// validateCounts checks a completeness envelope's counts against the number of
+// entries it actually carries.
+func validateCounts(kind QueryKind, section string, envelope json.RawMessage, carried int) error {
 	var counts struct {
-		Items      json.RawMessage `json:"items"`
 		Resolution json.RawMessage `json:"resolution"`
 		Shown      *int            `json:"shown"`
 		Total      *int            `json:"total"`
@@ -220,16 +296,12 @@ func validateCountedEnvelope(kind QueryKind, section string, envelope json.RawMe
 		Truncated  *bool           `json:"truncated"`
 		TokensUsed *int            `json:"tokens_used"`
 	}
-	if err := json.Unmarshal(envelope, &counts); err != nil || !rawJSONArray(counts.Items) || !rawResolution(counts.Resolution) ||
+	if err := json.Unmarshal(envelope, &counts); err != nil || !rawResolution(counts.Resolution) ||
 		counts.Shown == nil || counts.Total == nil || counts.Hidden == nil || counts.Truncated == nil || counts.TokensUsed == nil {
 		return fmt.Errorf("devmap %s %s lacks required completeness fields items, resolution, shown, total, hidden, truncated, or tokens_used", kind, section)
 	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(counts.Items, &items); err != nil {
-		return fmt.Errorf("devmap %s %s items are not an array", kind, section)
-	}
 	if *counts.Shown < 0 || *counts.Total < 0 || *counts.Hidden < 0 || *counts.Shown > *counts.Total ||
-		*counts.TokensUsed < 0 || *counts.Shown != len(items) ||
+		*counts.TokensUsed < 0 || *counts.Shown != carried ||
 		*counts.Hidden != *counts.Total-*counts.Shown || *counts.Truncated != (*counts.Hidden > 0) {
 		return fmt.Errorf("devmap %s %s carries impossible completeness counts", kind, section)
 	}

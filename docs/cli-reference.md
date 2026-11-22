@@ -36,7 +36,7 @@ DevMap build retains its measured five-stage trail and file counters.
 Optional output has bounded queues and shutdown waits. A full or disconnected
 stderr must not block an independent primary result stream. Primary stdout
 retains normal backpressure. Errors writing a result fail the command; the
-four JSON components (`dcstore`, `dcverify`, `dcjsoncheck`, `dcgrep`) share `dc_proc::cli` and return exit 1 for transport failure without a panic.
+five JSON components (`dcstore`, `dcverify`, `dcjsoncheck`, `dcgrep`, `dcredact`) share `dc_proc::cli` and return exit 1 for transport failure without a panic.
 
 `devcouncil install devmap --dry-run --json` emits the planned command receipt
 without executing it. `devmap repair --fts --pending --page-size --json`
@@ -485,6 +485,20 @@ dcgrep files < request.json
 dcgrep index < request.json
 dcgrep rank < request.json    # BM25/learned ranking with completeness contract & decoupled ceilings
 ```
+
+### Credential Redaction (`dcredact`)
+
+`dc-redact`'s credential table behind the same JSON-on-stdio contract as `dcgrep`, for apps that redact text but do not link the Rust crate (the library stays dependency-free; the process contract is the separate `dc-redact-cli` package):
+
+```bash
+dcredact [--version|-V|-v|version]
+dcredact health
+dcredact [redact] < request.json    # {"text":"..."}
+```
+
+- Exit 0 prints exactly one object: `{"ok":true,"id":"dcredact","component":"dc-redact","schema_version":1,"redaction_ran":true,"text":<redact_secrets(text)>,"redacted_lines":N,"kinds":[...],"input_bytes":N,"output_bytes":N}`. `redaction_ran` is always true in a success, so "redacted, nothing found" (`redacted_lines: 0`) is distinguishable from "never examined". `redacted_lines` counts rewritten lines (the library's granularity); `kinds` names the first vendor shape per rewritten line, a lower bound on the shapes present.
+- Exit 2 prints `{"ok":false,"redaction_ran":false,"error":"..."}` and never carries `text`: oversize text (`text` over 1 MiB, or a request over 8 MiB read), a malformed or unknown-field request, an unknown command, or a redaction that did not converge (re-scanned before it is returned). Transport failure (closed stdout) is exit 1, as for the other components.
+- `health` reports `schema_version` and the two size limits. Install it with `devcouncil install dcredact` (also in `all` and `analysis`).
 
 ---
 

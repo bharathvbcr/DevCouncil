@@ -401,6 +401,8 @@ func cargoInstallArgs(id, prefix string, ref gitRef) (string, []string, error) {
 		args = append(args, "--bin", "dcverify", "dc-verify")
 	case "dcgrep":
 		args = append(args, "--bin", "dcgrep", "dc-grep")
+	case "dcredact":
+		args = append(args, "--bin", "dcredact", "dc-redact-cli")
 	default:
 		return "", nil, fmt.Errorf("no remote install command for %s", id)
 	}

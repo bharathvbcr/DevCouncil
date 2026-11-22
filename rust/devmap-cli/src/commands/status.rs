@@ -341,6 +341,9 @@ fn kernel_capabilities() -> serde_json::Value {
             "impact": has_command("impact"),
             "trace": has_command("trace"),
             "affected": has_command("affected"),
+            // Named for the host query kind (devmap.QueryAskEvidence), which
+            // runs `ask --evidence`: a host checks this before asking.
+            "ask_evidence": accepts("ask", "evidence"),
             "html": has_command("html"),
             "seed": has_command("seed"),
             "manifest_graph_output": accepts("manifest", "graph-output"),
@@ -550,5 +553,26 @@ fn run_auto_rebuild(cli: &Cli) -> Result<(), String> {
             output.status.code().unwrap_or(-1),
             stderr.chars().take(500).collect::<String>()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kernel_capabilities;
+
+    /// Every query kind a host asks through `devmap.Client.Advanced` has a
+    /// capability of the same name, read from this binary's own parser. The
+    /// host refuses a kind the status does not advertise, so a kind missing
+    /// here is a query no host can make.
+    #[test]
+    fn every_host_query_kind_is_advertised() {
+        let caps = kernel_capabilities();
+        for kind in ["explore", "impact", "trace", "affected", "ask_evidence"] {
+            assert_eq!(
+                caps[kind],
+                serde_json::Value::Bool(true),
+                "{kind} is not advertised: {caps}"
+            );
+        }
     }
 }
