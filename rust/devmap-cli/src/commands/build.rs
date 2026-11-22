@@ -1085,9 +1085,16 @@ fn run_build(
     // The generation is committed. A cache write that fails must not fail it:
     // the next edit resolves every file the cache cannot prove, which is the
     // same graph. The diagnostic carries the error text.
-    if let Err(error) =
-        persist_resolution_reuse(path, &extractions, &produced, full_resolve, &limits, usage)
-    {
+    if let Err(error) = persist_resolution_reuse(
+        path,
+        &store,
+        gen_id,
+        &extractions,
+        &produced,
+        full_resolve,
+        &limits,
+        usage,
+    ) {
         progress.display.diagnostic(format_args!(
             "resolution reuse: the generation was committed but the reuse cache was not updated: {error}"
         ));
@@ -1641,6 +1648,12 @@ fn load_resolution_reuse(
         return Ok(loaded);
     }
     let dir = reuse_dir(repo);
+    if let Err(why) = check_reuse_binding(&dir, store) {
+        loaded.diagnostics.push(format!(
+            "resolution reuse: the cache is not bound to the store's latest generation ({why}), so every file is resolved"
+        ));
+        return Ok(loaded);
+    }
     let receipt_path = dir.join("budget.json");
     let receipt_bytes = match std::fs::read(&receipt_path) {
         Ok(bytes) => bytes,
@@ -1694,6 +1707,98 @@ fn load_resolution_reuse(
         }
     }
     Ok(loaded)
+}
+
+/// Which store, and which generation of it, the blobs in a reuse directory were
+/// resolved for. The blobs are keyed by content hash alone, so nothing else says
+/// that the resolutions they hold still describe the store's latest generation:
+/// another writer (the daemon's drain) may have committed a generation since,
+/// and a blob for a file that did not change then is stale whenever that
+/// generation added or removed a definition the file mentions.
+fn reuse_binding_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("generation.json")
+}
+
+fn store_identity(store: &Store) -> Option<String> {
+    store.path().map(|path| {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// `Ok` only when the binding is present, readable, names this store, and names
+/// the store's latest generation. Every other state is an `Err` carrying the
+/// reason: the cache is then not read at all.
+fn check_reuse_binding(dir: &std::path::Path, store: &Store) -> Result<(), String> {
+    let path = reuse_binding_path(dir);
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if bytes.len() as u64 > REUSE_BLOB_MAX_BYTES {
+        return Err(format!(
+            "{} is over the {REUSE_BLOB_MAX_BYTES} byte cap",
+            path.display()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} is not a binding: {error}", path.display()))?;
+    let bound_generation = value["generation_id"]
+        .as_u64()
+        .ok_or_else(|| format!("{} names no generation", path.display()))?;
+    let bound_store = value["store"]
+        .as_str()
+        .ok_or_else(|| format!("{} names no store", path.display()))?;
+    let identity = store_identity(store).ok_or_else(|| "the store has no path".to_string())?;
+    if bound_store != identity {
+        return Err(format!(
+            "written for the store {bound_store}, not {identity}"
+        ));
+    }
+    let latest = store
+        .latest_generation_id()
+        .map_err(|error| format!("could not read the latest generation: {error}"))?;
+    if latest.map(u64::from) != Some(bound_generation) {
+        return Err(format!(
+            "written for generation {bound_generation}, the store is at {latest:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Bind the directory to `generation_id`, but only while that is still the
+/// store's latest generation. A writer that committed after this build's own
+/// commit leaves the blobs describing a generation that is no longer latest, so
+/// the binding is removed rather than written: a missing binding is a refusal
+/// to reuse, never a pass.
+fn bind_reuse_cache(
+    dir: &std::path::Path,
+    store: &Store,
+    generation_id: u32,
+) -> Result<(), String> {
+    let path = reuse_binding_path(dir);
+    let identity = store_identity(store);
+    let current = store
+        .latest_generation_id()
+        .map_err(|error| format!("could not read the latest generation: {error}"));
+    match (identity, current) {
+        (Some(identity), Ok(Some(latest))) if latest == generation_id => {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "generation_id": generation_id,
+                "store": identity,
+            }))
+            .map_err(|error| format!("could not encode the binding: {error}"))?;
+            write_atomic(&path, &bytes)
+                .map_err(|error| format!("could not write the binding: {error}"))
+        }
+        (_, current) => {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("could not remove the stale binding: {error}")),
+            }
+            current.map(|_| ())
+        }
+    }
 }
 
 fn read_reuse_blob(
@@ -1765,8 +1870,11 @@ fn reuse_must_fall_back(
             > limits.ambiguity_evidence_bytes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_resolution_reuse(
     repo: &std::path::Path,
+    store: &Store,
+    generation_id: u32,
     extractions: &[devmap_extract::model::Extraction],
     produced: &std::collections::BTreeMap<String, ReusedFileResolution>,
     full_resolve: bool,
@@ -1776,6 +1884,13 @@ fn persist_resolution_reuse(
     let dir = reuse_dir(repo);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+    // The blobs below are about to describe `generation_id`; until the binding
+    // says so again they describe nothing the next build may trust.
+    match std::fs::remove_file(reuse_binding_path(&dir)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not unbind the reuse cache: {error}")),
+    }
     let mut failures = Vec::new();
     for (file_path, file) in produced {
         if let Err(error) = write_reuse_blob(&dir, file_path, file) {
@@ -1801,6 +1916,7 @@ fn persist_resolution_reuse(
     }
     prune_reuse_blobs(&dir, extractions)
         .map_err(|error| format!("could not prune stale reuse blobs: {error}"))?;
+    bind_reuse_cache(&dir, store, generation_id)?;
     remove_old_reuse_epochs(repo).map_err(|error| {
         format!(
             "the current reuse cache was written, but an older epoch could not be removed: {error}"
@@ -2210,6 +2326,24 @@ const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 mod tests {
     use super::*;
     use devmap_analyze::{LanguageResolution, ResolutionRate};
+
+    /// A writer that committed after this build's own generation leaves the
+    /// blobs describing a generation that is no longer the store's latest. The
+    /// binding must then be removed, not written: a missing binding refuses reuse.
+    #[test]
+    fn a_binding_is_withdrawn_when_the_build_is_no_longer_the_latest_generation() {
+        let dir = std::env::temp_dir().join(format!("devmap-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+        let binding = reuse_binding_path(&dir);
+        std::fs::write(&binding, b"{\"generation_id\":7,\"store\":\"x\"}").unwrap();
+        // The store holds no generation 7 (or any), so 7 is not its latest.
+        bind_reuse_cache(&dir, &store, 7).unwrap();
+        assert!(!binding.exists(), "a stale binding must not survive");
+        assert!(check_reuse_binding(&dir, &store).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_manifest_path_is_a_resolution_input_and_a_source_path_is_not() {
