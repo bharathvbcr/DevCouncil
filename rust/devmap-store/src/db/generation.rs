@@ -3464,7 +3464,10 @@ mod lazy_source_verification {
         // Inside the window the refusal stands, with its reason.
         let again = f.store.query_source_freshness();
         assert_eq!(again.fresh, None, "{again:?}");
-        assert!(again.reason.expect("reason").contains("larger than the 1 byte limit"));
+        assert!(again
+            .reason
+            .expect("reason")
+            .contains("larger than the 1 byte limit"));
         assert_eq!(walks(&f.store), 1);
     }
 

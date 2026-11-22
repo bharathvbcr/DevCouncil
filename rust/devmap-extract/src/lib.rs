@@ -1692,7 +1692,8 @@ fn scan_tree_inner(
 
     let held = std::sync::atomic::AtomicU64::new(0);
     let over_budget = || {
-        max_source_bytes.is_some_and(|limit| held.load(std::sync::atomic::Ordering::Relaxed) > limit)
+        max_source_bytes
+            .is_some_and(|limit| held.load(std::sync::atomic::Ordering::Relaxed) > limit)
     };
     let read: Vec<Result<(String, String), (String, DiscoverySkipReason)>> = candidates
         .into_par_iter()
