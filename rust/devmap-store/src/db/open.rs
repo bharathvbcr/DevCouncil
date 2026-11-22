@@ -460,16 +460,17 @@ impl Store {
         // repair after `Connection::open` is a repair the connection never
         // sees. See `repair_sidecar_modes`.
         Self::repair_sidecar_modes(path)?;
-        // A store is being created at `path`: the consumer sidecars beside it
+        // If a store is being created at `path`, the consumer sidecars beside it
         // (`.csr`, `.artifacts.json`) were written by an earlier store at this
         // path, never by this one, and each describes the store it sat beside.
         // Readers accept a CSR on its generation number alone, so an orphan
         // stamped with the new store's generation would be served as its graph.
-        // The guard, when one was needed, is held to the end of this open: it
-        // is what keeps a seed from placing its sidecars between the sweep and
-        // the creation. Taken before `CONNECTION_SETUP`, which it must not
-        // be waited on under.
-        let _creation_lock = Self::sweep_foreign_sidecars(path)?;
+        // The writer lock is taken for every creation, not only when an orphan
+        // is there to sweep, and held to the end of this open: it is what keeps
+        // a seed from placing its sidecars or its store between the sweep and
+        // the creation. Taken before `CONNECTION_SETUP`, which it must not be
+        // waited on under.
+        let _creation_lock = Self::lock_creation_and_sweep(path)?;
         // Held to the end of this open; see `CONNECTION_SETUP`.
         let _setup = CONNECTION_SETUP
             .lock()
@@ -550,33 +551,36 @@ impl Store {
         })
     }
 
-    /// Sweep the consumer sidecars beside a store that does not exist yet,
-    /// holding the store's writer lock while it does.
+    /// Take the store's writer lock for the creation of a store that does not
+    /// exist yet, and sweep the consumer sidecars an earlier store left beside
+    /// it while holding it. Returns the guard so the caller holds it through
+    /// the creation; `None` when the store already exists (nothing is created,
+    /// nothing is swept) or its directory does not (the open reports that).
     ///
     /// `CONNECTION_SETUP` serialises one process only. A seed in another
-    /// process places a store's sidecars first and the store last, under this
-    /// same lock, so a sweep that did not take it could delete the CSR and
-    /// artifact stamp a seed had just placed. The lock is taken only when an
-    /// orphan is actually there to remove, and the store's absence is checked
-    /// again under it: a seed that finished while this waited has left a store,
-    /// and its sidecars are its own. A caller that already holds the lock on
-    /// this thread (`devmap build` takes it, then opens the store it is about
-    /// to create) is not asked for it a second time: that would wait on itself.
+    /// process places a store's sidecars first and its store last, under this
+    /// same lock, so a creation that did not take it could delete the sidecars
+    /// a seed had just placed, or create an empty store the seed's final
+    /// placement then replaced. The store's absence is checked again under the
+    /// lock: a seed that finished while this waited has left a store, and its
+    /// sidecars are its own. The lock is taken whenever the store is absent,
+    /// orphans or not, because the second harm needs no orphan.
     ///
-    /// Returns the guard so the caller can hold it through the creation.
-    fn sweep_foreign_sidecars(db_path: &Path) -> Result<Option<WriterLock>> {
+    /// A caller that already holds the lock on this thread (`devmap build`
+    /// takes it, then opens the store it is about to create) is not asked for
+    /// it a second time: that would wait on itself. See [`Store::lock_writer_at`]
+    /// for what "the same lock" means.
+    fn lock_creation_and_sweep(db_path: &Path) -> Result<Option<WriterLock>> {
         let absent = |path: &Path| {
             matches!(
                 std::fs::symlink_metadata(path),
                 Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
             )
         };
-        let orphaned = || {
-            crate::seed::STORE_SIDECARS
-                .iter()
-                .any(|suffix| !absent(&crate::seed::sidecar(db_path, suffix)))
-        };
-        if !absent(db_path) || !orphaned() {
+        let parent_exists = db_path
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty() || parent.is_dir());
+        if !absent(db_path) || !parent_exists {
             return Ok(None);
         }
         let lock_path = Self::writer_lock_path(db_path);
@@ -590,9 +594,9 @@ impl Store {
             Some(
                 Self::lock_file_at(&lock_path, Self::WRITER_LOCK_WAIT).map_err(|error| {
                     refusal(format!(
-                        "a new devmap store at {} would sit beside sidecars an earlier store \
-                         left, and the writer lock that makes removing them safe could not be \
-                         taken: {error:#}",
+                        "a new devmap store at {} could not be created: the writer lock that \
+                         keeps a seed's placement and this creation apart could not be taken: \
+                         {error:#}",
                         db_path.display()
                     ))
                 })?,
@@ -1089,6 +1093,14 @@ impl Store {
     /// behind a wedged peer is not an improvement on one that fails.
     ///
     /// The holder writes its pid into the file, so the timeout can say who.
+    ///
+    /// The process also records which thread holds each lock, by lock-file
+    /// path as spelled after alias resolution, so that `Store::open` creating
+    /// a store under a lock its own thread holds does not wait on itself.
+    /// That contract is per thread and per spelling: the same store reached
+    /// through a different spelling (a symlinked parent that did not exist when
+    /// the lock was taken) or opened from another thread is not recognised and
+    /// waits on the lock like any other process would.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
         let db_path = devmap_extract::safe_fs::resolve_file_alias(db_path)?;
         Self::validate_database_file(&db_path)?;

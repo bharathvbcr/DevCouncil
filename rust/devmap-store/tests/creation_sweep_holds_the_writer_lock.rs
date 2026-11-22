@@ -27,18 +27,24 @@ fn an_open_waits_for_a_seed_that_holds_the_lock_and_leaves_its_sidecars() {
     std::fs::write(sidecar(&db, ".csr"), b"placed csr").unwrap();
     std::fs::write(sidecar(&db, ".artifacts.json"), b"placed stamp").unwrap();
 
-    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
     let opener = {
         let db = db.clone();
         std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            Store::open(&db).map(drop)
+            let outcome = Store::open(&db).map(drop);
+            done_tx.send(()).unwrap();
+            outcome
         })
     };
-    started_rx.recv().unwrap();
-    // Not an assertion about time: it only gives a sweep that ignores the lock
-    // the chance to run before the seed finishes placing.
-    std::thread::sleep(Duration::from_millis(300));
+    // While the seed holds the lock the open cannot complete, so its completion
+    // is the violation, and it is observed as an event, not inferred from a
+    // sleep. Nothing here depends on the open being slow: an open that waits
+    // correctly passes however long the window; a sweep that ignored the lock
+    // finishes within it and is caught.
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the open completed while a seed held the writer lock"
+    );
 
     // The seed finishes: its store lands, then it lets go.
     let staged = dir.join("devmap.sqlite.seed-1");
@@ -84,4 +90,31 @@ fn an_orphan_beside_a_new_store_is_swept_and_the_lock_is_released() {
     drop(Store::open(&db).unwrap());
     assert!(!sidecar(&db, ".artifacts.json").exists());
     drop(Store::lock_writer_at(&db, Duration::from_millis(200)).expect("lock released"));
+}
+
+/// A store created while a seed holds the lock, with no orphan beside it, must
+/// also wait: otherwise the seed's final placement replaces the empty store the
+/// open made, and the open's connection is left on a deleted file.
+#[test]
+fn a_creation_without_orphans_also_waits_for_the_lock() {
+    let dir = scratch("noorphan");
+    let db = dir.join("devmap.sqlite");
+    let held = Store::lock_writer_at(&db, Duration::from_secs(5)).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let opener = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let outcome = Store::open(&db).map(drop);
+            done_tx.send(()).unwrap();
+            outcome
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a creation completed while a seed held the writer lock"
+    );
+    assert!(!db.exists(), "no store may appear while the lock is held");
+    drop(held);
+    opener.join().unwrap().unwrap();
+    assert!(db.is_file());
 }
