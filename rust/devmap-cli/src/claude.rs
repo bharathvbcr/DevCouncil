@@ -1463,6 +1463,28 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
 /// non-zero exit too (same page), so a failed shell write is still refreshed.
 const CODEX_UNSUPPORTED_EVENTS: &[&str] = &["PostToolUseFailure"];
 
+/// The hook events Codex documents (https://learn.chatgpt.com/docs/hooks, read
+/// 2026-11-22). A test holds every rendered Codex `hooks.json` to this list, so
+/// an event added to [`DEVMAP_HOOKS`] that Codex does not know cannot ship in
+/// one unnoticed.
+#[cfg(test)]
+pub(crate) const CODEX_DOCUMENTED_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "UserPromptSubmit",
+    "SubagentStop",
+    "Stop",
+    "PreModelRequest",
+    "PostModelRequest",
+    "Interrupt",
+    "SessionStart",
+    "SubagentStart",
+    "SessionEnd",
+];
+
 /// [`hooks_block`] for Codex's `hooks.json`: the same table minus the events
 /// Codex does not document. Both Codex writers (the plugin bundle and
 /// `devmap integrate`) call this, so they cannot drift.
@@ -3013,6 +3035,12 @@ mod tests {
                 codex += 1;
                 assert!(document["hooks"].get("PostToolUseFailure").is_none());
                 assert!(document["hooks"]["PostToolUse"].is_array());
+                for event in document["hooks"].as_object().unwrap().keys() {
+                    assert!(
+                        CODEX_DOCUMENTED_EVENTS.contains(&event.as_str()),
+                        "Codex hooks.json carries {event}, which Codex does not document"
+                    );
+                }
             } else {
                 assert!(document["hooks"]["PostToolUseFailure"].is_array());
             }
