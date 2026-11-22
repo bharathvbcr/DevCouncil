@@ -1499,6 +1499,15 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
         .map(str::trim)
         .filter(|reason| !reason.is_empty())
         .map(|reason| {
+            // A store a newer devmap wrote must not be rebuilt by this one, and
+            // the cap would cut the reason before it says so: it is named whole.
+            if reason.contains(devmap_store::RESOLVER_NEWER_REASON) {
+                return format!(
+                    "DevMap index is degraded: {}; update devmap instead of rebuilding with \
+                     this one. Treat its answers as a lower bound.\n",
+                    devmap_store::RESOLVER_NEWER_REASON
+                );
+            }
             format!(
                 "DevMap index is degraded: {}. Treat its answers as a lower bound.\n",
                 truncate(&context_line(reason), DEGRADED_REASON_CAP)
@@ -1526,11 +1535,22 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
         .get("is_fresh")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // "Behind the working tree" is the typed claim `index_is_behind_the_tree`
+    // and `summarize_status` make: the source compared unequal, or edits are
+    // pending. `is_fresh` is also false for a resolver mismatch and when
+    // freshness was not measured; the tree has not necessarily moved then.
+    let behind = status.get("source_freshness").and_then(Value::as_bool) == Some(false)
+        || status
+            .get("pending_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|pending| pending > 0);
     let name = repo_context_label(root, "this repository");
-    let freshness = if fresh {
+    let freshness = if behind {
+        "behind the working tree, so its answers are a lower bound"
+    } else if fresh {
         "current"
     } else {
-        "behind the working tree, so its answers are a lower bound"
+        "not confirmed current, so its answers may be a lower bound"
     };
     let header = format!(
         "DevMap has {name} indexed: {nodes} symbols, {edges} edges, \
@@ -9048,6 +9068,39 @@ mod tests {
             text.starts_with("DevMap index is degraded: watcher_lagging. Treat"),
             "{text}"
         );
+    }
+
+    /// A store whose resolver stamp mismatches (`is_fresh:false`, source
+    /// unchanged) is not "behind the working tree"; one a newer devmap wrote
+    /// also keeps its "update devmap" instruction past the reason cap.
+    #[test]
+    fn a_resolver_mismatch_is_not_called_behind_the_tree() {
+        let older = r#"{"query_ready":true,"is_fresh":false,"analyzer_freshness":false,
+            "source_freshness":true,"pending_count":0,"node_count":10,"edge_count":20,
+            "generation_id":3,"degraded_reason":"resolver stamp differs from this build"}"#;
+        let text = compose_pre_tool_use(older, Path::new("/repo/Demo"), None).expect("emits");
+        assert!(!text.contains("behind the working tree"), "{text}");
+        assert!(text.contains("not confirmed current"), "{text}");
+
+        let newer = json!({"query_ready": true, "is_fresh": false, "analyzer_freshness": false,
+            "source_freshness": true, "pending_count": 0, "node_count": 10, "edge_count": 20,
+            "generation_id": 3,
+            "degraded_reason": format!("{} (stamp 9, this build 4){}",
+                devmap_store::RESOLVER_NEWER_REASON, " x".repeat(200))});
+        let text = compose_pre_tool_use(&newer.to_string(), Path::new("/repo/Demo"), None)
+            .expect("emits");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.contains(devmap_store::RESOLVER_NEWER_REASON), "{text}");
+        assert!(first.contains("update devmap instead of rebuilding"), "{text}");
+        assert!(!text.contains("behind the working tree"), "{text}");
+
+        for behind in [
+            r#"{"query_ready":true,"is_fresh":false,"source_freshness":false,"node_count":1}"#,
+            r#"{"query_ready":true,"is_fresh":false,"source_freshness":true,"pending_count":2,"node_count":1}"#,
+        ] {
+            let text = compose_pre_tool_use(behind, Path::new("/repo/Demo"), None).unwrap();
+            assert!(text.contains("behind the working tree"), "{text}");
+        }
     }
 
     #[test]
