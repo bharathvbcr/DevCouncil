@@ -165,7 +165,7 @@ impl DeltaStore {
         let conn = Connection::open(&path)
             .with_context(|| format!("cannot open delta store {}", path.display()))?;
         Self::configure(&conn)?;
-        conn.execute_batch(DELTA_SCHEMA_DDL)
+        Self::ensure_schema(&conn)
             .with_context(|| format!("cannot initialize delta schema at {}", path.display()))?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -173,8 +173,32 @@ impl DeltaStore {
         })
     }
 
+    /// Create the delta tables, all or none. The DDL is eight autocommitted
+    /// statements, so a reader that opened the file between two of them found
+    /// some tables and not the rest and was refused with "no such table". The
+    /// creating batch runs in one transaction, so a reader sees no tables or
+    /// every table. A schema that is already complete is re-run as before (it
+    /// only repairs a missing index) and takes no write lock.
+    fn ensure_schema(conn: &Connection) -> Result<()> {
+        let present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('delta_files', 'delta_symbols', 'delta_edges')",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 3 {
+            conn.execute_batch(DELTA_SCHEMA_DDL)?;
+        } else {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{DELTA_SCHEMA_DDL}\nCOMMIT;"))?;
+        }
+        Ok(())
+    }
+
     /// Open an existing `delta.sqlite` for reading: no creation, no schema
-    /// statements, no journal-mode change. `None` when the file does not exist.
+    /// statements, no journal-mode change. `None` when the file does not exist,
+    /// or exists with no tables at all: a writer creating the delta for the first
+    /// time has made the file and not yet committed its schema, and a delta with
+    /// no tables holds no edit.
     ///
     /// An ordinary read-only connection, never an immutable one: a live delta is
     /// rewritten by the detached `seed --sync-delta`, and an immutable open takes
@@ -209,39 +233,43 @@ impl DeltaStore {
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // SQLite opens lazily: read now, so a refusal is reported here.
-        conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(|err| {
-            let code = match &err {
-                rusqlite::Error::SqliteFailure(e, _) => Some(*e),
-                _ => None,
-            };
-            let why = match code {
-                Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
-                    "an interrupted writer left a hot rollback journal that a read-only open \
+        let tables = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|err| {
+                let code = match &err {
+                    rusqlite::Error::SqliteFailure(e, _) => Some(*e),
+                    _ => None,
+                };
+                let why = match code {
+                    Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
+                        "an interrupted writer left a hot rollback journal that a read-only open \
                          cannot roll back; run `devmap seed --sync-delta`"
-                }
-                Some(e)
-                    if matches!(
-                        e.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) =>
-                {
-                    "another process holds a write lock on it; wait for that writer (often a \
+                    }
+                    Some(e)
+                        if matches!(
+                            e.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) =>
+                    {
+                        "another process holds a write lock on it; wait for that writer (often a \
                          running `devmap seed --sync-delta`) to finish and retry"
-                }
-                Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
-                    "a WAL-mode delta from an earlier build in a read-only state directory is \
+                    }
+                    Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
+                        "a WAL-mode delta from an earlier build in a read-only state directory is \
                          unreadable, not empty"
-                }
-                _ => "the database could not be read",
-            };
-            anyhow::Error::new(err).context(format!(
-                "delta store {} cannot be read ({why})",
-                path.display()
-            ))
-        })?;
+                    }
+                    _ => "the database could not be read",
+                };
+                anyhow::Error::new(err).context(format!(
+                    "delta store {} cannot be read ({why})",
+                    path.display()
+                ))
+            })?;
+        if tables == 0 {
+            return Ok(None);
+        }
         Ok(Some(Self {
             conn: Mutex::new(conn),
             path,
@@ -757,6 +785,87 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_dir_all(&src);
         path
+    }
+
+    /// A writer creating the delta for the first time makes the file before it
+    /// commits any table. A reader in that window must see "no delta", not a
+    /// database with no tables to refuse on.
+    #[test]
+    fn a_delta_file_with_no_tables_reads_as_absent() {
+        let dir = temp_dir("no-tables");
+        let path = dir.join("delta.sqlite");
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            DeltaStore::open_read_only(&path).unwrap().is_none(),
+            "an empty delta.sqlite holds no edit"
+        );
+        drop(Connection::open(&path).unwrap());
+        assert!(DeltaStore::open_read_only(&path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the empty-file rule: a delta with some tables and not
+    /// the rest is damage, and must stay a refusal rather than read as empty.
+    #[test]
+    fn a_delta_with_only_some_of_its_tables_is_refused_not_read_as_empty() {
+        let dir = temp_dir("some-tables");
+        let path = dir.join("delta.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE delta_files (path TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        let store = DeltaStore::open_read_only(&path)
+            .unwrap()
+            .expect("a delta with a table is a delta");
+        let err = format!(
+            "{:#}",
+            store.load_snapshot().expect_err("the schema is incomplete")
+        );
+        assert!(err.contains("no such"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader polling while a writer creates the delta must see no delta or
+    /// a complete one on every poll: never a refusal. Fresh paths, many rounds.
+    #[test]
+    fn a_reader_beside_the_first_creation_of_a_delta_is_never_refused() {
+        let dir = temp_dir("first-create");
+        let mut refusals: Vec<String> = Vec::new();
+        for round in 0..300 {
+            let path = dir.join(format!("delta-{round}.sqlite"));
+            let barrier = std::sync::Barrier::new(2);
+            let done = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    DeltaStore::open(&path).expect("the writer creates the delta");
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                });
+                barrier.wait();
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    match DeltaStore::open_read_only(&path) {
+                        Ok(Some(store)) => {
+                            if let Err(err) = store.load_snapshot() {
+                                refusals.push(format!("{err:#}"));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => refusals.push(format!("{err:#}")),
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+            });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            refusals.is_empty(),
+            "{} of 300 creations refused a polling reader; first: {:?}",
+            refusals.len(),
+            refusals.first()
+        );
     }
 
     /// FIX-A: a read-only open cannot roll a hot journal back; it names the

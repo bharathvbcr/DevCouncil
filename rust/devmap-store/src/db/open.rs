@@ -1192,6 +1192,32 @@ impl Store {
         Ok(Some(Self::open_read_only(path)?))
     }
 
+    /// [`Self::open_immutable`] on a `/dev/fd/N` path, with a bounded retry of
+    /// SQLite's "unable to open database file".
+    ///
+    /// On macOS that open is intermittently refused for a descriptor that is
+    /// open and valid (an immediate re-open of the same `/dev/fd/N` succeeds)
+    /// while another thread of the process is spawning a child, as the MCP
+    /// engine does for `git` beside a lane read. A refusal that a re-open clears
+    /// is not a damaged lane, and reporting it as one sends the reader to a
+    /// restack. Any other error, and the last attempt's, is returned unchanged.
+    #[cfg(unix)]
+    fn open_immutable_fd(fd_path: &Path) -> Result<Connection> {
+        const ATTEMPTS: u32 = 5;
+        let mut attempt = 1;
+        loop {
+            match Self::open_immutable(fd_path) {
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.code == rusqlite::ErrorCode::CannotOpen && attempt < ATTEMPTS =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2 * u64::from(attempt)));
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Open a sealed immutable base snapshot (`chmod 0444`, rollback journal,
     /// zero `-wal`/`-shm` sidecars) with `?immutable=1` and an optional worktree
     /// `repo_root_override`.
@@ -1294,7 +1320,7 @@ impl Store {
         #[cfg(unix)]
         let conn = {
             use std::os::fd::AsRawFd;
-            Self::open_immutable(Path::new(&format!("/dev/fd/{}", file.as_raw_fd())))?
+            Self::open_immutable_fd(Path::new(&format!("/dev/fd/{}", file.as_raw_fd())))?
         };
         #[cfg(not(unix))]
         let conn = Self::open_immutable(path)?;
