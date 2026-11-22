@@ -330,7 +330,9 @@ func DCGrep(t testing.TB) string {
 // workspace's `devmap-cli`.
 func Devmap(t testing.TB) string {
 	t.Helper()
-	if explicit := strings.TrimSpace(os.Getenv("DEVMAP_BIN")); explicit != "" {
+	// With the mode set, DEVMAP_BIN is judged like the other binaries below,
+	// in cargoBin; without it, it is used or refused as it always was.
+	if explicit := strings.TrimSpace(os.Getenv("DEVMAP_BIN")); explicit != "" && os.Getenv(NoCargoEnv) == "" {
 		info, err := os.Stat(explicit)
 		if err != nil || info.IsDir() {
 			t.Fatalf("DEVMAP_BIN=%s is not a binary (%v); an explicit binary is used or refused", explicit, err)
@@ -384,7 +386,7 @@ func cargoBin(t testing.TB, crate, binary string) string {
 
 	// A prebuilt binary, when the caller asked for one, ends the call here:
 	// no build, no lock, no cargo. See NoCargoEnv.
-	if path, ok := prebuiltBinary(t, crates, binary); ok {
+	if path, ok := prebuiltBinary(t, crates, crate, binary); ok {
 		return path
 	}
 

@@ -3,7 +3,6 @@ package testsupport
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,21 +12,30 @@ import (
 )
 
 // NoCargoEnv selects prebuilt-binary mode. A caller that has already built
-// dcstore, dcverify and dcgrep — a gate script making one gated cargo call
-// before `go test` — sets it to 1, and every helper in this package then uses
-// those binaries and makes zero cargo calls. A binary that is missing or older
-// than the workspace sources fails the test; the helpers never fall back to
-// building, because a silent build is what queues behind the cargo slot gate
-// once per test process and outlasts the go test timeout.
+// dcstore, dcverify, dcgrep and devmap — a gate script making one gated cargo
+// call before `go test` — sets it to 1, and every store-backed helper in this
+// package (DCStore, DCVerify, DCGrep, Devmap and what they feed) then uses
+// those binaries and makes zero cargo calls. A binary that is missing, or not
+// strictly newer than what it was compiled from, fails the test; the helpers
+// never fall back to building, because a silent build is what queues behind the
+// cargo slot gate once per test process and outlasts the go test timeout. Any
+// value other than "1" (or unset or empty) fails the test rather than being
+// read as "off". Tests of this package that call cargo by design clear the mode
+// (see TestMain), so "zero cargo calls" is a claim about the helpers.
 //
-// Without a per-binary override the binary is <target>/debug/<name>, where
-// <target> is CARGO_TARGET_DIR when set and the workspace's target/ otherwise:
-// where a plain `cargo build -p dc-store --bin dcstore` leaves it.
+// Without an override the binary is <target>/debug/<name>, where <target> is
+// CARGO_TARGET_DIR when set and the workspace's target/ otherwise: where a plain
+// `cargo build -p <crate> --bin <name>` leaves it. DEVMAP_BIN, when set in this
+// mode, is checked like the others; without the mode it keeps its old meaning
+// (used or refused, no freshness check).
+//
+// The binary is handed to callers as a copy at the stable content-addressed
+// path cargoBin has always used, never as the path cargo owns.
 const NoCargoEnv = "DEVCOUNCIL_TEST_NO_CARGO"
 
-// prebuiltEnv names the per-binary override. Like DEVMAP_BIN, a set override is
-// used or refused, never replaced by a build. Setting one without NoCargoEnv
-// affects only that binary.
+// prebuiltEnv names the per-binary override. A set override is used or refused,
+// never replaced by a build, and must be an absolute path. Setting one without
+// NoCargoEnv affects only that binary.
 var prebuiltEnv = map[string]string{
 	"dcstore":  "DCSTORE_BIN",
 	"dcverify": "DCVERIFY_BIN",
@@ -35,142 +43,188 @@ var prebuiltEnv = map[string]string{
 	"devmap":   "DEVMAP_BIN",
 }
 
-// maxSourceFiles bounds the freshness walk: a workspace with more files than
-// this is refused as unverifiable rather than walked without limit.
-const maxSourceFiles = 200_000
-
-// prebuiltBinary returns the prebuilt binary for the named binary, or ok=false
-// when neither NoCargoEnv nor the binary's override asks for one. Every other
-// outcome is a failure: a binary that is absent, not executable, or older than
-// the sources it was built from is refused (never skipped, even under
-// AllowSkipEnv: a stale binary is not a missing toolchain).
-func prebuiltBinary(t testing.TB, crates, binary string) (path string, ok bool) {
+// noCargoMode reports whether NoCargoEnv asks for prebuilt-only. A value that is
+// neither "1" nor empty is refused: "true" silently meaning "off" would build.
+func noCargoMode(t testing.TB) bool {
 	t.Helper()
+	switch v := os.Getenv(NoCargoEnv); v {
+	case "":
+		return false
+	case "1":
+		return true
+	default:
+		t.Fatalf("%s=%q is not understood: set it to 1 to use prebuilt binaries only, or unset it", NoCargoEnv, v)
+		return false
+	}
+}
+
+// prebuiltBinary returns a stable copy of the prebuilt binary, or ok=false when
+// neither NoCargoEnv nor the binary's override asks for one. Every other outcome
+// is a failure — never a skip, even under AllowSkipEnv, because a stale binary
+// is not a missing toolchain.
+//
+// Freshness is judged against this workspace, not the binary's real origin: an
+// explicit override, or a shared CARGO_TARGET_DIR written by another checkout,
+// is trusted as named, and only has to be newer than the sources its own
+// dep-info lists and than this workspace's manifests. What it was compiled from
+// is read from the dep-info cargo leaves beside it (<name>.d): every listed
+// path must exist and be older than the binary. A missing or unparseable
+// dep-info is refused as unverifiable.
+func prebuiltBinary(t testing.TB, crates, crate, binary string) (path string, ok bool) {
+	t.Helper()
+	noCargo := noCargoMode(t)
 	override := strings.TrimSpace(os.Getenv(prebuiltEnv[binary]))
-	noCargo := os.Getenv(NoCargoEnv) == "1"
 	if override == "" && !noCargo {
 		return "", false
 	}
 	source := prebuiltEnv[binary] + "=" + override
-	if override == "" {
+	switch {
+	case override == "":
 		target := os.Getenv("CARGO_TARGET_DIR")
 		if target == "" {
 			target = filepath.Join(crates, "target")
 		}
 		override = filepath.Join(target, "debug", binary)
 		source = NoCargoEnv + "=1 (looked for " + override + ")"
+	case !filepath.IsAbs(override):
+		t.Fatalf("cannot use a prebuilt %s: %s is a relative path, and a test's working directory is its "+
+			"package directory, so it would name something other than what the caller meant; use an absolute path",
+			binary, source)
 	}
 	info, err := os.Stat(override)
 	switch {
 	case err != nil:
 		t.Fatalf("cannot use a prebuilt %s: %v [%s]. This mode never runs cargo: build it first "+
-			"(`cargo build -p <crate> --bin %s`) or unset the variable.", binary, err, source, binary)
+			"(`cargo build -p %s --bin %s`) or unset the variable.", binary, err, source, crate, binary)
 	case info.IsDir() || info.Mode()&0o111 == 0:
 		t.Fatalf("cannot use a prebuilt %s: %s is not an executable file [%s]", binary, override, source)
 	}
-	if newer, newerAt, err := newestSource(crates); err != nil {
-		t.Fatalf("cannot use a prebuilt %s: could not check it against the sources under %s: %v [%s]",
-			binary, crates, err, source)
-	} else if newerAt.After(info.ModTime()) {
-		t.Fatalf("refusing the prebuilt %s: %s (%s) is older than %s (%s). It may predate a schema or "+
-			"protocol change, and this mode never runs cargo: rebuild it with `cargo build -p <crate> --bin %s`. [%s]",
-			binary, override, info.ModTime().Format(time.RFC3339), newer, newerAt.Format(time.RFC3339), binary, source)
+	key := fmt.Sprintf("%s|%d|%d|%s", override, info.ModTime().UnixNano(), info.Size(), crates)
+	prebuiltMu.Lock()
+	cached, done := prebuiltDone[key]
+	prebuiltMu.Unlock()
+	if done {
+		return cached, true
 	}
-	return override, true
+	if stale, err := staleSource(crates, crate, binary, override, info.ModTime()); err != nil {
+		t.Fatalf("cannot use a prebuilt %s: %v [%s]", binary, err, source)
+	} else if stale != "" {
+		t.Fatalf("refusing the prebuilt %s: %s (%s) is not newer than %s. It may predate a schema or "+
+			"protocol change, and this mode never runs cargo: rebuild it with `cargo build -p %s --bin %s`. [%s]",
+			binary, override, info.ModTime().Format(time.RFC3339), stale, crate, binary, source)
+	}
+	data, err := readStableArtifact(override)
+	if err != nil {
+		t.Fatalf("cannot use a prebuilt %s: %v [%s]", binary, err, source)
+	}
+	stable, err := publishArtifact(filepath.Join(crates, "target"), binary, data)
+	if err != nil {
+		t.Fatalf("cannot use a prebuilt %s: publishing a stable copy: %v [%s]", binary, err, source)
+	}
+	prebuiltMu.Lock()
+	prebuiltDone[key] = stable
+	prebuiltMu.Unlock()
+	return stable, true
 }
 
+// Only successes are remembered: a refusal ends its test, and a cached one would
+// follow the next test that fixed the cause.
 var (
-	sourceMu    sync.Mutex
-	sourceCache = map[string]newestResult{}
+	prebuiltMu   sync.Mutex
+	prebuiltDone = map[string]string{}
 )
 
-type newestResult struct {
-	path string
-	at   time.Time
-	err  error
-}
-
-// newestSource returns the most recently modified file that cargo would read to
-// build a workspace binary: everything under the workspace except target/, VCS
-// and dependency directories, and the tests/ and benches/ that no binary
-// contains. A crate directory may be a symlink (Manvi's crates/ are links into
-// DevCouncil's rust/), so each top-level entry is resolved before walking.
-// Computed once per workspace per process: sources do not change mid-run.
-func newestSource(crates string) (string, time.Time, error) {
-	sourceMu.Lock()
-	defer sourceMu.Unlock()
-	if r, done := sourceCache[crates]; done {
-		return r.path, r.at, r.err
-	}
-	path, at, err := scanSources(crates)
-	sourceCache[crates] = newestResult{path, at, err}
-	return path, at, err
-}
-
-func scanSources(crates string) (newest string, newestAt time.Time, err error) {
-	files := 0
-	skipDir := func(name string) bool {
-		switch name {
-		case "target", ".git", "node_modules", "tests", "benches":
-			return true
-		}
-		return false
-	}
-	visit := func(path string) error {
-		files++
-		if files > maxSourceFiles {
-			return fmt.Errorf("more than %d files; the freshness check is capped, so this is unverified", maxSourceFiles)
-		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return err
-		}
-		if info.ModTime().After(newestAt) {
-			newest, newestAt = path, info.ModTime()
-		}
-		return nil
-	}
-	walk := func(root string) error {
-		return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				if path != root && skipDir(d.Name()) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			return visit(path)
-		})
-	}
-	entries, err := os.ReadDir(crates)
+// staleSource returns a source the binary is not strictly newer than, "" when it
+// is newer than all of them, and an error when that could not be established.
+// The sources are the paths in the dep-info beside the binary, which must all
+// exist, plus the workspace Cargo.toml, Cargo.lock and the crate's Cargo.toml,
+// which dep-info does not list and which may be absent (a missing manifest is
+// not a source of newer bytes). A crate directory may be a symlink (Manvi's
+// crates/ link into DevCouncil's rust/); stat follows it.
+func staleSource(crates, crate, binary, path string, built time.Time) (string, error) {
+	depInfo := filepath.Join(filepath.Dir(path), binary+".d")
+	raw, err := os.ReadFile(depInfo)
 	if err != nil {
-		return "", time.Time{}, err
+		return "", fmt.Errorf("no dep-info to check it against (%v): without what it was compiled from, "+
+			"whether it is current cannot be told", err)
 	}
-	for _, e := range entries {
-		if skipDir(e.Name()) {
+	listed, err := parseDepInfo(string(raw))
+	if err != nil {
+		return "", fmt.Errorf("dep-info %s is unusable (%v), so whether the binary is current cannot be told", depInfo, err)
+	}
+	for _, src := range listed {
+		info, err := os.Stat(src)
+		if err != nil {
+			return "", fmt.Errorf("dep-info %s lists %s, which cannot be read (%v): the binary was built from "+
+				"a source that is gone, so it cannot be shown current", depInfo, src, err)
+		}
+		if !built.After(info.ModTime()) {
+			return src, nil
+		}
+	}
+	for _, manifest := range []string{
+		filepath.Join(crates, "Cargo.toml"), filepath.Join(crates, "Cargo.lock"),
+		filepath.Join(crates, crate, "Cargo.toml"),
+	} {
+		info, err := os.Stat(manifest)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			continue
+		case err != nil:
+			return "", fmt.Errorf("cannot read %s: %v", manifest, err)
+		case !built.After(info.ModTime()):
+			return manifest, nil
+		}
+	}
+	return "", nil
+}
+
+// parseDepInfo reads the Makefile-syntax dependency line cargo writes beside a
+// binary: `<target>: <dep> <dep> ...`, spaces in a name escaped with a
+// backslash. rustc may add one empty `<dep>:` rule per dependency after the
+// first line; those carry no information and are ignored. An empty dependency
+// list is an error: a binary compiled from nothing is not a real one.
+func parseDepInfo(text string) ([]string, error) {
+	line, _, _ := strings.Cut(text, "\n")
+	// The target path may itself hold escaped spaces, so the separator is the
+	// first ": " that is not escaped.
+	sep := -1
+	for i := 0; i+1 < len(line); i++ {
+		if line[i] == '\\' {
+			i++
 			continue
 		}
-		resolved, err := filepath.EvalSymlinks(filepath.Join(crates, e.Name()))
-		if err != nil {
-			return "", time.Time{}, err
-		}
-		info, err := os.Stat(resolved)
-		if err != nil {
-			return "", time.Time{}, err
-		}
-		if info.IsDir() {
-			err = walk(resolved)
-		} else {
-			err = visit(resolved)
-		}
-		if err != nil {
-			return "", time.Time{}, err
+		if line[i] == ':' && line[i+1] == ' ' {
+			sep = i
+			break
 		}
 	}
-	if newest == "" {
-		return "", time.Time{}, errors.New("no source files found")
+	if sep < 0 {
+		return nil, errors.New("no \"target: dependencies\" line")
 	}
-	return newest, newestAt, nil
+	var deps []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			deps = append(deps, cur.String())
+			cur.Reset()
+		}
+	}
+	rest := line[sep+2:]
+	for i := 0; i < len(rest); i++ {
+		switch c := rest[i]; {
+		case c == '\\' && i+1 < len(rest):
+			i++
+			cur.WriteByte(rest[i])
+		case c == ' ' || c == '\t' || c == '\r':
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	if len(deps) == 0 {
+		return nil, errors.New("it lists no dependencies")
+	}
+	return deps, nil
 }
