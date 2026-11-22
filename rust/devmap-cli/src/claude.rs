@@ -1459,7 +1459,8 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
 /// (https://learn.chatgpt.com/docs/hooks lists PreToolUse, PermissionRequest,
 /// PostToolUse, PreCompact, PostCompact, UserPromptSubmit, SubagentStop, Stop,
 /// PreModelRequest, PostModelRequest, Interrupt, SessionStart, SubagentStart
-/// and SessionEnd). A failed shell call has no Codex event.
+/// and SessionEnd). Codex has no failure event; it runs `PostToolUse` for Bash after a
+/// non-zero exit too (same page), so a failed shell write is still refreshed.
 const CODEX_UNSUPPORTED_EVENTS: &[&str] = &["PostToolUseFailure"];
 
 /// [`hooks_block`] for Codex's `hooks.json`: the same table minus the events
@@ -2963,7 +2964,6 @@ mod tests {
             .find(|(event, _, _)| *event == "PostToolUseFailure")
             .unwrap();
         assert!(hook.is_some(), "{reason}");
-        assert!(!reason.starts_with("Not handled"), "{reason}");
         assert!(reason.contains("PostToolUseFailure"), "{reason}");
     }
 

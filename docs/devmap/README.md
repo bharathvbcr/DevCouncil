@@ -998,8 +998,13 @@ on `Bash`):
   `LD_PRELOAD`, ...), `bat --pager`, `file -C` and `git --exec-path=` count as
   possible writes.
 - Codex documents no failure event, so its `hooks.json` carries no
-  `PostToolUseFailure`; a failed shell write there is not refreshed. Codex also
-  re-trusts hooks by hash (`/hooks`) after a reinstall.
+  `PostToolUseFailure`; its `PostToolUse` for Bash also runs after a non-zero
+  exit, so a failed shell write is still refreshed. Codex also re-trusts hooks
+  by hash (`/hooks`) after a reinstall.
+- Cursor documents `postToolUseFailure` (matcher `Shell`) and fires
+  `postToolUse` after a successful execution. Whether a non-zero exit counts as
+  one is undocumented, so no `postToolUseFailure` entry is installed and a
+  failed shell write may not be refreshed under Cursor.
 
 ### Agent guides
 

@@ -2293,12 +2293,14 @@ fn split_shell_segments(command: &str) -> Option<Vec<Vec<String>>> {
 
 /// Verbs that read, print or change directory and nothing else. Anything that
 /// can write through an argument (`sort -o`, `tree -o`, `awk`, `tee`, `xargs`)
-/// or run another command (`env`, `time`, `sudo`) is absent on purpose.
+/// or run another command (`env`, `time`, `sudo`) is absent on purpose, as are
+/// `ag`, `ack` and `ugrep`: `--pager`/`--filter` name a program to run and
+/// `ugrep --save-config` writes `.ugrep`.
 const READ_ONLY_VERBS: &[&str] = &[
     "ls", "cat", "head", "tail", "nl", "wc", "less", "more", "bat", "grep", "egrep", "fgrep",
-    "ugrep", "ag", "ack", "pwd", "echo", "printf", "which", "whoami", "date", "uname", "stat",
-    "file", "du", "df", "id", "hostname", "basename", "dirname", "realpath", "readlink", "test",
-    "[", "true", "false", "sleep", "diff", "cmp", "cd", "pushd", "popd", "jq",
+    "pwd", "echo", "printf", "which", "whoami", "date", "uname", "stat", "file", "du", "df", "id",
+    "hostname", "basename", "dirname", "realpath", "readlink", "test", "[", "true", "false",
+    "sleep", "diff", "cmp", "cd", "pushd", "popd", "jq",
 ];
 
 /// Git subcommands that never change the working tree. `branch`, `tag` and
@@ -2392,9 +2394,10 @@ fn segment_cannot_change_tree(words: &[String]) -> bool {
         // `--pager` names a program `bat` runs on its output.
         "bat" => !args.iter().any(|arg| arg.starts_with("--pager")),
         // `-C` compiles a magic file and writes `<file>.mgc`; it may sit in a
-        // cluster of short flags (`-bC`).
+        // cluster of short flags (`-bC`). GNU long options match by prefix, so
+        // `--co` up to `--compile` is the same flag.
         "file" => !args.iter().any(|arg| {
-            *arg == "--compile"
+            (arg.len() >= 4 && "--compile".starts_with(*arg))
                 || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('C'))
         }),
         verb => READ_ONLY_VERBS.contains(&verb),
@@ -3717,14 +3720,15 @@ fn detached_shell_command(
         // The age ceiling reads the lock directory's mtime, which a rerun
         // would otherwise leave at the first run's start: a build plus reruns
         // past LOCK_MAX_AGE would let another hook reclaim a live lock. Making
-        // and removing an entry stamps the directory with shell builtins and
-        // `/bin/rm` only.
+        // and removing an entry stamps the directory. `mkdir` neither follows
+        // a symlink planted at the name nor is a POSIX special builtin, whose
+        // redirection failure (`: > missing/x`) exits dash.
         let beat = shell_single_quote(&format!("{lock}/beat"));
         script.push_str(&format!(
             "/bin/rm -f {marker}; {run}; status=$?; reruns=0; \
              while :; do \
              while [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ]; do \
-             reruns=$((reruns+1)); : > {beat} && /bin/rm -f {beat}; \
+             reruns=$((reruns+1)); /bin/rm -rf -- {beat}; /bin/mkdir {beat} && /bin/rm -rf -- {beat}; \
              /bin/rm -f {marker}; {run}; status=$?; done; \
              /bin/rm -rf {lock_quoted}; \
              [ -e {marker} ] && [ $reruns -lt {MAX_TRAILING_RUNS} ] \
@@ -5575,10 +5579,11 @@ mod tests {
             json!({
                 "conversation_id": "c",
                 "hook_event_name": "postToolUse",
-                "workspace_roots": [&lane.main],
+                // Not the tree under test, so only `cwd` can select it.
+                "workspace_roots": [&lane.parent],
                 "cwd": &lane.main,
                 "tool_name": "Shell",
-                "tool_input": { "command": command, "working_directory": &lane.main },
+                "tool_input": { "command": command },
                 "tool_output": "{}",
                 "duration": 12,
             })
@@ -5944,6 +5949,14 @@ mod tests {
             "file -C -m magic",
             "file -bC magic",
             "file --compile -m magic",
+            "file --comp -m magic",
+            "file --co -m magic",
+            "ag --pager 'rm x' foo",
+            "ack --pager=./p foo",
+            "ugrep --filter=./f foo",
+            "ugrep --save-config foo",
+            "ag foo",
+            "FOO=bar git status",
             "git --exec-path=./bin status",
             "find . -exec rm {} +",
             "find . -fprint out.txt",
@@ -10021,6 +10034,29 @@ mod lock_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The stamp neither writes through a symlink planted at its name nor
+    /// depends on a redirection that can fail.
+    #[test]
+    fn a_rerun_stamp_does_not_write_through_a_planted_symlink() {
+        let base = scratch("rerun-beat-link");
+        let codeintel = base.join("codeintel");
+        let lock = codeintel.join("hook-build.running");
+        fs::create_dir_all(&lock).unwrap();
+        let victim = base.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, lock.join("beat")).unwrap();
+        let marker = codeintel.join(BUILD_DIRTY_MARKER);
+        let mut child = rerun_script_child(&base, &lock, &marker, ":", |script| script);
+        child.wait().unwrap();
+        assert!(base.join("second").exists(), "no rerun");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"keep",
+            "the stamp wrote through the link"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// If the retaken lock's pid cannot be written, the lock is removed rather
     /// than left owner-less for LOCK_PID_GRACE.
     #[test]
@@ -10041,11 +10077,15 @@ mod lock_tests {
                 done = done.display(),
                 marker = marker.display()
             );
-            script.replacen(&unlock, &injection, 1).replacen(
+            let injected = script.replacen(&unlock, &injection, 1);
+            assert_ne!(injected, script, "the unlock was not found to inject after");
+            let broken = injected.replacen(
                 &format!("/bin/mkdir {quoted} 2>/dev/null"),
                 &format!("/bin/mkdir {quoted} 2>/dev/null && /bin/mkdir {quoted}/pid"),
                 1,
-            )
+            );
+            assert_ne!(broken, injected, "the retake mkdir was not found to break");
+            broken
         });
         let status = child.wait().unwrap();
         assert!(done.exists(), "the marker was never injected");
