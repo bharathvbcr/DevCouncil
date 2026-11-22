@@ -1624,7 +1624,12 @@ generation {latest}; run `devmap status` to re-verify",
     ///
     /// The walking query cancels its walk once [`crate::db::SOURCE_FRESHNESS_WALK_BUDGET`]
     /// passes, but joins the walk's thread, so its wait is that budget plus the
-    /// longest step that does not read the cancel flag (see the budget's doc).
+    /// time the walk takes to notice the cancel, including while it waits for
+    /// the connection (see the budget's doc for the single statements it does not
+    /// interrupt). One exception, stated there too: after a walk panic, the repair
+    /// (which rolls back any transaction the unwind left open, then clears the
+    /// poison) waits for the connection without a bound, because a store left
+    /// poisoned would refuse every later query.
     fn reverify_lazily(&self, fallback: QuerySourceFreshness) -> QuerySourceFreshness {
         let Ok(Some(generation)) = self.latest_generation_id() else {
             return fallback;
@@ -1690,12 +1695,13 @@ generation {latest}; run `devmap status` to re-verify",
             gate.walks += 1;
         }
         #[cfg(test)]
-        let (budget, probe, max_source_bytes) = (
+        let (budget, probe, max_source_bytes, fail_spawn) = (
             gate.budget
                 .unwrap_or(crate::db::SOURCE_FRESHNESS_WALK_BUDGET),
             gate.probe.clone(),
             gate.max_source_bytes
                 .unwrap_or(crate::db::SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES),
+            gate.fail_spawn,
         );
         #[cfg(not(test))]
         let (budget, max_source_bytes) = (
@@ -1709,35 +1715,50 @@ generation {latest}; run `devmap status` to re-verify",
             failure: None,
         };
         let was_poisoned = self.conn.is_poisoned();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::channel();
         let outcome = std::thread::scope(|scope| {
-            let spawned = std::thread::Builder::new()
-                .name("devmap-lazy-walk".to_string())
-                .spawn_scoped(scope, || {
-                    // A panic in the walk must end as a refused verdict, not
-                    // unwind through the scope into the query.
-                    let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        #[cfg(test)]
-                        if let Some(probe) = &probe {
-                            probe(&cancel);
-                        }
-                        self.source_snapshot_mismatch(
-                            generation,
-                            Some(&cancel),
-                            Some(max_source_bytes),
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        // The walk only reads, so a panic inside it leaves the
-                        // connection usable; the unwind poisoned its mutex.
-                        self.recover_connection_after_walk_panic(was_poisoned);
-                        Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                            std::io::Error::other("the walk panicked"),
-                        )))
-                    });
-                    let _ = sender.send(walked);
-                });
+            let start = || {
+                std::thread::Builder::new()
+                    .name("devmap-lazy-walk".to_string())
+                    .spawn_scoped(scope, || {
+                        // A panic in the walk must end as a refused verdict, not
+                        // unwind through the scope into the query.
+                        let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(test)]
+                            if let Some(probe) = &probe {
+                                probe(&cancel);
+                            }
+                            // The walk's connection waits give way to the cancel.
+                            let _waits =
+                                crate::db::WalkCancelScope::enter(std::sync::Arc::clone(&cancel));
+                            self.source_snapshot_mismatch(
+                                generation,
+                                Some(&cancel),
+                                Some(max_source_bytes),
+                            )
+                        }))
+                        .unwrap_or_else(|_| {
+                            // The walk only reads, so a panic inside it leaves the
+                            // connection usable; the unwind poisoned its mutex.
+                            // The repair waits for the connection without a bound
+                            // (no cancel scope is entered on this path).
+                            self.recover_connection_after_walk_panic(was_poisoned);
+                            Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other("the walk panicked"),
+                            )))
+                        });
+                        let _ = sender.send(walked);
+                    })
+            };
+            #[cfg(test)]
+            let spawned = if fail_spawn {
+                Err(std::io::Error::other("no thread available"))
+            } else {
+                start()
+            };
+            #[cfg(not(test))]
+            let spawned = start();
             if let Err(error) = spawned {
                 return Err(format!("the walk thread could not be started ({error})"));
             }
@@ -1783,6 +1804,11 @@ generation {latest}; run `devmap status` to re-verify",
     /// that is bounded by the rollback below, which leaves the database in its
     /// last committed state. A transaction the unwind left open is rolled back;
     /// if that fails the connection stays poisoned.
+    ///
+    /// The repair takes the connection with a plain blocking lock, outside the
+    /// walk's cancel scope, and always completes: after a walk panic the repair
+    /// waits for the connection without a bound, because a store left poisoned
+    /// would refuse every later query. The only exception to the walk's budget.
     fn recover_connection_after_walk_panic(&self, was_poisoned: bool) {
         if was_poisoned {
             return;
@@ -3771,6 +3797,92 @@ mod lazy_source_verification {
         assert!(
             error.to_string().contains("cancel"),
             "the walk read the store after it was cancelled: {error}"
+        );
+    }
+
+    // ---- the walking query's own wait is bounded by the budget ----
+
+    #[test]
+    fn a_walk_blocked_on_the_connection_is_cancelled_at_the_budget_not_joined_past_it() {
+        let f = indexed("blocked");
+        let reached = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let (reached, held) = (Arc::clone(&reached), Arc::clone(&held));
+            // The walk thread starts, then waits until another thread has the
+            // connection, so its first read has to wait for it.
+            arm(&f.store, std::time::Duration::from_millis(200), move |_| {
+                reached.store(true, Ordering::SeqCst);
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !held.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+        let (verdict, waited) = std::thread::scope(|scope| {
+            // A writer holding the connection: for 3 s, or until released.
+            let writer = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !reached.load(Ordering::SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the walk thread never reached its probe"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let _conn = lock_conn(&f.store.conn).expect("connection");
+                held.store(true, Ordering::SeqCst);
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            let asked = std::time::Instant::now();
+            let verdict = f.store.query_source_freshness();
+            let waited = asked.elapsed();
+            release.store(true, Ordering::SeqCst);
+            writer.join().expect("writer");
+            (verdict, waited)
+        });
+        assert!(
+            waited < std::time::Duration::from_millis(1500),
+            "the walking query waited {waited:?} on a walk blocked behind the connection"
+        );
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("did not finish within 200ms"), "{reason}");
+    }
+
+    #[test]
+    fn a_walk_thread_that_cannot_start_releases_the_gate_the_place_and_says_why() {
+        let f = indexed("no-thread");
+        let slots = Arc::new(crate::db::WalkSlots::new(1));
+        {
+            let mut gate = f.store.lazy_walk.lock().expect("gate");
+            gate.fail_spawn = true;
+            gate.slots = Some(Arc::clone(&slots));
+        }
+        let verdict = f.store.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("could not be started"), "{reason}");
+        {
+            let gate = f.store.lazy_walk.lock().expect("gate");
+            assert!(
+                !gate.in_flight,
+                "a walk that never started stayed in flight"
+            );
+        }
+        assert!(slots.acquire().is_some(), "the walk's place was not freed");
+        // Inside the window the reason stands for the later queries.
+        let again = f.store.query_source_freshness();
+        assert!(
+            again
+                .reason
+                .expect("reason")
+                .contains("could not be started"),
+            "a later query lost the failure"
         );
     }
 
