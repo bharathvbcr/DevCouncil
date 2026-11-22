@@ -1492,16 +1492,16 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
     // A degraded store that can still answer is worth naming, with the reason in
     // front: dropping the context hid a usable index, and the directive alone
     // would oversell it. A store that is not query-ready was dropped above.
+    // Trimmed, and an empty reason is no reason, as in `summarize_status`.
     let degraded_line = status
         .get("degraded_reason")
-        .filter(|reason| !reason.is_null())
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
         .map(|reason| {
-            let text = reason
-                .as_str()
-                .map_or_else(|| reason.to_string(), str::to_owned);
             format!(
                 "DevMap index is degraded: {}. Treat its answers as a lower bound.\n",
-                truncate(&context_line(&text), DEGRADED_REASON_CAP)
+                truncate(&context_line(reason), DEGRADED_REASON_CAP)
             )
         })
         .unwrap_or_default();
@@ -9026,6 +9026,28 @@ mod tests {
         assert!(text.contains("walk_incomplete"), "{text}");
         let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
         assert!(rest.chars().count() <= PRE_TOOL_CONTEXT_CAP, "{rest}");
+    }
+
+    /// A blank or whitespace-only reason names nothing: no line, the plain
+    /// context, as for a null one. A padded reason is trimmed.
+    #[test]
+    fn an_empty_degraded_reason_adds_no_line_and_a_padded_one_is_trimmed() {
+        let plain = |reason: &str| {
+            let status = json!({"query_ready": true, "degraded_reason": reason,
+                                "node_count": 10, "is_fresh": true});
+            compose_pre_tool_use(&status.to_string(), Path::new("/repo/Demo"), None)
+                .expect("emits")
+        };
+        for blank in ["", "   ", "\t\n"] {
+            let text = plain(blank);
+            assert!(!text.contains("degraded"), "{blank:?}: {text}");
+            assert!(text.starts_with("DevMap has Demo indexed"), "{text}");
+        }
+        let text = plain("  watcher_lagging \n");
+        assert!(
+            text.starts_with("DevMap index is degraded: watcher_lagging. Treat"),
+            "{text}"
+        );
     }
 
     #[test]
