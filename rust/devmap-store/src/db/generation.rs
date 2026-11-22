@@ -1445,6 +1445,12 @@ impl Store {
     /// read "unverified" for good a minute after the last `status`. See
     /// [`Self::reverify_lazily`].
     pub fn query_source_freshness(&self) -> QuerySourceFreshness {
+        if self
+            .lazy_source_verification
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.settle_owed_recovery();
+        }
         let mut walkable = false;
         let verdict = self.cached_source_freshness(&mut walkable);
         if walkable
@@ -1625,7 +1631,8 @@ generation {latest}; run `devmap status` to re-verify",
     /// The walking query cancels its walk once [`crate::db::SOURCE_FRESHNESS_WALK_BUDGET`]
     /// passes, but joins the walk's thread, so its wait is that budget plus the
     /// time the walk takes to notice the cancel, including while it waits for
-    /// the connection (see the budget's doc for what it does not interrupt).
+    /// the connection or to repair it after a panic (see the budget's doc for
+    /// the single statements it does not interrupt).
     fn reverify_lazily(&self, fallback: QuerySourceFreshness) -> QuerySourceFreshness {
         let Ok(Some(generation)) = self.latest_generation_id() else {
             return fallback;
@@ -1700,10 +1707,9 @@ generation {latest}; run `devmap status` to re-verify",
             gate.fail_spawn,
         );
         #[cfg(not(test))]
-        let (budget, max_source_bytes, fail_spawn) = (
+        let (budget, max_source_bytes) = (
             crate::db::SOURCE_FRESHNESS_WALK_BUDGET,
             crate::db::SOURCE_FRESHNESS_WALK_MAX_SOURCE_BYTES,
-            false,
         );
         drop(gate);
         // Ends the walk's bookkeeping on every exit, a panic included.
@@ -1715,9 +1721,7 @@ generation {latest}; run `devmap status` to re-verify",
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::channel();
         let outcome = std::thread::scope(|scope| {
-            let spawned = if fail_spawn {
-                Err(std::io::Error::other("no thread available"))
-            } else {
+            let start = || {
                 std::thread::Builder::new()
                     .name("devmap-lazy-walk".to_string())
                     .spawn_scoped(scope, || {
@@ -1740,7 +1744,21 @@ generation {latest}; run `devmap status` to re-verify",
                         .unwrap_or_else(|_| {
                             // The walk only reads, so a panic inside it leaves the
                             // connection usable; the unwind poisoned its mutex.
-                            self.recover_connection_after_walk_panic(was_poisoned);
+                            // The repair waits for the connection under the same
+                            // cancel as the walk did; a repair the cancel cut
+                            // short is owed to the next query.
+                            let repaired = {
+                                let _waits = crate::db::WalkCancelScope::enter(
+                                    std::sync::Arc::clone(&cancel),
+                                );
+                                self.recover_connection_after_walk_panic(was_poisoned)
+                            };
+                            if !repaired {
+                                self.lazy_walk
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .recovery_owed = true;
+                            }
                             Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                                 std::io::Error::other("the walk panicked"),
                             )))
@@ -1748,6 +1766,14 @@ generation {latest}; run `devmap status` to re-verify",
                         let _ = sender.send(walked);
                     })
             };
+            #[cfg(test)]
+            let spawned = if fail_spawn {
+                Err(std::io::Error::other("no thread available"))
+            } else {
+                start()
+            };
+            #[cfg(not(test))]
+            let spawned = start();
             if let Err(error) = spawned {
                 return Err(format!("the walk thread could not be started ({error})"));
             }
@@ -1793,19 +1819,45 @@ generation {latest}; run `devmap status` to re-verify",
     /// that is bounded by the rollback below, which leaves the database in its
     /// last committed state. A transaction the unwind left open is rolled back;
     /// if that fails the connection stays poisoned.
-    fn recover_connection_after_walk_panic(&self, was_poisoned: bool) {
+    ///
+    /// The wait for the connection is cancel-aware when a
+    /// [`crate::db::WalkCancelScope`] is on this thread. Returns false only when
+    /// that cancel fired before the connection could be had: the repair was not
+    /// done and is still owed (see [`Self::settle_owed_recovery`]). Every other
+    /// outcome, a refused rollback included, is final and returns true.
+    fn recover_connection_after_walk_panic(&self, was_poisoned: bool) -> bool {
         if was_poisoned {
-            return;
+            return true;
         }
-        let guard = self
-            .conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(guard) = crate::db::lock_conn_through_poison(&self.conn) else {
+            return false;
+        };
         if !guard.is_autocommit() && guard.execute_batch("ROLLBACK").is_err() {
-            return;
+            return true;
         }
         drop(guard);
         self.conn.clear_poison();
+        true
+    }
+
+    /// Repairs a connection a walk's panic poisoned when the walk's own repair
+    /// was cut short by its cancel. One attempt that never waits: a connection
+    /// still in use leaves the repair owed for the next query.
+    fn settle_owed_recovery(&self) {
+        let owed = self.lazy_walk.lock().is_ok_and(|gate| gate.recovery_owed);
+        if !owed {
+            return;
+        }
+        let no_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let repaired = {
+            let _no_wait = crate::db::WalkCancelScope::enter(no_wait);
+            self.recover_connection_after_walk_panic(false)
+        };
+        if repaired {
+            if let Ok(mut gate) = self.lazy_walk.lock() {
+                gate.recovery_owed = false;
+            }
+        }
     }
 
     /// Mark this store's edits as reported by a live file watcher (or not).
@@ -3807,7 +3859,12 @@ mod lazy_source_verification {
         let (verdict, waited) = std::thread::scope(|scope| {
             // A writer holding the connection: for 3 s, or until released.
             let writer = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while !reached.load(Ordering::SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the walk thread never reached its probe"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 let _conn = lock_conn(&f.store.conn).expect("connection");
@@ -3831,6 +3888,85 @@ mod lazy_source_verification {
         assert_eq!(verdict.fresh, None, "{verdict:?}");
         let reason = verdict.reason.expect("reason");
         assert!(reason.contains("did not finish within 200ms"), "{reason}");
+    }
+
+    /// A connection some thread's panic poisoned, and another thread then
+    /// holding it for `hold`, until `release`.
+    fn poisoned_and_held<'a>(
+        f: &'a Fixture,
+        release: &'a AtomicBool,
+        held: &'a AtomicBool,
+        hold: std::time::Duration,
+    ) -> impl FnOnce() + 'a {
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _conn = f.store.conn.lock().expect("connection");
+                    panic!("poison the connection");
+                })
+                .join()
+        });
+        assert!(f.store.conn.is_poisoned(), "premise");
+        move || {
+            let _conn = f
+                .store
+                .conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.store(true, Ordering::SeqCst);
+            let limit = std::time::Instant::now() + hold;
+            while !release.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn the_repair_after_a_walk_panic_waits_no_longer_than_the_cancel_and_stays_owed() {
+        let f = indexed("repair-bounded");
+        let release = AtomicBool::new(false);
+        let held = AtomicBool::new(false);
+        let holder = poisoned_and_held(&f, &release, &held, std::time::Duration::from_secs(5));
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(holder);
+            while !held.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancel);
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                flag.store(true, Ordering::SeqCst);
+            });
+            let asked = std::time::Instant::now();
+            let repaired = {
+                let _waits = crate::db::WalkCancelScope::enter(cancel);
+                f.store.recover_connection_after_walk_panic(false)
+            };
+            let waited = asked.elapsed();
+            assert!(
+                !repaired,
+                "the repair claimed success without the connection"
+            );
+            assert!(
+                waited < std::time::Duration::from_millis(2000),
+                "the repair waited {waited:?} for the connection"
+            );
+            assert!(f.store.conn.is_poisoned(), "premise: still poisoned");
+            // The owed repair is tried by the next query without waiting: still
+            // held, so still owed.
+            f.store.lazy_walk.lock().expect("gate").recovery_owed = true;
+            let asked = std::time::Instant::now();
+            f.store.settle_owed_recovery();
+            assert!(asked.elapsed() < std::time::Duration::from_millis(1000));
+            assert!(f.store.lazy_walk.lock().expect("gate").recovery_owed);
+            release.store(true, Ordering::SeqCst);
+            writer.join().expect("writer");
+        });
+        // Free now: the next query repairs it.
+        f.store.settle_owed_recovery();
+        assert!(!f.store.lazy_walk.lock().expect("gate").recovery_owed);
+        assert!(f.store.latest_generation_id().is_ok(), "still refused");
     }
 
     #[test]
