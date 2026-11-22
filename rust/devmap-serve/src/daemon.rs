@@ -5205,14 +5205,14 @@ mod tests {
         // the fresh store still opens.
         let staged = root.join("devmap.sqlite.fresh");
         drop(Store::open(&staged).unwrap());
-        for ext in ["-wal", "-shm"] {
+        for ext in devmap_store::seed::SQLITE_SIDECARS {
             let live = root.join(format!("devmap.sqlite{ext}"));
             if live.exists() {
                 fs::rename(&live, root.join(format!("devmap.sqlite.corrupt-1{ext}"))).unwrap();
             }
         }
         fs::rename(&staged, &db).unwrap();
-        for ext in ["-wal", "-shm"] {
+        for ext in devmap_store::seed::SQLITE_SIDECARS {
             let staged_side = root.join(format!("devmap.sqlite.fresh{ext}"));
             if staged_side.exists() {
                 fs::rename(&staged_side, root.join(format!("devmap.sqlite{ext}"))).unwrap();

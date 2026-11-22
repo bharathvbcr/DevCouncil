@@ -192,6 +192,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     ensure_target_absent(&target_db)?;
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
     seed::discard_staged(&staged);
+    sweep_dead_staging(&target_db);
     let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
         // A seed stamps the lane's HEAD on what it places, whether it keeps the
         // donor's graph or builds the lane's own, so a HEAD that cannot be read
@@ -320,6 +321,27 @@ pub(crate) struct Plan {
     root: PathBuf,
     main: PathBuf,
     source_store: PathBuf,
+}
+
+/// Clear what killed seeds left beside `target`, with its writer lock held.
+/// Hygiene only: a failure is reported and the seed goes on.
+fn sweep_dead_staging(target: &Path) {
+    let swept = seed::sweep_dead_staging(target);
+    if swept.removed > 0 {
+        eprintln!(
+            "devmap: removed {} staging file(s) left beside {} by a seed that did not finish",
+            swept.removed,
+            target.display()
+        );
+    }
+    if !swept.failures.is_empty() {
+        eprintln!(
+            "devmap: could not clear {} old seed staging file(s) ({} removed): {}",
+            swept.failures.len(),
+            swept.removed,
+            swept.failures.join("; ")
+        );
+    }
 }
 
 /// RAII guard for a staged `--seed-from` database (`<db>.seed-<pid>`).
@@ -451,6 +473,7 @@ impl Plan {
         let started = std::time::Instant::now();
         let staged = seed::sidecar(&db, &format!(".seed-{}", std::process::id()));
         seed::discard_staged(&staged);
+        sweep_dead_staging(&db);
         match self.stage_into(&staged) {
             Ok(method) => {
                 self.seed_resolution_reuse();
@@ -608,7 +631,9 @@ fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    if let Err(error) = std::fs::rename(staged_db, final_db) {
+    // Never replaces: the target was absent when this seed took the writer lock,
+    // and a store that appeared since is not this seed's to overwrite.
+    if let Err(error) = seed::rename_no_replace(staged_db, final_db) {
         let error =
             anyhow::Error::new(error).context(format!("cannot place {}", final_db.display()));
         return Err(withdraw(&placed, error));

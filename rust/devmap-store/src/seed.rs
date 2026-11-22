@@ -110,15 +110,137 @@ impl Fingerprint {
 /// the lock in two. A private staged store's lock goes through
 /// [`remove_staged_writer_lock`].
 pub fn discard_staged(path: &Path) {
-    for file in [
-        path.to_path_buf(),
-        sidecar(path, "-wal"),
-        sidecar(path, "-shm"),
-        sidecar(path, "-journal"),
-        sidecar(path, ".csr"),
-        sidecar(path, ".artifacts.json"),
-    ] {
+    let sidecars = SQLITE_SIDECARS.into_iter().chain(STORE_SIDECARS);
+    for file in
+        std::iter::once(path.to_path_buf()).chain(sidecars.map(|suffix| sidecar(path, suffix)))
+    {
         let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Whether process `pid` exists. Conservative: a platform with no way to ask,
+/// or an answer other than "no such process", reports it alive, so nothing a
+/// live process might be using is ever swept.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 only checks that the process exists and may be signalled.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// What [`sweep_dead_staging`] removed, and what it could not.
+#[derive(Debug, Default)]
+pub struct StagingSweep {
+    pub removed: usize,
+    /// One line per entry (or directory read) that could not be cleared. A
+    /// failure never stops the sweep: the rest are still attempted.
+    pub failures: Vec<String>,
+}
+
+/// Remove the staging files a killed seed left beside `target`: every
+/// `<target>.seed-<pid>` (a staged store, with the sidecars and writer lock
+/// that follow it) and `<target>.seed-dir-<pid>` (a staged cache directory:
+/// for `resolution-reuse-N` that is `<state>/resolution-reuse-N.seed-dir-<pid>`,
+/// so pass the directory's own path) whose `pid` is no longer running. This
+/// process's own name is left to its caller, and a name whose pid cannot be
+/// read or is alive is left alone.
+///
+/// A staged store is only ever staged under the target's writer lock, so call
+/// this for a store target with that lock held: a live seed holds it, and none
+/// can be mid-staging while this runs. Staged directories carry no lock and are
+/// protected by the pid check alone.
+pub fn sweep_dead_staging(target: &Path) -> StagingSweep {
+    let mut sweep = StagingSweep::default();
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return sweep;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{name}.seed-");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return sweep,
+        Err(error) => {
+            sweep
+                .failures
+                .push(format!("cannot read {}: {error}", dir.display()));
+            return sweep;
+        }
+    };
+    let own = std::process::id();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                sweep.failures.push(format!(
+                    "cannot read an entry of {}: {error}",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(rest) = file_name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let rest = rest.strip_prefix("dir-").unwrap_or(rest);
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(pid) = rest[..digits].parse::<u32>() else {
+            continue;
+        };
+        if pid == own || process_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let outcome = std::fs::symlink_metadata(&path).and_then(|meta| {
+            // A directory is removed only as a real directory; a symlink is unlinked.
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+        });
+        match outcome {
+            Ok(()) => sweep.removed += 1,
+            Err(error) => sweep
+                .failures
+                .push(format!("cannot remove {}: {error}", path.display())),
+        }
+    }
+    sweep
+}
+
+/// Move `from` to `to` without ever replacing `to`: it fails with
+/// `AlreadyExists` if anything is there. Done as a hard link followed by an
+/// unlink, which refuses an existing name atomically on every platform with
+/// hard links; on a filesystem without them it falls back to an absence check
+/// and a rename, which is only as strong as whatever lock the caller holds.
+pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => std::fs::remove_file(from).inspect_err(|_| {
+            // Two names for one store would leave the staged one behind.
+            let _ = std::fs::remove_file(to);
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => match std::fs::symlink_metadata(to) {
+            Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::rename(from, to),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -368,6 +490,11 @@ pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>>
 /// syscall; on filesystems without directory `clonefile`, creates a staged
 /// directory and clones/copies regular file entries atomically before rename.
 pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    // Whatever a killed seed staged for this directory under a pid that is gone.
+    let swept = sweep_dead_staging(target_dir);
+    for failure in &swept.failures {
+        eprintln!("devmap: could not clear old seed staging files: {failure}");
+    }
     match std::fs::symlink_metadata(target_dir) {
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -591,7 +718,7 @@ pub fn prepare_immutable_snapshot(staged: &Path) -> Result<()> {
         let _: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
         conn.close().map_err(|(_, error)| error)?;
     }
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_SIDECARS {
         let side = sidecar(staged, suffix);
         let _ = std::fs::remove_file(&side);
     }
@@ -682,7 +809,13 @@ pub fn settle_staged(staged: &Path) -> Result<()> {
         bail!("the staged store could not be checkpointed (busy)");
     }
     conn.close().map_err(|(_, error)| error)?;
-    for suffix in ["-wal", "-shm"] {
+    drop_empty_sidecars(staged)
+}
+
+/// Remove the SQLite sidecars beside `staged` that are empty, and refuse any
+/// that still hold data: what it holds would be replayed into the store.
+fn drop_empty_sidecars(staged: &Path) -> Result<()> {
+    for suffix in SQLITE_SIDECARS {
         let side = sidecar(staged, suffix);
         if let Ok(meta) = std::fs::symlink_metadata(&side) {
             if meta.len() != 0 {
@@ -1242,6 +1375,192 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644));
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn sweep_dead_staging_removes_only_what_a_dead_seed_left() {
+        let tmp = temp_test_dir("dead-staging");
+        let target = tmp.join("devmap.sqlite");
+        let dead = dead_pid();
+        let own = std::process::id();
+        let dead_name = format!("devmap.sqlite.seed-{dead}");
+        let dead_files: Vec<PathBuf> = [
+            "",
+            "-wal",
+            "-shm",
+            ".csr",
+            ".artifacts.json",
+            ".writer.lock",
+        ]
+        .iter()
+        .map(|suffix| tmp.join(format!("{dead_name}{suffix}")))
+        .collect();
+        for file in &dead_files {
+            std::fs::write(file, b"x").unwrap();
+        }
+        // Kept: this process's own staging, an unrelated store's, a final store,
+        // and a name whose pid cannot be read.
+        let kept: Vec<PathBuf> = [
+            format!("devmap.sqlite.seed-{own}"),
+            format!("other.sqlite.seed-{dead}"),
+            "devmap.sqlite".to_string(),
+            "devmap.sqlite.seed-notapid".to_string(),
+        ]
+        .iter()
+        .map(|name| tmp.join(name))
+        .collect();
+        for file in &kept {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let swept = sweep_dead_staging(&target);
+        assert_eq!(swept.removed, dead_files.len());
+        assert!(swept.failures.is_empty(), "{:?}", swept.failures);
+        for file in &dead_files {
+            assert!(!file.exists(), "{} should be gone", file.display());
+        }
+        for file in &kept {
+            assert!(file.exists(), "{} must survive", file.display());
+        }
+        assert_eq!(sweep_dead_staging(&target).removed, 0, "idempotent");
+        let absent = sweep_dead_staging(&tmp.join("absent-dir").join("x.sqlite"));
+        assert_eq!((absent.removed, absent.failures.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The name `seed_directory_cow` really stages under is
+    /// `<state>/resolution-reuse-N.seed-dir-<pid>`, and it is that name a later
+    /// call clears when the pid is gone.
+    #[test]
+    fn a_dead_seeds_staged_cache_directory_is_cleared_by_the_next_directory_seed() {
+        let tmp = temp_test_dir("dead-staged-dir");
+        let source = tmp.join("src").join("resolution-reuse-1");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("entry"), b"cache").unwrap();
+        let target = tmp.join("dst").join("resolution-reuse-1");
+        let dead = dead_pid();
+        let stale = sidecar(&target, &format!(".seed-dir-{dead}"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("partial"), b"x").unwrap();
+        // pid 1 is always running (signalling it is refused, not "no such process").
+        let live = sidecar(&target, ".seed-dir-1");
+        std::fs::create_dir_all(&live).unwrap();
+
+        // The producer's own name is what the sweep is matched against.
+        assert_eq!(
+            stale.file_name().unwrap().to_string_lossy(),
+            format!("resolution-reuse-1.seed-dir-{dead}")
+        );
+        seed_directory_cow(&source, &target)
+            .unwrap()
+            .expect("seeded");
+        assert!(
+            !stale.exists(),
+            "the dead seed's staged directory is cleared"
+        );
+        assert!(
+            target.join("entry").is_file(),
+            "the seed itself still lands"
+        );
+        assert!(
+            live.exists(),
+            "a name this sweep cannot show dead is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// One entry that cannot be removed must not hide the rest.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_dead_staging_continues_past_a_failed_removal_and_reports_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = temp_test_dir("dead-staging-fail");
+        let target = tmp.join("devmap.sqlite");
+        let dead = dead_pid();
+        // A directory that cannot be emptied: its parent entry cannot be removed
+        // from a read-only directory.
+        let locked = tmp.join(format!("devmap.sqlite.seed-{dead}-wal"));
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inner"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removable: Vec<PathBuf> = (0..3)
+            .map(|n| tmp.join(format!("devmap.sqlite.seed-{dead}.part{n}")))
+            .collect();
+        for file in &removable {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let swept = sweep_dead_staging(&target);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Running as root defeats the permission; then there is nothing to assert.
+        if swept.failures.is_empty() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        assert_eq!(swept.failures.len(), 1, "{:?}", swept.failures);
+        assert!(swept.failures[0].contains(&locked.display().to_string()));
+        assert_eq!(
+            swept.removed,
+            removable.len(),
+            "the others were still removed"
+        );
+        for file in &removable {
+            assert!(!file.exists());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rename_no_replace_never_replaces_an_existing_target() {
+        let tmp = temp_test_dir("no-replace");
+        let (from, to) = (tmp.join("staged"), tmp.join("final"));
+        std::fs::write(&from, b"new").unwrap();
+        rename_no_replace(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+
+        std::fs::write(&from, b"newer").unwrap();
+        let error = rename_no_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&to).unwrap(),
+            b"new",
+            "the target is untouched"
+        );
+        assert_eq!(
+            std::fs::read(&from).unwrap(),
+            b"newer",
+            "the source is kept"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// SQLite itself consumes a stale journal while the staged store is opened
+    /// for its checkpoint, so `settle_staged` cannot be handed one; the check
+    /// that refuses a sidecar holding data after the connection closed is
+    /// exercised directly.
+    #[test]
+    fn a_staged_sidecar_that_holds_data_after_the_checkpoint_is_refused() {
+        let tmp = temp_test_dir("settle-journal");
+        let staged = tmp.join("devmap.sqlite.seed-1");
+        std::fs::write(&staged, b"store").unwrap();
+        let journal = sidecar(&staged, "-journal");
+        std::fs::write(&journal, b"a hot journal").unwrap();
+        let error = drop_empty_sidecars(&staged).unwrap_err();
+        assert!(
+            error.to_string().contains("-journal"),
+            "the refusal names the journal: {error}"
+        );
+        assert!(journal.exists(), "the journal is left where it was found");
+        std::fs::write(&journal, b"").unwrap();
+        drop_empty_sidecars(&staged).expect("an empty journal is swept");
+        assert!(!journal.exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

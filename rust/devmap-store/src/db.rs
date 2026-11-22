@@ -55,6 +55,24 @@ impl std::error::Error for StoreRefusal {}
 /// concurrently.
 static CONNECTION_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The writer locks this process holds, by lock-file path, and the thread that
+/// took each. An `flock` taken on a second descriptor conflicts with the
+/// first even inside one process, so code that already holds a store's lock
+/// and then opens that store (`devmap build` does) must not ask for it again;
+/// [`Store::open`] consults this to tell its own caller's lock from a rival's.
+static HELD_WRITER_LOCKS: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, std::thread::ThreadId>>,
+> = std::sync::Mutex::new(None);
+
+fn held_writer_locks() -> std::sync::MutexGuard<
+    'static,
+    Option<std::collections::HashMap<std::path::PathBuf, std::thread::ThreadId>>,
+> {
+    HELD_WRITER_LOCKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 pub(crate) fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
@@ -1046,6 +1064,9 @@ impl WriterLock {
 impl Drop for WriterLock {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
+            if let (Some(path), Some(held)) = (self.path.as_ref(), held_writer_locks().as_mut()) {
+                held.remove(path);
+            }
             // Explicit rather than relying on close-releases-flock, so the
             // release is a statement in the code and not a side effect of drop
             // order. A failure here is not actionable — the descriptor closes

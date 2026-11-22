@@ -1043,7 +1043,7 @@ fn admit_published_base(
     let dir = PinnedDir::open(entry, false)
         .with_context(|| format!("cannot pin published base {}", entry.display()))?;
     let what = format!("published base {}", entry.display());
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for suffix in SQLITE_SIDECARS {
         require_child_absent(&dir, &format!("{BASE_SQLITE}{suffix}"), &what)?;
     }
     let open_entry = |name: &str| open_sealed_child(&dir, name, &format!("published {name}"), None);
