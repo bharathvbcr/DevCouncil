@@ -91,7 +91,11 @@ fn mcp(root: &Path, tool: &str, arguments: Value) -> Value {
         json!({"protocolVersion": "2025-11-25", "capabilities": {},
                "clientInfo": {"name": "parity", "version": "0"}}),
     );
-    let reply = ask(2, "tools/call", json!({"name": tool, "arguments": arguments}));
+    let reply = ask(
+        2,
+        "tools/call",
+        json!({"name": tool, "arguments": arguments}),
+    );
     drop(stdin);
     let _ = child.wait();
     assert_eq!(reply["result"]["isError"], json!(false), "{tool}: {reply}");
@@ -133,8 +137,15 @@ fn cli_and_mcp_answers_share_the_repository_key() {
             "{label}: CLI answer has no repository; keys {:?}",
             keys(&from_cli)
         );
-        eprintln!("{label}: cli keys {:?}\n{label}: mcp keys {:?}", keys(&from_cli), keys(&from_mcp));
-        let missing: Vec<_> = keys(&from_mcp).difference(&keys(&from_cli)).cloned().collect();
+        eprintln!(
+            "{label}: cli keys {:?}\n{label}: mcp keys {:?}",
+            keys(&from_cli),
+            keys(&from_mcp)
+        );
+        let missing: Vec<_> = keys(&from_mcp)
+            .difference(&keys(&from_cli))
+            .cloned()
+            .collect();
         let repository_shape = |v: &Value| keys(&v["repository"]);
         assert_eq!(
             repository_shape(&from_cli),
@@ -202,10 +213,17 @@ fn the_reported_store_is_the_one_the_command_opened() {
             "helper",
         ],
     );
-    assert_eq!(v["repository"]["store"], json!(copy.display().to_string()), "{v}");
+    assert_eq!(
+        v["repository"]["store"],
+        json!(copy.display().to_string()),
+        "{v}"
+    );
     assert_eq!(v["repository"]["resolved_from"], json!("db"));
 
-    let plain = cli(&a, &["--root", b.to_str().unwrap(), "--json", "search", "helper"]);
+    let plain = cli(
+        &a,
+        &["--root", b.to_str().unwrap(), "--json", "search", "helper"],
+    );
     assert_eq!(
         plain["repository"]["store"],
         json!(devmap_extract::paths::store_path(&b)
@@ -218,7 +236,6 @@ fn the_reported_store_is_the_one_the_command_opened() {
     let _ = std::fs::remove_dir_all(&b);
 }
 
-
 fn named_corpus(dir_name: &str) -> PathBuf {
     let parent = corpus("hostile-parent");
     let root = parent.join(dir_name);
@@ -229,7 +246,11 @@ fn named_corpus(dir_name: &str) -> PathBuf {
         .current_dir(&root)
         .output()
         .unwrap();
-    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     root.canonicalize().unwrap()
 }
 
@@ -242,7 +263,12 @@ fn named_corpus(dir_name: &str) -> PathBuf {
 fn whole_store_read_commands_name_their_repository_like_their_mcp_tools() {
     let root = corpus("whole-store");
     for (label, cli_args, tool, arguments) in [
-        ("routes", vec!["--json", "routes"], "devmap_routes", json!({})),
+        (
+            "routes",
+            vec!["--json", "routes"],
+            "devmap_routes",
+            json!({}),
+        ),
         (
             "api-impact",
             vec!["--json", "api-impact", "/x"],
@@ -257,7 +283,11 @@ fn whole_store_read_commands_name_their_repository_like_their_mcp_tools() {
         ),
         (
             "cypher",
-            vec!["--json", "cypher", "MATCH (a)-[r:calls]->(b) RETURN a, b LIMIT 1"],
+            vec![
+                "--json",
+                "cypher",
+                "MATCH (a)-[r:calls]->(b) RETURN a, b LIMIT 1",
+            ],
             "devmap_cypher",
             json!({"query": "MATCH (a)-[r:calls]->(b) RETURN a, b LIMIT 1"}),
         ),
@@ -280,13 +310,27 @@ fn whole_store_read_commands_name_their_repository_like_their_mcp_tools() {
 /// and MCP must report the same strings (JSON-escaped, not mangled).
 #[test]
 fn hostile_root_names_are_reported_exactly_as_the_mcp_envelope_reports_them() {
-    for dir in ["a b c", "q\"uote", "r\u{e9}p\u{f6}-\u{65e5}\u{672c}-\u{1f600}"] {
+    for dir in [
+        "a b c",
+        "q\"uote",
+        "r\u{e9}p\u{f6}-\u{65e5}\u{672c}-\u{1f600}",
+    ] {
         let root = named_corpus(dir);
         let from_cli = cli(&root, &["--json", "search", "helper"]);
         let from_mcp = mcp(&root, "devmap_search", json!({"query": "helper"}));
-        assert_eq!(from_cli["repository"]["root"], json!(root.display().to_string()), "{dir}");
-        assert_eq!(from_cli["repository"]["root"], from_mcp["repository"]["root"], "{dir}");
-        assert_eq!(from_cli["repository"]["store"], from_mcp["repository"]["store"], "{dir}");
+        assert_eq!(
+            from_cli["repository"]["root"],
+            json!(root.display().to_string()),
+            "{dir}"
+        );
+        assert_eq!(
+            from_cli["repository"]["root"], from_mcp["repository"]["root"],
+            "{dir}"
+        );
+        assert_eq!(
+            from_cli["repository"]["store"], from_mcp["repository"]["store"],
+            "{dir}"
+        );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }
@@ -297,7 +341,9 @@ fn hostile_root_names_are_reported_exactly_as_the_mcp_envelope_reports_them() {
 fn a_relative_db_from_another_cwd_is_reported_absolute_and_beats_root() {
     let a = corpus("reldb-a");
     let b = corpus("reldb-b");
-    let db = devmap_extract::paths::store_path(&b).canonicalize().unwrap();
+    let db = devmap_extract::paths::store_path(&b)
+        .canonicalize()
+        .unwrap();
     let rel = db
         .strip_prefix(a.parent().unwrap())
         .unwrap()
@@ -305,11 +351,27 @@ fn a_relative_db_from_another_cwd_is_reported_absolute_and_beats_root() {
         .to_string();
     let v = cli(
         a.parent().unwrap(),
-        &["--root", a.to_str().unwrap(), "--db", &rel, "--json", "search", "helper"],
+        &[
+            "--root",
+            a.to_str().unwrap(),
+            "--db",
+            &rel,
+            "--json",
+            "search",
+            "helper",
+        ],
     );
     assert_eq!(v["repository"]["resolved_from"], json!("db"), "{v}");
-    assert_eq!(v["repository"]["store"], json!(db.display().to_string()), "{v}");
-    assert_eq!(v["repository"]["root"], json!(b.display().to_string()), "{v}");
+    assert_eq!(
+        v["repository"]["store"],
+        json!(db.display().to_string()),
+        "{v}"
+    );
+    assert_eq!(
+        v["repository"]["root"],
+        json!(b.display().to_string()),
+        "{v}"
+    );
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
 }
