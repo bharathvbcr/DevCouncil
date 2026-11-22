@@ -273,13 +273,15 @@ fn hostile_manifest_shapes_are_refusals_not_hangs_or_failures() {
     std::fs::create_dir_all(root.join("bytes")).unwrap();
     std::fs::write(root.join("bytes/go.mod"), [0xff, 0xfe, 0x00, 0x9f]).unwrap();
     std::fs::create_dir_all(root.join("pipe")).unwrap();
-    let made = std::process::Command::new("mkfifo")
+    let fifo_made = std::process::Command::new("mkfifo")
         .arg(root.join("pipe/tsconfig.json"))
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
-    if !made {
-        return;
+    if !fifo_made {
+        // Only the FIFO case cannot be staged; the directory and non-UTF-8
+        // assertions below still run.
+        eprintln!("skipped: the FIFO manifest case (mkfifo is unavailable here)");
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -300,9 +302,14 @@ fn hostile_manifest_shapes_are_refusals_not_hangs_or_failures() {
     // walk classes it `Other`, "never a source", by design): neither a refusal
     // nor a failure, and above all not a blocking read. A manifest whose bytes
     // cannot be read as text is a named refusal.
-    for not_a_manifest in ["dirmod/go.mod", "pipe/tsconfig.json"] {
+    let not_manifests: &[&str] = if fifo_made {
+        &["dirmod/go.mod", "pipe/tsconfig.json"]
+    } else {
+        &["dirmod/go.mod"]
+    };
+    for not_a_manifest in not_manifests {
         assert!(
-            refused.iter().all(|path| path != not_a_manifest),
+            refused.iter().all(|path| path != *not_a_manifest),
             "{not_a_manifest} is not a manifest: {refused:?}"
         );
     }
