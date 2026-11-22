@@ -2244,7 +2244,7 @@ pub fn write_codex_plugin_assets(
     let version = env!("CARGO_PKG_VERSION");
     let manifest = claude::codex_plugin_manifest(Some(version))?;
     let manifest_path = plugin_dir.join("plugin.json");
-    let hooks = claude::hooks_block(executable, &["hook".to_string()])?;
+    let hooks = claude::codex_hooks_block(executable, &["hook".to_string()])?;
     let hooks_path = plugin_dir.join("hooks").join("hooks.json");
 
     for (path, value, note) in [
@@ -3123,6 +3123,7 @@ command = \"x\"\n";
         )
         .unwrap();
         assert!(hooks_doc["hooks"]["PostToolUse"].is_array());
+        assert!(hooks_doc["hooks"].get("PostToolUseFailure").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

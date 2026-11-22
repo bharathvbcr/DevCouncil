@@ -5564,6 +5564,49 @@ mod tests {
         .into_bytes()
     }
 
+    /// Cursor's `postToolUse` for its `Shell` tool carries `cwd` and
+    /// `tool_input.command` (https://cursor.com/docs/agent/hooks, read
+    /// 2026-11-21): a write-shaped command starts a build for that cwd's tree
+    /// and a read-only one starts none.
+    #[cfg(unix)]
+    #[test]
+    fn a_cursor_shell_payload_is_classified_like_a_bash_one() {
+        let cursor = |lane: &Lane, command: &str| {
+            json!({
+                "conversation_id": "c",
+                "hook_event_name": "postToolUse",
+                "workspace_roots": [&lane.main],
+                "cwd": &lane.main,
+                "tool_name": "Shell",
+                "tool_input": { "command": command, "working_directory": &lane.main },
+                "tool_output": "{}",
+                "duration": 12,
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let lane = Lane::new("cursor-shell", true);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &cursor(&lane, "git status"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(outcome.roots.is_empty(), "{:?}", outcome.roots);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &cursor(&lane, "git merge feature"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "a Cursor Shell write started no build"
+        );
+    }
+
     /// A `git merge` that stops on conflicts has written the tree and exits
     /// non-zero, so the host fires PostToolUseFailure, routed to this same
     /// handler. Its payload (an `error` in place of a response) starts a build
