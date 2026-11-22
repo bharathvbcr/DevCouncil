@@ -483,6 +483,34 @@ pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>>
     placed.map(Some)
 }
 
+/// File in a `resolution-reuse-*` directory that says which generation row its
+/// blobs were resolved for. Written by `devmap build`, last, and only while that
+/// generation is still the store's latest.
+pub const REUSE_BINDING_FILE: &str = "generation.json";
+
+/// [`seed_directory_cow`] for a `resolution-reuse-*` directory, from a donor
+/// whose writer lock the caller does not hold.
+///
+/// The donor's binding travels with the blobs, and stays true in the copy only
+/// when the donor did not write while it was copied: a build unbinds, rewrites
+/// blobs, then binds again. So the donor's binding is read before and after the
+/// copy and the copied binding is kept only when both reads are the same bytes.
+/// A binding that is absent, unreadable or changed is dropped from the copy,
+/// which makes the copy a cache that resolves every file once, never one that
+/// serves another generation's blobs.
+pub fn seed_reuse_directory(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    let binding = source_dir.join(REUSE_BINDING_FILE);
+    let before = std::fs::read(&binding).ok();
+    let placed = seed_directory_cow(source_dir, target_dir)?;
+    if placed.is_some() {
+        let after = std::fs::read(&binding).ok();
+        if before.is_none() || before != after {
+            remove_file_if_present(&target_dir.join(REUSE_BINDING_FILE))?;
+        }
+    }
+    Ok(placed)
+}
+
 /// Seed a flat cache directory (such as `resolution-reuse-1/`) via copy-on-write
 /// cloning when `target_dir` does not yet exist (`F9`).
 ///

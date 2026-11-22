@@ -1563,11 +1563,11 @@ fn a_cache_with_a_corrupt_binding_resolves_every_file() {
 }
 
 #[test]
-fn a_cache_written_for_another_store_resolves_every_file() {
-    assert_unbound_cache_resolves_everything("other-store", |root| {
+fn a_cache_written_for_another_creation_time_resolves_every_file() {
+    assert_unbound_cache_resolves_everything("other-created-at", |root| {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(binding_path(root)).unwrap()).unwrap();
-        value["store"] = serde_json::json!("/elsewhere/devmap.sqlite");
+        value["created_at"] = serde_json::json!(1.0);
         std::fs::write(binding_path(root), serde_json::to_vec(&value).unwrap()).unwrap();
     });
 }
@@ -1581,4 +1581,32 @@ fn a_cache_written_for_an_older_generation_resolves_every_file() {
         value["generation_id"] = serde_json::json!(id + 1);
         std::fs::write(binding_path(root), serde_json::to_vec(&value).unwrap()).unwrap();
     });
+}
+
+/// A replaced store can reuse the old store's latest generation id. The binding
+/// names the row by `(id, created_at)`, so the same id with another creation
+/// time is not the generation the blobs were resolved for.
+#[test]
+fn a_store_whose_latest_generation_id_matches_but_created_at_differs_is_refused() {
+    let root = scratch("replaced-store");
+    write_independent_tree(&root);
+    build_text(&root);
+    let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE generations SET created_at = created_at + 1.0
+              WHERE id = (SELECT max(id) FROM generations)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(conn);
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "a binding for another row of the same id is refused; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
 }

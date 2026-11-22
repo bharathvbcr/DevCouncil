@@ -882,11 +882,13 @@ fn run_build(
     // instead of 14, because liveness and community detection are global.
     //
     // Files outside the closure are reused from the pre-pass cache when
-    // their content hash matches. The post-pass (package membership, inert
-    // values) runs again on the union, so a reused file is not a stale
-    // edge list. A miss, a corrupt blob, a budget that the reused files
-    // were not charged against, or a previous generation that was itself
-    // capped, resolves the file. The unchanged tick returned above and
+    // their content hash matches, and only while the cache's generation.json
+    // binding names the store's latest generation row (a drain, or a replaced
+    // store, unbinds it; no binding resolves every file). The post-pass
+    // (package membership, inert values) runs again on the union, so a reused
+    // file is not a stale edge list. A miss, a corrupt blob, a budget that the
+    // reused files were not charged against, or a previous generation that was
+    // itself capped, resolves the file. The unchanged tick returned above and
     // does not read or write this cache.
     // K4: `--full` writes a full generation. An empty affected set *is*
     // the full-rewrite signal to the store, so the closure — whose only
@@ -1709,28 +1711,24 @@ fn load_resolution_reuse(
     Ok(loaded)
 }
 
-/// Which store, and which generation of it, the blobs in a reuse directory were
-/// resolved for. The blobs are keyed by content hash alone, so nothing else says
-/// that the resolutions they hold still describe the store's latest generation:
-/// another writer (the daemon's drain) may have committed a generation since,
-/// and a blob for a file that did not change then is stale whenever that
-/// generation added or removed a definition the file mentions.
+/// Which generation row the blobs in a reuse directory were resolved for, as
+/// `(generation_id, created_at)`. The blobs are keyed by content hash alone, so
+/// nothing else says that the resolutions they hold still describe the store's
+/// latest generation: another writer (the daemon's drain) may have committed a
+/// generation since, and a blob for a file that did not change then is stale
+/// whenever that generation added or removed a definition the file mentions.
+///
+/// The pair names a row, not a path. A store seeded from a donor carries the
+/// donor's row, so a donor's binding stays valid in the copy (and in a copy of
+/// the reuse directory), while a drain (new id) or a replaced store (another
+/// `created_at` under a recycled id) is refused.
 fn reuse_binding_path(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join("generation.json")
+    dir.join(devmap_store::seed::REUSE_BINDING_FILE)
 }
 
-fn store_identity(store: &Store) -> Option<String> {
-    store.path().map(|path| {
-        path.canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .into_owned()
-    })
-}
-
-/// `Ok` only when the binding is present, readable, names this store, and names
-/// the store's latest generation. Every other state is an `Err` carrying the
-/// reason: the cache is then not read at all.
+/// `Ok` only when the binding is present, readable, and names the store's
+/// latest generation row. Every other state is an `Err` carrying the reason:
+/// the cache is then not read at all.
 fn check_reuse_binding(dir: &std::path::Path, store: &Store) -> Result<(), String> {
     let path = reuse_binding_path(dir);
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -1745,60 +1743,65 @@ fn check_reuse_binding(dir: &std::path::Path, store: &Store) -> Result<(), Strin
     let bound_generation = value["generation_id"]
         .as_u64()
         .ok_or_else(|| format!("{} names no generation", path.display()))?;
-    let bound_store = value["store"]
-        .as_str()
-        .ok_or_else(|| format!("{} names no store", path.display()))?;
-    let identity = store_identity(store).ok_or_else(|| "the store has no path".to_string())?;
-    if bound_store != identity {
-        return Err(format!(
-            "written for the store {bound_store}, not {identity}"
-        ));
-    }
+    let bound_created = value["created_at"]
+        .as_f64()
+        .ok_or_else(|| format!("{} names no creation time", path.display()))?;
     let latest = store
-        .latest_generation_id()
+        .latest_generation_identity()
         .map_err(|error| format!("could not read the latest generation: {error}"))?;
-    if latest.map(u64::from) != Some(bound_generation) {
-        return Err(format!(
-            "written for generation {bound_generation}, the store is at {latest:?}"
-        ));
+    match latest {
+        Some((id, created)) if u64::from(id) == bound_generation && created == bound_created => {
+            Ok(())
+        }
+        Some((id, created)) => Err(format!(
+            "written for generation {bound_generation} created at {bound_created}, the store is at generation {id} created at {created}"
+        )),
+        None => Err(format!(
+            "written for generation {bound_generation}, the store has none"
+        )),
     }
-    Ok(())
 }
 
 /// Bind the directory to `generation_id`, but only while that is still the
 /// store's latest generation. A writer that committed after this build's own
 /// commit leaves the blobs describing a generation that is no longer latest, so
-/// the binding is removed rather than written: a missing binding is a refusal
-/// to reuse, never a pass.
+/// the binding is removed rather than written and the reason is returned: a
+/// missing binding is a refusal to reuse, never a pass.
 fn bind_reuse_cache(
     dir: &std::path::Path,
     store: &Store,
     generation_id: u32,
 ) -> Result<(), String> {
     let path = reuse_binding_path(dir);
-    let identity = store_identity(store);
-    let current = store
-        .latest_generation_id()
+    let latest = store
+        .latest_generation_identity()
         .map_err(|error| format!("could not read the latest generation: {error}"));
-    match (identity, current) {
-        (Some(identity), Ok(Some(latest))) if latest == generation_id => {
+    let withdrawn = match latest {
+        Ok(Some((id, created_at))) if id == generation_id => {
             let bytes = serde_json::to_vec(&serde_json::json!({
-                "generation_id": generation_id,
-                "store": identity,
+                "generation_id": id,
+                "created_at": created_at,
             }))
             .map_err(|error| format!("could not encode the binding: {error}"))?;
-            write_atomic(&path, &bytes)
-                .map_err(|error| format!("could not write the binding: {error}"))
+            return write_atomic(&path, &bytes)
+                .map_err(|error| format!("could not write the binding: {error}"));
         }
-        (_, current) => {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("could not remove the stale binding: {error}")),
-            }
-            current.map(|_| ())
+        Ok(Some((id, _))) => format!(
+            "the store is at generation {id}, not this build's generation {generation_id}, so the reuse cache is left unbound"
+        ),
+        Ok(None) => "the store has no generation, so the reuse cache is left unbound".to_string(),
+        Err(error) => format!("{error}, so the reuse cache is left unbound"),
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{withdrawn}; the stale binding could not be removed: {error}"
+            ))
         }
     }
+    Err(withdrawn)
 }
 
 fn read_reuse_blob(
@@ -2339,7 +2342,8 @@ mod tests {
         let binding = reuse_binding_path(&dir);
         std::fs::write(&binding, b"{\"generation_id\":7,\"store\":\"x\"}").unwrap();
         // The store holds no generation 7 (or any), so 7 is not its latest.
-        bind_reuse_cache(&dir, &store, 7).unwrap();
+        let why = bind_reuse_cache(&dir, &store, 7).unwrap_err();
+        assert!(why.contains("no generation"), "the reason is named: {why}");
         assert!(!binding.exists(), "a stale binding must not survive");
         assert!(check_reuse_binding(&dir, &store).is_err());
         let _ = std::fs::remove_dir_all(&dir);
