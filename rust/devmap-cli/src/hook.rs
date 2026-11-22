@@ -2344,7 +2344,17 @@ fn segment_cannot_change_tree(words: &[String]) -> bool {
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
     };
-    let mut rest = words.iter().skip_while(|word| is_assignment(word));
+    // A leading `VAR=value` changes what the verb runs: `GIT_PAGER`,
+    // `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND` and `LD_PRELOAD` all name a
+    // program or library the verb then loads. Only locale variables, which pick
+    // a language and a collation order, keep the verb's meaning.
+    let mut rest = words.iter().peekable();
+    while let Some(word) = rest.next_if(|word| is_assignment(word)) {
+        let name = word.split_once('=').map_or("", |(name, _)| name);
+        if name != "LANG" && !name.starts_with("LC_") {
+            return false;
+        }
+    }
     let Some(verb) = rest.next() else {
         // Only `VAR=value`: sets a variable, runs nothing.
         return true;
@@ -2379,6 +2389,14 @@ fn segment_cannot_change_tree(words: &[String]) -> bool {
                     | "-fls"
             )
         }),
+        // `--pager` names a program `bat` runs on its output.
+        "bat" => !args.iter().any(|arg| arg.starts_with("--pager")),
+        // `-C` compiles a magic file and writes `<file>.mgc`; it may sit in a
+        // cluster of short flags (`-bC`).
+        "file" => !args.iter().any(|arg| {
+            *arg == "--compile"
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('C'))
+        }),
         verb => READ_ONLY_VERBS.contains(&verb),
     }
 }
@@ -2396,6 +2414,8 @@ fn git_cannot_change_tree(args: &[&str]) -> bool {
             // `diff.external`): not a read.
             "-c" | "--config-env" => return false,
             flag if flag.starts_with("--config-env=") => return false,
+            // `--exec-path=<dir>` makes git run its subcommands from `<dir>`.
+            flag if flag.starts_with("--exec-path=") => return false,
             flag if flag.starts_with('-') => {}
             name => {
                 sub = Some(name);
@@ -5835,7 +5855,10 @@ mod tests {
             "git stash list",
             "git worktree list",
             "git config --get user.name",
-            "FOO=bar git status",
+            "LC_ALL=C git status",
+            "LANG=C LC_ALL=C ls",
+            "bat --plain a.rs",
+            "file -b a.rs",
             "cat a.rs | head -3 && git diff --stat",
             "sed -n '10,20p;30p' a.rs",
             "echo hi 2>&1",
@@ -5858,6 +5881,17 @@ mod tests {
             "git",
             "git -C",
             "rg --pre ./transform foo",
+            "GIT_PAGER='rm x' git log",
+            "GIT_EXTERNAL_DIFF=./d git diff",
+            "LD_PRELOAD=./evil.so ls",
+            "LC_ALL=C GIT_PAGER=./p git log",
+            "PATH=./bin ls",
+            "bat --pager 'rm x' a.rs",
+            "bat --pager=./p a.rs",
+            "file -C -m magic",
+            "file -bC magic",
+            "file --compile -m magic",
+            "git --exec-path=./bin status",
             "find . -exec rm {} +",
             "find . -fprint out.txt",
             "sort -o out.txt in.txt",
@@ -6158,7 +6192,7 @@ mod tests {
             "/usr/bin/git status",
             "git status | head",
             "git status && git log -1",
-            "FOO=1 rg foo",
+            "LC_ALL=C rg foo",
             "pwd; ls",
             "ls  \t ",
         ];
