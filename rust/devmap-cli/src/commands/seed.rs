@@ -326,13 +326,21 @@ pub(crate) struct Plan {
 /// Clear what killed seeds left beside `target`, with its writer lock held.
 /// Hygiene only: a failure is reported and the seed goes on.
 fn sweep_dead_staging(target: &Path) {
-    match seed::sweep_dead_staging(target) {
-        Ok(0) => {}
-        Ok(removed) => eprintln!(
-            "devmap: removed {removed} staging file(s) left beside {} by a seed that did not finish",
+    let swept = seed::sweep_dead_staging(target);
+    if swept.removed > 0 {
+        eprintln!(
+            "devmap: removed {} staging file(s) left beside {} by a seed that did not finish",
+            swept.removed,
             target.display()
-        ),
-        Err(error) => eprintln!("devmap: could not clear old seed staging files: {error:#}"),
+        );
+    }
+    if !swept.failures.is_empty() {
+        eprintln!(
+            "devmap: could not clear {} old seed staging file(s) ({} removed): {}",
+            swept.failures.len(),
+            swept.removed,
+            swept.failures.join("; ")
+        );
     }
 }
 
@@ -623,7 +631,9 @@ fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    if let Err(error) = std::fs::rename(staged_db, final_db) {
+    // Never replaces: the target was absent when this seed took the writer lock,
+    // and a store that appeared since is not this seed's to overwrite.
+    if let Err(error) = seed::rename_no_replace(staged_db, final_db) {
         let error =
             anyhow::Error::new(error).context(format!("cannot place {}", final_db.display()));
         return Err(withdraw(&placed, error));
