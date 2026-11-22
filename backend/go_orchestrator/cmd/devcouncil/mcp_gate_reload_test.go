@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func TestMCPGateAnnouncesWeakenedFlagsAndRefusals(t *testing.T) {
 	t.Run("operator env override is named with its origin", func(t *testing.T) {
 		t.Setenv(flags.EnvKey(flags.PolicyHardRules), "false")
 		var out bytes.Buffer
-		g, err := openAnnouncedGate(gateRepo(t, nil), &out)
+		g, err := openAnnouncedGate(gateRepo(t, nil), &out, "devcouncil mcp")
 		if err != nil || g == nil {
 			t.Fatalf("an operator env override must still build a gate: %v", err)
 		}
@@ -70,7 +71,7 @@ func TestMCPGateAnnouncesWeakenedFlagsAndRefusals(t *testing.T) {
 	})
 	t.Run("a strict gate says nothing", func(t *testing.T) {
 		var out bytes.Buffer
-		if _, err := openAnnouncedGate(gateRepo(t, nil), &out); err != nil {
+		if _, err := openAnnouncedGate(gateRepo(t, nil), &out, "devcouncil mcp"); err != nil {
 			t.Fatal(err)
 		}
 		if out.Len() != 0 {
@@ -81,7 +82,7 @@ func TestMCPGateAnnouncesWeakenedFlagsAndRefusals(t *testing.T) {
 		root := gateRepo(t, nil)
 		cfg := writeRepoConfigAt(t, root, "policy.hard_rules.enabled: false\n")
 		var out bytes.Buffer
-		g, err := openAnnouncedGate(root, &out)
+		g, err := openAnnouncedGate(root, &out, "devcouncil mcp")
 		if err == nil || g != nil {
 			t.Fatalf("a loosening repository config built a gate (err %v)", err)
 		}
@@ -104,7 +105,7 @@ func TestMCPPolicyCheckFollowsConfigEditsAndFailsClosed(t *testing.T) {
 	writeRepoConfigAt(t, root, "harness:\n  posture: dev\n")
 	var stderr bytes.Buffer
 	reg := devcouncil.NewRegistry(root, nil, nil)
-	reg.OpenGate = func() (*gate.Gate, error) { return openAnnouncedGate(root, &stderr) }
+	reg.OpenGate = func() (*gate.Gate, error) { return openAnnouncedGate(root, &stderr, "devcouncil mcp") }
 
 	const unplanned = "src/new_file.go"
 	// dev demotes the scope refusal of an unplanned write to an allow.
@@ -157,5 +158,93 @@ func TestMCPPolicyCheckDoesNotRebuildAnUnchangedConfig(t *testing.T) {
 	}
 	if builds != 1 {
 		t.Fatalf("an unchanged config rebuilt the gate %d times, want 1", builds)
+	}
+}
+
+// runMCP serves newMCPRegistry's registry, which builds the gate before the
+// first request: the weakened-flag line is on stderr at startup.
+func TestMCPStartupBuildsTheGateAndAnnouncesIt(t *testing.T) {
+	t.Setenv(flags.EnvKey(flags.PolicyHardRules), "false")
+	var out bytes.Buffer
+	newMCPRegistry(gateRepo(t, nil), nil, &out)
+	if !strings.Contains(out.String(), "devcouncil mcp: write gate running with weakened safety flags") ||
+		!strings.Contains(out.String(), flags.PolicyHardRules) {
+		t.Fatalf("nothing about the weakened flag was printed at startup: %q", out.String())
+	}
+}
+
+// The dev tool path builds the same announced gate.
+func TestToolPathAnnouncesWeakenedFlagsToo(t *testing.T) {
+	t.Setenv(flags.EnvKey(flags.PolicyHardRules), "false")
+	var out bytes.Buffer
+	if _, err := openAnnouncedGate(gateRepo(t, nil), &out, "devcouncil tool"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "devcouncil tool: write gate running with weakened") {
+		t.Fatalf("tool path notice = %q", out.String())
+	}
+}
+
+// Every transition between absent, a regular file, a live symlink and a
+// dangling symlink must rebuild the gate on a running host, and each state must
+// answer as a fresh registry would. The stat key used to give "absent" and
+// "stat failed" the same value and followed symlinks, so a dangling link kept
+// the old default gate answering allowed=true.
+func TestMCPGateFollowsConfigFileTypeTransitions(t *testing.T) {
+	root := gateRepo(t, nil)
+	cfg := filepath.Join(root, ".devcouncil", "config.yaml")
+	target := filepath.Join(t.TempDir(), "real.yaml")
+	if err := os.WriteFile(target, []byte("harness:\n  posture: strict\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set := map[string]func(){
+		"absent":   func() { _ = os.Remove(cfg) },
+		"regular":  func() { _ = os.Remove(cfg); writeRepoConfigAt(t, root, "harness:\n  posture: strict\n") },
+		"dangling": func() { _ = os.Remove(cfg); _ = os.Symlink(filepath.Join(t.TempDir(), "gone.yaml"), cfg) },
+		"live":     func() { _ = os.Remove(cfg); _ = os.Symlink(target, cfg) },
+	}
+	fresh := func() (any, any) {
+		r := devcouncil.NewRegistry(root, nil, nil)
+		r.OpenGate = func() (*gate.Gate, error) { return openGate(root) }
+		return policyCheck(t, r, "src/new_file.go"), nil
+	}
+	reg := devcouncil.NewRegistry(root, nil, nil)
+	reg.OpenGate = func() (*gate.Gate, error) { return openGate(root) }
+	states := []string{"absent", "regular", "dangling", "absent", "dangling", "regular", "live", "dangling", "live", "regular", "absent", "live", "absent"}
+	for i, s := range states {
+		set[s]()
+		got := policyCheck(t, reg, "src/new_file.go")
+		want, _ := fresh()
+		gv, ga := allowed(t, got)
+		wv, wa := allowed(t, want)
+		if gv != wv || ga != wa {
+			t.Fatalf("step %d -> %s: running host answered (allowed=%v answered=%v), a fresh registry (allowed=%v answered=%v)", i, s, gv, ga, wv, wa)
+		}
+	}
+}
+
+// A named pipe at config.yaml is refused without opening it. It used to be
+// opened by the retired-key pre-read, which blocks until a writer appears, with
+// the registry's gate lock held.
+func TestMCPPolicyCheckRefusesAConfigFIFOWithoutBlocking(t *testing.T) {
+	root := gateRepo(t, nil)
+	cfg := filepath.Join(root, ".devcouncil", "config.yaml")
+	if err := os.Remove(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(cfg, 0o644); err != nil {
+		t.Skipf("no FIFOs here: %v", err)
+	}
+	reg := devcouncil.NewRegistry(root, nil, nil)
+	reg.OpenGate = func() (*gate.Gate, error) { return openGate(root) }
+	done := make(chan any, 1)
+	go func() { done <- policyCheck(t, reg, ".env") }()
+	select {
+	case out := <-done:
+		if ok, answered := allowed(t, out); answered || ok {
+			t.Fatalf("a FIFO config produced a verdict: %+v", out)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("policy_check_write blocked on a FIFO at config.yaml")
 	}
 }

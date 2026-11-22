@@ -142,14 +142,30 @@ func Load(root string) Snapshot {
 }
 
 // FileKey identifies one reading of the config file: a different file (inode),
-// a rewrite (mtime, size) or a chmod (mode) all change it. The zero value is a
-// file that is absent or cannot be stat'ed.
+// a rewrite (mtime, size) or a chmod (mode) all change it. It is taken with
+// Lstat, so a config.yaml that is a symlink is its own state, and for a symlink
+// it also carries the target's stat (or that the target is gone), so editing
+// the target, repointing the link and dangling it are each a change. State
+// separates "absent", "present" and "stat failed"; the three never share a key.
 type FileKey struct {
-	mtime int64
-	ino   uint64
-	size  int64
-	mode  os.FileMode
+	state  keyState
+	mtime  int64
+	ino    uint64
+	size   int64
+	mode   os.FileMode
+	tstate keyState
+	tmtime int64
+	tino   uint64
+	tsize  int64
 }
+
+type keyState uint8
+
+const (
+	keyAbsent  keyState = iota // the path does not exist
+	keyPresent                 // the path was stat'ed
+	keyError                   // stat failed for a reason other than absence
+)
 
 // ConfigKey is the FileKey of root's .devcouncil/config.yaml. It is the one
 // answer to "has the config changed since I last read it": Resolve keys its
@@ -157,15 +173,27 @@ type FileKey struct {
 // gate) compares it to rebuild on the same condition rather than keeping a
 // second cache with its own idea of "changed".
 func ConfigKey(root string) FileKey {
-	info, err := os.Stat(filepath.Join(root, ".devcouncil", "config.yaml"))
+	path := filepath.Join(root, ".devcouncil", "config.yaml")
+	info, err := os.Lstat(path)
 	if err != nil {
-		return FileKey{}
+		return FileKey{state: errState(err)}
 	}
-	return fileKeyOf(info)
+	k := FileKey{state: keyPresent, mtime: info.ModTime().UnixNano(), ino: inode(info), size: info.Size(), mode: info.Mode()}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if t, err := os.Stat(path); err != nil {
+			k.tstate = errState(err)
+		} else {
+			k.tstate, k.tmtime, k.tino, k.tsize = keyPresent, t.ModTime().UnixNano(), inode(t), t.Size()
+		}
+	}
+	return k
 }
 
-func fileKeyOf(info os.FileInfo) FileKey {
-	return FileKey{mtime: info.ModTime().UnixNano(), ino: inode(info), size: info.Size(), mode: info.Mode()}
+func errState(err error) keyState {
+	if os.IsNotExist(err) {
+		return keyAbsent
+	}
+	return keyError
 }
 
 var (
@@ -184,14 +212,11 @@ type resolved struct {
 // every tool call. It fails closed exactly as Load does.
 func Resolve(root string) Snapshot {
 	path := filepath.Join(root, ".devcouncil", "config.yaml")
-	info, err := os.Stat(path)
-	if err != nil {
-		resolveMu.Lock()
-		delete(resolveCache, path)
-		resolveMu.Unlock()
+	key := ConfigKey(root)
+	if key.state == keyError || key.tstate == keyError {
+		// A stat that failed says nothing stable about the file: read it.
 		return Load(root)
 	}
-	key := fileKeyOf(info)
 	resolveMu.Lock()
 	if hit, ok := resolveCache[path]; ok && hit.key == key {
 		resolveMu.Unlock()

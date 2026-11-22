@@ -274,11 +274,7 @@ func runMCP() int {
 	// devcouncil_policy_check_write answers not_initialized instead of a
 	// verdict it could not reach. The gate is rebuilt whenever config.yaml
 	// changes, so a corrected file recovers on this same server.
-	reg := devcouncil.NewRegistry(root, openStore(root), nil)
-	reg.OpenGate = func() (*gate.Gate, error) { return openAnnouncedGate(root, console.Stderr()) }
-	// Build it now so the weakened-flag line and any refusal are on stderr at
-	// startup, not at the first policy_check_write.
-	_, _ = reg.CurrentGate()
+	reg := newMCPRegistry(root, openStore(root), console.Stderr())
 	srv := &mcp.Server{Registry: reg}
 	if err := srv.Serve(); err != nil {
 		console.Errorf("devcouncil mcp: %v\n", err)
@@ -371,14 +367,24 @@ func openGate(root string) (*gate.Gate, error) {
 // user-level override), so a weakening is visible on stderr rather than only in
 // a report the MCP host never prints. It runs on every build, including a
 // rebuild after config.yaml changed.
-func openAnnouncedGate(root string, w io.Writer) (*gate.Gate, error) {
+// newMCPRegistry is the registry runMCP serves: its write gate follows
+// config.yaml, and is built here, once, so the weakened-flag line and any
+// refusal are on w at startup rather than at the first policy_check_write.
+func newMCPRegistry(root string, st *store.Client, w io.Writer) *devcouncil.Registry {
+	reg := devcouncil.NewRegistry(root, st, nil)
+	reg.OpenGate = func() (*gate.Gate, error) { return openAnnouncedGate(root, w, "devcouncil mcp") }
+	_, _ = reg.CurrentGate()
+	return reg
+}
+
+func openAnnouncedGate(root string, w io.Writer, who string) (*gate.Gate, error) {
 	g, err := openGate(root)
 	if err != nil {
-		_, _ = fmt.Fprintf(w, "devcouncil mcp: write gate unavailable: %v\n", err)
+		_, _ = fmt.Fprintf(w, "%s: write gate unavailable: %v\n", who, err)
 		return nil, err
 	}
 	if weak := g.Report().WeakenedFlags; len(weak) > 0 {
-		_, _ = fmt.Fprintf(w, "devcouncil mcp: write gate running with weakened safety flags: %s\n", strings.Join(weak, "; "))
+		_, _ = fmt.Fprintf(w, "%s: write gate running with weakened safety flags: %s\n", who, strings.Join(weak, "; "))
 	}
 	return g, nil
 }
