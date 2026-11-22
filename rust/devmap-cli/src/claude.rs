@@ -1764,7 +1764,50 @@ pub(crate) fn path_is_hashed_test_binary(path: &Path) -> bool {
     })
 }
 
-/// Refuse to put a hashed test binary into an MCP command.
+/// True when `path` is a cargo build product (`target/debug`, `target/release`,
+/// or `target/<triple>/{debug,release}`) that lives in a linked worktree.
+///
+/// A linked worktree is one with a `worktrees` path component above `target`
+/// (`.gitpulse/worktrees/<lane>`, `.claude/worktrees/<lane>`), or one whose
+/// nearest `.git` is a file rather than a directory. That checkout is removed
+/// when its lane lands, and the binary goes with it. The primary checkout's own
+/// `target/debug` binary is not matched: it outlives any lane, and
+/// `mcp --print-config` names the binary that ran.
+pub(crate) fn path_is_worktree_build_output(path: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    let Some(target) = parts.iter().position(|name| *name == "target") else {
+        return false;
+    };
+    let profile_follows = parts
+        .iter()
+        .skip(target + 1)
+        .take(2)
+        .any(|name| *name == "debug" || *name == "release");
+    if !profile_follows {
+        return false;
+    }
+    if parts[..target].iter().any(|name| *name == "worktrees") {
+        return true;
+    }
+    let checkout: PathBuf = path
+        .components()
+        .take_while(|component| !matches!(component, std::path::Component::Normal(name) if *name == "target"))
+        .collect();
+    checkout
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|git| git.exists())
+        .is_some_and(|git| git.is_file())
+}
+
+/// Refuse to put a hashed test binary, or a linked worktree's build output,
+/// into an MCP command.
 ///
 /// A symlink is followed. The lexical path of a deleted worktree does not
 /// exist, so a failed canonicalize is not treated as safe: the path components
@@ -1774,6 +1817,16 @@ pub(crate) fn refuse_hashed_test_binary(executable: &Path) -> anyhow::Result<()>
     let canonical = executable.canonicalize().ok();
     let lexical = path_is_hashed_test_binary(executable);
     let via_link = canonical.as_deref().is_some_and(path_is_hashed_test_binary);
+    let worktree_output = path_is_worktree_build_output(executable)
+        || canonical.as_deref().is_some_and(path_is_worktree_build_output);
+    if worktree_output && !lexical && !via_link {
+        anyhow::bail!(
+            "refusing to register an MCP command at {}: that path is build output \
+             inside a linked worktree's target/, and it disappears when the worktree \
+             is removed. Register the installed devmap, not a lane's build.",
+            executable.display()
+        );
+    }
     if !lexical && !via_link {
         return Ok(());
     }
@@ -3313,6 +3366,41 @@ mod tests {
     /// Registering it is the failure. A checkout's own `target/debug` or
     /// `target/release` binary stays a valid absolute command, because
     /// `mcp --print-config` is specified to name the binary that ran.
+    #[test]
+    fn a_linked_worktrees_build_output_is_refused_as_an_mcp_command() {
+        // Deleted lane under .gitpulse/worktrees: lexical match, nothing on disk.
+        let lane = Path::new(
+            "/Users/x/Code/DevCouncil/.gitpulse/worktrees/agent-1/rust/target/debug/devmap",
+        );
+        let err = mcp_entry(lane, None, None).expect_err("a lane's target/debug is not an install");
+        assert!(err.to_string().contains("linked worktree"), "{err}");
+        let cross = Path::new("/w/.claude/worktrees/l/rust/target/aarch64-apple-darwin/release/devmap");
+        assert!(mcp_entry_with_root(cross, Path::new("/repo"), None).is_err());
+
+        // A linked worktree is also recognised by its `.git` file.
+        let root = std::env::temp_dir().join(format!(
+            "devmap-wt-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let linked = root.join("lane");
+        let primary = root.join("main");
+        std::fs::create_dir_all(linked.join("rust/target/debug")).expect("linked dirs");
+        std::fs::create_dir_all(primary.join(".git")).expect("primary git dir");
+        std::fs::create_dir_all(primary.join("rust/target/debug")).expect("primary dirs");
+        std::fs::write(linked.join(".git"), "gitdir: ../main/.git/worktrees/lane").expect(".git file");
+        let linked_bin = linked.join("rust/target/debug/devmap");
+        let primary_bin = primary.join("rust/target/debug/devmap");
+        let linked_result = mcp_entry(&linked_bin, None, None);
+        let primary_result = mcp_entry(&primary_bin, None, None);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(linked_result.is_err(), "a .git-file checkout's build output was accepted");
+        primary_result.expect("the primary checkout's own build stays a valid command");
+    }
+
     #[test]
     fn a_hashed_test_binary_is_refused_as_an_mcp_command() {
         let stale = Path::new(
