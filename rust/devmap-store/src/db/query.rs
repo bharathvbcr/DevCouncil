@@ -216,7 +216,7 @@ impl Store {
         }))
     }
 
-    fn generation_repo_root_in(
+    pub(super) fn generation_repo_root_in(
         &self,
         snapshot: &Connection,
         generation: u32,

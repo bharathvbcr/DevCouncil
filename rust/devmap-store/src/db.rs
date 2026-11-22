@@ -199,6 +199,13 @@ fn unsupported_schema_error(store: &str, found: i32) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(UnsupportedSchema::new(store, found)))
 }
 
+/// The head a build or drain stamps when `git rev-parse HEAD` cannot be read.
+///
+/// The one spelling of it: `devmap build`, the daemon's drain, the manifest and
+/// export fallbacks write it, and the status surfaces compare against it.
+/// `latest_generation_head_sha` returns it verbatim rather than as "never built".
+pub const UNAVAILABLE_HEAD: &str = "unavailable";
+
 /// Shared by [`Store::save_generation_timed`] and [`Store::restamp_latest_head`].
 /// A stamp is provenance, not a git-object proof: `"unavailable"` and `"unknown"`
 /// are valid, which is what the CLI writes when `rev-parse` fails.
@@ -1059,6 +1066,17 @@ pub struct StoreStatus {
     /// from a broken one without opening the database by hand. Each list is
     /// capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its own total.
     pub coverage_gaps: CoverageGaps,
+    /// The latest generation's `head_sha`, read in the snapshot every other
+    /// field here describes. A surface that re-read it later could pair
+    /// generation N with generation N+1's head. `None` with no generation.
+    pub head_sha: Option<String>,
+    /// The repository root the latest generation answers to (honouring a
+    /// caller's override), read in the same snapshot as [`Self::head_sha`].
+    pub repo_root: Option<String>,
+    /// How the latest generation's resolver stamp relates to this binary,
+    /// read once, in the same snapshot. `Err` carries the read failure so a
+    /// stamp that could not be read is never taken for current.
+    pub resolver_stamp: std::result::Result<ResolverStamp, String>,
 }
 
 impl StoreStatus {

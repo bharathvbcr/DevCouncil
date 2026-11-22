@@ -218,8 +218,12 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     // constructor), and `status` used to exit 1 with no JSON there, which a
     // host reading readiness cannot use. The tolerant open is for exactly this:
     // everything but search still answers, and the damage is reported below
-    // rather than refused. Damage that is not provably the index's alone still
-    // fails the open, here as before.
+    // rather than refused. The tolerance is only as wide as what the open checks:
+    // damage the schema check does not read (table pages beyond `sqlite_master`
+    // and `table_info`) can coexist with the index's and still open, and then the
+    // reason's `devmap repair --fts` rebuilds the index without curing it (the
+    // repair itself failing on config or data page damage is ft-72758783). Damage
+    // the schema check can see in another table still fails the open, here as before.
     let opened = match Store::open_existing(cli.db()) {
         Err(error) if Store::sqlite_error_is_full_text_damage(&error) => {
             Some(Store::open_read_only_with(
@@ -451,7 +455,7 @@ pub(crate) fn store_status_fields(
         // The structured half of the head clause in `degraded_reason`: the
         // commit the generation was built from, `"unavailable"` when git could
         // not say, `null` with no generation. Same field as the daemon's.
-        "head_sha": store.latest_generation_head_sha()?,
+        "head_sha": status.head_sha,
         // The structured half of the full-text clause in `degraded_reason`,
         // from the probe `devmap build` runs: a reader must not parse prose to
         // learn that `search` will fail.

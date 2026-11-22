@@ -652,7 +652,8 @@ fn run_build(
             // (empty commit, identical-tree checkout) while no file
             // did. Leaving the stamp behind is what made `status`
             // report NOT FRESH after a skip that had nothing to do.
-            let head = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
+            let head = current_git_head(path)
+                .unwrap_or_else(|_| devmap_store::UNAVAILABLE_HEAD.to_string());
             store.restamp_latest_head(&head)?;
             let store = if let Some(staged) = staged_seed.take() {
                 drop(store);
@@ -1038,7 +1039,8 @@ fn run_build(
         over_limit: Some(discovery_inventory.over_limit),
         verify_every_row: *verify_rows,
     };
-    let head_sha = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
+    let head_sha =
+        current_git_head(path).unwrap_or_else(|_| devmap_store::UNAVAILABLE_HEAD.to_string());
     progress.stage(
         4,
         format_args!(

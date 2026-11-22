@@ -1349,24 +1349,31 @@ impl Store {
         let mut status = self.status_snapshot(db_path)?;
         if let Some(generation) = status.latest_generation {
             if status.pending_count == 0 && status.degraded_reason.is_none() {
-                // One lock for both analyzer questions: they read one snapshot.
-                let (analyzer_freshness, analyzer_reason) = match lock_conn(&self.conn)
-                    .and_then(|conn| {
-                        Ok((
-                            Self::extraction_is_current_on(&conn)?,
-                            Self::resolver_stamp_on(&conn)?,
-                        ))
-                    }) {
-                    Ok((true, ResolverStamp::Current)) => (Some(true), None),
-                    // A resolver mismatch has its own reason, which
-                    // `rebuild_required_reason` does not match: a re-resolve can
-                    // outlast the SessionStart budget, so it lands on the next
-                    // build instead of an automatic one.
-                    Ok((true, stamp)) => (Some(false), Some(stamp.reason().to_string())),
-                    Ok((false, _)) => (Some(false), Some(
-                        "stored extraction payload is obsolete; rebuild with the current analyzer".to_string())),
-                    Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
-                };
+                // The resolver stamp is the one the snapshot read, the same one
+                // every status surface names; only the extraction question is
+                // asked here, so the stamp is read once per status.
+                let extraction = lock_conn(&self.conn)
+                    .and_then(|conn| Self::extraction_is_current_on(&conn))
+                    .map_err(|error| error.to_string());
+                let (analyzer_freshness, analyzer_reason) =
+                    match (extraction, status.resolver_stamp.clone()) {
+                        (Ok(true), Ok(ResolverStamp::Current)) => (Some(true), None),
+                        // A resolver mismatch has its own reason, which
+                        // `rebuild_required_reason` does not match: a re-resolve can
+                        // outlast the SessionStart budget, so it lands on the next
+                        // build instead of an automatic one.
+                        (Ok(true), Ok(stamp)) => (Some(false), Some(stamp.reason().to_string())),
+                        (Ok(false), _) => (
+                            Some(false),
+                            Some(
+                                "stored extraction payload is obsolete; rebuild with the current analyzer"
+                                    .to_string(),
+                            ),
+                        ),
+                        (Err(error), _) | (_, Err(error)) => {
+                            (None, Some(format!("analyzer freshness unverified: {error}")))
+                        }
+                    };
                 let (source_freshness, source_reason, source_delta) =
                     self.source_snapshot_mismatch(generation, cancel)?;
                 status.source_freshness = source_freshness;
@@ -2017,6 +2024,23 @@ generation {latest}; run `devmap status` to re-verify",
             None
         };
         let encoding_reason = self.payload_encoding_reason_cached(&snapshot, latest, stamp)?;
+        // Provenance of the generation counted above, read in the same snapshot:
+        // a surface that asked the store again afterwards could pair this
+        // generation's counts with a later generation's head, root or stamp.
+        let (head_sha, repo_root) = match latest {
+            Some(generation) => (
+                snapshot
+                    .query_row(
+                        "SELECT head_sha FROM generations WHERE id = ?1",
+                        params![generation],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?,
+                self.generation_repo_root_in(&snapshot, generation)?,
+            ),
+            None => (None, None),
+        };
+        let resolver_stamp = Self::resolver_stamp_on(&snapshot).map_err(|error| error.to_string());
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -2033,6 +2057,9 @@ generation {latest}; run `devmap status` to re-verify",
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
+            head_sha,
+            repo_root,
+            resolver_stamp,
         })
     }
 
@@ -2299,6 +2326,39 @@ generation {latest}; run `devmap status` to re-verify",
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok((Vec::new(), 0));
         };
+        Self::partial_parse_gaps_locked(&snapshot, generation, containing, admit, limit)
+    }
+
+    /// [`Self::latest_partial_parse_gaps`] for the generation the caller
+    /// already resolved something else against, so the two reads describe one
+    /// generation. A caller that resolves a scope from one read and then asks
+    /// for the latest gaps in another pairs generation N's files with N+1's
+    /// gaps whenever a build commits between them.
+    ///
+    /// `None` when the store no longer holds `generation` (pruned): a refusal
+    /// to answer, not an empty set, so the caller must say the lookup could not
+    /// be checked rather than report no gaps.
+    pub fn partial_parse_gaps_in(
+        &self,
+        generation: u32,
+        containing: &str,
+        admit: Option<&dyn Fn(&str) -> bool>,
+        limit: usize,
+    ) -> Result<Option<(Vec<crate::PartialParseGap>, usize)>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some(snapshot) = Self::generation_snapshot(&conn, generation)? else {
+            return Ok(None);
+        };
+        Self::partial_parse_gaps_locked(&snapshot, generation, containing, admit, limit).map(Some)
+    }
+
+    fn partial_parse_gaps_locked(
+        snapshot: &rusqlite::Connection,
+        generation: u32,
+        containing: &str,
+        admit: Option<&dyn Fn(&str) -> bool>,
+        limit: usize,
+    ) -> Result<(Vec<crate::PartialParseGap>, usize)> {
         let label = devmap_analyze::ExtractionGap::PartialParse.label();
         let filter = "g.generation_id = ?1 AND g.gap = ?2 AND instr(g.reason, ?3) > 0";
         let total_unscoped: Option<usize> = match admit {
@@ -2342,7 +2402,6 @@ generation {latest}; run `devmap status` to re-verify",
         }
         drop(rows);
         drop(stmt);
-        drop(snapshot);
         Ok((kept, total_unscoped.unwrap_or(seen)))
     }
 
