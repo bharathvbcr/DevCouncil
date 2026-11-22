@@ -168,7 +168,7 @@ fn run_integrate(
     let executable = claude::plugin_command(&std::env::current_exe()?, binary);
     let db = cli.db();
     let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
-    let report = integrate::integrate(
+    let mut report = integrate::integrate(
         host,
         project_root,
         &executable,
@@ -181,6 +181,11 @@ fn run_integrate(
         check,
         hand_written,
     )?;
+    // The warning `mcp_entry` prints on stderr, kept in the receipt's own
+    // `notes` so a caller reading the JSON sees it too.
+    if let Some(warning) = claude::worktree_build_output_warning(&executable) {
+        report.notes.push(warning);
+    }
     if cli.json {
         emit_json(
             cli,

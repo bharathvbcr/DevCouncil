@@ -1764,70 +1764,81 @@ pub(crate) fn path_is_hashed_test_binary(path: &Path) -> bool {
     })
 }
 
-/// True when `path` is a cargo build product (`target/debug`, `target/release`,
-/// or `target/<triple>/{debug,release}`) that lives in a linked worktree.
+/// Why `path` is a cargo build product inside a linked worktree, if it is.
 ///
-/// A linked worktree is one with a `worktrees` path component above `target`
-/// (`.gitpulse/worktrees/<lane>`, `.claude/worktrees/<lane>`), or one whose
-/// nearest `.git` is a file rather than a directory. That checkout is removed
-/// when its lane lands, and the binary goes with it. The primary checkout's own
-/// `target/debug` binary is not matched: it outlives any lane, and
-/// `mcp --print-config` names the binary that ran.
-pub(crate) fn path_is_worktree_build_output(path: &Path) -> bool {
-    let parts: Vec<&std::ffi::OsStr> = path
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name),
-            _ => None,
-        })
-        .collect();
-    let Some(target) = parts.iter().position(|name| *name == "target") else {
-        return false;
+/// A path with a `target` component followed by a profile directory and then
+/// the binary (`target/<profile>/devmap`, `target/<triple>/<profile>/devmap`) is
+/// build output whatever the profile is called. Every `target` component is
+/// tried, and the ancestors above it are asked whether any is a linked worktree
+/// that git itself registered, through `devmap_extract::paths::main_checkout_of`:
+/// that excludes submodules and any folder that merely looks like a worktree.
+/// A lane's checkout is removed when it lands, and the binary goes with it, so
+/// the host that stored the path fails `posix_spawn` with ENOENT. The primary
+/// checkout's own `target/` is not matched: it outlives any lane. A deleted
+/// worktree cannot be confirmed, so it is not named.
+pub(crate) fn worktree_build_output_warning(path: &Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    let is_target = |c: &std::path::Component<'_>| {
+        matches!(c, std::path::Component::Normal(name) if *name == "target")
     };
-    let profile_follows = parts
-        .iter()
-        .skip(target + 1)
-        .take(2)
-        .any(|name| *name == "debug" || *name == "release");
-    if !profile_follows {
-        return false;
+    for (index, _) in components.iter().enumerate().filter(|(_, c)| is_target(c)) {
+        // `target`, a profile directory, and the file itself.
+        if components.len() < index + 3 {
+            continue;
+        }
+        let above: PathBuf = components[..index].iter().collect();
+        for dir in above.ancestors() {
+            if let Some(main) = devmap_extract::paths::main_checkout_of(dir) {
+                return Some(format!(
+                    "the MCP command {} is build output inside the linked worktree {} \
+                     (main checkout {}); the entry will break when that worktree is \
+                     removed. Register an installed devmap, or pass --binary.",
+                    path.display(),
+                    dir.display(),
+                    main.display()
+                ));
+            }
+        }
     }
-    if parts[..target].iter().any(|name| *name == "worktrees") {
-        return true;
-    }
-    let checkout: PathBuf = path
-        .components()
-        .take_while(|component| !matches!(component, std::path::Component::Normal(name) if *name == "target"))
-        .collect();
-    checkout
-        .ancestors()
-        .map(|dir| dir.join(".git"))
-        .find(|git| git.exists())
-        .is_some_and(|git| git.is_file())
+    None
 }
 
-/// Refuse to put a hashed test binary, or a linked worktree's build output,
-/// into an MCP command.
+/// Print `worktree_build_output_warning` once per path per process.
+///
+/// Stderr only: `mcp --print-config` keeps stdout to the JSON a host consumes.
+fn warn_on_worktree_build_output(executable: &Path) {
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let canonical = executable.canonicalize().ok();
+    let Some(message) = worktree_build_output_warning(executable).or_else(|| {
+        canonical
+            .as_deref()
+            .and_then(worktree_build_output_warning)
+    }) else {
+        return;
+    };
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.iter().any(|p| p == executable) {
+        return;
+    }
+    seen.push(executable.to_path_buf());
+    eprintln!("warning: {message}");
+}
+
+/// Refuse to put a hashed test binary into an MCP command; warn on a linked
+/// worktree's build output.
 ///
 /// A symlink is followed. The lexical path of a deleted worktree does not
 /// exist, so a failed canonicalize is not treated as safe: the path components
 /// are checked either way. A missing ordinary path stays allowed, which is
-/// what the config writers' unit tests hand in.
+/// what the config writers' unit tests hand in. Build output in a linked
+/// worktree is only warned about: `CARGO_BIN_EXE_devmap` is that path whenever
+/// the integration tests run in a lane.
 pub(crate) fn refuse_hashed_test_binary(executable: &Path) -> anyhow::Result<()> {
     let canonical = executable.canonicalize().ok();
     let lexical = path_is_hashed_test_binary(executable);
     let via_link = canonical.as_deref().is_some_and(path_is_hashed_test_binary);
-    let worktree_output = path_is_worktree_build_output(executable)
-        || canonical.as_deref().is_some_and(path_is_worktree_build_output);
-    if worktree_output && !lexical && !via_link {
-        anyhow::bail!(
-            "refusing to register an MCP command at {}: that path is build output \
-             inside a linked worktree's target/, and it disappears when the worktree \
-             is removed. Register the installed devmap, not a lane's build.",
-            executable.display()
-        );
-    }
     if !lexical && !via_link {
+        warn_on_worktree_build_output(executable);
         return Ok(());
     }
     let shown = if via_link {
@@ -3361,46 +3372,101 @@ mod tests {
         }
     }
 
-    /// The ENOENT from 2026-10-29 was this path: a hashed copy under
-    /// `target/devcouncil-testbin` inside a worktree that was later deleted.
-    /// Registering it is the failure. A checkout's own `target/debug` or
-    /// `target/release` binary stays a valid absolute command, because
-    /// `mcp --print-config` is specified to name the binary that ran.
-    #[test]
-    fn a_linked_worktrees_build_output_is_refused_as_an_mcp_command() {
-        // Deleted lane under .gitpulse/worktrees: lexical match, nothing on disk.
-        let lane = Path::new(
-            "/Users/x/Code/DevCouncil/.gitpulse/worktrees/agent-1/rust/target/debug/devmap",
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "protocol.file.allow=always", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        let err = mcp_entry(lane, None, None).expect_err("a lane's target/debug is not an install");
-        assert!(err.to_string().contains("linked worktree"), "{err}");
-        let cross = Path::new("/w/.claude/worktrees/l/rust/target/aarch64-apple-darwin/release/devmap");
-        assert!(mcp_entry_with_root(cross, Path::new("/repo"), None).is_err());
+    }
 
-        // A linked worktree is also recognised by its `.git` file.
-        let root = std::env::temp_dir().join(format!(
-            "devmap-wt-guard-{}-{}",
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-wt-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
-        let linked = root.join("lane");
-        let primary = root.join("main");
-        std::fs::create_dir_all(linked.join("rust/target/debug")).expect("linked dirs");
-        std::fs::create_dir_all(primary.join(".git")).expect("primary git dir");
-        std::fs::create_dir_all(primary.join("rust/target/debug")).expect("primary dirs");
-        std::fs::write(linked.join(".git"), "gitdir: ../main/.git/worktrees/lane").expect(".git file");
-        let linked_bin = linked.join("rust/target/debug/devmap");
-        let primary_bin = primary.join("rust/target/debug/devmap");
-        let linked_result = mcp_entry(&linked_bin, None, None);
-        let primary_result = mcp_entry(&primary_bin, None, None);
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(linked_result.is_err(), "a .git-file checkout's build output was accepted");
-        primary_result.expect("the primary checkout's own build stays a valid command");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.canonicalize().expect("canonical scratch dir")
     }
 
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("repo dir");
+        git_in(dir, &["init", "-q"]);
+        git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Build output in a worktree git registered warns and is still accepted:
+    /// `CARGO_BIN_EXE_devmap` is exactly that path when the suite runs in a lane.
+    #[test]
+    fn a_registered_linked_worktrees_build_output_warns_and_is_accepted() {
+        let root = scratch_dir("lane");
+        let main = root.join("main");
+        init_repo(&main);
+        let lane = root.join("lane");
+        git_in(&main, &["worktree", "add", "-q", lane.to_str().expect("utf8"), "-b", "lane"]);
+        let primary_bin = main.join("rust/target/debug/devmap");
+        let cases = [
+            lane.join("rust/target/debug/devmap"),
+            lane.join("rust/target/aarch64-apple-darwin/release/devmap"),
+            lane.join("rust/target/custom-profile/devmap"),
+            lane.join("target/x/target/ci/devmap"),
+        ];
+        let warned: Vec<_> = cases
+            .iter()
+            .map(|p| (p.clone(), worktree_build_output_warning(p)))
+            .collect();
+        let accepted: Vec<_> = cases.iter().map(|p| mcp_entry(p, None, None)).collect();
+        let primary = worktree_build_output_warning(&primary_bin);
+        let source_file = worktree_build_output_warning(&lane.join("rust/src/target"));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, warning) in warned {
+            let warning = warning.unwrap_or_else(|| panic!("{} was not flagged", path.display()));
+            assert!(warning.contains("removed"), "{warning}");
+            assert!(warning.contains("--binary"), "{warning}");
+            assert!(warning.contains(&*path.to_string_lossy()), "{warning}");
+        }
+        for entry in accepted {
+            entry.expect("a warning is not a refusal");
+        }
+        assert!(primary.is_none(), "the main checkout outlives any lane: {primary:?}");
+        assert!(source_file.is_none(), "a file named target is not build output");
+    }
+
+    #[test]
+    fn a_submodules_target_and_a_plain_worktrees_folder_are_not_flagged() {
+        let root = scratch_dir("neg");
+        let sub_src = root.join("sub-src");
+        init_repo(&sub_src);
+        let main = root.join("main");
+        init_repo(&main);
+        git_in(&main, &["submodule", "add", "-q", sub_src.to_str().expect("utf8"), "vendor/sub"]);
+        let submodule_bin = main.join("vendor/sub/target/debug/devmap");
+        let outside_git = root.join("not-a-repo/worktrees/lane/rust/target/debug/devmap");
+        let flagged = [
+            worktree_build_output_warning(&submodule_bin),
+            worktree_build_output_warning(&outside_git),
+        ];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(flagged, [None, None]);
+    }
+
+    /// The ENOENT from 2026-10-29 was this path: a hashed copy under
+    /// `target/devcouncil-testbin` inside a worktree that was later deleted.
+    /// Registering it is the failure. A checkout's own `target/debug` or
+    /// `target/release` binary stays a valid absolute command, because
+    /// `mcp --print-config` is specified to name the binary that ran.
     #[test]
     fn a_hashed_test_binary_is_refused_as_an_mcp_command() {
         let stale = Path::new(
