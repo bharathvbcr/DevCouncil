@@ -2515,7 +2515,10 @@ pub fn redact_secrets(text: &str) -> String {
 
 /// What [`redact_secrets_report`] answers: the redacted text and an exact
 /// account of what was replaced in it.
+///
+/// `non_exhaustive`: fields may be added later without breaking a vendored copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RedactionReport {
     /// Exactly [`redact_secrets`]`(text)`, byte for byte.
     pub text: String,

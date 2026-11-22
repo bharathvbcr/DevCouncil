@@ -139,6 +139,42 @@ fn counts_every_span_and_names_every_kind_on_one_line() {
     );
 }
 
+/// A chain of JWTs joined by `-` hides one credential behind the next, so each
+/// redaction pass can only reach the last. Past the library's pass cap the line
+/// is redacted whole, and the span count is then a lower bound on what it held.
+#[test]
+fn a_line_redacted_whole_after_the_pass_cap_counts_the_pass_spans_and_the_whole_line() {
+    let jwt = format!(
+        "{}{}.{}.{}",
+        "ey",
+        "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    );
+    let chain = vec![jwt.as_str(); 20].join("-");
+    let text = format!("seen {chain}\n");
+    let run = run(&["redact"], &request(&text));
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    let out = run.json["text"].as_str().expect("text");
+    assert!(!out.contains("JhbGci"), "a token survived: {out:?}");
+    assert_eq!(
+        out.matches("chars)").count(),
+        1,
+        "one whole-line marker: {out:?}"
+    );
+    assert_eq!(run.json["redacted_lines"], 1);
+    assert_eq!(
+        run.json["redacted_spans"], 17,
+        "16 pass spans plus the whole-line replacement: {}",
+        run.stdout
+    );
+    assert!(
+        !run.json["kinds"].as_array().expect("kinds").is_empty(),
+        "{}",
+        run.stdout
+    );
+}
+
 #[test]
 fn clean_text_still_reports_that_redaction_ran() {
     let run = run(&["redact"], &request("nothing to hide here\n"));
