@@ -4958,6 +4958,23 @@ mod tests {
             fs::read_to_string(&self.starts).map_or(0, |text| text.lines().count())
         }
 
+        /// The dirty marker a hook leaves for a running build of the main checkout.
+        fn dirty_marker(&self) -> PathBuf {
+            state_dir(&self.main)
+                .join("codeintel")
+                .join(BUILD_DIRTY_MARKER)
+        }
+
+        /// The main checkout's builder has exited and will not run again: its
+        /// lock is gone and no marker is left for a rerun. The builder removes
+        /// the lock and then re-reads the marker to retake it, so a marker that
+        /// is present keeps that gap from reading as "finished". Where the
+        /// rerun budget is spent a marker stays behind on purpose, and a test
+        /// there waits on its own count instead.
+        fn builder_finished(&self) -> bool {
+            !self.main_lock().exists() && !self.dirty_marker().exists()
+        }
+
         fn lock(&self) -> PathBuf {
             coalesce_lock_dir(&self.lane, "build")
         }
@@ -5677,7 +5694,13 @@ mod tests {
             None,
         );
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-        thread::sleep(Duration::from_millis(300));
+        // A hook that starts a build takes its coalescing lock before it
+        // returns, and the stand-in holds it until released, so the lock is the
+        // observable that no builder was spawned: nothing to wait for.
+        assert!(
+            !lane.main_lock().exists(),
+            "a failed read-only command took the build lock"
+        );
         assert_eq!(lane.builds_started(), 0, "a failed read-only command built");
 
         let outcome = run_hook(
@@ -5894,10 +5917,9 @@ mod tests {
                 None,
             );
             assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-            assert!(eventually(|| !lane.main_lock().exists()));
+            assert!(eventually(|| lane.builder_finished()));
         }
         let elapsed = begun.elapsed();
-        thread::sleep(Duration::from_millis(300));
         let windows = 1 + (elapsed.as_secs_f64() / 2.0) as usize;
         assert!(lane.builds_started() >= 1, "the first payload must build");
         assert!(
@@ -6473,22 +6495,35 @@ mod tests {
     #[test]
     fn an_unwritable_state_directory_is_reported_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
+        // root writes through a 0o555 directory, so there is no unwritable
+        // state to report; say so instead of passing on a check that never ran.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a read-only directory is writable");
+            return;
+        }
         let lane = Lane::new("trail-ro", true);
         let codeintel = state_dir(&lane.main).join("codeintel");
         fs::create_dir_all(&codeintel).unwrap();
         fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o555)).unwrap();
-        for payload in [
+        let outcomes: Vec<HookOutcome> = [
             shell_payload(&lane.main, "git merge feature"),
             edit_in_main(&lane),
-        ] {
-            let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        ]
+        .iter()
+        .map(|payload| run_hook(HookEvent::PostToolUse, payload, &lane.exe, None))
+        .collect();
+        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o755)).unwrap();
+        for outcome in &outcomes {
+            assert_eq!(outcome.exit_code, 1, "{:?}", outcome.stderr_line);
             assert!(
-                outcome.exit_code == 0 || outcome.exit_code == 1,
-                "{}",
-                outcome.exit_code
+                outcome
+                    .stderr_line
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "an unwritable state directory must say why: {:?}",
+                outcome.stderr_line
             );
         }
-        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(lane.builds_started(), 0);
     }
 
@@ -6675,8 +6710,7 @@ mod tests {
             eventually(|| lane.builds_started() >= 1),
             "a stale marker wedged the build"
         );
-        assert!(eventually(|| !lane.main_lock().exists()));
-        thread::sleep(Duration::from_millis(300));
+        assert!(eventually(|| lane.builder_finished()));
         assert_eq!(lane.builds_started(), 1, "a stale marker caused a rerun");
 
         // A writer that dirties the tree during every run.
@@ -6695,12 +6729,18 @@ mod tests {
             &lane.exe,
             None,
         );
-        assert!(eventually(|| lane.builds_started() > before));
-        assert!(eventually(|| !lane.main_lock().exists()));
-        thread::sleep(Duration::from_millis(500));
+        // The spent budget leaves its marker behind, so the builder is done
+        // when its lock is gone with every permitted run counted. An extra run
+        // would hold the lock past that count and fail the equality below.
+        let expected = 1 + MAX_TRAILING_RUNS as usize;
+        assert!(
+            eventually(|| !lane.main_lock().exists() && lane.builds_started() - before >= expected),
+            "{} builds, expected {expected}",
+            lane.builds_started() - before
+        );
         assert_eq!(
             lane.builds_started() - before,
-            1 + MAX_TRAILING_RUNS as usize,
+            expected,
             "one build plus the bounded trailing runs, no more"
         );
     }
@@ -6747,10 +6787,9 @@ mod tests {
             "no build started"
         );
         assert!(
-            eventually(|| !lane.main_lock().exists()),
+            eventually(|| lane.builder_finished()),
             "the lock outlived its builder"
         );
-        thread::sleep(Duration::from_millis(300));
         assert!(
             !marker.exists(),
             "a marker survived its builder with {} builds run",
