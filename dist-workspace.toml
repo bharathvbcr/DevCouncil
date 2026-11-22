@@ -13,11 +13,19 @@ ci = "github"
 # The installers to generate for each app. Every asset they produce is a
 # README contract (curl | sh, irm | iex, brew install), so the release gate
 # (backend/go_orchestrator/devcouncil/release) requires each one by name.
-installers = ["shell", "powershell", "homebrew"]
-# Homebrew tap the publish-homebrew-formula job pushes the formula to. The
-# repository and the HOMEBREW_TAP_TOKEN secret must exist before a tag.
-tap = "bharathvbcr/homebrew-tap"
-publish-jobs = ["homebrew"]
+installers = ["shell", "powershell"]
+# Homebrew is off until the tap exists (task ft-0151590c). To turn it on, after
+# creating the bharathvbcr/homebrew-tap repository and the HOMEBREW_TAP_TOKEN
+# secret, add "homebrew" to installers and these two keys here:
+#   tap = "bharathvbcr/homebrew-tap"
+#   publish-jobs = ["homebrew"]
+# and name the formula for the binary in rust/devmap-cli/Cargo.toml:
+#   [package.metadata.dist]
+#   formula = "devmap"
+# cargo-dist builds the formula from that key alone, so the release gate
+# refuses it while homebrew is off. Once all four are in, the gate requires
+# devmap.rb, and release.yml's publish-homebrew-formula job runs because the
+# plan names it.
 # Same directory scripts/install.sh uses, so every install route agrees.
 install-path = "~/.local/bin"
 # Target platforms matching the existing CI matrix. Windows is required: a

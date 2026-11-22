@@ -27,20 +27,13 @@ macOS and Linux:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.sh | sh
 ```
 
-Homebrew:
-
-```bash
-brew install bharathvbcr/tap/devmap
-```
-
 Windows (PowerShell):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.ps1 | iex"
 ```
 
-The shell and PowerShell installers put one self-contained `devmap` binary in
-`~/.local/bin`; Homebrew puts it in its own prefix. You
+The installers put one self-contained `devmap` binary in `~/.local/bin`. You
 can also download the archive for your platform (macOS arm64 and x86_64,
 Linux x86_64, Windows x64) from
 [Releases](https://github.com/bharathvbcr/DevCouncil/releases) and check it

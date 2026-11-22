@@ -629,6 +629,8 @@ jobs:
   # formula list is read line by line from the plan instead of word-split.
   # Needs the bharathvbcr/homebrew-tap repository and a HOMEBREW_TAP_TOKEN
   # secret (a token that can push to that repository only). Prereleases skip.
+  # It runs only when the plan names the devmap.rb formula, which happens only
+  # while dist-workspace.toml declares the homebrew installer (off for now).
   publish-homebrew-formula:
     permissions:
       "contents": "read"
@@ -640,7 +642,7 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "github-actions[bot]"
       GITHUB_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    if: ${{ contains(needs.plan.outputs.val, '"devmap.rb"') && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

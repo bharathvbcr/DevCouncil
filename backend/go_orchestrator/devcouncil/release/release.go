@@ -45,12 +45,13 @@ var RequiredArchives = []string{
 }
 
 // RequiredInstallers is every installer asset a release must carry. The
-// README's `curl | sh`, `irm | iex` and `brew install` lines download these
-// by name, so a release without one breaks a documented install command.
+// README's `curl | sh` and `irm | iex` lines download these by name, so a
+// release without one breaks a documented install command. Optional kinds
+// (homebrew) are required only while dist-workspace.toml declares them; see
+// declaredInstallerAssets.
 var RequiredInstallers = []string{
 	"devmap-cli-installer.sh",
 	"devmap-cli-installer.ps1",
-	"devmap.rb",
 }
 
 // installerAssets maps a dist-workspace.toml installer kind to the asset
@@ -85,6 +86,7 @@ var (
 	distTargetsRe   = regexp.MustCompile(`targets\s*=\s*\[`)
 	distInstallRe   = regexp.MustCompile(`(?m)^installers\s*=\s*\[`)
 	distTapRe       = regexp.MustCompile(`(?m)^tap\s*=\s*"[^"\s]+"`)
+	distFormulaRe   = regexp.MustCompile(`(?m)^formula\s*=\s*"([^"]*)"`)
 	distFlagRe      = regexp.MustCompile(`^dist\s*=\s*(true|false)\b`)
 	workspaceHdrRe  = regexp.MustCompile(`(?m)^\[workspace\]`)
 	membersRe       = regexp.MustCompile(`members\s*=\s*\[`)
@@ -872,6 +874,7 @@ func archiveFor(target string) string {
 // Inspect runs the gate.
 func Inspect(src Sources, opts Options) Result {
 	var errs []string
+	var declaredInstallers []string
 	read := func(file, label string) (string, bool) {
 		text, ok := readText(file)
 		if !ok {
@@ -1025,6 +1028,11 @@ func Inspect(src Sources, opts Options) Result {
 			}
 		}
 		errs = append(errs, distInstallerGaps(distToml)...)
+		if src.RustRoot != "" {
+			crateToml, _ := readText(filepath.Join(src.RustRoot, DistPackage, "Cargo.toml"))
+			errs = append(errs, formulaGaps(distToml, crateToml)...)
+		}
+		declaredInstallers = declaredInstallerAssets(distToml)
 	}
 
 	if !opts.SkipWorkflows {
@@ -1054,12 +1062,52 @@ func Inspect(src Sources, opts Options) Result {
 		if missing := MissingArchives(opts.ArtifactsDir, RequiredArchives); len(missing) > 0 {
 			errs = append(errs, "required release archives missing: "+strings.Join(missing, ", "))
 		}
-		if missing := MissingArchives(opts.ArtifactsDir, RequiredInstallers); len(missing) > 0 {
+		required := slices.Clone(RequiredInstallers)
+		for _, asset := range declaredInstallers {
+			if !slices.Contains(required, asset) {
+				required = append(required, asset)
+			}
+		}
+		if missing := MissingArchives(opts.ArtifactsDir, required); len(missing) > 0 {
 			errs = append(errs, "required release installers missing: "+strings.Join(missing, ", "))
 		}
 	}
 
 	return Result{Version: identity, Errors: errs}
+}
+
+// formulaGaps holds the shipped crate's Homebrew formula key to the homebrew
+// installer flag. cargo-dist builds <formula>.rb from the key alone, so a key
+// left behind while homebrew is off still produces a formula, and the publish
+// job would run against a tap that may not exist. With homebrew on, the key
+// must name the asset the README's brew line installs.
+func formulaGaps(distToml, crateToml string) []string {
+	installers, _ := distWorkspaceInstallers(distToml)
+	homebrew := slices.Contains(installers, "homebrew")
+	want := strings.TrimSuffix(installerAssets["homebrew"], ".rb")
+	m := distFormulaRe.FindStringSubmatch(crateToml)
+	crate := "rust/" + DistPackage + "/Cargo.toml"
+	switch {
+	case !homebrew && m != nil:
+		return []string{fmt.Sprintf("%s sets a Homebrew formula (%q) while dist-workspace.toml does not declare the homebrew installer; cargo-dist still builds %s.rb and publish-homebrew-formula would run", crate, m[1], m[1])}
+	case homebrew && (m == nil || m[1] != want):
+		return []string{fmt.Sprintf("dist-workspace.toml declares the homebrew installer but %s does not set [package.metadata.dist] formula = %q, so the asset would not be %s", crate, want, installerAssets["homebrew"])}
+	}
+	return nil
+}
+
+// declaredInstallerAssets is the asset of every installer kind
+// dist-workspace.toml declares that this gate knows. A release must carry each
+// one, so turning homebrew on makes the formula required without a code change.
+func declaredInstallerAssets(distToml string) []string {
+	installers, _ := distWorkspaceInstallers(distToml)
+	var assets []string
+	for _, kind := range installers {
+		if asset, known := installerAssets[kind]; known {
+			assets = append(assets, asset)
+		}
+	}
+	return assets
 }
 
 // distInstallerGaps holds dist-workspace.toml's installers to the assets the

@@ -49,7 +49,7 @@ analysis binaries' prebuilt releases are card ft-3f6a1a26. Until those ship, the
 
 | # | Gap | Status | Card |
 |---|---|---|---|
-| 1 | No install without building from source. Release CI already built 4 platform archives, but nothing pointed at them, and the npm package is only a launcher. | **Wired on `feat/launch-install-readme`**: cargo-dist shell, powershell and homebrew installers; the release gate requires each asset. Goes live at v0.2.5 after the owner steps below. | ft-1e3c8f0a |
+| 1 | No install without building from source. Release CI already built 4 platform archives, but nothing pointed at them, and the npm package is only a launcher. | **Wired on `feat/launch-install-readme`**: cargo-dist shell and powershell installers; the release gate requires each asset. Goes live at v0.2.5. Homebrew is wired but switched off until the tap exists (ft-0151590c). | ft-1e3c8f0a |
 | 2 | README leads with architecture; no one-sentence hook. | **Rewritten on the branch.** DevMap-first, three install lines, a five-command tour, an agent-question table. Architecture moved to docs/architecture.md. | ft-1e3c8f0a |
 | 3 | Surface size: about 45 devmap subcommands, about 20 dev families, 7 binaries with 3 names each. | Open | ft-fbe43919 |
 | 4 | About 25 report files at the repository root read as a private workspace. | Open (needs two-signal proof before moving) | ft-fbe43919 |
@@ -87,16 +87,23 @@ Marketing improvements from the same pass, in order. The cards above carry them.
 
 ## Release checklist for the installers (owner steps, not done)
 
-These are outward-facing, so they were not done in the session that wired the installers:
+v0.2.5 ships without Homebrew (owner decision, 2026-11-22). The curl and PowerShell installers need no
+extra setup:
 
-1. Create the `bharathvbcr/homebrew-tap` repository (public, with a README).
-2. Add the `HOMEBREW_TAP_TOKEN` secret to this repository. It should be a fine-grained token limited
-   to the tap repository, with contents: write.
-3. Write `docs/releases/v0.2.5.md`. Merge `feat/launch-install-readme` after a `git merge-tree`
-   check against the unmerged land-* branches, which also touch release.yml and quickstart.md. Then tag
-   `v0.2.5`.
-4. Run every README install line verbatim on clean macOS, Linux and Windows machines. Until then, do
-   not merge: the curl, irm and brew lines 404 before the first release that carries installers.
+1. Write `docs/releases/v0.2.5.md`, merge `feat/launch-install-readme`, then tag `v0.2.5`.
+   (`git merge-tree` against main and train/20261122-b2902 is clean. The four land-* branches already
+   conflict with main in rust/devmap-cli/src/commands/doctor.rs, which this branch does not touch.)
+2. Run both README install lines verbatim on clean macOS, Linux and Windows machines.
+
+Homebrew, later (ft-0151590c):
+1. Create `bharathvbcr/homebrew-tap`.
+2. Add `HOMEBREW_TAP_TOKEN`, a fine-grained token limited to the tap repository with contents: write.
+3. Add "homebrew" to `installers`, plus the `tap` and `publish-jobs` keys, in dist-workspace.toml.
+   Add `[package.metadata.dist] formula = "devmap"` in rust/devmap-cli/Cargo.toml. The comment in
+   dist-workspace.toml gives the exact lines, and the release gate refuses any partial set.
+4. Put the `brew install bharathvbcr/tap/devmap` line back in README.md and docs/quickstart.md.
+
+The release gate then requires `devmap.rb`, and the publish job runs, with no code change.
 
 Security impact of the new `publish-homebrew-formula` job: it checks out the tap with
 `HOMEBREW_TAP_TOKEN` and `persist-credentials: true` so that it can push the formula. It holds

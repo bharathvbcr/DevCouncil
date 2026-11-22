@@ -13,9 +13,6 @@ binary for macOS (arm64, x86_64), Linux (x86_64) and Windows (x64), each with a
 ```bash
 # macOS / Linux
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.sh | sh
-
-# Homebrew
-brew install bharathvbcr/tap/devmap
 ```
 
 ```powershell
