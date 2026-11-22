@@ -176,12 +176,12 @@ func TestMCPStartupBuildsTheGateAndAnnouncesIt(t *testing.T) {
 // The dev tool path builds the same announced gate.
 func TestToolPathAnnouncesWeakenedFlagsToo(t *testing.T) {
 	t.Setenv(flags.EnvKey(flags.PolicyHardRules), "false")
-	var out bytes.Buffer
-	if _, err := openAnnouncedGate(gateRepo(t, nil), &out, "devcouncil tool"); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "devcouncil tool: write gate running with weakened") {
-		t.Fatalf("tool path notice = %q", out.String())
+	stderr, restore := swapStderr(t)
+	answer := callToolInProcess(gateRepo(t, nil), "devcouncil_policy_check_write", map[string]any{"path": ".env"})
+	restore()
+	if !strings.Contains(stderr.String(), "devcouncil tool: write gate running with weakened") ||
+		!strings.Contains(stderr.String(), flags.PolicyHardRules) {
+		t.Fatalf("dev tool path printed %q (answer %q)", stderr.String(), answer.Text)
 	}
 }
 

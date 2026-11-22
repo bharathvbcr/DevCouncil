@@ -361,12 +361,6 @@ func openGate(root string) (*gate.Gate, error) {
 	return gate.New(regFlags, root, subsystems)
 }
 
-// openAnnouncedGate is openGate plus the operator-facing record of how it went:
-// a gate that cannot be built is said, and so is every Safety flag that is not
-// at its safest value (gate.Report's WeakenedFlags — the dev posture, an env or
-// user-level override), so a weakening is visible on stderr rather than only in
-// a report the MCP host never prints. It runs on every build, including a
-// rebuild after config.yaml changed.
 // newMCPRegistry is the registry runMCP serves: its write gate follows
 // config.yaml, and is built here, once, so the weakened-flag line and any
 // refusal are on w at startup rather than at the first policy_check_write.
@@ -377,6 +371,12 @@ func newMCPRegistry(root string, st *store.Client, w io.Writer) *devcouncil.Regi
 	return reg
 }
 
+// openAnnouncedGate is openGate plus the operator-facing record of how it went:
+// a gate that cannot be built is said, and so is every Safety flag that is not
+// at its safest value (gate.Report's WeakenedFlags — the dev posture, an env or
+// user-level override), so a weakening is visible on stderr rather than only in
+// a report the MCP host never prints. It runs on every build, including a
+// rebuild after config.yaml changed. who prefixes each line.
 func openAnnouncedGate(root string, w io.Writer, who string) (*gate.Gate, error) {
 	g, err := openGate(root)
 	if err != nil {
