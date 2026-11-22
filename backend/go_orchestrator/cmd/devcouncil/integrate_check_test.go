@@ -19,7 +19,7 @@ func integrateEnv(t *testing.T) (home, repo string) {
 	// Stage a non-symlinked copy under the test's isolated $HOME/.local/bin/devmap
 	// because `devmap integrate` rightly refuses `target/devcouncil-testbin/...`.
 	builtBin := testsupport.Devmap(t)
-	home = t.TempDir()
+	home = testsupport.IsolateHostConfig(t).Home
 	repo = t.TempDir()
 	installedDir := filepath.Join(home, ".local", "bin")
 	if err := os.MkdirAll(installedDir, 0o755); err != nil {
@@ -33,7 +33,6 @@ func integrateEnv(t *testing.T) (home, repo string) {
 	if err := os.WriteFile(devmapBin, rawBin, 0o755); err != nil {
 		t.Fatalf("stage devmap: %v", err)
 	}
-	t.Setenv("HOME", home)
 	t.Setenv("DEVMAP_BIN", devmapBin)
 	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)

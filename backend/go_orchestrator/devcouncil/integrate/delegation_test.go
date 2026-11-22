@@ -13,8 +13,10 @@ import (
 )
 
 // Host documents are written by `devmap integrate`, so these tests drive the
-// real binary. HOME is a scratch directory for every one of them: DevMap also
-// writes user-level configs (`~/.cursor/mcp.json`, `~/.claude.json`,
+// real binary. HOME is a scratch directory for every one of them, and
+// CLAUDE_CONFIG_DIR / CODEX_HOME are removed (testsupport.IsolateHostConfig):
+// DevMap also writes user-level configs (`~/.cursor/mcp.json`,
+// `~/.claude.json` or `$CLAUDE_CONFIG_DIR/.claude.json`,
 // `~/.codex/config.toml`), and a test must never reach the developer's own.
 
 // fakeSelf stands in for this devcouncil binary in the entries written. It is
@@ -27,11 +29,12 @@ const fakeSelf = "/opt/devcouncil-test/bin/devcouncil"
 // one is never executed either; it only has to be absolute.
 const fakeDevmap = "/opt/devcouncil-test/bin/devmap"
 
-// devmapForTest returns a devmap binary and isolates HOME.
+// devmapForTest returns a devmap binary and isolates every user-level config
+// location devmap honours (HOME and the overrides in testsupport.HostConfigEnv).
 func devmapForTest(t *testing.T) string {
 	t.Helper()
 	bin := testsupport.Devmap(t)
-	t.Setenv("HOME", t.TempDir())
+	testsupport.IsolateHostConfig(t)
 	return bin
 }
 
@@ -81,9 +84,14 @@ func TestEveryHostRegistersDevCouncilAndAChecksAgrees(t *testing.T) {
 	bin := devmapForTest(t)
 	for _, host := range devmapHosts(t, bin) {
 		t.Run(host, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			home := testsupport.IsolateHostConfig(t).Home
 			root := newRepo(t)
 			receipt := apply(t, bin, root, host)
+			receiptPaths := make([]string, 0, len(receipt.Files))
+			for path := range receipt.Files {
+				receiptPaths = append(receiptPaths, path)
+			}
+			testsupport.AssertWithin(t, []string{root, home}, receiptPaths...)
 			if !registersDevCouncil(t, root, receipt) {
 				t.Fatalf("%s: no written file carries the devcouncil entry: %v", host, receipt.Files)
 			}
@@ -104,6 +112,62 @@ func TestEveryHostRegistersDevCouncilAndAChecksAgrees(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A seat-pinned session exports CLAUDE_CONFIG_DIR, and devmap honours it for the
+// Claude host. The tests' isolation has to cover it as well as HOME: otherwise
+// `integrate claude --apply` merges into the developer's live seat profile.
+// The planted directory stands for that profile; it must come out byte for
+// byte as it went in, and no receipt may name a file outside the scratch roots.
+func TestSeatPinnedConfigDirIsNeverReached(t *testing.T) {
+	seat := t.TempDir()
+	planted := filepath.Join(seat, ".claude.json")
+	const body = `{"projects":{},"sentinel":"seat-config-do-not-touch"}` + "\n"
+	if err := os.WriteFile(planted, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", seat)
+	t.Setenv("CODEX_HOME", filepath.Join(seat, "codex"))
+
+	bin := devmapForTest(t)
+	home := os.Getenv("HOME")
+	root := newRepo(t)
+	for _, mode := range []Mode{ModeDryRun, ModeApply, ModeCheck} {
+		receipt, err := Run(Options{Root: root, Host: "claude", Mode: mode, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
+		if err != nil {
+			t.Fatalf("integrate claude %s: %v", mode, err)
+		}
+		paths := make([]string, 0, len(receipt.Files))
+		for path := range receipt.Files {
+			paths = append(paths, path)
+		}
+		testsupport.AssertWithin(t, []string{root, home}, paths...)
+	}
+	after, err := os.ReadFile(planted)
+	if err != nil || string(after) != body {
+		t.Fatalf("the seat-pinned %s changed (err %v):\n%s", planted, err, after)
+	}
+	if entries, _ := os.ReadDir(seat); len(entries) != 1 {
+		t.Fatalf("the seat-pinned directory gained files: %v", entries)
+	}
+	if !anyFileUnder(t, home, fakeDevmap) {
+		t.Fatalf("claude's registration did not land under the scratch HOME %s", home)
+	}
+}
+
+// anyFileUnder reports whether some regular file below dir holds want.
+func anyFileUnder(t *testing.T, dir, want string) bool {
+	t.Helper()
+	found := false
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			if b, rerr := os.ReadFile(path); rerr == nil && strings.Contains(string(b), want) {
+				found = true
+			}
+		}
+		return nil
+	})
+	return found
 }
 
 // registersDevCouncil reports whether some file the receipt names carries
@@ -167,7 +231,7 @@ func TestNoDevmapIsARefusalNotASuccess(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	// ~/.local/bin is a rung of component discovery, so an absent
 	// component is absent there too.
-	t.Setenv("HOME", t.TempDir())
+	testsupport.IsolateHostConfig(t)
 	root := t.TempDir()
 	receipt, err := Run(Options{Root: root, Host: "cursor", Mode: ModeApply, SelfBin: fakeSelf})
 	if err == nil || !strings.Contains(err.Error(), "nothing was configured") {
