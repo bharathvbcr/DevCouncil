@@ -141,13 +141,31 @@ func Load(root string) Snapshot {
 	return snap
 }
 
-// fileKey identifies one reading of the config file: a different file (inode),
-// a rewrite (mtime, size) or a chmod (mode) all change it.
-type fileKey struct {
+// FileKey identifies one reading of the config file: a different file (inode),
+// a rewrite (mtime, size) or a chmod (mode) all change it. The zero value is a
+// file that is absent or cannot be stat'ed.
+type FileKey struct {
 	mtime int64
 	ino   uint64
 	size  int64
 	mode  os.FileMode
+}
+
+// ConfigKey is the FileKey of root's .devcouncil/config.yaml. It is the one
+// answer to "has the config changed since I last read it": Resolve keys its
+// cache on it, and a host that builds something from the file (the MCP write
+// gate) compares it to rebuild on the same condition rather than keeping a
+// second cache with its own idea of "changed".
+func ConfigKey(root string) FileKey {
+	info, err := os.Stat(filepath.Join(root, ".devcouncil", "config.yaml"))
+	if err != nil {
+		return FileKey{}
+	}
+	return fileKeyOf(info)
+}
+
+func fileKeyOf(info os.FileInfo) FileKey {
+	return FileKey{mtime: info.ModTime().UnixNano(), ino: inode(info), size: info.Size(), mode: info.Mode()}
 }
 
 var (
@@ -156,7 +174,7 @@ var (
 )
 
 type resolved struct {
-	key  fileKey
+	key  FileKey
 	snap Snapshot
 }
 
@@ -173,7 +191,7 @@ func Resolve(root string) Snapshot {
 		resolveMu.Unlock()
 		return Load(root)
 	}
-	key := fileKey{mtime: info.ModTime().UnixNano(), ino: inode(info), size: info.Size(), mode: info.Mode()}
+	key := fileKeyOf(info)
 	resolveMu.Lock()
 	if hit, ok := resolveCache[path]; ok && hit.key == key {
 		resolveMu.Unlock()

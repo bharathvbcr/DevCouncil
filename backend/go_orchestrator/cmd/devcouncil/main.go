@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -268,14 +269,16 @@ func runMCP() int {
 		console.Errorf("devcouncil mcp: %v\n", err)
 		return 2
 	}
-	g, err := openGate(root)
-	if err != nil {
-		// Served without a gate rather than not at all: the task loop and the
-		// verifier do not depend on it, and devcouncil_policy_check_write
-		// answers not_initialized instead of a verdict it could not reach.
-		console.Errorf("devcouncil mcp: write gate unavailable: %v\n", err)
-	}
-	reg := devcouncil.NewRegistry(root, openStore(root), g)
+	// Served without a gate rather than not at all when it cannot be built: the
+	// task loop and the verifier do not depend on it, and
+	// devcouncil_policy_check_write answers not_initialized instead of a
+	// verdict it could not reach. The gate is rebuilt whenever config.yaml
+	// changes, so a corrected file recovers on this same server.
+	reg := devcouncil.NewRegistry(root, openStore(root), nil)
+	reg.OpenGate = func() (*gate.Gate, error) { return openAnnouncedGate(root, console.Stderr()) }
+	// Build it now so the weakened-flag line and any refusal are on stderr at
+	// startup, not at the first policy_check_write.
+	_, _ = reg.CurrentGate()
 	srv := &mcp.Server{Registry: reg}
 	if err := srv.Serve(); err != nil {
 		console.Errorf("devcouncil mcp: %v\n", err)
@@ -360,6 +363,24 @@ func openGate(root string) (*gate.Gate, error) {
 	// The gate's Matcher stays nil: fnmatch decides every pattern question
 	// (docs/gusset-candidates.md).
 	return gate.New(regFlags, root, subsystems)
+}
+
+// openAnnouncedGate is openGate plus the operator-facing record of how it went:
+// a gate that cannot be built is said, and so is every Safety flag that is not
+// at its safest value (gate.Report's WeakenedFlags — the dev posture, an env or
+// user-level override), so a weakening is visible on stderr rather than only in
+// a report the MCP host never prints. It runs on every build, including a
+// rebuild after config.yaml changed.
+func openAnnouncedGate(root string, w io.Writer) (*gate.Gate, error) {
+	g, err := openGate(root)
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "devcouncil mcp: write gate unavailable: %v\n", err)
+		return nil, err
+	}
+	if weak := g.Report().WeakenedFlags; len(weak) > 0 {
+		_, _ = fmt.Fprintf(w, "devcouncil mcp: write gate running with weakened safety flags: %s\n", strings.Join(weak, "; "))
+	}
+	return g, nil
 }
 
 func astArgs(rest []string) []string {
