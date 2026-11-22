@@ -406,8 +406,36 @@ fn a_store_that_will_not_open_is_a_link_candidates_gap() {
 fn a_store_whose_extractions_will_not_decode_is_a_link_candidates_gap() {
     let base = scratch("link-bad-payload");
     let built = base.join("built");
+    let provider = base.join("provider");
     let damaged = base.join("damaged");
-    build_repo(&built, &[("main.py", "def main():\n    return 1\n")]);
+    // A real cross-repo import between the two healthy repositories, so the
+    // answer has a link to lose.
+    std::fs::create_dir_all(&built).unwrap();
+    std::fs::create_dir_all(&provider).unwrap();
+    std::fs::write(
+        built.join("go.mod"),
+        "module example.com/built\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider.join("go.mod"),
+        "module example.com/provider\n\ngo 1.21\n",
+    )
+    .unwrap();
+    build_repo(
+        &built,
+        &[(
+            "main.go",
+            "package main\n\nimport (\n\t\"example.com/provider/store\"\n)\n\nfunc main() {\n\t_ = store.Open(\"x\")\n}\n",
+        )],
+    );
+    build_repo(
+        &provider,
+        &[(
+            "store/store.go",
+            "package store\n\nfunc Open(p string) error {\n\treturn nil\n}\n",
+        )],
+    );
     build_repo(&damaged, &[("lib.py", "def lib():\n    return 2\n")]);
     let db = devmap_extract::paths::store_path(&damaged);
     {
@@ -421,9 +449,21 @@ fn a_store_whose_extractions_will_not_decode_is_a_link_candidates_gap() {
         assert!(changed > 0, "the fixture has a payload to damage");
     }
 
-    let workspace = registry(&[("built", &built), ("damaged", &damaged)]);
+    let workspace = registry(&[
+        ("built", &built),
+        ("provider", &provider),
+        ("damaged", &damaged),
+    ]);
     let answer = link_candidates(&workspace)
         .expect("one undecodable store is a gap in the answer, not a failed answer");
+    assert!(
+        answer
+            .links
+            .iter()
+            .any(|l| l.from_repo == "built" && l.to_repo == "provider"),
+        "the healthy repositories keep their link: {:?}",
+        answer.links
+    );
     let gaps: Vec<(&str, &str)> = answer
         .coverage_gaps
         .iter()
@@ -436,7 +476,8 @@ fn a_store_whose_extractions_will_not_decode_is_a_link_candidates_gap() {
         "a store whose extractions will not decode is a gap: {gaps:?}"
     );
     assert!(
-        gaps.iter().all(|(repo, _)| *repo != "built"),
+        gaps.iter()
+            .all(|(repo, _)| *repo != "built" && *repo != "provider"),
         "a repository read in full contributes no gap: {gaps:?}"
     );
     let _ = std::fs::remove_dir_all(&base);
