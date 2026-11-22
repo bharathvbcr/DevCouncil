@@ -1454,7 +1454,7 @@ fn pre_tool_use_sync(
     };
     // When the payload names a file and the index is query-ready, replace the
     // tool-name directive with that file's signature list. Silence still wins
-    // for empty / degraded / not query-ready indexes.
+    // for empty / not query-ready indexes; a degraded one is named, not dropped.
     let skeleton = file_path_from_payload(payload).and_then(|path| {
         let leftover = PRE_TOOL_USE_BUDGET.saturating_sub(started.elapsed());
         if leftover.is_zero() {
@@ -1476,7 +1476,9 @@ fn pre_tool_use_sync(
 /// The directive — or a file's signature list — or nothing when the index
 /// cannot back it.
 ///
-/// Silence is the correct output for an unbuilt, empty or degraded index.
+/// Silence is the correct output for an unbuilt, empty or not query-ready
+/// index. A query-ready store that carries a `degraded_reason` still answers,
+/// so it keeps its context behind one line naming the reason.
 /// Pointing an agent at `devmap_search` when the store cannot answer earns one
 /// empty result and a durable conclusion that the tool does not work — which
 /// is not hypothetical here: a sibling MCP server pinned to an older store
@@ -1496,12 +1498,22 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
     {
         return None;
     }
-    if status
+    // A degraded store that can still answer is worth naming, with the reason in
+    // front: dropping the context hid a usable index, and the directive alone
+    // would oversell it. A store that is not query-ready was dropped above.
+    let degraded_line = status
         .get("degraded_reason")
-        .is_some_and(|reason| !reason.is_null())
-    {
-        return None;
-    }
+        .filter(|reason| !reason.is_null())
+        .map(|reason| {
+            let text = reason
+                .as_str()
+                .map_or_else(|| reason.to_string(), str::to_owned);
+            format!(
+                "DevMap index is degraded: {}. Treat its answers as a lower bound.\n",
+                truncate(&context_line(&text), DEGRADED_REASON_CAP)
+            )
+        })
+        .unwrap_or_default();
     let nodes = status
         .get("node_count")
         .and_then(Value::as_u64)
@@ -1542,8 +1554,16 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
     } else {
         PRE_TOOL_CONTEXT_CAP
     };
-    Some(truncate(&format!("{header} {body}"), cap))
+    // The degraded line sits outside the cap: counted in it, a long reason would
+    // cut the caveat the directive ends on.
+    Some(format!(
+        "{degraded_line}{}",
+        truncate(&format!("{header} {body}"), cap)
+    ))
 }
+
+/// Longest degraded reason the PreToolUse prefix line carries.
+const DEGRADED_REASON_CAP: usize = 160;
 
 /// Open the on-disk store and render one file's signature list for the hook.
 ///
@@ -8889,8 +8909,8 @@ mod tests {
                 r#"{"query_ready":false,"node_count":10}"#,
             ),
             (
-                "degraded",
-                r#"{"query_ready":true,"degraded_reason":"schema","node_count":10}"#,
+                "not query ready and degraded",
+                r#"{"query_ready":false,"degraded_reason":"schema","node_count":10}"#,
             ),
             ("empty", r#"{"query_ready":true,"node_count":0}"#),
             // Absent `query_ready` with a populated store. Without this case
@@ -8924,6 +8944,46 @@ mod tests {
             text.chars().count() <= PRE_TOOL_CONTEXT_CAP,
             "directive is {} chars, cap is {PRE_TOOL_CONTEXT_CAP}",
             text.chars().count()
+        );
+    }
+
+    /// A degraded store that can still answer keeps its context, led by one
+    /// line naming the reason; one that cannot answer stays silent.
+    #[test]
+    fn a_degraded_but_query_ready_index_keeps_its_context_behind_a_reason_line() {
+        let degraded = r#"{"query_ready":true,"degraded_reason":"watcher_lagging","node_count":10,
+                           "edge_count":20,"generation_id":3,"is_fresh":true}"#;
+        let text = compose_pre_tool_use(degraded, Path::new("/repo/Demo"), None)
+            .expect("a degraded but query-ready index still emits");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.contains("degraded"), "{text}");
+        assert!(first.contains("watcher_lagging"), "{text}");
+        assert!(text.contains("DevMap has Demo indexed"), "{text}");
+        assert!(text.contains("devmap_search"), "{text}");
+        // The reason line does not eat into the directive's own cap.
+        assert!(text.contains("walk_incomplete"), "{text}");
+        let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
+        assert!(rest.chars().count() <= PRE_TOOL_CONTEXT_CAP, "{rest}");
+    }
+
+    #[test]
+    fn a_degraded_index_that_is_not_query_ready_stays_silent() {
+        let status = r#"{"query_ready":false,"degraded_reason":"schema","node_count":10}"#;
+        assert!(compose_pre_tool_use(status, Path::new("/repo/Demo"), None).is_none());
+    }
+
+    #[test]
+    fn a_hostile_degraded_reason_stays_one_bounded_line() {
+        let reason = format!("bad\nreason{}", "x".repeat(500));
+        let status = json!({"query_ready": true, "degraded_reason": reason, "node_count": 10});
+        let text = compose_pre_tool_use(&status.to_string(), Path::new("/repo/Demo"), None)
+            .expect("emits");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.contains("bad\\u000areason"), "{text}");
+        assert!(
+            first.chars().count() < 260,
+            "{} chars",
+            first.chars().count()
         );
     }
 

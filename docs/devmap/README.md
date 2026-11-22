@@ -1006,6 +1006,12 @@ on `Bash`):
   one is undocumented, so no `postToolUseFailure` entry is installed and a
   failed shell write may not be refreshed under Cursor.
 
+The `PreToolUse` context (the index directive or a file's signature list)
+is returned when the store is `query_ready`. A store that is query-ready but
+carries a `degraded_reason` still gets it, led by one line naming the reason
+and saying its answers are a lower bound; a store that is not query-ready gets
+nothing.
+
 ### Agent guides
 
 Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five
