@@ -6,6 +6,12 @@
 //! refused as "generation N is not in this store" even though the store held a
 //! newer one. The decision (consistent with `keyword_page`, which also reads
 //! one snapshot) is documented on `StoreQueryEngine::savings`.
+//!
+//! What these tests can and cannot tell apart: the deterministic test (the hook
+//! prunes at the pause) passes on the old code as well, because the hook fires
+//! inside the old `list_generation_paths` snapshot too, after its existence
+//! check; no seam sits between the old `latest_generation_id()` and that call.
+//! Only the stress test can catch the old window, and only by chance.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -100,7 +106,7 @@ fn a_prune_during_the_file_list_read_does_not_change_or_refuse_the_report() {
     assert_eq!(
         PAUSE_FIRES.with(Cell::get),
         1,
-        "the id and the files were read from separate snapshots"
+        "savings did not read its file list through exactly one pinned snapshot"
     );
     assert_eq!(
         report.indexed_files, 3,
@@ -145,7 +151,7 @@ fn savings_answers_every_call_while_another_connection_commits_and_prunes() {
             let mut round = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 round += 1;
-                let files = if round % 2 == 0 {
+                let files = if round.is_multiple_of(2) {
                     vec![("src/only.py", "def only():\n    return 9\n")]
                 } else {
                     vec![

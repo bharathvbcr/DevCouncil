@@ -1832,7 +1832,7 @@ impl Store {
     ///
     /// Only for the readers whose snapshot a test must race: the corpus reads
     /// a stacked store pairs (`all_symbols_page`, `all_symbols_page_with_files`,
-    /// `latest_scope_inputs`). `search_page` stays on the plain
+    /// `latest_scope_inputs`) and `latest_generation_paths`. `search_page` stays on the plain
     /// [`Self::latest_snapshot`] and never pauses; a test pins that.
     pub(super) fn latest_snapshot_paused(
         conn: &Connection,

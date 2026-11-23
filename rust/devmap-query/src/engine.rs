@@ -3593,12 +3593,7 @@ impl<'a> StoreQueryEngine<'a> {
                 .map(|(_, _, files)| files.into_iter().map(|(p, _)| p).collect())
                 .unwrap_or_default()
         } else {
-            // One snapshot for the id and its files. A prune that commits
-            // mid-call is invisible to it, so there is nothing to retry and no
-            // refusal to report -- the same property `keyword_page` has, which
-            // is why `savings` neither retries nor errors the way a
-            // `latest_generation_id()` then `list_generation_paths(id)` pair
-            // did when a prune landed between the two.
+            // One snapshot: see "A prune that lands mid-call" above.
             self.store
                 .latest_generation_paths()?
                 .map(|(_, paths)| paths)

@@ -2356,6 +2356,12 @@ fn atk1_three_readers_in_a_second_process_race_never_answer_empty_or_partial() {
         }
     }
     assert!(reads > 50, "the probe never got to read: {reads}");
+    assert!(answered > 0, "no read was ever answered in {reads} rounds");
+    assert_eq!(
+        answered + refused,
+        reads * 4,
+        "a round's four reads each answered or refused, none vanished"
+    );
     assert!(
         violations.is_empty(),
         "{} violations in {reads} rounds:\n  {}",
@@ -2382,7 +2388,9 @@ type StarveEntry = (
 );
 
 fn step_outcome<T>(result: Result<T, rusqlite::Error>) -> Result<(), Option<rusqlite::ErrorCode>> {
-    result.map(|_| ()).map_err(|error| error.sqlite_error_code())
+    result
+        .map(|_| ())
+        .map_err(|error| error.sqlite_error_code())
 }
 
 thread_local! {
@@ -2435,7 +2443,9 @@ fn atk3_a_writer_commit_prune_and_checkpoint_during_the_snapshot_are_bounded() {
         let log = STARVE_LOG.with(|slot| slot.borrow().clone());
         let fires = pause_fires();
         drop(guard);
-        let after = store.checkpoint_wal().expect("the checkpoint after the read");
+        let after = store
+            .checkpoint_wal()
+            .expect("the checkpoint after the read");
         let refused_after = store.list_generation_paths(old).is_err();
         let _ = fs::remove_dir_all(&dir);
         (raced, log, fires, after, refused_after)
@@ -2530,13 +2540,25 @@ fn atk4_the_seam_is_thread_local_and_inert_when_unset() {
 
 // ---- attack 5 -------------------------------------------------------------
 
-/// SQLite's bound-variable limit on the connection this build links, read from
-/// the library rather than quoted (the bundled default is 32766 and
-/// `SQLITE_MAX_VARIABLE_NUMBER` can change it at build time).
+/// SQLite's bound-variable limit on the connection this build links, measured
+/// rather than quoted (the bundled default is 32766 and
+/// `SQLITE_MAX_VARIABLE_NUMBER` can change it at build time). Probed because
+/// rusqlite's `limits` feature is not enabled: `SELECT ?N` prepares exactly
+/// when N is within the limit.
 fn sqlite_variable_limit() -> usize {
     let connection = rusqlite::Connection::open_in_memory().unwrap();
-    usize::try_from(connection.limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER).unwrap())
-        .unwrap()
+    let prepares = |n: usize| connection.prepare(&format!("SELECT ?{n}")).is_ok();
+    assert!(prepares(1));
+    let (mut low, mut high) = (1usize, 1usize << 24);
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        if prepares(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
 }
 
 /// The keyed ledger reads are chunked, never truncated and never refused for
@@ -2560,7 +2582,9 @@ fn atk5_key_lists_across_the_sqlite_variable_limit_are_all_answered() {
             };
             let answered = got
                 .unwrap_or_else(|error| panic!("{label} keys={}: refused: {error}", keys.len()))
-                .unwrap_or_else(|| panic!("{label} keys={}: None for a live generation", keys.len()));
+                .unwrap_or_else(|| {
+                    panic!("{label} keys={}: None for a live generation", keys.len())
+                });
             let rows = answered.get("settle").map_or(0, |(rows, _)| rows.len());
             assert!(
                 rows >= 1,
@@ -2659,7 +2683,9 @@ fn atk6_a_store_in_rollback_journal_mode() {
     assert!(
         matches!(
             log[0].2,
-            Err(Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+            Err(Some(
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ))
         ),
         "the writer was not refused as busy: {log:?}"
     );

@@ -182,7 +182,10 @@ impl Store {
         )))
     }
 
-    fn generation_paths_in(snapshot: &rusqlite::Connection, generation_id: u32) -> Result<Vec<String>> {
+    fn generation_paths_in(
+        snapshot: &rusqlite::Connection,
+        generation_id: u32,
+    ) -> Result<Vec<String>> {
         let mut stmt = snapshot.prepare(
             "SELECT DISTINCT p.path FROM generation_nodes n
              JOIN paths p ON p.id = n.file_id
