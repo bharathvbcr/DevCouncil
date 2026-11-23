@@ -9,6 +9,7 @@
 //! and preflight-reconciled against remote state with 3-way conflict detection
 //! before retrying.
 
+use super::input::reject_line_break;
 use super::{
     Affected, Entity, Error, Input, MAX_INTEGER, Result, collect_page, page, page_response,
     put_body, record_change,
@@ -667,6 +668,7 @@ fn sync_accept(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<(
     for field in &chosen_fields {
         match field.as_str() {
             "title" => {
+                reject_line_break("title", &remote.title)?;
                 if remote.title.trim().is_empty() || remote.title.chars().count() > 300 {
                     return Err(Error::invalid(
                         "inbound title must be nonblank and at most 300 characters",
