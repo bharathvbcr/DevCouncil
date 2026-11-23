@@ -1550,6 +1550,15 @@ fn analysis_budget(cancel: &devmap_query::Cancel) -> dc_regress::Budget {
     dc_regress::Budget::default().with_cancel(move || cancel.is_cancelled())
 }
 
+/// The bound a `routes` or `api-impact` source scan runs under: the scan's
+/// default caps, ended early by the request's cancel.
+fn route_scan_budget(cancel: &devmap_query::Cancel) -> devmap_query::api_routes::ScanBudget {
+    devmap_query::api_routes::ScanBudget {
+        cancel: cancel.clone(),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn dispatch(
     store: &Store,
     request: IpcRequest,
@@ -1900,12 +1909,14 @@ pub(crate) fn dispatch_with_stacked(
         }
         IpcCommand::Routes { filter, budget } => {
             let root = route_scan_root(store)?;
-            let graph = devmap_query::graph_core_for_store(store)?;
-            let mut mapped = devmap_query::api_routes::route_map(
-                &root,
-                &graph,
-                &devmap_query::api_routes::ScanBudget::default(),
-            );
+            let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
+            let mut mapped =
+                devmap_query::api_routes::route_map(&root, &graph, &route_scan_budget(cancel));
+            // A scan the caller abandoned says so in `scan.cancelled`, but the
+            // dispatcher's contract is the engine arms': a cancelled request
+            // answers with `QueryCancelled`, never a value that could be read
+            // as a finished route map.
+            cancel.check()?;
             if let Some(filter) = filter.as_deref() {
                 devmap_query::api_routes::retain_matching_routes(&mut mapped, filter);
             }
@@ -1914,17 +1925,20 @@ pub(crate) fn dispatch_with_stacked(
         }
         IpcCommand::ApiImpact { route } => {
             let root = route_scan_root(store)?;
-            let graph = devmap_query::graph_core_for_store(store)?;
-            Ok(devmap_query::api_routes::api_impact(
+            let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
+            let impact = devmap_query::api_routes::api_impact(
                 &root,
                 &graph,
-                &devmap_query::api_routes::ScanBudget::default(),
+                &route_scan_budget(cancel),
                 &route,
-            ))
+            );
+            cancel.check()?;
+            Ok(impact)
         }
         IpcCommand::Cypher { query, limit } => {
-            let graph = devmap_query::graph_core_for_store(store)?;
+            let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
             let result = devmap_query::cypher::run(&graph, &query, limit);
+            cancel.check()?;
             // A refusal is an error, exactly as the CLI exits non-zero on one:
             // "your query was not run" must not arrive looking like "your query
             // matched nothing".
