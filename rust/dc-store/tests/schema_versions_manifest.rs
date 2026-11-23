@@ -16,9 +16,10 @@ fn number(text: &str, group: &str, key: &str) -> i64 {
     let k = body
         .find(&format!("\"{key}\""))
         .unwrap_or_else(|| panic!("protocols/schema-versions/v1.json: {group}.{key} is missing"));
-    let rest = body[k + key.len() + 2..].trim_start().strip_prefix(':').unwrap_or_else(|| {
-        panic!("protocols/schema-versions/v1.json: {group}.{key} has no value")
-    });
+    let rest = body[k + key.len() + 2..]
+        .trim_start()
+        .strip_prefix(':')
+        .unwrap_or_else(|| panic!("protocols/schema-versions/v1.json: {group}.{key} has no value"));
     let rest = rest.trim_start();
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let next = rest[digits.len()..].trim_start().chars().next();
@@ -33,7 +34,10 @@ fn number(text: &str, group: &str, key: &str) -> i64 {
 
 #[test]
 fn manifest_matches_dc_store_constants() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../protocols/schema-versions/v1.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../protocols/schema-versions/v1.json"
+    );
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     assert_eq!(
         number(&text, "dc_store", "schema_version"),
