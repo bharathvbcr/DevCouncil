@@ -152,14 +152,15 @@ func TestCloseEndsAnInFlightProbeAndReapsItsChild(t *testing.T) {
 	cancel()
 	<-errc
 
-	// A caller that joins the run and is still waiting when Close cancels it
+	// The first caller has left (waiters is back to 0). A caller that joins the
+	// run and is still waiting when Close cancels it
 	// must get a cancellation, not a claim that the binary cannot be trusted.
 	joiner := make(chan error, 1)
 	go func() { joiner <- c.Probe(context.Background()) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		c.probeMu.Lock()
-		joined := c.probing != nil && c.probing.waiters >= 2
+		joined := c.probing != nil && c.probing.waiters >= 1
 		c.probeMu.Unlock()
 		if joined {
 			break

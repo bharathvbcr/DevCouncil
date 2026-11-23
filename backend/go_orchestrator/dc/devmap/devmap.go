@@ -171,7 +171,9 @@ func NewWarm(binary, root string) *Client {
 // would kill it at probeTimeout dies with the host, so the child is not merely
 // late: if it is hung it lives on indefinitely (it is one `manifest --help`
 // and writes nothing, but it is orphaned). Close ends an in-flight probe and
-// waits for its child to be reaped, so hosts must call Close on their way out;
+// waits for its child to be reaped (a best-effort wait bounded at 100 ms by
+// proc.RunBoundedWithCleanup, not a guarantee), so hosts must call Close on
+// their way out;
 // a host that cannot is exposed for as long as a probe is in flight, at most
 // probeTimeout.
 func (c *Client) Probe(ctx context.Context) error {
