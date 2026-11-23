@@ -401,6 +401,21 @@ func TestGitMetadataEntriesAreNotSources(t *testing.T) {
 	}
 }
 
+// If every entry is skipped, only the manifests would be checked, and that is
+// not evidence the binary is current.
+func TestDepInfoWithOnlyGitEntriesIsRefused(t *testing.T) {
+	workspace, calls := prebuiltSetup(t)
+	head := filepath.Join(filepath.Dir(workspace), ".git", "HEAD")
+	plantBinary(t, debugBin(workspace, "devmap"), time.Hour, head)
+	t.Setenv("DEVCOUNCIL_TEST_NO_CARGO", "1")
+	if msg := refused(t, "dep-info listing only git metadata", Devmap); !strings.Contains(msg, "git metadata") {
+		t.Errorf("the refusal does not say why:\n%s", msg)
+	}
+	if n := cargoCalls(t, calls); n != 0 {
+		t.Errorf("made %d cargo calls", n)
+	}
+}
+
 // A manifest above the workspace is not a dependency manifest, however new.
 func TestManifestOutsideTheWorkspaceIsIgnored(t *testing.T) {
 	workspace, _ := prebuiltSetup(t)

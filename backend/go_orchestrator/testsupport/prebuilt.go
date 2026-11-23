@@ -74,7 +74,9 @@ func noCargoMode(t testing.TB) bool {
 // Entries inside git metadata (a .git component) are skipped: they are a build
 // script's rerun triggers for embedded version info, not compiled source, and
 // in a linked worktree .git is a file. Manifests are checked only inside the
-// workspace.
+// workspace. The trade-off: a path dependency outside the workspace keeps its
+// listed sources checked but not its Cargo.toml. If every entry is skipped as git
+// metadata the binary is refused as unverifiable.
 //
 // A successful verdict is cached for the life of the process, keyed by the
 // binary's path, mtime and size: this matches cargoBin's once-per-process build,
@@ -184,6 +186,10 @@ func staleSource(crates, crate, binary, path string, built time.Time) (string, e
 		if !built.After(info.ModTime()) {
 			return src, nil
 		}
+	}
+	if len(sources) == 0 {
+		return "", fmt.Errorf("dep-info %s lists no compiled source once git metadata is set aside "+
+			"(a checkout under a path with a .git component looks like this), so the binary cannot be shown current", depInfo)
 	}
 	// A crate whose source is listed also contributes its manifest — features and
 	// edition live there and dep-info does not list it — so each listed path's
