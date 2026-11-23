@@ -102,6 +102,137 @@ func devmapCrateSources(t *testing.T) []string {
 	return srcs
 }
 
+var (
+	cfgTestMarker = regexp.MustCompile(`#\[cfg\(test\)\]`)
+	// After the marker: more attributes, an optional visibility, then a
+	// module with an inline body. "mod tests;" (no brace) is not matched.
+	cfgTestModHead = regexp.MustCompile(`^(?:\s|#\[[^\]]*\])*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{`)
+)
+
+// stripCfgTestModules removes every #[cfg(test)] module (through its matching
+// closing brace) from Rust source. Other #[cfg(test)] items, a const, a field,
+// a fn, stay in the text: a test module is not always last in the file, and
+// cutting at the first marker hid every literal after a mid-file test item.
+func stripCfgTestModules(body []byte) []byte {
+	var out []byte
+	pos := 0
+	for _, loc := range cfgTestMarker.FindAllIndex(body, -1) {
+		if loc[0] < pos {
+			continue // inside a module already removed
+		}
+		head := cfgTestModHead.FindIndex(body[loc[1]:])
+		if head == nil {
+			continue
+		}
+		end := matchingBrace(body, loc[1]+head[1]-1)
+		out = append(out, body[pos:loc[0]]...)
+		pos = end
+	}
+	return append(out, body[pos:]...)
+}
+
+// matchingBrace returns the index just past the brace that closes the one at
+// open, skipping line and block comments, string, raw string and char
+// literals; it returns len(b) if the source ends first.
+func matchingBrace(b []byte, open int) int {
+	depth := 0
+	for i := open; i < len(b); i++ {
+		switch c := b[i]; {
+		case c == '/' && i+1 < len(b) && b[i+1] == '/':
+			for i < len(b) && b[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(b) && b[i+1] == '*':
+			nest := 1
+			for i += 2; i < len(b) && nest > 0; i++ {
+				if b[i] == '/' && i+1 < len(b) && b[i+1] == '*' {
+					nest++
+					i++
+				} else if b[i] == '*' && i+1 < len(b) && b[i+1] == '/' {
+					nest--
+					i++
+				}
+			}
+			i--
+		case c == 'r' && rawStringStart(b, i) > 0:
+			hashes := rawStringStart(b, i) - 2 - i
+			closer := "\"" + strings.Repeat("#", hashes)
+			if k := strings.Index(string(b[i+hashes+2:]), closer); k >= 0 {
+				i += hashes + 2 + k + len(closer) - 1
+			} else {
+				return len(b)
+			}
+		case c == '"':
+			for i++; i < len(b) && b[i] != '"'; i++ {
+				if b[i] == '\\' {
+					i++
+				}
+			}
+		case c == '\'':
+			// A char literal ('x', '\n', '{'); anything else is a lifetime.
+			if i+2 < len(b) && b[i+1] != '\\' && b[i+2] == '\'' {
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '\\' {
+				for i += 2; i < len(b) && b[i] != '\''; i++ {
+				}
+			}
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(b)
+}
+
+// rawStringStart returns the index just past the opening quote of a raw string
+// (r"..", r#".."#) beginning at i, or 0 if i does not start one.
+func rawStringStart(b []byte, i int) int {
+	if i > 0 && (b[i-1] == '_' || b[i-1] >= '0' && b[i-1] <= '9' || b[i-1] >= 'A' && b[i-1] <= 'Z' || b[i-1] >= 'a' && b[i-1] <= 'z') {
+		return 0 // the r ends an identifier
+	}
+	j := i + 1
+	for j < len(b) && b[j] == '#' {
+		j++
+	}
+	if j < len(b) && b[j] == '"' {
+		return j + 1
+	}
+	return 0
+}
+
+func TestStripCfgTestModules(t *testing.T) {
+	const midItem = "const A: u8 = 1;\n#[cfg(test)]\nconst X: u8 = 2;\nfn f() { env::var(\"CLAUDE_CONFIG_DIR\"); }\n"
+	cases := []struct {
+		name, in string
+		keep     []string
+		drop     []string
+	}{
+		{"mid-file cfg(test) const keeps later literals", midItem, []string{"CLAUDE_CONFIG_DIR"}, nil},
+		{"test module is removed", "fn a() { \"REAL\"; }\n#[cfg(test)]\nmod tests {\n    fn t() { \"FAKE_HOME\"; }\n}\n", []string{"REAL"}, []string{"FAKE_HOME"}},
+		{"nested braces and braces in strings", "fn a() { \"REAL\"; }\n#[cfg(test)]\npub(crate) mod tests {\n    fn t() { if x { let s = \"}}{\"; let c = '}'; \"FAKE_HOME\"; } }\n    // } stray\n    fn u() { \"FAKE_DIR\"; }\n}\n", []string{"REAL"}, []string{"FAKE_HOME", "FAKE_DIR"}},
+		{"raw string and lifetime in test module", "#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    fn t<'a>(x: &'a str) { r#\"}\"#; \"FAKE_HOME\"; }\n}\nfn z() { \"AFTER\"; }\n", []string{"AFTER"}, []string{"FAKE_HOME"}},
+		{"test module not last keeps code after it", "#[cfg(test)]\nmod tests { fn t() { \"FAKE_HOME\"; } }\nfn z() { \"AFTER_DIR\"; }\n", []string{"AFTER_DIR"}, []string{"FAKE_HOME"}},
+		{"external test module has no body to remove", "#[cfg(test)]\nmod tests;\nfn z() { \"AFTER\"; }\n", []string{"AFTER"}, nil},
+	}
+	for _, c := range cases {
+		got := string(stripCfgTestModules([]byte(c.in)))
+		for _, k := range c.keep {
+			if !strings.Contains(got, k) {
+				t.Errorf("%s: %q was removed:\n%s", c.name, k, got)
+			}
+		}
+		for _, d := range c.drop {
+			if strings.Contains(got, d) {
+				t.Errorf("%s: %q survived:\n%s", c.name, d, got)
+			}
+		}
+	}
+}
+
 // Every upper-case string literal in the sources of devmap-cli and its path
 // dependencies that looks like a home, config or directory variable must be
 // classified: isolated (HostConfigEnv, or HOME), or listed in nonConfigEnv as
@@ -129,9 +260,7 @@ func TestHostConfigEnvCoversWhatDevmapReads(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if cut := strings.Index(string(body), "#[cfg(test)]"); cut >= 0 {
-				body = body[:cut] // by convention the test module closes the file
-			}
+			body = stripCfgTestModules(body)
 			for _, m := range literal.FindAllSubmatch(body, -1) {
 				seen[string(m[1])] = path
 			}
