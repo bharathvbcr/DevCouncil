@@ -330,18 +330,18 @@ pub(super) fn member_count_for_repository(conn: &Connection, repository_id: &str
     )?)
 }
 
+/// A member enqueued before checkout paths were resolved holds the host's
+/// spelling; compare it resolved so the run it leased is still recognised. A
+/// stored path that no longer resolves matches only by exact string.
+fn same_directory(stored: &str, git_dir: &str) -> bool {
+    stored == git_dir || runs::resolved_or_raw(stored) == git_dir
+}
+
 /// Check queue lease ownership for `runs.prepare`.
 ///
 /// When `claimed` is `None`, any held lease on `(repository_id, git_dir)` is
 /// rejected. When `claimed` is `Some((queue_id, member_id))`, verifies that exact
 /// member holds an active lease on that exact `(repository_id, git_dir, task_id)`.
-/// A member enqueued before checkout paths were resolved holds the host's
-/// spelling; compare it resolved so the run it leased is still recognised. A
-/// stored path that no longer resolves matches only by exact string.
-fn same_directory(stored: &str, git_dir: &str) -> bool {
-    stored == git_dir || runs::canonical_directory(stored).is_ok_and(|dir| dir == git_dir)
-}
-
 pub(super) fn verify_run_lease(
     conn: &Connection,
     repository_id: &str,

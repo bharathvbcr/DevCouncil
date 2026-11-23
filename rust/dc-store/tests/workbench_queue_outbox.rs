@@ -797,3 +797,140 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         1
     );
 }
+
+fn member(id: &str, repo: &str, git_dir: &str) -> String {
+    format!(
+        r#"{{"member_id":"{id}","repository_id":"{repo}","git_dir":"{git_dir}","base_oid":"{OID_A}"}}"#
+    )
+}
+
+/// Removes the fixture checkout `name` (created by `real_checkouts`) so the
+/// path a stored member names no longer resolves.
+fn delete_checkout(name: &str) {
+    std::fs::remove_dir_all(format!("{}/checkout/{name}", support::checkout_root())).unwrap();
+}
+
+#[test]
+fn a_member_whose_directory_was_deleted_does_not_break_finishing_another_member() {
+    let (s, _) = fixture();
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-stale","request_id":"qs-enq","expected_revision":0,"title":"Stale","concurrency_limit":2,"members":[{},{},{}]}}"#,
+            member("m-a", "repo-a", "/checkout/stale-a/.git"),
+            member("m-c", "repo-c", "/checkout/stale-c/.git"),
+            member("m-z", "repo-z", "/checkout/stale-z/.git"),
+        ),
+    );
+    delete_checkout("stale-z");
+    let acquired = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q-stale","request_id":"qs-acq","expected_revision":1}"#,
+    );
+    assert_eq!(
+        json::<String>(&s, &acquired, "$.item.members[0].state"),
+        "leased"
+    );
+    let passed = call(
+        &s,
+        "queue.member.update",
+        r#"{"id":"q-stale","request_id":"qs-pass","expected_revision":2,"member_id":"m-a","state":"passed"}"#,
+    );
+    assert_eq!(
+        json::<String>(&s, &passed, "$.item.members[2].state"),
+        "leased"
+    );
+}
+
+#[test]
+fn a_member_whose_directory_was_deleted_does_not_fail_acquire_for_another_member() {
+    let (s, _) = fixture();
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-acq","request_id":"qa-enq","expected_revision":0,"title":"Stale acquire","members":[{},{}]}}"#,
+            member("m-a", "repo-a", "/checkout/acq-a/.git"),
+            member("m-b", "repo-b", "/checkout/acq-b/.git"),
+        ),
+    );
+    delete_checkout("acq-b");
+    let acquired = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q-acq","request_id":"qa-acq","expected_revision":1}"#,
+    );
+    assert_eq!(
+        json::<String>(&s, &acquired, "$.item.members[0].state"),
+        "leased"
+    );
+    assert_eq!(
+        json::<String>(&s, &acquired, "$.item.members[1].state"),
+        "leased"
+    );
+}
+
+#[test]
+fn a_member_enqueued_with_a_respelled_git_dir_is_stored_resolved() {
+    let (s, _) = fixture();
+    let enqueued = call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-resolved","request_id":"qr-enq","expected_revision":0,"title":"Resolved","members":[{}]}}"#,
+            member("m-a", "repo-a", "/checkout/resolved/x/../.git/"),
+        ),
+    );
+    let expected = std::fs::canonicalize(format!(
+        "{}/checkout/resolved/.git",
+        support::checkout_root()
+    ))
+    .unwrap();
+    assert_eq!(
+        json::<String>(&s, &enqueued, "$.item.members[0].git_dir"),
+        expected.to_str().unwrap()
+    );
+}
+
+#[test]
+fn a_leased_member_stored_in_the_old_spelling_still_passes_a_claimed_prepare() {
+    let (s, _) = fixture();
+    put_task(&s, "t-a", 0, "repo-a", r#","status":"ready""#);
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-old","request_id":"qo-enq","expected_revision":0,"title":"Old spelling","members":[{}]}}"#,
+            member("m-a", "repo-a", "/checkout/old/.git")
+                .replace("\"base_oid\"", "\"task_id\":\"t-a\",\"base_oid\""),
+        ),
+    );
+    call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q-old","request_id":"qo-acq","expected_revision":1}"#,
+    );
+    // A member enqueued before checkout paths were resolved holds the host's
+    // spelling, whatever it was.
+    let git = format!("{}/checkout/old/.git", support::checkout_root());
+    let legacy = format!("{}/checkout/old/x/../.git/", support::checkout_root());
+    std::fs::create_dir_all(format!("{}/checkout/old/x", support::checkout_root())).unwrap();
+    let changed = s
+        .connection()
+        .execute(
+            "UPDATE work_queue_members SET git_dir=?1 WHERE queue_id='q-old'",
+            [&legacy],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let prepared = call(
+        &s,
+        "runs.prepare",
+        &format!(
+            r#"{{"id":"run-old","request_id":"ro-prep","expected_revision":0,"task_id":"t-a","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/checkout/old","git_dir":"{git}","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main","queue_id":"q-old","member_id":"m-a"}}"#
+        ),
+    );
+    assert_eq!(json::<String>(&s, &prepared, "$.item.id"), "run-old");
+}

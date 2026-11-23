@@ -54,15 +54,17 @@ pub(super) fn active_on_repository(
 /// run that occupies the local checkout (`skip_checkout_occupancy` runs do not).
 ///
 /// Directories are compared resolved, on both sides: a row stored before
-/// checkout paths were resolved still holds whatever spelling the host sent,
-/// and a stored path that no longer resolves is an error, never a free slot.
+/// checkout paths were resolved still holds whatever spelling the host sent.
+/// A stored path that no longer resolves matches only by its exact string
+/// (see [`resolved_or_raw`]): a stale row must not fail every other launch in
+/// the repository, and it still blocks the spelling it was stored under.
 pub(super) fn has_active_checkout(
     conn: &rusqlite::Connection,
     repository_id: &str,
     git_dir: &str,
     now: i64,
 ) -> Result<bool> {
-    let wanted = canonical_directory(git_dir)?;
+    let wanted = resolved_or_raw(git_dir);
     let mut stmt = conn.prepare(&format!(
         "SELECT json_extract(body,'$.git_dir') FROM work_runs WHERE repository_id=?2 AND coalesce(json_extract(body,'$.skip_checkout_occupancy'),0)=0 AND {ACTIVE}"
     ))?;
@@ -70,12 +72,9 @@ pub(super) fn has_active_checkout(
         row.get::<_, Option<String>>(0)
     })?;
     for row in rows {
-        let Some(stored) = row? else {
-            return Err(Error::invalid(
-                "an active run is missing git_dir; refusing to treat its checkout as free",
-            ));
-        };
-        if canonical_directory(&stored)? == wanted {
+        // A row with no git_dir names no checkout, as the plain column compare
+        // it replaces never matched NULL either.
+        if row?.is_some_and(|stored| resolved_or_raw(&stored) == wanted) {
             return Ok(true);
         }
     }
@@ -101,12 +100,22 @@ pub(super) fn canonical_directory(path: &str) -> Result<String> {
         .ok_or_else(|| Error::invalid("checkout path is not valid Unicode after resolving it"))
 }
 
-/// `local:` keys name a directory and compare resolved. Any other key, such as
-/// `fixture:`, stays an exact string compare and is not rewritten.
-fn same_registered_checkout(identity: &str, common: &str) -> Result<bool> {
+/// The resolved spelling of a directory the store already holds, or the string
+/// as stored when it no longer resolves. Strictness belongs to the caller's own
+/// `git_dir` and `git_common_dir` ([`canonical_directory`]); a stored or
+/// registered path that went stale compares only by its exact string, so it
+/// can neither fail an unrelated request nor match a different directory.
+pub(super) fn resolved_or_raw(path: &str) -> String {
+    canonical_directory(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// `local:` keys name a directory and compare resolved; one that no longer
+/// resolves compares as written and so does not match (`repository_mismatch`).
+/// Any other key, such as `fixture:`, stays an exact string compare.
+fn same_registered_checkout(identity: &str, common: &str) -> bool {
     match identity.strip_prefix("local:") {
-        Some(registered) => Ok(canonical_directory(registered)? == common),
-        None => Ok(identity == format!("local:{common}")),
+        Some(registered) => resolved_or_raw(registered) == common,
+        None => identity == format!("local:{common}"),
     }
 }
 
@@ -661,7 +670,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         [&repository_id],
         |r| r.get(0),
     )?;
-    if !same_registered_checkout(&identity, &common)? {
+    if !same_registered_checkout(&identity, &common) {
         return Err(refuse(
             "repository_mismatch",
             "the supplied Git common directory does not match the registered repository",

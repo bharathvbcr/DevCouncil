@@ -43,6 +43,13 @@ fn quote(value: &str) -> String {
     format!("{:?}", value)
 }
 
+/// `path` with a trailing separator, built from the platform's own separator.
+fn with_trailing_separator(path: &Path) -> String {
+    let mut raw = path.as_os_str().to_owned();
+    raw.push(std::path::MAIN_SEPARATOR_STR);
+    raw.into_string().expect("temp paths are unicode")
+}
+
 fn spelled(path: &Path) -> String {
     path.to_str().expect("temp paths are unicode").to_owned()
 }
@@ -113,7 +120,7 @@ fn a_trailing_slash_on_git_dir_is_the_same_checkout_as_the_active_run() {
         "runs.prepare",
         &prepare("first", &spelled(&tmp.0), &plain, &plain),
     );
-    let slashed = format!("{plain}/");
+    let slashed = with_trailing_separator(&git);
     let error = refused(store.workbench_request(
         "runs.prepare",
         &prepare("second", &spelled(&tmp.0), &slashed, &plain),
@@ -134,7 +141,7 @@ fn a_dotdot_component_on_git_dir_is_the_same_checkout_as_the_active_run() {
         "runs.prepare",
         &prepare("first", &spelled(&tmp.0), &plain, &plain),
     );
-    let dotted = format!("{}/x/../.git", spelled(&tmp.0));
+    let dotted = spelled(&tmp.0.join("x").join("..").join(".git"));
     let error = refused(store.workbench_request(
         "runs.prepare",
         &prepare("second", &spelled(&tmp.0), &dotted, &plain),
@@ -149,7 +156,7 @@ fn the_stored_git_dir_is_the_resolved_spelling() {
     tmp.dir("x");
     let store = open();
     register(&store, &format!("local:{}", canonical(&git)));
-    let dotted = format!("{}/x/../.git/", spelled(&tmp.0));
+    let dotted = with_trailing_separator(&tmp.0.join("x").join("..").join(".git"));
     let run = call(
         &store,
         "runs.prepare",
@@ -165,7 +172,13 @@ fn a_registered_identity_in_another_spelling_still_matches() {
     let git = tmp.dir(".git");
     tmp.dir("x");
     let store = open();
-    register(&store, &format!("local:{}/x/../.git/", spelled(&tmp.0)));
+    register(
+        &store,
+        &format!(
+            "local:{}",
+            with_trailing_separator(&tmp.0.join("x").join("..").join(".git"))
+        ),
+    );
     let plain = canonical(&git);
     call(
         &store,
@@ -188,7 +201,7 @@ fn a_run_stored_before_resolution_still_blocks_a_new_run_on_the_same_directory()
         &prepare("old", &spelled(&tmp.0), &plain, &plain),
     );
     // Rows written before this change hold whatever spelling the host sent.
-    let legacy = format!("{}/x/../.git/", spelled(&tmp.0));
+    let legacy = with_trailing_separator(&tmp.0.join("x").join("..").join(".git"));
     let changed = store
         .connection()
         .execute(
@@ -210,7 +223,7 @@ fn a_git_dir_that_does_not_exist_is_invalid_input() {
     let git = tmp.dir(".git");
     let store = open();
     register(&store, &format!("local:{}", canonical(&git)));
-    let missing = format!("{}/absent", spelled(&tmp.0));
+    let missing = spelled(&tmp.0.join("absent"));
     let error = refused(store.workbench_request(
         "runs.prepare",
         &prepare("first", &spelled(&tmp.0), &missing, &canonical(&git)),
@@ -234,7 +247,7 @@ fn a_git_dir_that_is_a_file_is_invalid_input() {
 }
 
 #[test]
-fn an_active_run_whose_stored_git_dir_is_gone_is_invalid_input_not_a_free_slot() {
+fn an_active_run_whose_stored_git_dir_is_gone_does_not_block_a_different_checkout() {
     let tmp = TempDir::new("gone");
     let git = tmp.dir(".git");
     let other = tmp.dir("other");
@@ -247,11 +260,43 @@ fn an_active_run_whose_stored_git_dir_is_gone_is_invalid_input_not_a_free_slot()
         &prepare("old", &spelled(&tmp.0), &spelled(&other), &plain),
     );
     std::fs::remove_dir(&other).unwrap();
-    let error = refused(store.workbench_request(
+    // A stale row must not take the repository down: another checkout launches.
+    call(
+        &store,
         "runs.prepare",
         &prepare("new", &spelled(&tmp.0), &plain, &plain),
+    );
+    // The caller's own path is still strict: a path that does not resolve is
+    // invalid input, never a free slot.
+    let error = refused(store.workbench_request(
+        "runs.prepare",
+        &prepare("gone", &spelled(&tmp.0), &spelled(&other), &plain),
     ));
     assert_eq!(error.code, "invalid_input", "{error}");
+    // The stored row still holds its checkout: once the directory exists again
+    // the same spelling is busy.
+    std::fs::create_dir(&other).unwrap();
+    let error = refused(store.workbench_request(
+        "runs.prepare",
+        &prepare("back", &spelled(&tmp.0), &spelled(&other), &plain),
+    ));
+    assert_eq!(error.code, "checkout_busy", "{error}");
+}
+
+#[test]
+fn a_registered_identity_that_no_longer_resolves_is_a_repository_mismatch() {
+    let tmp = TempDir::new("stale-identity");
+    let git = tmp.dir(".git");
+    let stale = tmp.dir("stale");
+    let store = open();
+    register(&store, &format!("local:{}", canonical(&stale)));
+    std::fs::remove_dir(&stale).unwrap();
+    let plain = canonical(&git);
+    let error = refused(store.workbench_request(
+        "runs.prepare",
+        &prepare("first", &spelled(&tmp.0), &plain, &plain),
+    ));
+    assert_eq!(error.code, "repository_mismatch", "{error}");
 }
 
 #[test]
@@ -266,7 +311,13 @@ fn skip_checkout_occupancy_still_lets_a_remote_run_share_a_respelled_checkout() 
         "runs.prepare",
         &prepare("local", &spelled(&tmp.0), &plain, &plain),
     );
-    let remote = prepare("remote", &spelled(&tmp.0), &format!("{plain}/"), &plain).replace(
+    let remote = prepare(
+        "remote",
+        &spelled(&tmp.0),
+        &with_trailing_separator(&git),
+        &plain,
+    )
+    .replace(
         "\"head_oid\"",
         "\"skip_checkout_occupancy\":true,\"head_oid\"",
     );

@@ -117,11 +117,21 @@ pub fn checkout_root() -> &'static str {
     ROOT.get_or_init(|| {
         let path = std::env::temp_dir().join("dc-store-fixture-checkouts");
         std::fs::create_dir_all(&path).unwrap();
-        std::fs::canonicalize(&path)
-            .unwrap()
-            .to_str()
-            .expect("temp paths are unicode")
-            .replace('\\', "/")
+        // Unix resolves symlinks (macOS `/var` is `/private/var`) so the stored
+        // value equals what the fixtures supply. Windows keeps the plain temp
+        // path rather than a `\\?\` verbatim one, with forward slashes so it
+        // embeds in JSON strings; the store resolves it either way.
+        if cfg!(windows) {
+            path.to_str()
+                .expect("temp paths are unicode")
+                .replace('\\', "/")
+        } else {
+            std::fs::canonicalize(&path)
+                .unwrap()
+                .to_str()
+                .expect("temp paths are unicode")
+                .to_owned()
+        }
     })
 }
 
