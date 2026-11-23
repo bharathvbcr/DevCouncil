@@ -8,6 +8,7 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,7 +47,7 @@ func TestHelperMCPServer(t *testing.T) {
 	}
 	tools, answers := os.LookupEnv(helperToolsEnv)
 	if !answers {
-		time.Sleep(30 * time.Second)
+		_, _ = io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
 	}
 	var list []string
@@ -99,7 +100,8 @@ func TestFakeServerAnswersWhereverIDSitsInTheFrame(t *testing.T) {
 	}
 	for _, c := range cases {
 		spec := fakeServer(t, []string{"a"}, nil)
-		cmd := exec.Command(spec.bin, spec.args...)
+		cmd := exec.CommandContext(t.Context(), spec.bin, spec.args...)
+		cmd.WaitDelay = 2 * time.Second
 		cmd.Env = append(os.Environ(), spec.env...)
 		cmd.Stdin = strings.NewReader(c.frame + "\n")
 		out, err := cmd.Output()
