@@ -30,7 +30,7 @@ import {
   runSteps,
   tagVerdict,
 } from "./ci-local-checks.mjs";
-import { writeStamp } from "./gusset-engine-stamp.mjs";
+import { stampedBuild } from "./gusset-engine-stamp.mjs";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
@@ -158,23 +158,26 @@ function ensureGussetEngine(ctx) {
     );
   }
   requireGussetAtPin(path.dirname(siblingMod));
-  exec(ctx, "cargo", [
-    "build",
-    "--release",
-    "--locked",
-    "--manifest-path",
-    "rust/gusset-engine/Cargo.toml",
-    // Where gussetfn's #cgo -L and the hash below look, whatever
-    // CARGO_TARGET_DIR says.
-    "--target-dir",
-    "rust/gusset-engine/target",
-  ]);
   const archive = path.join(REPO_ROOT, "rust", "gusset-engine", "target", "release", "libgusset.a");
+  // The previous stamp goes before the build and a new one is written only if the
+  // inputs did not change under it: lane-env reuses an archive only on a matching
+  // stamp. A stamp problem warns; it never changes this step's verdict.
+  stampedBuild(REPO_ROOT, path.dirname(siblingMod), path.dirname(archive), () => {
+    exec(ctx, "cargo", [
+      "build",
+      "--release",
+      "--locked",
+      "--manifest-path",
+      "rust/gusset-engine/Cargo.toml",
+      // Where gussetfn's #cgo -L and the hash below look, whatever
+      // CARGO_TARGET_DIR says.
+      "--target-dir",
+      "rust/gusset-engine/target",
+    ]);
+  });
   if (!existsSync(archive)) {
     throw fail(1, `${archive} is missing after cargo build`);
   }
-  // lane-env reuses an archive only if this stamp matches a checkout's inputs.
-  writeStamp(REPO_ROOT, path.dirname(siblingMod), path.dirname(archive));
   // Go hashes cgo flags, not the libraries they link: key the caches on the archive.
   return { env: { CGO_CFLAGS: engineCflags(archive, ctx.env) } };
 }

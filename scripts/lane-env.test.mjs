@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it, after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { writeStamp } from "./gusset-engine-stamp.mjs";
+import { stampedBuild, writeStamp } from "./gusset-engine-stamp.mjs";
 import { laneGoWork, locate, plan } from "./lane-env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -214,37 +214,121 @@ describe("engine choice by input stamp", () => {
   });
 });
 
-describe("cgo-env.sh stamps what it builds (fake cargo)", () => {
-  it("writes a stamp lane-env accepts; --no-build leaves the stamp alone", () => {
-    const f = fixture({ archive: false });
-    const bin = path.join(f.top, "bin");
-    put(path.join(bin, "cargo"), `#!/bin/sh
+/** A fixture whose main has cgo-env.sh and a fake cargo; returns how to run it. */
+function cgoFixture() {
+  const f = fixture({ archive: false });
+  const bin = path.join(f.top, "bin");
+  put(path.join(bin, "cargo"), `#!/bin/sh
 while [ $# -gt 0 ]; do [ "$1" = --target-dir ] && td="$2"; shift; done
 mkdir -p "$td/release" && echo fake > "$td/release/libgusset.a"
+[ -n "$FAKE_CARGO_BREAK_GIT" ] && rm -rf "$FAKE_CARGO_BREAK_GIT/.git"
+[ -n "$FAKE_CARGO_APPEND" ] && echo changed >> "$FAKE_CARGO_APPEND"
+exit 0
 `);
-    spawnSync("chmod", ["+x", path.join(bin, "cargo")]);
-    const sh = path.join(f.main, "rust/gusset-engine/cgo-env.sh");
-    copyFileSync(path.join(HERE, "../rust/gusset-engine/cgo-env.sh"), sh);
-    mkdirSync(path.join(f.gusset, "crates/gusset"), { recursive: true });
-    writeFileSync(path.join(f.gusset, "crates/gusset/Cargo.toml"), "[package]\n");
-    git(f.gusset, "add", "."); git(f.gusset, "commit", "-qm", "crate");
-    // main's action.yml pin follows the sibling's new HEAD
-    put(path.join(f.main, ".github/actions/setup-gusset/action.yml"), `        ref: ${git(f.gusset, "rev-parse", "HEAD")}\n`);
-    git(f.main, "add", "."); git(f.main, "commit", "-qm", "sh");
-    git(f.lane, "merge", "-q", "lane", "--ff-only");
-    git(f.lane, "reset", "-q", "--hard", git(f.main, "rev-parse", "HEAD"));
-    const env = { ...GIT_ENV, PATH: `${bin}:${process.env.PATH}` };
-    const r = spawnSync("bash", [sh], { encoding: "utf8", env, cwd: f.main });
+  spawnSync("chmod", ["+x", path.join(bin, "cargo")]);
+  const sh = path.join(f.main, "rust/gusset-engine/cgo-env.sh");
+  copyFileSync(path.join(HERE, "../rust/gusset-engine/cgo-env.sh"), sh);
+  mkdirSync(path.join(f.gusset, "crates/gusset"), { recursive: true });
+  writeFileSync(path.join(f.gusset, "crates/gusset/Cargo.toml"), "[package]\n");
+  git(f.gusset, "add", "."); git(f.gusset, "commit", "-qm", "crate");
+  put(path.join(f.main, ".github/actions/setup-gusset/action.yml"), `        ref: ${git(f.gusset, "rev-parse", "HEAD")}\n`);
+  git(f.main, "add", "."); git(f.main, "commit", "-qm", "sh");
+  git(f.lane, "reset", "-q", "--hard", git(f.main, "rev-parse", "HEAD"));
+  const releaseDir = path.join(f.main, "rust/gusset-engine/target/release");
+  const run = (extra = {}, args = []) =>
+    spawnSync("bash", [sh, ...args], { encoding: "utf8", cwd: f.main, env: { ...GIT_ENV, PATH: `${bin}:${process.env.PATH}`, ...extra } });
+  return { f, run, releaseDir, stamp: path.join(releaseDir, "libgusset.stamp.json"),
+    lanePlan: () => plan(f.lane, { scriptDir: f.scripts(f.lane), env: { ...process.env, CGO_LDFLAGS: "" } }) };
+}
+
+describe("cgo-env.sh stamps what it builds (fake cargo)", () => {
+  it("writes a stamp lane-env accepts; --no-build leaves the stamp alone", () => {
+    const c = cgoFixture();
+    const r = c.run();
     assert.equal(r.status, 0, r.stderr);
-    const stampPath = path.join(f.main, "rust/gusset-engine/target/release/libgusset.stamp.json");
-    const stamp = JSON.parse(readFileSync(stampPath, "utf8"));
+    const stamp = JSON.parse(readFileSync(c.stamp, "utf8"));
     assert.equal(stamp.dirty, false);
     assert.deepEqual(Object.keys(stamp.trees).sort(), ["rust-toolchain.toml", "rust/dc-glob", "rust/gusset-engine"]);
-    const p = plan(f.lane, { scriptDir: f.scripts(f.lane), env: { ...process.env, CGO_LDFLAGS: "" } });
-    assert.equal(p.engine.dir, path.dirname(stampPath));
-    rmSync(stampPath);
-    assert.equal(spawnSync("bash", [sh, "--no-build"], { env, cwd: f.main }).status, 0);
-    assert.equal(existsSync(stampPath), false, "--no-build does not stamp");
+    assert.equal(c.lanePlan().engine.dir, c.releaseDir);
+    rmSync(c.stamp);
+    assert.equal(c.run({}, ["--no-build"]).status, 0);
+    assert.equal(existsSync(c.stamp), false, "--no-build does not stamp");
+  });
+  it("records the gusset cargo built against (../../../gusset), not GUSSET_DIR", () => {
+    const c = cgoFixture();
+    const other = path.join(c.f.top, "other-gusset");
+    put(path.join(other, "go.mod"), "module other\n");
+    git(c.f.top, "init", "-q", other); git(other, "add", "."); git(other, "commit", "-qm", "o");
+    const r = c.run({ GUSSET_DIR: other });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(JSON.parse(readFileSync(c.stamp, "utf8")).gusset, git(c.f.gusset, "rev-parse", "HEAD"));
+  });
+  it("a failed stamp write leaves no stamp, not the previous one", () => {
+    const c = cgoFixture();
+    assert.equal(c.run().status, 0);
+    assert.equal(existsSync(c.stamp), true);
+    const r = c.run({ FAKE_CARGO_BREAK_GIT: c.f.gusset });
+    assert.equal(r.status, 0, "the archive is fine; the stamp is not fatal");
+    assert.equal(existsSync(c.stamp), false);
+    assert.match(r.stderr, /no engine stamp was written/);
+  });
+  it("inputs changing during the build write no stamp", () => {
+    const c = cgoFixture();
+    assert.equal(c.run().status, 0);
+    const r = c.run({ FAKE_CARGO_APPEND: path.join(c.f.main, "rust/dc-glob/src/lib.rs") });
+    assert.equal(r.status, 0);
+    assert.equal(existsSync(c.stamp), false);
+    assert.match(r.stderr, /inputs changed while the build ran/);
+  });
+});
+
+describe("stampedBuild (what ensureGussetEngine runs around cargo)", () => {
+  const setup = () => {
+    const f = fixture({ archive: false });
+    const dir = path.join(f.main, "rust/gusset-engine/target/release");
+    const build = (extra = () => {}) => () => { put(path.join(dir, "libgusset.a"), "built"); extra(); };
+    return { f, dir, build, stamp: path.join(dir, "libgusset.stamp.json") };
+  };
+  it("stamps a clean build", () => {
+    const x = setup();
+    const r = stampedBuild(x.f.main, x.f.gusset, x.dir, x.build(), () => assert.fail("no warning expected"));
+    assert.equal(r.written, true);
+    assert.equal(JSON.parse(readFileSync(x.stamp, "utf8")).gusset, git(x.f.gusset, "rev-parse", "HEAD"));
+  });
+  it("drops the previous stamp, and warns without throwing when inputs change mid-build", () => {
+    const x = setup();
+    stampedBuild(x.f.main, x.f.gusset, x.dir, x.build());
+    const warnings = [];
+    const r = stampedBuild(x.f.main, x.f.gusset, x.dir, x.build(() => put(path.join(x.f.main, "rust/dc-glob/src/lib.rs"), "// raced\n")), (m) => warnings.push(m));
+    assert.equal(r.written, false);
+    assert.equal(existsSync(x.stamp), false);
+    assert.match(warnings[0], /changed while the build ran.*unstamped/);
+  });
+  it("a stamp that cannot be computed warns, does not throw, and leaves no stamp", () => {
+    const x = setup();
+    stampedBuild(x.f.main, x.f.gusset, x.dir, x.build());
+    const warnings = [];
+    const r = stampedBuild(x.f.main, x.f.gusset, x.dir, x.build(() => rmSync(path.join(x.f.gusset, ".git"), { recursive: true })), (m) => warnings.push(m));
+    assert.equal(r.written, false);
+    assert.equal(existsSync(x.stamp), false);
+    assert.equal(warnings.length, 1);
+  });
+  it("a failing build propagates and leaves no stale stamp", () => {
+    const x = setup();
+    stampedBuild(x.f.main, x.f.gusset, x.dir, x.build());
+    assert.throws(() => stampedBuild(x.f.main, x.f.gusset, x.dir, () => { throw new Error("cargo failed"); }), /cargo failed/);
+    assert.equal(existsSync(x.stamp), false);
+  });
+});
+
+describe("path dependencies outside the repository", () => {
+  it("are refused unless they are under the sibling gusset", () => {
+    const f = fixture();
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"),
+      '[dependencies]\ngusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }\nevil = { path = "../../../evil" }\n');
+    git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "evil dep");
+    assert.throws(() => plan(f.lane, { scriptDir: f.scripts(f.lane), env: { ...process.env, CGO_LDFLAGS: "" } }),
+      /path dependency \.\.\/\.\.\/\.\.\/evil outside the repository and outside/);
   });
 });
 

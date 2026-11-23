@@ -3,8 +3,12 @@
  * The input stamp for libgusset.a: what a built archive was built from, so a
  * consumer can tell whether it still matches a checkout's sources.
  *
- *   node scripts/gusset-engine-stamp.mjs write <archive-dir> [<gusset-dir>]
+ *   node scripts/gusset-engine-stamp.mjs begin <archive-dir> <gusset-dir>   # deletes the old stamp, prints the inputs
+ *   node scripts/gusset-engine-stamp.mjs write <archive-dir> <gusset-dir> <inputs-from-begin>
  *
+ * A build is: begin (delete the old stamp, record the inputs), build, write
+ * (only if the inputs are unchanged by the build and the archive exists). A
+ * failed or raced stamp therefore leaves NO stamp, never the previous one.
  * Whoever builds the archive writes <archive-dir>/libgusset.stamp.json:
  * ensureGussetEngine in ci-local.mjs and rust/gusset-engine/cgo-env.sh (which
  * calls this CLI, so there is one computation). scripts/lane-env.mjs compares
@@ -17,7 +21,7 @@
  * which ignores status.showUntrackedFiles); a dirty stamp is never reusable.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,8 +44,18 @@ export function enginePaths(root) {
     if (!existsSync(toml)) throw new Error(`${toml} is missing (a path dependency of the engine)`);
     for (const m of readFileSync(toml, "utf8").matchAll(/\bpath\s*=\s*"([^"]+)"/g)) {
       const dep = path.relative(root, path.resolve(root, rel, m[1])).split(path.sep).join("/");
-      // Outside the repository is the sibling gusset: its commit is recorded instead.
-      if (dep.startsWith("..") || path.isAbsolute(dep) || out.includes(dep)) continue;
+      if (dep.startsWith("..") || path.isAbsolute(dep)) {
+        // Outside the repository it must be the sibling gusset the manifests
+        // expect (<root>/../gusset, resolved the way cargo does); its commit is
+        // recorded instead. Anything else is an input the stamp cannot see.
+        const sibling = path.resolve(root, "..", "gusset");
+        const abs = path.resolve(root, rel, m[1]);
+        if (abs !== sibling && !abs.startsWith(sibling + path.sep)) {
+          throw new Error(`${toml} has a path dependency ${m[1]} outside the repository and outside ${sibling}; the engine stamp cannot cover it`);
+        }
+        continue;
+      }
+      if (out.includes(dep)) continue;
       out.push(dep);
       queue.push(dep);
     }
@@ -67,12 +81,66 @@ export function engineInputs(root, gussetDir) {
 
 export const stampFile = (dir) => path.join(dir, STAMP_NAME);
 
-export function writeStamp(root, gussetDir, archiveDir) {
-  const { stamp } = engineInputs(root, gussetDir);
+function putStamp(archiveDir, stamp) {
   const tmp = `${stampFile(archiveDir)}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(stamp, null, 2)}\n`);
   renameSync(tmp, stampFile(archiveDir));
+}
+
+/** Compute and write the stamp for the current inputs (no build in between). */
+export function writeStamp(root, gussetDir, archiveDir) {
+  const { stamp } = engineInputs(root, gussetDir);
+  putStamp(archiveDir, stamp);
   return stamp;
+}
+
+/**
+ * Start a build: delete any previous stamp, then record the inputs. Returns
+ * the inputs, or undefined (with the reason) if they cannot be computed.
+ *
+ * @returns {{ before?: ReturnType<typeof engineInputs>, error?: string }}
+ */
+export function beginStamp(root, gussetDir, archiveDir) {
+  rmSync(stampFile(archiveDir), { force: true });
+  try {
+    return { before: engineInputs(root, gussetDir) };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+/**
+ * Finish a build: write the stamp only if the archive exists and the inputs
+ * equal the ones `beginStamp` saw. Never throws; otherwise no stamp exists.
+ *
+ * @returns {{ written: boolean, reason: string }}
+ */
+export function finishStamp(root, gussetDir, archiveDir, before) {
+  rmSync(stampFile(archiveDir), { force: true });
+  if (!before) return { written: false, reason: "the inputs could not be recorded before the build" };
+  if (!existsSync(path.join(archiveDir, "libgusset.a"))) return { written: false, reason: `no libgusset.a in ${archiveDir}` };
+  try {
+    const after = engineInputs(root, gussetDir);
+    if (JSON.stringify(after.stamp) !== JSON.stringify(before.stamp)) {
+      return { written: false, reason: "the engine inputs changed while the build ran" };
+    }
+    putStamp(archiveDir, after.stamp);
+    return { written: true, reason: after.stamp.dirty ? "dirty stamp (never reused by lane-env)" : "ok" };
+  } catch (e) {
+    return { written: false, reason: e.message };
+  }
+}
+
+/**
+ * Run `build` between begin and finish. A stamp problem is reported through
+ * `warn` and never fails the build; it leaves the archive unstamped.
+ */
+export function stampedBuild(root, gussetDir, archiveDir, build, warn = console.warn) {
+  const { before, error } = beginStamp(root, gussetDir, archiveDir);
+  build();
+  const r = finishStamp(root, gussetDir, archiveDir, before);
+  if (!r.written) warn(`engine stamp not written (${error ?? r.reason}); lane-env.mjs will refuse this archive as unstamped`);
+  return r;
 }
 
 /**
@@ -104,12 +172,22 @@ export function stampVerdict(inputs, dir) {
 
 const entry = process.argv[1];
 if (entry !== undefined && realpathSync(path.resolve(entry)) === realpathSync(fileURLToPath(import.meta.url))) {
-  const [cmd, archiveDir, gusset] = process.argv.slice(2);
-  if (cmd !== "write" || !archiveDir) {
-    console.error("usage: gusset-engine-stamp.mjs write <archive-dir> [<gusset-dir>]");
+  const [cmd, archiveDir, gusset, beforeJson] = process.argv.slice(2);
+  if (!["begin", "write"].includes(cmd) || !archiveDir || !gusset || (cmd === "write" && !beforeJson)) {
+    console.error("usage: gusset-engine-stamp.mjs begin <archive-dir> <gusset-dir> | write <archive-dir> <gusset-dir> <inputs-from-begin>");
     process.exit(2);
   }
   const root = realpathSync(git(path.dirname(fileURLToPath(import.meta.url)), "rev-parse", "--show-toplevel"));
-  const s = writeStamp(root, path.resolve(gusset ?? process.env.GUSSET_DIR ?? path.join(root, "..", "gusset")), archiveDir);
-  console.log(`gusset-engine-stamp: wrote ${stampFile(archiveDir)}${s.dirty ? " (DIRTY: not reusable by lane-env)" : ""}`);
+  if (cmd === "begin") {
+    const { before, error } = beginStamp(root, path.resolve(gusset), archiveDir);
+    if (!before) {
+      console.error(`gusset-engine-stamp: ${error}`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify(before));
+  } else {
+    const r = finishStamp(root, path.resolve(gusset), archiveDir, JSON.parse(beforeJson));
+    console.error(`gusset-engine-stamp: ${r.written ? `wrote ${stampFile(archiveDir)} (${r.reason})` : `no stamp written: ${r.reason}`}`);
+    process.exit(r.written ? 0 : 3);
+  }
 }

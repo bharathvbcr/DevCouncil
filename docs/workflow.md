@@ -42,7 +42,10 @@ An unstamped, stale or dirty-built archive, or uncommitted engine inputs in the
 lane, fail closed and name the build command; commit engine changes, then
 rebuild. A `CGO_LDFLAGS` `-L` to another `libgusset.a` is refused. For a lane
 editing the engine, `--engine-dir <dir>` links `<dir>/libgusset.a` unchecked,
-with a warning. The sibling gusset must be at the setup-gusset pin. The two
+with a warning. A lane cannot build its own archive unless a gusset checkout is
+reachable at `../../../gusset` from the lane (the engine's Cargo path
+dependency), so in practice a lane uses main's stamped archive or
+`--engine-dir`. The sibling gusset must be at the setup-gusset pin. The two
 linker "search path ... not found" warnings are harmless. Do not hand-roll a
 `-modfile`.
 
