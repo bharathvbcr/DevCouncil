@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use devmap_serve::{default_ipc_path_for, Daemon};
+use devmap_serve::{default_ipc_path_for, Daemon, ShutdownSignals};
 use devmap_store::Store;
 
 use crate::cli::{root_parser, Cli};
@@ -35,13 +35,21 @@ const WAIT_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(5)
 /// open, that wait is silent for up to `Store::WRITER_LOCK_WAIT`, and a host
 /// whose start timeout is shorter sees a hang it cannot name. So a creating
 /// start takes the lock itself, on a blocking thread, naming the wait on stderr
-/// when it begins and every few seconds after, and abandoning it when the
-/// process is told to stop. `Store::open` on the same thread then recognises
-/// the lock as held and does not wait again.
-async fn open_store(cli: &Cli) -> anyhow::Result<Store> {
+/// when it begins and every few seconds after. `Store::open` on the same
+/// thread then recognises the lock as held and does not wait again.
+///
+/// A stop signal ends the start: the wait is abandoned, and a signal that
+/// lands after the lock was taken (creation, migration) is honoured when the
+/// open returns instead of being dropped. `signals` is the daemon's own set,
+/// installed by the caller before this runs, so a signal this function has not
+/// read is still pending for the daemon.
+///
+/// A `--db` that is a dangling symlink counts as absent (the open creates the
+/// store at its target), so it takes the same watched path.
+async fn open_store(cli: &Cli, signals: &mut ShutdownSignals) -> anyhow::Result<Store> {
     let db = cli.db();
     let absent = matches!(
-        std::fs::symlink_metadata(&db),
+        std::fs::metadata(&db),
         Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
     );
     if !absent {
@@ -50,18 +58,26 @@ async fn open_store(cli: &Cli) -> anyhow::Result<Store> {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waiter = {
         let cancel = std::sync::Arc::clone(&cancel);
+        let db = db.clone();
         tokio::task::spawn_blocking(move || create_store_under_lock(&db, &cancel))
     };
     tokio::pin!(waiter);
-    let mut stop = std::pin::pin!(stop_requested());
-    loop {
+    let mut stopped_by = None;
+    let outcome = loop {
         tokio::select! {
-            outcome = &mut waiter => return outcome?,
-            () = &mut stop, if !cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+            outcome = &mut waiter => break outcome,
+            signal = signals.recv(), if stopped_by.is_none() => {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                stopped_by = Some(signal);
             }
         }
+    };
+    if let Some(signal) = stopped_by {
+        anyhow::bail!(
+            "devmap serve: start cancelled by {signal} while creating the store at {db:?}"
+        );
     }
+    outcome?
 }
 
 fn create_store_under_lock(
@@ -75,49 +91,34 @@ fn create_store_under_lock(
         }
         if reported.is_none_or(|at| wait.waited >= at + WAIT_REPORT_EVERY) {
             reported = Some(wait.waited);
+            // `{:?}` on the path: a store path with a newline or a forged
+            // `pid=` in it must not be able to write a state line of its own.
             eprintln!(
-                "devmap serve: state=waiting_for_seed_writer_lock store={} pid={} waited_s={} \
-                 bound_s={}",
-                db.display(),
+                "devmap serve: state=waiting_for_seed_writer_lock store={db:?} pid={} \
+                 waited_s={} bound_s={}",
                 wait.holder_pid(),
                 wait.waited.as_secs(),
                 wait.bound.as_secs()
             );
         }
         std::ops::ControlFlow::Continue(())
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "a new devmap store at {} could not be created: the writer lock that keeps a \
+             seed's placement and this creation apart could not be taken: {error:#}",
+            db.display()
+        )
     })?;
     if let Some(waited) = reported {
         eprintln!(
-            "devmap serve: state=writer_lock_acquired store={} waited_s={}",
-            db.display(),
+            "devmap serve: state=writer_lock_acquired store={db:?} waited_s={}",
             waited.as_secs()
         );
     }
     let store = Store::open(db)?;
     drop(guard);
     Ok(store)
-}
-
-/// Resolves when the process is asked to stop (SIGTERM or SIGINT).
-#[cfg(unix)]
-async fn stop_requested() {
-    use tokio::signal::unix::{signal, SignalKind};
-    match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
-        (Ok(mut term), Ok(mut int)) => {
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = int.recv() => {}
-            }
-        }
-        _ => std::future::pending::<()>().await,
-    }
-}
-
-#[cfg(not(unix))]
-async fn stop_requested() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending::<()>().await;
-    }
 }
 
 pub(crate) async fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
@@ -171,8 +172,13 @@ pub(crate) async fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     // the way `build` and `repair` do, from a read that writes nothing. Every
     // other store open of the MCP server is read-only and cannot migrate.
     Store::refuse_a_live_foreign_owner_before_open(&cli.db(), &root)?;
-    let store = open_store(cli).await?;
+    // Before the store is opened and kept until the daemon's loop runs: a stop
+    // signal that arrives while the store is created or migrated is still
+    // pending then, and tokio does not replay one to a later subscriber.
+    let mut signals = ShutdownSignals::install()?;
+    let store = open_store(cli, &mut signals).await?;
     let daemon = Daemon::new(store, root)
+        .with_shutdown_signals(signals)
         // So the daemon can notice its own store being deleted or
         // replaced at the same path and exit, instead of serving a
         // removed inode until its idle bound expires half an hour later.

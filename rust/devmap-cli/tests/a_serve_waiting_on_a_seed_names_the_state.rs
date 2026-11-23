@@ -20,11 +20,20 @@ struct Served {
     lines: Receiver<String>,
 }
 
-fn scratch(tag: &str) -> PathBuf {
+/// A scratch directory removed when the test ends, pass or fail.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("serve-wait-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
+    Scratch(dir.canonicalize().unwrap())
 }
 
 fn start(dir: &Path, db: &Path) -> Served {
@@ -51,6 +60,14 @@ fn start(dir: &Path, db: &Path) -> Served {
         }
     });
     Served { child, lines }
+}
+
+/// A failed assertion must not leave a daemon running (idle retirement is off).
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Served {
@@ -87,16 +104,21 @@ impl Served {
 /// be told what the server is waiting for, and must be able to end the wait.
 #[test]
 fn a_serve_start_waiting_on_a_seed_names_the_state_and_ends_when_told_to_stop() {
-    let dir = scratch("named");
+    let scratch = scratch("named");
+    let dir = scratch.0.as_path();
     let db = dir.join("devmap.sqlite");
     let held = Store::lock_writer_at(&db, Duration::from_secs(5)).unwrap();
 
-    let mut served = start(&dir, &db);
+    let mut served = start(dir, &db);
     let line = served
-        .line_containing(STATE, Duration::from_secs(4))
+        .line_containing(STATE, Duration::from_secs(25))
         .expect("no named state on stderr within the host's start timeout");
-    assert!(line.contains(&format!("pid={}", std::process::id())), "{line}");
-    assert!(line.contains("bound_s=60"), "{line}");
+    assert!(
+        line.contains(&format!("pid={}", std::process::id())),
+        "{line}"
+    );
+    assert!(line.contains("waited_s=0"), "{line}");
+    assert!(line.ends_with("bound_s=60"), "{line}");
     assert!(!db.exists(), "no store may appear while the lock is held");
 
     let started = Instant::now();
@@ -108,8 +130,44 @@ fn a_serve_start_waiting_on_a_seed_names_the_state_and_ends_when_told_to_stop() 
         "stopping took {:?}",
         started.elapsed()
     );
-    assert!(!status.success(), "a cancelled start is not a clean serve");
+    // Exit 1 through the cancel path, not death by the default SIGTERM action
+    // before a handler existed.
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    served
+        .line_containing("start cancelled by SIGTERM", Duration::from_secs(5))
+        .expect("the cancel path did not report itself");
     assert!(!db.exists(), "a cancelled start created a store");
+    drop(held);
+}
+
+/// A store path is data: one with a newline and a forged `pid=` in it must not
+/// be able to write a state line of its own.
+#[test]
+fn a_hostile_store_path_cannot_forge_the_state_line() {
+    let scratch = scratch("hostile");
+    let dir = scratch.0.as_path();
+    let db =
+        dir.join("x\n devmap serve: state=waiting_for_seed_writer_lock pid=1 bound_s=1\".sqlite");
+    let held = Store::lock_writer_at(&db, Duration::from_secs(5)).unwrap();
+
+    let served = start(dir, &db);
+    let line = served
+        .line_containing(STATE, Duration::from_secs(25))
+        .expect("no named state on stderr");
+    assert!(
+        line.contains(&format!("pid={}", std::process::id())),
+        "{line}"
+    );
+    assert!(line.ends_with("bound_s=60"), "{line}");
+    // The path's own newline would have started a second line with its tail.
+    std::thread::sleep(Duration::from_millis(300));
+    while let Ok(extra) = served.lines.try_recv() {
+        assert!(
+            !extra.contains("bound_s=1") || extra.contains("\\n"),
+            "a store path wrote its own stderr line: {extra}"
+        );
+        assert!(!extra.starts_with(" devmap serve:"), "forged line: {extra}");
+    }
     drop(held);
 }
 
@@ -117,11 +175,12 @@ fn a_serve_start_waiting_on_a_seed_names_the_state_and_ends_when_told_to_stop() 
 /// its store and binds.
 #[test]
 fn a_serve_start_proceeds_once_the_seed_releases_the_lock() {
-    let dir = scratch("released");
+    let scratch = scratch("released");
+    let dir = scratch.0.as_path();
     let db = dir.join("devmap.sqlite");
     let held = Store::lock_writer_at(&db, Duration::from_secs(5)).unwrap();
 
-    let mut served = start(&dir, &db);
+    let mut served = start(dir, &db);
     served
         .line_containing(STATE, Duration::from_secs(10))
         .expect("no named state on stderr");

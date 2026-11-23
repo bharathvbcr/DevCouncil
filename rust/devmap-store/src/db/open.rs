@@ -1125,7 +1125,11 @@ impl Store {
     /// contention waits, a failed check is reported as such, and the timeout
     /// names the holder's pid.
     pub fn lock_file_at(lock_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
-        Self::lock_file_watched(lock_path, wait, &mut |_| std::ops::ControlFlow::Continue(()))
+        Self::lock_file_watched(
+            lock_path,
+            wait,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+        )
     }
 
     fn lock_file_watched(
@@ -1210,7 +1214,7 @@ impl Store {
         })
     }
 
-    /// [`Store::poll_writer_lock`] that calls `watch` after each refused attempt
+    /// The unwatched poll that calls `watch` after each refused attempt
     /// with how long the wait has run; `Break` ends it with a refusal that says
     /// it was cancelled, not that the bound passed.
     pub(super) fn poll_writer_lock_watched<F>(
