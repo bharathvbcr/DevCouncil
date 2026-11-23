@@ -1834,7 +1834,7 @@ impl Store {
     /// a stacked store pairs (`all_symbols_page`, `all_symbols_page_with_files`,
     /// `latest_scope_inputs`). `search_page` stays on the plain
     /// [`Self::latest_snapshot`] and never pauses; a test pins that.
-    fn latest_snapshot_paused(
+    pub(super) fn latest_snapshot_paused(
         conn: &Connection,
     ) -> Result<Option<(rusqlite::Transaction<'_>, u32)>> {
         let pinned = Self::latest_snapshot(conn)?;
@@ -1854,6 +1854,19 @@ impl Store {
     /// since lost it. `None` means the generation is not in this store in that
     /// snapshot (pruned or never written), which is a refusal and not an empty
     /// read. Rolled back on drop; takes no write lock.
+    ///
+    /// **Journal mode.** "Takes no write lock" and "a writer is not blocked"
+    /// hold in WAL mode, where the snapshot is an end mark in the WAL and a
+    /// writer commits beside it. In rollback-journal (`DELETE`) mode the same
+    /// read transaction holds SQLite's SHARED lock until it drops, so a writer
+    /// that wants to commit meanwhile waits out its `busy_timeout` and then
+    /// gets `SQLITE_BUSY`. That mode is reachable only through
+    /// [`Store::open_read_only`] on a file that is not already WAL:
+    /// [`Store::open`] converts a store to WAL. The behaviour is documented
+    /// rather than refused because a read-only open of a rollback-mode file is
+    /// legitimate (a copied or archived index), the hold lasts one read, and
+    /// the writer's refusal is bounded and honest; `atk6` in
+    /// `tests/adversarial_store.rs` pins it.
     pub(super) fn generation_snapshot(
         conn: &Connection,
         generation: u32,

@@ -3566,6 +3566,16 @@ impl<'a> StoreQueryEngine<'a> {
     /// `repo_root`. Files that cannot be read are counted separately rather
     /// than treated as zero bytes: a corpus figure that silently omits what it
     /// could not open understates the alternative and flatters the map.
+    ///
+    /// **A prune that lands mid-call.** The indexed-file list is the latest
+    /// generation read in one snapshot ([`Store::latest_generation_paths`]), the
+    /// same property `keyword_page` has, so a prune committed after the pin is
+    /// invisible to it: the report describes the generation that was latest
+    /// when the call began, whole. That is why `savings` neither retries nor
+    /// errors (a refusal for a store that was only being pruned is what the
+    /// earlier `latest_generation_id()` then `list_generation_paths(id)` pair
+    /// returned). The optional `query` part is a separate `search` and keeps
+    /// `search`'s own pruned-generation reporting.
     pub fn savings(&self, query: Option<&str>, token_budget: u32) -> anyhow::Result<SavingsReport> {
         let repo_root = self.latest_repo_root()?;
         let resolve = |path: &str| -> PathBuf {
@@ -3583,10 +3593,16 @@ impl<'a> StoreQueryEngine<'a> {
                 .map(|(_, _, files)| files.into_iter().map(|(p, _)| p).collect())
                 .unwrap_or_default()
         } else {
-            match self.store.latest_generation_id()? {
-                Some(gen) => self.store.list_generation_paths(gen)?,
-                None => Vec::new(),
-            }
+            // One snapshot for the id and its files. A prune that commits
+            // mid-call is invisible to it, so there is nothing to retry and no
+            // refusal to report -- the same property `keyword_page` has, which
+            // is why `savings` neither retries nor errors the way a
+            // `latest_generation_id()` then `list_generation_paths(id)` pair
+            // did when a prune landed between the two.
+            self.store
+                .latest_generation_paths()?
+                .map(|(_, paths)| paths)
+                .unwrap_or_default()
         };
         let mut corpus_bytes = 0u64;
         let mut corpus_files_unreadable = 0usize;
@@ -4306,6 +4322,10 @@ mod pruned_generation_namesake;
 #[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/pruned_keyword_page.rs"]
 mod pruned_keyword_page;
+
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/pruned_savings.rs"]
+mod pruned_savings;
 
 #[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/charged_scope_pairing.rs"]
