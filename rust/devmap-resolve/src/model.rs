@@ -1100,6 +1100,31 @@ impl ResolutionBudgetGap {
         sample
     }
 
+    /// `name` as one double-quoted token that cannot be read as note structure.
+    ///
+    /// A name is whatever the tree declares, and the sentence it lands in is
+    /// joined to the next note by `"; "` and followed by a call-site clause that
+    /// opens with a count. A consumer that splits on `"; "` or anchors on
+    /// `<N> call site(s)` must never find either inside a name, so the quotes,
+    /// backslashes, controls and non-printables are written as escapes (the
+    /// `Debug` spelling) and `;` as `\u{3b}`. This crate sits below
+    /// `devmap-query` (which owns `bounded_text`/`is_agent_unsafe` for the
+    /// agent-visible sinks and depends on this crate), so it cannot call that
+    /// escaper; this one adds only what the sentence's own grammar needs.
+    fn quote_name(name: &str) -> String {
+        let mut quoted = String::with_capacity(name.len() + 2);
+        quoted.push('"');
+        for ch in name.chars() {
+            if ch == ';' {
+                quoted.push_str("\\u{3b}");
+            } else {
+                quoted.extend(ch.escape_debug());
+            }
+        }
+        quoted.push('"');
+        quoted
+    }
+
     /// One sentence that says what was capped and by how much.
     pub fn describe(&self) -> String {
         // Two of the three states a budget can leave a name in are gaps, and
@@ -1140,7 +1165,12 @@ impl ResolutionBudgetGap {
             self.sites,
             self.sample_names.len(),
             Self::NAME_BYTES,
-            self.sample_names.join(", "),
+            self
+                .sample_names
+                .iter()
+                .map(|name| Self::quote_name(name))
+                .collect::<Vec<_>>()
+                .join(", "),
             tail
         )
     }
