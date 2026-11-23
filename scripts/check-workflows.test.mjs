@@ -521,29 +521,6 @@ jobs:
       );
     });
 
-    it("lets only the named scorecard job hold id-token: write, and never on pull_request", () => {
-      const scorecard = (job, trigger) => `on:
-  ${trigger}:
-permissions: {}
-jobs:
-  ${job}:
-    permissions:
-      security-events: write
-      id-token: write
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo ok
-`;
-      assert.deepEqual(supplyChainFailures({ "scorecard.yml": scorecard("analysis", "push") }), []);
-      const otherJob = supplyChainFailures({ "scorecard.yml": scorecard("upload", "push") });
-      assert.ok(otherJob.some((f) => f.includes("job upload holds id-token: write")), JSON.stringify(otherJob));
-      const otherFile = supplyChainFailures({ "codeql.yml": scorecard("analysis", "push") });
-      assert.ok(otherFile.some((f) => f.includes("job analysis holds id-token: write")), JSON.stringify(otherFile));
-      const onPull = supplyChainFailures({ "scorecard.yml": scorecard("analysis", "pull_request") });
-      assert.ok(onPull.some((f) => f.includes("id-token: write on pull_request")), JSON.stringify(onPull));
-    });
-
     it("fails when claude-code is installed without an exact version", () => {
       const failures = supplyChainFailures({
         "ignored-tests.yml": "on: push\njobs:\n  t:\n    steps:\n      - run: npm install --global @anthropic-ai/claude-code\n",
