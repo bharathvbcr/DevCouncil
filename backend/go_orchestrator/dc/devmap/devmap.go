@@ -164,10 +164,16 @@ func NewWarm(binary, root string) *Client {
 // the last caller leaves would make a hung binary un-diagnosable for callers
 // whose own deadlines are shorter than probeTimeout, because every call would
 // start a fresh probe and wait out its own deadline instead of failing fast
-// from the cache. The cost is a window of at most probeTimeout in which a devmap
-// child (one `manifest --help`, no writes) can outlive a host that exits
-// without calling Close. Close ends an in-flight probe and waits for its child
-// to be reaped, so a host with a shutdown path leaves nothing behind.
+// from the cache.
+//
+// The cost is paid by a host that exits without calling Close while a probe is
+// in flight. The probe child is a process-group leader and the goroutine that
+// would kill it at probeTimeout dies with the host, so the child is not merely
+// late: if it is hung it lives on indefinitely (it is one `manifest --help`
+// and writes nothing, but it is orphaned). Close ends an in-flight probe and
+// waits for its child to be reaped, so hosts must call Close on their way out;
+// a host that cannot is exposed for as long as a probe is in flight, at most
+// probeTimeout.
 func (c *Client) Probe(ctx context.Context) error {
 	if c.probeParent != nil {
 		return c.probeParent.Probe(ctx)
@@ -272,6 +278,11 @@ func (c *Client) runProbe(ctx context.Context) error {
 			c.Binary, timeout)
 	}
 	if runErr != nil {
+		// A probe ended from outside (Close) is not a verdict about the binary,
+		// whichever way the killed child's exit surfaces.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Read only on the path where the goroutine has returned: a buffer an
 		// abandoned writer still owns must not be read at all.
 		detail := strings.TrimSpace(string(out.Bytes()))
