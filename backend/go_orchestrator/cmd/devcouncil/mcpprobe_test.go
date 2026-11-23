@@ -100,7 +100,9 @@ func TestFakeServerAnswersWhereverIDSitsInTheFrame(t *testing.T) {
 	}
 	for _, c := range cases {
 		spec := fakeServer(t, []string{"a"}, nil)
-		cmd := exec.CommandContext(t.Context(), spec.bin, spec.args...)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, spec.bin, spec.args...)
 		cmd.WaitDelay = 2 * time.Second
 		cmd.Env = append(os.Environ(), spec.env...)
 		cmd.Stdin = strings.NewReader(c.frame + "\n")
