@@ -1915,7 +1915,8 @@ pub(crate) fn dispatch_with_stacked(
             // A scan the caller abandoned says so in `scan.cancelled`, but the
             // dispatcher's contract is the engine arms': a cancelled request
             // answers with `QueryCancelled`, never a value that could be read
-            // as a finished route map.
+            // as a finished route map. A cancel that arrives after a complete
+            // scan returns `QueryCancelled` too, on purpose: the caller is gone.
             cancel.check()?;
             if let Some(filter) = filter.as_deref() {
                 devmap_query::api_routes::retain_matching_routes(&mut mapped, filter);
@@ -1938,6 +1939,8 @@ pub(crate) fn dispatch_with_stacked(
         IpcCommand::Cypher { query, limit } => {
             let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
             let result = devmap_query::cypher::run(&graph, &query, limit);
+            // `cypher::run` does not observe cancel, so this check changes what
+            // is returned, not the work done; the row ceiling bounds that work.
             cancel.check()?;
             // A refusal is an error, exactly as the CLI exits non-zero on one:
             // "your query was not run" must not arrive looking like "your query
@@ -2532,6 +2535,35 @@ pub async fn run_named_pipe(
 
 #[cfg(test)]
 mod tests {
+    /// The route scan runs under the request's cancel and keeps the scan's own
+    /// caps: a budget that dropped the cancel (`ScanBudget::default()`) would
+    /// walk files for a client that has gone.
+    #[test]
+    fn the_route_scan_budget_carries_the_cancel_and_keeps_the_default_caps() {
+        let root = std::env::temp_dir().join(format!("devmap-route-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        let graph = json!({"nodes": [{"path": "a.ts"}]});
+
+        let cancel = devmap_query::Cancel::new();
+        let live =
+            devmap_query::api_routes::route_map(&root, &graph, &super::route_scan_budget(&cancel));
+        assert_eq!(live["scan"]["cancelled"], json!(false), "{live:#}");
+        assert_eq!(live["scan"]["files_read"], json!(1), "{live:#}");
+
+        cancel.cancel();
+        let budget = super::route_scan_budget(&cancel);
+        let defaults = devmap_query::api_routes::ScanBudget::default();
+        assert_eq!(budget.max_files, defaults.max_files);
+        assert_eq!(budget.max_file_bytes, defaults.max_file_bytes);
+        assert_eq!(budget.max_sites, defaults.max_sites);
+        let cut = devmap_query::api_routes::route_map(&root, &graph, &budget);
+        assert_eq!(cut["scan"]["cancelled"], json!(true), "{cut:#}");
+        assert_eq!(cut["scan"]["files_read"], json!(0), "{cut:#}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A peer dribbling one byte at a time must be cut by an *overall* request
     /// deadline, not just the per-read timeout.
     ///
