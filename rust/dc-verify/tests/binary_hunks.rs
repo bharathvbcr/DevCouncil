@@ -285,3 +285,141 @@ fn a_binary_with_a_git_quoted_name_is_scanned() {
     );
     assert!(!reply.contains(&key), "the reply quotes the credential");
 }
+
+#[test]
+fn adv_multi_backslash_and_mixed_slashes_are_scanned_at_exact_spelling() {
+    let root = Root::new();
+    let key = secret();
+    std::fs::write(root.0.join("src/ok.rs"), "pub fn ok() -> u8 { 1 }\n").unwrap();
+
+    // 1. Multi-backslash: assets\nested\deep.bin
+    // The slash twin assets/nested/deep.bin is clean.
+    std::fs::create_dir_all(root.0.join("assets").join("nested")).unwrap();
+    std::fs::write(root.0.join("assets/nested/deep.bin"), b"clean\n").unwrap();
+
+    let spelled_multi = "assets\\nested\\deep.bin";
+    std::fs::write(root.0.join(spelled_multi), format!("\0{key}\0")).unwrap();
+    let quoted_multi = spelled_multi.replace('\\', "\\\\");
+    let diff_multi = format!(
+        "{TEXT}diff --git \"a/{quoted_multi}\" \"b/{quoted_multi}\"\nBinary files \"a/{quoted_multi}\" and \"b/{quoted_multi}\" differ\n"
+    );
+    let reply_multi = check(&root.0, &format!("src/ok.rs\n{spelled_multi}"), &diff_multi);
+    assert!(
+        reply_multi.contains("\"ok\":true"),
+        "multi-backslash check did not run: {reply_multi}"
+    );
+    assert!(
+        reply_multi.contains("\"gate\":\"secret_scan\""),
+        "multi-backslash binary path was not secret-scanned: {reply_multi}"
+    );
+    assert!(
+        reply_multi.contains("assets\\\\nested\\\\deep.bin"),
+        "finding path is not the exact multi-backslash spelling: {reply_multi}"
+    );
+    assert!(
+        !reply_multi.contains(&key),
+        "the reply quotes the credential in full: {reply_multi}"
+    );
+
+    // 2. Mixed slashes: assets/nested\deep_mixed.bin
+    // Inside directory assets, file nested\deep_mixed.bin
+    // The slash twin assets/nested/deep_mixed.bin is clean.
+    std::fs::write(root.0.join("assets/nested/deep_mixed.bin"), b"clean\n").unwrap();
+    let spelled_mixed = "assets/nested\\deep_mixed.bin";
+    std::fs::write(
+        root.0.join("assets").join("nested\\deep_mixed.bin"),
+        format!("\0{key}\0"),
+    )
+    .unwrap();
+    let quoted_mixed = spelled_mixed.replace('\\', "\\\\");
+    let diff_mixed = format!(
+        "{TEXT}diff --git \"a/{quoted_mixed}\" \"b/{quoted_mixed}\"\nBinary files \"a/{quoted_mixed}\" and \"b/{quoted_mixed}\" differ\n"
+    );
+    let reply_mixed = check(&root.0, &format!("src/ok.rs\n{spelled_mixed}"), &diff_mixed);
+    assert!(
+        reply_mixed.contains("\"ok\":true"),
+        "mixed slashes check did not run: {reply_mixed}"
+    );
+    assert!(
+        reply_mixed.contains("\"gate\":\"secret_scan\""),
+        "mixed slashes binary path was not secret-scanned: {reply_mixed}"
+    );
+    assert!(
+        reply_mixed.contains("assets/nested\\\\deep_mixed.bin"),
+        "finding path is not the exact mixed-slashes spelling: {reply_mixed}"
+    );
+    assert!(
+        !reply_mixed.contains(&key),
+        "the reply quotes the credential in full: {reply_mixed}"
+    );
+}
+
+#[test]
+fn adv_missing_binary_backslash_file_reports_degraded_not_clean() {
+    let root = Root::new();
+    std::fs::write(root.0.join("src/ok.rs"), "pub fn ok() -> u8 { 1 }\n").unwrap();
+
+    let spelled = "assets\\missing_ghost.bin";
+    // We intentionally do NOT create `assets\missing_ghost.bin` on disk.
+    let quoted = spelled.replace('\\', "\\\\");
+    let diff = format!(
+        "{TEXT}diff --git \"a/{quoted}\" \"b/{quoted}\"\nBinary files \"a/{quoted}\" and \"b/{quoted}\" differ\n"
+    );
+    let reply = check(&root.0, &format!("src/ok.rs\n{spelled}"), &diff);
+    assert!(
+        reply.contains("\"ok\":true"),
+        "the check did not run: {reply}"
+    );
+    // Must report degraded, NOT a clean scan
+    assert!(
+        reply.contains("stub_ast_degraded\":[") && !reply.contains("stub_ast_degraded\":[]"),
+        "missing backslash binary was treated as a clean scan: {reply}"
+    );
+    assert!(
+        reply.contains("secret scan skipped (binary file not read: "),
+        "degraded reason did not report secret scan skipped: {reply}"
+    );
+    assert!(
+        reply.contains("assets\\\\missing_ghost.bin"),
+        "degraded entry did not name the backslash binary path: {reply}"
+    );
+    assert!(
+        !reply.contains("\"gate\":\"secret_scan\""),
+        "missing binary reported secret findings: {reply}"
+    );
+}
+
+#[test]
+fn adv_backslash_binary_path_with_spaces_and_utf8_is_scanned() {
+    let root = Root::new();
+    let key = secret();
+    std::fs::write(root.0.join("src/ok.rs"), "pub fn ok() -> u8 { 1 }\n").unwrap();
+
+    // Filename containing backslash, space, and UTF-8 characters:
+    // "assets\my spaced dir\café.bin"
+    let spelled = "assets\\my spaced dir\\caf\u{e9}.bin";
+    std::fs::write(root.0.join(spelled), format!("\0{key}\0")).unwrap();
+
+    // Standard git diff header with octal escape for é (\303\251) and escaped backslashes:
+    let quoted = "assets\\\\my spaced dir\\\\caf\\303\\251.bin";
+    let diff = format!(
+        "{TEXT}diff --git \"a/{quoted}\" \"b/{quoted}\"\nBinary files \"a/{quoted}\" and \"b/{quoted}\" differ\n"
+    );
+    let reply = check(&root.0, &format!("src/ok.rs\n{spelled}"), &diff);
+    assert!(
+        reply.contains("\"ok\":true"),
+        "the check did not run: {reply}"
+    );
+    assert!(
+        reply.contains("\"gate\":\"secret_scan\""),
+        "backslash binary path with spaces and utf8 was not secret-scanned: {reply}"
+    );
+    assert!(
+        reply.contains("assets\\\\my spaced dir\\\\caf"),
+        "finding path is not the exact spelling: {reply}"
+    );
+    assert!(
+        !reply.contains(&key),
+        "the reply quotes the credential in full"
+    );
+}

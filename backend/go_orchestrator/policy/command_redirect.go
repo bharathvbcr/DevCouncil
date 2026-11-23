@@ -61,6 +61,18 @@ type RedirectSet struct {
 	// writer). It is not Opaque: with no task scope there is no fence for such
 	// a write to get past, so only a caller that has a scope bound refuses.
 	Unjudged string
+	// SiblingWrites holds writes performed against registered sibling worktrees
+	// (`git -C <sibling>`), attributed to each sibling's canonical root rather
+	// than the caller's root.
+	SiblingWrites []SiblingWrite
+}
+
+// SiblingWrite groups argument writes that target a registered sibling worktree.
+type SiblingWrite struct {
+	Root     string
+	Targets  []string
+	Deletes  []string
+	Unjudged string
 }
 
 // RedirectWrites is RedirectTargets with the scope-dependent half reported
@@ -71,9 +83,16 @@ type RedirectSet struct {
 // scanned, and the writes are their union: a file one reading writes is a file
 // the line may write.
 func RedirectWrites(command string) (RedirectSet, error) {
+	return RedirectWritesInRoot(command, "")
+}
+
+// RedirectWritesInRoot is RedirectWrites with caller working tree attribution,
+// separating writes made via `git -C <registered sibling>` into SiblingWrites.
+func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 	var found redirectFindings
+	memo := scanMemo{}
 	for i, reading := range expandBindings(command) {
-		one, err := redirectTargets(reading, 0)
+		one, err := redirectTargetsMemo(reading, root, 0, memo)
 		if err != nil {
 			return RedirectSet{}, err
 		}
@@ -81,58 +100,64 @@ func RedirectWrites(command string) (RedirectSet, error) {
 			found = one
 			continue
 		}
-		found.targets = append(found.targets, one.targets...)
-		found.opaque = found.opaque || one.opaque
-		if found.unjudged == "" {
-			found.unjudged = one.unjudged
+		found.mergeFrom(one)
+	}
+	distinct, deletes, overflow := dedupeWriteTargets(found.targets, found.deleted, maxRedirectTargets)
+	if overflow {
+		return RedirectSet{Targets: distinct, Deletes: deletes, Opaque: true, Unjudged: found.unjudged}, nil
+	}
+	total := len(distinct)
+	var siblingWrites []SiblingWrite
+	for _, sib := range found.siblings {
+		sibDistinct, sibDeletes, sibOverflow := dedupeWriteTargets(sib.targets, sib.deleted, maxRedirectTargets-total)
+		total += len(sibDistinct)
+		if sibOverflow {
+			return RedirectSet{Targets: distinct, Deletes: deletes, SiblingWrites: siblingWrites, Opaque: true, Unjudged: found.unjudged}, nil
 		}
-		if len(one.deleted) > 0 && found.deleted == nil {
-			found.deleted = make(map[string]int, len(one.deleted))
-		}
-		for target, count := range one.deleted {
-			found.deleted[target] += count
+		if len(sibDistinct) > 0 || sib.unjudged != "" {
+			siblingWrites = append(siblingWrites, SiblingWrite{
+				Root:     sib.root,
+				Targets:  sibDistinct,
+				Deletes:  sibDeletes,
+				Unjudged: sib.unjudged,
+			})
 		}
 	}
-	targets, opaque, unjudged := found.targets, found.opaque, found.unjudged
-	named := make(map[string]int, len(found.deleted))
+	return RedirectSet{
+		Targets:       distinct,
+		Deletes:       deletes,
+		Opaque:        found.opaque,
+		Unjudged:      found.unjudged,
+		SiblingWrites: siblingWrites,
+	}, nil
+}
+
+func dedupeWriteTargets(targets []string, delMap map[string]int, limit int) (distinct, deletes []string, overflow bool) {
+	named := make(map[string]int, len(delMap))
 	for _, target := range targets {
-		if found.deleted[target] > 0 {
+		if delMap[target] > 0 {
 			named[target]++
 		}
 	}
-	var deletes []string
-	// Deduplicated, and bounded. Both are about what the caller does with this
-	// list: it puts every entry through the write gate, so the length of the
-	// list is a multiplier on the cost of judging one command line.
-	//
-	// `a > f && a > f && …` names one file however many times it is repeated,
-	// and re-judging it once per clause turned a 360 KiB command line into
-	// eight seconds of gate time — the same verdict, twenty thousand times.
-	// Distinctness is the honest unit anyway: the question the gate answers is
-	// "may this file be written", and it has one answer per file.
 	seen := make(map[string]struct{}, len(targets))
-	distinct := make([]string, 0, len(targets))
+	distinct = make([]string, 0, len(targets))
 	for _, target := range targets {
 		if _, dup := seen[target]; dup {
 			continue
 		}
-		// A stream device is not a file the command writes; see IsStreamDevice.
 		if IsStreamDevice(target) {
 			continue
 		}
-		if len(distinct) >= maxRedirectTargets {
-			// Past the cap the enumeration is incomplete, and incomplete is
-			// exactly what opacity means — the caller refuses rather than
-			// judging a prefix of the writes and calling it the whole set.
-			return RedirectSet{Targets: distinct, Deletes: deletes, Opaque: true, Unjudged: unjudged}, nil
+		if len(distinct) >= limit {
+			return distinct, deletes, true
 		}
 		seen[target] = struct{}{}
 		distinct = append(distinct, target)
-		if found.deleted[target] > 0 && found.deleted[target] == named[target] {
+		if delMap[target] > 0 && delMap[target] == named[target] {
 			deletes = append(deletes, target)
 		}
 	}
-	return RedirectSet{Targets: distinct, Deletes: deletes, Opaque: opaque, Unjudged: unjudged}, nil
+	return distinct, deletes, false
 }
 
 // streamDevices are the device paths a redirection writes to without creating
@@ -201,6 +226,70 @@ type redirectFindings struct {
 	deleted  map[string]int
 	opaque   bool
 	unjudged string
+	siblings []siblingRedirectFindings
+}
+
+type siblingRedirectFindings struct {
+	root     string
+	targets  []string
+	deleted  map[string]int
+	unjudged string
+}
+
+func (f *redirectFindings) mergeFrom(o redirectFindings) {
+	f.targets = append(f.targets, o.targets...)
+	f.opaque = f.opaque || o.opaque
+	if f.unjudged == "" {
+		f.unjudged = o.unjudged
+	}
+	if len(o.deleted) > 0 && f.deleted == nil {
+		f.deleted = make(map[string]int, len(o.deleted))
+	}
+	for target, count := range o.deleted {
+		f.deleted[target] += count
+	}
+	for _, sib := range o.siblings {
+		f.mergeSibling(sib.root, sib.targets, sib.deleted, sib.unjudged)
+	}
+}
+
+func (f *redirectFindings) mergeSibling(root string, targets []string, delMap map[string]int, unjudged string) {
+	appendSiblingRedirectFindings(&f.siblings, root, targets, delMap, unjudged)
+}
+
+func appendSiblingRedirectFindings(siblings *[]siblingRedirectFindings, root string, targets []string, delMap map[string]int, unjudged string) {
+	if len(targets) == 0 && len(delMap) == 0 && unjudged == "" {
+		return
+	}
+	for i := range *siblings {
+		sib := &(*siblings)[i]
+		if sameWorktreePath(sib.root, root) {
+			sib.targets = append(sib.targets, targets...)
+			if sib.unjudged == "" {
+				sib.unjudged = unjudged
+			}
+			if len(delMap) > 0 && sib.deleted == nil {
+				sib.deleted = make(map[string]int, len(delMap))
+			}
+			for target, count := range delMap {
+				sib.deleted[target] += count
+			}
+			return
+		}
+	}
+	var copiedDel map[string]int
+	if len(delMap) > 0 {
+		copiedDel = make(map[string]int, len(delMap))
+		for k, v := range delMap {
+			copiedDel[k] = v
+		}
+	}
+	*siblings = append(*siblings, siblingRedirectFindings{
+		root:     root,
+		targets:  append([]string(nil), targets...),
+		deleted:  copiedDel,
+		unjudged: unjudged,
+	})
 }
 
 // scanMemo remembers what one RedirectWrites call has already found for a span
@@ -212,15 +301,16 @@ type scanMemo map[memoKey]redirectFindings
 
 type memoKey struct {
 	text  string
+	root  string
 	depth int
 }
 
 func redirectTargets(command string, depth int) (redirectFindings, error) {
-	return redirectTargetsMemo(command, depth, scanMemo{})
+	return redirectTargetsMemo(command, "", depth, scanMemo{})
 }
 
-func redirectTargetsMemo(command string, depth int, memo scanMemo) (redirectFindings, error) {
-	key := memoKey{command, depth}
+func redirectTargetsMemo(command, root string, depth int, memo scanMemo) (redirectFindings, error) {
+	key := memoKey{command, root, depth}
 	if found, ok := memo[key]; ok {
 		return found, nil
 	}
@@ -237,13 +327,19 @@ func redirectTargetsMemo(command string, depth int, memo scanMemo) (redirectFind
 	if depth > maxSubstitutionDepth {
 		return redirectFindings{opaque: true}, nil
 	}
-	s := redirectScan{runes: []rune(command), depth: depth, memo: memo}
+	s := redirectScan{runes: []rune(command), root: root, depth: depth, memo: memo}
 	if err := s.scanOperators(); err != nil {
 		return redirectFindings{}, err
 	}
 	s.addArgumentWrites()
 	s.reconcileWithSubstitutions(command)
-	found := redirectFindings{targets: s.targets, deleted: s.deleted, opaque: s.opaque, unjudged: s.unjudged}
+	found := redirectFindings{
+		targets:  s.targets,
+		deleted:  s.deleted,
+		opaque:   s.opaque,
+		unjudged: s.unjudged,
+		siblings: s.siblings,
+	}
 	memo[key] = found
 	return found, nil
 }
@@ -252,6 +348,7 @@ func redirectTargetsMemo(command string, depth int, memo scanMemo) (redirectFind
 // recursion depth it was reached at, and what the walk has found so far.
 type redirectScan struct {
 	runes []rune
+	root  string
 	depth int
 	memo  scanMemo
 
@@ -259,6 +356,7 @@ type redirectScan struct {
 	deleted  map[string]int
 	opaque   bool
 	unjudged string
+	siblings []siblingRedirectFindings
 
 	// masked is this command line as the argument scan reads it: every
 	// substitution span scanOperators descends into is replaced by
@@ -333,7 +431,7 @@ func (s *redirectScan) scanOperators() error {
 // are. Its findings merge into this command's, because sh performs them
 // whether or not the surrounding line has a redirect of its own.
 func (s *redirectScan) descend(inner string) error {
-	inside, err := redirectTargetsMemo(inner, s.depth+1, s.memo)
+	inside, err := redirectTargetsMemo(inner, s.root, s.depth+1, s.memo)
 	if err != nil {
 		return err
 	}
@@ -341,6 +439,9 @@ func (s *redirectScan) descend(inner string) error {
 	s.noteDeleted(inside.deleted)
 	s.opaque = s.opaque || inside.opaque
 	s.noteUnjudged(inside.unjudged)
+	for _, sib := range inside.siblings {
+		appendSiblingRedirectFindings(&s.siblings, sib.root, sib.targets, sib.deleted, sib.unjudged)
+	}
 	return nil
 }
 
@@ -549,13 +650,20 @@ func readRedirectTarget(runes []rune, start int) (string, int, error) {
 // redirect and passed the other four. See argumentWriteTargets for which
 // commands and why.
 func (s *redirectScan) addArgumentWrites() {
-	args := argumentWriteTargets(s.masked.String())
+	args := argumentWriteTargetsInRoot(s.masked.String(), s.root)
 	s.targets = append(s.targets, args.targets...)
 	for _, d := range args.deletes {
 		s.noteDeleted(map[string]int{d: 1})
 	}
 	s.opaque = s.opaque || args.opaque
 	s.noteUnjudged(args.unjudged)
+	for _, sib := range args.siblings {
+		delMap := make(map[string]int, len(sib.writes.deletes))
+		for _, d := range sib.writes.deletes {
+			delMap[d]++
+		}
+		appendSiblingRedirectFindings(&s.siblings, sib.root, sib.writes.targets, delMap, sib.writes.unjudged)
+	}
 }
 
 // noteDeleted records targets a command removes.
@@ -613,12 +721,19 @@ func (s *redirectScan) reconcileWithSubstitutions(command string) {
 	for _, target := range s.targets {
 		have[target] = struct{}{}
 	}
+	type sibTarget struct{ root, target string }
+	haveSib := make(map[sibTarget]struct{})
+	for _, sib := range s.siblings {
+		for _, t := range sib.targets {
+			haveSib[sibTarget{sib.root, t}] = struct{}{}
+		}
+	}
 	for _, span := range spans {
 		// depth+1 so this shares the recursion bound with descend rather
 		// than adding a second, independent one. Past the bound the call
 		// returns opacity immediately, which is both the fail-closed answer
 		// and what stops this walk.
-		inside, spanErr := redirectTargetsMemo(span, s.depth+1, s.memo)
+		inside, spanErr := redirectTargetsMemo(span, s.root, s.depth+1, s.memo)
 		s.noteUnjudged(inside.unjudged)
 		if spanErr != nil || inside.opaque {
 			s.opaque = true
@@ -628,6 +743,14 @@ func (s *redirectScan) reconcileWithSubstitutions(command string) {
 			if _, ok := have[target]; !ok {
 				s.opaque = true
 				return
+			}
+		}
+		for _, sib := range inside.siblings {
+			for _, target := range sib.targets {
+				if _, ok := haveSib[sibTarget{sib.root, target}]; !ok {
+					s.opaque = true
+					return
+				}
 			}
 		}
 	}

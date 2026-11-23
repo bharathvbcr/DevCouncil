@@ -1,6 +1,7 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,7 +19,6 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/correction"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gating"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
@@ -191,9 +191,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	if g := DetectNoWorkGap(taskID, planned, workPresent); g != nil {
 		gaps = append(gaps, *g)
 	}
-	gaps = append(gaps, DetectPlannedFileGaps(taskID, planned, in.ChangedFiles)...)
-	gaps = append(gaps, DetectOrphanDiffGaps(taskID, planned, in.ChangedFiles, in.AddedFiles)...)
-	gaps = append(gaps, DetectDependencyRiskGaps(taskID, planned, in.ChangedFiles)...)
+	gaps = append(gaps, DetectPlannedFileGapsIn(in.Root, taskID, planned, in.ChangedFiles)...)
+	gaps = append(gaps, DetectOrphanDiffGapsIn(in.Root, taskID, planned, in.ChangedFiles, in.AddedFiles)...)
+	gaps = append(gaps, DetectDependencyRiskGapsIn(in.Root, taskID, planned, in.ChangedFiles)...)
 	if in.GitErr != nil {
 		gaps = append(gaps, gitStateGap(taskID, in.GitErr))
 	}
@@ -604,18 +604,49 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	// instead of each starting its own.
 	ctx, cancel := proc.WithWalkBudget(ctx)
 	defer cancel()
-	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-status", "-z"}, toolStateExcludes()...)...)
+	// base is what the diffs compare the tree to: HEAD, or in a repository with
+	// no commits yet the empty tree, so what is staged or modified there is
+	// listed and read like any other change instead of being dropped.
+	base := "HEAD"
+	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", base, "--name-status", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
-		if !hasNoHead(ctx, git) {
+		noHead, headErr := hasNoHead(ctx, git)
+		if headErr != nil {
+			return GitState{}, fmt.Errorf("%w (and HEAD could not be classified: %v)", err, headErr)
+		}
+		if !noHead {
 			return GitState{}, err
 		}
-		headless, nameOut = true, nil
+		headless = true
+		if base, err = emptyTreeOID(ctx, git); err != nil {
+			return GitState{}, err
+		}
+		nameOut, err = runGit(ctx, git, gitListingLimit, append([]string{"diff", base, "--name-status", "-z"}, toolStateExcludes()...)...)
+		if err != nil {
+			return GitState{}, err
+		}
 	}
 	entries, err := parseNameStatus(nameOut)
 	if err != nil {
 		return GitState{}, err
 	}
+	// The index is a second view of the change: what is staged is in the next
+	// commit whatever the worktree holds now, so a secret staged and then
+	// reverted or deleted on disk is in no worktree diff. Its paths join the
+	// list and its sections join the diff (appendNewSections).
+	// Unmerged paths are left out of the index view (--diff-filter=u): git prints
+	// a conflicted path as a `* Unmerged path` stub, which is no diff to parse,
+	// and the worktree view already carries it.
+	stagedOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "--cached", "--diff-filter=u", base, "--name-status", "-z"}, toolStateExcludes()...)...)
+	if err != nil {
+		return GitState{}, err
+	}
+	staged, err := parseNameStatus(stagedOut)
+	if err != nil {
+		return GitState{}, err
+	}
+	entries = append(entries, staged...)
 	seen := map[string]struct{}{}
 	add := func(path string) {
 		// Tool-owned state is not the agent's work; policy.ToolStateDirs
@@ -641,6 +672,7 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	tracked := map[string]struct{}{}
 	addedSet := map[string]struct{}{}
 	var recreated []string
+	recreatedSet := map[string]struct{}{}
 	for _, entry := range entries {
 		if policy.IsToolState(entry.path) {
 			continue
@@ -659,7 +691,10 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 			case serr != nil:
 				return GitState{}, fmt.Errorf("cannot tell whether deleted %s is back on disk: %v", entry.path, serr)
 			case !info.IsDir():
-				recreated = append(recreated, entry.path)
+				if _, dup := recreatedSet[entry.path]; !dup {
+					recreatedSet[entry.path] = struct{}{}
+					recreated = append(recreated, entry.path)
+				}
 				continue
 			}
 		}
@@ -698,8 +733,12 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	if err != nil {
 		return GitState{}, err
 	}
-	if !headless {
-		args := append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)
+	for _, cached := range []bool{false, true} {
+		args := []string{"-c", "core.quotePath=false", "diff"}
+		if cached {
+			args = append(args, "--cached", "--diff-filter=u")
+		}
+		args = append(append(args, base), toolStateExcludes()...)
 		for _, path := range recreated {
 			args = append(args, ":(top,exclude,literal)"+path)
 		}
@@ -707,7 +746,10 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 		if err != nil {
 			return GitState{}, err
 		}
-		diff = string(diffBytes)
+		diff = appendNewSections(diff, string(diffBytes))
+		if len(diff) > gitDiffLimit {
+			return GitState{}, diffTooLargeError{}
+		}
 	}
 	diff, err = attachMissingDiffBytes(ctx, git, root, changed, tracked, dirty, diff)
 	if err != nil {
@@ -773,18 +815,113 @@ func ToolOwned(path string) bool { return policy.IsToolState(path) }
 func toolStateExcludes() []string {
 	spec := []string{"--", "."}
 	for _, dir := range policy.ToolStateDirs {
-		spec = append(spec, ":(top,exclude)"+dir)
+		spec = append(spec, toolStatePathspec("exclude", dir))
 	}
 	return spec
 }
 
-// hasNoHead reports whether the repository has no HEAD commit yet: git ran
-// and answered that HEAD does not resolve. A git that could not run, or was
-// refused, is not that answer.
-func hasNoHead(ctx context.Context, git *proc.GitSession) bool {
-	_, err := runGit(ctx, git, 1<<10, "rev-parse", "--verify", "--quiet", "HEAD")
+// emptyTreeOID is the object id of the empty tree in this repository's hash
+// format (a sha256 repository has a different one), asked of git rather than
+// written down.
+func emptyTreeOID(ctx context.Context, git *proc.GitSession) (string, error) {
+	out, err := runGit(ctx, git, 1<<10, "hash-object", "-t", "tree", os.DevNull)
+	if err != nil {
+		return "", fmt.Errorf("reading the empty tree id: %w", err)
+	}
+	oid := strings.TrimSpace(string(out))
+	if n := len(oid); n != 40 && n != 64 {
+		return "", fmt.Errorf("git named %q as the empty tree", oid)
+	}
+	return oid, nil
+}
+
+// appendNewSections returns diff followed by each per-file section of extra
+// that diff does not already hold byte for byte. A file staged and left alone
+// on disk reads the same in both views; keeping one copy stops its findings
+// being reported twice, while a file whose index and worktree differ keeps both.
+func appendNewSections(diff, extra string) string {
+	if extra == "" {
+		return diff
+	}
+	have := map[string]struct{}{}
+	for _, sec := range diffSections(diff) {
+		have[sec] = struct{}{}
+	}
+	var b strings.Builder
+	b.WriteString(diff)
+	if diff != "" && !strings.HasSuffix(diff, "\n") {
+		b.WriteByte('\n')
+	}
+	for _, sec := range diffSections(extra) {
+		if _, ok := have[sec]; !ok {
+			b.WriteString(sec)
+		}
+	}
+	return b.String()
+}
+
+// diffSections splits a git diff into its `diff --git` sections, each kept
+// whole with its trailing newline.
+func diffSections(diff string) []string {
+	var out []string
+	for diff != "" {
+		next := strings.Index(diff, "\ndiff --git ")
+		if next < 0 {
+			out = append(out, diff)
+			break
+		}
+		out = append(out, diff[:next+1])
+		diff = diff[next+1:]
+	}
+	return out
+}
+
+// probeGit is one small git read whose exit code is the answer, under its own
+// gitReadBound (each read of hasNoHead gets the full bound, not a share of one).
+func probeGit(ctx context.Context, git *proc.GitSession, args ...string) (proc.GitResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitReadBound)
+	defer cancel()
+	res, err := git.Run(ctx, 1<<10, args...)
+	if err != nil && res.TimedOut {
+		err = fmt.Errorf("%w (per-read bound %s, or the enclosing deadline, expired)", err, gitReadBound)
+	}
+	return res, err
+}
+
+// hasNoHead reports whether the repository has no HEAD commit yet. Only one
+// answer is that: git ran, `rev-parse --verify --quiet HEAD` exited 1 with
+// nothing on stderr, HEAD is a symbolic ref (`symbolic-ref -q HEAD` names a
+// branch), and that branch's ref does not exist (`show-ref --verify --quiet`
+// exits 1). Anything else is an error, not "no commits": a lock failure, a
+// corrupt repository, a detached HEAD naming a missing object, or a git that
+// could not run all exit non-zero too, and reading them as an empty repository
+// clears the change list and skips the diff. A true answer is not "nothing to
+// read": the caller diffs against the empty tree instead (emptyTreeOID).
+func hasNoHead(ctx context.Context, git *proc.GitSession) (bool, error) {
+	res, err := probeGit(ctx, git, "rev-parse", "--verify", "--quiet", "HEAD")
+	if err == nil {
+		return false, nil
+	}
 	var exit *exec.ExitError
-	return errors.As(err, &exit)
+	if !errors.As(err, &exit) || res.ExitCode != 1 || len(bytes.TrimSpace(res.Stderr)) != 0 {
+		return false, err
+	}
+	sym, err := probeGit(ctx, git, "symbolic-ref", "-q", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("HEAD does not resolve and is not a branch name: %w", err)
+	}
+	ref := strings.TrimSpace(string(sym.Stdout))
+	if ref == "" {
+		return false, errors.New("HEAD does not resolve and symbolic-ref named no branch")
+	}
+	res, err = probeGit(ctx, git, "show-ref", "--verify", "--quiet", ref)
+	if err == nil {
+		return false, fmt.Errorf("HEAD does not resolve although %s exists", ref)
+	}
+	if errors.As(err, &exit) && res.ExitCode == 1 && len(bytes.TrimSpace(res.Stderr)) == 0 {
+		return true, nil
+	}
+	return false, err
 }
 
 // Output caps for the git reads verification judges. The diff is what the
@@ -799,12 +936,18 @@ const (
 // ErrGitOutputTruncated is returned when a git read exceeded its output cap.
 var ErrGitOutputTruncated = errors.New("git output exceeded the verification cap")
 
-// runGit runs a git read through the shared proc.GitSession runner. The diff
-// verification judges comes from git, and a git the repository supplies — or
-// a program its .git/config names — could report any diff it likes,
-// including none.
+// gitReadBound is the longest one git read of verification may take. It bounds
+// each read on its own; the whole collection also draws on the walk budget
+// (proc.WithWalkBudget), and gitDiffLimit caps what a read may return, so a
+// read that is merely large is refused by size, not by this bound.
+const gitReadBound = 60 * time.Second
+
+// runGit runs a git read through the shared proc.GitSession runner, bounded by
+// gitReadBound. The diff verification judges comes from git, and a git the
+// repository supplies — or a program its .git/config names — could report any
+// diff it likes, including none.
 func runGit(ctx context.Context, git *proc.GitSession, limit int, args ...string) ([]byte, error) {
-	return runGitEnv(ctx, git, limit, 60*time.Second, nil, args...)
+	return runGitEnv(ctx, git, limit, gitReadBound, nil, args...)
 }
 
 // runGitEnv is runGit with its own time bound and env added to git's
@@ -814,6 +957,9 @@ func runGitEnv(ctx context.Context, git *proc.GitSession, limit int, bound time.
 	defer cancel()
 	res, err := git.RunEnv(ctx, limit, env, args...)
 	if err != nil {
+		if res.TimedOut {
+			return nil, fmt.Errorf("%w (per-read bound %s, or the enclosing deadline, expired)", err, bound)
+		}
 		return nil, err
 	}
 	if res.Truncated {
@@ -974,14 +1120,14 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		return MCPResult{}, nil, err
 	}
 	if client == nil {
-		return MCPResult{}, nil, fmt.Errorf("store unavailable")
+		return MCPResult{}, nil, ErrStoreUnavailable
 	}
 	task, err := client.Task(ctx, taskID)
 	if err != nil {
-		return MCPResult{}, nil, err
+		return MCPResult{}, nil, storeReadError{err}
 	}
 	if task == nil {
-		return MCPResult{}, nil, fmt.Errorf("task %s not found", taskID)
+		return MCPResult{}, nil, taskNotFoundError{taskID}
 	}
 	state, gitErr := CollectGitStateReport(ctx, root)
 	if gitErr != nil {
@@ -1053,7 +1199,6 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	meta.StartedAt, meta.FinishedAt = began, time.Now().UTC()
 	result := ToMCP(taskID, gaps, meta)
 	persistErr := Persist(ctx, client, taskID, gaps, meta, result.Status)
-	writeBlockedCorrection(root, taskID, &result, gaps)
 	if persistErr != nil {
 		// The verdict is returned with the error so a caller can show it, but
 		// as an error: the gates and the task loop read the store, and a run
@@ -1086,41 +1231,4 @@ func allowNoRigor() bool {
 		return true
 	}
 	return false
-}
-
-// writeBlockedCorrection persists a repair brief when a check ran and
-// blocked. A write failure must not hide the verify result — gaps are already
-// in the store. A skipped or passing verify writes nothing.
-func writeBlockedCorrection(root, taskID string, result *MCPResult, gaps []Gap) {
-	if result == nil || result.Passed || result.VerificationSkipped || result.Status == "degraded" {
-		return
-	}
-	if root == "" || taskID == "" {
-		return
-	}
-	manifestGaps := make([]correction.ManifestGap, 0, len(gaps))
-	for _, g := range gaps {
-		if !g.Blocking {
-			continue
-		}
-		file := ""
-		if g.File != nil {
-			file = *g.File
-		}
-		manifestGaps = append(manifestGaps, correction.ManifestGap{
-			ID: g.ID, GapType: g.GapType, Severity: g.Severity,
-			Blocking: true, Action: g.RecommendedFix, File: file,
-		})
-	}
-	actions := make([]string, 0, len(result.NextActions))
-	for _, a := range result.NextActions {
-		actions = append(actions, a.Action)
-	}
-	_, path, err := correction.Write(correction.WriteOptions{
-		Root: root, TaskID: taskID, Gaps: manifestGaps, NextActions: actions,
-	})
-	if err != nil {
-		return
-	}
-	result.CorrectionPath = path
 }

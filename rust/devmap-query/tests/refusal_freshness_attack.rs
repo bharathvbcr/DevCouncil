@@ -537,6 +537,42 @@ fn p2b_generation_deleted_mid_session_is_never_fresh() {
 
 // Probe 4: both halves of a layered impact carry the same freshness, on every
 // arm, and the same freshness the plain `impact` of the same query carries.
+/// Every store-backed envelope carries the age of the verdict it repeats, and
+/// carries none when no walk backs it (an absent age is "never verified").
+#[test]
+fn p5_a_verified_verdict_carries_its_age_on_the_envelope() {
+    let fx = fixture("p5", None);
+    let engine = StoreQueryEngine::new(&fx.store);
+    let before = engine.impact(req("a", 3)).unwrap().source_freshness;
+    assert_eq!(before.verified_age_ms, None, "{before:?}");
+    assert!(!serde_json::to_string(&before)
+        .unwrap()
+        .contains("verified_age_ms"));
+
+    fx.store.status("t").unwrap();
+    let layered = engine.impact_layered(req("a", 3)).unwrap();
+    for (name, freshness) in [
+        (
+            "impact",
+            engine.impact(req("a", 3)).unwrap().source_freshness,
+        ),
+        ("layered edges", layered.edges.source_freshness),
+        (
+            "search",
+            engine.search(req("a", 3)).unwrap().source_freshness,
+        ),
+    ] {
+        assert_eq!(freshness.fresh, Some(true), "{name}: {freshness:?}");
+        assert!(freshness.verified_age_ms.is_some(), "{name}: {freshness:?}");
+        assert!(
+            serde_json::to_string(&freshness)
+                .unwrap()
+                .contains("verified_age_ms"),
+            "{name} must put the age on the wire"
+        );
+    }
+}
+
 #[test]
 fn p4_layered_halves_agree_with_each_other_and_with_plain_impact() {
     for prime in [false, true] {
@@ -792,4 +828,39 @@ fn p2c_preview_on_an_empty_store_says_no_generation() {
         "{:?}",
         r.broken_callers.source_freshness
     );
+}
+
+// Probe 8 (resolver-stale): a tree that matches the stored hashes over edges an
+// older resolver wrote is never `fresh: true` on any surface, success or refusal,
+// and every surface still carries exactly the store's own verdict.
+#[test]
+fn p8_a_resolver_stale_base_is_never_fresh_on_any_surface() {
+    let dir = tmp_dir("p8-db");
+    let db = dir.join("devmap.sqlite");
+    let fx = fixture("p8", Some(&db));
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', '0')",
+                [],
+            )
+            .unwrap();
+        assert!(changed > 0, "precondition: a generation to age");
+    }
+    let status = fx.store.status(&db.to_string_lossy()).unwrap();
+    eprintln!("status: {:?}", status.source_freshness);
+    let want = expected(&fx.store);
+    assert_ne!(
+        want.fresh,
+        Some(true),
+        "the store itself says fresh over a stale resolver: {want:?}"
+    );
+    let engine = StoreQueryEngine::new(&fx.store);
+    let (seen, _) = sweep(&engine);
+    assert!(!seen.is_empty());
+    assert_all_match(&seen, &want, "resolver-stale");
+    for (name, row_refused, f) in flagged_surfaces(&engine) {
+        assert_ne!(f.fresh, Some(true), "{name} (refused={row_refused}): {f:?}");
+    }
 }

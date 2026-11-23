@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tgrep_core::PostingEntry;
 use tgrep_core::meta::{FileEvidence, file_version};
-use tgrep_core::query::{build_query_plan, execute_plan};
+use tgrep_core::query::{build_literal_plan, build_query_plan, execute_plan};
 use tgrep_core::reader::IndexReader;
 
 use crate::lexical;
@@ -346,6 +346,7 @@ impl Candidates {
         root: &Path,
         pattern: &str,
         case_insensitive: bool,
+        fixed_strings: bool,
     ) -> (Option<Self>, SearchIndex) {
         // Unix ctime + inode catches rewrites with restored mtime. Other
         // platforms retain live search until equivalent evidence is available.
@@ -354,13 +355,21 @@ impl Candidates {
         }
         // tgrep's HIR adapter and ripgrep's byte matcher differ for byte-mode
         // flags and Unicode case folding. Conservatively scan those patterns;
-        // ordinary case-sensitive regexes still get trigram planning.
-        if case_insensitive || pattern.contains("(?") {
+        // ordinary case-sensitive regexes and literal strings still get trigram planning.
+        if case_insensitive || (!fixed_strings && pattern.contains("(?")) {
             return (None, SearchIndex::scan("pattern_requires_live_scan"));
         }
-        let plan = match build_query_plan(pattern, false) {
-            Ok(plan) if !plan.is_match_all() => plan,
-            _ => return (None, SearchIndex::scan("pattern_has_no_safe_trigrams")),
+        let plan = if fixed_strings {
+            let plan = build_literal_plan(pattern, false);
+            if plan.is_match_all() {
+                return (None, SearchIndex::scan("pattern_has_no_safe_trigrams"));
+            }
+            plan
+        } else {
+            match build_query_plan(pattern, false) {
+                Ok(plan) if !plan.is_match_all() => plan,
+                _ => return (None, SearchIndex::scan("pattern_has_no_safe_trigrams")),
+            }
         };
         match Self::open(root, &plan) {
             Ok((candidates, count)) => (
@@ -676,7 +685,7 @@ fn build_with_limits(
     // and reporting it is the only way that fact reaches anyone: a ranking
     // over a subset does not look different from a ranking over the whole.
     let mut lexical_used: usize = 0;
-    for entry in build_walker(&root, true)?.build() {
+    for entry in build_walker(&root, &root, true, false)?.build() {
         if started.elapsed() >= max_duration {
             walk_ended(
                 lexical::store::Limit::Duration,
@@ -708,7 +717,12 @@ fn build_with_limits(
         // `lexical_unindexed` so `complete` cannot be true over it. The ones that
         // are not counted say why where they are: a file with a NUL byte or that
         // is not UTF-8 is not rankable, so leaving it out is not a shortfall.
-        let Some(path) = entry.path().strip_prefix(&root).ok().and_then(slashed) else {
+        let Some(path) = entry
+            .path()
+            .strip_prefix(&root)
+            .ok()
+            .and_then(|p| slashed(p, false))
+        else {
             // A name that is not UTF-8 cannot be written into the index.
             response.left_out("unrepresentable_name", &root_relative(&root, entry.path()));
             continue;

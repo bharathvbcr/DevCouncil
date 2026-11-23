@@ -242,6 +242,8 @@ func TestDepsCarriesTheProducersNoteAndPartialMark(t *testing.T) {
 	partial := fake(t, map[string]string{
 		"status": healthyStatus,
 		"deps":   `{"hidden":0,"items":[],"walk_incomplete":"the analysis is partial"}`,
+		"dead":   `{"hidden":0,"items":[],"walk_incomplete":"the analysis is partial"}`,
+		"search": `{"hidden":0,"items":[],"note":"0 matches after filtering","walk_incomplete":"the analysis is partial"}`,
 	})
 	result, err = partial.Deps(context.Background(), "defs.py")
 	if err != nil {
@@ -249,6 +251,23 @@ func TestDepsCarriesTheProducersNoteAndPartialMark(t *testing.T) {
 	}
 	if result.Clean() || len(result.Degraded) != 1 || !strings.Contains(result.Degraded[0], "the analysis is partial") {
 		t.Fatalf("walk_incomplete must degrade the result: %+v", result)
+	}
+	deadRes, err := partial.Dead(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadRes.Clean() || len(deadRes.Degraded) != 1 || !strings.Contains(deadRes.Degraded[0], "the analysis is partial") {
+		t.Fatalf("dead walk_incomplete must degrade the result: %+v", deadRes)
+	}
+	searchRes, err := partial.Search(context.Background(), "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if searchRes.Clean() || len(searchRes.Degraded) != 1 || !strings.Contains(searchRes.Degraded[0], "the analysis is partial") {
+		t.Fatalf("search walk_incomplete must degrade the result: %+v", searchRes)
+	}
+	if !strings.Contains(searchRes.Note, "0 matches after filtering") {
+		t.Fatalf("search note was dropped: %+v", searchRes)
 	}
 }
 

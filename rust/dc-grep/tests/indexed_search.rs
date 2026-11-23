@@ -399,3 +399,82 @@ fn rebuilding_repairs_a_corrupt_pointer_instead_of_requiring_manual_cleanup() {
     );
     assert_eq!(repo.search("needle")["count"], 1);
 }
+
+#[test]
+fn indexed_search_supports_fixed_strings_and_include_hidden() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "fn hit() { let _ = \"needle (a+)+\"; }\n");
+    repo.write("src/miss.rs", "fn other() {}\n");
+    repo.write("src/ws.txt", "   \n");
+    repo.write(".github/ci.yml", "run: needle (a+)+\n");
+    repo.index();
+
+    // Literal search with metacharacters uses trigram index and still inspects hidden files.
+    let (ok, res) = repo.call(
+        "search",
+        json!({
+            "pattern": "needle (a+)+",
+            "fixed_strings": true,
+            "include_hidden": true,
+        }),
+    );
+    assert!(ok, "{res}");
+    #[cfg(unix)]
+    assert_eq!(res["index"]["status"], "used");
+    let mut paths: Vec<&str> = res["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec![".github/ci.yml", "src/lib.rs"]);
+
+    // 3-space literal has one trigram and uses the trigram index.
+    let (ok, ws3) = repo.call(
+        "search",
+        json!({
+            "pattern": "   ",
+            "fixed_strings": true,
+        }),
+    );
+    assert!(ok, "{ws3}");
+    #[cfg(unix)]
+    assert_eq!(ws3["index"]["status"], "used");
+    assert_eq!(ws3["matches"][0]["path"], "src/ws.txt");
+
+    // 2-space literal is shorter than one trigram and falls back to live scan.
+    let (ok, ws2) = repo.call(
+        "search",
+        json!({
+            "pattern": "  ",
+            "fixed_strings": true,
+        }),
+    );
+    assert!(ok, "{ws2}");
+    #[cfg(unix)]
+    assert_eq!(ws2["index"]["status"], "scan");
+    assert_eq!(ws2["matches"][0]["path"], "src/ws.txt");
+
+    // Health advertises the explorer capabilities under schema_version 1.
+    let (ok, health) = support::run("health", b"", support::CALL_BOUND);
+    assert!(ok);
+    let health: Value = serde_json::from_slice(&health).expect("health JSON");
+    assert_eq!(health["schema_version"], 1);
+    for cap in [
+        "fixed_strings",
+        "include_hidden",
+        "preserve_whitespace",
+        "include_oversized",
+        "include_symlinks",
+        "precompose_unicode",
+        "include_devcouncil",
+        "ignore_dot_ignore",
+        "include_git_tracked",
+    ] {
+        assert_eq!(
+            health["capabilities"][cap], true,
+            "missing cap {cap}: {health}"
+        );
+    }
+}

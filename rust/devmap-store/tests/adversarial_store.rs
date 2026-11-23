@@ -20,10 +20,11 @@
 //!   stated rather than inherited from whatever the next layer happens to
 //!   enforce.
 
+use std::cell::{Cell, RefCell};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use devmap_analyze::analyze;
 use devmap_extract::extract_file;
@@ -1047,6 +1048,542 @@ fn a_generation_the_store_does_not_hold_is_refused_rather_than_answered_empty() 
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// A prune that commits between a generation's existence check and its select.
+//
+// `list_generation_paths`, `search_page_in` and `unresolved_sites_keyed` check
+// that the generation exists and then read it. The prune runs on another
+// connection (in production, the daemon) and takes no lock the reader holds,
+// so in WAL mode it can commit between the two statements. These tests land
+// it there with `set_generation_read_pause`, which fires after the check has
+// passed and before the select.
+//
+// The contract pinned: a call whose check passed answers from one snapshot,
+// the generation's pre-prune rows, byte for byte. Never `Ok([])`, never an
+// empty page, never a ledger read missing the rows the prune deleted. A call
+// that starts after the prune committed is the existing refusal / `None`.
+// ---------------------------------------------------------------------------
+
+/// Bytes the raced read has to return unchanged. `é` is U+00E9, not a
+/// decomposed `e` + combining acute; `String` equality is byte equality.
+const UNICODE_PATH: &str = "目录/caf\u{00e9}.py";
+const SPACED_PATH: &str = "src/my file.py";
+
+/// Under the store's 5s `busy_timeout`. A second connection that blocks on the
+/// read's lock until that timeout is a deadlock, not a slow read.
+const PAUSE_BOUND: Duration = Duration::from_secs(4);
+
+const LEDGER_SRC: &str = "class Ledger:\n    def settle(self):\n        return 1\n";
+const A_SRC: &str = "def alpha():\n    return 1\n\ndef untyped(book):\n    return book.settle()\n";
+const C_SRC: &str = "def other(x):\n    return x.settle()\n";
+const UNICODE_SRC: &str = "def alpha():\n    return 3\n\ndef u(y):\n    return y.settle()\n";
+const SPACED_SRC: &str = "def alpha():\n    return 4\n\ndef u(y):\n    return y.settle()\n";
+
+thread_local! {
+    static PAUSE_FIRES: Cell<u32> = const { Cell::new(0) };
+    static PRUNE_TARGET: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static PRUNE_READ_ONLY: Cell<bool> = const { Cell::new(false) };
+    static PRUNE_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Clears the hook when it goes out of scope: the harness reuses threads.
+struct PauseInstall;
+
+impl Drop for PauseInstall {
+    fn drop(&mut self) {
+        devmap_store::db::set_generation_read_pause(None);
+        PRUNE_TARGET.with(|slot| *slot.borrow_mut() = None);
+        PRUNE_READ_ONLY.with(|slot| slot.set(false));
+    }
+}
+
+fn pause_fires() -> u32 {
+    PAUSE_FIRES.with(|slot| slot.get())
+}
+
+/// Runs on the reading thread with the read's snapshot open. It opens a
+/// second `Store` and never calls back into the paused one, whose mutex is
+/// held and is not re-entrant.
+fn fired_pause() {
+    PAUSE_FIRES.with(|slot| slot.set(slot.get().saturating_add(1)));
+    let path = PRUNE_TARGET
+        .with(|slot| slot.borrow().clone())
+        .expect("the pause fired without a database to prune");
+    if PRUNE_READ_ONLY.with(|slot| slot.get()) {
+        let pruner =
+            Store::open_read_only(&path).expect("a read-only second connection opens the store");
+        match pruner.prune_generations_except_latest(1) {
+            Ok(pruned) => panic!(
+                "the read-only prune committed ({pruned} generations); the \
+                 partial-failure probe never failed"
+            ),
+            Err(error) => PRUNE_ERROR.with(|slot| *slot.borrow_mut() = Some(error.to_string())),
+        }
+    } else {
+        let pruner = Store::open(&path).expect("a second connection opens the store");
+        pruner
+            .prune_generations_except_latest(1)
+            .expect("the prune committed while the read was paused");
+    }
+}
+
+fn arm_pause(dir: &Path, read_only_pruner: bool) -> PauseInstall {
+    PAUSE_FIRES.with(|slot| slot.set(0));
+    PRUNE_READ_ONLY.with(|slot| slot.set(read_only_pruner));
+    PRUNE_ERROR.with(|slot| *slot.borrow_mut() = None);
+    PRUNE_TARGET.with(|slot| *slot.borrow_mut() = Some(dir.join("index.sqlite")));
+    devmap_store::db::set_generation_read_pause(Some(fired_pause));
+    PauseInstall
+}
+
+fn finish_under_busy_timeout<T>(label: &str, body: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let out = body();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < PAUSE_BOUND,
+        "{label} took {elapsed:?}, which is not under the 5s busy_timeout; the \
+         second connection did not finish while the read snapshot was open"
+    );
+    out
+}
+
+/// Generation `old` indexes six files; the newer generation re-saves three of
+/// them with identical bytes (their ledger ranges stay open), drops `src/c.py`
+/// and the unicode path (their ranges end there, which is what a prune
+/// deletes) and adds `src/b.py`.
+fn raced_generation() -> (PathBuf, Store, u32, u32) {
+    let dir = tmp_dir("generation-race-strict");
+    let store = Store::open(dir.join("index.sqlite")).unwrap();
+    let mode: String = rusqlite::Connection::open(dir.join("index.sqlite"))
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        mode.to_ascii_lowercase(),
+        "wal",
+        "the race is only defined in WAL mode; rollback mode makes the in-pause \
+         prune wait out busy_timeout, which is a different test"
+    );
+    let (extractions, resolution, analysis) = pipeline(&[
+        ("src/ledger.py", LEDGER_SRC),
+        ("src/a.py", A_SRC),
+        ("src/c.py", C_SRC),
+        (UNICODE_PATH, UNICODE_SRC),
+        (SPACED_PATH, SPACED_SRC),
+    ]);
+    let old = store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    let (extractions, resolution, analysis) = pipeline(&[
+        ("src/ledger.py", LEDGER_SRC),
+        ("src/a.py", A_SRC),
+        (SPACED_PATH, SPACED_SRC),
+        ("src/b.py", "def beta():\n    return 2\n"),
+    ]);
+    let latest = store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    assert!(latest > old, "the newer generation did not supersede `old`");
+
+    // One range carried, one ended: otherwise "equals the baseline" would also
+    // hold for a read that lost exactly the rows the prune deletes.
+    let at_latest = store
+        .unresolved_sites_naming(latest, &["settle".to_string()], 50)
+        .unwrap()
+        .unwrap();
+    let (rows, _) = at_latest.get("settle").unwrap();
+    assert!(
+        rows.iter().any(|row| row.source_file == "src/a.py"),
+        "the carried range is missing at the latest generation: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| row.source_file != "src/c.py"),
+        "src/c.py's range should have ended before the latest generation: {rows:?}"
+    );
+    (dir, store, old, latest)
+}
+
+/// What one raced read returns, reduced to comparable bytes. `None` is "this
+/// store no longer holds the generation".
+type Read<V> = fn(&Store, u32) -> rusqlite::Result<Option<V>>;
+
+type PageView = (u32, Vec<(String, String)>, Option<String>, bool);
+
+fn page_view(page: &devmap_store::SearchPage) -> PageView {
+    (
+        page.total,
+        page.rows
+            .iter()
+            .map(|row| (row.name.clone(), row.path.clone()))
+            .collect(),
+        page.repo_root.clone(),
+        page.analysis.is_some(),
+    )
+}
+
+fn read_list(store: &Store, generation: u32) -> rusqlite::Result<Option<Vec<String>>> {
+    match store.list_generation_paths(generation) {
+        Ok(mut paths) => {
+            paths.sort();
+            Ok(Some(paths))
+        }
+        Err(error)
+            if error
+                .to_string()
+                .contains(&format!("generation {generation} is not in this store")) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_page(store: &Store, generation: u32) -> rusqlite::Result<Option<PageView>> {
+    Ok(store
+        .search_page_in(generation, "alpha", 10, None)?
+        .map(|page| page_view(&page)))
+}
+
+fn read_page_narrowed(store: &Store, generation: u32) -> rusqlite::Result<Option<PageView>> {
+    let narrowing = devmap_store::KeywordNarrowing {
+        paths: vec!["src/a.py".to_string(), UNICODE_PATH.to_string()],
+        ..Default::default()
+    };
+    Ok(store
+        .search_page_in(generation, "alpha", 10, Some(&narrowing))?
+        .map(|page| page_view(&page)))
+}
+
+fn read_settle(
+    store: &Store,
+    generation: u32,
+) -> rusqlite::Result<Option<devmap_store::UnresolvedSitesByName>> {
+    store.unresolved_sites_naming(generation, &["settle".to_string()], 50)
+}
+
+fn read_files(
+    store: &Store,
+    generation: u32,
+) -> rusqlite::Result<Option<devmap_store::UnresolvedSitesByName>> {
+    let files = [
+        "src/a.py".to_string(),
+        "src/c.py".to_string(),
+        UNICODE_PATH.to_string(),
+        SPACED_PATH.to_string(),
+    ];
+    store.unattributed_sites_in_files(generation, &files, 50)
+}
+
+fn sites_in(sites: &devmap_store::UnresolvedSitesByName, file: &str) -> usize {
+    sites
+        .values()
+        .flat_map(|(rows, _)| rows.iter())
+        .filter(|row| row.source_file.as_bytes() == file.as_bytes())
+        .count()
+}
+
+/// Read `old` once with no pause (the baseline), then again with a committed
+/// prune landing inside the call. The raced answer must equal the baseline,
+/// the pause must have fired exactly once, the prune must really have
+/// committed (a later call is refused) and that later call must not pause.
+/// `read_only_reader` makes the reader a `Store::open_read_only`, the
+/// production shape: the daemon prunes, the MCP reader reads.
+fn race<V: PartialEq + std::fmt::Debug>(
+    label: &str,
+    read_only_reader: bool,
+    read: Read<V>,
+    baseline_is_meaningful: impl Fn(&V),
+) {
+    let (dir, writer, old, _latest) = raced_generation();
+    let read_only;
+    let reader = if read_only_reader {
+        read_only = Store::open_read_only(dir.join("index.sqlite")).unwrap();
+        &read_only
+    } else {
+        &writer
+    };
+    let baseline = read(reader, old)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{label}: the fixture generation is not readable"));
+    baseline_is_meaningful(&baseline);
+
+    let guard = arm_pause(&dir, false);
+    let raced = finish_under_busy_timeout(label, || read(reader, old));
+    let fires = pause_fires();
+    assert_eq!(fires, 1, "{label}: the pause fired {fires} times");
+    assert!(
+        writer.list_generation_paths(old).is_err(),
+        "{label}: the prune did not commit during the pause, so nothing raced"
+    );
+    let raced = raced
+        .unwrap_or_else(|error| panic!("{label}: Err after the check passed: {error}"))
+        .unwrap_or_else(|| panic!("{label}: None after the check passed"));
+    assert_eq!(
+        raced, baseline,
+        "{label}: the raced read is not the generation's pre-prune answer"
+    );
+
+    assert!(
+        read(reader, old).unwrap().is_none(),
+        "{label}: a call that starts after the prune committed must be refused"
+    );
+    assert_eq!(
+        pause_fires(),
+        1,
+        "{label}: the pause ran for a gone generation"
+    );
+    drop(guard);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn list_baseline(paths: &Vec<String>) {
+    assert!(
+        paths.iter().any(|path| path == "src/c.py") && paths.iter().any(|p| p == UNICODE_PATH),
+        "the baseline must hold the files the prune deletes: {paths:?}"
+    );
+}
+
+fn page_baseline(page: &PageView) {
+    assert!(
+        page.0 >= 1 && !page.1.is_empty(),
+        "empty baseline: {page:?}"
+    );
+}
+
+fn sites_baseline(sites: &devmap_store::UnresolvedSitesByName) {
+    assert!(
+        sites_in(sites, "src/c.py") >= 1,
+        "the baseline must hold a src/c.py site, a row the prune deletes: {sites:?}"
+    );
+    assert!(sites_in(sites, "src/a.py") >= 1, "{sites:?}");
+}
+
+fn files_baseline(sites: &devmap_store::UnresolvedSitesByName) {
+    sites_baseline(sites);
+    for file in [UNICODE_PATH, SPACED_PATH] {
+        assert!(
+            sites_in(sites, file) >= 1,
+            "no site found under {file:?}: {sites:?}"
+        );
+    }
+}
+
+#[test]
+fn a_prune_in_the_pause_leaves_list_generation_paths_its_pre_prune_files() {
+    race("list_generation_paths", false, read_list, list_baseline);
+}
+
+#[test]
+fn a_prune_in_the_pause_does_not_shrink_the_ledger_read() {
+    race(
+        "unresolved_sites_naming",
+        false,
+        read_settle,
+        sites_baseline,
+    );
+    race(
+        "unattributed_sites_in_files",
+        false,
+        read_files,
+        files_baseline,
+    );
+}
+
+#[test]
+fn a_prune_in_the_pause_leaves_search_page_in_its_hit() {
+    race("search_page_in", false, read_page, page_baseline);
+    race(
+        "search_page_in narrowed",
+        false,
+        read_page_narrowed,
+        page_baseline,
+    );
+}
+
+#[test]
+fn a_read_only_reader_keeps_its_snapshot_while_the_daemon_prunes() {
+    race("ro list_generation_paths", true, read_list, list_baseline);
+    race("ro search_page_in", true, read_page, page_baseline);
+    race("ro ledger", true, read_settle, sites_baseline);
+}
+
+#[test]
+fn ids_never_written_and_empty_keys_are_answered_by_the_check() {
+    let (dir, store, old, _latest) = raced_generation();
+    let guard = arm_pause(&dir, false);
+    for id in [0, u32::MAX, 9_999] {
+        let error = store.list_generation_paths(id).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("generation {id}")),
+            "the refusal does not name {id}: {error}"
+        );
+        assert!(store
+            .search_page_in(id, "alpha", 10, None)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .unresolved_sites_naming(id, &["settle".to_string()], 10)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .unresolved_sites_naming(id, &[], 10)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            pause_fires(),
+            0,
+            "generation {id} was answered by pausing, not by the existence check"
+        );
+    }
+    // A live generation with no keys is a read of nothing, not a refusal. The
+    // check passes, so the pause fires and the prune lands; the answer is
+    // still the snapshot's.
+    let empty_keys = store
+        .unresolved_sites_naming(old, &[], 10)
+        .unwrap()
+        .expect("an empty key list on a live generation is Some, not None");
+    assert!(empty_keys.is_empty(), "{empty_keys:?}");
+    assert_eq!(pause_fires(), 1);
+    assert!(store.list_generation_paths(old).is_err());
+    assert!(store
+        .unresolved_sites_naming(old, &[], 10)
+        .unwrap()
+        .is_none());
+    drop(guard);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unfiltered_search_page_is_unchanged_and_never_pauses() {
+    let (dir, store, old, _latest) = raced_generation();
+    let live_miss = store
+        .search_page_in(old, "no_such_symbol_zz", 10, None)
+        .unwrap()
+        .expect("a live generation whose query matches nothing is still a page");
+    assert_eq!(
+        (live_miss.total, live_miss.rows.len()),
+        (0, 0),
+        "{live_miss:?}"
+    );
+    let guard = arm_pause(&dir, false);
+    let hit = store.search_page("beta", 10).unwrap().expect("live");
+    assert!(
+        hit.total >= 1 && hit.rows.iter().any(|row| row.name == "beta"),
+        "{hit:?}"
+    );
+    let miss = store
+        .search_page("no_such_symbol_zz", 10)
+        .unwrap()
+        .expect("matching nothing is a page, not an absent generation");
+    assert_eq!((miss.total, miss.rows.len()), (0, 0), "{miss:?}");
+    assert_eq!(
+        pause_fires(),
+        0,
+        "search_page fired the generation pause; it reads through latest_snapshot"
+    );
+    drop(guard);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The second connection's prune fails before it commits. The read still looks
+/// at the snapshot that passed the check and must return those rows, and the
+/// failed writer must not have been blocked by the reader (WAL).
+#[test]
+fn a_failed_prune_during_the_snapshot_does_not_empty_it() {
+    let (dir, store, old, _latest) = raced_generation();
+    let baseline_list = read_list(&store, old).unwrap().unwrap();
+    let baseline_page = read_page(&store, old).unwrap().unwrap();
+    let baseline_sites = read_settle(&store, old).unwrap().unwrap();
+    let guard = arm_pause(&dir, true);
+
+    let list = finish_under_busy_timeout("list during a failed prune", || read_list(&store, old))
+        .expect("Err during a failed prune")
+        .expect("a failed prune turned the list into a refusal");
+    assert_eq!(list, baseline_list);
+    assert_eq!(pause_fires(), 1);
+
+    let page = finish_under_busy_timeout("search during a failed prune", || read_page(&store, old))
+        .expect("Err during a failed prune")
+        .expect("a failed prune turned the hit into None");
+    assert_eq!(page, baseline_page);
+    assert_eq!(pause_fires(), 2);
+
+    let sites =
+        finish_under_busy_timeout("ledger during a failed prune", || read_settle(&store, old))
+            .expect("Err during a failed prune")
+            .expect("a failed prune turned the ledger rows into None");
+    assert_eq!(sites, baseline_sites);
+    assert_eq!(pause_fires(), 3);
+
+    let error = PRUNE_ERROR
+        .with(|slot| slot.borrow().clone())
+        .expect("the read-only prune did not return an error");
+    let lower = error.to_ascii_lowercase();
+    assert!(
+        !lower.contains("busy") && !lower.contains("locked"),
+        "the second connection blocked instead of failing closed: {error}"
+    );
+    drop(guard);
+    assert_eq!(read_list(&store, old).unwrap().unwrap(), baseline_list);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A generation the public write path committed with no files is `Ok([])`.
+/// That is not the answer a pruned generation gives.
+#[test]
+fn a_generation_that_indexed_no_files_is_an_empty_list_not_a_pruned_one() {
+    let dir = tmp_dir("zero-file-generation");
+    let store = Store::open(dir.join("index.sqlite")).unwrap();
+    let (extractions, resolution, analysis) = pipeline(&[]);
+    let empty = store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    assert_eq!(
+        store.list_generation_paths(empty).unwrap(),
+        Vec::<String>::new(),
+        "a generation that indexed no files is Ok([]), not a refusal"
+    );
+    let page = store
+        .search_page_in(empty, "zz", 10, None)
+        .unwrap()
+        .expect("the empty generation is live, so the page is Some");
+    assert_eq!((page.total, page.rows.len()), (0, 0), "{page:?}");
+    let no_keys = store
+        .unresolved_sites_naming(empty, &[], 10)
+        .unwrap()
+        .expect("an empty key list on a live generation is Some");
+    assert!(no_keys.is_empty(), "{no_keys:?}");
+
+    let (extractions, resolution, analysis) =
+        pipeline(&[("src/a.py", "def alpha():\n    return 1\n")]);
+    let live = store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    assert!(live != empty);
+    store.prune_generations_except_latest(1).unwrap();
+
+    let error = store.list_generation_paths(empty).unwrap_err();
+    assert!(
+        error.to_string().contains(&format!("generation {empty}")),
+        "{error}"
+    );
+    assert!(store
+        .search_page_in(empty, "zz", 10, None)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .unresolved_sites_naming(empty, &[], 10)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.list_generation_paths(live).unwrap(),
+        vec!["src/a.py".to_string()],
+        "the retained generation was refused along with the pruned one"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The writer half of the cross-process probe below: a real second process,
 /// committing and pruning against the same file until told to stop.
 ///
@@ -1698,4 +2235,432 @@ fn audit_generation_id_exhaustion_rolls_back_without_wrapping_identity() {
     drop(conn);
     drop(store);
     fs::remove_dir_all(dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Attack pass on ft-9450b451 (generation_snapshot): cross-process race, seam
+// misuse, writer starvation, boundaries, non-WAL.
+// ---------------------------------------------------------------------------
+
+/// Peer process for the three-reader race. Bounded by an iteration cap and by
+/// the stop file. Each generation rewrites `src/a.py` with an untyped
+/// `.settle()` receiver call, so every generation holds one ledger row.
+#[test]
+#[ignore]
+fn attack_three_readers_prune_child() {
+    let db = std::env::var("DEVMAP_PROBE_DB").expect("DEVMAP_PROBE_DB");
+    let stop = std::env::var("DEVMAP_PROBE_STOP").expect("DEVMAP_PROBE_STOP");
+    let store = Store::open(&db).expect("child opens the store");
+    for salt in 1..=200usize {
+        if Path::new(&stop).exists() {
+            break;
+        }
+        let source = format!("def alpha_one(book):\n    return book.settle()  # {salt}\n");
+        let (extractions, resolution, analysis) = pipeline(&[("src/a.py", source.as_str())]);
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .expect("child commits");
+        store
+            .prune_generations_except_latest(1)
+            .expect("child prunes");
+    }
+}
+
+#[test]
+fn atk1_three_readers_in_a_second_process_race_never_answer_empty_or_partial() {
+    let dir = tmp_dir("atk1-three-readers");
+    let db_path = dir.join("index.sqlite");
+    let stop = dir.join("STOP");
+    {
+        let store = Store::open(&db_path).unwrap();
+        let (e, r, a) = pipeline(&[(
+            "src/a.py",
+            "def alpha_one(book):\n    return book.settle()  # 0\n",
+        )]);
+        store.save_generation(&e, &r, &a).unwrap();
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "attack_three_readers_prune_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("DEVMAP_PROBE_DB", &db_path)
+        .env("DEVMAP_PROBE_STOP", &stop)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the writer process");
+    let reader = Store::open_read_only(&db_path).unwrap();
+    let (mut reads, mut refused, mut answered) = (0u64, 0u64, 0u64);
+    let mut violations: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut child_done = false;
+    while Instant::now() < deadline && reads < 60_000 && !child_done {
+        child_done = matches!(child.try_wait(), Ok(Some(_)));
+        let Some(g) = reader.latest_generation_id().unwrap() else {
+            violations.push("latest_generation_id: None".into());
+            break;
+        };
+        reads += 1;
+        match reader.list_generation_paths(g) {
+            Ok(v) if v != ["src/a.py".to_string()] => violations.push(format!("list g={g}: {v:?}")),
+            Ok(_) => answered += 1,
+            Err(e) if e.to_string().contains("is not in this store") => refused += 1,
+            Err(e) => violations.push(format!("list g={g}: {e}")),
+        }
+        match reader.search_page_in(g, "alpha_one", 20, None) {
+            Ok(Some(p)) if p.total != 1 || p.rows.len() != 1 => violations.push(format!(
+                "page g={g}: total={} rows={}",
+                p.total,
+                p.rows.len()
+            )),
+            Ok(Some(_)) => answered += 1,
+            Ok(None) => refused += 1,
+            Err(e) => violations.push(format!("page g={g}: {e}")),
+        }
+        for (label, read) in [("naming", 0u8), ("files", 1u8)] {
+            let got = if read == 0 {
+                reader.unresolved_sites_naming(g, &["settle".to_string()], 10)
+            } else {
+                reader.unattributed_sites_in_files(g, &["src/a.py".to_string()], 10)
+            };
+            match got {
+                Ok(Some(m)) => {
+                    let n: usize = m.values().map(|(rows, _)| rows.len()).sum();
+                    // `unattributed_sites_in_files` may filter by class; only
+                    // the unfiltered read has a fixed expected count.
+                    if read == 0 && n != 1 {
+                        violations.push(format!("{label} g={g}: {n} sites {m:?}"));
+                    } else {
+                        answered += 1;
+                    }
+                }
+                Ok(None) => refused += 1,
+                Err(e) => violations.push(format!("{label} g={g}: {e}")),
+            }
+        }
+    }
+    fs::write(&stop, b"stop").unwrap();
+    let kill_at = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < kill_at => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "atk1: reads={reads} answered={answered} refused={refused} violations={}",
+        violations.len()
+    );
+    assert!(reads > 50, "the probe never got to read: {reads}");
+    assert!(
+        violations.is_empty(),
+        "{} violations in {reads} rounds:\n  {}",
+        violations.len(),
+        violations
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- attack 3 / 4 hooks ---------------------------------------------------
+
+thread_local! {
+    static STARVE_LOG: RefCell<Vec<(&'static str, Duration, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs on the reading thread with the snapshot open: a second connection does
+/// what the daemon does — commit a generation, prune, checkpoint — and every
+/// outcome and duration is recorded rather than asserted here.
+fn starving_pause() {
+    PAUSE_FIRES.with(|slot| slot.set(slot.get().saturating_add(1)));
+    let path = PRUNE_TARGET
+        .with(|slot| slot.borrow().clone())
+        .expect("no database to write");
+    let writer = Store::open(&path).expect("second connection opens");
+    let mut log = Vec::new();
+    let t = Instant::now();
+    let (e, r, a) = pipeline(&[("src/z.py", "def zed():\n    return 1\n")]);
+    let saved = writer.save_generation(&e, &r, &a);
+    log.push((
+        "save_generation",
+        t.elapsed(),
+        format!("{:?}", saved.map(|_| ())),
+    ));
+    let t = Instant::now();
+    let pruned = writer.prune_generations_except_latest(1);
+    log.push(("prune", t.elapsed(), format!("{pruned:?}")));
+    let t = Instant::now();
+    let cp = writer.checkpoint_wal();
+    log.push(("checkpoint_wal", t.elapsed(), format!("{cp:?}")));
+    STARVE_LOG.with(|slot| *slot.borrow_mut() = log);
+}
+
+fn run_bounded<T: Send + 'static>(
+    label: &str,
+    secs: u64,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(body());
+    });
+    rx.recv_timeout(Duration::from_secs(secs))
+        .unwrap_or_else(|_| panic!("{label}: hung past {secs}s (writer starved by the snapshot?)"))
+}
+
+#[test]
+fn atk3_a_writer_commit_prune_and_checkpoint_during_the_snapshot_are_bounded() {
+    let outcome = run_bounded("atk3", 40, || {
+        let (dir, store, old, _latest) = raced_generation();
+        let guard = arm_pause(&dir, false);
+        devmap_store::db::set_generation_read_pause(Some(starving_pause));
+        let t = Instant::now();
+        let raced = read_list(&store, old);
+        let total = t.elapsed();
+        let log = STARVE_LOG.with(|slot| slot.borrow().clone());
+        let fires = pause_fires();
+        drop(guard);
+        let after = store.checkpoint_wal();
+        let refused_after = store.list_generation_paths(old).is_err();
+        let _ = fs::remove_dir_all(&dir);
+        (
+            raced,
+            total,
+            log,
+            fires,
+            format!("{after:?}"),
+            refused_after,
+        )
+    });
+    let (raced, total, log, fires, after, refused_after) = outcome;
+    eprintln!("atk3: total={total:?} log={log:?} after={after}");
+    assert_eq!(fires, 1);
+    for (label, elapsed, result) in &log {
+        assert!(
+            *elapsed < Duration::from_secs(4),
+            "{label} took {elapsed:?}: {result}"
+        );
+        assert!(
+            !result.contains("Err"),
+            "{label} failed while the snapshot was open: {result}"
+        );
+    }
+    let raced = raced.unwrap().expect("the snapshot read answered None");
+    assert!(
+        raced.iter().any(|p| p == "src/c.py"),
+        "the paused list lost its rows: {raced:?}"
+    );
+    assert!(refused_after, "the prune never committed");
+    assert!(
+        after.contains("Truncate") && after.contains("busy: 0"),
+        "WAL not truncatable once the read ended: {after}"
+    );
+}
+
+fn panicking_pause() {
+    PAUSE_FIRES.with(|slot| slot.set(slot.get().saturating_add(1)));
+    panic!("attack: panic inside the generation read pause");
+}
+
+#[test]
+fn atk4_a_panicking_pause_rolls_the_snapshot_back_and_fails_closed() {
+    let (dir, store, old, _latest) = raced_generation();
+    let _guard = arm_pause(&dir, false);
+    devmap_store::db::set_generation_read_pause(Some(panicking_pause));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.list_generation_paths(old)
+    }));
+    assert!(panicked.is_err(), "the pause did not panic");
+    devmap_store::db::set_generation_read_pause(None);
+    // The abandoned snapshot must not pin the WAL: a truncating checkpoint from
+    // another connection has to finish with busy == 0.
+    let other = Store::open(dir.join("index.sqlite")).unwrap();
+    let cp = other.checkpoint_wal().unwrap();
+    assert_eq!(
+        (cp.busy, format!("{:?}", cp.mode)),
+        (0, "Truncate".to_string()),
+        "{cp:?}"
+    );
+    // The poisoned handle refuses; it does not answer, and certainly not empty.
+    let next = store.list_generation_paths(old);
+    let next_err = next.expect_err("a poisoned store answered").to_string();
+    assert!(next_err.contains("poisoned"), "{next_err}");
+    // A fresh handle on the same file reads the generation fine (not pruned here).
+    assert!(other
+        .list_generation_paths(old)
+        .unwrap()
+        .iter()
+        .any(|p| p == "src/c.py"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn atk4_the_seam_is_thread_local_and_inert_when_unset() {
+    let (dir, store, old, _latest) = raced_generation();
+    let _guard = arm_pause(&dir, false);
+    let path = dir.join("index.sqlite");
+    let other_thread = std::thread::spawn(move || {
+        let reader = Store::open_read_only(&path).unwrap();
+        let before = pause_fires();
+        let got = reader.list_generation_paths(old).map(|mut v| {
+            v.sort();
+            v
+        });
+        (before, pause_fires(), got)
+    })
+    .join()
+    .expect("the hook fired on a thread that never set it");
+    assert_eq!((other_thread.0, other_thread.1), (0, 0));
+    assert!(other_thread.2.unwrap().iter().any(|p| p == "src/c.py"));
+    assert_eq!(pause_fires(), 0, "setting the hook fired it with no read");
+    devmap_store::db::set_generation_read_pause(None);
+    assert!(store.list_generation_paths(old).is_ok());
+    assert_eq!(pause_fires(), 0, "an unset seam fired");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- attack 5 -------------------------------------------------------------
+
+#[test]
+fn atk5_key_lists_at_the_sqlite_variable_limit_are_answered_or_refused_never_empty() {
+    let (dir, store, old, _latest) = raced_generation();
+    for filler in [100usize, 32_000, 32_700, 32_760, 32_764, 40_000, 100_000] {
+        let mut keys: Vec<String> = (0..filler).map(|n| format!("nokey{n}")).collect();
+        keys.push("settle".to_string());
+        for (label, only_attr) in [("naming", false), ("unattributed", true)] {
+            let got = if only_attr {
+                store.unattributed_sites_naming(old, &keys, 5)
+            } else {
+                store.unresolved_sites_naming(old, &keys, 5)
+            };
+            match got {
+                Ok(Some(m)) => {
+                    let rows = m.get("settle").map(|(r, _)| r.len()).unwrap_or(0);
+                    assert!(
+                        rows >= 1,
+                        "{label} keys={}: Ok(Some) but settle lost its rows",
+                        keys.len()
+                    );
+                    eprintln!(
+                        "atk5 {label} keys={}: answered, settle rows={rows}",
+                        keys.len()
+                    );
+                }
+                Ok(None) => panic!("{label} keys={}: None for a live generation", keys.len()),
+                Err(e) => eprintln!("atk5 {label} keys={}: honest Err: {e}", keys.len()),
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn atk5_prune_zero_keeps_the_latest_readable_and_refuses_the_pruned() {
+    let (dir, store, old, latest) = raced_generation();
+    store.prune_generations_except_latest(0).unwrap();
+    assert_eq!(store.latest_generation_id().unwrap(), Some(latest));
+    assert!(store.list_generation_paths(old).is_err());
+    assert!(store
+        .search_page_in(old, "alpha", 10, None)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .unresolved_sites_naming(old, &["settle".to_string()], 5)
+        .unwrap()
+        .is_none());
+    let paths = store.list_generation_paths(latest).unwrap();
+    assert!(paths.iter().any(|p| p == "src/b.py"), "{paths:?}");
+    assert!(store
+        .search_page_in(latest, "beta", 10, None)
+        .unwrap()
+        .is_some_and(|p| p.total >= 1));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- attack 6 -------------------------------------------------------------
+
+fn busy_writer_pause() {
+    PAUSE_FIRES.with(|slot| slot.set(slot.get().saturating_add(1)));
+    let path = PRUNE_TARGET.with(|slot| slot.borrow().clone()).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.busy_timeout(Duration::from_millis(300)).unwrap();
+    let t = Instant::now();
+    let r = conn.execute("DELETE FROM unresolved_rows", []);
+    STARVE_LOG
+        .with(|slot| *slot.borrow_mut() = vec![("raw_delete", t.elapsed(), format!("{r:?}"))]);
+}
+
+#[test]
+fn atk6_a_store_in_rollback_journal_mode() {
+    let dir = tmp_dir("atk6-delete-mode");
+    let path = dir.join("index.sqlite");
+    let (old,) = {
+        let store = Store::open(&path).unwrap();
+        let (e, r, a) = pipeline(&[("src/ledger.py", LEDGER_SRC), ("src/a.py", A_SRC)]);
+        (store.save_generation(&e, &r, &a).unwrap(),)
+    };
+    let mode_of = |p: &Path| -> String {
+        rusqlite::Connection::open(p)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let _: String = conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+            .unwrap();
+    }
+    assert_eq!(mode_of(&path).to_lowercase(), "delete");
+    // read-only open on a rollback-mode file.
+    let ro = Store::open_read_only(&path);
+    eprintln!(
+        "atk6: open_read_only on DELETE-mode: {}",
+        if ro.is_ok() {
+            "ok".to_string()
+        } else {
+            format!("{:?}", ro.as_ref().err())
+        }
+    );
+    let ro = ro.expect("read-only open on a rollback-mode copy");
+    let baseline = read_list(&ro, old).unwrap().unwrap();
+    assert!(baseline.iter().any(|p| p == "src/a.py"));
+    assert_eq!(
+        mode_of(&path).to_lowercase(),
+        "delete",
+        "a read-only open changed the journal mode"
+    );
+    // A writer that wants the file while the snapshot is open is bounded and honest.
+    let dir2 = dir.clone();
+    let (raced, fires, log) = run_bounded("atk6 raced read", 20, move || {
+        let _guard = arm_pause(&dir2, false);
+        devmap_store::db::set_generation_read_pause(Some(busy_writer_pause));
+        let raced = read_list(&ro, old);
+        let log = STARVE_LOG.with(|slot| slot.borrow().clone());
+        (raced, pause_fires(), log)
+    });
+    eprintln!("atk6: writer during rollback-mode snapshot: {log:?}");
+    assert_eq!(fires, 1);
+    assert_eq!(raced.unwrap().unwrap(), baseline);
+    assert!(log[0].1 < Duration::from_secs(3), "{log:?}");
+    assert!(
+        log[0].2.contains("DatabaseBusy") || log[0].2.contains("DatabaseLocked"),
+        "the writer was not refused as busy: {log:?}"
+    );
+    // Full Store::open converts to WAL: show it.
+    drop(Store::open(&path).unwrap());
+    eprintln!("atk6: after Store::open, journal_mode = {}", mode_of(&path));
+    let _ = fs::remove_dir_all(&dir);
 }

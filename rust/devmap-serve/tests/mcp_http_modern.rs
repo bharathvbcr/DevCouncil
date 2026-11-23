@@ -377,6 +377,26 @@ async fn an_oversized_declared_body_is_refused() {
 
 /// THE transport-parity test.
 ///
+/// Removes every `verified_age_ms`, including inside a text block that
+/// carries a JSON document: the moment a verdict was read differs between two
+/// transports even when both report the same verdict.
+fn strip_verified_age(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("verified_age_ms");
+            map.values_mut().for_each(strip_verified_age);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_verified_age),
+        serde_json::Value::String(text) if text.starts_with('{') || text.starts_with('[') => {
+            if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text) {
+                strip_verified_age(&mut inner);
+                *text = inner.to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The server's central claim is "three transports, one answer". If HTTP and
 /// stdio can disagree on the same question, the claim is false and one of the
 /// two is lying to an agent. Compared on the `result` payload only: the
@@ -411,8 +431,13 @@ async fn http_and_stdio_answer_the_same_question_identically() {
             .await
             .expect("stdio answers");
 
+        let mut http_result = over_http["result"].clone();
+        let mut stdio_result = over_stdio["result"].clone();
+        // The age is when each transport read the verdict, not what it says.
+        strip_verified_age(&mut http_result);
+        strip_verified_age(&mut stdio_result);
         assert_eq!(
-            over_http["result"], over_stdio["result"],
+            http_result, stdio_result,
             "the transports disagree on {method} {}",
             frame["params"]
         );

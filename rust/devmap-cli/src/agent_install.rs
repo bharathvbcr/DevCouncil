@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 
+use crate::sha256::sha256_hex;
 use crate::skills::MAX_LIBRARY_BYTES;
 
 const FILE_LIMIT: usize = 256 * 1024;
@@ -536,10 +537,6 @@ fn write_atomic_bytes(path: &Path, content: &[u8]) -> anyhow::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    crate::sha256::sha256_hex(data)
 }
 
 #[cfg(test)]

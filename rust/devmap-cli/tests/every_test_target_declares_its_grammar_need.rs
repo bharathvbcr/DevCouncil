@@ -55,6 +55,10 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "python_source_roots_collect",
             "reliability_source_reads",
             "safe_fs_controls",
+            // Walker only; the bounded scan reads source text, never a grammar.
+            // Verified with `cargo check -p devmap-extract --no-default-features
+            // --all-targets`.
+            "scan_tree_bounded",
             "swift_targets_collect",
             "the_bounded_runner_under_hostile_children",
             "workspaces_collect",
@@ -152,10 +156,18 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",
+            // Both compile feature-off, checked with
+            // `cargo check -p devmap-store --no-default-features --all-targets`.
+            "a_donor_csr_is_kept_only_for_the_generation_it_was_checked_against",
             // Store opens and the WAL lock protocol; no extraction anywhere.
             "a_second_open_keeps_the_first_connections_locks",
             "a_refusal_names_its_reason_not_a_parameter",
+            "a_store_created_beside_foreign_sidecars_removes_them",
             "adversarial_store_without_grammars",
+            // Store opens, the writer lock and sidecar placement; no extraction.
+            // Verified with `cargo check -p devmap-store --no-default-features
+            // --all-targets`.
+            "creation_sweep_holds_the_writer_lock",
             // The mapped-CSR reader and writer tests and the reader memory
             // bound: store files and sidecars only. Verified with
             // `cargo check -p devmap-store --no-default-features --all-targets`
@@ -178,6 +190,10 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "page_size_and_index_contracts",
             // Store opens and hand-stamped schema rows; no extraction anywhere.
             "reader_floor",
+            // Compares two crate constants with protocols/schema-versions/v1.json;
+            // no store, no extraction. Verified with
+            // `cargo check -p devmap-store --no-default-features --all-targets`.
+            "schema_versions_manifest",
             "store_hardening_without_grammars",
             "write_breakdown_without_grammars",
         ],

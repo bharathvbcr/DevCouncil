@@ -134,7 +134,7 @@ func plantCatalog(t *testing.T, prefix string) map[string]string {
 		ext = ".exe"
 	}
 	planted := map[string]string{}
-	for _, name := range []string{"devcouncil", "devmap", "dcstore", "dcverify", "dcgrep"} {
+	for _, name := range []string{"devcouncil", "devmap", "dcstore", "dcverify", "dcgrep", "dcredact"} {
 		path := filepath.Join(bindir, name+ext)
 		if err := os.WriteFile(path, []byte("keep"), 0o755); err != nil {
 			t.Fatal(err)

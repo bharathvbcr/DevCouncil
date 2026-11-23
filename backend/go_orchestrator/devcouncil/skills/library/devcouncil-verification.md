@@ -13,7 +13,7 @@ DevCouncil's verifier is **deterministic** (no extra LLM calls for stub or secre
 It decides pass/fail from evidence: diffs, test output, coverage intersection, and policy checks.
 
 This skill does not make verification mandatory. Check `gates.mode` first
-(`dev gate status`):
+(`dev gate status --json`):
 
 - `enforce`: verification and effective blocking gaps govern task release.
 - `advisory`: verification is optional; quality findings are recorded as advisory.
@@ -23,7 +23,7 @@ Hard-safety findings remain blocking in every mode.
 
 ## Verification outputs
 
-`devcouncil_verify_task` (or `dev verify TASK-ID --json`) returns:
+`dev verify TASK-ID --json` (or the MCP tool `devcouncil_verify_task`) returns:
 
 - **`passed`** — no blocking gaps remain
 - **`blocking_gaps`** — must fix before release only in `enforce` (hard safety
@@ -32,12 +32,15 @@ Hard-safety findings remain blocking in every mode.
 - **`rigor_applied`** — which rigor gates ran; when none did,
   **`rigor_skipped_reason`** says why. An empty list is not a clean result.
 
-Read persisted state without re-verifying:
+Read persisted state without re-verifying, from a shell:
 
+```bash
+dev tool call devcouncil_get_gaps --args '{"task_id":"T-1"}'   # gaps for task_id; read each gap's blocking field
+dev tool call devcouncil_get_diff --args '{"task_id":"T-1"}'   # working-tree diff scoped to the task
 ```
-devcouncil_get_gaps           # gap list for task_id (no filter argument; read each gap's blocking field)
-devcouncil_get_diff           # working-tree diff, optionally scoped to the task
-```
+
+The MCP tools `devcouncil_get_gaps` and `devcouncil_get_diff` give the same answer.
+Exit status 0 answered, 1 refused, 2 malformed, 3 could not run here (never a clean result).
 
 Those two are the whole persisted-state surface this host serves. The typed
 actions and `allowed_next_tools` ride on the `devcouncil_verify_task` result;
@@ -95,9 +98,10 @@ supplied — `dev verify TASK-ID --coverage PATH`; the MCP tool supplies none �
 `coverage_skipped_reason` field says when it did not run. Its gap is always advisory:
 no setting promotes it to blocking.
 
-A failed verification also writes a correction manifest — the gaps and their next
-actions — beside the task. Repair from it without weakening tests or stubbing around
-a gap.
+A blocked verification records those gaps in the store and returns `blocking_gaps`
+and `next_actions` on `devcouncil_verify_task` (queryable afterward via
+`devcouncil_get_gaps`). Repair from them without weakening tests or stubbing around a
+gap.
 
 ## Repair workflow (`enforce`, or when explicitly requested)
 

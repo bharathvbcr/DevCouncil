@@ -32,8 +32,7 @@ const DefaultLeaseTTL = 15 * time.Minute
 // allowed_next_tools_test.go — every tool this host serves is one an agent may
 // legitimately reach for, so withholding one would be a restriction the next
 // person to add a tool has to rediscover.
-func AllowedNextTools(status string, hasBlockingGaps bool) []string {
-	_ = hasBlockingGaps
+func AllowedNextTools(status string) []string {
 	switch status {
 	case "planned", "in_progress", "blocked", "verified", "done":
 		return ServedToolNames()
@@ -349,6 +348,23 @@ func expiredLeasePayload(taskID string) map[string]any {
 		"suggested_tool":   "devcouncil_checkout_task",
 		"task_id":          taskID,
 	}
+}
+
+// PlannedEntries returns the task's planned files with their allowed_change, so
+// get_diff can judge a path with the same read_only-wins judge the write gate and
+// verification use. found is false for an unknown task.
+func (s *LeaseService) PlannedEntries(ctx context.Context, taskID string) (entries []dc.PlannedFile, found bool, err error) {
+	if s.Store == nil {
+		return nil, false, errors.New("not initialized")
+	}
+	task, err := s.Store.Task(ctx, taskID)
+	if err != nil {
+		return nil, false, err
+	}
+	if task == nil {
+		return nil, false, nil
+	}
+	return append([]dc.PlannedFile{}, task.PlannedFiles...), true, nil
 }
 
 // PlannedPaths returns planned file paths for a task, or ok=false details.

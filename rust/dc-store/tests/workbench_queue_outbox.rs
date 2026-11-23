@@ -663,3 +663,135 @@ fn github_sync_and_confirmed_durable_outbox_survive_restart_and_reconcile() {
         "delivered"
     );
 }
+
+#[test]
+fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leases() {
+    let (s, _) = fixture();
+    put_task(&s, "t-a", 0, "repo-a", r#","status":"ready""#);
+    put_task(&s, "t-b", 0, "repo-b", r#","status":"ready""#);
+
+    let remote_b = |id: &str, req: &str, extra: &str| {
+        format!(
+            r#"{{"id":"{id}","request_id":"{req}","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-b","git_dir":"/tmp/git-b/.git","git_common_dir":"/tmp/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main","skip_checkout_occupancy":true{extra}}}"#
+        )
+    };
+
+    // 1. While a `skip_checkout_occupancy: true` run is `prepared`, `queue.acquire` on repo-b succeeds.
+    call(&s, "runs.prepare", &remote_b("run-b-prep", "rbp-1", ""));
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Q1","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+        ),
+    );
+    let acq1 = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q1","request_id":"q1-acq","expected_revision":1}"#,
+    );
+    assert_eq!(json::<String>(&s, &acq1, "$.item.state"), "leased");
+    // Release q1 so we can test `running` and `unresolved` states.
+    call(
+        &s,
+        "queue.member.update",
+        r#"{"id":"q1","request_id":"q1-pass","expected_revision":2,"member_id":"m-b","state":"passed"}"#,
+    );
+    call(
+        &s,
+        "queue.verify",
+        &format!(
+            r#"{{"id":"q1","request_id":"q1-ver","expected_revision":3,"results":[{{"member_id":"m-b","ok":true,"head_oid":"{OID_B}","command":"test","exit_code":0,"summary":"ok"}}]}}"#
+        ),
+    );
+
+    // 2. While `skip_checkout_occupancy: true` run is `running`, `queue.acquire` on repo-b succeeds.
+    call(&s, "runs.prepare", &remote_b("run-b-live", "rbl-1", ""));
+    call(
+        &s,
+        "runs.claim",
+        r#"{"id":"run-b-live","request_id":"rbl-claim","expected_revision":1,"owner_id":"host-1","session_id":"sess-1"}"#,
+    );
+    call(
+        &s,
+        "runs.started",
+        r#"{"id":"run-b-live","request_id":"rbl-start","expected_revision":2,"owner_id":"host-1","session_id":"sess-1","process_id":12,"process_start":"boot:12"}"#,
+    );
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q2","request_id":"q2-enq","expected_revision":0,"title":"Q2","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+        ),
+    );
+    let acq2 = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q2","request_id":"q2-acq","expected_revision":1}"#,
+    );
+    assert_eq!(json::<String>(&s, &acq2, "$.item.state"), "leased");
+    call(
+        &s,
+        "queue.member.update",
+        r#"{"id":"q2","request_id":"q2-pass","expected_revision":2,"member_id":"m-b","state":"passed"}"#,
+    );
+    call(
+        &s,
+        "queue.verify",
+        &format!(
+            r#"{{"id":"q2","request_id":"q2-ver","expected_revision":3,"results":[{{"member_id":"m-b","ok":true,"head_oid":"{OID_B}","command":"test","exit_code":0,"summary":"ok"}}]}}"#
+        ),
+    );
+
+    // 3. While `skip_checkout_occupancy: true` run is `unresolved`, `queue.acquire` on repo-b succeeds.
+    call(
+        &s,
+        "runs.finish",
+        r#"{"id":"run-b-live","request_id":"rbl-unres","expected_revision":3,"owner_id":"host-1","session_id":"sess-1","outcome":"unresolved","reason":"lost ssh"}"#,
+    );
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q3","request_id":"q3-enq","expected_revision":0,"title":"Q3","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+        ),
+    );
+    let acq3 = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q3","request_id":"q3-acq","expected_revision":1}"#,
+    );
+    assert_eq!(json::<String>(&s, &acq3, "$.item.state"), "leased");
+
+    // 4. While q3 holds an active queue lease on repo-b, `runs.prepare` with
+    // `skip_checkout_occupancy: true` still obeys `queue::verify_run_lease`.
+    refuse(
+        &s,
+        "runs.prepare",
+        &remote_b("run-b-nolease", "rbnl-1", ""),
+        "checkout_busy",
+    );
+    refuse(
+        &s,
+        "runs.prepare",
+        &remote_b(
+            "run-b-badlease",
+            "rbbl-1",
+            r#","queue_id":"q3","member_id":"m-missing""#,
+        ),
+        "queue_lease_required",
+    );
+    let leased = call(
+        &s,
+        "runs.prepare",
+        &remote_b(
+            "run-b-goodlease",
+            "rbgl-1",
+            r#","queue_id":"q3","member_id":"m-b""#,
+        ),
+    );
+    assert_eq!(
+        json::<i64>(&s, &leased, "$.item.skip_checkout_occupancy"),
+        1
+    );
+}

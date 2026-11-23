@@ -193,21 +193,33 @@ type Result struct {
 // Callers turn it into a message naming the remedy rather than an empty result.
 var ErrNoBinary = errors.New("no dcgrep binary configured")
 
+func call[Req, Resp any](
+	ctx context.Context,
+	c *Client,
+	command string,
+	req Req,
+	setRoot func(*Req, string),
+) (*Resp, error) {
+	if c == nil || c.Binary == "" {
+		return nil, ErrNoBinary
+	}
+	setRoot(&req, c.Root)
+
+	var out Resp
+	if err := c.run(ctx, command, req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Search runs one search.
 //
 // Every error here names a fault, and none of them is reachable by a search
 // that simply found nothing: that is a Result with Count zero.
 func (c *Client) Search(ctx context.Context, req Request) (*Result, error) {
-	if c == nil || c.Binary == "" {
-		return nil, ErrNoBinary
-	}
-	req.Root = c.Root
-
-	var out Result
-	if err := c.run(ctx, "search", req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return call[Request, Result](ctx, c, "search", req, func(r *Request, root string) {
+		r.Root = root
+	})
 }
 
 // run is the one place this package execs the searcher.
@@ -693,15 +705,9 @@ type ListResult struct {
 // two readers of one repository, disagreeing, with no way for the agent
 // holding both answers to tell which was about the tree it was editing.
 func (c *Client) List(ctx context.Context, req ListRequest) (*ListResult, error) {
-	if c == nil || c.Binary == "" {
-		return nil, ErrNoBinary
-	}
-	req.Root = c.Root
-	var out ListResult
-	if err := c.run(ctx, "files", req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return call[ListRequest, ListResult](ctx, c, "files", req, func(r *ListRequest, root string) {
+		r.Root = root
+	})
 }
 
 // IndexRequest builds the cached indexes for a repository.
@@ -870,15 +876,9 @@ func (r *RankedResult) Partial() string {
 // so this is acceleration and ranking, never correctness. A build that fails
 // is reported; it does not make the repository unsearchable.
 func (c *Client) Index(ctx context.Context, req IndexRequest) (*IndexResult, error) {
-	if c == nil || c.Binary == "" {
-		return nil, ErrNoBinary
-	}
-	req.Root = c.Root
-	var out IndexResult
-	if err := c.run(ctx, "index", req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return call[IndexRequest, IndexResult](ctx, c, "index", req, func(r *IndexRequest, root string) {
+		r.Root = root
+	})
 }
 
 // Rank returns the files most about a query, in rank order.
@@ -893,15 +893,9 @@ func (c *Client) Index(ctx context.Context, req IndexRequest) (*IndexResult, err
 // nothing is about the query are different facts, and a caller that cannot
 // tell them apart will report the second when it means the first.
 func (c *Client) Rank(ctx context.Context, req RankedRequest) (*RankedResult, error) {
-	if c == nil || c.Binary == "" {
-		return nil, ErrNoBinary
-	}
-	req.Root = c.Root
-	var out RankedResult
-	if err := c.run(ctx, "rank", req, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return call[RankedRequest, RankedResult](ctx, c, "rank", req, func(r *RankedRequest, root string) {
+		r.Root = root
+	})
 }
 
 // Available reports whether the searcher can be reached, by asking it to

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"time"
 )
 
@@ -57,11 +58,14 @@ func strictUnmarshal(body []byte, into any) error {
 // `go test` would have printed, so a failing test's output is in the job log
 // and not only in an artifact.
 type goJSONTee struct {
+	mu           sync.Mutex
 	log, console io.Writer
 	buf          []byte
 }
 
 func (g *goJSONTee) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if _, err := g.log.Write(p); err != nil {
 		return 0, err
 	}
@@ -71,7 +75,7 @@ func (g *goJSONTee) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		g.show(g.buf[:i])
+		g.showLocked(g.buf[:i])
 		g.buf = g.buf[i+1:]
 	}
 	if len(g.buf) > maxLogLine {
@@ -81,12 +85,39 @@ func (g *goJSONTee) Write(p []byte) (int, error) {
 }
 
 func (g *goJSONTee) show(line []byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.showLocked(line)
+}
+
+func (g *goJSONTee) showLocked(line []byte) {
 	var ev struct {
 		Action, Output string
 	}
 	if json.Unmarshal(line, &ev) == nil && ev.Action == "output" {
 		_, _ = io.WriteString(g.console, ev.Output)
 	}
+}
+
+func (g *goJSONTee) flush() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.buf) > 0 {
+		g.showLocked(g.buf)
+		g.buf = nil
+	}
+}
+
+// syncWriter serializes writes to an underlying io.Writer using a shared mutex.
+type syncWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 // teeWriter writes to two places. It is a pointer type on purpose: cargo
@@ -268,6 +299,9 @@ func runAll(ctx context.Context, root string, cmds []Command, timeout time.Durat
 // Commands that name the same log share it: the first truncates, the rest
 // append, so a phase's many cargo invocations are one libtest log.
 func runPhase(ctx context.Context, root string, cmds []Command, timeout time.Duration, logDir string, stdout, stderr io.Writer) (int, []ExitInfo) {
+	var mu sync.Mutex
+	syncOut := &syncWriter{mu: &mu, w: stdout}
+	syncErr := &syncWriter{mu: &mu, w: stderr}
 	worst := 0
 	statuses := []ExitInfo{}
 	logs := map[string]*os.File{}
@@ -277,11 +311,11 @@ func runPhase(ctx context.Context, root string, cmds []Command, timeout time.Dur
 		}
 	}()
 	for _, c := range cmds {
-		fmt.Fprintln(stdout, group(c.Display))
-		info, code := runOne(ctx, root, c, timeout, logDir, logs, stdout, stderr)
-		fmt.Fprintln(stdout, "::endgroup::")
+		fmt.Fprintln(syncOut, group(c.Display))
+		info, code := runOne(ctx, root, c, timeout, logDir, logs, syncOut, syncErr)
+		fmt.Fprintln(syncOut, "::endgroup::")
 		if code != 0 {
-			fmt.Fprintln(stdout, annotate("error", fmt.Sprintf("%s exited %d", c.Display, code)))
+			fmt.Fprintln(syncOut, annotate("error", fmt.Sprintf("%s exited %d", c.Display, code)))
 		}
 		statuses = append(statuses, info)
 		if code > worst {
@@ -329,7 +363,7 @@ func runOne(ctx context.Context, root string, c Command, timeout time.Duration, 
 	dir := filepath.Join(root, filepath.FromSlash(c.Dir))
 	err := runProcess(ctx, timeout, dir, c.Env, c.Argv, out, errw)
 	if g, ok := out.(*goJSONTee); ok {
-		g.show(g.buf)
+		g.flush()
 	}
 	var exit *exec.ExitError
 	switch {

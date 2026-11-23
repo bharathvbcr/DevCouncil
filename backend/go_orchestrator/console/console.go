@@ -230,7 +230,7 @@ func (w outputWriter) Write(p []byte) (int, error) {
 		chunk := make([]byte, 0, humanBufCap)
 		chunk = append(chunk, pending...)
 		chunk = append(chunk, p[start:end]...)
-		valid := len(chunk)
+		var valid int
 		// Locate the start of the final code point, including a lone lead byte.
 		tail := len(chunk) - 1
 		for tail > 0 && !utf8.RuneStart(chunk[tail]) {

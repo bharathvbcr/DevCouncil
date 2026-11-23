@@ -114,5 +114,76 @@ fn deeply_nested_syntax_does_not_recurse_the_rust_call_stack() {
         ext.parse_outcome,
         ParseOutcome::Clean | ParseOutcome::Partial { .. }
     ));
-    assert_eq!(ext.content_hash, content_hash(&source));
+    assert_eq!(ext.content_hash, source_identity(&source));
+}
+
+/// Reference FNV-1a 64 and the length-folded source identity, restated here so
+/// these tests state the contract rather than call the function under test.
+/// `fold` is `(h ^ len * K) * P` with `K = 0x9E3779B97F4A7C15`.
+fn ref_fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn ref_identity(bytes: &[u8]) -> u64 {
+    (ref_fnv(bytes) ^ (bytes.len() as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        .wrapping_mul(0x100000001b3)
+}
+
+#[test]
+fn an_extraction_carries_the_length_folded_identity_not_plain_fnv() {
+    for (path, source) in [
+        ("a.py", "def f():\n    return 1\n"),
+        ("empty.py", ""),
+        ("b.rs", "fn main() {}\n"),
+    ] {
+        let ext = extract_file(path, source);
+        assert_eq!(
+            ext.content_hash,
+            ref_identity(source.as_bytes()),
+            "{path}: the identity folds the byte length"
+        );
+        assert_ne!(
+            ext.content_hash,
+            ref_fnv(source.as_bytes()),
+            "{path}: plain FNV is the pre-v100 identity"
+        );
+    }
+}
+
+/// A row written under plain FNV, even stamped with the current analyzer
+/// version string, is not served and is not "unchanged": the value changed with
+/// the bump, so the version string is not the only thing that retires old rows.
+#[test]
+fn a_plain_fnv_row_is_neither_served_nor_read_as_unchanged() {
+    use std::collections::BTreeMap;
+
+    let source = "def f():\n    return 1\n";
+    let store = devmap_store::Store::open_in_memory().unwrap();
+    let payload = extract_file("a.py", source);
+
+    let mut old = cache::CacheKey::for_extraction(&payload);
+    old.content_hash = ref_fnv(source.as_bytes());
+    store.admit_cached_extraction(&old, &payload).unwrap();
+    assert!(
+        store.try_get_cached_extraction(&old).unwrap().is_some(),
+        "control: the plain-FNV row is stored"
+    );
+    let current = cache::CacheKey::for_source("python", source);
+    assert!(
+        store.try_get_cached_extraction(&current).unwrap().is_none(),
+        "a plain-FNV row was served to a length-folded key"
+    );
+
+    let dir = std::env::temp_dir().join(format!("devmap-identity-delta-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.py"), source).unwrap();
+    let scanned = scan_tree(&dir).unwrap();
+    let previous = BTreeMap::from([("a.py".to_string(), ref_fnv(source.as_bytes()))]);
+    let delta = scanned.file_delta(&previous);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(delta.changed, 1, "{delta:?}");
+    assert!(!delta.is_unchanged());
 }

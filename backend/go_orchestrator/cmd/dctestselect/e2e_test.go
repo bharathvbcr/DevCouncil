@@ -85,7 +85,12 @@ func e2eRepo(t *testing.T) string {
 	}
 	sh(t, root, "git", "init", "-q", "-b", "main")
 	put(t, root, ".gitignore", ".devcouncil/\n.devmap/\ntarget/\n")
-	put(t, root, "rust/Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"ca\", \"cb\"]\n")
+	// cz depends on nothing and nothing depends on it: a selection of ca and cb
+	// is then a proper subset of the universe. Without it ca+cb is the whole
+	// workspace, which the plan collapses to everything (see runsFullSuite).
+	put(t, root, "rust/Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"ca\", \"cb\", \"cz\"]\n")
+	put(t, root, "rust/cz/Cargo.toml", "[package]\nname = \"cz\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+	put(t, root, "rust/cz/src/lib.rs", "pub fn zero() -> i32 {\n    0\n}\n")
 	put(t, root, "rust/ca/Cargo.toml", "[package]\nname = \"ca\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
 	put(t, root, "rust/ca/src/lib.rs", "pub fn price(x: i32) -> i32 {\n    x + 1\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn prices() {\n        assert_eq!(price(1), 2);\n    }\n}\n")
 	put(t, root, "rust/cb/Cargo.toml", "[package]\nname = \"cb\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[dependencies]\nca = { path = \"../ca\" }\n\n[[test]]\nname = \"it\"\npath = \"tests/it.rs\"\n")

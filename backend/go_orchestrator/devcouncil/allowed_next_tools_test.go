@@ -66,17 +66,15 @@ func TestCheckoutAllowedNextToolsAreAllServedByThisHost(t *testing.T) {
 		"planned", "in_progress", "blocked", "verified", "done",
 		"", "unknown", "archived",
 	} {
-		for _, gaps := range []bool{false, true} {
-			allowed := devcouncil.AllowedNextTools(status, gaps)
-			if len(allowed) == 0 {
-				t.Errorf("status %q names no next tool, leaving the agent nothing to call", status)
-			}
-			for _, name := range allowed {
-				if !served[name] {
-					t.Errorf("checkout of a %q task names %s as an allowed next tool, but this "+
-						"host serves no such tool; the agent's first step after checkout would "+
-						"call into nothing", status, name)
-				}
+		allowed := devcouncil.AllowedNextTools(status)
+		if len(allowed) == 0 {
+			t.Errorf("status %q names no next tool, leaving the agent nothing to call", status)
+		}
+		for _, name := range allowed {
+			if !served[name] {
+				t.Errorf("checkout of a %q task names %s as an allowed next tool, but this "+
+					"host serves no such tool; the agent's first step after checkout would "+
+					"call into nothing", status, name)
 			}
 		}
 	}

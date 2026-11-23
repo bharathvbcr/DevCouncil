@@ -60,6 +60,10 @@ fn a_reader_cannot_create_or_take_the_writer_lock() {
     let temp = Scratch::new();
     drop(Store::open(temp.db()).unwrap());
     let lock_path = Store::writer_lock_path(&temp.db());
+    // Creating the store took the writer lock and left its file; nothing holds
+    // it now, so clear it and assert what this test is about: a reader neither
+    // creates nor takes it.
+    fs::remove_file(&lock_path).unwrap();
     assert!(!lock_path.exists());
 
     let reader = Store::open_read_only(temp.db()).unwrap();
@@ -302,6 +306,9 @@ fn symlinked_database_names_cannot_bypass_writer_ownership() {
 fn hardlinked_databases_are_refused_before_diverging_wal_or_lock_files() {
     let temp = Scratch::new();
     drop(Store::open(temp.db()).unwrap());
+    // Creation left its (unheld) lock file; what is asserted below is that the
+    // refusals create none.
+    fs::remove_file(Store::writer_lock_path(&temp.db())).unwrap();
     let alias = temp.0.join("alias.sqlite");
     fs::hard_link(temp.db(), &alias).unwrap();
     let before = fs::read(temp.db()).unwrap();

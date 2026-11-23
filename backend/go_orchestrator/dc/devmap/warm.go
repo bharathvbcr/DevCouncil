@@ -418,9 +418,10 @@ const warmStderrTail = 2 << 10
 // stderrTail is the last bytes the child wrote to stderr, flattened to one
 // printable line, for inclusion in an error. Empty when it wrote nothing.
 func (s *mcpSession) stderrTail() string {
-	// CappedBuffer has no lock and exec's copier writes to it until Wait
-	// returns, so it is read only after the process is reaped. A live session
-	// reports no tail rather than racing the writer.
+	// CappedBuffer is locked, so a read cannot race the writer, but exec's copier
+	// writes to it until Wait returns: the tail is read only after the process
+	// is reaped so it is the whole of what the child said. A live session
+	// reports no tail rather than a partial one.
 	if s.stderr == nil || !s.reaped.Load() {
 		return ""
 	}

@@ -25,7 +25,8 @@ user explicitly asks for that workflow.
 1. Open `.devcouncil/repo_map.json` for subsystem entry points, critical files, and
    cross-subsystem handoff paths. Regenerate with `dev map` after large refactors.
 2. Read `AGENTS.md` / `CLAUDE.md` for workspace conventions.
-3. Read the gate mode with `dev gate status` (add `--json` for scripting).
+3. Read the gate mode with `dev gate status --json`; `dev doctor --json` says which task store `next_task` reads.
+4. Navigate with `devmap search|explore|affected … --json --root <abs repo path>` (the shell form of the `devmap_*` MCP tools).
 
 ## Dead code / liveness
 
@@ -47,15 +48,46 @@ so `devmap --help` lists the rest.
 
 ## MCP tools vs CLI
 
-| Need | Prefer |
-|---|---|
-| Task loop (checkout, verify, release) | MCP tools (`mcp__devcouncil__devcouncil_*`) |
-| Gate mode | `dev gate status` |
-| Scripting, CI, headless runs | `dev verify TASK-ID --json` |
-| Read-only inspection (gaps, diff) | MCP read tools before re-running verify |
+| Need | Shell form (lead with this) | MCP alternative |
+|---|---|---|
+| Any `devcouncil_*` tool | `dev tool call <name> --args '<json>'` | `mcp__devcouncil__devcouncil_<name>` |
+| Gate mode | `dev gate status --json` | none |
+| Verify a task | `dev verify TASK-ID --json` | `devcouncil_verify_task` |
+| Persisted gaps, diff | `dev tool call devcouncil_get_gaps --args '{"task_id":"T-1"}'` | `devcouncil_get_gaps`, `devcouncil_get_diff` |
+| Health | `dev doctor --json` | none |
+| Code navigation | `devmap search … --json --root <abs>` | `devmap_*` tools |
 
 MCP tool names in Claude Code are prefixed: `mcp__devcouncil__devcouncil_<name>`.
 Install the MCP server for a host with `dev integrate claude --apply`.
+
+**Claude Code Code Mode.** When the host gives you a REPL tool that runs JavaScript
+([Code Mode](https://code.claude.com/docs/en/code-mode)), fan the reads out in one
+script and return only what blocks. `2>/dev/null` keeps the fallback notice that
+`dev tool call` prints on stderr out of the JSON:
+
+```js
+const root = '/abs/repo', task = 'T-1', files = ['path/changed.go'];
+const j = async (p) => { const r = await p.nothrow(); // exit 1 refused, 2 malformed, 3 could not run
+  try { return { exit: r.exitCode, ...JSON.parse(r.stdout) }; } catch { return { exit: r.exitCode, raw: r.stdout.slice(0, 300) }; } };
+const [gate, gaps, tests] = await Promise.all([
+  j($`dev gate status --json --project-root ${root} 2>/dev/null`),
+  j($`dev tool call devcouncil_get_gaps --args ${JSON.stringify({ task_id: task })} --project-root ${root} 2>/dev/null`),
+  j($`devmap affected ${files} --json --root ${root} 2>/dev/null`),
+]);
+({ mode: gate.verification_mode, gapsExit: gaps.exit, blocking: gaps.gaps?.filter((g) => g.blocking),
+   tests: tests.tests?.items?.map((t) => t.path) })
+```
+
+A non-zero `gapsExit` or a `raw` field means the call did not answer: never read it as "no gaps".
+
+**When MCP is unreliable.** `dev tool call <name> --args '<json>'` runs the same
+tool, from the same registry, with the same arguments, and prints the text an MCP
+client would receive; `dev tool list` names the tools. Leases live in the task
+store, so a lease taken over MCP is renewed, verified and released from the shell
+and the other way round; keep one `client_id`. Exit status: 0 answered (for verify,
+read `passed`), 1 refused, 2 malformed call, 3 could not run here. Say in your report when you fell back.
+`dev doctor --mcp` starts each MCP server, times its handshake and `tools/list`,
+and says whether the served tools match this binary.
 
 ## MCP tools (by role)
 

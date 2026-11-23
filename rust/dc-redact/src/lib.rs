@@ -14,6 +14,31 @@
 //! take the table at all while it lived there. A second copy of the table
 //! would have been the alternative, and a second table is how a key redacted
 //! by one consumer leaks out of another.
+//!
+//! # What a value is judged on
+//!
+//! A credential-named key (`password=`, `"token": `, `--password`) is followed
+//! by a value that may be a secret or may be a reference to one, and the
+//! detectors decide which by reading the value: its length, whether it reads as
+//! an identifier or as words, whether it is a placeholder. That judgement reads
+//! at most the first `MAX_JUDGED_VALUE` (512) bytes of the value, cut at a
+//! character boundary. The detectors ask at every separator of a line, and the
+//! value after a separator can run to the end of it, so an unbounded read made
+//! a long line of repeated `password=` quadratic; the bound makes a line cost
+//! time proportional to its length (`tests/scaling.rs` measures 100 KB against
+//! 400 KB). A real password, key or token is far shorter than 512 bytes. The
+//! bound is on the judgement only: a value judged a secret is redacted whole,
+//! however long, and a value whose first 512 bytes read as words or an
+//! identifier is not judged by anything past them.
+//!
+//! # Same-line joins
+//!
+//! The scan reads one line at a time. On one line, a run of two or more quoted
+//! literals separated only by whitespace or one `+` is also scanned once as one
+//! joined literal, so a key written as two quoted halves is the key it reads as. The
+//! line as written is always scanned first, and a match in the joined copy
+//! counts only when it starts in one literal and ends in a later one. A split
+//! across lines and a headerless PEM body stay misses.
 
 /// A credential shape worth stopping a commit for.
 struct SecretPattern {
@@ -39,16 +64,36 @@ enum Body {
     Any,
     /// Letters and digits only.
     Alphanumeric,
+    /// Upper-case letters and digits only: how AWS writes every key id. For
+    /// a prefix as short as `A3T`, the case is what keeps the start of a
+    /// mixed-case base64 run from reading as a key.
+    UpperAlphanumeric,
     /// Letters, digits, `-` and `_`: the URL-safe base64 alphabet without
     /// padding. A `/` or a `.` in the run means a path or a URL, not a key.
     UrlSafe,
+    /// Any key character, and `%` and `\`: a browser cookie copied from a
+    /// header or a JSON export keeps its percent-encoding and its escapes, and
+    /// a run that ended at the first `%` left the rest of the cookie visible.
+    Cookie,
+    /// A structure the vendor's key has, checked by the function: numeric
+    /// parts, a fixed encoded host, a digit a short key always carries.
+    Shape(fn(&str) -> bool),
 }
 
 impl Body {
+    /// Whether `c` continues a key's run past the prefix.
+    fn continues(self, c: char) -> bool {
+        is_key_char(c) || matches!(self, Body::Cookie) && matches!(c, '%' | '\\')
+    }
+
     fn admits(self, body: &str) -> bool {
         match self {
-            Body::Any => true,
+            Body::Any | Body::Cookie => true,
+            Body::Shape(shape) => shape(body),
             Body::Alphanumeric => body.bytes().all(|b| b.is_ascii_alphanumeric()),
+            Body::UpperAlphanumeric => body
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()),
             Body::UrlSafe => body
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
@@ -59,7 +104,11 @@ impl Body {
 impl SecretPattern {
     /// Validated UTF-8 byte spans. Rejected prefixes do not hide subsequent
     /// candidates; a matched token is consumed once, including nested prefixes.
-    fn spans<'a>(&'a self, content: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+    fn spans<'a>(
+        &'a self,
+        content: &'a str,
+        boundary: &'a dyn Fn(usize) -> bool,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
         let pem = self.prefix == "-----BEGIN";
         let mut token_end = 0;
         let mut consumed = 0;
@@ -68,7 +117,7 @@ impl SecretPattern {
             .filter_map(move |(start, _)| {
                 // A PEM header opens with its own dashes, which are the
                 // boundary; one glued to the word before it is still a header.
-                if start < consumed || !(pem || starts_a_token(content, start)) {
+                if start < consumed || !(pem || starts_a_token(content, start) || boundary(start)) {
                     return None;
                 }
                 let end = if pem {
@@ -82,7 +131,7 @@ impl SecretPattern {
                     if start >= token_end {
                         token_end = body
                             + content[body..]
-                                .find(|c: char| !is_key_char(c))
+                                .find(|c: char| !self.body.continues(c))
                                 .unwrap_or(content.len() - body);
                     }
                     // A period closing a sentence is not part of the key.
@@ -164,11 +213,19 @@ fn pem_private_header_end(content: &str, label_at: usize) -> Option<usize> {
 /// Two evasions remain, and they are written down rather than left implied,
 /// because a gate is only safe to rely on while what it cannot see is known:
 ///
-///   - **A key split across added lines.** `const k = "sk-ant-" +` on one line
-///     and `"api03-…"` on the next is not detected; the scan reads one line at
-///     a time. Joining lines first would mean deciding where a logical line
-///     ends in every language a repository contains, and getting that wrong
-///     brings back the false positives this design exists to avoid.
+///   - **A key split across lines.** `const k = "sk-ant-" +` on one line and
+///     `"api03-…"` on the next is not detected; the scan reads one line at a
+///     time. On one line, a run of quoted literals separated only by
+///     whitespace or by one `+` is joined and scanned as one token
+///     ([`join_quoted_literals`]), but only a match that starts in one literal
+///     and ends in a later one is taken from that join. A secret wholly inside
+///     one literal is read on the original line, so the literal before it
+///     cannot hide the token start. A Rust raw string (`r`, `br`, `cr`, or
+///     `bcr`, any ASCII case, then one or more hashes) is not a join. Joining
+///     lines first would mean deciding
+///     where a logical line ends in every language a repository contains, and
+///     getting that wrong brings back the false positives this design exists
+///     to avoid.
 ///   - **A PEM body without its header.** The private-key pattern requires a
 ///     header whose label says `private key`, because matching the
 ///     dashes alone flagged certificates and public keys — ordinary
@@ -181,6 +238,11 @@ fn pem_private_header_end(content: &str, label_at: usize) -> Option<usize> {
 /// Credentials with no vendor prefix — a password, an AWS secret key, a
 /// bearer token, a JWT, a URL's inline password — are not here; they are
 /// found by their context, in [`CONTEXT_PATTERNS`].
+///
+/// Formats the vendor does not publish are taken from Kingfisher's bundled
+/// rules (MongoDB's Kingfisher, Apache-2.0, 2.16.0), and say so where they
+/// appear: a prefix, an alphabet and a length are facts about a key, not
+/// Kingfisher's expressions, and none of its patterns is copied here.
 const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "anthropic api key",
@@ -194,29 +256,48 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 24,
         body: Body::Any,
     },
+    // Stripe: `sk_`/`rk_`, the mode, and ten or more letters and digits —
+    // Kingfisher's stripe-access-token rule, which also admits a `prod` mode
+    // that Stripe's docs do not show. The floor was 24, which passed a short
+    // key. The body is checked by `stripe_body`: base64's alphabet, so an
+    // `sk_test_fixture_…` identifier is not a key while the base64 bodies
+    // other vendors issue under `sk_live_` still are, and a body with no
+    // digit must still be the 16 characters the old floor asked.
     SecretPattern {
         name: "stripe live key",
         prefix: "sk_live_",
-        min_len: 24,
-        body: Body::Any,
+        min_len: 18,
+        body: Body::Shape(stripe_body),
     },
     SecretPattern {
         name: "stripe test key",
         prefix: "sk_test_",
-        min_len: 24,
-        body: Body::Any,
+        min_len: 18,
+        body: Body::Shape(stripe_body),
+    },
+    SecretPattern {
+        name: "stripe prod key",
+        prefix: "sk_prod_",
+        min_len: 18,
+        body: Body::Shape(stripe_body),
     },
     SecretPattern {
         name: "stripe restricted test key",
         prefix: "rk_test_",
-        min_len: 24,
-        body: Body::Any,
+        min_len: 18,
+        body: Body::Shape(stripe_body),
     },
     SecretPattern {
         name: "stripe restricted live key",
         prefix: "rk_live_",
-        min_len: 24,
-        body: Body::Any,
+        min_len: 18,
+        body: Body::Shape(stripe_body),
+    },
+    SecretPattern {
+        name: "stripe restricted prod key",
+        prefix: "rk_prod_",
+        min_len: 18,
+        body: Body::Shape(stripe_body),
     },
     // OpenAI admin keys: the Admin API Keys reference's create example returns
     // a value beginning `sk-admin-`
@@ -226,6 +307,18 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "openai admin api key",
         prefix: "sk-admin-",
+        min_len: 24,
+        body: Body::Any,
+    },
+    // OpenAI service-account keys: `sk-svcacct-`, then a body written in the
+    // URL-safe alphabet with `-` and `_`, which is why the legacy `sk-` rule
+    // below (alphanumeric bodies only) never saw them. Gitleaks'
+    // `openai-api-key` rule names `sk-(?:proj|svcacct|admin)-` as one family
+    // (https://github.com/gitleaks/gitleaks, config/gitleaks.toml); OpenAI
+    // states no length, so the floor matches the sibling prefixes above.
+    SecretPattern {
+        name: "openai service account api key",
+        prefix: "sk-svcacct-",
         min_len: 24,
         body: Body::Any,
     },
@@ -268,6 +361,16 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         prefix: "AIza",
         min_len: 30,
         body: Body::Any,
+    },
+    // Gemini's `AQ.` key: `AQ.Ab8RN6` and 44 URL-safe characters. This is
+    // Kingfisher's rule. Google's API-key pages (AI Studio's, which makes
+    // every new key an auth key from 2026-05-28, and Cloud's "Manage API
+    // keys") describe auth keys but state no format.
+    SecretPattern {
+        name: "google gemini api key",
+        prefix: "AQ.Ab8RN6",
+        min_len: 53,
+        body: Body::UrlSafe,
     },
     // Google OAuth 2.0 access token. Google's Compute Engine guide prints one
     // as `ya29.AHES6ZRN3-…` (59 characters) and its IAM downscoping guide as
@@ -352,18 +455,29 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         body: Body::Any,
     },
     // GitLab token prefixes, from the table at
-    // https://docs.gitlab.com/security/tokens/ . The page states no length or
-    // character set, so the floor is the one `glpat-` already uses.
+    // https://docs.gitlab.com/security/tokens/ , which states no length or
+    // character set. GitLab's own secret-detection rules do
+    // (gitlab-org/security-products/secret-detection/secret-detection-rules,
+    // rules/mit/gitlab/gitlab.toml): every classic token is its prefix and a
+    // 20-character body of `[0-9a-zA-Z_-]`, and the routable, partitioned and
+    // versioned forms are longer. So a floor is the prefix plus 20 at most:
+    // `gldt-`, `glrt-` and `glft-` tokens are 25 characters, and the floor of
+    // 26 they shared with `glpat-` passed every one of them whole. `glwt-` is
+    // listed there only in its routable form (45 or more); its floor is still
+    // prefix plus 20, because a floor above a real token is a token passed,
+    // and one below it costs nothing for a prefix this distinctive. No floor
+    // is raised to a family's longer documented body: that would trade recall
+    // for nothing measured.
     SecretPattern {
         name: "gitlab deploy token",
         prefix: "gldt-",
-        min_len: 26,
+        min_len: 25,
         body: Body::Any,
     },
     SecretPattern {
         name: "gitlab runner authentication token",
         prefix: "glrt-",
-        min_len: 26,
+        min_len: 25,
         body: Body::Any,
     },
     SecretPattern {
@@ -393,7 +507,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "gitlab feed token",
         prefix: "glft-",
-        min_len: 26,
+        min_len: 25,
         body: Body::Any,
     },
     SecretPattern {
@@ -411,7 +525,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "gitlab workspace token",
         prefix: "glwt-",
-        min_len: 26,
+        min_len: 25,
         body: Body::Any,
     },
     SecretPattern {
@@ -424,6 +538,56 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "gitlab feature flags client token",
         prefix: "glffct-",
         min_len: 26,
+        body: Body::Any,
+    },
+    // GitLab's runner registration token, deprecated but still accepted:
+    // `GR1348941` and 20 characters (GitLab's secret-detection rules,
+    // gitlab_runner_registration_token, and Kingfisher's).
+    SecretPattern {
+        name: "gitlab runner registration token",
+        prefix: "GR1348941",
+        min_len: 29,
+        body: Body::UrlSafe,
+    },
+    // GitLab's session cookie: `_gitlab_session=` and 32 characters
+    // (Kingfisher's rule), or the cell-routed `cell-<n>-` and 64 hex
+    // (GitLab's gitlab_session_cookie rule). A session cookie is a signed-in
+    // browser: whoever holds it is that user until it expires.
+    SecretPattern {
+        name: "gitlab session cookie",
+        prefix: "_gitlab_session=",
+        min_len: 48,
+        body: Body::UrlSafe,
+    },
+    // Slack token rotation: an app that opts in gets access tokens
+    // `xoxe.xoxp-…`, `xoxe.xoxb-…` and `xoxe.xapp-…` and refresh tokens
+    // `xoxe-1-…` (https://docs.slack.dev/authentication/using-token-rotation;
+    // https://docs.slack.dev/authentication/tokens names `xoxe.xapp-`). No
+    // length is stated, so the floor is the other Slack tokens'. The rotated
+    // forms come before `xoxp-`, `xoxb-` and `xapp-`: a `.` is a token
+    // boundary, and the inner prefix would otherwise name the token.
+    SecretPattern {
+        name: "slack rotated user token",
+        prefix: "xoxe.xoxp-",
+        min_len: 30,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack rotated bot token",
+        prefix: "xoxe.xoxb-",
+        min_len: 30,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack rotated app-level token",
+        prefix: "xoxe.xapp-",
+        min_len: 30,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack refresh token",
+        prefix: "xoxe-",
+        min_len: 30,
         body: Body::Any,
     },
     SecretPattern {
@@ -449,6 +613,51 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         prefix: "xapp-",
         min_len: 30,
         body: Body::Any,
+    },
+    // Slack's older and browser-session tokens, none of which Slack's token
+    // page names; the shapes are Kingfisher's rules. Each short one carries
+    // a structure the body must have, which is what lets its floor sit low.
+    //   - `xoxo-`/`xoxs-` legacy tokens: three numeric parts and a hex secret.
+    //   - `xoxa-`/`xoxr-` legacy workspace tokens: an optional `<digit>-`,
+    //     then eight or more letters and digits. A long `xoxa-` token is
+    //     already the workspace token above.
+    //   - `xoxc-` session token: three numeric parts and 64 hex, 99 at least.
+    //   - `xoxd-` session cookie: 100 or more characters, URL-encoded.
+    SecretPattern {
+        name: "slack legacy token",
+        prefix: "xoxo-",
+        min_len: 12,
+        body: Body::Shape(slack_legacy_body),
+    },
+    SecretPattern {
+        name: "slack legacy token",
+        prefix: "xoxs-",
+        min_len: 12,
+        body: Body::Shape(slack_legacy_body),
+    },
+    SecretPattern {
+        name: "slack workspace token",
+        prefix: "xoxa-",
+        min_len: 13,
+        body: Body::Shape(slack_legacy_workspace_body),
+    },
+    SecretPattern {
+        name: "slack legacy workspace token",
+        prefix: "xoxr-",
+        min_len: 13,
+        body: Body::Shape(slack_legacy_workspace_body),
+    },
+    SecretPattern {
+        name: "slack session token",
+        prefix: "xoxc-",
+        min_len: 99,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack session cookie",
+        prefix: "xoxd-",
+        min_len: 105,
+        body: Body::Cookie,
     },
     // The URL is the credential: whoever has it can post to the channel.
     SecretPattern {
@@ -504,17 +713,81 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 20,
         body: Body::Alphanumeric,
     },
+    // The other credential ids in AWS's unique-ID prefix table
+    // (https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html#identifiers-prefixes):
+    // `ABIA`, an AWS STS service bearer token, and `ACCA`, a context-specific
+    // credential. Like `AKIA` they are 20 characters.
+    SecretPattern {
+        name: "aws sts service bearer token id",
+        prefix: "ABIA",
+        min_len: 20,
+        body: Body::UpperAlphanumeric,
+    },
+    SecretPattern {
+        name: "aws context-specific credential id",
+        prefix: "ACCA",
+        min_len: 20,
+        body: Body::UpperAlphanumeric,
+    },
+    // `A3T` and one more character: an access key id prefix that secret
+    // scanners match beside `AKIA` (gitleaks' and Betterleaks'
+    // `A3T[A-Z0-9]`). AWS's prefix table does not list it, so this is a
+    // scanner convention, not a documented format. Three characters is a
+    // short prefix, so the body must be upper case and digits, as every AWS
+    // key id is, and a mixed-case base64 run that starts `A3T` is refused.
+    SecretPattern {
+        name: "aws access key id",
+        prefix: "A3T",
+        min_len: 20,
+        body: Body::UpperAlphanumeric,
+    },
+    // Amazon Bedrock short-term API key: `bedrock-api-key-`, the base64 of a
+    // presigned URL with embedded credentials, then `&Version=1` (AWS's
+    // aws-bedrock-token-generator README, "Token Format"). The URL is on
+    // `bedrock.amazonaws.com`, 21 bytes, so its base64 is a fixed 28
+    // characters the body must open with; `&` ends the run, so the suffix
+    // stays visible and the credential does not.
+    SecretPattern {
+        name: "aws bedrock short-term api key",
+        prefix: "bedrock-api-key-",
+        min_len: 44,
+        body: Body::Shape(bedrock_presigned_body),
+    },
+    // Amazon Bedrock long-term API key: `ABSK` and 109 to 269 base64
+    // characters. Kingfisher's rule; AWS's user guide describes the key, the
+    // `ServiceApiKeyValue` of CreateServiceSpecificCredential, but not its
+    // format. The base64 alphabet and the length keep `ABSK…` names out.
+    SecretPattern {
+        name: "aws bedrock long-term api key",
+        prefix: "ABSK",
+        min_len: 113,
+        body: Body::Shape(base64_body),
+    },
     SecretPattern {
         name: "huggingface token",
         prefix: "hf_",
         min_len: 30,
         body: Body::Any,
     },
+    // HuggingFace organisation API token, deprecated but still in old
+    // organisations' hands: `huggingface_hub`'s login refuses a token that
+    // `startswith("api_org")` (src/huggingface_hub/_login.py). HuggingFace
+    // documents no length; scanners give the body as 34 letters, 42 in all.
+    // The body is letters and digits, so an `api_org_…` identifier is not one.
+    SecretPattern {
+        name: "huggingface organization token",
+        prefix: "api_org_",
+        min_len: 40,
+        body: Body::Alphanumeric,
+    },
+    // npm: `npm_` and 36 letters and digits, 40 in all. With any key
+    // character admitted, every `fn npm_…()` test name was a token. The floor
+    // stays where it was, below the real length.
     SecretPattern {
         name: "npm access token",
         prefix: "npm_",
         min_len: 36,
-        body: Body::Any,
+        body: Body::Alphanumeric,
     },
     // PyPI API token: `pypi-` and a base64 macaroon; the secret-reporting
     // docs give the pattern as `pypi-[A-Za-z0-9-_]{85,}`, 90 bytes with the
@@ -582,6 +855,40 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 30,
         body: Body::Any,
     },
+    // Groq: `gsk_` and 52 letters and digits, TruffleHog's `groq` detector
+    // (`gsk_[a-zA-Z0-9]{52}`, https://github.com/trufflesecurity/trufflehog,
+    // pkg/detectors/groq). Groq's documentation does not state the format. The
+    // floor sits below that length, and the alphanumeric body keeps a
+    // `gsk_config_value` identifier from reading as a key.
+    SecretPattern {
+        name: "groq api key",
+        prefix: "gsk_",
+        min_len: 48,
+        body: Body::Alphanumeric,
+    },
+    // Atlassian API tokens: `ATATT3` and a long run of URL-safe base64 with
+    // `=`, 186 characters after the prefix in Gitleaks'
+    // `atlassian-api-token` rule (config/gitleaks.toml). Atlassian documents
+    // no length, and other scanners anchor on the prefix alone, so the floor is
+    // half of that.
+    SecretPattern {
+        name: "atlassian api token",
+        prefix: "ATATT3",
+        min_len: 100,
+        body: Body::Shape(atlassian_body),
+    },
+    // Databricks personal access token: `dapi`, 32 hex digits and an optional
+    // `-` and digit (Kingfisher's imported Betterleaks rule
+    // `dapi[a-f0-9]{32}(?:-\d)?`; AWS Secrets Manager's partner documentation
+    // describes it as "dapi followed by 32 hexadecimal characters",
+    // https://docs.aws.amazon.com/secretsmanager/latest/userguide/mes-partner-DatabricksPAT.html).
+    // `dapi` begins ordinary words, so only the hex body makes it a key.
+    SecretPattern {
+        name: "databricks personal access token",
+        prefix: "dapi",
+        min_len: 36,
+        body: Body::Shape(databricks_body),
+    },
     SecretPattern {
         name: "private key block",
         prefix: "-----BEGIN",
@@ -589,6 +896,72 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         body: Body::Any,
     },
 ];
+
+/// Whether every byte of `body` is in standard base64's alphabet, padding
+/// included.
+fn base64_body(body: &str) -> bool {
+    body.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// Atlassian's body: the URL-safe base64 alphabet, and `=`.
+fn atlassian_body(body: &str) -> bool {
+    body.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'='))
+}
+
+/// Databricks' body: at least 32 hex digits, then optionally `-` and digits.
+fn databricks_body(body: &str) -> bool {
+    let hex = match body.rsplit_once('-') {
+        Some((hex, suffix)) if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+            hex
+        }
+        _ => body,
+    };
+    hex.len() >= 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Stripe's body: base64's alphabet — letters and digits for Stripe's own
+/// keys, `+`, `/` and `=` for the base64 keys other vendors issue under the
+/// same prefixes — so an `sk_test_fixture_loader` identifier is refused. A
+/// body under 16 characters must hold a digit: a random key's does, and a
+/// short camelCase name (`sk_live_dashboardView`) does not.
+fn stripe_body(body: &str) -> bool {
+    base64_body(body) && (body.len() >= 16 || body.bytes().any(|b| b.is_ascii_digit()))
+}
+
+/// The base64 of `bedrock.amazonaws.com`, where every presigned URL a
+/// Bedrock short-term key encodes begins. It is 21 bytes, a multiple of
+/// three, so the encoding of what follows starts on a fresh quantum and these
+/// 28 characters open every such key unchanged.
+const BEDROCK_HOST_BASE64: &str = "YmVkcm9jay5hbWF6b25hd3MuY29t";
+
+fn bedrock_presigned_body(body: &str) -> bool {
+    body.starts_with(BEDROCK_HOST_BASE64) && base64_body(body)
+}
+
+/// A Slack legacy token's body: three numeric parts, then a hex secret.
+fn slack_legacy_body(body: &str) -> bool {
+    let mut parts = body.splitn(4, '-');
+    let numeric =
+        |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A Slack legacy workspace token's body: an optional `<digit>-`, then eight
+/// or more letters and digits before anything else.
+fn slack_legacy_workspace_body(body: &str) -> bool {
+    let rest = match body.as_bytes() {
+        [d, b'-', ..] if d.is_ascii_digit() => &body[2..],
+        _ => body,
+    };
+    rest.bytes().take_while(u8::is_ascii_alphanumeric).count() >= 8
+}
 
 /// A credential with no vendor prefix, recognised by what surrounds it.
 ///
@@ -625,6 +998,11 @@ const CONTEXT_PATTERNS: &[ContextPattern] = &[
         spans: url_password_spans,
     },
     ContextPattern {
+        name: "gitlab incoming email token",
+        keep: 0,
+        spans: gitlab_incoming_email_spans,
+    },
+    ContextPattern {
         name: "password on a command line",
         keep: 0,
         spans: cli_password_spans,
@@ -640,13 +1018,559 @@ const CONTEXT_PATTERNS: &[ContextPattern] = &[
 /// sit fixtures (`"test"`), flags and enum values.
 const MIN_LITERAL_LEN: usize = 8;
 
+/// One quoted literal on `line`.
+struct Lit {
+    /// First byte of the literal, including a string prefix.
+    start: usize,
+    /// The opening quote. A triple quote still records its first byte.
+    quote_at: usize,
+    /// First byte of the raw interior.
+    content: usize,
+    /// The closing quote, or `line.len()` when the literal never closes.
+    content_end: usize,
+    /// One past the closing delimiter, or `line.len()` when it never closes.
+    end: usize,
+    /// Closed, and not a format string, a verbatim string, or an identifier
+    /// glued to the quote. Only joinable literals are concatenated.
+    joinable: bool,
+    /// A plain quote that never closed. The scan treats the quote as an
+    /// ordinary character and goes on at the next one, so an apostrophe in a
+    /// comment does not swallow the well-formed literals after it.
+    resync: bool,
+}
+
+fn is_prefix_letter(b: u8) -> bool {
+    matches!(
+        b,
+        b'r' | b'R' | b'u' | b'U' | b'b' | b'B' | b'f' | b'F' | b'c' | b'C'
+    )
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// A hashed Rust raw string: `r#"..."#`, `br#"..."#`, `cr#"..."#`, or
+/// `bcr#"..."#`, with the prefix in any ASCII case and one or more hashes.
+/// The hashes are part of the delimiter, so quotes inside it are not string
+/// boundaries and the span is not joinable. The same prefixes with no hash
+/// (`r"..."`, `br"..."`, `cr"..."`) stay ordinary prefixed literals and stay
+/// joinable. An identifier glued on the front (`xr#"..."#`) is not a raw
+/// string. An unclosed or mismatched closer runs to the end of the line and
+/// is not joinable.
+fn try_raw_hash(line: &str, i: usize) -> Option<Lit> {
+    let b = line.as_bytes();
+    if i >= b.len() || !matches!(b[i].to_ascii_lowercase(), b'b' | b'c' | b'r') {
+        return None;
+    }
+    // Longest first, so `bcr` is not read as `br` plus a stray `c`.
+    const PREFIXES: [&[u8]; 4] = [b"bcr", b"br", b"cr", b"r"];
+    let prefix_len = PREFIXES.into_iter().find_map(|prefix| {
+        let end = i.checked_add(prefix.len())?;
+        let got = b.get(i..end)?;
+        got.iter()
+            .zip(prefix)
+            .all(|(got, want)| got.eq_ignore_ascii_case(want))
+            .then_some(prefix.len())
+    })?;
+    // `foo_r#"..."#` and `xr#"..."#` are identifiers, not raw strings.
+    if i > 0 && is_ident_byte(b[i - 1]) {
+        return None;
+    }
+    let mut hash_end = i + prefix_len;
+    if hash_end >= b.len() || b[hash_end] != b'#' {
+        return None;
+    }
+    while hash_end < b.len() && b[hash_end] == b'#' {
+        hash_end += 1;
+    }
+    let hashes = hash_end - (i + prefix_len);
+    if hash_end >= b.len() || b[hash_end] != b'"' {
+        return None;
+    }
+    let quote_at = hash_end;
+    let content = quote_at + 1;
+    let mut k = content;
+    while k < b.len() {
+        if b[k] == b'"'
+            && let Some(end) = k.checked_add(1 + hashes)
+            && end <= b.len()
+            && b[k + 1..end].iter().all(|c| *c == b'#')
+        {
+            return Some(Lit {
+                start: i,
+                quote_at,
+                content,
+                content_end: k,
+                end,
+                joinable: false,
+                resync: false,
+            });
+        }
+        k += 1;
+    }
+    Some(Lit {
+        start: i,
+        quote_at,
+        content,
+        content_end: line.len(),
+        end: line.len(),
+        joinable: false,
+        resync: false,
+    })
+}
+
+/// The literal at `i`: a hashed Rust raw string, or an ordinary quote.
+fn at_literal(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    try_raw_hash(line, i).or_else(|| try_literal(line, i, dead))
+}
+
+/// The ordinary literal that starts at `i`, if one does.
+///
+/// An unclosed quote is a literal through the end of the line and is not
+/// joinable, so a `+` inside it stays text: the bytes are copied unchanged
+/// and a secret written there is still scanned. Format strings (`f`, `fr`,
+/// `rf`) and C# verbatim `@"..."` are recognised so they are not joined, and
+/// then skipped the same way. Backticks and macro calls are not literals.
+/// Hashed Rust raw strings are handled by [`try_raw_hash`] before this runs.
+fn try_literal(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    let b = line.as_bytes();
+    if i >= b.len() {
+        return None;
+    }
+    let prev_ident = i > 0 && is_ident_byte(b[i - 1]);
+    let (quote_at, format_prefix) = if b[i] == b'"' || b[i] == b'\'' {
+        (i, false)
+    } else if prev_ident || !is_prefix_letter(b[i]) {
+        return None;
+    } else {
+        let mut j = i;
+        while j < b.len() && j - i < 2 && is_prefix_letter(b[j]) {
+            j += 1;
+        }
+        if j < b.len() && is_prefix_letter(b[j]) {
+            return None;
+        }
+        if j >= b.len() || (b[j] != b'"' && b[j] != b'\'') {
+            return None;
+        }
+        let format = b[i..j].contains(&b'f') || b[i..j].contains(&b'F');
+        (j, format)
+    };
+    let quote = b[quote_at];
+    let verbatim = quote == b'"' && quote_at > 0 && b[quote_at - 1] == b'@';
+    let glued = quote_at == i && prev_ident;
+    let triple = quote_at + 2 < b.len() && b[quote_at + 1] == quote && b[quote_at + 2] == quote;
+    let single = usize::from(quote == b'\'');
+    let kind = if triple {
+        2 + single
+    } else if verbatim {
+        4
+    } else {
+        single
+    };
+    let closer = if dead.0[kind].get() {
+        None
+    } else if triple {
+        close_triple(b, quote_at, quote)
+    } else if verbatim {
+        close_verbatim(b, quote_at)
+    } else {
+        close_quoted(line, quote_at, quote)
+    };
+    // A scan of this kind that ran off the end means no later opener of the
+    // same kind closes either (an escaped quote is skipped the same way from
+    // wherever it is reached), so the answer is remembered rather than found
+    // again at every later opener: that is what keeps `"\"\"\"…` linear.
+    if closer.is_none() {
+        dead.0[kind].set(true);
+    }
+    let unclosed_open = if triple { quote_at + 3 } else { quote_at + 1 };
+    let (content, content_end, end) = closer.unwrap_or((unclosed_open, line.len(), line.len()));
+    let closed = content_end < line.len();
+    // `"$URL"` and `"Bearer ${TOKEN}"` are references written as literals.
+    // Joining one onto the string beside it pulls the reference into a value
+    // the scanners already found, and the redaction of that line changes.
+    let reference = closed && interior_is_reference(line, content, content_end);
+    Some(Lit {
+        start: i,
+        quote_at,
+        content,
+        content_end,
+        end,
+        joinable: closed && !format_prefix && !verbatim && !glued && !reference,
+        resync: !closed,
+    })
+}
+
+/// A quoted interior that names a value rather than being one: a shell
+/// `$var` (or `\$var`, as it is written inside an eval or a heredoc), a
+/// template, or a printf format with a conversion in it (`'KEY=%s\n'`). A `$`
+/// later in a password is still a character.
+fn interior_is_reference(line: &str, content: usize, content_end: usize) -> bool {
+    let v = &line[content..content_end];
+    v.starts_with('$')
+        || v.starts_with("\\$")
+        || ["${", "$(", "{{", "%("].iter().any(|t| v.contains(t))
+        || has_printf_conversion(v)
+}
+
+/// Whether `v` holds a printf conversion: `%`, optional flags, width and
+/// precision, then a conversion letter (`%s`, `%q`, `%v`, `%-8.3f`). `%%` is
+/// a literal percent sign and is not one.
+fn has_printf_conversion(v: &str) -> bool {
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if b.get(i + 1) == Some(&b'%') {
+            i += 2;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < b.len() && matches!(b[j], b'-' | b'+' | b'#' | b' ' | b'0'..=b'9' | b'.' | b'*') {
+            j += 1;
+        }
+        if j < b.len() && b"sdqvxXfFeEgGcTtpbouUi".contains(&b[j]) {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
+
+/// `(content_end, end)` of a single-quoted literal, honouring backslash escapes.
+fn close_quoted(line: &str, quote_at: usize, quote: u8) -> Option<(usize, usize, usize)> {
+    let b = line.as_bytes();
+    let mut i = quote_at + 1;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 1;
+            if i >= b.len() {
+                break;
+            }
+            i += line[i..].chars().next()?.len_utf8();
+            continue;
+        }
+        if b[i] == quote {
+            return Some((quote_at + 1, i, i + 1));
+        }
+        i += line[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn close_triple(b: &[u8], quote_at: usize, quote: u8) -> Option<(usize, usize, usize)> {
+    let mut i = quote_at + 3;
+    while i + 2 < b.len() {
+        if b[i] == quote && b[i + 1] == quote && b[i + 2] == quote {
+            return Some((quote_at + 3, i, i + 3));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn close_verbatim(b: &[u8], quote_at: usize) -> Option<(usize, usize, usize)> {
+    let mut i = quote_at + 1;
+    while i < b.len() {
+        if b[i] == b'"' {
+            if i + 1 < b.len() && b[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            return Some((quote_at + 1, i, i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_hspace(b: &[u8], mut j: usize) -> usize {
+    while j < b.len() && matches!(b[j], b' ' | b'\t' | 0x0c) {
+        j += 1;
+    }
+    j
+}
+
+/// The next joinable literal after `i` when only whitespace, or whitespace
+/// around one `+`, separates them.
+fn join_sep(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    let b = line.as_bytes();
+    let j = skip_hspace(b, i);
+    if let Some(lit) = at_literal(line, j, dead)
+        && lit.joinable
+    {
+        return Some(lit);
+    }
+    if j < b.len() && b[j] == b'+' && !matches!(b.get(j + 1).copied(), Some(b'+' | b'=')) {
+        let k = skip_hspace(b, j + 1);
+        if let Some(lit) = at_literal(line, k, dead)
+            && lit.joinable
+        {
+            return Some(lit);
+        }
+    }
+    None
+}
+
+/// Quote kinds whose closer was looked for and not found, one flag each: plain
+/// `"`, plain `'`, triple `"`, triple `'`, and C# verbatim. See `try_literal`.
+#[derive(Default)]
+struct Dead([std::cell::Cell<bool>; 5]);
+
+/// Appends `range` of `line` to `out`.
+fn push_slice(out: &mut String, line: &str, range: std::ops::Range<usize>) {
+    out.push_str(&line[range]);
+}
+
+/// Whether `line` holds a run of two or more joinable literals. Stops at the
+/// second literal of the first run, so a line with no join costs one pass and
+/// a line with one costs the distance to it.
+fn has_quoted_join(line: &str, dead: &Dead) -> bool {
+    let mut i = 0;
+    while i < line.len() {
+        match at_literal(line, i, dead) {
+            Some(first) if !first.resync => {
+                if first.joinable && join_sep(line, first.end, dead).is_some() {
+                    return true;
+                }
+                i = first.end;
+            }
+            _ => i += line[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    false
+}
+
+/// The set bit that marks a [`Cut`] as the start of a joined piece.
+const PIECE: usize = 1 << (usize::BITS - 1);
+
+/// A point where the joined copy stops being a byte-for-byte copy of the line.
+///
+/// From shadow position `at()` on, shadow position `p` is line position
+/// `orig + (p - at())`, until the next cut. There is one cut per joined piece
+/// (flagged) and one after each run of pieces, so the map is sixteen bytes per
+/// literal rather than eight per byte of the line.
+struct Cut {
+    at_and_flag: usize,
+    orig: usize,
+}
+
+impl Cut {
+    fn piece(at: usize, orig: usize) -> Cut {
+        Cut {
+            at_and_flag: at | PIECE,
+            orig,
+        }
+    }
+
+    fn after(at: usize, orig: usize) -> Cut {
+        Cut {
+            at_and_flag: at,
+            orig,
+        }
+    }
+
+    fn at(&self) -> usize {
+        self.at_and_flag & !PIECE
+    }
+
+    fn is_piece(&self) -> bool {
+        self.at_and_flag & PIECE != 0
+    }
+}
+
+/// The joined copy of a line: every run of two or more joinable literals is
+/// one literal (one opening quote, the concatenated interiors, one closing
+/// quote), everything else is as written. `cuts` maps it back to the line.
+struct Joined {
+    shadow: String,
+    cuts: Vec<Cut>,
+}
+
+impl Joined {
+    /// Line position of shadow position `p`.
+    fn orig_of(&self, p: usize) -> usize {
+        match self.cuts.partition_point(|c| c.at() <= p) {
+            0 => p,
+            n => self.cuts[n - 1].orig + (p - self.cuts[n - 1].at()),
+        }
+    }
+
+    /// The line bytes a shadow span was joined from; `None` for an empty span
+    /// or one off the end of the shadow.
+    fn orig_range(&self, span: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        if span.start >= span.end || span.end > self.shadow.len() {
+            return None;
+        }
+        Some(self.orig_of(span.start)..self.orig_of(span.end - 1) + 1)
+    }
+
+    /// The cut that starts the piece holding shadow byte `p`, if one does. A
+    /// piece ends where the next cut begins, less the closing quote the copy
+    /// keeps after the last piece of a run.
+    fn piece_at(&self, p: usize) -> Option<usize> {
+        let idx = self.cuts.partition_point(|c| c.at() <= p).checked_sub(1)?;
+        if !self.cuts[idx].is_piece() {
+            return None;
+        }
+        let next = self.cuts.get(idx + 1)?;
+        let end = if next.is_piece() {
+            next.at()
+        } else {
+            next.at() - 1
+        };
+        (p < end).then_some(idx)
+    }
+
+    /// Whether `span` starts in one joined piece and ends in a later one. A
+    /// match wholly inside one piece is visible on the line as written, and
+    /// taking it from the copy too would hide the quote that bounds it.
+    fn crosses(&self, span: &std::ops::Range<usize>) -> bool {
+        if span.start >= span.end {
+            return false;
+        }
+        match (self.piece_at(span.start), self.piece_at(span.end - 1)) {
+            (Some(first), Some(last)) => last > first,
+            _ => false,
+        }
+    }
+
+    /// Whether a piece begins at shadow position `p`. A piece begins at a
+    /// quote, so a key that starts there starts a token whatever the piece
+    /// before it ended in.
+    fn is_piece_start(&self, p: usize) -> bool {
+        let mut k = self.cuts.partition_point(|c| c.at() < p);
+        while let Some(cut) = self.cuts.get(k)
+            && cut.at() == p
+        {
+            if cut.is_piece() {
+                return true;
+            }
+            k += 1;
+        }
+        false
+    }
+
+    /// The joined text of line bytes `a..b`: those bytes, less the quotes and
+    /// separators the copy took out between pieces. It is the secret as a
+    /// reader of the line sees it, and what a marker's length counts.
+    fn joined_text(&self, a: usize, b: usize) -> String {
+        let mut out = String::new();
+        // Segment i is the shadow bytes from cut i to cut i+1, which are the
+        // line bytes from cut i's `orig` on; segment -1 runs from 0 to cut 0.
+        let first = self.cuts.partition_point(|c| c.orig <= a);
+        let mut seg = first.checked_sub(1);
+        loop {
+            let (at, orig) = seg.map_or((0, 0), |k| (self.cuts[k].at(), self.cuts[k].orig));
+            if orig >= b {
+                break;
+            }
+            let next = seg.map_or(0, |k| k + 1);
+            let end = self.cuts.get(next).map_or(self.shadow.len(), |c| c.at());
+            let len = end - at;
+            let (lo, hi) = (a.max(orig), b.min(orig + len));
+            if lo < hi {
+                out.push_str(&self.shadow[at + (lo - orig)..at + (hi - orig)]);
+            }
+            if next >= self.cuts.len() {
+                break;
+            }
+            seg = Some(next);
+        }
+        out
+    }
+}
+
+/// A line in which every same-line run of two or more quoted literals is one
+/// literal, with the map back to `line`.
+///
+/// `None` when there is no such run, so the caller scans `line` itself and
+/// redaction of every other line stays byte-identical. The join is lexical,
+/// not a parse: `'` and `"` (including a Python `r`/`u`/`b` prefix and a
+/// triple quote), separated by whitespace or one `+`. Not joined: a format
+/// string, a quoted reference (`"$URL"`, `"${TOKEN}"`, `'KEY=%s'`), a backtick
+/// template, a C# verbatim string, a hashed Rust raw string, a call or macro
+/// (`concat!("A", "B")` is an accepted miss), or anything on the next line. A
+/// quote that never closes is an ordinary character, and the scan goes on at
+/// the next one. Interiors are copied raw, escapes and all; they are not
+/// decoded.
+fn join_quoted_literals(line: &str) -> Option<Joined> {
+    let b = line.as_bytes();
+    if !b.contains(&b'"') && !b.contains(&b'\'') {
+        return None;
+    }
+    let dead = Dead::default();
+    if !has_quoted_join(line, &dead) {
+        return None;
+    }
+    let mut shadow = String::with_capacity(line.len());
+    let mut cuts = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        match at_literal(line, i, &dead) {
+            Some(first) if !first.resync => {
+                let second = if first.joinable {
+                    join_sep(line, first.end, &dead)
+                } else {
+                    None
+                };
+                let Some(second) = second else {
+                    push_slice(&mut shadow, line, first.start..first.end);
+                    i = first.end;
+                    continue;
+                };
+                // One opening quote, so the scanners that already understand a
+                // quoted literal see the concatenated interior. Extra quotes of
+                // a triple-quoted piece are left out of the copy.
+                push_slice(&mut shadow, line, first.start..first.quote_at + 1);
+                let mut lit = first;
+                let mut next = Some(second);
+                loop {
+                    cuts.push(Cut::piece(shadow.len(), lit.content));
+                    push_slice(&mut shadow, line, lit.content..lit.content_end);
+                    let Some(n) = next.take() else { break };
+                    lit = n;
+                    next = join_sep(line, lit.end, &dead);
+                }
+                push_slice(&mut shadow, line, lit.content_end..lit.content_end + 1);
+                i = lit.end;
+                cuts.push(Cut::after(shadow.len(), i));
+            }
+            _ => {
+                let n = line[i..].chars().next().map_or(1, char::len_utf8);
+                push_slice(&mut shadow, line, i..i + n);
+                i += n;
+            }
+        }
+    }
+    Some(Joined { shadow, cuts })
+}
+
 /// Every credential on `line`, from both tables, as (name, span, bytes kept).
+///
+/// Spans refer to `line` as passed. A joined shadow is a different line; only
+/// a span that crosses its pieces is mapped back onto the original.
 fn detections(
     line: &str,
 ) -> impl Iterator<Item = (&'static str, std::ops::Range<usize>, usize)> + '_ {
-    let prefixed = SECRET_PATTERNS
-        .iter()
-        .flat_map(move |p| p.spans(line).map(move |s| (p.name, s, p.prefix.len())));
+    detections_at(line, &|_| false)
+}
+
+/// [`detections`] where `boundary(p)` also says that a token may start at byte
+/// `p`: the start of a joined piece, which is the quote that opens a literal.
+fn detections_at<'a>(
+    line: &'a str,
+    boundary: &'a dyn Fn(usize) -> bool,
+) -> impl Iterator<Item = (&'static str, std::ops::Range<usize>, usize)> + 'a {
+    let prefixed = SECRET_PATTERNS.iter().flat_map(move |p| {
+        p.spans(line, boundary)
+            .map(move |s| (p.name, s, p.prefix.len()))
+    });
     let contextual = CONTEXT_PATTERNS.iter().flat_map(move |p| {
         (p.spans)(line)
             .into_iter()
@@ -792,6 +1716,76 @@ fn url_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+/// The token in a GitLab incoming-email address:
+/// `incoming+<project path>-<project id>-<token>-issue@<host>`, and the
+/// `-issue-<n>` and `-merge-request` forms (Kingfisher's
+/// gitlab-incoming-mail-address-token rule). Whoever has the address can open
+/// issues and merge requests as the user it belongs to.
+///
+/// The token is what follows the last `-<digits>-` before the suffix — the
+/// project id, which the path before it may also contain digits beside —
+/// and it is judged as every literal is, so a `<your-token>` slot or a short
+/// word is not one.
+fn gitlab_incoming_email_spans(line: &str) -> Vec<std::ops::Range<usize>> {
+    /// Longest local part read. RFC 5321 allows 64 octets; a long project
+    /// path can pass that, and the bound keeps a line of `incoming+` from
+    /// being rescanned to its end from every one.
+    const MAX_LOCAL: usize = 256;
+    const LEAD: &str = "incoming+";
+    let mut spans = Vec::new();
+    for (at, _) in line.match_indices(LEAD) {
+        if !starts_a_token(line, at) {
+            continue;
+        }
+        let from = at + LEAD.len();
+        let rest = &line.as_bytes()[from..];
+        let window = &rest[..rest.len().min(MAX_LOCAL + 1)];
+        let Some(len) = window
+            .iter()
+            .position(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+        else {
+            continue;
+        };
+        if window[len] != b'@' {
+            continue;
+        }
+        let local = &line[from..from + len];
+        let Some(body) = local.strip_suffix("-merge-request").or_else(|| {
+            let issue = local.rfind("-issue")?;
+            let after = &local[issue + "-issue".len()..];
+            let numbered = after
+                .strip_prefix('-')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            (after.is_empty() || numbered).then(|| &local[..issue])
+        }) else {
+            continue;
+        };
+        // The token starts after the last `-<digits>-`, or `<digits>-` at the
+        // start of the local part.
+        let bytes = body.as_bytes();
+        let token_start = (0..bytes.len()).rev().find(|&dash| {
+            bytes[dash] == b'-' && dash + 1 < bytes.len() && {
+                let digits = bytes[..dash]
+                    .iter()
+                    .rev()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                digits > 0 && (digits == dash || bytes[dash - digits - 1] == b'-')
+            }
+        });
+        let Some(dash) = token_start else { continue };
+        let token = &body[dash + 1..];
+        let token_ok = token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+        if token_ok && token.len() >= MIN_LITERAL_LEN && !is_placeholder(token) {
+            let start = from + dash + 1;
+            spans.push(start..start + token.len());
+        }
+    }
+    spans
+}
+
 /// `<credential-named key> = <literal>`, in the spellings source, config and
 /// shell files use: `k = "v"`, `k := "v"`, `K=v`, `k: v`, `"k": "v"`.
 ///
@@ -845,6 +1839,9 @@ fn assignment_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             continue;
         };
         if !names_a_credential(key) {
+            continue;
+        }
+        if b == b':' && value_from == i + 1 && annotates_a_type(line, i) {
             continue;
         }
         if let Some(span) = literal_after(line, value_from, &mut ends) {
@@ -1061,7 +2058,7 @@ impl ValueEnds {
     ///
     /// The hop from a comma depends only on where it is, so every comma inside
     /// a chain already walked ends at the chain's end. Walking it again from
-    /// each one made a line of `password=Ab12345678Ab12345678,` repeated
+    /// each one made a line of `password=` and a comma-joined value, repeated,
     /// quadratic — one chain, as long as the line, started at every separator.
     fn reach_past_commas(&mut self, line: &str, end: usize) -> usize {
         if !line[end..].starts_with(',') {
@@ -1160,9 +2157,30 @@ fn is_literal_secret(value: &str, quoted: bool) -> bool {
             .rsplit('.')
             .next()
             .is_some_and(|last| reads_as_words(last, 1));
-    // An expression rather than a literal: a call, an index, a member access.
+    // An increment or decrement of a bare name: `++latest`, `--remaining`.
+    // Only those two: a password may start with one `!`, `-`, `+` or `*`
+    // (`!Welcomeback`), and a single operator says too little to excuse it.
+    // The operand is letters and `_` alone — no digit — as a name is.
+    let operand = value
+        .strip_prefix("++")
+        .or_else(|| value.strip_prefix("--"))
+        .unwrap_or(value);
+    let operated_name = operand.len() < value.len()
+        && !operand.is_empty()
+        && operand
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'_');
+    // An expression rather than a literal: a call, an index, a member access
+    // or path (`Duration::ZERO`), a block or object literal or format slot
+    // (`{scrubbed}`, which the unquoted value's end at `}` cuts to
+    // `{scrubbed`), an operator applied.
     let expression = !quoted
-        && (value.contains(['(', '[']) || value.contains('.') && !has_digit || qualified_name);
+        && (value.contains(['(', '['])
+            || value.starts_with('{')
+            || value.contains("::")
+            || value.contains('.') && !has_digit
+            || qualified_name
+            || operated_name);
     let plain_word = value.bytes().all(|b| b.is_ascii_lowercase()) && value.len() < 12;
     value.chars().count() >= MIN_LITERAL_LEN
         && !value.contains(char::is_whitespace)
@@ -1244,7 +2262,15 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             .any(|&(_, w)| matches!(w, "machine" | "login" | "default"));
     let next_word_at = |i: usize| words.get(i + 1).map(|&(at, _)| at);
     for (i, &(at, word)) in words.iter().enumerate() {
-        let program = word.rsplit('/').next().unwrap_or(word);
+        // The client's name, with what is glued to its front taken off: a
+        // directory, and the `=`, `(`, backtick or quote that a command
+        // recorded as `command=curl`, run as `$(curl …)` or written inside a
+        // string literal puts there. Reading only a bare `curl` passed the
+        // password after every one of those.
+        let program = word
+            .rsplit(['/', '=', '(', '`', '"', '\''])
+            .next()
+            .unwrap_or(word);
         if ATTACHED.contains(&program) || matches!(program, "sshpass" | "curl") {
             client = Some(program);
             continue;
@@ -1313,7 +2339,18 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             .chars()
             .filter(|c| !matches!(c, '"' | '\'') && !c.is_whitespace())
             .collect();
-        if is_literal_secret(&value, quoted) {
+        // A command read inside a backtick or a `$(…)` ends at the closer,
+        // which a value glued to it — ``…`curl -u user:password`, …`` in
+        // prose — would otherwise carry into its judging, hiding the generic
+        // word it is. Only the judging drops it; the redaction keeps the word
+        // whole, and a value with no closer is judged as written.
+        let unclosed = value.trim_end_matches([',', ';', '.', ':']);
+        let judged = if unclosed.ends_with(['`', ')']) {
+            unclosed.trim_end_matches(['`', ')'])
+        } else {
+            value.as_str()
+        };
+        if is_literal_secret(judged, quoted) {
             spans.push(start..end);
         }
     }
@@ -1357,12 +2394,73 @@ fn is_placeholder(value: &str) -> bool {
         .is_some_and(|open| value[open..].contains('>'));
     value.starts_with('$')
         || slot
+        || has_brace_slot(value)
         || ["${", "{{", "$(", "%("].iter().any(|t| value.contains(t))
         || WORDS.iter().any(|w| lowered.contains(w))
         || value
             .chars()
             .all(|c| c == value.chars().next().unwrap_or(c))
         || value.contains('…')
+}
+
+/// Whether `value` holds a single-brace template slot — `{}`, `{token}`,
+/// `{pw:?}`, `{0}` — the interpolation of a Rust or Python format string,
+/// which a program fills in. Like the angle-bracket slot, it needs its closing
+/// brace, and its inside must read as a name or a format spec: braces around
+/// anything else are characters of a literal. One pass, so a value of
+/// unclosed braces costs no more than its length.
+fn has_brace_slot(value: &str) -> bool {
+    let mut open = false;
+    for b in value.bytes() {
+        match b {
+            b'{' => open = true,
+            b'}' if open => return true,
+            _ if open
+                && !(b.is_ascii_alphanumeric()
+                    || matches!(b, b'_' | b'.' | b':' | b'?' | b'#')) =>
+            {
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the `:` at `colon` opens a type annotation rather than a value:
+/// `MIN_TOKEN_INTERVAL: Duration = …`, `let token: String = …`, a parameter
+/// `token_delay: Duration)`, a field `password: Password,`. The name before
+/// the colon is a credential's; what follows it is a type, and reading that
+/// type as the literal assigned flagged `Duration` as a token.
+///
+/// A type followed by `=` is annotated whatever it looks like. One followed by
+/// `)`, `,`, `;` or `{` is only when it reads as a capitalised name of words,
+/// because a YAML flow mapping writes a password the same way.
+fn annotates_a_type(line: &str, colon: usize) -> bool {
+    /// Longest type read. A type is short; the bound keeps a line of `:`s
+    /// from being rescanned to its end at every one of them.
+    const MAX_TYPE_LEN: usize = 128;
+    let rest = line[colon + 1..].trim_start();
+    let scan = &rest.as_bytes()[..rest.len().min(MAX_TYPE_LEN + 1)];
+    let len = scan
+        .iter()
+        .position(|&b| {
+            !(b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b':' | b'<' | b'>' | b'&' | b'[' | b']' | b'*'))
+        })
+        .unwrap_or(scan.len());
+    if len == 0 || len > MAX_TYPE_LEN {
+        return false;
+    }
+    let ty = &rest[..len];
+    let after = rest[len..].trim_start();
+    // Spaced: `QWxhZGRpbg=`, a base64 value's own padding, is glued to it.
+    let spaced = after.len() < rest.len() - len;
+    let assigned = spaced && after.starts_with('=') && !after[1..].starts_with(['=', '>']);
+    let named_type = after.starts_with([')', ',', ';', '{'])
+        && ty.starts_with(|c: char| c.is_ascii_uppercase())
+        && reads_as_words(ty, 1);
+    assigned || named_type
 }
 
 /// A credential found on a line: which shape it has, and the token rendered
@@ -1384,11 +2482,21 @@ pub struct SecretMatch {
 /// of another's evidence field. Table order is what makes the most specific
 /// vendor win when one prefix starts another.
 pub fn find_secret(line: &str) -> Option<SecretMatch> {
-    detections(line)
-        .next()
-        .map(|(name, span, keep)| SecretMatch {
+    if let Some((name, span, keep)) = detections(line).next() {
+        return Some(SecretMatch {
             name,
             redacted: redact(&line[span], keep),
+        });
+    }
+    // Nothing on the original line. A secret split across literals exists
+    // only in the joined copy, and only when the match itself crosses.
+    let joined = join_quoted_literals(line)?;
+    let boundary = |p: usize| joined.is_piece_start(p);
+    detections_at(&joined.shadow, &boundary)
+        .find(|(_, span, _)| joined.crosses(span))
+        .map(|(name, span, keep)| SecretMatch {
+            name,
+            redacted: redact(&joined.shadow[span], keep),
         })
 }
 
@@ -1402,6 +2510,49 @@ pub fn find_secret(line: &str) -> Option<SecretMatch> {
 /// gate reports. A token is replaced wherever it appears, not only at its
 /// first occurrence.
 pub fn redact_secrets(text: &str) -> String {
+    redact_text(text, None)
+}
+
+/// What [`redact_secrets_report`] answers: the redacted text and an exact
+/// account of what was replaced in it.
+///
+/// `non_exhaustive`: fields may be added later without breaking a vendored copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RedactionReport {
+    /// Exactly [`redact_secrets`]`(text)`, byte for byte.
+    pub text: String,
+    /// Replacements made, counting every merged span of every pass. A line
+    /// that never converged and was redacted whole counts that whole-line
+    /// replacement as one more span.
+    pub spans: usize,
+    /// Every vendor shape a detection matched, sorted and de-duplicated. A
+    /// shape whose match overlapped another's, and so shared its span, is
+    /// still named.
+    pub kinds: Vec<&'static str>,
+}
+
+/// [`redact_secrets`] that also reports how many spans it replaced and which
+/// shapes it matched, where [`find_secret`] names only the first shape on a
+/// line. Additive: the output text is identical to `redact_secrets`.
+pub fn redact_secrets_report(text: &str) -> RedactionReport {
+    let mut tally = Tally::default();
+    let text = redact_text(text, Some(&mut tally));
+    RedactionReport {
+        text,
+        spans: tally.spans,
+        kinds: tally.kinds.into_iter().collect(),
+    }
+}
+
+/// What a report accumulates while a redaction runs.
+#[derive(Default)]
+struct Tally {
+    spans: usize,
+    kinds: std::collections::BTreeSet<&'static str>,
+}
+
+fn redact_text(text: &str, mut tally: Option<&mut Tally>) -> String {
     // One line at a time, exactly as `contains_secret` reads. Every detector
     // is a one-line rule; run over a whole text, one line's `${` made the next
     // line's password look like template syntax, so the password was found by
@@ -1410,7 +2561,7 @@ pub fn redact_secrets(text: &str) -> String {
     for segment in text.split_inclusive('\n') {
         let line = segment.trim_suffix('\n');
         let line = line.trim_suffix('\r');
-        out.push_str(&redact_line(line));
+        out.push_str(&redact_line(line, tally.as_deref_mut()));
         out.push_str(&segment[line.len()..]);
     }
     out
@@ -1430,55 +2581,110 @@ const MAX_REDACTION_PASSES: usize = 16;
 /// a single pass. Redaction must leave nothing a scan would still stop, so it
 /// runs until a scan stops nothing. A line that has not converged at the cap
 /// is redacted whole: fail closed, never return a line still carrying one.
-fn redact_line(line: &str) -> String {
-    let mut text = redact_pass(line);
+fn redact_line(line: &str, mut tally: Option<&mut Tally>) -> String {
+    let mut text = redact_pass(line, tally.as_deref_mut());
     if text == line {
         return text;
     }
     for _ in 1..MAX_REDACTION_PASSES {
-        let next = redact_pass(&text);
+        let next = redact_pass(&text, tally.as_deref_mut());
         if next == text {
             return text;
         }
         text = next;
     }
+    if let Some(tally) = tally {
+        tally.spans += 1;
+    }
     redact(line, 0)
 }
 
 /// One redaction pass over a line: every detection, overlaps merged.
-fn redact_pass(text: &str) -> String {
+///
+/// Detections are found on the line as written and, when the line holds a
+/// same-line join, on the joined copy (only matches that cross pieces). They
+/// are merged in line coordinates exactly as a line with no join is, and a
+/// merged span's marker is rendered from the whole merged text, so a line
+/// with no join comes out byte for byte as it always did.
+fn redact_pass(text: &str, mut tally: Option<&mut Tally>) -> String {
+    // (span in `text`, bytes kept, found on the joined copy)
+    let mut hits: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
+    for (name, span, keep) in detections(text) {
+        if let Some(tally) = tally.as_deref_mut() {
+            tally.kinds.insert(name);
+        }
+        hits.push((span, keep, false));
+    }
+    let joined = join_quoted_literals(text);
+    if let Some(joined) = &joined {
+        let boundary = |p: usize| joined.is_piece_start(p);
+        for (name, span, keep) in detections_at(&joined.shadow, &boundary) {
+            if !joined.crosses(&span) {
+                continue;
+            }
+            if let Some(tally) = tally.as_deref_mut() {
+                tally.kinds.insert(name);
+            }
+            match joined.orig_range(&span) {
+                Some(orig) if orig.end <= text.len() => hits.push((orig, keep, true)),
+                // A span that cannot be placed on the line is still a
+                // credential: redact the line whole rather than leave it.
+                _ => {
+                    if let Some(tally) = tally {
+                        tally.spans += 1;
+                    }
+                    return redact(text, 0);
+                }
+            }
+        }
+    }
     // Preserve byte offsets until every family has been checked. Sorting and
     // merging overlaps keeps the most specific prefix at a shared start and
     // prevents replacement text from being interpreted as another credential.
     // The prefix is chosen before the length: a vendor key and a context match
     // that start together merge into the longer span, and that span still
     // shows the vendor's prefix, which says what leaked and nothing more.
-    let mut spans: Vec<_> = detections(text)
-        .map(|(_, span, keep)| (span, keep))
-        .collect();
-    spans.sort_by_key(|(span, keep)| {
+    hits.sort_by_key(|(span, keep, _)| {
         (
             span.start,
             std::cmp::Reverse(*keep),
             std::cmp::Reverse(span.end),
         )
     });
-    let mut merged: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
-    for (span, keep) in spans {
-        if let Some((previous, _)) = merged.last_mut()
+    let mut merged: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
+    for (span, keep, on_copy) in hits {
+        if let Some((previous, _, previous_on_copy)) = merged.last_mut()
             && span.start < previous.end
         {
             previous.end = previous.end.max(span.end);
+            *previous_on_copy |= on_copy;
             continue;
         }
-        merged.push((span, keep));
+        merged.push((span, keep, on_copy));
+    }
+    if let Some(tally) = tally {
+        tally.spans += merged.len();
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    for (span, keep) in merged {
-        out.push_str(&text[copied..span.start]);
-        out.push_str(&redact(&text[span.clone()], keep));
-        copied = span.end;
+    for (span, keep, on_copy) in merged {
+        // Widened, never narrowed, to character boundaries: a bad span may
+        // redact too much of a line, and cannot leave part of one in the clear.
+        let mut start = span.start.min(text.len());
+        while !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = span.end.min(text.len());
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let start = start.max(copied);
+        out.push_str(&text[copied..start]);
+        match &joined {
+            Some(joined) if on_copy => out.push_str(&redact(&joined.joined_text(start, end), keep)),
+            _ => out.push_str(&redact(&text[start..end], keep)),
+        }
+        copied = end;
     }
     out.push_str(&text[copied..]);
     out
@@ -1489,7 +2695,13 @@ fn redact_pass(text: &str) -> String {
 /// Callers that must *refuse* rather than redact use this: a value that cannot
 /// be safely stored is not the same as one that was stored redacted.
 pub fn contains_secret(text: &str) -> bool {
-    text.lines().any(|line| detections(line).next().is_some())
+    text.lines().any(|line| {
+        detections(line).next().is_some()
+            || join_quoted_literals(line).is_some_and(|joined| {
+                let boundary = |p: usize| joined.is_piece_start(p);
+                detections_at(&joined.shadow, &boundary).any(|(_, span, _)| joined.crosses(&span))
+            })
+    })
 }
 
 /// redact keeps the identifying prefix and hides the rest.
@@ -1502,9 +2714,38 @@ fn redact(token: &str, keep: usize) -> String {
 mod redaction_tests {
     use super::*;
 
+    /// A fixture written so that its source line is not a credential:
+    /// `masked` is the value with a `¦` placed where it breaks the shape a
+    /// detector reads — a key's separator, a URL's `://`, a client's name, a
+    /// JWT's `eyJ` — and the value under test is `masked` without it. See
+    /// `no_line_of_src_is_flagged_by_find_secret`. The string is leaked so a
+    /// fixture is a `&'static str` like the literal it stands for.
+    fn fixture(masked: &str) -> &'static str {
+        assert!(
+            masked.contains('¦'),
+            "a fixture must carry its mask: {masked}"
+        );
+        Box::leak(masked.replace('¦', "").into_boxed_str())
+    }
+
     /// A GitHub classic token shape, split so that no source line is one (see
     /// `no_line_of_this_file_is_itself_a_vendor_token`).
     const GITHUB_TOKEN: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyzA");
+
+    #[test]
+    fn report_counts_every_span_and_names_every_shape_on_one_line() {
+        let aws = concat!("AK", "IAQYPD7W3KXN2MZB5T");
+        let text = format!("A={GITHUB_TOKEN} B={aws}\nplain\nC={GITHUB_TOKEN}\n");
+        let report = redact_secrets_report(&text);
+        assert_eq!(report.text, redact_secrets(&text));
+        assert_eq!(report.spans, 3, "{}", report.text);
+        assert_eq!(
+            report.kinds,
+            vec!["aws access key id", "github personal access token"]
+        );
+        let clean = redact_secrets_report("nothing here\n");
+        assert_eq!((clean.spans, clean.kinds.len()), (0, 0));
+    }
 
     #[test]
     fn redacts_a_credential_in_an_argv_line() {
@@ -1603,47 +2844,47 @@ mod redaction_tests {
     fn context_detectors_find_literals_and_leave_references_alone() {
         for (line, name) in [
             (
-                r#"password = "Tr0ub4dor&3xample""#,
+                fixture(r#"password¦ = "Tr0ub4dor&3xample""#),
                 "credential assigned to a named key",
             ),
             (
-                r#"password = "pässwörd""#,
+                fixture(r#"password¦ = "pässwörd""#),
                 "credential assigned to a named key",
             ),
             (
-                "PGPASSWORD=xv9Lq2Rt7pW3 psql -h db",
+                fixture("PGPASSWORD¦=xv9Lq2Rt7pW3 psql -h db"),
                 "credential assigned to a named key",
             ),
             (
-                r#"const ADMIN_PASSWORD: &str = "Wint3r!sComing2026";"#,
+                fixture(r#"const ADMIN_PASSWORD: &str ¦= "Wint3r!sComing2026";"#),
                 "credential assigned to a named key",
             ),
             (
-                r#"val apiToken: String = "a7Hk29LmQp3ZxW8vRt5N""#,
+                fixture(r#"val apiToken: String ¦= "a7Hk29LmQp3ZxW8vRt5N""#),
                 "credential assigned to a named key",
             ),
             (
-                r#"  "apiKey": "AbC123dEf456GhI789jKl0","#,
+                fixture(r#"  "apiKey"¦: "AbC123dEf456GhI789jKl0","#),
                 "credential assigned to a named key",
             ),
             (
-                "discord_token: MTIzNDU2Nzg5MDEy.GhIjKl.MnOpQrStUvWxYz012345",
+                fixture("discord_token¦: MTIzNDU2Nzg5MDEy.GhIjKl.MnOpQrStUvWxYz012345"),
                 "credential assigned to a named key",
             ),
             (
-                "DATABASE_URL=postgres://app:s3cr3tPassw0rd@db:5432/app",
+                fixture("DATABASE_URL=postgres:¦//app:s3cr3tPassw0rd@db:5432/app"),
                 "password in a url",
             ),
             (
-                r#"{"Authorization": "Bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a0"}"#,
+                fixture(r#"{"Authorization": "Bear¦er 9f8e7d6c5b4a39281706f5e4d3c2b1a0"}"#),
                 "http authorization credential",
             ),
             (
-                r#"auth = "Basic dXNlcjpwYXNzd29yZA==""#,
+                fixture(r#"auth = "Bas¦ic dXNlcjpwYXNzd29yZA==""#),
                 "http authorization credential",
             ),
             (
-                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w",
+                fixture("eyJhbGciOiJIUzI1NiJ9.ey¦JzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w"),
                 "json web token",
             ),
         ] {
@@ -1679,11 +2920,11 @@ mod redaction_tests {
     #[test]
     fn command_line_passwords_are_found_and_prompts_are_not() {
         for line in [
-            "mysql -u root -pS3cretRootPw appdb",
-            "mysqldump --user=app -pDumpP4ss2026 shop > shop.sql",
-            "/usr/bin/mariadb -h db -pM4riaPassw0rd",
-            "sshpass -p Tr0ub4dor3x ssh deploy@host",
-            "psql --password=xv9Lq2Rt7pW3 -h db",
+            fixture("mys¦ql -u root -pS3cretRootPw appdb"),
+            fixture("mysqld¦ump --user=app -pDumpP4ss2026 shop > shop.sql"),
+            fixture("/usr/bin/mari¦adb -h db -pM4riaPassw0rd"),
+            fixture("sshp¦ass -p Tr0ub4dor3x ssh deploy@host"),
+            fixture("psql --password¦=xv9Lq2Rt7pW3 -h db"),
         ] {
             assert!(contains_secret(line), "{line}");
             let once = redact_secrets(line);
@@ -1725,13 +2966,13 @@ mod redaction_tests {
         }
         for line in [
             concat!(r#"aws_access_key_id = "AKIA"#, r#"IOSFODNN7EXAMPLE""#),
-            r#"aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#,
+            fixture(r#"aws_secret_access_key¦ = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#),
             concat!(
                 r#"WEBHOOK = "https://hooks.slack.com/services/"#,
                 r#"T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX""#
             ),
-            "postgres://app:hunter2@prod-db.internal:5432/app",
-            "amqp://app:z9@mq:5672/",
+            fixture("postgres:¦//app:hunter2@prod-db.internal:5432/app"),
+            fixture("amqp:¦//app:z9@mq:5672/"),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
         }
@@ -1740,14 +2981,20 @@ mod redaction_tests {
     #[test]
     fn context_matches_redact_their_value_and_redaction_is_idempotent() {
         for (line, value) in [
-            (r#"password = "Tr0ub4dor&3xample""#, "Tr0ub4dor&3xample"),
             (
-                "DB_PASSWORD=correcthorsebatterystaple",
+                fixture(r#"password¦ = "Tr0ub4dor&3xample""#),
+                "Tr0ub4dor&3xample",
+            ),
+            (
+                fixture("DB_PASSWORD¦=correcthorsebatterystaple"),
                 "correcthorsebatterystaple",
             ),
-            ("redis://:9xYzQ8wVu7tS6rQ5@cache:6379/0", "9xYzQ8wVu7tS6rQ5"),
             (
-                "Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b",
+                fixture("redis:¦//:9xYzQ8wVu7tS6rQ5@cache:6379/0"),
+                "9xYzQ8wVu7tS6rQ5",
+            ),
+            (
+                fixture("Authorization: Tok¦en 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"),
                 "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b",
             ),
         ] {
@@ -1767,15 +3014,15 @@ mod redaction_tests {
     #[test]
     fn no_character_at_any_position_panics_a_detector() {
         let lines = [
-            r#"password = "Tr0ub4dor&3xample""#,
-            "PGPASSWORD=xv9Lq2Rt7pW3 psql",
+            fixture(r#"password¦ = "Tr0ub4dor&3xample""#),
+            fixture("PGPASSWORD¦=xv9Lq2Rt7pW3 psql"),
             r#"const K: &str = "Wint3r!sComing2026";"#,
-            "redis://:9xYzQ8wVu7tS6rQ5@cache:6379/0",
-            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w",
+            fixture("redis:¦//:9xYzQ8wVu7tS6rQ5@cache:6379/0"),
+            fixture("Authorization: Bas¦ic dXNlcjpwYXNzd29yZA=="),
+            fixture("eyJhbGciOiJIUzI1NiJ9.ey¦JzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w"),
             "api_key: ${API_KEY:?missing}",
             concat!("-----BEGIN RSA PRIVATE", " KEY-----"),
-            "mysql -u root -p\"S3cretRootPw\" db | sshpass -p Tr0ub4dor3x ssh h",
+            fixture("mys¦ql -u root -p\"S3cretRootPw\" db | sshp¦ass -p Tr0ub4dor3x ssh h"),
         ];
         for line in lines {
             let boundaries: Vec<usize> = line
@@ -1806,7 +3053,7 @@ mod redaction_tests {
         for text in [
             "echo \"${\"\npassword = \"Tr0ub4dor3xample\"\n",
             "{{ header }}\r\napi_key: Xk29LmQp3ZxW8vRt5N\r\n",
-            "run:\n  - echo ${\n  - PGPASSWORD=xv9Lq2Rt7pW3 psql",
+            fixture("run:\n  - echo ${\n  - PGPASSWORD¦=xv9Lq2Rt7pW3 psql"),
         ] {
             assert!(contains_secret(text), "{text:?}");
             let out = redact_secrets(text);
@@ -1844,14 +3091,18 @@ mod redaction_tests {
     #[test]
     fn a_secret_value_is_redacted_whole() {
         for (line, hidden, kept) in [
-            ("api_key: Ab1234567890Xy,zzzz", vec!["Ab12", "zzzz"], ""),
             (
-                "{api_key: Ab1234567890Xy, next: 1}",
+                fixture("api_key¦: Ab1234567890Xy,zzzz"),
+                vec!["Ab12", "zzzz"],
+                "",
+            ),
+            (
+                fixture("{api_key¦: Ab1234567890Xy, next: 1}"),
                 vec!["Ab1234567890Xy"],
                 ", next: 1}",
             ),
             (
-                "mysql -u root -pS3cr3t\"x y\" appdb",
+                fixture("mys¦ql -u root -pS3cr3t\"x y\" appdb"),
                 vec!["S3cr3t", "x y"],
                 " appdb",
             ),
@@ -1870,7 +3121,7 @@ mod redaction_tests {
     /// identifier with a number on the end, a qualified type name, and a key
     /// that only begins with `password`.
     ///
-    /// The textbook `Bearer abc123def456ghi789` in a comment is *not* here: the
+    /// The textbook bearer example, `abc123def456ghi789` after the scheme, in a comment is *not* here: the
     /// corpus labels credentials by shape, published examples included, and
     /// its held-out set labels `AbC123dEf456GhI789jKl0` a secret.
     #[test]
@@ -1890,12 +3141,12 @@ mod redaction_tests {
         }
         // The same keys with literal values still are.
         for line in [
-            "secret: Tr0ub4dor-x9q",
-            "token: v1.Xk29LmQp3ZxW8vRt5N",
-            "password: Summer2024!x",
-            "auth: dXNlcjpwYXNzd29yZDEyMw==",
-            "DB_PASSWORD=correcthorsebatterystaple",
-            "// Bearer token format: Bearer abc123def456ghi789",
+            fixture("secret¦: Tr0ub4dor-x9q"),
+            fixture("token¦: v1.Xk29LmQp3ZxW8vRt5N"),
+            fixture("password¦: Summer2024!x"),
+            fixture("auth¦: dXNlcjpwYXNzd29yZDEyMw=="),
+            fixture("DB_PASSWORD¦=correcthorsebatterystaple"),
+            fixture("// Bearer token format: Bear¦er abc123def456ghi789"),
         ] {
             assert!(find_secret(line).is_some(), "{line}");
         }
@@ -1931,7 +3182,7 @@ mod redaction_tests {
             .filter(|(_, line)| {
                 SECRET_PATTERNS
                     .iter()
-                    .any(|p| p.spans(line).next().is_some())
+                    .any(|p| p.spans(line, &|_| false).next().is_some())
             })
             .map(|(i, _)| i + 1)
             .collect();
@@ -1939,6 +3190,50 @@ mod redaction_tests {
             offenders.is_empty(),
             "rust/dc-redact/src/lib.rs lines {offenders:?} carry a vendor token as written; \
              split each fixture with concat! so the source line does not"
+        );
+    }
+
+    /// No line of this crate's source is a credential by its own rules — not
+    /// only no vendor token, which the test above holds, but no assignment,
+    /// URL password, authorization header, JWT or command-line password
+    /// either. GitPulse vendors `src/` and its pre-push scan runs
+    /// [`find_secret`] on every line, so a fixture written as a literal made
+    /// it refuse its own branch. Every `src/` file is read, so a new module is
+    /// held to this too. Only line numbers are reported, never the line.
+    #[test]
+    fn no_line_of_src_is_flagged_by_find_secret() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(!files.is_empty(), "no source files under {}", src.display());
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read source file");
+            for (i, line) in text.lines().enumerate() {
+                if find_secret(line).is_some() {
+                    offenders.push(format!(
+                        "{}:{}",
+                        file.strip_prefix(&src).unwrap_or(file).display(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "{} line(s) of dc-redact/src are flagged by find_secret: {offenders:?}; \
+             write each fixture through `fixture(...)` with a `¦` breaking its shape",
+            offenders.len()
         );
     }
 
@@ -2035,7 +3330,18 @@ mod redaction_tests {
     /// ledger writer, where a stalled scan is a stalled commit.
     #[test]
     fn every_detector_scans_its_worst_line_in_linear_time() {
-        let shapes: [(&str, &str); 12] = [
+        let shapes: [(&str, &str); 23] = [
+            ("type annotation", "fn f(token: Duration) "),
+            ("incoming email", "incoming+a-1-"),
+            ("incoming email at", "incoming+a-1-b@"),
+            ("slack legacy", "xoxo-1-"),
+            ("slack cookie", "xoxd-%"),
+            ("stripe", "sk_live_"),
+            ("bedrock short", fixture("bedrock-api¦-key-")),
+            ("bedrock long", "ABSK"),
+            ("brace slots", "https://u:{a"),
+            ("glued client", fixture("x=cu¦rl -u a:Xk29LmQp3Zw ")),
+            ("prefix operator", "token=++latest "),
             ("jwt dots", "eyJ."),
             ("jwt dashes", "-eyJ"),
             ("url userinfo", "a://"),
@@ -2043,11 +3349,11 @@ mod redaction_tests {
             ("pem header", "-----BEGIN "),
             ("nested prefix", "ghp_"),
             ("cli password", "mysql -px "),
-            ("template", "${password=Ab12345678 "),
+            ("template", fixture("${password¦=Ab12345678 ")),
             ("quoted keys", "\"a\":\""),
             ("assignment", "token=\""),
             ("separators", "a:1,"),
-            ("commas", "api_key: Ab1234567890Xy,"),
+            ("commas", fixture("api_key¦: Ab1234567890Xy,")),
         ];
         for (name, unit) in shapes {
             let line = unit.repeat(400_000 / unit.len());
@@ -2068,8 +3374,8 @@ mod redaction_tests {
     /// its own, in the clear.
     #[test]
     fn redaction_repeats_until_nothing_is_left() {
-        let first = "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.c2lnbmF0dXJlMQ";
-        let second = "eyJ0eXAiOiJKV1Qi.eyJpc3MiOiJhY21l.c2lnbmF0dXJlMg";
+        let first = fixture("eyJhbGciOiJIUzI1.ey¦JzdWIiOiIxMjM0.c2lnbmF0dXJlMQ");
+        let second = fixture("eyJ0eXAiOiJKV1Qi.ey¦Jpc3MiOiJhY21l.c2lnbmF0dXJlMg");
         // No credential-named key: an assignment detector would redact the
         // whole value in one pass and hide what this is about.
         let line = format!("seen {first}-{second} next");
@@ -2088,9 +3394,9 @@ mod redaction_tests {
     #[test]
     fn an_unclosed_template_opener_hides_nothing_after_it() {
         for line in [
-            r#"const open = "{{"; const password = "Xq9vB2mL7pZ4";"#,
-            r#"echo "${" ; DB_PASSWORD=Xq9vB2mL7pZ4"#,
-            r#"tpl = "${x"; api_key = "Xq9vB2mL7pZ4""#,
+            fixture(r#"const open = "{{"; const password¦ = "Xq9vB2mL7pZ4";"#),
+            fixture(r#"echo "${" ; DB_PASSWORD¦=Xq9vB2mL7pZ4"#),
+            fixture(r#"tpl = "${x"; api_key¦ = "Xq9vB2mL7pZ4""#),
         ] {
             assert!(contains_secret(line), "missed: {line}");
             assert!(!redact_secrets(line).contains("Xq9vB2mL7pZ4"), "{line}");
@@ -2108,7 +3414,10 @@ mod redaction_tests {
     /// `>` is a character a password may contain, and it hid the password.
     #[test]
     fn only_an_angle_bracket_slot_is_a_placeholder() {
-        for line in [r#"password = "x>y2Zq81!mN""#, r#"password = "Zq81!mN<y2x""#] {
+        for line in [
+            fixture(r#"password¦ = "x>y2Zq81!mN""#),
+            fixture(r#"password¦ = "Zq81!mN<y2x""#),
+        ] {
             assert!(contains_secret(line), "missed: {line}");
         }
         for line in [
@@ -2181,6 +3490,531 @@ mod redaction_tests {
         }
         // Agreement on lines with no JWT in them would prove nothing.
         assert!(hits >= 1_000, "only {hits} generated lines held a JWT");
+    }
+
+    /// `prefix` and `body` joined at run time, so no source line of this file
+    /// is itself a vendor token.
+    fn token(prefix: &[&str], body: &str) -> String {
+        let mut t = prefix.concat();
+        t.push_str(body);
+        t
+    }
+
+    /// GitLab's own secret-detection rules give every classic token a
+    /// 20-character body, so `gldt-`, `glft-` and `glrt-` tokens are 25
+    /// characters long. The table's floor of 26 passed each of them whole.
+    #[test]
+    fn gitlab_tokens_with_a_twenty_character_body_are_found() {
+        const BODY: &str = "Xk29LmQp3ZwR7tY1uV5n";
+        for (prefix, name) in [
+            (["gl", "dt-"], "gitlab deploy token"),
+            (["gl", "ft-"], "gitlab feed token"),
+            (["gl", "rt-"], "gitlab runner authentication token"),
+            (["gl", "wt-"], "gitlab workspace token"),
+            (["gl", "pat-"], "gitlab personal access token"),
+        ] {
+            let t = token(&prefix, BODY);
+            assert_eq!(find_secret(&t).map(|m| m.name), Some(name), "{name}");
+            let line = format!("export TOKEN={t}");
+            assert!(!redact_secrets(&line).contains(BODY), "{name}");
+            // One character short of GitLab's shortest body is not a token.
+            assert_eq!(find_secret(&t[..t.len() - 1]), None, "{name}");
+        }
+        // The partitioned runner token carries `t1_`..`t3_` before its body.
+        let t = token(&["gl", "rt-", "t3_"], BODY);
+        assert_eq!(
+            find_secret(&t).map(|m| m.name),
+            Some("gitlab runner authentication token")
+        );
+    }
+
+    /// Slack's token rotation issues refresh tokens `xoxe-1-…` and rotated
+    /// access tokens `xoxe.xoxp-…`, `xoxe.xoxb-…` and `xoxe.xapp-…`. A refresh
+    /// token passed whole; a rotated token was named by the `xoxp-` inside it.
+    #[test]
+    fn slack_rotation_tokens_are_found_and_named() {
+        const BODY: &str = "1-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0";
+        for (prefix, name, shown) in [
+            (["xo", "xe-"].as_slice(), "slack refresh token", "xoxe-"),
+            (
+                ["xo", "xe.xo", "xp-"].as_slice(),
+                "slack rotated user token",
+                "xoxe.xoxp-",
+            ),
+            (
+                ["xo", "xe.xo", "xb-"].as_slice(),
+                "slack rotated bot token",
+                "xoxe.xoxb-",
+            ),
+            (
+                ["xo", "xe.xa", "pp-"].as_slice(),
+                "slack rotated app-level token",
+                "xoxe.xapp-",
+            ),
+        ] {
+            let t = token(prefix, BODY);
+            let line = format!("refresh_token={t}");
+            let found = find_secret(&line).expect(name);
+            assert_eq!(found.name, name);
+            assert!(found.redacted.starts_with(shown), "{name}");
+            assert!(!redact_secrets(&line).contains(&BODY[10..]), "{name}");
+        }
+    }
+
+    /// AWS's unique-ID prefixes for an STS service bearer token (`ABIA`) and
+    /// a context-specific credential (`ACCA`), and the `A3T` key-id prefix
+    /// secret scanners carry, beside `AKIA` and `ASIA`.
+    #[test]
+    fn aws_bearer_context_and_a3t_key_ids_are_found() {
+        const BODY: &str = "Q3EGRTWQKYZXN7M2";
+        for (prefix, name) in [
+            (["AB", "IA"].as_slice(), "aws sts service bearer token id"),
+            (
+                ["AC", "CA"].as_slice(),
+                "aws context-specific credential id",
+            ),
+            (["A3", "TX"].as_slice(), "aws access key id"),
+            (["A3", "T7"].as_slice(), "aws access key id"),
+        ] {
+            let t = token(prefix, BODY);
+            assert_eq!(t.len(), 20);
+            assert_eq!(
+                find_secret(&format!("id: {t}")).map(|m| m.name),
+                Some(name),
+                "{t}"
+            );
+        }
+        // The body is upper-case letters and digits, as AWS writes every
+        // key id: a mixed-case run that starts `A3T` is base64, not a key.
+        for line in [
+            token(&["A3", "T"], "xq9vB2mL7pZ4kR8sT1u"),
+            token(&["AB", "IA"], "q3egrtwqkyzxn7m2"),
+            token(&["ac", "ca"], BODY),
+        ] {
+            assert_eq!(find_secret(&line), None, "{line}");
+        }
+    }
+
+    /// HuggingFace organisation tokens begin `api_org_`; `huggingface_hub`'s
+    /// own login refuses a token with that prefix. The body is letters, so an
+    /// identifier that starts the same way is not one.
+    #[test]
+    fn huggingface_organisation_tokens_are_found() {
+        let t = token(&["api_", "org_"], "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh");
+        assert_eq!(
+            find_secret(&format!("HF_TOKEN={t}")).map(|m| m.name),
+            Some("huggingface organization token")
+        );
+        for line in [
+            "fn api_org_settings_handler_for_the_tenant_admin_page() {",
+            "let x = api_org_membership_lookup_table_v2.get(id);",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// `curl -u user:password` was already a detected shape, but only when
+    /// the word was `curl` itself. A command recorded as `command=curl …`, a
+    /// command substitution `$(curl …)`, or one inside a string literal hid
+    /// the client's name, and the password after it passed.
+    #[test]
+    fn a_client_name_glued_to_punctuation_is_still_the_client() {
+        for line in [
+            fixture("command=cu¦rl --user alice:Xk29LmQp3Zw https://example.test"),
+            fixture("out=$(cu¦rl -u alice:Xk29LmQp3Zw https://example.test)"),
+            fixture(r#"run("cu¦rl -u alice:Xk29LmQp3Zw https://example.test")"#),
+            fixture(r#"let cmd = "cu¦rl --user alice:Xk29LmQp3Zw";"#),
+            fixture("`cu¦rl -u alice:Xk29LmQp3Zw https://example.test`"),
+            fixture(r#"sh -c "mys¦ql -u root -pS3cretRootPw appdb""#),
+            fixture("cmd=sshp¦ass -p Tr0ub4dor3x ssh deploy@host"),
+        ] {
+            assert_eq!(
+                find_secret(line).map(|m| m.name),
+                Some("password on a command line"),
+                "{line}"
+            );
+            let out = redact_secrets(line);
+            assert!(!out.contains("Xk29LmQp3Zw"), "{line} -> {out}");
+            assert!(!out.contains("S3cretRootPw"), "{line} -> {out}");
+            assert!(!out.contains("Tr0ub4dor3x"), "{line} -> {out}");
+            assert_eq!(redact_secrets(&out), out, "not idempotent: {out}");
+        }
+        // The same rules as every other client: a reference, a prompt, a
+        // value under the length floor and a placeholder are not passwords.
+        for line in [
+            r#"command=curl -u "$USER:$PASS" https://example.test"#,
+            "command=curl -u alice https://example.test",
+            "command=curl -u alice:opaque https://example.test",
+            "out=$(curl -u alice:${TOKEN} https://example.test)",
+            "command=curl -u alice:<your-password> https://example.test",
+            "mode=curl-like retry -u 5",
+            // This crate's own doc comment: the backtick ends the command.
+            "///   - `curl -u user:password`, `--user user:password`, `-uuser:password`",
+            "see `$(curl -u user:password)` and `mysql -ppassword`;",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // Shell punctuation inside a value is a character of the password:
+        // a `.netrc` is not shell, and the rest is not the end of a command
+        // until whitespace. Each is found and redacted whole.
+        for (line, tail) in [
+            (
+                fixture("machine m login l pass¦word Ab1&2345678x"),
+                "2345678x",
+            ),
+            (fixture("sshp¦ass -p Tr0ub4dor&3xample ssh host"), "3xample"),
+            (fixture("mys¦ql -u root -pS3cr3t;Pw99 db"), "Pw99"),
+            (fixture("dock¦er login -p Xk29Lm|Qp3Zw registry"), "Qp3Zw"),
+            (fixture("psql --pass¦word Xk29Lm<Qp3Zw -h db"), "Qp3Zw"),
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+            assert!(!redact_secrets(line).contains(tail), "{line}");
+        }
+    }
+
+    /// Real npm tokens are `npm_` and 36 letters and digits. With any key
+    /// character admitted, a test function named `npm_…` was a token.
+    #[test]
+    fn an_npm_prefixed_identifier_is_not_an_npm_token() {
+        for line in [
+            "fn npm_scan_package_manifest_handles_scoped_names() {",
+            "fn npm_scan_child_sees_no_tokens_and_a_pinned_config() {",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        let t = token(&["np", "m_"], "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        assert_eq!(
+            find_secret(&format!("//registry.npmjs.org/:_authToken={t}")).map(|m| m.name),
+            Some("npm access token")
+        );
+    }
+
+    /// A type annotation names a type, not a value: `MIN_TOKEN_INTERVAL:
+    /// Duration =` read `Duration` as the literal assigned to a token.
+    #[test]
+    fn a_type_annotation_is_not_a_credential_value() {
+        for line in [
+            "const MIN_TOKEN_INTERVAL: Duration = Duration::from_millis(1);",
+            "let token_ttl_floor: Duration = Duration::ZERO;",
+            "fn wait(token_delay: Duration) {",
+            "    password: Password,",
+            "pub fn new(secret: Zeroizing, other: u8) -> Self {",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // A typed declaration with a literal still assigns one, a YAML value
+        // that is a capitalised word is still a value, and so is a base64
+        // value whose padding `=` is glued to it.
+        for line in [
+            fixture(r#"const ADMIN_PASSWORD: &str ¦= "Wint3r!sComing2026";"#),
+            fixture(r#"let token: String ¦= "a7Hk29LmQp3ZxW8vRt5N".into();"#),
+            fixture("password¦: Monkeyshines"),
+            fixture("token¦: QWxhZGRpbjpvcGVuIHNlc2FtZQ="),
+        ] {
+            assert_eq!(
+                find_secret(line).map(|m| m.name),
+                Some("credential assigned to a named key"),
+                "{line}"
+            );
+        }
+    }
+
+    /// A prefix operator applied to a name is an expression: `const token =
+    /// ++latest;` assigns a counter, not a password.
+    #[test]
+    fn a_prefix_operator_on_a_name_is_an_expression() {
+        for line in [
+            "const token = ++latest;",
+            "let token = --remaining;",
+            "token = !isStale",
+            "auth = &mutableConfig;",
+            "secret = *borrowedSecret",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // Leading punctuation in a literal password is still a password, a
+        // letters-only one included: only `++` and `--` make an expression.
+        for line in [
+            fixture("DB_PASSWORD¦=!Welcomeback"),
+            fixture("sshp¦ass -p !Welcomeback ssh h"),
+            fixture("token¦=+Correcthorse"),
+            fixture("password¦=!Xk29LmQp3Z"),
+            fixture("token¦ = -A1b2C3d4E5f6"),
+            fixture("secret¦: +Zq81mNy2x7"),
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+        }
+    }
+
+    /// A single-brace template — Rust's and Python's `{}`, `{name}`,
+    /// `{name:?}` — stands in for a value the program supplies, as `${…}` and
+    /// `<…>` already did. In a URL's userinfo and after a credential-named key
+    /// it was reported as the credential itself.
+    #[test]
+    fn a_brace_template_is_a_placeholder() {
+        for line in [
+            r#""leaked bearer token: {scrubbed}""#,
+            r#"format!("password={password}")"#,
+            r#"let url = format!("https://x:{token}@example.com/r");"#,
+            r#"write!(f, "https://user:{}@host/path", self.user)"#,
+            r#"f"https://{user}:{password}@db.internal:5432/app""#,
+            r#"format!("https://user:{pw:?}@host")"#,
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // Braces that do not form a slot are characters of the literal.
+        for line in [
+            fixture("postgres:¦//app:s3cr}t{Passw0rd@db:5432/app"),
+            fixture("postgres:¦//app:{s3cr3t-Passw0rd!}@db:5432/app"),
+            fixture(r#"password¦ = "Xq9{vB2mL7pZ4""#),
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+        }
+    }
+
+    /// `unit` repeated to exactly `len` characters: a long plant body.
+    fn body_of(unit: &str, len: usize) -> String {
+        unit.chars().cycle().take(len).collect()
+    }
+
+    /// Amazon Bedrock API keys. A short-term key is `bedrock-api-key-` and the
+    /// base64 of a presigned URL on `bedrock.amazonaws.com`, then `&Version=1`
+    /// (AWS's aws-bedrock-token-generator README). A long-term key is `ABSK`
+    /// and 109 to 269 base64 characters (Kingfisher's rule; AWS's user guide
+    /// states no format).
+    #[test]
+    fn aws_bedrock_api_keys_are_found() {
+        let host = "YmVkcm9jay5hbWF6b25hd3MuY29t";
+        let short = token(
+            &["bedrock-", "api-key-", host],
+            "Lz9BY3Rpb249Q2FsbFdpdGhCZWFyZXJUb2tlbiZYLUFtei1",
+        );
+        let long = token(
+            &["AB", "SK"],
+            &body_of("QmVkcm9ja0FQSUtleS1+Xk29Lm/Qp3Zw", 120),
+        );
+        for (line, name, tail) in [
+            (
+                format!("export AWS_BEARER_TOKEN_BEDROCK={short}&Version=1"),
+                "aws bedrock short-term api key",
+                "ZYLUFtei1",
+            ),
+            (
+                format!("key: {}", token(&["bedrock-", "api-key-"], host)),
+                "aws bedrock short-term api key",
+                "hd3MuY29t",
+            ),
+            (
+                format!("bedrock_key = \"{long}\""),
+                "aws bedrock long-term api key",
+                "Qp3Zw",
+            ),
+        ] {
+            assert_eq!(find_secret(&line).map(|m| m.name), Some(name), "{name}");
+            assert!(!redact_secrets(&line).contains(tail), "{name}");
+        }
+        for line in [
+            "fn rotate_bedrock_api_key_for_the_staging_account() {",
+            "let prefix = \"bedrock-api-key-\";",
+            "bedrock-api-key-rotation-handler-for-the-staging-account-and-more",
+            "const ABSKIP_MASK: u32 = 0x1;",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// Gemini's `AQ.` auth key, `AQ.Ab8RN6` and 44 URL-safe characters. This
+    /// is Kingfisher's rule: Google's API-key pages state no format.
+    #[test]
+    fn google_gemini_auth_keys_are_found() {
+        let key = token(&["AQ.", "Ab8RN6"], &body_of("Xk29LmQp3Zw_R7tY-1uV5n", 44));
+        assert_eq!(key.len(), 53);
+        let line = format!("GEMINI_API_KEY={key}");
+        assert_eq!(
+            find_secret(&line).map(|m| m.name),
+            Some("google gemini api key")
+        );
+        assert!(!redact_secrets(&line).contains("R7tY-1uV5n"));
+        for line in [
+            concat!("AQ.Ab8", "RN6 is the prefix"),
+            concat!(
+                "see AQ.Ab8",
+                "RN6/docs/path/that/runs/well/past/the/length/floor/here"
+            ),
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// GitLab's runner registration token (`GR1348941` and 20 characters, in
+    /// GitLab's own secret-detection rules and Kingfisher's) and its session
+    /// cookie (`_gitlab_session=` and 32 characters, Kingfisher's rule; the
+    /// cell-routed form `cell-<n>-` and 64 hex is GitLab's).
+    #[test]
+    fn gitlab_registration_tokens_and_session_cookies_are_found() {
+        let rrt = token(&["GR134", "8941"], "Xk29LmQp3Zw_R7tY-1uV");
+        let cookie = token(
+            &["_gitlab_", "session="],
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        );
+        let cell = token(
+            &["_gitlab_", "session=", "cell-1-"],
+            &body_of("0123456789abcdef", 64),
+        );
+        for (line, name, tail) in [
+            (
+                format!("REGISTRATION_TOKEN={rrt}"),
+                "gitlab runner registration token",
+                "R7tY-1uV",
+            ),
+            (
+                format!("Cookie: {cookie}; path=/"),
+                "gitlab session cookie",
+                "c4d5e6a7b8",
+            ),
+            (
+                format!("Cookie: {cell}"),
+                "gitlab session cookie",
+                "89abcdef0123",
+            ),
+        ] {
+            assert_eq!(find_secret(&line).map(|m| m.name), Some(name), "{line}");
+            assert!(!redact_secrets(&line).contains(tail), "{name}");
+        }
+        for line in [
+            concat!("GR134", "8941 is the registration token prefix"),
+            concat!("Cookie: _gitlab_", "session=${GITLAB_SESSION}"),
+            concat!("x_gitlab_", "session=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"),
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// GitLab's incoming-email address carries a user's incoming-email token:
+    /// `incoming+<project path>-<project id>-<token>-issue@…`, and the
+    /// `-issue-<n>` and `-merge-request` forms (Kingfisher's rule).
+    #[test]
+    fn gitlab_incoming_email_address_tokens_are_found() {
+        let tok = "a1b2c3d4e5f6g7h8i9j0k1l2m";
+        for local in [
+            format!("acme-web-42-{tok}-issue"),
+            format!("42-{tok}-issue-7"),
+            format!("acme.group-web-2024-42-{tok}-merge-request"),
+        ] {
+            let line = format!(
+                "Reply-To: {}{local}@gitlab.example.com",
+                ["incom", "ing+"].concat()
+            );
+            assert_eq!(
+                find_secret(&line).map(|m| m.name),
+                Some("gitlab incoming email token"),
+                "{line}"
+            );
+            let out = redact_secrets(&line);
+            assert!(!out.contains(tok), "{out}");
+            assert!(out.ends_with("@gitlab.example.com"), "{out}");
+        }
+        for line in [
+            "write to incoming+support@example.com for help",
+            "incoming+acme-42-<your-token>-issue@gitlab.example.com",
+            "incoming+acme-42-short-issue@gitlab.example.com",
+            "the incoming+ address is shown in the project's issue list",
+            "incoming+acme-web-42-a1b2c3d4e5f6g7h8i9j0-comment@example.com",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// Stripe's keys at any length Kingfisher's access-token rule admits:
+    /// `sk_`/`rk_`, `test`/`live`/`prod`, and ten or more letters and digits.
+    /// The floor of 24 passed a ten-character key, and `_prod_` had no entry.
+    /// The body is base64's alphabet, so an `sk_test_…` identifier is not a
+    /// key, and a key whose body has no digit still needs the old length.
+    #[test]
+    fn stripe_keys_of_any_admitted_length_are_found() {
+        for (prefix, name) in [
+            (["sk_", "test_"], "stripe test key"),
+            (["sk_", "live_"], "stripe live key"),
+            (["rk_", "test_"], "stripe restricted test key"),
+            (["rk_", "live_"], "stripe restricted live key"),
+            (["sk_", "prod_"], "stripe prod key"),
+            (["rk_", "prod_"], "stripe restricted prod key"),
+        ] {
+            let line = format!("STRIPE_KEY={}", token(&prefix, "Xk29LmQp3Z"));
+            assert_eq!(find_secret(&line).map(|m| m.name), Some(name), "{name}");
+            assert!(!redact_secrets(&line).contains("LmQp3Z"), "{name}");
+        }
+        // A base64 body, as other vendors issue under `sk_live_`, still is one.
+        let b64 = token(&["sk_", "live_"], &body_of("a2V5Xz+Xk29Lm/Qp3Zw=", 75));
+        assert!(find_secret(&b64).is_some());
+        for line in [
+            "fn sk_test_helpers_module() {}",
+            "let rk_live_dashboard_url = base();",
+            "use crate::sk_prod_config::load;",
+            "sk_test_fixture_loader_for_payments()",
+            "sk_live_dashboardView",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// Slack's legacy tokens (`xoxo-`/`xoxs-` with three numeric parts and a
+    /// hex secret; `xoxa-`/`xoxr-` workspace tokens), the browser session
+    /// token `xoxc-` and the session cookie `xoxd-`, which is URL-encoded and
+    /// carries `%` and `\`. All from Kingfisher's rules; Slack's token page
+    /// names none of them.
+    #[test]
+    fn slack_legacy_and_session_tokens_are_found() {
+        let hex64 = body_of("0123456789abcdef", 64);
+        let cookie = token(&["xo", "xd-"], &body_of("Xk29Lm%2FQp3Zw\\R7tY-1uV5n+", 140));
+        for (line, name, tail) in [
+            (
+                token(&["xo", "xs-"], "12345-67890-13579-0a1b2c3d4e5f"),
+                "slack legacy token",
+                "0a1b2c3d4e5f",
+            ),
+            (
+                token(&["xo", "xo-"], "1-2-3-abcdef"),
+                "slack legacy token",
+                "-abcdef",
+            ),
+            (
+                token(&["xo", "xr-"], "2-AbCd1234Ef"),
+                "slack legacy workspace token",
+                "1234Ef",
+            ),
+            (
+                token(&["xo", "xa-"], "AbCd1234Ef"),
+                "slack workspace token",
+                "1234Ef",
+            ),
+            (
+                token(
+                    &["xo", "xc-"],
+                    &format!("123456789-234567890-345678901-{hex64}"),
+                ),
+                "slack session token",
+                "89abcdef0123",
+            ),
+            (
+                format!("d={cookie}; Path=/"),
+                "slack session cookie",
+                "R7tY-1uV5n+",
+            ),
+        ] {
+            assert_eq!(find_secret(&line).map(|m| m.name), Some(name), "{line}");
+            assert!(!redact_secrets(&line).contains(tail), "{name}: {line}");
+        }
+        for line in [
+            concat!("xo", "xo-hugs-from-the-whole-team-at-the-office"),
+            concat!("XO", "XO-gossip-girl-1-2-3-abcdef"),
+            concat!("the xo", "xs- prefix was retired"),
+            concat!("xo", "xr-abc"),
+            concat!("xo", "xc-12-34-56-abcdef"),
+            concat!("xo", "xd-short%2Fcookie"),
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
     }
 
     /// The table's own invariant: a key is longer than its prefix, so the

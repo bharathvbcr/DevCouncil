@@ -15,11 +15,6 @@
 //!   as a separate target or silently skipped: `every_test_file_is_a_module`
 //!   fails until it is declared here or isolated.
 
-// One load of the daemon-ignore helpers. The suites below used to each
-// `mod` this file, and clippy::duplicate_mod rejects that in one test binary.
-#[path = "support_ignored/mod.rs"]
-mod support_ignored;
-
 mod a_budget_refused_file_is_re_extracted_by_the_next_build;
 mod a_build_names_its_parse_budget_outcome;
 mod a_call_blind_file_names_its_hole;
@@ -45,7 +40,6 @@ mod a_v96_swift_extraction_is_not_served_after_the_bump;
 mod a_v97_extraction_is_not_served_after_the_bump;
 mod a_v98_extraction_is_not_served_after_the_bump;
 mod agents_install;
-mod an_ignore_file_binds_the_daemon;
 mod api_views_are_honest;
 mod artifacts_say_when_they_lag_the_store;
 mod ast_reports_its_own_totals;
@@ -56,8 +50,10 @@ mod attack_rb_resolution_budget;
 mod binary_digests_are_memoised;
 mod blast_names_what_a_change_reaches;
 mod blast_reads_once_and_names_every_path;
+mod blast_whole_file_has_no_sentinel_line;
 mod budget_refusal_attack;
 mod build_lsp_opt_in;
+mod build_lsp_paths_are_anchored;
 mod build_ms_is_the_locked_build;
 mod caller_assets_over_stdin;
 mod claude_config_dir;
@@ -65,11 +61,10 @@ mod claude_integration;
 mod cli_json_contract;
 mod closed_pipe_is_not_a_panic;
 mod common;
+mod content_bearing_keys_are_published;
 mod coverage_invariants;
 mod crash_consistency;
 mod cstyle_reuse_epoch;
-#[cfg(unix)]
-mod daemon_envelope_freshness_cycles;
 mod daemon_storm_soak;
 mod dead_tier_eligibility;
 mod dependencies_attack;
@@ -96,7 +91,6 @@ mod manifest_is_written_once;
 mod mcp_over_real_stdio;
 mod min_rung_flag;
 mod outside_index_and_leaf_answers;
-mod over_limit_daemon_agrees_with_build;
 mod over_limit_files_are_listed_not_lost;
 mod partial_parses_are_a_coverage_bucket;
 mod passive_diagnostics;
@@ -137,6 +131,7 @@ mod test_store;
 mod test_stress;
 mod test_workspace;
 mod the_churn_window_is_an_artifact_input;
+mod the_cli_envelope_names_its_repository;
 mod the_map_reads_the_repository_inventory;
 mod the_workspace_registry_stays_with_the_repository;
 mod tsconfig_path_mapping;
@@ -144,7 +139,13 @@ mod unchanged_skip;
 mod worktree_stress_support;
 
 /// Files that keep a process of their own, and why (see the file's header).
-const ISOLATED: &[&str] = &["global_excludes_bind_the_daemon", "test_time_scale"];
+const ISOLATED: &[&str] = &[
+    "an_ignore_file_binds_the_daemon",
+    "daemon_envelope_freshness_cycles",
+    "global_excludes_bind_the_daemon",
+    "over_limit_daemon_agrees_with_build",
+    "test_time_scale",
+];
 
 mod every_test_file_is_a_module {
     use std::collections::BTreeSet;

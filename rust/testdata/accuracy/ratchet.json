@@ -6,9 +6,9 @@
     "present": 52
   },
   "kotlin": {
-    "forbid_any_tier_rows": 4,
+    "forbid_any_tier_rows": 5,
     "known_failing": 7,
-    "positive_rows": 69,
+    "positive_rows": 70,
     "present": 63
   },
   "python": {
@@ -24,7 +24,7 @@
     "present": 201
   },
   "swift": {
-    "forbid_any_tier_rows": 9,
+    "forbid_any_tier_rows": 10,
     "known_failing": 4,
     "positive_rows": 117,
     "present": 113

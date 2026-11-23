@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use devmap_store::Store;
 
 use crate::cli::{default_root_hint, root_parser, Cli};
-use crate::output::{emit_json, open_for_read};
+use crate::output::{emit_store_answer, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Routes")]
@@ -37,7 +37,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         devmap_query::api_routes::retain_matching_routes(&mut mapped, filter);
     }
     if cli.json {
-        emit_json(cli, &mapped)?;
+        emit_store_answer(cli, &store, mapped)?;
     } else {
         report_routes(&mapped);
     }

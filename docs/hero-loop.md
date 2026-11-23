@@ -42,6 +42,14 @@ Use the tool’s advertised input schema. The host does not offer arbitrary
 Implement edits through the agent’s own tools. A policy-check result protects
 only consumers that honor it; ordinary external writes are not intercepted.
 
+When an MCP call errors or times out, the same tool answers from a shell:
+`dev tool call <name> --args '<same JSON>'` runs it through the same registry and
+prints the text the MCP client would have received. The lease lives in the task
+store, so the loop can move between MCP and the shell at any step; keep one
+`client_id`. Exit status 0 means the tool answered (for verify, read `passed`).
+`dev doctor --mcp` times each server's handshake. See the
+[CLI reference](cli-reference.md#mcp-fallback-tool).
+
 ```mermaid
 stateDiagram-v2
     [*] --> Idle: Task created in store
@@ -92,8 +100,9 @@ operator-provided test command can still access the network.
 | `rigor_skipped_reason` | Why rigor did not run; missing evidence is not a clean finding |
 | `coverage_measured`, `coverage_skipped_reason` | Whether changed-line coverage was evaluated |
 | `next_actions`, `advisory_actions` | Concrete gaps for the agent to address or review |
-| finding `strength` | How the gate knows: `proven` (from the parsed diff), `observed` (from an execution artifact), `derived` (a text pattern, which can match something else). Both findings gates report `derived` today. |
+| finding `strength` | How the gate knows: `proven` (from the parsed diff), `observed` (from an execution artifact), `derived` (a text pattern, which can match something else). `secret_scan`, `stub_detection`, `runner_hijack`, and `lean_tcb` report `derived` or AST-backed levels while test-rigor gates report parsed structure. |
 | `low_substance` gap | How much of the diff is new work rather than structure, relocation, repetition or generated output. Never blocking — a refactor measures low by construction. Absent means either substantive or too small to judge. |
+| `runner_hijack` / `lean_tcb` / `unattested_test_run` / `oracle_tampering` | Hard-safety, non-demotable anti-reward-hacking gaps (blocking under `advisory` too): test-runner tampering or self-weakening, unvetted Lean 4 TCB axioms/`sorry`/external FFI, zero-case/skipped expected commands, or mid-run mutation of held-out test/oracle files. |
 | gap `occurrences`, `resurfaces` | From `devcouncil_get_gaps`. `resurfaces > 0` means this gap was reported, went away, and came back — something reported it fixed and a later run disagreed. `recurrence_available: false` means the annotation is missing from every gap, not that nothing has recurred. |
 | `allowed_next_tools` | Names the host actually serves; not a grant of permission to arbitrary tools |
 | `llm_review_unproven` gap | An `llm_review` criterion with no recorded independent review of exactly this content, or one that cannot vouch for it (not signed by a trusted key, isolation probe not passed, fewer than two reviewers completed, rubric changed, a blocker open). The agent cannot clear it by itself: a review must be signed by a key kept outside the repository, and a change after the review needs a new one. See [independent reviews](cli-reference.md#independent-reviews-llm_review). |
@@ -157,10 +166,14 @@ the posture demoted the scope refusal. Treat `allowed: true` with
 `would_block_verification: true` as a path to plan, not a path to write.
 
 DevCouncil's own state is not the agent's work. Verification and `get_diff`
-leave out `.devcouncil/` (the task store, `config.yaml`, correction manifests)
+leave out `.devcouncil/` (the task store, `config.yaml`, verification run logs)
 and `.devmap/`; the write policy lists the same directories as restricted
 (`policy.ToolStateDirs`), so an agent can neither write them nor be blamed for
-them, and no gap asks it to "revert" the task store.
+them, and no gap asks it to "revert" the task store. When a command targets a
+registered sibling worktree via `git -C <registered-worktree>` (verified
+bidirectionally against the shared common Git directory in `policy/git_worktree.go`),
+write evaluation scopes against that sibling worktree root while `--git-dir`,
+`--work-tree`, `cd`, and unregistered `-C` paths remain refused.
 
 ## Repair and completion
 

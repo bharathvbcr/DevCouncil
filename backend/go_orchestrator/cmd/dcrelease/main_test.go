@@ -166,3 +166,252 @@ func TestARelativeRootIsAUsageError(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}
 }
+
+const artifactsOutside = "FAIL: --artifacts is outside the checkout\n"
+
+func plantArchives(t *testing.T, dir string) {
+	t.Helper()
+	for _, name := range []string{
+		"devmap-cli-x86_64-unknown-linux-gnu.tar.xz",
+		"devmap-cli-aarch64-apple-darwin.tar.xz",
+		"devmap-cli-x86_64-apple-darwin.tar.xz",
+		"devmap-cli-x86_64-pc-windows-msvc.zip",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func mkdirAll(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+}
+
+func assertArtifactsRefused(t *testing.T, root, artifacts string) {
+	t.Helper()
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", artifacts)
+	if code != 1 || stdout != "" || stderr != artifactsOutside {
+		t.Fatalf("--artifacts %q: exit %d\nstdout %q\nstderr %q", artifacts, code, stdout, stderr)
+	}
+}
+
+// An inside path is not a containment failure: it reaches Inspect, which
+// fails on this empty root for its own reason.
+func assertArtifactsInspected(t *testing.T, root, artifacts string) {
+	t.Helper()
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", artifacts)
+	if code != 1 || strings.Contains(stdout, "OK:") || strings.Contains(stderr, "outside the checkout") || !strings.Contains(stderr, "missing package.json") {
+		t.Fatalf("--artifacts %q: exit %d\nstdout %q\nstderr %q", artifacts, code, stdout, stderr)
+	}
+}
+
+func TestArtifactsThatLeaveTheCheckoutAreRefused(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	evil := mkdirAll(t, filepath.Join(parent, "repo-evil"))
+	// A complete archive set outside would otherwise satisfy the check.
+	plantArchives(t, evil)
+	sep := string(filepath.Separator)
+	for _, artifacts := range []string{
+		"..",
+		filepath.Join("..", "repo-evil"),
+		"sub" + sep + ".." + sep + ".." + sep + "repo-evil",
+		evil,
+		root + sep + ".." + sep + "repo-evil",
+		parent,
+		filepath.Join(parent, "no-such-outside"),
+	} {
+		assertArtifactsRefused(t, root, artifacts)
+	}
+}
+
+func TestArtifactsInsideTheCheckoutAreInspected(t *testing.T) {
+	root := t.TempDir()
+	mkdirAll(t, filepath.Join(root, "sub", "dir"))
+	for _, artifacts := range []string{
+		".",
+		filepath.Join("sub", "dir"),
+		filepath.Join("sub", "..", "sub", "dir"),
+		filepath.Join("sub", "missing"),
+		root,
+		filepath.Join(root, "sub", "dir"),
+	} {
+		assertArtifactsInspected(t, root, artifacts)
+	}
+}
+
+func TestSymlinkedArtifactsThatLeaveTheCheckoutAreRefused(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	plantArchives(t, outside)
+	symlink(t, outside, filepath.Join(root, "arts"))
+	symlink(t, filepath.Join(outside, "not-created"), filepath.Join(root, "dangling"))
+	symlink(t, filepath.Join("..", "escaped"), filepath.Join(root, "relout"))
+	for _, artifacts := range []string{
+		"arts",
+		filepath.Join(root, "arts"),
+		filepath.Join("arts", "missing"),
+		"dangling",
+		"relout",
+	} {
+		assertArtifactsRefused(t, root, artifacts)
+	}
+
+	// A link that stays inside is the checkout's own directory.
+	inside := mkdirAll(t, filepath.Join(root, "inside"))
+	symlink(t, inside, filepath.Join(root, "kept"))
+	assertArtifactsInspected(t, root, "kept")
+}
+
+func TestASymlinkCycleIsACouldNotRunNotOK(t *testing.T) {
+	root := t.TempDir()
+	symlink(t, "cycle", filepath.Join(root, "cycle"))
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", "cycle")
+	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "dcrelease:") {
+		t.Fatalf("exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+}
+
+// A root that is itself a symlink must not make its real path look outside,
+// nor hide a path that leaves it.
+func TestARootThatIsASymlinkIsComparedByItsRealPath(t *testing.T) {
+	parent := t.TempDir()
+	real := mkdirAll(t, filepath.Join(parent, "real"))
+	outside := mkdirAll(t, filepath.Join(parent, "outside"))
+	plantArchives(t, outside)
+	rootLink := filepath.Join(parent, "rootlink")
+	symlink(t, real, rootLink)
+	assertArtifactsInspected(t, rootLink, filepath.Join(real, "sub"))
+	assertArtifactsInspected(t, rootLink, filepath.Join(rootLink, "sub"))
+	assertArtifactsInspected(t, rootLink, "sub")
+	assertArtifactsRefused(t, rootLink, filepath.Join("..", "outside"))
+	assertArtifactsRefused(t, rootLink, outside)
+}
+
+func TestAdversarialSymlinkShapesNeverAdmitOutside(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	mkdirAll(t, filepath.Join(parent, "repo2"))
+	outside := mkdirAll(t, filepath.Join(parent, "outside"))
+	plantArchives(t, outside)
+	symlink(t, outside, filepath.Join(root, "hop2"))
+	symlink(t, "hop2", filepath.Join(root, "hop1"))
+	symlink(t, "hop1", filepath.Join(root, "hop0"))
+	symlink(t, "..", filepath.Join(root, "up"))
+	symlink(t, filepath.Join(parent, "repo2"), filepath.Join(root, "sib"))
+	symlink(t, "b", filepath.Join(root, "a"))
+	symlink(t, "a", filepath.Join(root, "b"))
+	symlink(t, outside, filepath.Join(root, "arts"))
+	sep := string(filepath.Separator)
+	for _, artifacts := range []string{
+		"hop0",
+		"hop0" + sep + "missing",
+		"up",
+		"up" + sep + "outside",
+		"up" + sep + "repo2",
+		"sib",
+		"arts" + sep,
+		"." + sep + "arts",
+		"arts" + sep + sep + "x",
+		"arts" + sep + "." + sep + "x",
+		root + sep + sep + "arts",
+		filepath.Join(root, "arts") + sep,
+	} {
+		assertArtifactsRefused(t, root, artifacts)
+	}
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", "a")
+	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "dcrelease:") {
+		t.Fatalf("two-link cycle: exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+}
+
+func TestAdversarialEmptyFileAndRootSpellings(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	if err := os.WriteFile(filepath.Join(root, "afile"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "ofile"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runArgs("--root", root, "--artifacts", "")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "--artifacts needs a value") {
+		t.Fatalf("empty --artifacts: exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+	assertArtifactsRefused(t, root, filepath.Join("..", "ofile"))
+	assertArtifactsRefused(t, root, filepath.Join(parent, "ofile"))
+	assertArtifactsInspected(t, root, "afile")
+	assertArtifactsInspected(t, root, root+string(filepath.Separator))
+	assertArtifactsInspected(t, root, "."+string(filepath.Separator))
+	// Prefix confusion: root-evil and root2 share root's prefix.
+	for _, name := range []string{"repo-evil", "repo2", "repository"} {
+		mkdirAll(t, filepath.Join(parent, name))
+		assertArtifactsRefused(t, root, filepath.Join(parent, name))
+		assertArtifactsRefused(t, root, filepath.Join("..", name))
+	}
+}
+
+// A spelling that differs from the checkout only in case or Unicode
+// normalisation may be refused (a limitation on APFS) but never admitted
+// when it names a directory outside, and never prints OK.
+func TestAdversarialCaseAndNormalisationNeverAdmitOutside(t *testing.T) {
+	parent := t.TempDir()
+	nfc := "caf\u00e9"
+	nfd := "cafe\u0301"
+	root := mkdirAll(t, filepath.Join(parent, nfc))
+	outside := mkdirAll(t, filepath.Join(parent, nfc+"-evil"))
+	plantArchives(t, outside)
+	for _, artifacts := range []string{
+		filepath.Join(parent, nfd+"-evil"),
+		filepath.Join(parent, "CAF\u00c9-EVIL"),
+		filepath.Join(parent, nfd, "..", nfd+"-evil"),
+	} {
+		code, stdout, stderr := runArgs("--root", root, "--artifacts", artifacts)
+		if strings.Contains(stdout, "OK:") || code == 0 || strings.Contains(stderr, "missing package.json") {
+			t.Fatalf("--artifacts %q admitted: exit %d\nstdout %q\nstderr %q", artifacts, code, stdout, stderr)
+		}
+	}
+}
+
+// --artifacts is judged before any git runs, so a refusal prints nothing to
+// stdout: no "would publish" OK line beside the FAIL.
+func TestArtifactsRefusalWithTagAtHeadPrintsNoOKLine(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	dir := t.TempDir()
+	git(t, dir, "init", "-q")
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "a")
+	git(t, dir, "commit", "-q", "-m", "one")
+	code, stdout, stderr := runArgs("--root", dir, "--tag", "v9.9.9", "--tag-at-head", "--artifacts", "..")
+	if code != 1 || stdout != "" || stderr != artifactsOutside {
+		t.Fatalf("exit %d\nstdout %q\nstderr %q", code, stdout, stderr)
+	}
+}
+
+// A dangling link whose target walks back through a link that leaves: the
+// ".." belongs to the link's real directory, not to the lexical path.
+func TestDanglingLinkThroughAnOutsideLinkIsRefused(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirAll(t, filepath.Join(parent, "repo"))
+	outside := mkdirAll(t, filepath.Join(parent, "outside"))
+	mkdirAll(t, filepath.Join(outside, "sub"))
+	symlink(t, filepath.Join(outside, "sub"), filepath.Join(root, "s"))
+	// Join would clean the target to "x"; the link must keep the ".." as written.
+	symlink(t, "s"+string(filepath.Separator)+".."+string(filepath.Separator)+"x", filepath.Join(root, "link"))
+	assertArtifactsRefused(t, root, "link")
+}

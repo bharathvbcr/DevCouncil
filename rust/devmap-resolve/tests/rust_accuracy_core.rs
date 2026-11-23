@@ -540,3 +540,32 @@ pub fn go() -> u8 { log() }
     assert!(!r.has("m.rs::go", "m.rs::log"), "{:?}", r.edges);
     assert!(r.has("m.rs::go", "a.rs::log"), "{:?}", r.edges);
 }
+
+#[test]
+fn a_non_ascii_self_path_reference_binds_to_module_function() {
+    let src = "\
+fn 帮助() {}\n\
+fn helper() {}\n\
+pub fn via_path() {\n\
+    let named = self::帮助;\n\
+    let ascii = self::helper;\n\
+}\n\
+";
+    let r = resolve(&[("weird/名字.rs", src)]);
+    assert!(
+        r.edges.iter().any(|(from, to, kind)| {
+            kind == "References" && from == "weird/名字.rs::via_path" && to == "weird/名字.rs::帮助"
+        }),
+        "self::帮助 must resolve to module function: {:?}",
+        r.edges
+    );
+    assert!(
+        r.edges.iter().any(|(from, to, kind)| {
+            kind == "References"
+                && from == "weird/名字.rs::via_path"
+                && to == "weird/名字.rs::helper"
+        }),
+        "self::helper must resolve to module function: {:?}",
+        r.edges
+    );
+}

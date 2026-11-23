@@ -1,7 +1,7 @@
 use clap::ValueEnum;
 
 use crate::cli::Cli;
-use crate::output::{emit_json, open_for_read};
+use crate::output::{emit_store_answer, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Blast")]
@@ -68,7 +68,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         (None, None) => unreachable!("blast requires --since or --at"),
     };
     if cli.json {
-        emit_json(cli, &serde_json::to_value(&report)?)?;
+        emit_store_answer(cli, &store, serde_json::to_value(&report)?)?;
     } else if *format == BlastFormat::Markdown {
         emit_blast_markdown(&report);
     } else {
@@ -83,6 +83,16 @@ pub(crate) enum BlastFormat {
     #[default]
     Text,
     Markdown,
+}
+
+/// `start-end` for a human renderer. The whole-file sentinel is "to the end of
+/// the file" (it is `null` in JSON), never the number `u32::MAX`.
+pub(crate) fn line_span(start: u32, end: u32) -> String {
+    if end == dc_regress::WHOLE_FILE_END_LINE {
+        format!("{start}-EOF")
+    } else {
+        format!("{start}-{end}")
+    }
 }
 
 /// Render a blast report.
@@ -158,10 +168,9 @@ fn emit_blast(report: &dc_regress::BlastReport) {
                 outln!("  {}: {}", entry.path, entry.reason.describe());
             } else {
                 outln!(
-                    "  {}:{}-{}: {}",
+                    "  {}:{}: {}",
                     entry.path,
-                    entry.start_line,
-                    entry.end_line,
+                    line_span(entry.start_line, entry.end_line),
                     entry.reason.describe()
                 );
             }
@@ -303,10 +312,9 @@ fn emit_blast_markdown(report: &dc_regress::BlastReport) {
                 outln!("- `{}`: {}", entry.path, entry.reason.describe());
             } else {
                 outln!(
-                    "- `{}:{}-{}`: {}",
+                    "- `{}:{}`: {}",
                     entry.path,
-                    entry.start_line,
-                    entry.end_line,
+                    line_span(entry.start_line, entry.end_line),
                     entry.reason.describe()
                 );
             }

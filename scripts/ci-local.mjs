@@ -3,49 +3,117 @@
  * Local equivalent of the checks that must be green before a version tag.
  * A step that cannot run exits the same way as a step that failed — never
  * as a pass.
+ *
+ *   node scripts/ci-local.mjs                 stop at the first failing step
+ *   node scripts/ci-local.mjs --continue      run every step whose needs passed
+ *   node scripts/ci-local.mjs --only <step>   run <step> and the steps it needs
+ *
+ * The two new modes end with a summary block (PASS / FAIL / SKIP / N/A per
+ * step) and exit 1 if any step failed, else 2 if any was skipped, else 0.
+ * Without a flag the output and exit codes are what they always were.
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  StepStop,
+  devmapAvailable,
+  expectedRowLabels,
   goModToolchain,
   gussetPin,
   gussetPinVerdict,
   localTagState,
+  nestedGateProblem,
+  parseArgs,
+  runSteps,
   tagVerdict,
 } from "./ci-local-checks.mjs";
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
-const ACCURACY_MODULE = path.join(REPO_ROOT, "tools", "accuracy");
-
-/** Steps that could not run. They are listed at the end and never counted as passes. */
-const notRun = [];
+export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
+export const ACCURACY_MODULE = path.join(REPO_ROOT, "tools", "accuracy");
 
 /**
- * @param {string} label
+ * Print `FAIL: <message>` and return the stop for the step to throw.
+ *
+ * @param {number} code
+ * @param {string} message
+ * @param {{ cannotRun?: boolean, note?: string }} [opts]
+ */
+function fail(code, message, opts) {
+  console.error(`FAIL: ${message}`);
+  return new StepStop(code, message, opts);
+}
+
+/**
+ * Run one command as the step's work, under the step's env (the base env plus
+ * what its declared producers returned).
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
  * @param {string} command
  * @param {string[]} args
- * @param {{ cwd?: string, env?: NodeJS.ProcessEnv }} [opts]
+ * @param {{ cwd?: string, check?: (log: string) => string | undefined }} [opts]
  */
-function run(label, command, args, opts = {}) {
-  console.log(`\n== ${label} ==`);
+function exec(ctx, command, args, opts = {}) {
+  ctx.header();
+  if (opts.check) return execChecked(ctx, command, args, opts);
   const result = spawnSync(command, args, {
     cwd: opts.cwd ?? REPO_ROOT,
-    env: opts.env ?? process.env,
+    env: ctx.env,
     stdio: "inherit",
     shell: false,
   });
   if (result.error) {
-    console.error(`FAIL: ${label} could not run: ${result.error.message}`);
-    process.exit(2);
+    throw fail(2, `${ctx.label} could not run: ${result.error.message}`, { cannotRun: true });
   }
   if (result.status !== 0) {
-    console.error(`FAIL: ${label} (exit ${result.status})`);
-    process.exit(result.status ?? 1);
+    const note = result.signal ? `signal ${result.signal}` : `exit ${result.status}`;
+    throw fail(result.status ?? 1, `${ctx.label} (exit ${result.status})`, { note });
+  }
+}
+
+/**
+ * exec() for a nested gate whose exit 0 must be backed by its own output.
+ * The output still streams to this terminal (stderr merged into stdout, and
+ * through a pipe, as it is in any logged run); `tee` keeps a copy, and the
+ * command's status is written to a file because a pipeline reports tee's.
+ * After an exit 0, `check(log)` names why the run cannot be believed, or
+ * returns undefined.
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{ cwd?: string, check: (log: string) => string | undefined }} opts
+ */
+function execChecked(ctx, command, args, opts) {
+  const dir = mkdtempSync(path.join(tmpdir(), "ci-local-run-"));
+  const logFile = path.join(dir, "log");
+  const statusFile = path.join(dir, "status");
+  try {
+    const result = spawnSync(
+      "sh",
+      ["-c", 'st=$1; lg=$2; shift 2; { "$@"; echo $? > "$st"; } 2>&1 | tee "$lg"', "sh", statusFile, logFile, command, ...args],
+      { cwd: opts.cwd ?? REPO_ROOT, env: ctx.env, stdio: "inherit", shell: false },
+    );
+    if (result.error) {
+      throw fail(2, `${ctx.label} could not run: ${result.error.message}`, { cannotRun: true });
+    }
+    const status = existsSync(statusFile) ? Number.parseInt(readFileSync(statusFile, "utf8"), 10) : Number.NaN;
+    if (Number.isNaN(status)) {
+      throw fail(2, `${ctx.label} did not report an exit status`, { cannotRun: true });
+    }
+    if (status !== 0) {
+      throw fail(status, `${ctx.label} (exit ${status})`, { note: `exit ${status}` });
+    }
+    const problem = opts.check(existsSync(logFile) ? readFileSync(logFile, "utf8") : "");
+    if (problem !== undefined) {
+      throw fail(1, `${ctx.label} is not believed: ${problem}`, { note: `unverified: ${problem}` });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -64,8 +132,7 @@ function requireGussetAtPin(sibling) {
   const head = spawnSync("git", ["-C", sibling, "rev-parse", "HEAD"], { encoding: "utf8", shell: false });
   const verdict = gussetPinVerdict(pin, head.status === 0 ? head.stdout.trim() : "");
   if (!verdict.ok) {
-    console.error(`FAIL: ${verdict.message}`);
-    process.exit(1);
+    throw fail(1, verdict.message);
   }
   console.log(`ok: ${verdict.message}`);
 }
@@ -75,18 +142,24 @@ function requireGussetAtPin(sibling) {
  * `go test` without either fails as a missing replace directory, which reads
  * like a Go bug. Name the missing checkout, and build the archive when the
  * checkout is already there.
+ *
+ * Returns the CGO_CFLAGS that key Go's caches on the archive, for the steps
+ * that declare this one in `needs`.
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
  */
-function ensureGussetEngine() {
+function ensureGussetEngine(ctx) {
   const siblingMod = path.resolve(REPO_ROOT, "..", "gusset", "go.mod");
   if (!existsSync(siblingMod)) {
-    console.error(
-      `FAIL: Go replace expects a Gusset checkout at ${path.dirname(siblingMod)}. ` +
+    throw fail(
+      2,
+      `Go replace expects a Gusset checkout at ${path.dirname(siblingMod)}. ` +
         "CI checks out https://github.com/bharathvbcr/gusset in .github/actions/setup-gusset.",
+      { cannotRun: true },
     );
-    process.exit(2);
   }
   requireGussetAtPin(path.dirname(siblingMod));
-  run("gusset engine", "cargo", [
+  exec(ctx, "cargo", [
     "build",
     "--release",
     "--locked",
@@ -99,20 +172,19 @@ function ensureGussetEngine() {
   ]);
   const archive = path.join(REPO_ROOT, "rust", "gusset-engine", "target", "release", "libgusset.a");
   if (!existsSync(archive)) {
-    console.error(`FAIL: ${archive} is missing after cargo build`);
-    process.exit(1);
+    throw fail(1, `${archive} is missing after cargo build`);
   }
   // Key Go's caches on the archive, as rust/gusset-engine/cgo-env.sh does:
   // Go hashes cgo flags, not the libraries they link, so a rebuilt archive
   // is otherwise not relinked and a cached "ok" is replayed against the old one.
   const sum = createHash("sha256").update(readFileSync(archive)).digest("hex").slice(0, 32);
   // `go env` reports the process env, a `go env -w` setting, or Go's default.
-  const goEnv = spawnSync("go", ["env", "CGO_CFLAGS"], { encoding: "utf8", shell: false });
-  const current = goEnv.status === 0 ? goEnv.stdout.trim() : (process.env.CGO_CFLAGS || "-O2 -g");
+  const goEnv = spawnSync("go", ["env", "CGO_CFLAGS"], { env: ctx.env, encoding: "utf8", shell: false });
+  const current = goEnv.status === 0 ? goEnv.stdout.trim() : (ctx.env.CGO_CFLAGS || "-O2 -g");
   const base = current
     .replace(/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=\S*/g, "")
     .trim();
-  process.env.CGO_CFLAGS = `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}`;
+  return { env: { CGO_CFLAGS: `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}` } };
 }
 
 /**
@@ -120,42 +192,41 @@ function ensureGussetEngine() {
  * declares (setup-gusset's neighbours use setup-go with go-version-file). A
  * newer local gofmt called a file clean that CI then rejected, so resolve the
  * declared toolchain's own gofmt.
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
  */
-function gofmtClean() {
-  console.log("\n== gofmt ==");
+function gofmtClean(ctx) {
+  ctx.header();
   const toolchain = goModToolchain(readFileSync(path.join(GO_MODULE, "go.mod"), "utf8"));
   if (!toolchain) {
-    console.error("FAIL: no go or toolchain line in backend/go_orchestrator/go.mod");
-    process.exit(2);
+    throw fail(2, "no go or toolchain line in backend/go_orchestrator/go.mod", { cannotRun: true });
   }
   const root = spawnSync("go", ["env", "GOROOT"], {
     cwd: GO_MODULE,
-    env: { ...process.env, GOTOOLCHAIN: toolchain },
+    env: { ...ctx.env, GOTOOLCHAIN: toolchain },
     encoding: "utf8",
     shell: false,
   });
   const goroot = root.status === 0 ? root.stdout.trim() : "";
   if (!goroot) {
-    console.error(`FAIL: could not resolve ${toolchain} (${(root.stderr || "").trim()}); gofmt was not run`);
-    process.exit(2);
+    throw fail(2, `could not resolve ${toolchain} (${(root.stderr || "").trim()}); gofmt was not run`, { cannotRun: true });
   }
   const gofmt = path.join(goroot, "bin", process.platform === "win32" ? "gofmt.exe" : "gofmt");
   console.log(`gofmt from ${toolchain}`);
   for (const cwd of [GO_MODULE, ACCURACY_MODULE]) {
     const result = spawnSync(gofmt, ["-l", "."], {
       cwd,
+      env: ctx.env,
       encoding: "utf8",
       shell: false,
     });
     if (result.error) {
-      console.error(`FAIL: gofmt could not run: ${result.error.message}`);
-      process.exit(2);
+      throw fail(2, `gofmt could not run: ${result.error.message}`, { cannotRun: true });
     }
     const extra = (result.stdout || "").trim();
     if (result.status !== 0 || extra) {
       if (extra) console.error(extra);
-      console.error(`FAIL: gofmt would rewrite files in ${path.relative(REPO_ROOT, cwd)}`);
-      process.exit(1);
+      throw fail(1, `gofmt would rewrite files in ${path.relative(REPO_ROOT, cwd)}`);
     }
   }
 }
@@ -170,78 +241,178 @@ function gofmtClean() {
  * tagged commit, so if the tag is behind the notes, the stale notes ship and
  * every gate passes on them — they are internally consistent at that commit.
  * The only place to catch it is here, before the push.
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
  */
-function releaseTagAgrees(dcrelease) {
+function releaseTagAgrees(ctx) {
   const pkgPath = path.join(REPO_ROOT, "package.json");
   const version = JSON.parse(readFileSync(pkgPath, "utf8")).version;
   if (typeof version !== "string" || version === "") {
-    console.error(`FAIL: no version in ${pkgPath}`);
-    process.exit(2);
+    throw fail(2, `no version in ${pkgPath}`, { cannotRun: true });
   }
   const state = localTagState(REPO_ROOT, version);
   const verdict = tagVerdict(state);
   if (verdict === "NOT RUN") {
     // No local tag: nothing to compare with HEAD. The owner creates and pushes
     // the tag at the release commit once every workflow is green.
-    console.log(`\n== release identity (tag path) ==\nNOT RUN: no local tag ${state.tag}`);
-    notRun.push(`release identity (tag path): no local tag ${state.tag}`);
-    return;
+    ctx.header();
+    console.log(`NOT RUN: no local tag ${state.tag}`);
+    return { na: `no local tag ${state.tag}` };
   }
   if (verdict === "FAIL" && state.state === "unknown") {
-    console.error(`FAIL: ${state.reason}`);
-    process.exit(2);
+    throw fail(2, state.reason ?? "git could not read the local tag", { cannotRun: true });
   }
   // off-head fails inside dcrelease with the notes-behind-the-tag explanation.
-  run("release identity (tag path)", dcrelease, ["--tag", state.tag, "--tag-at-head"]);
+  exec(ctx, dcreleaseFrom(ctx), ["--tag", state.tag, "--tag-at-head"]);
 }
 
-function main() {
-  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs", "scripts/code-map-bundle.test.mjs"]);
+/**
+ * The binary `build dcrelease` returned. Reachable only through `needs`.
+ *
+ * @param {import("./ci-local-checks.mjs").StepContext} ctx
+ */
+function dcreleaseFrom(ctx) {
+  const bin = ctx.paths["build dcrelease"]?.dcrelease;
+  if (!bin) throw new Error(`${ctx.label} does not declare \`build dcrelease\` in needs`);
+  return bin;
+}
+
+/**
+ * A step that runs one command. The command is data so the tests can read it
+ * without running it.
+ *
+ * @param {string} label
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{ cwd?: string, needs?: string[], requires?: Step["requires"] }} [opts]
+ * @returns {Step}
+ */
+function commandStep(label, command, args, opts = {}) {
+  const cwd = opts.cwd ?? REPO_ROOT;
+  return { label, needs: opts.needs ?? [], requires: opts.requires, command, args, cwd, run: (ctx) => exec(ctx, command, args, { cwd }) };
+}
+
+const VERIFY_ARGS = ["./verify.sh", "--quick"];
+
+/**
+ * The rust/verify.sh step, with the directory as a parameter so a test can run
+ * it against a fake script.
+ *
+ * @param {string} cwd the directory holding verify.sh
+ * @returns {Step}
+ */
+export function rustVerifyStep(cwd) {
+  /** The steps verify.sh declares, read when the run ends so the script that ran is the one read. */
+  const declaredSteps = (/** @type {string} */ dir) => {
+    try {
+      return expectedRowLabels(readFileSync(path.join(dir, "verify.sh"), "utf8"));
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    label: "rust verify --quick",
+    needs: [],
+    command: "bash",
+    args: VERIFY_ARGS,
+    cwd,
+    // In the new modes verify.sh keeps going too (cargo test --no-fail-fast),
+    // and prints its rows as a nested block without totals.
+    run: (ctx) =>
+      exec(ctx, "bash", ctx.mode === "default" ? VERIFY_ARGS : [...VERIFY_ARGS, "--continue", "--nested"], {
+        cwd,
+        check: (log) => nestedGateProblem(log, { nested: ctx.mode !== "default", labels: declaredSteps(cwd) }),
+      }),
+  };
+}
+
+/**
+ * Every ci:local step, in order. `needs` names the steps whose output a step
+ * uses; the runner hands a step only its declared producers' `env` and
+ * `paths`, and in the new modes runs it only when they passed.
+ *
+ * @typedef {import("./ci-local-checks.mjs").RunnableStep & { command?: string, args?: string[], cwd?: string }} Step
+ * @type {Step[]}
+ */
+export const STEPS = [
+  commandStep("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs", "scripts/code-map-bundle.test.mjs"]),
   // The page shell is TypeScript bundled by the pinned Bun; the checked-in bundle must be what it builds.
-  run("code map bundle", process.execPath, ["scripts/code-map-bundle.mjs", "check"]);
-  run("code map tests", "bun", ["test", "rust/devmap-query/assets/code-map"]);
-  run("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], {
-    cwd: GO_MODULE,
-  });
-  // Built, not `go run`: `go run` reports every non-zero exit as 1, and this
-  // gate's 2 ("could not run") must not read as a mismatch.
-  const binDir = mkdtempSync(path.join(tmpdir(), "devcouncil-dcrelease-"));
-  process.on("exit", () => rmSync(binDir, { recursive: true, force: true }));
-  const dcrelease = path.join(binDir, process.platform === "win32" ? "dcrelease.exe" : "dcrelease");
-  run("build dcrelease", "go", ["build", "-o", dcrelease, "./cmd/dcrelease"], { cwd: GO_MODULE });
-  run("release identity", dcrelease, []);
-  releaseTagAgrees(dcrelease);
-  run("workflow lint", process.execPath, ["scripts/check-workflows.mjs"]);
-  run("npm pack", "npm", ["run", "pack:check"]);
-  run("npm runtime smoke", process.execPath, ["scripts/npm-runtime-smoke.mjs"]);
-  gofmtClean();
-  ensureGussetEngine();
-  run("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], {
-    cwd: GO_MODULE,
-  });
+  commandStep("code map bundle", process.execPath, ["scripts/code-map-bundle.mjs", "check"]),
+  commandStep("code map tests", "bun", ["test", "rust/devmap-query/assets/code-map"]),
+  commandStep("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], { cwd: GO_MODULE }),
+  {
+    label: "build dcrelease",
+    needs: [],
+    // Built, not `go run`: `go run` reports every non-zero exit as 1, and this
+    // gate's 2 ("could not run") must not read as a mismatch.
+    run: (ctx) => {
+      const binDir = mkdtempSync(path.join(tmpdir(), "devcouncil-dcrelease-"));
+      process.on("exit", () => rmSync(binDir, { recursive: true, force: true }));
+      const dcrelease = path.join(binDir, process.platform === "win32" ? "dcrelease.exe" : "dcrelease");
+      exec(ctx, "go", ["build", "-o", dcrelease, "./cmd/dcrelease"], { cwd: GO_MODULE });
+      return { paths: { dcrelease } };
+    },
+  },
+  { label: "release identity", needs: ["build dcrelease"], run: (ctx) => exec(ctx, dcreleaseFrom(ctx), []) },
+  { label: "release identity (tag path)", needs: ["build dcrelease"], run: releaseTagAgrees },
+  commandStep("workflow lint", process.execPath, ["scripts/check-workflows.mjs"]),
+  commandStep("npm pack", "npm", ["run", "pack:check"]),
+  commandStep("npm runtime smoke", process.execPath, ["scripts/npm-runtime-smoke.mjs"]),
+  { label: "gofmt", needs: [], run: gofmtClean },
+  { label: "gusset engine", needs: [], run: ensureGussetEngine },
+  commandStep("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], { cwd: GO_MODULE, needs: ["gusset engine"] }),
   // The DevMap test selector's end-to-end tests (selected-tests.yml runs them
   // on every push). They are behind the e2e tag, so `./...` below does not
   // compile them, and this is their only run here; the selector's unit tests
   // are in `./...`. They drive the real `devmap` on PATH and fail, not skip,
-  // without one.
-  run("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1", "-timeout", "30m"], {
+  // without one; --continue and --only report that as SKIP before starting.
+  commandStep("test selector end-to-end", "go", ["test", "-tags", "e2e", "./cmd/dctestselect", "-run", "^TestE2E", "-count=1", "-p", "1", "-timeout", "30m"], {
     cwd: GO_MODULE,
-  });
-  run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {
-    cwd: GO_MODULE,
-  });
+    requires: (env) => (devmapAvailable(env) ? undefined : "devmap not found: not on PATH and MANVI_MAP_BINARY is unset"),
+  }),
+  // `./...` includes ./cmd/devcouncil and ./gussetfn, which link libgusset.a.
+  commandStep("go orchestrator tests", "go", ["test", "./...", "-count=1"], { cwd: GO_MODULE, needs: ["gusset engine"] }),
   // The go/types labeller behind the DevMap corpus record, its own module.
-  run("accuracy labeller vet", "go", ["vet", "./..."], { cwd: ACCURACY_MODULE });
-  run("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: ACCURACY_MODULE });
-  run("rust verify --quick", "bash", ["./verify.sh", "--quick"], {
-    cwd: path.join(REPO_ROOT, "rust"),
-  });
+  commandStep("accuracy labeller vet", "go", ["vet", "./..."], { cwd: ACCURACY_MODULE }),
+  commandStep("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: ACCURACY_MODULE }),
+  rustVerifyStep(path.join(REPO_ROOT, "rust")),
+];
+
+function main() {
+  /** @type {ReturnType<typeof parseArgs>} */
+  let opts;
+  try {
+    opts = parseArgs(process.argv.slice(2));
+  } catch (e) {
+    console.error(`ci:local: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(2);
+  }
+  /** @type {ReturnType<typeof runSteps>} */
+  let result;
+  try {
+    result = runSteps(STEPS, { ...opts, gate: "DevCouncil ci:local" });
+  } catch (e) {
+    if (e instanceof StepStop) throw e;
+    console.error(`ci:local: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(2);
+  }
+  if (opts.mode !== "default") {
+    process.exitCode = result.code;
+    return;
+  }
+  if (result.code !== 0) process.exit(result.code);
+  // Steps that could not run. They are listed at the end and never counted as passes.
+  const notRun = result.rows.filter((r) => r.status === "N/A");
   if (notRun.length > 0) {
     console.log(`\nOK: ci:local, with ${notRun.length} step(s) NOT RUN:`);
-    for (const line of notRun) console.log(`  - ${line}`);
+    for (const r of notRun) console.log(`  - ${r.label}: ${r.note.replace(/^not applicable: /, "")}`);
     return;
   }
   console.log("\nOK: ci:local");
 }
 
-main();
+// Run only as a program: the tests import STEPS.
+const entry = process.argv[1];
+if (entry !== undefined && realpathSync(path.resolve(entry)) === realpathSync(fileURLToPath(import.meta.url))) {
+  main();
+}

@@ -291,6 +291,7 @@ version = "0.2.5"
 name = "dc-grep"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
  "grep-regex",
  "grep-searcher",
  "ignore",
@@ -312,6 +313,16 @@ dependencies = [
 [[package]]
 name = "dc-redact"
 version = "0.2.5"
+
+[[package]]
+name = "dc-redact-cli"
+version = "0.2.5"
+dependencies = [
+ "dc-proc",
+ "dc-redact",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "dc-regress"
@@ -337,6 +348,7 @@ dependencies = [
 name = "dc-store"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
  "rusqlite",
 ]
 
@@ -377,6 +389,7 @@ version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
+ "dc-evidence",
  "dc-regress",
  "dc-regress-store",
  "devmap-analyze",

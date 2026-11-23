@@ -1,0 +1,46 @@
+{
+  "generated": "2026-11-19",
+  "host": "Apple M5 Pro 18 cores 64 GB macOS 27.2 (shared; load1 20-81 during run)",
+  "bins": {
+    "main": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.gitpulse/scratch/target-wave6-t/release/devmap",
+      "version": "devmap 0.2.5 (store schema 29, code graph schema 2, extract schema 100, build 290e355bcdac)",
+      "sha256": "d11230b7043f5de873dcdfec0f270277eade8d9fcb0c39008a4db56d30f72780",
+      "source_commit": "290e355bcdac108a017bce1453b4281a6569d846"
+    },
+    "s29": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.gitpulse/scratch/target-wave6-t-s29/release/devmap",
+      "version": "devmap 0.2.5 (store schema 29, code graph schema 2, extract schema 98, build 5a4a15e7a6ff)",
+      "sha256": "45b7a2fefd3eba0da634903660a515bdbb9ad30266f7dff216c6fb182c7bac5a",
+      "source_commit": "5a4a15e7a6ff2c9a21b67348cb8901b2696d8550"
+    },
+    "orbit": {
+      "path": "/Users/bharath/.local/bin/orbit",
+      "version": "orbit 0.163.0-38-g3d379c2",
+      "sha256": "6ed6b09e548afe866e7a85a6cf7bda5528f436d9f8767b1492076992f586afdb"
+    }
+  },
+  "corpora": {
+    "DevPrism": "348d14f8f5a116cbacd4cdeed69b1113131d401c",
+    "DevCouncil": "5a4a15e7a6ff2c9a21b67348cb8901b2696d8550",
+    "GitPulse": "5394f4d3e1f8a891e39935d9a89fd82783a1549f",
+    "orbit-knowledge-graph": "ecfa552d0349e1e16a185930a9be52d03d0ced77"
+  },
+  "edit_files": {
+    "DevPrism": "apps/desktop/src/lib/resume-sections.ts",
+    "DevCouncil": "backend/go_orchestrator/devcouncil/verify/next_actions.go",
+    "GitPulse": "src/lib/pulse/types.ts",
+    "orbit-knowledge-graph": "crates/orbit-cli/src/commands/hook_guard.rs"
+  },
+  "edit": "append one exported/unexported function benchProbeAdded to the file; revert = git show HEAD:file",
+  "env": {
+    "RAYON_NUM_THREADS": "unset (the 5 Nov provenance records no setting)",
+    "ORBIT_TELEMETRY_ENABLED": "false",
+    "ORBIT_DATA_DIR": "per-corpus scratch dir; orbit run WITHOUT --db (with --db orbit skips its incremental path and re-indexes fully)",
+    "devmap_flags": "build --db <scratch>.sqlite --progress never --json"
+  },
+  "timing": "/usr/bin/time -l wrapping the tool directly; wall = \"real\", instructions = \"instructions retired\"",
+  "reps": "5 interleaved (per rep: main, s29, orbit; each edit -> revert -> refresh); cold once per tool",
+  "load_gate": "runs started only while load1 < 60 (relaxed from 30 because the host stayed at 25-80); every row carries load1_before",
+  "budget_refusals": 0
+}

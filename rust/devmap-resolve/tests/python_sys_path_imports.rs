@@ -307,6 +307,80 @@ def test_it():
     }
 }
 
+/// The S2 corpus with an unreadable module-level insert after the readable
+/// one: the readable `aws` entry still shadows the sibling, so the import must
+/// not bind either file. An unreadable insert must not withdraw the evidence.
+#[test]
+fn an_unreadable_insert_does_not_unshadow_the_sibling() {
+    let source = "\
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+sys.path.insert(0, somewhere)
+import analyse_wave20 as a20
+
+def test_it():
+    a20.spearman([], [])
+";
+    let resolution = resolve(&[
+        ("scripts/test_wave20_analyser.py", source),
+        ("scripts/analyse_wave20.py", WAVE20),
+        ("scripts/aws/analyse_wave20.py", WAVE20),
+    ]);
+    for target in ["scripts/analyse_wave20.py", "scripts/aws/analyse_wave20.py"] {
+        assert!(
+            !imports(&resolution, "scripts/test_wave20_analyser.py", target),
+            "{target}: an Imports edge was made"
+        );
+        assert!(
+            callers_of(&resolution, &format!("{target}::spearman")).is_empty(),
+            "{target}: callers {:?}",
+            callers_of(&resolution, &format!("{target}::spearman"))
+        );
+    }
+}
+
+/// Insert order around the import. A readable entry ahead of the import
+/// shadows the sibling even when an unreadable insert follows it; with only an
+/// unreadable insert ahead and the readable one after, no known entry precedes
+/// the import, and an unknown directory never vetoes an ordinary import.
+#[test]
+fn an_unreadable_insert_orders_against_the_import_like_any_entry() {
+    let prelude =
+        "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n";
+    let aws = "sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))\n";
+    let import = "import analyse_wave20 as a20\n";
+    let usage = "\ndef test_it():\n    a20.spearman([], [])\n";
+    let files = |source: &str| {
+        resolve(&[
+            ("scripts/test_wave20_analyser.py", source),
+            ("scripts/analyse_wave20.py", WAVE20),
+            ("scripts/aws/analyse_wave20.py", WAVE20),
+        ])
+    };
+
+    let before = format!("{prelude}{aws}{import}sys.path.insert(0, somewhere)\n{usage}");
+    let resolution = files(&before);
+    for target in ["scripts/analyse_wave20.py", "scripts/aws/analyse_wave20.py"] {
+        assert!(
+            !imports(&resolution, "scripts/test_wave20_analyser.py", target),
+            "readable, import, unreadable: {target} was bound"
+        );
+    }
+
+    let after = format!("{prelude}sys.path.insert(0, somewhere)\n{import}{aws}{usage}");
+    let resolution = files(&after);
+    assert!(
+        imports(
+            &resolution,
+            "scripts/test_wave20_analyser.py",
+            "scripts/analyse_wave20.py"
+        ),
+        "unreadable, import, readable: the sibling lost its edge"
+    );
+}
+
 /// An inserted directory that holds the *same* file ordinary resolution found
 /// shadows nothing, so the ordinary answer stands.
 #[test]
@@ -491,6 +565,10 @@ fn an_unpinned_insert_vetoes_every_sys_path_link_but_not_ordinary_imports() {
             "class Holder:\n    sys.path.insert(0, str(ROOT / \"vendor\"))\n",
         ),
         (
+            "unreadable at module level",
+            "sys.path.insert(0, somewhere)\n",
+        ),
+        (
             "above the repository root",
             "sys.path.insert(0, str(Path(__file__).resolve().parents[4] / \"lib\"))\n",
         ),
@@ -626,5 +704,298 @@ fn thousands_of_imports_behind_many_inserts_resolve_in_linear_time() {
     assert!(
         ratio < 40.0,
         "10x the imports took {ratio:.1}x the time ({small:?} -> {large:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Attack lane A (ft-87363ce5): the file-wide veto must block only
+// `sys.path`-derived links, whatever the insert order and shape.
+// ---------------------------------------------------------------------------
+
+const ATK_PRELUDE: &str =
+    "import os\nimport sys\nimport json\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n";
+const ATK_AWS: &str = "sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))\n";
+const ATK_UNREADABLE: &str = "sys.path.insert(0, somewhere)\n";
+const ATK_IMPORT: &str = "import analyse_wave20 as a20\n";
+const ATK_USE: &str = "\ndef test_it():\n    a20.spearman([], [])\n";
+
+fn atk_resolve_pair(source: &str) -> ResolutionResult {
+    resolve(&[
+        ("scripts/test_wave20_analyser.py", source),
+        ("scripts/analyse_wave20.py", WAVE20),
+        ("scripts/aws/analyse_wave20.py", WAVE20),
+    ])
+}
+
+/// `(sibling bound, aws bound)` for the importer.
+fn atk_bound(resolution: &ResolutionResult) -> (bool, bool) {
+    (
+        imports(
+            resolution,
+            "scripts/test_wave20_analyser.py",
+            "scripts/analyse_wave20.py",
+        ),
+        imports(
+            resolution,
+            "scripts/test_wave20_analyser.py",
+            "scripts/aws/analyse_wave20.py",
+        ),
+    )
+}
+
+/// Ordinary package imports, relative imports, `from . import x`, stdlib and
+/// package-root imports keep their edges in a file that carries both a readable
+/// entry and an unreadable module-level insert.
+#[test]
+fn atk_the_veto_blocks_only_sys_path_links_not_ordinary_ones() {
+    let main = format!(
+        "{ATK_PRELUDE}{ATK_AWS}{ATK_UNREADABLE}\
+from . import util\n\
+from .other import thing\n\
+import pkg.other as po\n\
+from pkg.util import helper\n\
+import sibling\n\n\
+def run():\n    util.helper()\n    thing()\n    po.thing()\n    helper()\n    sibling.sib()\n"
+    );
+    let resolution = resolve(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/util.py", "def helper():\n    return 1\n"),
+        ("pkg/other.py", "def thing():\n    return 2\n"),
+        ("pkg/sibling.py", "def sib():\n    return 3\n"),
+        ("pkg/main.py", &main),
+    ]);
+    for target in ["pkg/util.py", "pkg/other.py"] {
+        assert!(imports(&resolution, "pkg/main.py", target), "{target} lost");
+    }
+    for (callee, label) in [
+        ("pkg/util.py::helper", "util.helper"),
+        ("pkg/other.py::thing", "thing"),
+    ] {
+        assert!(
+            callers_of(&resolution, callee)
+                .iter()
+                .any(|caller| caller == "pkg/main.py::run"),
+            "{label}: callers {:?}",
+            callers_of(&resolution, callee)
+        );
+    }
+    assert!(
+        callers_of(&resolution, "pkg/sibling.py::sib")
+            .iter()
+            .any(|caller| caller == "pkg/main.py::run"),
+        "`import sibling` lost its caller edge"
+    );
+}
+
+/// Same file shape with only an unreadable insert (no readable entry): the
+/// resolver stores no search path at all and every ordinary import binds.
+#[test]
+fn atk_an_unreadable_insert_alone_changes_nothing_for_ordinary_imports() {
+    let source = format!("{ATK_PRELUDE}{ATK_UNREADABLE}{ATK_IMPORT}{ATK_USE}");
+    let resolution = atk_resolve_pair(&source);
+    assert_eq!(atk_bound(&resolution), (true, false));
+}
+
+/// Insert order against the import, across every block shape the extractor
+/// counts as module level.
+#[test]
+fn atk_insert_order_matrix() {
+    // (label, source body, sibling bound, aws bound)
+    let cases: Vec<(&str, String, bool, bool)> = vec![
+        ("aws, unreadable, import", format!("{ATK_AWS}{ATK_UNREADABLE}{ATK_IMPORT}"), false, false),
+        ("unreadable, aws, import", format!("{ATK_UNREADABLE}{ATK_AWS}{ATK_IMPORT}"), false, false),
+        (
+            "unreadable, unreadable, aws, import",
+            format!("{ATK_UNREADABLE}{ATK_UNREADABLE}{ATK_AWS}{ATK_IMPORT}"),
+            false,
+            false,
+        ),
+        ("import, aws, unreadable", format!("{ATK_IMPORT}{ATK_AWS}{ATK_UNREADABLE}"), true, false),
+        ("import, unreadable", format!("{ATK_IMPORT}{ATK_UNREADABLE}"), true, false),
+        (
+            "unreadable, import, aws",
+            format!("{ATK_UNREADABLE}{ATK_IMPORT}{ATK_AWS}"),
+            true,
+            false,
+        ),
+        (
+            "aws in __main__ guard, unreadable in try, import",
+            format!(
+                "if __name__ == \"__main__\":\n    {ATK_AWS}try:\n    {ATK_UNREADABLE}except Exception:\n    pass\n{ATK_IMPORT}"
+            ),
+            false,
+            false,
+        ),
+        (
+            "aws in with, unreadable in for, import",
+            format!("with ctx():\n    {ATK_AWS}for p in ps:\n    sys.path.insert(0, p)\n{ATK_IMPORT}"),
+            false,
+            false,
+        ),
+        (
+            "aws, import, unreadable only inside a function",
+            format!("{ATK_AWS}{ATK_IMPORT}def later(w):\n    sys.path.insert(0, w)\n"),
+            false,
+            false,
+        ),
+        (
+            "function-scoped readable + module unreadable, no module entry",
+            format!(
+                "{ATK_UNREADABLE}{ATK_IMPORT}def later():\n    sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))\n"
+            ),
+            true,
+            false,
+        ),
+    ];
+    for (label, body, sibling, aws) in cases {
+        let source = format!("{ATK_PRELUDE}{body}{ATK_USE}");
+        let resolution = atk_resolve_pair(&source);
+        assert_eq!(atk_bound(&resolution), (sibling, aws), "{label}");
+    }
+}
+
+/// An import that only `sys.path` can supply, with the readable entry ahead of
+/// it and the unreadable insert AFTER it. At run time the import ran before the
+/// unknown insert, so the link is true; the veto is file-wide and ignores
+/// order. CHARACTERISATION: this equals v99 (nothing was linked then either),
+/// so it is a known over-veto, not a regression.
+#[test]
+fn atk_characterise_a_late_unreadable_insert_still_vetoes_an_earlier_link() {
+    let source = format!("{ATK_PRELUDE}{ATK_AWS}{ATK_IMPORT}{ATK_UNREADABLE}{ATK_USE}");
+    let resolution = resolve(&[
+        ("scripts/test_wave20_analyser.py", &source),
+        ("scripts/aws/analyse_wave20.py", WAVE20),
+    ]);
+    assert!(!imports(
+        &resolution,
+        "scripts/test_wave20_analyser.py",
+        "scripts/aws/analyse_wave20.py"
+    ));
+}
+
+/// A `..` escape above the repository root vetoes `sys.path` links but the
+/// readable entry still makes the sibling abstain, and ordinary imports bind.
+#[test]
+fn atk_an_escape_above_the_root_vetoes_links_but_keeps_ordinary_imports() {
+    let source = format!(
+        "{ATK_PRELUDE}{ATK_AWS}sys.path.insert(0, str(ROOT / \"..\" / \"..\" / \"lib\"))\n{ATK_IMPORT}import helper\n{ATK_USE}"
+    );
+    let resolution = resolve(&[
+        ("scripts/test_wave20_analyser.py", &source),
+        ("scripts/analyse_wave20.py", WAVE20),
+        ("scripts/aws/analyse_wave20.py", WAVE20),
+        ("scripts/helper.py", "def assist():\n    pass\n"),
+    ]);
+    assert_eq!(atk_bound(&resolution), (false, false));
+    assert!(imports(
+        &resolution,
+        "scripts/test_wave20_analyser.py",
+        "scripts/helper.py"
+    ));
+}
+
+/// Pathological, mixed and over-cap files never panic and never link the
+/// unreadable-insert path. Within the 64-row cap the readable entry shadows
+/// the sibling; past the cap the whole search path is withdrawn, so the
+/// sibling binds (the over-cap gap kept out of ft-87363ce5's scope).
+#[test]
+fn atk_cap_boundary_shadows_within_the_cap_and_withdraws_past_it() {
+    for (readable, unreadable) in [
+        (62usize, 1usize),
+        (63, 1),
+        (63, 2),
+        (64, 1),
+        (65, 1),
+        (1, 200),
+    ] {
+        let mut inserts = String::from(ATK_AWS);
+        for i in 0..readable.saturating_sub(1) {
+            inserts.push_str(&format!("sys.path.insert(0, str(ROOT / \"d{i}\"))\n"));
+        }
+        for _ in 0..unreadable {
+            inserts.push_str(ATK_UNREADABLE);
+        }
+        let source = format!("{ATK_PRELUDE}{inserts}{ATK_IMPORT}{ATK_USE}");
+        let resolution = atk_resolve_pair(&source);
+        let (sibling, aws) = atk_bound(&resolution);
+        // Within the 64-row cap the aws entry stays and shadows the sibling.
+        // Beyond it the file's whole search path is withdrawn (v99 behaviour),
+        // so the sibling binds; the aws link is never made either way.
+        let total = readable + usize::from(unreadable > 0);
+        let expect_sibling = total > 64;
+        assert!(!aws, "{readable}+{unreadable}: aws linked");
+        assert_eq!(sibling, expect_sibling, "{readable}+{unreadable}");
+    }
+}
+
+/// `from X import name` and an `X.Base` heritage read: a known out-of-scope
+/// gap (index.rs `resolve_import_path` direct binding, pytypes.rs heritage
+/// fallback). CHARACTERISATION of today's behaviour for a sibling that a
+/// readable entry shadows, with and without an unreadable insert: the
+/// symbol-level edges (Calls, Extends, References) still bind the sibling
+/// although the `Imports` edge abstains. If a later change closes the gap,
+/// flip these assertions.
+#[test]
+fn atk_characterise_from_import_and_heritage_against_a_shadowed_sibling() {
+    let sibling = "class Base:\n    def run(self):\n        return 1\n\ndef spearman(xs, ys):\n    return 0.0\n";
+    for (label, extra) in [
+        ("readable only", ""),
+        ("readable + unreadable", ATK_UNREADABLE),
+    ] {
+        let source = format!(
+            "{ATK_PRELUDE}{ATK_AWS}{extra}from analyse_wave20 import spearman, Base\n\nclass Child(Base):\n    pass\n\ndef test_it():\n    spearman([], [])\n"
+        );
+        let resolution = resolve(&[
+            ("scripts/test_wave20_analyser.py", &source),
+            ("scripts/analyse_wave20.py", sibling),
+            ("scripts/aws/analyse_wave20.py", sibling),
+        ]);
+        let sib_imports = imports(
+            &resolution,
+            "scripts/test_wave20_analyser.py",
+            "scripts/analyse_wave20.py",
+        );
+        let sib_callers = callers_of(&resolution, "scripts/analyse_wave20.py::spearman");
+        let extends = resolution.edges.iter().any(|e| {
+            e.edge_kind == EdgeKind::Extends && e.target_file == "scripts/analyse_wave20.py"
+        });
+        let aws_edges = resolution
+            .edges
+            .iter()
+            .filter(|e| {
+                e.target_file == "scripts/aws/analyse_wave20.py"
+                    && e.edge_kind != EdgeKind::Contains
+            })
+            .count();
+        assert!(!sib_imports, "{label}: the Imports edge abstains today");
+        assert!(
+            !sib_callers.is_empty(),
+            "{label}: the known gap closed? {sib_callers:?}"
+        );
+        assert!(extends, "{label}: the heritage gap closed?");
+        assert_eq!(aws_edges, 0, "{label}: a vetoed/shadowing aws link leaked");
+    }
+}
+
+/// The module only the inserted directory holds, read with `from X import`
+/// in a file whose unreadable insert vetoes the link: no edge to it.
+#[test]
+fn atk_from_import_through_a_vetoed_search_path_binds_nothing() {
+    let source = format!(
+        "{ATK_PRELUDE}{ATK_AWS}{ATK_UNREADABLE}from analyse_wave20 import spearman\n\ndef test_it():\n    spearman([], [])\n"
+    );
+    let resolution = resolve(&[
+        ("scripts/test_wave20_analyser.py", &source),
+        ("scripts/aws/analyse_wave20.py", WAVE20),
+    ]);
+    assert!(!imports(
+        &resolution,
+        "scripts/test_wave20_analyser.py",
+        "scripts/aws/analyse_wave20.py"
+    ));
+    assert!(
+        callers_of(&resolution, "scripts/aws/analyse_wave20.py::spearman").is_empty(),
+        "{:?}",
+        callers_of(&resolution, "scripts/aws/analyse_wave20.py::spearman")
     );
 }

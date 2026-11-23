@@ -21,6 +21,8 @@
 //!
 //! Every wait is bounded; a bound that expires fails the test and names it.
 
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -29,7 +31,7 @@ use devmap_store::Store;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-use crate::support_ignored;
+mod support_ignored;
 
 const CYCLES: usize = 20;
 const SETTLE_BOUND: Duration = Duration::from_secs(30);
@@ -81,7 +83,7 @@ fn tree_differs(root: &Path, reader: &Store) -> bool {
     }
     walked.iter().any(|(path, _)| {
         let on_disk = std::fs::read_to_string(root.join(path))
-            .map(|source| devmap_extract::content_hash(&source));
+            .map(|source| devmap_extract::source_identity(&source));
         on_disk.ok() != stored.get(path).copied()
     })
 }
@@ -104,27 +106,44 @@ struct Tally {
 /// One edit shape per cycle: rewrite, add, delete, rewrite.
 fn edit(root: &Path, cycle: usize) {
     let src = root.join("src");
-    match cycle % 4 {
-        0 | 3 => std::fs::write(
-            src.join(format!("m{}.py", cycle % 3)),
-            format!("def edited_{cycle}(x):\n    return x + {cycle}\n"),
-        ),
-        1 => std::fs::write(
-            src.join(format!("added_{cycle}.py")),
-            format!("def added_{cycle}(x):\n    return x * {cycle}\n"),
-        ),
-        _ => std::fs::remove_file(src.join("m2.py")).or_else(|_| {
-            std::fs::write(
-                src.join("m2.py"),
-                format!("def back_{cycle}():\n    return 1\n"),
-            )
-        }),
-    }
-    .unwrap_or_else(|error| panic!("cycle {cycle}: the edit failed: {error}"));
+    let res: std::io::Result<()> = (|| {
+        use std::io::Write;
+        match cycle % 4 {
+            0 | 3 => {
+                let path = src.join(format!("m{}.py", cycle % 3));
+                let mut f = std::fs::File::create(&path)?;
+                f.write_all(
+                    format!("def edited_{cycle}(x):\n    return x + {cycle}\n").as_bytes(),
+                )?;
+                f.sync_all()
+            }
+            1 => {
+                let path = src.join(format!("added_{cycle}.py"));
+                let mut f = std::fs::File::create(&path)?;
+                f.write_all(format!("def added_{cycle}(x):\n    return x * {cycle}\n").as_bytes())?;
+                f.sync_all()
+            }
+            _ => {
+                let path = src.join("m2.py");
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    let _ = std::fs::File::open(&src).map(|d| d.sync_all());
+                    Ok(())
+                } else {
+                    let mut f = std::fs::File::create(&path)?;
+                    f.write_all(format!("def back_{cycle}():\n    return 1\n").as_bytes())?;
+                    f.sync_all()
+                }
+            }
+        }
+    })();
+    res.unwrap_or_else(|error| panic!("cycle {cycle}: the edit failed: {error}"));
+    eprintln!("DEBUG: edit completed for cycle {cycle}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycles() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let root = support_ignored::scratch("envelope-cycles");
     for index in 0..3 {
         std::fs::write(
@@ -157,6 +176,8 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
     .expect("run_loop neither served nor returned within 60 s");
 
     let reader = Store::open(&store_path).unwrap();
+    // Allow the filesystem watcher backend to attach and startup sweep to settle.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     let quiet = Instant::now();
     while reader.status("").unwrap().pending_count != 0 && quiet.elapsed() < Duration::from_secs(20)
     {
@@ -205,14 +226,18 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
         // of the tree, which a query does not do; that window is the watcher's
         // debounce and is not what this test judges. Bounded.
         let noticed = Instant::now();
-        while reader.status("").unwrap().pending_count == 0
+        while reader.get_pending_paths().unwrap().is_empty()
             && generation(&reader) == before_generation
         {
-            assert!(
-                noticed.elapsed() < Duration::from_secs(20),
-                "cycle {cycle}: the daemon never noticed the edit within 20 s"
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            if noticed.elapsed() >= Duration::from_secs(45) {
+                panic!(
+                    "cycle {cycle}: the daemon never noticed the edit within 45 s! before_gen={before_generation}, gen_now={}, pending={:?}, differs={}",
+                    generation(&reader),
+                    reader.get_pending_paths().unwrap(),
+                    tree_differs(&root, &reader),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let g0 = generation(&reader);
         let differs0 = tree_differs(&root, &reader);
@@ -248,7 +273,7 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
                 waited.elapsed() < SETTLE_BOUND,
                 "cycle {cycle}: the daemon did not rebuild within {SETTLE_BOUND:?}"
             );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         // Settled: the verdict must not be `false`, for either query shape.

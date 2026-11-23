@@ -5,8 +5,8 @@ use tracing::{info, warn};
 
 use devmap_analyze::analyze_with_discovery;
 use devmap_extract::{
-    collect_project_manifests, collect_sources_with_report, content_hash, extract_file,
-    is_indexable_source, DiscoverySkipReason, MAX_SOURCE_BYTES,
+    collect_project_manifests, collect_sources_with_report, extract_file, is_indexable_source,
+    source_identity, DiscoverySkipReason, MAX_SOURCE_BYTES,
 };
 use devmap_resolve::Resolver;
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
@@ -33,6 +33,23 @@ struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortTaskOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Marks the store watcher-live while the daemon's file watcher runs, and
+/// clears the mark when the daemon leaves, however it does.
+struct WatcherLive(Arc<Store>);
+
+impl WatcherLive {
+    fn mark(store: &Arc<Store>) -> Self {
+        store.set_watcher_live(true);
+        Self(Arc::clone(store))
+    }
+}
+
+impl Drop for WatcherLive {
+    fn drop(&mut self) {
+        self.0.set_watcher_live(false);
     }
 }
 
@@ -827,7 +844,7 @@ impl Daemon {
             .collect();
         let current: std::collections::BTreeMap<_, _> = sources
             .iter()
-            .map(|(path, source)| (path.clone(), content_hash(source)))
+            .map(|(path, source)| (path.clone(), source_identity(source)))
             .collect();
         let mut pending = std::collections::BTreeSet::new();
         for (path, hash) in &current {
@@ -1263,7 +1280,7 @@ impl Daemon {
             Ok(sha) => sha,
             Err(error) => {
                 warn!("cannot read git HEAD for {root:?}: {error}");
-                "unavailable".to_string()
+                devmap_store::UNAVAILABLE_HEAD.to_string()
             }
         };
         // Compared against the *stamp*, not against the raw reading. The two
@@ -1900,6 +1917,10 @@ impl Daemon {
             },
             watch_backlog,
         )?;
+        // From here an edit the watcher sees queues a path and ends the
+        // store's remembered freshness verdict, so verdicts remembered now are
+        // not aged out. The guard clears it however this loop leaves.
+        let _watching = WatcherLive::mark(&self.store);
 
         #[cfg(unix)]
         let mut ipc_task = AbortTaskOnDrop({
@@ -2423,7 +2444,7 @@ enum LoopExit {
 ///    separator and no terminator.
 /// 3. **Hash**: FNV-1a, 64-bit. Offset basis `0xcbf29ce484222325`, prime
 ///    `0x100000001b3`; per byte, `hash = (hash XOR byte) * prime`, multiplication
-///    wrapping at 64 bits. This is `devmap_extract::content_hash`, reused rather
+///    wrapping at 64 bits. This is `devmap_extract::fnv1a64`, reused rather
 ///    than re-spelled so the constants have one definition.
 /// 4. **Rendering**: lowercase hexadecimal, zero-padded to exactly 16 digits.
 /// 5. **Directory**: `<system temp dir>/devmap-<hex>`, created mode `0700`.
@@ -2451,7 +2472,7 @@ enum LoopExit {
 pub fn ipc_identity_for(root: &std::path::Path) -> u64 {
     let canonical = root.canonicalize();
     let canonical = canonical.as_deref().unwrap_or(root);
-    devmap_extract::content_hash(&canonical.to_string_lossy())
+    devmap_extract::fnv1a64(canonical.to_string_lossy().as_bytes())
 }
 
 /// `<temp_dir>/devmap-{ipc_identity_for(root):016x}/ipc.sock`.
@@ -2823,7 +2844,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             daemon.drain_pending_batch_with_head(&|_| {
                 sent.send(()).unwrap();
-                Ok("unavailable".into())
+                Ok(devmap_store::UNAVAILABLE_HEAD.into())
             })
         });
         let read_while_locked = received.recv_timeout(Duration::from_millis(500));
@@ -2853,7 +2874,7 @@ mod tests {
     /// `"unknown"` reaches no production store; a fixture that leaves it there
     /// silently moves the test onto the full-rebuild branch and stops
     /// exercising the differential one it was written for.
-    const SCRATCH_HEAD: &str = "unavailable";
+    const SCRATCH_HEAD: &str = devmap_store::UNAVAILABLE_HEAD;
 
     /// `Store::save_generation` with the scratch tree's HEAD recorded. See
     /// [`SCRATCH_HEAD`].
@@ -5029,7 +5050,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-shutdown-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5093,7 +5114,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-vanished-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5156,7 +5177,7 @@ mod tests {
         let db = root.join("devmap.sqlite");
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-replaced-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5184,14 +5205,14 @@ mod tests {
         // the fresh store still opens.
         let staged = root.join("devmap.sqlite.fresh");
         drop(Store::open(&staged).unwrap());
-        for ext in ["-wal", "-shm"] {
+        for ext in devmap_store::seed::SQLITE_SIDECARS {
             let live = root.join(format!("devmap.sqlite{ext}"));
             if live.exists() {
                 fs::rename(&live, root.join(format!("devmap.sqlite.corrupt-1{ext}"))).unwrap();
             }
         }
         fs::rename(&staged, &db).unwrap();
-        for ext in ["-wal", "-shm"] {
+        for ext in devmap_store::seed::SQLITE_SIDECARS {
             let staged_side = root.join(format!("devmap.sqlite.fresh{ext}"));
             if staged_side.exists() {
                 fs::rename(&staged_side, root.join(format!("devmap.sqlite{ext}"))).unwrap();
@@ -5298,7 +5319,7 @@ mod tests {
         let db = root.join("devmap.sqlite");
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-nostore-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let lock = crate::protocol::ipc_lock_path(&socket);
         let _ = fs::remove_file(&socket);
@@ -5339,6 +5360,32 @@ mod tests {
         );
         assert!(!lock.exists(), "a storeless daemon left its lock behind");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The endpoint identity is a cross-implementation contract (the Python
+    /// client derives it), so its output is pinned as literals rather than
+    /// restated through the hash it is built from. The two roots do not exist,
+    /// so `ipc_identity_for` falls back to the path as written and the input
+    /// bytes are exactly the ones below. The values are plain FNV-1a 64 over
+    /// those bytes, computed by an independent implementation; they must not
+    /// move when the source-identity hash changes.
+    #[cfg(unix)]
+    #[test]
+    fn the_ipc_identity_is_pinned_to_plain_fnv1a64() {
+        use std::path::Path;
+        assert_eq!(
+            ipc_identity_for(Path::new("/nonexistent-w16/devmap/golden")),
+            0x0824_c575_5ad9_30d8
+        );
+        assert_eq!(
+            ipc_identity_for(Path::new("/nonexistent-w16/other-root")),
+            0x4bf7_e9ab_f6a2_1b82
+        );
+        assert_eq!(
+            ipc_identity_for(Path::new("")),
+            0xcbf2_9ce4_8422_2325,
+            "the empty path is the FNV offset basis"
+        );
     }
 
     /// The IPC path must be a function of the *canonical* root.
@@ -5384,7 +5431,7 @@ mod tests {
         let expected = std::env::temp_dir()
             .join(format!(
                 "devmap-{:016x}",
-                devmap_extract::content_hash(&canonical.to_string_lossy())
+                devmap_extract::fnv1a64(canonical.to_string_lossy().as_bytes())
             ))
             .join("ipc.sock");
         assert_eq!(direct, expected);
@@ -5405,7 +5452,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let socket = std::path::PathBuf::from(format!(
             "/tmp/devmap-cancel-{:016x}.sock",
-            devmap_extract::content_hash(&root.to_string_lossy())
+            devmap_extract::fnv1a64(root.to_string_lossy().as_bytes())
         ));
         let _ = fs::remove_file(&socket);
         let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
@@ -6515,6 +6562,37 @@ mod tests {
             "{walks} freshness walks over {drains} drains from {EDITS} edits"
         );
         assert!(verified.is_ok(), "the settled tree never read fresh:true");
+    }
+
+    /// The 60 s age bound is for verdicts no watcher backs. A daemon marks its
+    /// store watcher-live for as long as its watcher runs, so the verdicts its
+    /// drains certify are exempt from the bound, and the mark is gone once it
+    /// has left (the store-level tests advance the clock past the bound).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_daemon_marks_its_store_watcher_live_and_clears_it_on_exit() {
+        let (daemon, task, root) =
+            freshness_fixture("watcher-live", Duration::from_millis(20), None, false).await;
+        let store = Arc::clone(&daemon.store);
+        assert!(
+            store.watcher_live(),
+            "the watcher is running, so the store must say a watcher backs its verdicts"
+        );
+        wait_for_drained_generation(&store).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while store.query_source_freshness().fresh != Some(true) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the settled tree never read fresh:true");
+        daemon.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !store.watcher_live(),
+            "a daemon that has left must not leave its store marked as watched"
+        );
     }
 
     /// A shutdown that arrives while a walk is running must not wait for it.

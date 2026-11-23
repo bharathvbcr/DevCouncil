@@ -31,6 +31,8 @@ Available MCP tools are `devcouncil_verify_task`, `devcouncil_get_gaps` and `dev
 - task detail, provenance and evidence: `devcouncil verify TASK_ID --json`, and read the persisted state under `.devcouncil/` directly.
 - next actions: read the typed `next_actions` out of the `devcouncil_verify_task` result rather than a separate tool.
 
+When one of those three MCP calls errors or times out, run it from the shell with the same arguments — `dev tool call devcouncil_get_gaps --args '{"task_id":"T-1"}'` — and say in your report that you fell back. The answer text is the MCP answer; exit status 3 means the tool could not run here, which is not a pass.
+
 Report the blocking gaps effective under the current mode, whether the changed code was actually exercised (diff coverage), and the concrete next actions. In off mode, report completed work as unverified rather than blocking on historical quality gaps.
 
 **Navigate with DevMap and GitPulse Insights, not by reading files at random.** Both are read-only, so both are open to you:

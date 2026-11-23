@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/agents"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 func TestAntigravitySendsAgentsBeforeTheMCPInstall(t *testing.T) {
@@ -148,7 +149,7 @@ printf '%s\n' '{"check_ok":true,"host":"antigravity"}'
 exit 0
 `)
 	t.Setenv("DEVMAP_LOG", log)
-	t.Setenv("HOME", t.TempDir())
+	testsupport.IsolateHostConfig(t)
 	root := t.TempDir()
 	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeCheck, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err == nil {
@@ -182,7 +183,7 @@ esac
 echo "unexpected $*" >&2
 exit 1
 `)
-	t.Setenv("HOME", t.TempDir())
+	testsupport.IsolateHostConfig(t)
 	root := t.TempDir()
 	receipt, err := Run(Options{Root: root, Host: "antigravity", Mode: ModeApply, DevmapBin: bin, SelfBin: fakeSelf, DevmapCommand: fakeDevmap})
 	if err == nil || !strings.Contains(err.Error(), "mcp document refused") {

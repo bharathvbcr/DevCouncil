@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,10 +166,31 @@ func (e *LazyFetchUnguardedError) Error() string {
 		e.Root, e.Version, e.Git)
 }
 
-// gitEnv is the environment every git DevCouncil runs gets: no terminal
-// prompt, no optional index lock (a read must never leave index.lock in
-// someone's checkout), and no lazy fetch from a promisor remote, so a
-// missing object fails the read loudly instead of fetching.
+// repositoryLocatingEnv are the variables that tell git which repository, work
+// tree, index or object store to read, whatever directory it runs in. One
+// inherited from the caller (a hook, a git alias, a wrapper) would redirect a
+// read of the session's root to another repository, so gitEnv drops them. A
+// read that needs its own index adds GIT_INDEX_FILE after (RunEnv's env).
+var repositoryLocatingEnv = []string{
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+	"GIT_PREFIX", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+}
+
+// gitEnv is the environment every git DevCouncil runs gets: the caller's
+// environment without the repository-locating variables, no terminal prompt,
+// no optional index lock (a read must never leave index.lock in someone's
+// checkout), and no lazy fetch from a promisor remote, so a missing object
+// fails the read loudly instead of fetching.
 func gitEnv() []string {
-	return append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1")
+	env := os.Environ()
+	kept := make([]string, 0, len(env)+3)
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		if slices.Contains(repositoryLocatingEnv, name) {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return append(kept, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1")
 }

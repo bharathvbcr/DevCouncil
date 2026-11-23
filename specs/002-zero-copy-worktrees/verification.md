@@ -12,3 +12,8 @@
 9. **Proc-Macro Poisoning (`F14`, `OQ4`)**: Test Stage-2 cache key with `serde_derive` (pinned hash -> normalized sentinel) vs `sqlx_macros` / unknown `.dylib` / `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), ...))` (must include raw `CARGO_MANIFEST_DIR`).
 10. **Multi-Lane Harness (`F16`, `P3.3`)**: Execute concurrent `Manvi` runs on sibling worktrees of one repo and invoke `workspace: "worktree"` subagent coordination.
 11. **Standalone Seed Build-Before-Place (`F-g`)**: Commit an edit on a linked worktree lane, run `devmap seed` without `devmap build`, and assert immediate queryability of the lane's new symbol, `head_sha` matching lane `HEAD`, materialized `.csr`, and zero partial store when staged FTS shadow tables are damaged.
+
+## Known limitation: delta rows survive an extraction-schema bump (ft-444eeede)
+`delta.sqlite` records no analyzer or extraction version, and `StackedStore::delta_covers` compares only the file's blake3. A delta row written by an older extraction (for example extract-v99) therefore still counts as covering the file after the binary moves to a newer `EXTRACTION_SCHEMA_VERSION`, and a stacked worktree serves that old extraction until the next `devmap seed --sync-delta` rewrites the row. Every other warm path is forced to re-extract by the `:extract-vN` analyzer string.
+
+Until the delta store records its writer's extraction identity, after any extraction-schema bump: rebuild the stacked base stores and re-run `devmap seed --sync-delta` in every stacked worktree BEFORE reinstalling or re-vendoring the new devmap.

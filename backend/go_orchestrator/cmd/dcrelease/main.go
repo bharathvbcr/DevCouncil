@@ -4,7 +4,9 @@
 //	go -C backend/go_orchestrator run ./cmd/dcrelease [--tag vX.Y.Z] [--artifacts DIR] [--root DIR]
 //
 // A relative --artifacts is resolved against the checkout root, because
-// `go -C` has already moved the working directory into the module.
+// `go -C` has already moved the working directory into the module. A path
+// that leaves that root is refused: Join cleans "..", and an absolute path
+// was previously used unchanged, so both could still print OK.
 //
 // --tag-at-head adds the one check CI structurally cannot make: that the
 // tag, if it already exists, names HEAD (see release.TagNamesHead). ci:local
@@ -79,6 +81,116 @@ func parseArgs(argv []string) (args, error) {
 	return out, nil
 }
 
+// errArtifactsOutside is the containment refusal for --artifacts. It is a
+// failed check (exit 1), not a usage error: the flag parsed, and the path
+// it names is not in this checkout.
+var errArtifactsOutside = errors.New("--artifacts is outside the checkout")
+
+// artifactsWithinCheckout resolves artifacts against root. An empty value
+// stays empty. A relative path is joined to the checkout. Root and candidate
+// are then resolved through symlinks (as far as they exist) and compared, so
+// a link inside the checkout that points out, a dangling link (its target's
+// directory part is resolved, its missing tail is kept), and a root that is
+// itself a link are all judged by where they really lead. A missing
+// path that resolves inside is not a containment failure.
+func artifactsWithinCheckout(root, artifacts string) (string, error) {
+	if artifacts == "" {
+		return "", nil
+	}
+	candidate := filepath.Clean(artifacts)
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(root, candidate)
+	}
+	rootResolved, err := resolveExisting(root)
+	if err != nil {
+		return "", fmt.Errorf("--artifacts: %w", err)
+	}
+	resolved, err := resolveExisting(candidate)
+	if err != nil {
+		return "", fmt.Errorf("--artifacts: %w", err)
+	}
+	if !pathInside(rootResolved, resolved) {
+		return "", errArtifactsOutside
+	}
+	return candidate, nil
+}
+
+// pathInside reports whether path is root or a directory under it. A sibling
+// such as root+"-evil" is outside, and so is another volume.
+func pathInside(root, path string) bool {
+	if filepath.VolumeName(root) != filepath.VolumeName(path) {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveExisting follows symlinks as far as the path exists, then reattaches
+// the missing tail. EvalSymlinks fails on a path that is not there, and it
+// also fails on a dangling symlink; peeling that link and keeping its name
+// would call an outside target contained. A chain that does not finish is an
+// error, not a path.
+func resolveExisting(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	cur := abs
+	rest := ""
+	for steps := 0; steps < 256; steps++ {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if rest == "" {
+				return resolved, nil
+			}
+			return filepath.Join(resolved, rest), nil
+		}
+		fi, lerr := os.Lstat(cur)
+		if lerr != nil && !os.IsNotExist(lerr) {
+			return "", lerr
+		}
+		if lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			target, rerr := os.Readlink(cur)
+			if rerr != nil {
+				return "", rerr
+			}
+			if !filepath.IsAbs(target) {
+				// Concatenated, not Joined: Join would clean ".." lexically.
+				target = filepath.Dir(cur) + string(filepath.Separator) + target
+			}
+			// The target's directory part may itself be a link, so ".." in it
+			// is taken from its real location. A directory that cannot be
+			// resolved is an error, never a lexical guess.
+			dirPart, base := target, ""
+			if i := strings.LastIndex(target, string(filepath.Separator)); i >= 0 {
+				dirPart, base = target[:i+1], target[i+1:]
+			}
+			if base == "" || base == "." || base == ".." {
+				dirPart, base = target, ""
+			}
+			dir, derr := filepath.EvalSymlinks(dirPart)
+			if derr != nil {
+				return "", derr
+			}
+			cur = filepath.Join(dir, base)
+			continue
+		}
+		if lerr == nil {
+			// Present, not a symlink, and EvalSymlinks still failed.
+			return "", fmt.Errorf("resolve %s", cur)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+	return "", errors.New("symlink resolution did not converge")
+}
+
 // revParse resolves rev to a commit sha, or "" when no such rev exists. A git
 // that cannot run is an error, never an empty answer.
 //
@@ -129,6 +241,15 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
+	artifacts, err := artifactsWithinCheckout(root, a.artifacts)
+	if err != nil {
+		if errors.Is(err, errArtifactsOutside) {
+			fmt.Fprintf(stderr, "FAIL: %s\n", errArtifactsOutside)
+			return 1
+		}
+		fmt.Fprintf(stderr, "dcrelease: %v\n", err)
+		return 2
+	}
 	if a.tagAtHead {
 		head, err := revParse(root, "HEAD")
 		if err == nil && head == "" {
@@ -147,10 +268,6 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "OK: %s would publish the notes at HEAD\n", a.tag)
-	}
-	artifacts := a.artifacts
-	if artifacts != "" && !filepath.IsAbs(artifacts) {
-		artifacts = filepath.Join(root, artifacts)
 	}
 	result := release.Inspect(release.DefaultSources(root), release.Options{Tag: a.tag, ArtifactsDir: artifacts})
 	if len(result.Errors) > 0 {

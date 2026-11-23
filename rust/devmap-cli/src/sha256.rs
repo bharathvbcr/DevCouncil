@@ -32,10 +32,8 @@ use sha2::{Digest, Sha256};
 /// Bytes per read when hashing a file.
 const CHUNK: usize = 64 * 1024;
 
-/// Hex digest of a byte slice.
-pub fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
-}
+/// Hex digest of a byte slice, owned by `dc_evidence`.
+pub use dc_evidence::sha256 as sha256_hex;
 
 /// What a whole inventory pass may spend hashing, shared across every file it
 /// reaches rather than granted to each.

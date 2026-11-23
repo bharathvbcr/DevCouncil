@@ -25,13 +25,14 @@ const (
 	maxBatchMembers   = 64
 	defaultCallBudget = 60 * time.Second
 	// verifyCallBudget is what devcouncil_verify_task gets unless
-	// callBudgetEnv says otherwise: one verification command may legitimately
+	// CallBudgetEnv says otherwise: one verification command may legitimately
 	// run for verify.CommandTimeout, so the call that hosts it must outlive it.
 	// The 60 s default it used to share with every other tool cut a suite short
 	// and, because the run was written on the expired context, lost its record.
 	verifyCallBudget = verify.CommandTimeout + 2*time.Minute
 	verifyToolName   = "devcouncil_verify_task"
-	callBudgetEnv    = "DEVCOUNCIL_MCP_CALL_TIMEOUT_MS"
+	// CallBudgetEnv overrides every call budget, in milliseconds.
+	CallBudgetEnv    = "DEVCOUNCIL_MCP_CALL_TIMEOUT_MS"
 	slotPoll         = 2 * time.Millisecond
 	maxResponseBytes = 4 * 1024 * 1024
 	drainGrace       = 5 * time.Second
@@ -56,6 +57,9 @@ type Server struct {
 
 	callsMu sync.Mutex
 	calls   map[string]*call
+
+	// Test hook to exercise tools/list behavior when a spec schema is invalid.
+	specsOverride []devcouncil.ToolSpec
 }
 
 // call is one request that has been accepted and not yet answered.
@@ -100,7 +104,7 @@ type toolsCallParams struct {
 // budgetFromEnv reads DEVCOUNCIL_MCP_CALL_TIMEOUT_MS: milliseconds, applied to
 // every tool call when set to a positive integer.
 func budgetFromEnv() (time.Duration, bool) {
-	if raw := os.Getenv(callBudgetEnv); raw != "" {
+	if raw := os.Getenv(CallBudgetEnv); raw != "" {
 		var ms int64
 		if _, err := fmt.Sscanf(raw, "%d", &ms); err == nil && ms > 0 {
 			return time.Duration(ms) * time.Millisecond, true
@@ -112,16 +116,31 @@ func budgetFromEnv() (time.Duration, bool) {
 // callBudgetFor is how long a request may run before the host answers it with a
 // timeout and cancels what it started.
 func callBudgetFor(method string, params json.RawMessage) time.Duration {
-	if d, ok := budgetFromEnv(); ok {
-		return d
-	}
 	if method == "tools/call" {
 		var p struct {
 			Name string `json:"name"`
 		}
-		if json.Unmarshal(params, &p) == nil && p.Name == verifyToolName {
-			return verifyCallBudget
+		if json.Unmarshal(params, &p) == nil {
+			return ToolCallBudget(p.Name)
 		}
+	}
+	if d, ok := budgetFromEnv(); ok {
+		return d
+	}
+	return defaultCallBudget
+}
+
+// ToolCallBudget is how long one call of the named tool may run: the
+// CallBudgetEnv override when set, the verification budget for
+// devcouncil_verify_task, and the default otherwise. `devcouncil tool call`
+// bounds its in-process call by the same number, so a call does not get more
+// or less time for having come in through the shell.
+func ToolCallBudget(name string) time.Duration {
+	if d, ok := budgetFromEnv(); ok {
+		return d
+	}
+	if name == verifyToolName {
+		return verifyCallBudget
 	}
 	return defaultCallBudget
 }
@@ -389,7 +408,7 @@ func (s *Server) acquireSlot() bool {
 }
 
 func timeoutResponse(id json.RawMessage, budget time.Duration) rpcResponse {
-	return errResult(id, -32000, fmt.Sprintf("request timed out after %s; set %s (milliseconds) to change the budget", budget, callBudgetEnv))
+	return errResult(id, -32000, fmt.Sprintf("request timed out after %s; set %s (milliseconds) to change the budget", budget, CallBudgetEnv))
 }
 
 // startCall runs one request in its own goroutine under its own budget. It
@@ -546,7 +565,7 @@ func (s *Server) send(resp rpcResponse) bool {
 			"result": map[string]any{
 				"content": []map[string]any{{
 					"type": "text",
-					"text": mustJSON(map[string]any{"ok": false, "code": "truncated", "error": "response exceeded body cap", "truncated": true}),
+					"text": devcouncil.MarshalToolPayload(map[string]any{"ok": false, "code": "truncated", "error": "response exceeded body cap", "truncated": true}),
 				}},
 				"isError":   true,
 				"truncated": true,
@@ -602,7 +621,11 @@ func (s *Server) legacyHandle(ctx context.Context, req rpcRequest) rpcResponse {
 		// request is owed a response; the empty result is devmap's answer too.
 		return okResult(req.ID, map[string]any{})
 	case "tools/list":
-		return okResult(req.ID, s.listTools())
+		listed, err := s.listTools()
+		if err != nil {
+			return errResult(req.ID, -32603, err.Error())
+		}
+		return okResult(req.ID, listed)
 	case "tools/call":
 		return s.callTool(ctx, req)
 	default:
@@ -610,20 +633,12 @@ func (s *Server) legacyHandle(ctx context.Context, req rpcRequest) rpcResponse {
 	}
 }
 
-func (s *Server) listTools() map[string]any {
-	specs := s.Registry.Specs()
-	tools := make([]map[string]any, 0, len(specs))
-	for _, spec := range specs {
-		var schema any
-		_ = json.Unmarshal(spec.InputSchema, &schema)
-		tools = append(tools, map[string]any{
-			"name":        spec.Name,
-			"description": spec.Description,
-			"inputSchema": schema,
-			"annotations": spec.Behaviour.Annotations(),
-		})
+func (s *Server) listTools() (map[string]any, error) {
+	specs := s.specsOverride
+	if specs == nil {
+		specs = s.Registry.Specs()
 	}
-	return map[string]any{"tools": tools}
+	return devcouncil.ToolsListResult(specs)
 }
 
 func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
@@ -634,27 +649,12 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	if params.Arguments == nil {
 		params.Arguments = map[string]any{}
 	}
-	payload, err := s.Registry.Call(ctx, params.Name, params.Arguments)
-	if err != nil {
-		return okResult(req.ID, map[string]any{
-			"content": []map[string]any{{"type": "text", "text": mustJSON(map[string]any{"ok": false, "error": err.Error(), "code": "tool_error"})}},
-			"isError": true,
-		})
-	}
-	text := mustJSON(payload)
-	isError := false
-	if m, ok := payload.(map[string]any); ok {
-		if okFlag, exists := m["ok"].(bool); exists && !okFlag {
-			isError = true
-		}
-	} else if ep, ok := payload.(devcouncil.ErrorPayload); ok && !ep.OK {
-		isError = true
-	} else if dr, ok := payload.(devcouncil.DiffResult); ok && !dr.OK {
-		isError = true
-	}
+	// Rendered by the same function `devcouncil tool call` uses, so the shell
+	// fallback prints the bytes this reply carries.
+	answer := devcouncil.AnswerTool(s.Registry.Call(ctx, params.Name, params.Arguments))
 	return okResult(req.ID, map[string]any{
-		"content": []map[string]any{{"type": "text", "text": text}},
-		"isError": isError,
+		"content": []map[string]any{{"type": "text", "text": answer.Text}},
+		"isError": answer.IsError,
 	})
 }
 
@@ -696,14 +696,6 @@ func okResult(id json.RawMessage, result any) rpcResponse {
 
 func errResult(id json.RawMessage, code int, message string) rpcResponse {
 	return rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message}}
-}
-
-func mustJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return `{"ok":false,"error":"marshal failed"}`
-	}
-	return string(b)
 }
 
 func jsonRawOrNull(id json.RawMessage) any {

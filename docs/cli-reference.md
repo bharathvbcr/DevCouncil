@@ -36,7 +36,7 @@ DevMap build retains its measured five-stage trail and file counters.
 Optional output has bounded queues and shutdown waits. A full or disconnected
 stderr must not block an independent primary result stream. Primary stdout
 retains normal backpressure. Errors writing a result fail the command; the
-three JSON components return exit 1 for transport failure without a panic.
+five JSON components (`dcstore`, `dcverify`, `dcjsoncheck`, `dcgrep`, `dcredact`) share `dc_proc::cli` and return exit 1 for transport failure without a panic.
 
 `devcouncil install devmap --dry-run --json` emits the planned command receipt
 without executing it. `devmap repair --fts --pending --page-size --json`
@@ -66,7 +66,8 @@ Usage:
   devcouncil skills list                               # List embedded agent skills
   devcouncil skills scaffold [options]                 # Distribute skills into project
   devcouncil task create|status|show …                 # Create, move and show tasks (workbench items)
-  devcouncil doctor [--json]                           # Which store next_task reads; how many ready items it holds
+  devcouncil doctor [--json] [--mcp]                   # Which store next_task reads; --mcp times each MCP server's handshake
+  devcouncil tool list|call NAME [--args JSON|-]       # The devcouncil_* MCP tools from a shell (MCP fallback)
   devcouncil verify TASK_ID [options]                  # Deterministically verify a task diff
   devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
   devcouncil search QUERY [--type symbol|structural|literal|regex] [--path DIR] [--max N] [--json]
@@ -99,7 +100,7 @@ devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [
                        [--scope-json JSON | --scope-file PATH] [--project-root DIR]
 devcouncil task status ID --to backlog|ready|in_progress|review|done
 devcouncil task show ID [--json]
-devcouncil doctor [--json] [--project-root DIR]
+devcouncil doctor [--json] [--mcp] [--project-root DIR]
 ```
 
 The task board has five statuses. `inbox`, the name the Backlog column had before the two were merged, is still accepted wherever a status is read and means `backlog`; no task is stored or shown as `inbox`.
@@ -120,6 +121,12 @@ The task board has five statuses. `inbox`, the name the Backlog column had befor
   default `.devcouncil/state.sqlite`, always inside `.devcouncil/`), the gate mode,
   and how many ready items the store holds: all of them, and how many `next_task`
   offers under that mode. It exits 1 when the store cannot be read.
+- `doctor --mcp` also starts `devcouncil mcp` (this executable) and `devmap mcp`,
+  runs `initialize` and `tools/list` under a 30 s bound per server, and reports
+  the time each phase took, the tool count, and any tool this host's server
+  advertises that this binary does not serve (or the reverse) — a sign the
+  server on that path is another build. A server that could not be started is
+  `not_run`, never `ok`; either one exits 1.
 
 ### Host MCP Server
 
@@ -129,6 +136,48 @@ devcouncil mcp
 ```
 
 Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. What `integrate` installs into Cursor/Claude. Arbitrary filesystem/patch/shell tools are not exposed by this host. Its verification gateway does invoke `dcverify` for rigor; see [the task loop contract](hero-loop.md).
+
+### MCP fallback (`tool`)
+
+```bash
+devcouncil tool list [--json]
+devcouncil tool call NAME [--args JSON|-] [--project-root DIR]
+devcouncil tool call devcouncil_checkout_task --args '{"task_id":"T-1","client_id":"me"}'
+```
+
+For when a `devcouncil_*` MCP call errors or times out. `tool call` builds the
+registry `devcouncil mcp` builds and calls the named tool once, in this process:
+the same argument checks (an undeclared argument is refused), the same per-tool
+time budget (`DEVCOUNCIL_MCP_CALL_TIMEOUT_MS` overrides both), and stdout is
+byte-for-byte the text an MCP client receives — one renderer serves both. The
+write gate is built only for `devcouncil_policy_check_write`. `--args -` reads
+the object from stdin (at most 4 MiB, the server's frame cap). `tool list --json`
+is the server's `tools/list` result.
+
+Leases live in the task store, not in a server process, so a lease taken over MCP
+is renewed, verified and released from the shell and the other way round. Use the
+same `client_id` on both: a checkout by the holding client hands its lease back.
+
+Exit status: `0` the tool answered ok (for `devcouncil_verify_task` that means a
+verdict came back: read `passed`; `dev verify` instead exits 1 on a failing
+verdict); `1` it refused (`ok: false`, e.g.
+`lease_conflict`, `not_found`); `2` the call was malformed (unknown tool,
+bad JSON, an undeclared or missing argument); `3` it could not run here
+(`not_initialized`, `store_error`, `policy_error`, `verify_error`,
+`git_repo_undetermined`, a timeout). Every call prints one stderr line saying it
+was answered from the shell, so a fallback is visible in the transcript.
+
+The policy allowlist admits `dev tool list` and the read-only tools (next_task,
+get_diff, get_gaps, policy_check_write) without a lease, and renew_lease,
+release_task and verify_task to a lease holder; never `dev tool call *`.
+`devcouncil_checkout_task` is in neither list: a harness that enforces the gate
+(Manvi) offers its own checkout, which takes no `force` and no caller-chosen
+client id, and the shell spelling would carry both. Where no gate runs (an
+interactive host; DevCouncil's hooks are retired) the shell checkout works.
+
+This fixes transport failures only. The CLI shares the registry, the store and
+the project-root resolution with the server, so a missing store or a wrong root
+fails the same way on both.
 
 ### Agent Host Integrations
 
@@ -213,10 +262,11 @@ devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox loca
 
 Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work, planned-file scope, orphan diffs, dependency-risk, and expected-test / allowed-command execution. It also spawns **`dcverify`** for the rigor gates — stub detection (`stub_detected`), secret scanning (`security_risk`), and diff↔coverage (`diff_not_exercised`).
 - `--coverage`: Path to a coverage profile (Go `-coverprofile` output, or LCOV) for the same change. Without it the diff↔coverage gate does not run and `coverage_skipped_reason` says `coverage profile not supplied`; the stub and secret gates run either way. A path that names no file is an error, not an unmeasured run.
-- `rigor_applied` / `rigor_skipped_reason`: Exactly one is populated. `rigor_applied` names the gates that ran (`secret_scan`, `stub_detection`, `substance`; `assert_free_test` and `skipped_test` only when at least one changed file was parsed, since they exist only on that path; and `diff_coverage` when a profile was given). Stub detection parses Rust, Go, Python and TypeScript changed files from the working tree (falling back to a line match, labelled `derived`, elsewhere); an `allow-stub: <reason>` comment on or above a stub records it as a non-blocking `stub_declared` gap carrying the reason, and a marker without a reason is ignored. Added tests with no assertion or an unconditional skip are advisory `assert_free_test` / `skipped_test` gaps. When `dcverify` is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what to install. If `dcverify` **is** installed and fails, that is a blocking `rigor_check_unavailable` gap rather than a skip — a credential scan that could not run must not read like one that ran and found nothing.
+- `rigor_applied` / `rigor_skipped_reason`: Exactly one is populated. `rigor_applied` names the gates that ran (`secret_scan`, `stub_detection`, `substance`, `runner_hijack`, `lean_tcb`; `assert_free_test` and `skipped_test` only when at least one changed file was parsed, since they exist only on that path; and `diff_coverage` when a profile was given). Stub detection parses Rust, Go, Python and TypeScript changed files from the working tree (falling back to a line match, labelled `derived`, elsewhere); an `allow-stub: <reason>` comment on or above a stub records it as a non-blocking `stub_declared` gap carrying the reason, and a marker without a reason is ignored. Added tests with no assertion or an unconditional skip are advisory `assert_free_test` / `skipped_test` gaps. Anti-reward-hacking hard-safety checks add non-demotable `runner_hijack`, `lean_tcb` (optional Lean kernel verification controlled by `DC_VERIFY_LEAN_KERNEL` / `DC_LEAN_KERNEL_TIMEOUT_MS`), `unattested_test_run`, and `oracle_tampering` gaps. When `dcverify` is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what to install. If `dcverify` **is** installed and fails, that is a blocking `rigor_check_unavailable` gap rather than a skip — a credential scan that could not run must not read like one that ran and found nothing.
 - `dcverify` is discovered on `PATH`, excluding any candidate inside the repository under analysis (`proc.LookPathOutside`); `MANVI_VERIFY_BINARY` overrides discovery. It remains a separately installed component (`devcouncil install --only=dcverify`).
 - `--mode`: `off` (default when unset) skips quality verification and reports `status: "skipped"`, `passed: false`, and `verification_skipped: true`; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair. Skipped tasks increment `completed_without_verification`, not `verified_tasks`. Completion and verification remain separate outcomes.
+- `not_run`: A verify that judged nothing says so. An id this store does not hold (a GitPulse board card id is not a task here), a missing store, or a store read error ends with exit 1, `ok: false`, `processed_tasks: 0` and a top-level `not_run` object, `{"reason": "task_not_found" | "store_unavailable" | "store_error", "task_id": ...}`; `error` keeps its text. Nothing is written to the store, and none of `verified_tasks`, `blocked_tasks`, `degraded_tasks` or `completed_without_verification` counts it. `not_run` is absent on any run that judged a task. When a multi-task run judges some tasks and then cannot read a later one, the earned verdicts stay in `tasks[]` and the unread task is its own entry with `status: "not_run"` and a `not_run` object; the run is `ok: false`. Report a not-run as not run, never as passed. Human mode prints one stderr line, `verify: NOT RUN (<reason>): ...`, with control characters escaped.
 - Acceptance criteria: each criterion the task claims is dispatched on its requirement's `verification_method` (`devcouncil/verify/criteria.go`). `unit_test`, `integration_test` and `static_check` are discharged when the task's verification commands all ran and passed, and are then also reported as a non-blocking `coarse_acceptance_proof`; otherwise they are `acceptance_criteria_unproven`. `manual` has no executor and is a hard-safety `unsupported_verification_method` gap (blocking when `required`, in advisory mode too). `llm_review` is discharged only by a recorded independent review of exactly the content under verification (see [Independent reviews](#independent-reviews-llm_review)); with none, or with one that cannot vouch for this content, it is a blocking `llm_review_unproven` gap whose evidence says why, and a discharging review's open major or contested findings are reported as a non-blocking `llm_review_findings` gap. Passing commands never discharge it. A criterion no linked requirement defines, or requirements the store could not return, also block.
 - `--sandbox`: Only `local` exists: verification commands run on the host (`/bin/sh -c` in the project root), and the report's `sandbox` field is always `local` because that is where they ran. Any other value (`docker`, `nix`, anything) is refused with exit 2 before a store is opened or a command runs (TASK-P7-2). MCP `devcouncil_verify_task` takes no sandbox argument and refuses one with `code: invalid_argument`.
 
@@ -293,6 +343,7 @@ High-performance multi-language code graph and symbol analysis engine (extract �
 ```bash
 # Build & Lifecycle
 devmap build --manifest     # Generate repo_map.json and code_graph.json
+devmap seed                 # Seed or stack a linked worktree's index from a registered checkout
 devmap build --full         # Cold rebuild: re-parse every source, ignore the extraction cache
 devmap build --verify-rows  # Incremental extraction, but re-derive every stored edge's validity
 devmap build --manifest --force  # Also replace a foreign repo map / code graph (`--force` requires `--manifest`)
@@ -309,14 +360,22 @@ devmap build --lsp          # Opt-in language server extraction pass (drains & r
 devmap serve                # Watcher + IPC (not `build --watch`)
 devmap status [--json]      # Generation, readiness, resolution caps, search_index_damaged probe
 devmap --version            # Prints version, store schema, code graph schema, extract schema, build hash
+devmap version              # Subcommand equivalent of --version
 devmap doctor               # No `--fix`
 devmap paths [--json]
+devmap freshness            # Working-tree head/inventory/content digests (--expect-* checks staleness)
 devmap history
+devmap snapshots
 devmap repair
+devmap workspace            # Manage workspace registry and cross-repo queries
+devmap savings              # Estimated map vs file-read token savings
 
 # Code Exploration & Navigation
 devmap search <QUERY> [--semantic]
+devmap ask "<QUERY>"        # Plain-language TF-IDF + Personalized PageRank find
 devmap explore <NAME>
+devmap skeleton <FILE>      # Signatures and spans in a file without bodies
+devmap literals <QUERY>     # String-literal search across indexed sites and consts
 devmap deps <FILE> [--min-rung deterministic|high|speculative]
 devmap trace <SRC> <DST>
 devmap impact <TARGET> [--layers]
@@ -331,24 +390,30 @@ devmap preview --file <FILE> [--content <PATH|->]
 devmap blast [--since <REV>] [--at <LOC>]   # Forward change impact (inbound edges)
 devmap suspects <SYMPTOM> --since <REV>     # Backward regression attribution (outbound edges)
 
-# Structural & Route Analysis
+# Structural, Route & Proof Analysis
 devmap cypher '<QUERY>'
 devmap pdg <FILE> [--taint]
 devmap routes [--filter <PATH>]
 devmap shape-check [--filter <PATH>]
 devmap api-impact <ROUTE>
 devmap ast <QUERY> [--kind <KIND>] [--language <LANG>]
+devmap lean-tcb             # Audit Lean 4 (.lean) Trusted Computing Base boundaries
 
 # Session Insights & Gaps
 devmap gap-record --tool <TOOL> --gap-id <ID> --reason <REASON>
 devmap session-report [--last]
 
-# Visualizers & Servers
+# Visualizers, Host Integration & Servers
 devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html); see code-graph.md
 devmap html                 # Symbol graph HTML
 devmap mcp                  # DevMap MCP stdio (21 read-only tools: status, search, ask, ask_evidence, deps, impact, trace, neighbors, dead, skeleton, clones, preview, explore, literals, doc_drift, affected, suspects, blast, routes, api_impact, cypher)
 devmap mcp --http <ADDR>   # MCP 2026-07-28 over HTTP (bare port = 127.0.0.1); also serves GET /map_preview.html and GET /code_graph.html, read-only; see HOST_INTEGRATION.md
 devmap export               # GraphML
+devmap integrate <HOST>     # Register DevMap guides, Cursor rules, skills, and MCP
+devmap skills               # Install embedded DevMap skills
+devmap agents               # Install Antigravity agents/rules from --agents-stdin
+devmap claude               # Emit/validate DevMap Claude Code plugin/hooks
+devmap hook                 # Host-neutral hook entrypoint (stdin JSON)
 ```
 
 Unknown: `query`, `view`, `demo`, `graph-html`, `doctor --fix`, `build --watch`, `build --if-stale`.
@@ -362,27 +427,50 @@ Unknown: `query`, `view`, `demo`, `graph-html`, `doctor --fix`, `build --watch`,
 Provides atomic mutual-exclusion leases and persistent SQLite task storage:
 
 ```bash
+dcstore [--version|-V|-v|version]
 dcstore --db <PATH> health
 dcstore --db <PATH> acquire --task <ID> --owner <OWNER> --client-id <CLIENT> --ttl-seconds <N>
 dcstore --db <PATH> renew --task <ID> --token <TOKEN> --ttl-seconds <N>
 dcstore --db <PATH> release --task <ID> --token <TOKEN>
+dcstore --db <PATH> diagnose
+dcstore --db <PATH> active
+dcstore --db <PATH> list
 dcstore --db <PATH> task --task <ID>
 dcstore --db <PATH> ready
+dcstore --db <PATH> scope-append --task <ID> --record <JSON>
+dcstore --db <PATH> serve
+dcstore --db <PATH> local-repository
+dcstore --db <PATH> requirements
+dcstore --db <PATH> evidence-append --task <ID> --record <JSON>
+dcstore --db <PATH> evidence-list --task <ID>
 dcstore --db <PATH> review-append --task <ID> --acceptance-criterion-id <AC> --subject-hash <SUBJECT> --record <JSON>
 dcstore --db <PATH> reviews --task <ID> [--acceptance-criterion-id <AC>]
+dcstore --db <PATH> gaps
+dcstore --db <PATH> gaps-clear
+dcstore --db <PATH> gaps-replace
+dcstore --db <PATH> gap-history
+dcstore --db <PATH> gap-upsert
+dcstore --db <PATH> run-record
+dcstore --db <PATH> runs
+dcstore --db <PATH> run-get --id <RUN_ID>
+dcstore --db <PATH> handoff
+dcstore --db <PATH> handoff-get --id <HANDOFF_ID>
+dcstore --db <PATH> work
 ```
 
-`review-append` and `reviews` are the [independent review](#independent-reviews-llm_review) record (schema 11). `review-append` refuses an unknown task, a subject hash outside `a-z0-9:-`, and a record that is not one JSON object; `reviews` embeds each record as the object it was stored as, or `null` beside a `record_error`.
+`review-append` and `reviews` store the [independent review](#independent-reviews-llm_review) record (dc-store schema 11), while `work` serves the workbench profile store (workbench schema 17). `review-append` refuses an unknown task, a subject hash outside `a-z0-9:-`, and a record that is not one JSON object; `reviews` embeds each record as the object it was stored as, or `null` beside a `record_error`.
 
-### Deterministic Verifier (`dcverify`)
+### Deterministic Verifier (`dcverify`, `dcjsoncheck`)
 
-Diff parser, scope classifier, and rigor gate evaluator:
+Diff parser, scope classifier, rigor gate evaluator, and independent evidence checker (`dcverify`), plus schema-validated JSON check runner (`dcjsoncheck`):
 
 ```bash
+dcverify [--version|-V|-v|version]
 dcverify health
 dcverify check --planned "src/service.go" --root /path/to/repo < unified.diff
 # Optional: --coverage /path/to/profile (Go coverprofile or LCOV)
 dcverify evidence-check --contract <PATH> --bundle <PATH> [options]
+dcjsoncheck [--version|-V|-v|version]
 ```
 
 ### Ripgrep Engine Search (`dcgrep`)
@@ -390,12 +478,27 @@ dcverify evidence-check --contract <PATH> --bundle <PATH> [options]
 Ignore-aware high-speed repository search with optional trigram index:
 
 ```bash
+dcgrep [--version|-V|-v|version]
 dcgrep health
 dcgrep search < request.json
 dcgrep files < request.json
 dcgrep index < request.json
 dcgrep rank < request.json    # BM25/learned ranking with completeness contract & decoupled ceilings
 ```
+
+### Credential Redaction (`dcredact`)
+
+`dc-redact`'s credential table behind the same JSON-on-stdio contract as `dcgrep`, for apps that redact text but do not link the Rust crate (the library stays dependency-free; the process contract is the separate `dc-redact-cli` package):
+
+```bash
+dcredact [--version|-V|-v|version]
+dcredact health
+dcredact [redact] < request.json    # {"text":"..."}
+```
+
+- Exit 0 prints exactly one object: `{"ok":true,"id":"dcredact","component":"dc-redact","schema_version":1,"redaction_ran":true,"text":<redact_secrets(text)>,"redacted_lines":N,"redacted_spans":N,"kinds":[...],"input_bytes":N,"output_bytes":N}`. `redaction_ran` is always true in a success, so "redacted, nothing found" (`redacted_lines: 0`) is distinguishable from "never examined". `redacted_lines` counts rewritten lines; `redacted_spans` counts the replacements made (a line with two keys counts two). On a line that did not converge within the library's 16-pass cap and was redacted whole, it counts the spans of every pass plus one for the whole-line replacement, so there it is a lower bound on the credentials the line held (a chain of 20 joined JWTs reports 17); `kinds` names every vendor shape a detection matched, sorted and de-duplicated, and on such a line is likewise a lower bound. `redacted_spans` is an additive field and `schema_version` stays 1.
+- Exit 2 prints `{"ok":false,"redaction_ran":false,"error":"..."}` and never carries `text`: oversize text (`text` over 1 MiB, or a request over 8 MiB read), a malformed or unknown-field request, an unknown command, or a redaction that did not converge (re-scanned before it is returned). Transport failure (closed stdout) is exit 1, as for the other components.
+- `health` reports `schema_version` and the two size limits. Install it with `devcouncil install dcredact` (also in `all` and `analysis`).
 
 ---
 
@@ -409,7 +512,7 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
-| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:` and `dev map`, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
+| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:`, `dev map` and the read-only `dev tool` fallbacks, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
 | `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID --mode enforce --json` for an existing task, or `dcverify`. |
 | `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Managed guides are available with `devmap build --manifest --guides`; they do not replace the full wiki/OKF feature set. |
 | `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |

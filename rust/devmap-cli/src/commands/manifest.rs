@@ -256,7 +256,7 @@ pub(crate) fn write_consumer_artifacts(
     })?;
     let built_head = store
         .latest_generation_head()?
-        .unwrap_or_else(|| "unavailable".to_string());
+        .unwrap_or_else(|| devmap_store::UNAVAILABLE_HEAD.to_string());
     let repo_root = store.latest_repo_root()?.or_else(|| {
         request
             .path

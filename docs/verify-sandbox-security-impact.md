@@ -10,7 +10,7 @@ test. This statement is the first acceptance criterion of task
 
 ## Implemented: local environment scrub
 
-`verify/env.go` owns it. Each verification command runs with an allow-listed
+`verify/env.go` owns the per-repo rule and `proc/env.go` owns the base list (`baseEnvAllow`). Each verification command runs with an allow-listed
 environment instead of the host's:
 
 - **Base list** (`baseEnvAllow`): PATH, HOME, USER, LOGNAME, SHELL, TMPDIR,
@@ -22,9 +22,8 @@ environment instead of the host's:
 - **Per-repo extension**: `verify.env_allow: [NAME, NAME]` in
   `.devcouncil/config.yaml` (inline list or comma-separated scalar). A block
   list is an error, not an empty list.
-- **Refusals**: a name that is not a legal variable name, or that contains KEY,
-  SECRET, TOKEN, PASSW, CREDENTIAL, AUTH, PRIVATE or COOKIE, is refused even
-  when listed. `config.yaml` is inside the tree the verified agent edits, so it
+- **Refusals**: a name that is not a legal variable name, or that matches a name rule (it cannot promise that no credential gets through): KEY, SECRET, TOKEN, PASSW, PASSPHRASE, CREDENTIAL, AUTH, PRIVATE or COOKIE anywhere in the name; the tokens DSN, PAT, JWT, PASS, PWD (not the bare shell PWD), HOOK or WEBHOOK; PGPASS, NETRC, ASKPASS, CONNECTION_STRING; a name ending in PROXY (including GOPROXY and NO_PROXY) or DSN, or containing WEBHOOK; and datastore, broker, mail, directory or package-index URLs and URIs (DATABASE_URL, REDIS_URL, MONGODB_URI, PIP_INDEX_URL and the like, including suffixed forms such as DATABASE_URL_TEST), is refused even
+  when listed (`isCredentialName` in `verify/env.go`). `config.yaml` is inside the tree the verified agent edits, so it
   must not be what hands that agent's judge a credential. A repository that
   truly needs such a variable has no per-repo route; that is a decision for the
   owner.

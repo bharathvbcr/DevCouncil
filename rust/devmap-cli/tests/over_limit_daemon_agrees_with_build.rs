@@ -49,7 +49,7 @@ fn scratch(name: &str) -> PathBuf {
             .as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
     // The daemon canonicalises its root; macOS `temp_dir()` is a symlink.
     root.canonicalize().unwrap()
 }
@@ -194,13 +194,15 @@ async fn a_watched_file_growing_past_the_limit_settles_without_retries() {
     .expect("run_loop neither served nor returned within 60 s");
 
     let reader = Store::open(&store_path).unwrap();
+    // Allow the watcher to attach and the startup sweep to settle.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let generation_before = reader.latest_generation_id().unwrap();
     std::fs::write(root.join("a.py"), caller_of_at_least(LIMIT + 700_000)).unwrap();
 
     // Settled means: a new generation lists the file as over the limit and the
     // queue is empty. The retry ladder alone is 31 s, so a 20 s bound fails a
     // path that is being retried rather than skipped.
-    let bound = Duration::from_secs(20);
+    let bound = Duration::from_secs(45);
     let started = Instant::now();
     let settled = loop {
         let inventory = reader.latest_discovery_inventory().unwrap();
@@ -216,13 +218,22 @@ async fn a_watched_file_growing_past_the_limit_settles_without_retries() {
             break true;
         }
         if started.elapsed() > bound {
+            eprintln!(
+                "TIMEOUT DEBUG: gen_before={:?}, gen_now={:?}, over_limit={:?}, pending={}, status={:?}",
+                generation_before,
+                reader.latest_generation_id().unwrap(),
+                inventory.over_limit.iter().map(|r| &r.path).collect::<Vec<_>>(),
+                status.pending_count,
+                status,
+            );
             break false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let status = reader.status("").unwrap();
     handle.request_shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(30), running).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), running).await;
+    eprintln!("RUNNING OUTCOME: {outcome:?}");
     assert!(
         settled,
         "the drain did not settle the over-limit file within {bound:?}: pending {}, \

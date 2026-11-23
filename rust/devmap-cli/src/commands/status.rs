@@ -213,7 +213,27 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         emit_json(cli, &payload)?;
         return Ok(());
     }
-    let Some(store) = Store::open_existing(cli.db())? else {
+    // A store whose only fault is its full-text index may be unopenable by the
+    // strict read (a damaged `nodes_fts_config` page fails the index's own
+    // constructor), and `status` used to exit 1 with no JSON there, which a
+    // host reading readiness cannot use. The tolerant open is for exactly this:
+    // everything but search still answers, and the damage is reported below
+    // rather than refused. The tolerance is only as wide as what the open checks:
+    // damage the schema check does not read (table pages beyond `sqlite_master`
+    // and `table_info`) can coexist with the index's and still open, and then the
+    // reason's `devmap repair --fts` rebuilds the index without curing it (the
+    // repair itself failing on config or data page damage is ft-72758783). Damage
+    // the schema check can see in another table still fails the open, here as before.
+    let opened = match Store::open_existing(cli.db()) {
+        Err(error) if Store::sqlite_error_is_full_text_damage(&error) => {
+            Some(Store::open_read_only_with(
+                cli.db(),
+                devmap_store::ReaderMemory::CURRENT.tolerating_full_text_damage(),
+            )?)
+        }
+        other => other?,
+    };
+    let Some(store) = opened else {
         anyhow::bail!(
             "the devmap store at {} vanished between the schema probe and the read",
             cli.db().display()
@@ -325,6 +345,9 @@ fn kernel_capabilities() -> serde_json::Value {
             "impact": has_command("impact"),
             "trace": has_command("trace"),
             "affected": has_command("affected"),
+            // Named for the host query kind (devmap.QueryAskEvidence), which
+            // runs `ask --evidence`: a host checks this before asking.
+            "ask_evidence": accepts("ask", "evidence"),
             "html": has_command("html"),
             "seed": has_command("seed"),
             "manifest_graph_output": accepts("manifest", "graph-output"),
@@ -429,6 +452,10 @@ pub(crate) fn store_status_fields(
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
+        // The structured half of the head clause in `degraded_reason`: the
+        // commit the generation was built from, `"unavailable"` when git could
+        // not say, `null` with no generation. Same field as the daemon's.
+        "head_sha": status.head_sha,
         // The structured half of the full-text clause in `degraded_reason`,
         // from the probe `devmap build` runs: a reader must not parse prose to
         // learn that `search` will fail.
@@ -530,5 +557,26 @@ fn run_auto_rebuild(cli: &Cli) -> Result<(), String> {
             output.status.code().unwrap_or(-1),
             stderr.chars().take(500).collect::<String>()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kernel_capabilities;
+
+    /// Every query kind a host asks through `devmap.Client.Advanced` has a
+    /// capability of the same name, read from this binary's own parser. The
+    /// host refuses a kind the status does not advertise, so a kind missing
+    /// here is a query no host can make.
+    #[test]
+    fn every_host_query_kind_is_advertised() {
+        let caps = kernel_capabilities();
+        for kind in ["explore", "impact", "trace", "affected", "ask_evidence"] {
+            assert_eq!(
+                caps[kind],
+                serde_json::Value::Bool(true),
+                "{kind} is not advertised: {caps}"
+            );
+        }
     }
 }

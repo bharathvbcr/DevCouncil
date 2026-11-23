@@ -165,7 +165,17 @@ Considered and rejected.
   used by hosts other than this one. Linking it would couple its release to
   every host's.
 
-## Stays a process: `dcgrep`, `dcstore`, `devmap`
+## Stays a process: `dcredact`, `dcgrep`, `dcstore`, `devmap`
+
+- **`dcredact`** redacts a text in microseconds against a measured ~2.6 ms
+  spawn (300 sequential runs, release build, one 63-byte request, 0.777 s
+  wall). That is far below the ~100 µs per-call work that
+  `gusset/docs/choosing.md` sets as the point where Gusset pays, and inside
+  its "under ~10 µs: write it in Go or raw cgo" row, so no opcode was added and
+  no benchmark committed: the call is too small for a Gusset round trip (about
+  10 µs) to beat a Go or raw-cgo call, and an out-of-process redactor keeps a
+  crash from taking the caller down. A caller redacting many small strings
+  should link `dc-redact` directly (Rust) rather than spawn per string.
 
 - **`dcgrep`** is per call, like matching, but the call is a search: a median
   of 343 ms for one regex over this repository (debug build) against the same

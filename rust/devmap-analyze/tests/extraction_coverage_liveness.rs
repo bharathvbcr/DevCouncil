@@ -722,3 +722,50 @@ fn a_powershell_recovery_does_not_cap_python_findings() {
         "a .ps1 must not demote a Python orphan: {dangling:?}"
     );
 }
+
+/// 2026-11-17, Opus review of 7767f7cf. Past `MAX_FILE_CALLS` the extractor
+/// keeps a prefix of a file's calls, so every callee reached only from the cut
+/// part has lost its caller. The cut used to live only in `diagnostics`, which
+/// `for_durable_store()` clears before the payload is stored: a build that
+/// re-resolves from cached payloads (an epoch move, a full rewrite) then saw a
+/// clean file, and the coverage row written from the fresh extraction was gone.
+/// The cut now rides on `parse_outcome`, which is stored, the way the notebook
+/// and embedded extractors carry theirs. This asserts on the STORED form.
+#[test]
+fn a_file_whose_calls_were_cut_at_the_ceiling_is_still_a_partial_parse_once_stored() {
+    let ceiling = devmap_extract::treesitter::MAX_FILE_CALLS;
+    let mut source = String::from("fn f() {\n");
+    for _ in 0..=ceiling {
+        source.push_str("    other();\n");
+    }
+    source.push_str("}\nfn other() {}\n");
+    let fresh = extract_file("big.rs", &source);
+    assert_eq!(
+        fresh.calls.len(),
+        ceiling,
+        "precondition: the file must really have been cut at the ceiling"
+    );
+
+    let stored = vec![fresh.for_durable_store()];
+    assert!(
+        stored[0].diagnostics.is_empty(),
+        "precondition: the stored form carries no diagnostics, so the cut cannot ride on them"
+    );
+    let gaps = extraction_gaps(&stored);
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.path == "big.rs" && gap.gap == ExtractionGap::PartialParse),
+        "a stored file whose calls were cut must be a partial parse, or a re-resolve from cached \
+         payloads forgets the cut: {gaps:?}"
+    );
+
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&stored);
+    let resolution = resolver.resolve_all(&stored).unwrap();
+    let outcome = analyze_liveness_with_coverage(&stored, &resolution, DiscoveryCoverage::none());
+    assert_eq!(
+        outcome.coverage.partial_parse_files, 1,
+        "the stored cut must be counted as a partial parse: {:?}",
+        outcome.coverage
+    );
+}

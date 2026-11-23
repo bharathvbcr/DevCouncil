@@ -228,6 +228,29 @@ fn a_method_only_a_namesake_declares_is_not_the_imported_class_s() {
 }
 
 #[test]
+fn a_chained_method_only_a_namesake_declares_is_not_the_imported_class_s() {
+    // Constructor-chained call `Engine().only_b()` with `from a import Engine`
+    // where `a.Engine` has no `only_b` and `b.Engine` has `only_b`.
+    let resolution = resolve(&[
+        ("a.py", A_ENGINE),
+        ("b.py", B_ENGINE),
+        (
+            "use_a.py",
+            "from a import Engine\n\ndef run():\n    return Engine().only_b()\n",
+        ),
+    ]);
+    let targets = methods_of(&resolution, "use_a.py::run");
+    assert!(
+        !targets.iter().any(|target| target.starts_with("b.py::")),
+        "bound the other file's namesake on chained constructor call: {targets:?}"
+    );
+    assert!(
+        targets.is_empty(),
+        "expected 0 methods resolved for missing method on imported class, got: {targets:?}"
+    );
+}
+
+#[test]
 fn the_files_own_class_wins_over_an_imported_namesake() {
     let resolution = resolve(&[
         ("a.py", A_ENGINE),

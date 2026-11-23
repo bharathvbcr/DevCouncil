@@ -1270,7 +1270,7 @@ fn plant_blobs_of_another_epoch(
     for entry in std::fs::read_dir(reuse_dir(root)).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        if name == "budget.json" {
+        if name == "budget.json" || name == "generation.json" {
             std::fs::copy(entry.path(), planted.join(&name)).unwrap();
             continue;
         }
@@ -1337,6 +1337,359 @@ fn a_blob_beside_the_current_epoch_directory_is_never_read() {
         "the current epoch's blobs are reused (only the edited file is resolved); output was:\n{edited}"
     );
     assert!(!planted.exists(), "the older epoch's directory is removed");
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Attack lane A (ft-87363ce5): the file-wide unreadable-insert veto through the
+// real build, incremental and cache seams.
+// ---------------------------------------------------------------------------
+
+const ATK_HEAD: &str = "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\nsys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))\n";
+const ATK_TAIL: &str = "import analyse_wave20 as a20\n\ndef test_it():\n    a20.spearman([], [])\n";
+const ATK_MODULE: &str = "def spearman(xs, ys):\n    return 0.0\n";
+
+fn atk_tree(name: &str) -> std::path::PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("devmap-atk-syspath-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("scripts/aws")).unwrap();
+    std::fs::write(root.join("scripts/aws/analyse_wave20.py"), ATK_MODULE).unwrap();
+    root
+}
+
+fn atk_links_aws(root: &std::path::Path) -> bool {
+    graph(root)
+        .iter()
+        .any(|row| row.contains("test_x.py") && row.contains("scripts/aws/analyse_wave20.py"))
+}
+
+/// Adding an unreadable module-level insert on an incremental build removes the
+/// `sys.path`-derived link; removing it restores the link; each build equals a
+/// cold build of the same tree.
+#[test]
+fn atk_an_edit_that_adds_or_removes_an_unreadable_insert_updates_the_link() {
+    let root = atk_tree("edit");
+    let file = root.join("scripts/test_x.py");
+    std::fs::write(&file, format!("{ATK_HEAD}{ATK_TAIL}")).unwrap();
+    build(&root);
+    assert!(atk_links_aws(&root), "control: the readable insert links");
+
+    std::fs::write(
+        &file,
+        format!("{ATK_HEAD}sys.path.insert(0, somewhere)\n{ATK_TAIL}"),
+    )
+    .unwrap();
+    build(&root);
+    let vetoed = graph(&root);
+    assert!(
+        !atk_links_aws(&root),
+        "the unreadable insert did not veto: {vetoed:?}"
+    );
+
+    std::fs::write(&file, format!("{ATK_HEAD}{ATK_TAIL}")).unwrap();
+    build(&root);
+    assert!(
+        atk_links_aws(&root),
+        "removing the unreadable insert did not restore the link"
+    );
+    let incremental = graph(&root);
+
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(&root)).unwrap();
+    build(&root);
+    assert_eq!(incremental, graph(&root), "incremental != cold");
+
+    // The same through the explicit affected-files path.
+    std::fs::write(
+        &file,
+        format!("{ATK_HEAD}sys.path.insert(0, somewhere)\n{ATK_TAIL}"),
+    )
+    .unwrap();
+    let out = Command::new(devmap())
+        .args(["build", ".", "--affected", "scripts/test_x.py"])
+        .current_dir(&root)
+        .output()
+        .expect("devmap build --affected");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!atk_links_aws(&root), "--affected did not apply the veto");
+    let affected = graph(&root);
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(&root)).unwrap();
+    build(&root);
+    assert_eq!(affected, graph(&root), "--affected != cold");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A generation whose payloads carry the v99 identity is stale, is rebuilt, and
+/// the rebuilt graph equals a cold one.
+#[test]
+fn atk_a_v99_generation_with_an_unreadable_insert_is_not_served_at_v100() {
+    let root = atk_tree("v99");
+    std::fs::write(
+        root.join("scripts/test_x.py"),
+        format!("{ATK_HEAD}sys.path.insert(0, somewhere)\n{ATK_TAIL}"),
+    )
+    .unwrap();
+    build(&root);
+    let fresh = graph(&root);
+    let v99 = format!("{}:extract-v99", devmap_extract::cache::ANALYZER_VERSION);
+    {
+        let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+        assert!(age_payloads(&conn, Some(&v99)) > 0);
+    }
+    let store = devmap_store::Store::open(db_path(&root)).unwrap();
+    assert!(!store.latest_generation_payload_is_current().unwrap());
+    drop(store);
+    build(&root);
+    let store = devmap_store::Store::open(db_path(&root)).unwrap();
+    assert!(store.latest_generation_payload_is_current().unwrap());
+    drop(store);
+    assert_eq!(graph(&root), fresh);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// ft-258f2788 criterion 2: the resolution-reuse cache is bound to the
+// generation it was written for.
+// ---------------------------------------------------------------------------
+
+/// The independent tree plus `src/user.py`, which calls `later_defined`, a name
+/// nothing defines yet.
+fn write_tree_with_an_unresolved_caller(root: &std::path::Path) {
+    write_independent_tree(root);
+    std::fs::write(
+        root.join("src/user.py"),
+        "def use():\n    return later_defined()\n",
+    )
+    .unwrap();
+}
+
+/// Commit a generation through the daemon's own drain that adds
+/// `later_defined` to `mod_5.py`, a definition the unchanged `user.py` calls.
+fn daemon_adds_the_definition(root: &std::path::Path) {
+    let file = root.join("src/mod_5.py");
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push_str("\n\ndef later_defined():\n    return 5\n");
+    std::fs::write(&file, text).unwrap();
+    let store = devmap_store::Store::open(db_path(root)).unwrap();
+    store
+        .enqueue_pending_paths(&[file.to_string_lossy().into_owned()])
+        .unwrap();
+    let daemon = devmap_serve::Daemon::new(store, root.to_path_buf());
+    assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+}
+
+fn has_edge_into_later_defined(root: &std::path::Path) -> bool {
+    graph(root)
+        .iter()
+        .any(|row| row.starts_with("src/user.py::") && row.contains("later_defined"))
+}
+
+/// Build, drain a second generation that adds a definition an unchanged file
+/// calls, edit a third file, build again: the graph is a cold build's.
+#[test]
+fn a_build_after_a_daemon_drain_equals_a_cold_build() {
+    let root = scratch("drain-then-build");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    write_tree_with_an_unresolved_caller(&root);
+    build_text(&root);
+    assert!(
+        !has_edge_into_later_defined(&root),
+        "nothing defines it yet"
+    );
+
+    daemon_adds_the_definition(&root);
+    edit_last_module(&root);
+    let edited = build_text(&root);
+
+    let cold_scratch = scratch("drain-then-build-cold");
+    let cold = cold_generation(&root, &cold_scratch);
+    assert!(
+        cold.0
+            .iter()
+            .any(|row| row.starts_with("src/user.py::") && row.contains("later_defined")),
+        "fixture precondition: a cold build binds user.py to later_defined"
+    );
+    assert_eq!(
+        graph(&root),
+        cold.0,
+        "the build after a daemon drain reused a stale resolution; build said:\n{edited}"
+    );
+    assert_eq!(dead(&root), cold.2);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&cold_scratch);
+}
+
+fn binding_path(root: &std::path::Path) -> std::path::PathBuf {
+    reuse_dir(root).join("generation.json")
+}
+
+/// A reuse cache whose binding is missing, unreadable, from another store, or
+/// from another generation is not reused: every file is resolved and the graph
+/// is a cold build's.
+fn assert_unbound_cache_resolves_everything(label: &str, damage: impl FnOnce(&std::path::Path)) {
+    let root = scratch(label);
+    write_independent_tree(&root);
+    build_text(&root);
+    assert!(binding_path(&root).is_file(), "the build wrote a binding");
+    damage(&root);
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "{label}: an unbound cache resolves every file; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_cache_with_no_binding_resolves_every_file() {
+    assert_unbound_cache_resolves_everything("no-binding", |root| {
+        std::fs::remove_file(binding_path(root)).unwrap();
+    });
+}
+
+#[test]
+fn a_cache_with_a_corrupt_binding_resolves_every_file() {
+    assert_unbound_cache_resolves_everything("corrupt-binding", |root| {
+        std::fs::write(binding_path(root), b"{{").unwrap();
+    });
+}
+
+#[test]
+fn a_cache_written_for_another_creation_time_resolves_every_file() {
+    assert_unbound_cache_resolves_everything("other-created-at", |root| {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(binding_path(root)).unwrap()).unwrap();
+        value["created_at_bits"] = serde_json::json!(1.0f64.to_bits());
+        std::fs::write(binding_path(root), serde_json::to_vec(&value).unwrap()).unwrap();
+    });
+}
+
+#[test]
+fn a_cache_written_for_an_older_generation_resolves_every_file() {
+    assert_unbound_cache_resolves_everything("older-generation", |root| {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(binding_path(root)).unwrap()).unwrap();
+        let id = value["generation_id"].as_u64().unwrap();
+        value["generation_id"] = serde_json::json!(id + 1);
+        std::fs::write(binding_path(root), serde_json::to_vec(&value).unwrap()).unwrap();
+    });
+}
+
+/// A replaced store can reuse the old store's latest generation id. The binding
+/// names the row by `(id, created_at)`, so the same id with another creation
+/// time is not the generation the blobs were resolved for.
+#[test]
+fn a_store_whose_latest_generation_id_matches_but_created_at_differs_is_refused() {
+    let root = scratch("replaced-store");
+    write_independent_tree(&root);
+    build_text(&root);
+    let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE generations SET created_at = created_at + 1.0
+              WHERE id = (SELECT max(id) FROM generations)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(conn);
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "a binding for another row of the same id is refused; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A creation time with 17 significant digits, as a nanosecond clock produces.
+/// The binding compares exact bits, so a valid binding for such a row is
+/// honoured however the decimal text would round-trip.
+fn assert_exact_created_at_is_reused(label: &str, created_at: f64) {
+    let root = scratch(label);
+    write_independent_tree(&root);
+    build_text(&root);
+    let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE generations SET created_at = ?1
+              WHERE id = (SELECT max(id) FROM generations)",
+            [created_at],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(conn);
+    // The binding the build writes for this row, by the same encoding.
+    let id: i64 = rusqlite::Connection::open(db_path(&root))
+        .unwrap()
+        .query_row("SELECT max(id) FROM generations", [], |row| row.get(0))
+        .unwrap();
+    std::fs::write(
+        binding_path(&root),
+        serde_json::to_vec(&serde_json::json!({
+            "generation_id": id,
+            "created_at_bits": created_at.to_bits(),
+            "created_at": created_at,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 1 of 21 files"),
+        "{label}: a binding for exactly this creation time is reused; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_binding_for_a_seventeen_digit_creation_time_is_reused() {
+    assert_exact_created_at_is_reused("created-at-17", 1795366155.1264899);
+}
+
+#[test]
+fn a_binding_for_a_creation_time_a_decimal_round_trip_misreads_is_reused() {
+    // 17 significant digits that serde_json's default parser reads back one ULP
+    // away from the f64 it was written from (found by search, not by hand).
+    assert_exact_created_at_is_reused("created-at-ulp", 1795366155.0000021);
+}
+
+/// A binding written before the exact-bits field existed names only
+/// `created_at`. It is not trusted: the build says so and resolves every file.
+#[test]
+fn a_legacy_binding_with_only_created_at_resolves_every_file() {
+    let root = scratch("legacy-binding");
+    write_independent_tree(&root);
+    build_text(&root);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(binding_path(&root)).unwrap()).unwrap();
+    assert!(
+        value["created_at"].is_number(),
+        "the build wrote created_at"
+    );
+    value.as_object_mut().unwrap().remove("created_at_bits");
+    std::fs::write(binding_path(&root), serde_json::to_vec(&value).unwrap()).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "a binding without exact bits resolves every file; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("names no creation time"),
+        "the diagnostic names the missing field; output was:\n{edited}"
+    );
     assert_matches_cold(&root);
     let _ = std::fs::remove_dir_all(&root);
 }

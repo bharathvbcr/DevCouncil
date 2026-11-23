@@ -55,6 +55,8 @@ mod budget_characterization;
 #[cfg(feature = "parse")]
 mod budget_is_a_real_bound;
 #[cfg(feature = "parse")]
+mod budget_pathological_through_retry;
+#[cfg(feature = "parse")]
 mod budget_retry;
 #[cfg(feature = "parse")]
 mod c_family;
@@ -164,6 +166,7 @@ mod rust_thread_local_statics;
 #[cfg(feature = "parse")]
 mod rust_use_declarations;
 mod safe_fs_controls;
+mod scan_tree_bounded;
 #[cfg(feature = "parse")]
 mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]

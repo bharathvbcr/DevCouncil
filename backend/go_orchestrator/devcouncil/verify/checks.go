@@ -38,18 +38,36 @@ func DetectNoWorkGap(taskID string, planned []dc.PlannedFile, workPresent bool) 
 	}
 }
 
+// changedMatches reports whether any changed path is one the planned entry
+// names, asked of policy.MatchesPlannedPath so verification reads an entry the
+// way the write gate does.
+func changedMatches(root string, pf dc.PlannedFile, changed []string) bool {
+	entry := []dc.PlannedFile{pf}
+	for _, c := range changed {
+		if editable, readOnly := policy.PlannedScopeIn(root, c, entry); editable || readOnly {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectPlannedFileGaps returns advisory gaps for planned files not touched.
 func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []string) []Gap {
-	changedSet := make(map[string]struct{}, len(changed))
-	for _, c := range changed {
-		changedSet[c] = struct{}{}
-	}
+	return DetectPlannedFileGapsIn("", taskID, planned, changed)
+}
+
+// DetectPlannedFileGapsIn is DetectPlannedFileGaps with the repository root, so
+// the planned-path judge can run its on-disk alias rungs. root may be "".
+func DetectPlannedFileGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
 	for _, pf := range planned {
 		if pf.AllowedChange == dc.ChangeReadOnly {
 			continue
 		}
-		if _, ok := changedSet[pf.Path]; ok {
+		// The planned-path judge, entry by entry: a glob entry is satisfied
+		// by any change it matches, and "./" or backslash spellings by the
+		// path they name.
+		if changedMatches(root, pf, changed) {
 			continue
 		}
 		path := pf.Path
@@ -72,24 +90,19 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 // and emits hard-safety `oracle_tampering` gaps if any `read_only` planned file
 // was modified.
 func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
-	editableSet := make(map[string]struct{}, len(planned))
-	readOnlySet := make(map[string]struct{})
-	for _, pf := range planned {
-		if pf.AllowedChange == dc.ChangeReadOnly {
-			readOnlySet[pf.Path] = struct{}{}
-			delete(editableSet, pf.Path)
-			continue
-		}
-		if _, ro := readOnlySet[pf.Path]; !ro {
-			editableSet[pf.Path] = struct{}{}
-		}
-	}
+	return DetectOrphanDiffGapsIn("", taskID, planned, changed, orphanAdded)
+}
+
+// DetectOrphanDiffGapsIn is DetectOrphanDiffGaps with the repository root (see
+// DetectPlannedFileGapsIn). root may be "".
+func DetectOrphanDiffGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string, orphanAdded map[string]struct{}) []Gap {
 	var gaps []Gap
 	for _, cf := range changed {
 		if policy.IsToolState(cf) {
 			continue
 		}
-		if _, ro := readOnlySet[cf]; ro {
+		editable, readOnly := policy.PlannedScopeIn(root, cf, planned)
+		if readOnly {
 			gaps = append(gaps, Gap{
 				ID:             StableGapID(taskID, "READONLY-"+cf),
 				Severity:       "critical",
@@ -103,7 +116,7 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 			})
 			continue
 		}
-		if _, ok := editableSet[cf]; ok {
+		if editable {
 			continue
 		}
 		_, isAdded := orphanAdded[cf]
@@ -142,18 +155,18 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 
 // DetectDependencyRiskGaps blocks unplanned dependency-manifest edits.
 func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed []string) []Gap {
-	plannedSet := make(map[string]struct{}, len(planned))
-	for _, pf := range planned {
-		if pf.AllowedChange != dc.ChangeReadOnly {
-			plannedSet[pf.Path] = struct{}{}
-		}
-	}
+	return DetectDependencyRiskGapsIn("", taskID, planned, changed)
+}
+
+// DetectDependencyRiskGapsIn is DetectDependencyRiskGaps with the repository
+// root (see DetectPlannedFileGapsIn). root may be "".
+func DetectDependencyRiskGapsIn(root, taskID string, planned []dc.PlannedFile, changed []string) []Gap {
 	var gaps []Gap
 	for _, path := range changed {
 		if _, ok := depFileNames[filepath.Base(path)]; !ok {
 			continue
 		}
-		if _, ok := plannedSet[path]; ok {
+		if editable, _ := policy.PlannedScopeIn(root, path, planned); editable {
 			continue
 		}
 		gaps = append(gaps, Gap{

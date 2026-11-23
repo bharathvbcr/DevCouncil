@@ -386,7 +386,7 @@ func (t *Task) Domain() *dc.Task {
 		PlannedFiles:              planned,
 		AgentAppendedPlannedFiles: t.AgentAppended,
 		AllowedCommands:           t.AllowedCommands,
-		ForbiddenChanges:          t.ForbiddenChanges,
+		ForbiddenChanges:          dc.NormalizePlanPaths(t.ForbiddenChanges),
 		RequirementIDs:            t.RequirementIDs,
 		AcceptanceCriterionIDs:    t.AcceptanceCriterionIDs,
 	}
@@ -456,7 +456,7 @@ func (c *Client) AppendPlannedFiles(ctx context.Context, taskID, token string, a
 
 	wanted := make([]dc.PlannedFile, 0, len(add))
 	for _, pf := range add {
-		path := strings.TrimSpace(pf.Path)
+		path := dc.NormalizePlanPath(strings.TrimSpace(pf.Path))
 		if path == "" {
 			return nil, errors.New("store: a scope entry with no path widens nothing")
 		}
@@ -1019,9 +1019,14 @@ func (c *Client) Reviews(ctx context.Context, taskID, criterionID string) ([]Sto
 	return reviews, nil
 }
 
-// EvidenceList returns evidence rows (newest first), optionally for one task.
-func (c *Client) EvidenceList(ctx context.Context, taskID string) ([]EvidenceRow, bool, error) {
-	args := []string{"evidence-list"}
+func listByTask[T any](
+	ctx context.Context,
+	c *Client,
+	command string,
+	taskID string,
+	pick func(*response) []T,
+) ([]T, bool, error) {
+	args := []string{command}
 	if taskID != "" {
 		args = append(args, "--task", taskID)
 	}
@@ -1030,42 +1035,31 @@ func (c *Client) EvidenceList(ctx context.Context, taskID string) ([]EvidenceRow
 		return nil, false, err
 	}
 	if !out.OK {
-		return nil, false, fmt.Errorf("evidence-list refused: %s", out.Error)
+		return nil, false, fmt.Errorf("%s refused: %s", command, out.Error)
 	}
-	return out.Evidence, out.Truncated, nil
+	return pick(out), out.Truncated, nil
+}
+
+// EvidenceList returns evidence rows (newest first), optionally for one task.
+func (c *Client) EvidenceList(ctx context.Context, taskID string) ([]EvidenceRow, bool, error) {
+	return listByTask(ctx, c, "evidence-list", taskID, func(out *response) []EvidenceRow {
+		return out.Evidence
+	})
 }
 
 // Gaps returns gap rows, optionally for one task.
 func (c *Client) Gaps(ctx context.Context, taskID string) ([]GapRow, bool, error) {
-	args := []string{"gaps"}
-	if taskID != "" {
-		args = append(args, "--task", taskID)
-	}
-	out, err := c.run(ctx, args...)
-	if err != nil {
-		return nil, false, err
-	}
-	if !out.OK {
-		return nil, false, fmt.Errorf("gaps refused: %s", out.Error)
-	}
-	return out.Gaps, out.Truncated, nil
+	return listByTask(ctx, c, "gaps", taskID, func(out *response) []GapRow {
+		return out.Gaps
+	})
 }
 
 // GapHistory returns the recurrence record for a task's gaps, or for every
 // task when taskID is empty.
 func (c *Client) GapHistory(ctx context.Context, taskID string) ([]GapHistoryRow, bool, error) {
-	args := []string{"gap-history"}
-	if taskID != "" {
-		args = append(args, "--task", taskID)
-	}
-	out, err := c.run(ctx, args...)
-	if err != nil {
-		return nil, false, err
-	}
-	if !out.OK {
-		return nil, false, fmt.Errorf("gap-history refused: %s", out.Error)
-	}
-	return out.History, out.Truncated, nil
+	return listByTask(ctx, c, "gap-history", taskID, func(out *response) []GapHistoryRow {
+		return out.History
+	})
 }
 
 // MaxGapsPerReplace is the most gaps one replacement may carry. It mirrors

@@ -21,6 +21,7 @@ rust-version.workspace = true
 # The audit surface this buys is 22 crates, all from the ripgrep and rust-lang
 # trees; `cargo tree -e normal -p dc-grep` prints it.
 [dependencies]
+dc-proc = { path = "../dc-proc" }
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.33"

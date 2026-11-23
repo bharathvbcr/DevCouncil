@@ -986,6 +986,39 @@ without matcher support is ignored, an `if` outside a tool event means the
 handler never runs. A writer that only serializes reports the same success for a
 dead install as for a working one.
 
+Known limits of the shell-call refresh (`PostToolUse` / `PostToolUseFailure`
+on `Bash`):
+
+- It rebuilds the tree named by the payload's `cwd`. A shell call that edits
+  *another* tree (`cd ../wt && sed -i ...`, `sed -i ../wt/x`) refreshes the
+  `cwd` tree, not the touched one; the other tree's index catches up on its
+  own next build. The hook does not parse path operands out of the command.
+- Shell calls are rate-limited to one build start per 2 s window per tree. On
+  unix a call inside the window is held back until the window ends; Windows has
+  no shell to wait in, so such a call starts a build at once (still coalesced
+  onto a running one) and does not open a new window. Windows also has no
+  trailing rerun: a write that coalesces onto a build already running there is
+  not rerun after it (the dirty marker is only read by the unix shell wrapper),
+  so it is indexed by the next build.
+- A command is skipped only when the whole line provably cannot change the
+  tree. A leading `VAR=value` other than `LANG`/`LC_*` (`GIT_PAGER`,
+  `LD_PRELOAD`, ...), `bat --pager`, `file -C` and `git --exec-path=` count as
+  possible writes.
+- Codex documents no failure event, so its `hooks.json` carries no
+  `PostToolUseFailure`; its `PostToolUse` for Bash also runs after a non-zero
+  exit, so a failed shell write is still refreshed. Codex also re-trusts hooks
+  by hash (`/hooks`) after a reinstall.
+- Cursor documents `postToolUseFailure` (matcher `Shell`) and fires
+  `postToolUse` after a successful execution. Whether a non-zero exit counts as
+  one is undocumented, so no `postToolUseFailure` entry is installed and a
+  failed shell write may not be refreshed under Cursor.
+
+The `PreToolUse` context (the index directive or a file's signature list)
+is returned when the store is `query_ready`. A store that is query-ready but
+carries a `degraded_reason` still gets it, led by one line naming the reason
+and saying its answers are a lower bound; a store that is not query-ready gets
+nothing.
+
 ### Agent guides
 
 Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five

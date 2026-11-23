@@ -475,16 +475,8 @@ fn write_atomic_bytes(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     result
 }
 
-/// SHA-256 hex digest for the receipt format shared with the Python installer.
-///
-/// Delegates to [`crate::sha256`]. This was a second hand-rolled FIPS 180-4
-/// implementation, kept "to avoid a new crate dependency" — a reason that had
-/// already lapsed, since `sha2` was in the workspace for `dc-evidence`. Two
-/// copies of one hash cannot be checked against each other by anything, and a
-/// receipt is exactly where a disagreement would go unnoticed.
-pub fn sha256_hex(data: &[u8]) -> String {
-    crate::sha256::sha256_hex(data)
-}
+/// SHA-256 hex digest for the receipt format, re-exported from [`dc_evidence`].
+pub use crate::sha256::sha256_hex;
 #[cfg(test)]
 mod tests {
     use super::*;

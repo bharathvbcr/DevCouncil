@@ -233,6 +233,36 @@ an operating-system sandbox against a privileged actor or another process
 already running with the same user's authority. Cross-platform runtime
 qualification must be recorded separately from compilation or macOS tests.
 
+### Git in another session's worktree
+
+A `git -C <path>` command that resolves to a different registered worktree of
+the same repository is attributed to that worktree, and the gate refuses it
+unless git can only read it or record into it. The allowed subcommands are
+`status`, `diff`, `log`, `show`, `whatchanged`, `rev-parse`, `rev-list`,
+`merge-base`, `ls-files`, `ls-tree`, `cat-file`, `blame`, `describe`,
+`for-each-ref`, `show-ref`, `shortlog`, listing forms of `branch`, `worktree
+list`, `stash list` and `stash show`, `apply --check`, `fetch`, `add`, and
+`commit` without `--amend`. Every other subcommand is refused with the reason
+"in another session's worktree", for a task with or without a declared scope.
+
+The rule is a closed allowlist because the alternatives cannot be complete. The
+sibling is judged against the hard rules (secret and restricted paths) and
+nothing else: not the caller's plan, not the no-task rule, not the lease holder
+of that worktree. The modelled writes (`checkout`, `restore`, `rm`, `mv`,
+`clean`) name files that pass those rules, and no write rule models `reset`,
+`stash`, `switch`, `merge`, `rebase`, `pull`, `am`, `read-tree`, `update-ref`,
+`branch -D` or `worktree remove`, so an allowed `git *` would otherwise match
+every one of them through `git -C`. `git apply` names its files inside the
+patch, so it is refused as an unjudged write.
+
+What this does not do: `add` and `commit` still write into another session's
+index and current branch, `fetch` updates its remote-tracking refs, and the
+task model has no worktree field, so a caller's lease cannot be required to
+cover the sibling. Those residual permissions are an owner decision recorded on
+the task board, not a property this rule establishes. A worktree that is not
+registered, or a path that escapes the repository, is refused as before.
+The tests are in `gate/git_worktree_gate_test.go`.
+
 ## Resource and result contracts
 
 | Surface | Bound and refusal behavior |
@@ -256,7 +286,9 @@ operator's, not repository content.
 One bounded runner serves every process boundary in the Rust workspace, and it
 lives in `dc-proc` so `dc-verify` and `dc-regress` can use it without
 depending on the kernel — `devmap_extract::subprocess` is a re-export of that one
-implementation, not a second copy. Its properties are the ones a caller cannot
+implementation, not a second copy. `dc-proc` also owns the shared `cli`
+contract helpers (shared by `dcstore`, `dcverify`, `dcjsoncheck`, and
+`dcgrep`) and the bounded `lean_kernel` runner. Its properties are the ones a caller cannot
 reliably assemble by hand: a wall-clock deadline, a kill that reaches the
 child's whole process group, and both pipes drained concurrently on their own
 threads. That last one is load-bearing rather than tidy: a reader that takes
@@ -291,7 +323,8 @@ text.
 What the redaction does and does not cover is a property of `dc-redact`, not
 of this path: it redacts the credential shapes the table names — vendor
 prefixed keys (Anthropic, OpenAI, Stripe, GitHub, GitLab, Slack, AWS access
-key ids, Hugging Face, npm, PyPI and the others listed there), private-key PEM
+key ids, Hugging Face, npm, PyPI and the others listed there), bare Google
+OAuth tokens and client secrets (`ya29.`, `1//`, `GOCSPX-`), private-key PEM
 headers, JSON web tokens, HTTP `Authorization` credentials, passwords inline
 in a URL or on a command line, and a value assigned to a key named like a
 credential. It does not redact anything else a server may print: absolute

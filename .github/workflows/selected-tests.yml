@@ -81,7 +81,7 @@ jobs:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
       - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           workspaces: rust

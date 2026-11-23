@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // Every temp HOME here is the test's own: Run and Remove drive a real devmap
@@ -24,8 +26,7 @@ func TestRemoveUndoesAnApplyAndLeavesTheUsersDocumentsAlone(t *testing.T) {
 	bin := devmapForTest(t)
 	for _, host := range devmapHosts(t, bin) {
 		t.Run(host, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
+			home := testsupport.IsolateHostConfig(t).Home
 			root := newRepo(t)
 
 			userDocs := map[string][]byte{}

@@ -116,7 +116,7 @@ flowchart TD
 
     Agent -->|"Code questions<br/>(repo_path, symbol)"| DM_Tools
     DM_Tools --- DM_Envelope
-    DM_Tools --> GraphDB[(".devmap/devmap.sqlite")]
+    DM_Tools --> GraphDB[(".devmap/codeintel/devmap.sqlite")]
 
     Agent -->|"Task lifecycle & policy<br/>(task_id, lease_id)"| DC_Tools
     DC_Tools --- DC_Scope
@@ -126,7 +126,10 @@ flowchart TD
 ## Code graph pipeline
 
 1. `devmap-extract` discovers files and extracts definitions, imports, calls and
-   language-specific evidence (extraction schema 98). Handles Java records, compact
+   language-specific evidence (extraction schema 100; a file's `content_hash` is FNV-1a 64
+   with its byte length folded in, `source_identity`), including bounded Lean 4
+   declarations (`devmap lean-tcb`) and per-file symbol/call/reference caps
+   (`MAX_FILE_SYMBOLS`, `MAX_FILE_CALLS`, `MAX_FILE_REFERENCES`). Handles Java records, compact
    constructors, enum constants, Kotlin expression-recovery, Svelte template text
    `&`/`>` repair, and CommonJS exports. Parsing and discovery gaps remain visible.
 2. `devmap-resolve` resolves symbols and relationships, preserving ambiguity and
@@ -170,8 +173,12 @@ Verification rigor encompasses:
 - **Comprehensive scan coverage:** Scans untracked and recreated files, submodule
   commit-range bytes when pointers move (`proc/gitsubmodules.go`), binary-marked source,
   and streamed index entries.
-- **Stub AST scanner:** Detects opaque stubs, stub-scanned binary-marked source, and
-  lexer comments using whole-name path matching.
+- **Anti-reward-hacking & stub AST scanner:** Detects opaque stubs, stub-scanned binary-marked source,
+  lexer comments using whole-name path matching, and non-demotable `runner_hijack`,
+  `lean_tcb`, `unattested_test_run`, and `oracle_tampering` hard-safety conditions.
+  `git -C <registered-worktree>` commands verified against the shared common Git
+  directory evaluate writes against that sibling worktree root while `--git-dir`,
+  `--work-tree`, `cd`, and unregistered `-C` paths remain refused.
 - **Secret leak prevention:** Verification error output suppresses raw diff line echoes,
   and panic hooks omit backtrace payloads, printing only file and line.
 - **Bounded execution:** A single unified walk deadline bounds verification walks, with

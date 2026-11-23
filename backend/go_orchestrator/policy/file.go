@@ -130,7 +130,7 @@ var RestrictedPathPatterns = []string{
 }
 
 // ToolStateDirs are the directories DevCouncil's own tools write state into:
-// the task store, config and correction manifests under .devcouncil, and the
+// the task store, config and verification run logs under .devcouncil, and the
 // code graph and repo map under .devmap. They are a subset of
 // RestrictedPathPatterns — the write policy refuses an agent's write there — and
 // the same list is what verification leaves out of the diff it judges: a file
@@ -142,7 +142,7 @@ var ToolStateDirs = []string{".devcouncil", ".devmap"}
 // a DevCouncil tool owns. Folded and slash-normalised like the restricted rung,
 // because that is the rung it must agree with.
 func IsToolState(path string) bool {
-	cleaned := strings.TrimPrefix(normalizeSlashes(strings.TrimSpace(path)), "./")
+	cleaned := dc.NormalizePlanPath(strings.TrimSpace(path))
 	folded := fnmatch.Fold(cleaned)
 	for _, dir := range ToolStateDirs {
 		if folded == dir || strings.HasPrefix(folded, dir+"/") {
@@ -217,51 +217,8 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		return diskName, diskDiffers
 	}
 
-	if g.HardRules {
-		// Checked on the raw input and again on the normalized result: a ".."
-		// segment can promote an interior component to the final one, so
-		// "a /b/.." resolves to the aliasing path "a " from an input whose own
-		// last component is harmless.
-		if reason, bad := malformedPath(path); bad {
-			return deny(RuleMalformedPath, reason, "", taskID)
-		}
-		if reason, bad := malformedPath(normalized); bad {
-			return deny(RuleMalformedPath, reason, normalized, taskID)
-		}
-		if outside && tempWrite(g.Root, normalized) {
-			return allow("Write to a temporary directory allowed.", normalized, taskID)
-		}
-		if outside {
-			return deny(RuleOutsideRoot, "Path is outside the project root.", normalized, taskID)
-		}
-		// Case-folded: on APFS and NTFS ".ENV" and ".env" are one file, so a
-		// case-sensitive check would read the pattern and still allow the write.
-		if mt.anyFold(SecretPathPatterns, normalized) {
-			return deny(RuleSecretPath, "Secret and credential paths are never writable.", normalized, taskID)
-		}
-		if !internal && matchesRestricted(mt, normalized) {
-			return deny(RuleRestrictedPath, "Protected repository paths cannot be modified.", normalized, taskID)
-		}
-		// The same two rungs against the name the filesystem stores, for a path
-		// that exists: a spelling the text rules do not fold to the pattern can
-		// still be the file the pattern protects. See onDiskSpelling.
-		if disk, differs := diskOnce(); differs {
-			if mt.anyFold(SecretPathPatterns, disk) {
-				return deny(RuleSecretPath, "Path is another name for `"+disk+"`, a secret or credential path, which is never writable.", normalized, taskID)
-			}
-			if !internal && matchesRestricted(mt, disk) {
-				return deny(RuleRestrictedPath, "Path is another name for `"+disk+"`, a protected repository path.", normalized, taskID)
-			}
-		}
-	}
-
-	// Outside the hard-rules block on purpose: see PromptInputPatterns for what
-	// that buys and what it does not. Internal writes are the host's own — a
-	// host-trust assertion, as for the restricted rung — and are not judged.
-	if !internal {
-		if reason := g.promptInputReason(path, normalized, outside, diskOnce); reason != "" {
-			return deny(RuleRestrictedPath, reason, normalized, taskID)
-		}
+	if d, done := g.preTaskDecision(mt, path, normalized, outside, internal, diskOnce, taskID); done {
+		return d
 	}
 
 	if task == nil {
@@ -276,10 +233,11 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 	// case-sensitive on purpose: its failure direction is denial, which is
 	// safe, and folding it would let a differently-cased path claim another
 	// entry's authorisation.)
-	if mt.anyFold(task.ForbiddenChanges, normalized) {
+	forbidden := dc.NormalizePlanPaths(task.ForbiddenChanges)
+	if mt.anyFold(forbidden, normalized) {
 		return g.noteHardRules(deny(RuleForbiddenChange, "Path is listed in forbidden_changes.", normalized, task.ID))
 	}
-	if entry, aliased := forbiddenAlias(g.Root, normalized, task.ForbiddenChanges); aliased {
+	if entry, aliased := forbiddenAlias(g.Root, normalized, forbidden); aliased {
 		return g.noteHardRules(deny(RuleForbiddenChange,
 			"Path is another name for `"+entry+"`, which is listed in forbidden_changes.",
 			normalized, task.ID))
@@ -332,6 +290,103 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		return g.noteHardRules(d)
 	}
 	return g.noteHardRules(allow("File change is allowed.", normalized, task.ID))
+}
+
+// preTaskDecision is every rung of the ladder that runs before the task is
+// read: malformed paths, the temp-dir allowance, outside-root, secret,
+// restricted, their on-disk aliases, and prompt inputs. EvaluateFileChange
+// returns its decision when it has one, and HardDenied asks the same function,
+// so the set of paths no plan can authorise is one list rather than a copy that
+// can drift from the gate.
+func (g FileGate) preTaskDecision(mt matching, path, normalized string, outside, internal bool,
+	diskOnce func() (string, bool), taskID string) (Decision, bool) {
+	if g.HardRules {
+		// Checked on the raw input and again on the normalized result: a ".."
+		// segment can promote an interior component to the final one, so
+		// "a /b/.." resolves to the aliasing path "a " from an input whose own
+		// last component is harmless.
+		if reason, bad := malformedPath(path); bad {
+			return deny(RuleMalformedPath, reason, "", taskID), true
+		}
+		if reason, bad := malformedPath(normalized); bad {
+			return deny(RuleMalformedPath, reason, normalized, taskID), true
+		}
+		if outside && tempWrite(g.Root, normalized) {
+			return allow("Write to a temporary directory allowed.", normalized, taskID), true
+		}
+		if outside {
+			return deny(RuleOutsideRoot, "Path is outside the project root.", normalized, taskID), true
+		}
+		// Case-folded: on APFS and NTFS ".ENV" and ".env" are one file, so a
+		// case-sensitive check would read the pattern and still allow the write.
+		if mt.anyFold(SecretPathPatterns, normalized) {
+			return deny(RuleSecretPath, "Secret and credential paths are never writable.", normalized, taskID), true
+		}
+		if !internal && matchesRestricted(mt, normalized) {
+			return deny(RuleRestrictedPath, "Protected repository paths cannot be modified.", normalized, taskID), true
+		}
+		// The same two rungs against the name the filesystem stores, for a path
+		// that exists: a spelling the text rules do not fold to the pattern can
+		// still be the file the pattern protects. See onDiskSpelling.
+		if disk, differs := diskOnce(); differs {
+			if mt.anyFold(SecretPathPatterns, disk) {
+				return deny(RuleSecretPath, "Path is another name for `"+disk+"`, a secret or credential path, which is never writable.", normalized, taskID), true
+			}
+			if !internal && matchesRestricted(mt, disk) {
+				return deny(RuleRestrictedPath, "Path is another name for `"+disk+"`, a protected repository path.", normalized, taskID), true
+			}
+		}
+	}
+
+	// Outside the hard-rules block on purpose: see PromptInputPatterns for what
+	// that buys and what it does not. Internal writes are the host's own — a
+	// host-trust assertion, as for the restricted rung — and are not judged.
+	if !internal {
+		if reason := g.promptInputReason(path, normalized, outside, diskOnce); reason != "" {
+			return deny(RuleRestrictedPath, reason, normalized, taskID), true
+		}
+	}
+
+	return Decision{}, false
+}
+
+// textOnlyRoot is the root HardDenied asks with when its caller has none: a
+// directory that cannot exist, so every on-disk rung (aliases, hard links)
+// finds nothing and only the textual rungs speak.
+const textOnlyRoot = "/nonexistent/devcouncil-text-only-root"
+
+// HardDenied reports whether the write gate refuses path before it ever reads a
+// task: a malformed spelling (raw or cleaned), a path outside the root, a
+// secret, restricted or tool-state path, a prompt input, or the on-disk alias of
+// one. It asks preTaskDecision, the function EvaluateFileChange itself calls, so
+// the two cannot drift. root may be "" when the caller has none; then only the
+// textual rungs run, which is a lower bound, never a license. An engine that
+// cannot answer counts as denied, as it does in the gate.
+func HardDenied(root, path string) bool {
+	d, outside := hardDecision(root, path)
+	return outside || d.Blocked()
+}
+
+func hardDecision(root, path string) (d Decision, outside bool) {
+	mt := matching{m: GoMatcher}
+	defer failClosed(&d, RulePathEngineUnavailable, "", "", true)
+	g := FileGate{Root: root, HardRules: true}
+	var normalized string
+	diskOnce := func() (string, bool) { return "", false }
+	if root == "" {
+		g.Root = textOnlyRoot
+		cleaned, settled := settlePath(normalizeSlashes(path))
+		outside = !settled || filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, "../")
+		normalized = cleaned
+	} else {
+		normalized, outside = NormalizeRepoPath(root, path)
+		diskOnce = func() (string, bool) { return onDiskSpelling(root, normalized) }
+	}
+	if outside {
+		return Decision{}, true
+	}
+	d, _ = g.preTaskDecision(mt, path, normalized, outside, false, diskOnce, "")
+	return d, false
 }
 
 // lendsScope reports whether a planned entry may lend its neighbourhood to the
@@ -672,10 +727,7 @@ func isRootArea(area string) bool {
 }
 
 func scopeDir(p string) (string, bool) {
-	normalized := normalizeSlashes(p)
-	for strings.HasPrefix(normalized, "./") {
-		normalized = normalized[2:]
-	}
+	normalized := dc.NormalizePlanPath(p)
 	idx := strings.LastIndex(normalized, "/")
 	if idx <= 0 {
 		return "", false
@@ -887,7 +939,7 @@ func NormalizeRepoPath(root, raw string) (string, bool) {
 
 	rel, err := filepath.Rel(rootResolved, resolved)
 	if err != nil {
-		return strings.TrimPrefix(cleaned, "./"), true
+		return dc.NormalizePlanPath(cleaned), true
 	}
 	rel = filepath.ToSlash(rel)
 	if rel == ".." || strings.HasPrefix(rel, "../") {
@@ -1005,26 +1057,73 @@ func resolveExisting(p string) (string, bool) {
 	return "", false
 }
 
-// NormalizePlannedCandidate strips the leading "./" the way write
-// authorization does, so both surfaces match the same string.
-func NormalizePlannedCandidate(path string) string {
-	normalized := normalizeSlashes(path)
-	for strings.HasPrefix(normalized, "./") {
-		normalized = normalized[2:]
-	}
-	return normalized
+// MatchesPlannedPath reports whether path matches a planned file exactly or by
+// glob. It is the planned-path judge verify, get_diff and WouldBlockVerification
+// ask, and the write gate reads the plan through the same scopeMatch it is built
+// on, so a plan entry means the same thing on every surface. Entries and path are
+// spelled through dc.NormalizePlanPath, the one strip rule for plan entries.
+// Matching is case-sensitive on purpose (see EvaluateFileChange): a
+// differently-cased path must not claim another entry's authorisation. It has no
+// root, so the on-disk alias rungs do not run; see PlannedScopeIn.
+func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
+	editable, readOnly := PlannedScope(path, planned)
+	return editable || readOnly
 }
 
-// MatchesPlannedPath reports whether path matches a planned file exactly or by
-// glob. CLI and MCP surfaces in DevCouncil drifted on this once; one helper is
-// the fix, so the harness uses one too.
-func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
-	patterns := make([]string, len(planned))
-	for i, pf := range planned {
-		patterns[i] = pf.Path
-	}
-	return matchesAny(patterns, NormalizePlannedCandidate(path))
+// PlannedScope is PlannedScopeIn with no root.
+func PlannedScope(path string, planned []dc.PlannedFile) (editable, readOnly bool) {
+	return PlannedScopeIn("", path, planned)
 }
+
+// PlannedScopeIn classifies path against the plan entry by entry: editable when
+// some entry that is not read_only matches, readOnly when some read_only entry
+// matches. Both can be true when entries overlap, and read_only wins: the gate
+// reads the plan through scopeMatch too, so it refuses the write, and
+// verification raises oracle_tampering, whatever the order or spelling of the
+// entries.
+//
+// A glob entry never covers a path HardDenied says the gate refuses before it
+// reads the plan (secret, restricted, tool-state, prompt input, malformed, or
+// the on-disk alias of one; root enables the alias rungs): a glob such as "*"
+// must not make verification treat a change to ".env" or "CLAUDE.md" as planned.
+// An entry that names such a path exactly is read as it always was (existing
+// verify tests pin a planned secret path as planned, so its secret scan, not an
+// orphan_diff, speaks for it); the gate refuses the write either way.
+func PlannedScopeIn(root, path string, planned []dc.PlannedFile) (editable, readOnly bool) {
+	want := dc.NormalizePlanPath(path)
+	ed, ro := scopeMatch(matching{m: GoMatcher}, want, planned, HardDenied(root, path))
+	return ed != nil, ro != nil
+}
+
+// scopeMatch is the one place plan entries are compared with a path: the first
+// matching editable entry and the first matching read_only entry. With guarded
+// set (the path is hard-denied) only entries that name the path exactly count.
+// The gate passes guarded=false because it has already refused every hard-denied
+// path.
+func scopeMatch(mt matching, want string, planned []dc.PlannedFile, guarded bool) (editable, readOnly *dc.PlannedFile) {
+	for i := range planned {
+		pf := &planned[i]
+		if !pathMatches(mt, pf.Path, want) {
+			continue
+		}
+		if guarded && dc.NormalizePlanPath(pf.Path) != want {
+			continue
+		}
+		if pf.AllowedChange == dc.ChangeReadOnly {
+			if readOnly == nil {
+				readOnly = pf
+			}
+		} else if editable == nil {
+			editable = pf
+		}
+	}
+	return editable, readOnly
+}
+
+// NormalizePlannedCandidate is dc.NormalizePlanPath, kept as an exported name
+// because Manvi's verify (manvi/devcouncil/verify.go) calls it and links this
+// module live.
+func NormalizePlannedCandidate(path string) string { return dc.NormalizePlanPath(path) }
 
 // plannedFileFor finds the entry that authorises a path, and reports the
 // appended pattern when the entry came from scope an executor added to its own
@@ -1033,8 +1132,8 @@ func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
 // The plan is searched first, and the order is the rule rather than an
 // optimisation. An appended entry must never reach past what the planner said
 // about the same path: a file planned read-only stays read-only however many
-// times an agent appends it, because the read-only entry is found first and
-// decides.
+// times an agent appends it, because the plan is searched first and, within
+// it, a read_only entry decides over an editable one whatever their order.
 func plannedFileFor(mt matching, path string, task *dc.Task) (*dc.PlannedFile, string) {
 	if pf := matchPlannedFile(mt, path, task.PlannedFiles); pf != nil {
 		return pf, ""
@@ -1045,15 +1144,15 @@ func plannedFileFor(mt matching, path string, task *dc.Task) (*dc.PlannedFile, s
 	return nil, ""
 }
 
-// matchPlannedFile returns the first entry that matches, so it asks entry by
-// entry: which entry decides is the rule, and a batched "any" cannot say.
+// matchPlannedFile returns the entry that decides for path: a matching
+// read_only entry if there is one, else the first matching editable entry. It is
+// scopeMatch, the same comparison PlannedScopeIn makes for verification.
 func matchPlannedFile(mt matching, path string, planned []dc.PlannedFile) *dc.PlannedFile {
-	for i := range planned {
-		if pathMatches(mt, planned[i].Path, path) {
-			return &planned[i]
-		}
+	editable, readOnly := scopeMatch(mt, path, planned, false)
+	if readOnly != nil {
+		return readOnly
 	}
-	return nil
+	return editable
 }
 
 // forbiddenAlias reports which forbidden_changes entry names the same *file*
@@ -1088,7 +1187,7 @@ func forbiddenAlias(root, path string, forbidden []string) (string, bool) {
 		return "", false
 	}
 	for _, raw := range forbidden {
-		entry := NormalizePlannedCandidate(raw)
+		entry := dc.NormalizePlanPath(raw)
 		if entry == "" || entry == path || strings.ContainsAny(entry, "*?[") {
 			continue
 		}
@@ -1111,20 +1210,8 @@ func forbiddenAlias(root, path string, forbidden []string) (string, bool) {
 }
 
 func pathMatches(mt matching, pattern, path string) bool {
-	p := normalizeSlashes(pattern)
+	p := dc.NormalizePlanPath(pattern)
 	return path == p || mt.any([]string{p}, path)
-}
-
-// matchesAny backs MatchesPlannedPath, a bool API called outside any gate
-// entry point, so there is no failClosed to catch an engine error: it asks
-// fnmatch, never the configurable default.
-func matchesAny(patterns []string, path string) bool {
-	for _, raw := range patterns {
-		if pathMatches(matching{m: GoMatcher}, raw, path) {
-			return true
-		}
-	}
-	return false
 }
 
 // matchesRestricted mirrors the Python rule, which tests both a glob match and
@@ -1172,7 +1259,7 @@ func normalizeSlashes(p string) string { return strings.ReplaceAll(p, `\`, "/") 
 
 // WouldBlockVerification reports whether a write this decision lets through
 // will be raised as an unplanned file by verification. Verification judges the
-// exact planned set; the write policy also lends a planned file's subsystem,
+// planned set (exact entries and globs); the write policy also lends a planned file's subsystem,
 // neighbours and directory, and a posture can demote an unplanned refusal, so a
 // write can be allowed here and blocked there. The answer is the same
 // question verification asks — is the path one the task plans — asked of the
@@ -1185,14 +1272,8 @@ func WouldBlockVerification(d Decision, task *dc.Task) bool {
 	return !PlansPath(task, d.Target)
 }
 
-// PlansPath reports whether the task's planned files name path exactly, which
-// is the set verification's orphan check compares the changed files with.
+// PlansPath reports whether some planned entry names path, exactly or by glob,
+// which is the set verification's orphan check compares the changed files with.
 func PlansPath(task *dc.Task, path string) bool {
-	want := strings.TrimPrefix(normalizeSlashes(path), "./")
-	for _, pf := range task.PlannedFiles {
-		if strings.TrimPrefix(normalizeSlashes(pf.Path), "./") == want {
-			return true
-		}
-	}
-	return false
+	return MatchesPlannedPath(path, task.PlannedFiles)
 }

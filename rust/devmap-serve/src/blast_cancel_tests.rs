@@ -142,6 +142,26 @@ fn a_cancelled_blast_says_it_was_cut_short() {
     );
 }
 
+/// A bare path asks about the whole file, which the analysis spells as an end
+/// line of `u32::MAX`. The daemon (and the MCP tool over it) must not print
+/// that as a line number: the end line is `null`, "to the end of the file".
+#[test]
+fn a_whole_file_at_target_has_a_null_end_line_not_a_sentinel() {
+    let f = fixture();
+    let report = ask(
+        &f,
+        &devmap_query::Cancel::new(),
+        json!({"version": 1, "cmd": "blast", "at": "core.py"}),
+    );
+    let range = &report["changed_files"][0]["ranges"][0];
+    assert_eq!(range["start_line"], json!(1), "{report:#}");
+    assert!(range["end_line"].is_null(), "{report:#}");
+    assert!(
+        !report.to_string().contains("4294967295"),
+        "no field carries the whole-file sentinel: {report:#}"
+    );
+}
+
 #[test]
 fn a_cancelled_suspects_says_it_was_cut_short() {
     let f = fixture();

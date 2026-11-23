@@ -27,3 +27,13 @@ class FlHolderB {
         return engine.tick()
     }
 }
+
+fun makeFlOther(): FlOther = FlOther()
+
+class FlHolderC {
+    val engine = makeFlOther()
+
+    fun go(): Int {
+        return engine.tick()
+    }
+}

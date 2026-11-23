@@ -35,7 +35,11 @@ impl ReadStore {
         if let Self::Stacked(stacked) = self {
             stacked.attach_incompleteness(&mut answer)?;
         }
-        emit_json(cli, &answer)
+        let opened = match self {
+            Self::Plain(store) => store,
+            Self::Stacked(stacked) => stacked.base_store(),
+        };
+        emit_store_answer(cli, opened, answer)
     }
 
     /// After a human-readable answer: the lane's incompleteness warning, if any.
@@ -97,6 +101,31 @@ pub(crate) fn ensure_parent(path: &std::path::Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+/// Print a JSON answer read from `store`, naming the repository it came from
+/// as the MCP envelope does, through the same builder. Additive: an answer that
+/// already carries a `repository` key keeps it, and only an object can carry
+/// one. The store is the path this command opened, never a second resolution.
+/// Every read command that prints a store-backed answer goes through here,
+/// including the ones that need the whole store (`require_plain`).
+pub(crate) fn emit_store_answer(
+    cli: &Cli,
+    store: &Store,
+    mut answer: serde_json::Value,
+) -> anyhow::Result<()> {
+    if let (Some(object), Some(path)) = (answer.as_object_mut(), store.path()) {
+        object.entry("repository").or_insert_with(|| {
+            devmap_serve::repo_scope::RepositoryRef::for_cli_read(
+                path,
+                &cli.root_hint(),
+                cli.root.is_some(),
+                cli.db.is_some(),
+            )
+            .to_json()
+        });
+    }
+    emit_json(cli, &answer)
 }
 
 pub(crate) fn emit_json(cli: &Cli, payload: &serde_json::Value) -> anyhow::Result<()> {

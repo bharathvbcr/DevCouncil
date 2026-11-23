@@ -16,6 +16,8 @@
 //!   fails until it is declared here or isolated.
 
 #[cfg(feature = "parse")]
+mod a_c_bare_call_never_binds_a_method;
+#[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
 mod a_kotlin_property_is_not_a_call_target;
@@ -33,6 +35,8 @@ mod a_receiver_member_nothing_declares;
 mod adversarial_resolve;
 #[cfg(feature = "parse")]
 mod ambiguity_budget;
+#[cfg(feature = "parse")]
+mod an_inherited_in_repo_member_is_not_an_external_supertype_miss;
 #[cfg(feature = "parse")]
 mod attack_ccf_edges;
 #[cfg(feature = "parse")]
@@ -310,4 +314,6 @@ mod attack_swift_residue;
 mod attack_tsj_edges;
 #[cfg(feature = "parse")]
 mod corpus_dump_attack;
+#[cfg(feature = "parse")]
+mod field_declared_type_leak_across_classes;
 mod rust_compile_fail_record;

@@ -3,6 +3,7 @@ package skills_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,6 +62,31 @@ func TestEmbeddedLibraryCarriesLanguagePolicy(t *testing.T) {
 		}
 	}
 	t.Fatal("language-policy missing from the embedded library")
+}
+
+// The DevCouncil skills lead with the shell form of each tool so an agent
+// whose MCP call errors, or one scripting in a REPL, has a command to run.
+func TestDevcouncilSkillsLeadWithShellForms(t *testing.T) {
+	all, err := skills.Embedded.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"devcouncil":              {"dev tool call", "dev gate status --json", "devmap affected", "Promise.all"},
+		"devcouncil-hero-loop":    {"dev tool call devcouncil_checkout_task", "dev verify TASK-ID --json"},
+		"devcouncil-verification": {"dev tool call devcouncil_get_gaps", "dev verify TASK-ID --json"},
+	}
+	for _, s := range all {
+		for _, needle := range want[s.Name] {
+			if !strings.Contains(string(s.Content), needle) {
+				t.Errorf("skill %s lost %q", s.Name, needle)
+			}
+		}
+		delete(want, s.Name)
+	}
+	for name := range want {
+		t.Errorf("skill %s missing from the embedded library", name)
+	}
 }
 
 func TestScaffoldCoreEngineering(t *testing.T) {

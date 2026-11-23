@@ -71,6 +71,11 @@ pub(crate) async fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     }
 
     ensure_parent(&cli.db())?;
+    // Whose store this is comes before the open, which migrates and heals. The
+    // daemon is the longest-lived writer of the store, so it proves ownership
+    // the way `build` and `repair` do, from a read that writes nothing. Every
+    // other store open of the MCP server is read-only and cannot migrate.
+    Store::refuse_a_live_foreign_owner_before_open(&cli.db(), &root)?;
     let store = Store::open(cli.db())?;
     let daemon = Daemon::new(store, root)
         // So the daemon can notice its own store being deleted or

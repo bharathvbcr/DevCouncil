@@ -98,6 +98,18 @@ pass, and the final line lists every NOT RUN step. For Rust changes also run
 `cargo fmt --all -- --check` and the clippy command from
 `.github/workflows/rust.yml` in `rust/`.
 
+By default `ci:local` stops at the first failing step. To see every result,
+for example to compare a branch with a `main` that is already red, run
+`npm run ci:local -- --continue`. It runs every step whose prerequisites
+passed, gives `rust/verify.sh` `--continue` (so `cargo test` runs with
+`--no-fail-fast`), and ends with one row per step: PASS, FAIL, SKIP (could
+not run, or a step it needs did not pass, which the row names) or N/A
+(correctly nothing to do, such as the release-tag step before the tag
+exists). It exits 1 if any step failed, else 2 if any was skipped, else 0.
+`npm run ci:local -- --only "<step>"` runs one step and the steps it needs.
+The prerequisites are the `needs` lists in `scripts/ci-local.mjs`; a step
+receives another step's output only when it lists that step there.
+
 `ci:local` and `rust/verify.sh` need the Gusset sibling at `../gusset` at the
 revision pinned in `.github/actions/setup-gusset/action.yml`, and fail on any
 other revision (`rust/gusset-engine/check-pin.sh`).

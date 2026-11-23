@@ -891,6 +891,329 @@ fn a_colliding_item_id_does_not_keep_the_workbench_upgrade() {
 }
 
 #[test]
+fn adv_multi_item_id_collisions_across_repos_do_not_keep_workbench_upgrade() {
+    let path = temp_dir("tasks-multi-collide").join("state.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store.upgrade_workbench_profile().unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE work_meta SET version = 13", [])
+            .unwrap();
+        conn.execute_batch(LEGACY_TASKS).unwrap();
+
+        // Populate multiple legacy tasks: item 1 clean, item 2 collides, item 3 clean, item 4 collides, item 5 clean
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('CLEAN-1', 'clean task 1', 'desc 1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('COLLIDE-ALPHA', 'colliding alpha', 'desc 2')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('CLEAN-2', 'clean task 2', 'desc 3')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('COLLIDE-BETA', 'colliding beta', 'desc 4')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('CLEAN-3', 'clean task 3', 'desc 5')",
+            [],
+        )
+        .unwrap();
+
+        // Multiple external repositories
+        conn.execute(
+            "INSERT INTO work_repositories (id, revision, body) VALUES ('repo-alpha', 1, '{\"identity_key\":\"alpha-key\",\"name\":\"alpha\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_repositories (id, revision, body) VALUES ('repo-beta', 1, '{\"identity_key\":\"beta-key\",\"name\":\"beta\"}')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-existing workbench items belonging to those repositories
+        conn.execute(
+            "INSERT INTO work_items (id, revision, body, primary_repository_id) VALUES ('COLLIDE-ALPHA', 1, '{\"title\":\"taken alpha\",\"description\":\"\",\"status\":\"ready\"}', 'repo-alpha')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_items (id, revision, body, primary_repository_id) VALUES ('COLLIDE-BETA', 1, '{\"title\":\"taken beta\",\"description\":\"\",\"status\":\"ready\"}', 'repo-beta')",
+            [],
+        )
+        .unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 13);
+    }
+
+    let refused = Store::open(&path).expect_err("a colliding id must refuse the open");
+    match refused {
+        StoreError::Workbench { message, .. } => {
+            assert!(
+                message.contains("already belongs to repository repo-alpha")
+                    || message.contains("already belongs to repository repo-beta"),
+                "unexpected collision message: {message}"
+            );
+        }
+        other => panic!("want a workbench refusal, got {other}"),
+    }
+
+    let conn = Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        version, 13,
+        "ensure_schema_within committed intermediate upgrade steps before the collision rolled back"
+    );
+
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 5,
+        "legacy tasks table was modified or partially deleted"
+    );
+
+    let item_count: i64 = conn
+        .query_row("SELECT count(*) FROM work_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(item_count, 2, "clean items were committed before rollback");
+
+    let clean_committed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM work_items WHERE id IN ('CLEAN-1', 'CLEAN-2', 'CLEAN-3')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        clean_committed, 0,
+        "clean items leaked into work_items despite rollback"
+    );
+
+    let scope_appends: i64 = conn
+        .query_row("SELECT count(*) FROM task_scope_appends", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        scope_appends, 0,
+        "task_scope_appends leaked entries despite rollback"
+    );
+
+    // Resolving collisions allows full migration to finish
+    conn.execute(
+        "DELETE FROM work_items WHERE id IN ('COLLIDE-ALPHA', 'COLLIDE-BETA')",
+        [],
+    )
+    .unwrap();
+
+    let store = Store::open(&path).expect("open should succeed once collisions are resolved");
+    let conn = store.connection();
+
+    assert!(
+        !table_exists(conn, "tasks"),
+        "tasks table was not dropped after retirement"
+    );
+    let final_wb_version: i64 = conn
+        .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(final_wb_version, dc_store::workbench::WORKBENCH_SCHEMA);
+
+    let final_items: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM work_items WHERE id IN ('CLEAN-1', 'COLLIDE-ALPHA', 'CLEAN-2', 'COLLIDE-BETA', 'CLEAN-3')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(final_items, 5);
+}
+
+#[test]
+fn adv_unmigratable_row_under_migration_within_rolls_back_cleanly() {
+    // Subcase 1: Unmigratable row in legacy tasks (invalid JSON / bad metadata) with pre-migration workbench version 13
+    let path = temp_dir("tasks-unmigratable-legacy").join("state.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store.upgrade_workbench_profile().unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE work_meta SET version = 13", [])
+            .unwrap();
+        conn.execute_batch(LEGACY_TASKS).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, planned_files_json) VALUES ('TASK-VALID', 'valid', 'd1', '[]')",
+            [],
+        )
+        .unwrap();
+        // Unmigratable task with bad metadata / invalid JSON array
+        conn.execute(
+            "INSERT INTO tasks (id, title, description, planned_files_json) VALUES ('TASK-CORRUPT', 'corrupt', 'd2', '{\"not\":\"an-array\"}')",
+            [],
+        )
+        .unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 13);
+    }
+
+    let err = Store::open(&path).expect_err("an unmigratable row in legacy tasks must refuse open");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("TASK-CORRUPT") && msg.contains("not a JSON array"),
+        "error message must describe unmigratable row refusal: {msg}"
+    );
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            version, 13,
+            "ensure_schema_within committed upgrade steps before unmigratable row rolled back"
+        );
+        let task_count: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(task_count, 2, "legacy tasks table was modified");
+        let item_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM work_items WHERE id IN ('TASK-VALID', 'TASK-CORRUPT')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_count, 0, "partial items committed despite rollback");
+
+        // Repair unmigratable row
+        conn.execute(
+            "UPDATE tasks SET planned_files_json = '[]' WHERE id = 'TASK-CORRUPT'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).expect("open should succeed once unmigratable row is repaired");
+    let conn = store.connection();
+    assert!(!table_exists(conn, "tasks"));
+    let version: i64 = conn
+        .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, dc_store::workbench::WORKBENCH_SCHEMA);
+
+    // Subcase 2: Unmigratable row directly during schema upgrade migration within ensure_schema_within
+    // (e.g. malformed JSON in work_revisions triggering failure in status_merge.sql at step 15 -> 16)
+    let path2 = temp_dir("tasks-unmigratable-schema-step").join("state.sqlite");
+    {
+        let store = Store::open(&path2).unwrap();
+        store.upgrade_workbench_profile().unwrap();
+    }
+    {
+        let conn = Connection::open(&path2).unwrap();
+        conn.execute("UPDATE work_meta SET version = 15", [])
+            .unwrap();
+        conn.execute_batch(LEGACY_TASKS).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('TASK-PENDING', 'pending', 'desc')",
+            [],
+        )
+        .unwrap();
+
+        // Plant malformed JSON in work_revisions using PRAGMA ignore_check_constraints
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO work_revisions (entity_type, entity_id, revision, body)
+             VALUES ('item', 'REV-1', 1, '{\"status\": \"inbox\", \"corrupt\": [1, 2,')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 15);
+    }
+
+    let err2 =
+        Store::open(&path2).expect_err("malformed JSON during ensure_schema_within must fail");
+    let msg2 = err2.to_string();
+    assert!(
+        msg2.contains("malformed JSON")
+            || msg2.contains("store_error")
+            || msg2.contains("legacy_task_unmigratable"),
+        "unexpected error on malformed JSON: {msg2}"
+    );
+
+    {
+        let conn = Connection::open(&path2).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            version, 15,
+            "ensure_schema_within committed schema 16 before malformed JSON step rolled back"
+        );
+        let task_count: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(task_count, 1, "legacy tasks table was lost");
+
+        // Repair corrupt row
+        conn.execute(
+            "UPDATE work_revisions SET body = '{\"status\": \"inbox\", \"corrupt\": [1, 2]}' WHERE entity_id = 'REV-1'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let store2 = Store::open(&path2).expect("open should succeed once malformed row is repaired");
+    let conn2 = store2.connection();
+    assert!(!table_exists(conn2, "tasks"));
+    let version2: i64 = conn2
+        .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(version2, dc_store::workbench::WORKBENCH_SCHEMA);
+}
+
+#[test]
 fn a_failed_stamp_leaves_the_legacy_table_and_its_version_as_found() {
     let path = pre_migration("tasks-stamp-fails");
     let refused = Store::open_failing_stamp_after(&path, 0)

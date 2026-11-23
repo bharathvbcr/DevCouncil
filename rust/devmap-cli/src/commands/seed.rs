@@ -20,7 +20,6 @@ use devmap_query::{
     gc_unused_bases, provision_stacked_worktree, seed_derived_artifacts_and_reuse_caches,
     StackedStore, SyncTarget,
 };
-use devmap_store::csr::CsrGraphReader;
 use devmap_store::seed::{self, SeedMethod};
 use devmap_store::Store;
 
@@ -193,6 +192,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     ensure_target_absent(&target_db)?;
     let staged = seed::sidecar(&target_db, &format!(".seed-{}", std::process::id()));
     seed::discard_staged(&staged);
+    sweep_dead_staging(&target_db);
     let staged_outcome = (|| -> anyhow::Result<(SeedMethod, bool)> {
         // A seed stamps the lane's HEAD on what it places, whether it keeps the
         // donor's graph or builds the lane's own, so a HEAD that cannot be read
@@ -269,8 +269,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     // The store is placed: nothing after this point may fail the command. When
     // the lane's tree matched the donor's, seed consumer artifacts and reuse
     // caches as a best-effort note; when the lane diverged, `resolution-reuse-*`
-    // was already seeded and updated during the staged incremental build, and
-    // donor artifacts would describe the wrong tree.
+    // was already seeded and, by the staged incremental build, rebound to that
+    // build's generation (the binding names a generation row, which the placed
+    // store keeps, not the staged path), and donor artifacts would describe the
+    // wrong tree.
     if tree_matches_donor {
         if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
             eprintln!(
@@ -303,38 +305,17 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Give the staged store a CSR sidecar. The donor's is copied to the private
-/// staged path first and that copy, not the donor's path, is what is checked: it
-/// is kept only when stamped with the staged store's latest generation, so a
-/// donor renamed or rewritten after the copy cannot be placed unchecked. A donor
-/// that is absent, not a regular file, unreadable or stamped for another
-/// generation (an orphan left by an earlier store at the donor's path) is not
-/// kept, and a fresh sidecar is written from the staged store instead. Readers
-/// accept a sidecar on its generation number alone, so a copy stamped for
-/// another store's generation would be served as this store's graph.
+/// `seed::stage_donor_csr` for a staged store, saying so on stderr when the
+/// donor's sidecar was not the staged store's and a fresh one replaced it.
 fn stage_donor_csr(staged_store: &Store, donor_csr: &Path, staged_db: &Path) -> anyhow::Result<()> {
-    let Some(latest) = staged_store.latest_generation_id()? else {
-        return Ok(());
-    };
-    let staged_csr = csr_path_for_store(staged_db);
-    // `seed_artifact` places nothing when the donor is absent or not a regular
-    // file, or when a sidecar already sits at the staged path (of unknown
-    // generation); both fall through to the fresh write below.
-    let copied = seed::seed_artifact(donor_csr, &staged_csr)
-        .with_context(|| format!("cannot stage CSR sidecar from {}", donor_csr.display()))?
-        .is_some();
-    if copied {
-        match CsrGraphReader::open_mmap(&staged_csr) {
-            Ok(reader) if reader.generation() == u64::from(latest) => return Ok(()),
-            Ok(_) => {}
-            Err(error) => eprintln!(
-                "devmap seed: the donor CSR {} is unreadable ({error:#}); writing a fresh one",
-                donor_csr.display()
-            ),
-        }
-        seed::remove_file_if_present(&staged_csr)?;
+    if let seed::DonorCsr::Rejected { reason } =
+        seed::stage_donor_csr(staged_store, donor_csr, staged_db)?
+    {
+        eprintln!(
+            "devmap seed: the donor CSR {} was not kept ({reason}); wrote a fresh one",
+            donor_csr.display()
+        );
     }
-    staged_store.write_latest_csr_sidecar_strict()?;
     Ok(())
 }
 
@@ -342,6 +323,27 @@ pub(crate) struct Plan {
     root: PathBuf,
     main: PathBuf,
     source_store: PathBuf,
+}
+
+/// Clear what killed seeds left beside `target`, with its writer lock held.
+/// Hygiene only: a failure is reported and the seed goes on.
+fn sweep_dead_staging(target: &Path) {
+    let swept = seed::sweep_dead_staging(target);
+    if swept.removed > 0 {
+        eprintln!(
+            "devmap: removed {} staging file(s) left beside {} by a seed that did not finish",
+            swept.removed,
+            target.display()
+        );
+    }
+    if !swept.failures.is_empty() {
+        eprintln!(
+            "devmap: could not clear {} old seed staging file(s) ({} removed): {}",
+            swept.failures.len(),
+            swept.removed,
+            swept.failures.join("; ")
+        );
+    }
 }
 
 /// RAII guard for a staged `--seed-from` database (`<db>.seed-<pid>`).
@@ -445,8 +447,9 @@ pub(crate) fn plan(cli: &Cli, seed_from: &Path) -> anyhow::Result<Plan> {
 
 impl Plan {
     /// Stage a seeded store at `<cli.db()>.seed-<pid>` and clone `resolution-reuse-*`
-    /// directories, or say why not and leave the build to start cold. Call with the
-    /// writer lock held.
+    /// directories (each with its generation binding, kept only if the donor did
+    /// not write during the copy), or say why not and leave the build to start
+    /// cold. Call with the writer lock held.
     pub(crate) fn stage<'a>(
         &'a self,
         cli: &Cli,
@@ -473,6 +476,7 @@ impl Plan {
         let started = std::time::Instant::now();
         let staged = seed::sidecar(&db, &format!(".seed-{}", std::process::id()));
         seed::discard_staged(&staged);
+        sweep_dead_staging(&db);
         match self.stage_into(&staged) {
             Ok(method) => {
                 self.seed_resolution_reuse();
@@ -547,7 +551,11 @@ impl Plan {
 }
 
 /// Clone `source_root`'s `resolution-reuse-*` directories into `target_root`'s
-/// state directory. Best-effort: a cache that did not seed costs a cold resolve.
+/// state directory. The donor's `generation.json` binding names the generation
+/// row the seeded store carries, so it stays valid in the copy; the donor's
+/// writer lock is not held here, so [`seed::seed_reuse_directory`] drops the
+/// copied binding unless the donor's was unchanged across the copy.
+/// Best-effort: a cache that did not seed costs a cold resolve.
 fn seed_resolution_reuse_dirs(source_root: &Path, target_root: &Path) {
     let src_state = state_dir(source_root);
     let dst_state = state_dir(target_root);
@@ -556,7 +564,7 @@ fn seed_resolution_reuse_dirs(source_root: &Path, target_root: &Path) {
             let name = entry.file_name();
             if let Some(name_str) = name.to_str() {
                 if name_str.starts_with("resolution-reuse-") && entry.path().is_dir() {
-                    let _ = seed::seed_directory_cow(&entry.path(), &dst_state.join(name_str));
+                    let _ = seed::seed_reuse_directory(&entry.path(), &dst_state.join(name_str));
                 }
             }
         }
@@ -577,10 +585,6 @@ fn ensure_target_absent(target_db: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// The sidecars that follow a store: its CSR graph and the artifact stamp the
-/// manifest writes beside it. Each describes the one store it sits beside.
-const STORE_SIDECARS: [&str; 2] = [".csr", ".artifacts.json"];
-
 /// Place a settled staged store, and its sidecars when it has them, at
 /// `final_db`, which must be absent and whose writer lock the caller holds.
 ///
@@ -599,11 +603,11 @@ const STORE_SIDECARS: [&str; 2] = [".csr", ".artifacts.json"];
 /// path after.
 fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
     ensure_target_absent(final_db)?;
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for suffix in seed::SQLITE_SIDECARS {
         seed::remove_file_if_present(&seed::sidecar(final_db, suffix))?;
     }
     let mut placed: Vec<PathBuf> = Vec::new();
-    for suffix in STORE_SIDECARS {
+    for suffix in seed::STORE_SIDECARS {
         let staged_side = seed::sidecar(staged_db, suffix);
         let final_side = seed::sidecar(final_db, suffix);
         match std::fs::symlink_metadata(&staged_side) {
@@ -634,7 +638,9 @@ fn place_staged(staged_db: &Path, final_db: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    if let Err(error) = std::fs::rename(staged_db, final_db) {
+    // Never replaces: the target was absent when this seed took the writer lock,
+    // and a store that appeared since is not this seed's to overwrite.
+    if let Err(error) = seed::rename_no_replace(staged_db, final_db) {
         let error =
             anyhow::Error::new(error).context(format!("cannot place {}", final_db.display()));
         return Err(withdraw(&placed, error));
@@ -655,4 +661,59 @@ fn withdraw(placed: &[PathBuf], error: anyhow::Error) -> anyhow::Error {
         }
     }
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("devmap-place-staged-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A sidecar the staged store does not bring is swept from the final path:
+    /// one left there by an earlier store describes another store.
+    #[test]
+    fn a_staged_store_without_sidecars_sweeps_the_orphans_at_the_final_path() {
+        let dir = tmp_dir("no-sidecars");
+        let (staged, final_db) = (dir.join("devmap.sqlite.seed-1"), dir.join("devmap.sqlite"));
+        std::fs::write(&staged, b"staged store").unwrap();
+        for suffix in seed::STORE_SIDECARS {
+            std::fs::write(seed::sidecar(&final_db, suffix), b"orphan").unwrap();
+        }
+
+        place_staged(&staged, &final_db).unwrap();
+
+        assert_eq!(std::fs::read(&final_db).unwrap(), b"staged store");
+        for suffix in seed::STORE_SIDECARS {
+            assert!(
+                !seed::sidecar(&final_db, suffix).exists(),
+                "the orphan {suffix} survived placement"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A sidecar the staged store brings replaces the orphan at the final path.
+    #[test]
+    fn a_staged_sidecar_replaces_the_orphan_at_the_final_path() {
+        let dir = tmp_dir("with-csr");
+        let (staged, final_db) = (dir.join("devmap.sqlite.seed-1"), dir.join("devmap.sqlite"));
+        std::fs::write(&staged, b"staged store").unwrap();
+        std::fs::write(seed::sidecar(&staged, ".csr"), b"staged csr").unwrap();
+        std::fs::write(seed::sidecar(&final_db, ".csr"), b"orphan").unwrap();
+
+        place_staged(&staged, &final_db).unwrap();
+
+        assert_eq!(
+            std::fs::read(seed::sidecar(&final_db, ".csr")).unwrap(),
+            b"staged csr"
+        );
+        assert!(!seed::sidecar(&staged, ".csr").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

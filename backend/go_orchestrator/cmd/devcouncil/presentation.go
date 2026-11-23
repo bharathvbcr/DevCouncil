@@ -98,6 +98,11 @@ func presentationArgs(args []string) ([]string, console.Policy, error) {
 		}
 	case "verify":
 		policy.Title, policy.Activity = "Verification", "Checking the work"
+	case "tool":
+		// stdout is the MCP answer text, byte for byte, on a terminal as in a
+		// pipe: never framed or wrapped for a person.
+		policy.Title, policy.Activity = "MCP tool", "Calling the tool"
+		policy.JSON = true
 	case "install":
 		policy.Title, policy.Activity = "Installation", "Preparing your tools"
 	case "uninstall":

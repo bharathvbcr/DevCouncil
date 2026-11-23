@@ -1577,14 +1577,7 @@ fn servers_mut<'a>(
 }
 
 fn kind_of(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
+    devmap_query::json_value_kind_article(value)
 }
 
 /// OpenCode reaches hooks through an ES module named in `opencode.json`'s
@@ -2251,7 +2244,7 @@ pub fn write_codex_plugin_assets(
     let version = env!("CARGO_PKG_VERSION");
     let manifest = claude::codex_plugin_manifest(Some(version))?;
     let manifest_path = plugin_dir.join("plugin.json");
-    let hooks = claude::hooks_block(executable, &["hook".to_string()])?;
+    let hooks = claude::codex_hooks_block(executable, &["hook".to_string()])?;
     let hooks_path = plugin_dir.join("hooks").join("hooks.json");
 
     for (path, value, note) in [
@@ -2971,6 +2964,13 @@ mod tests {
             value.get("failClosed").is_none() && nav.get("failClosed").is_none(),
             "failClosed would turn a crash into a blocked Read: {value}"
         );
+        // `afterFileEdit` never fires for a shell write, so Cursor's terminal tool
+        // ("Shell") gets the refresh handler on its own postToolUse entry.
+        let shell = &value["hooks"]["postToolUse"][1];
+        assert_eq!(shell["matcher"], "Shell");
+        let shell_cmd = shell["command"].as_str().unwrap();
+        assert!(shell_cmd.contains("hook post-tool-use"), "{shell_cmd}");
+        assert_eq!(value["hooks"]["postToolUse"].as_array().unwrap().len(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3123,6 +3123,13 @@ command = \"x\"\n";
         )
         .unwrap();
         assert!(hooks_doc["hooks"]["PostToolUse"].is_array());
+        assert!(hooks_doc["hooks"].get("PostToolUseFailure").is_none());
+        for event in hooks_doc["hooks"].as_object().unwrap().keys() {
+            assert!(
+                crate::claude::CODEX_DOCUMENTED_EVENTS.contains(&event.as_str()),
+                "Codex hooks.json carries {event}, which Codex does not document"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

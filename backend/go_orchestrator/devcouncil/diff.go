@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
@@ -121,12 +122,16 @@ func ProbeGitRepoState(ctx context.Context, root string) GitRepoState {
 
 // GetDiffArgs are the MCP/CLI arguments for get_diff.
 type GetDiffArgs struct {
-	TaskID        string
-	Paths         []string
-	Staged        bool
-	PlannedFiles  []string // when TaskID set: planned paths from the task
-	TaskFound     bool     // false + TaskID set => not_found
-	DBInitialized bool     // false + TaskID set => not_initialized
+	TaskID       string
+	Paths        []string
+	Staged       bool
+	PlannedFiles []string // when TaskID set: planned paths from the task
+	// PlannedEntries, when non-nil, replaces PlannedFiles: the task's planned
+	// files with their allowed_change, so a path the plan makes read_only is
+	// out of the task's diff scope exactly as the write gate and verify read it.
+	PlannedEntries []dc.PlannedFile
+	TaskFound      bool // false + TaskID set => not_found
+	DBInitialized  bool // false + TaskID set => not_initialized
 }
 
 // GetDiff implements Python handlers/git.py handle_get_diff + git_diff.
@@ -168,20 +173,27 @@ func GetDiff(ctx context.Context, root string, args GetDiffArgs) (any, error) {
 			}, nil
 		}
 		taskScoped = true
-		planned := make([]string, 0, len(args.PlannedFiles))
-		for _, p := range args.PlannedFiles {
-			planned = append(planned, strings.ReplaceAll(p, "\\", "/"))
+		entries := args.PlannedEntries
+		if entries == nil {
+			for _, p := range args.PlannedFiles {
+				entries = append(entries, dc.PlannedFile{Path: strings.ReplaceAll(p, "\\", "/"), AllowedChange: dc.ChangeModify})
+			}
 		}
 		if len(scopePaths) > 0 {
 			filtered := make([]string, 0, len(scopePaths))
 			for _, p := range scopePaths {
-				if MatchesPlannedPath(p, planned) {
+				if editable, readOnly := policy.PlannedScopeIn(root, p, entries); editable && !readOnly {
 					filtered = append(filtered, p)
 				}
 			}
 			scopePaths = filtered
 		} else {
-			scopePaths = planned
+			scopePaths = make([]string, 0, len(entries))
+			for _, pf := range entries {
+				if pf.AllowedChange != dc.ChangeReadOnly {
+					scopePaths = append(scopePaths, pf.Path)
+				}
+			}
 		}
 	}
 

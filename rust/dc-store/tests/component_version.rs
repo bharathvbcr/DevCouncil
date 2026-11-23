@@ -67,6 +67,25 @@ fn version_flag_needs_no_database() {
     }
 }
 
+/// A version word beside other arguments is an argument, not a version request:
+/// `acquire --task version` must not exit 0 having taken no lease.
+#[test]
+fn version_word_beside_other_arguments_is_not_a_version_request() {
+    let dir = std::env::temp_dir().join(format!("dcstore-vword-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("state.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_dcstore"))
+        .args(["--db", db.to_str().unwrap(), "acquire", "--task", "version"])
+        .output()
+        .expect("dcstore must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\"component\":\"dc-store\",\"version\""),
+        "a version word in a value position must not be answered as a version request: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn health_reports_version_and_id() {
     let dir = std::env::temp_dir().join(format!("dcstore-test-{}", std::process::id()));

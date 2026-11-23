@@ -5,9 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 func TestSpecExportTasksPersistsWorkbenchItemsWithScopeAndDAG(t *testing.T) {
+	bin := testsupport.DCStore(t)
+	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	root := t.TempDir()
 	specDir := filepath.Join(root, "specs", "002-zero-copy-worktrees")
 	if err := os.MkdirAll(specDir, 0o755); err != nil {

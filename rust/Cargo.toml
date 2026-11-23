@@ -4,6 +4,7 @@ members = [
     "dc-glob",
     "dc-proc",
     "dc-redact",
+    "dc-redact-cli",
     "dc-grep",
     "dc-store",
     "dc-verify",

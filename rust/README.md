@@ -9,7 +9,7 @@ jobs**, because a `dc-verify` test must not compile thirty tree-sitter grammars.
 
 | Plane | Crates | Answers |
 |---|---|---|
-| Analysis | `dc-glob`, `dc-grep`, `dc-store`, `dc-verify`, `dc-evidence`, `dc-proc` | May this change proceed |
+| Analysis | `dc-glob`, `dc-grep`, `dc-store`, `dc-verify`, `dc-evidence`, `dc-proc`, `dc-redact`, `dc-redact-cli`, `dc-regress`, `dc-regress-store` | May this change proceed |
 | Kernel | `devmap-extract` … `devmap-cli` (including `devmap-store::csr` zero-copy `mmap` CSR graph storage) | What does this code mean |
 
 DevCouncil owns these as **components and modules**. A harness — [Manvi](https://github.com/bharathvbcr/Manvi)
@@ -24,11 +24,14 @@ The analysis-plane crates:
 | Crate | Binary | Answers |
 |---|---|---|
 | `dc-store` | `devc-store` (`dc-store` / `dcstore`) | Which tasks exist, and who holds the lease on one |
-| `dc-verify` | `devc-verify` (`dc-verify` / `dcverify`) | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it, and how much of it is new work |
+| `dc-verify` | `devc-verify` (`dc-verify` / `dcverify`, `dcjsoncheck`) | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it, and how much of it is new work |
 | `dc-grep` | `devc-grep` (`dc-grep` / `dcgrep`) | What is in this repository, honouring its ignore rules |
+| `dc-redact-cli` | `devc-redact` (`dc-redact` / `dcredact`) | Redacts credentials in a text (`dc-redact` stays the dependency-free library) |
 | `dc-glob` | *(library)* | Whether a path matches a pattern, with CPython `fnmatch` semantics |
 | `dc-evidence` | *(library, via `dcverify evidence-check`)* | Whether an independently admitted acceptance contract is satisfied by a bound execution-evidence bundle |
-| `dc-proc` | *(library)* | Subprocess isolation invariants: 5 s default deadline, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation and daemon reaping |
+| `dc-proc` | *(library)* | Subprocess isolation invariants: 5 s default deadline, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation, `spawn_session` 4 KiB stderr tail, `lean_kernel` runner, and shared `cli` JSON-stdio contract helpers |
+| `dc-redact` | *(library)* | Credential/OAuth secret redaction table shared across `dc-verify`, `dc-proc`, and GitPulse |
+| `dc-regress`, `dc-regress-store` | *(binaries/libraries)* | Deterministic regression corpus execution (`git cat-file --batch` session draining) and storage |
 
 ---
 
@@ -55,9 +58,11 @@ because consumers depend on all of them and none is enforced by the type system.
 Command surfaces, as the binaries themselves report them:
 
 ```
-dcstore    acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, review-append, reviews, evidence-append, evidence-list, gaps, run-record
-dcverify   check, evidence-check, health
-dcgrep     search, files, index, health
+dcstore      acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, local-repository, evidence-append, evidence-list, requirements, review-append, reviews, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, runs, run-get, handoff, handoff-get, work (--version|-V|-v|version)
+dcverify     check, evidence-check, health (--version|-V|-v|version)
+dcjsoncheck  schema-validated JSON check runner (--version|-V|-v|version)
+dcgrep       search, files, index, rank, health (--version|-V|-v|version)
+dcredact     redact, health (--version|-V|-v|version)
 ```
 
 `dcstore` additionally requires `--db`.
@@ -68,8 +73,10 @@ dcgrep     search, files, index, health
 `advisory`) says how much a finding matters. **Strength** (`proven` /
 `observed` / `derived`) says how much it can be trusted — whether the gate read
 the parsed structure of the diff, read an execution artifact, or matched a
-pattern. Both findings gates currently report `derived`: `secret_scan` matches
-a credential's *shape* and `stub_detection` matches text. That is an accurate
+pattern. Pattern-based gates (`secret_scan`, `stub_detection`, `runner_hijack`,
+`lean_tcb`) report `derived` (or AST-backed levels), while test-rigor gates report
+parsed structure: `secret_scan` matches
+a credential's *shape* and `stub_detection` matches text/AST nodes. That is an accurate
 and slightly uncomfortable description of the rigor layer, which is why it is
 on the wire. The rule is the existing one carried one step further — a check
 that could not run must not look like one that ran, and a guess must not look
@@ -269,11 +276,7 @@ fails if they skipped.
 
 ## Where to look next
 
-- [`STATUS.md`](STATUS.md) — the analysis-plane port ledger: what was verified and how, what is
-  deliberately different from MANVI's mirror, what is still open. **§4 is the one
-  to read before planning a cutover**: these components are not uniformly better
-  than the Python they resemble, and `dcverify`'s stub detection is measurably
-  weaker than `verification/stub_detector.py`, which does AST analysis.
+- [`STATUS.md`](STATUS.md) — the dated analysis-plane port ledger: what was verified and how during the September–October 2026 cutover, and what was deliberately different from MANVI's mirror (note: legacy `src/` and Python `verification/stub_detector.py` have since been retired, and `dc-verify` now performs tree-sitter AST stub/test-rigor analysis natively).
 - [`../docs/archive/devmap/STATUS.md`](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/STATUS.md) — archived kernel port ledger (pre-Phase-7). Live kernel contracts: [`../docs/devmap/DIVERGENCES.md`](../docs/devmap/DIVERGENCES.md); frozen follow-up ledger: [`docs/TODO.md`](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/TODO.md).
 - MANVI's `docs/COMPONENTS_AND_HARNESS.md` — the consumer's view: the resolution
   ladder, where a change belongs, and the checklist a newly ported component

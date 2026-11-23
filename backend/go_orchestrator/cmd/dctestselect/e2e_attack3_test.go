@@ -206,7 +206,11 @@ func TestE2ECrateSelectionRunsEveryTargetTheFullSuiteRunsInTheCrate(t *testing.T
 // command builds it the same way, so the fast phase fails the same test (`-p a`
 // alone would build a without `extra`).
 var a3pairFiles = map[string]string{
-	"rust/Cargo.toml":   "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"b\"]\n",
+	// c is a bystander: with only a and b, "a with its dependent b" is the whole
+	// workspace, which the plan collapses to everything (see runsFullSuite).
+	"rust/Cargo.toml":   "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"b\", \"c\"]\n",
+	"rust/c/Cargo.toml": "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+	"rust/c/src/lib.rs": "",
 	"rust/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nextra = []\n",
 	"rust/a/src/lib.rs": "#[cfg(feature = \"extra\")]\n#[test]\nfn extra_bad() { assert!(false); }\n",
 	"rust/b/Cargo.toml": "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\na = { path = \"../a\", features = [\"extra\"] }\n",
@@ -235,7 +239,11 @@ func TestE2EACrateAndItsDependentBuildInOneCommandWithTheFeaturesTheFullSuiteBui
 // is therefore a command that ran nothing, and is not examined.
 func TestE2ECargoLeavesNoTestResultWhenOneRequestedCrateFailsToCompile(t *testing.T) {
 	root, ws := a3fixture(t, map[string]string{
-		"rust/Cargo.toml":   "[workspace]\nresolver = \"3\"\nmembers = [\"x\", \"y\"]\n",
+		// w is a bystander: x and y alone are the whole workspace, which the plan
+		// collapses to everything instead of selecting them (see runsFullSuite).
+		"rust/Cargo.toml":   "[workspace]\nresolver = \"3\"\nmembers = [\"x\", \"y\", \"w\"]\n",
+		"rust/w/Cargo.toml": "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+		"rust/w/src/lib.rs": "",
 		"rust/x/Cargo.toml": "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
 		"rust/x/src/lib.rs": "pub fn broken( {\n",
 		"rust/y/Cargo.toml": "[package]\nname = \"y\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",

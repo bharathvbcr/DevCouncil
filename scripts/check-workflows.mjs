@@ -8,8 +8,8 @@
  * and is reported differently from workflows that were checked and found
  * faulty, which exits 1.
  *
- * Exit codes: 0 workflows are clean · 1 actionlint found problems ·
- * 2 the check could not run
+ * Exit codes: 0 workflows are clean · 1 actionlint or a supply-chain
+ * rule found problems · 2 the check could not run
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -528,6 +528,387 @@ export function testsupportPathsMissing(yaml, label) {
   return failures;
 }
 
+/** @param {string} repoRoot @returns {Record<string, string>} */
+export function readCompositeActions(repoRoot) {
+  const root = path.join(repoRoot, ".github", "actions");
+  if (!existsSync(root)) return {};
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const dir of readdirSync(root)) {
+    const yml = path.join(root, dir, "action.yml");
+    if (!existsSync(yml)) continue;
+    out[path.posix.join(".github", "actions", dir, "action.yml")] = readFileSync(yml, "utf8");
+  }
+  return out;
+}
+
+/**
+ * Bodies of `run:` steps. `defaults: run:` is not a step.
+ * @param {string} yaml
+ * @returns {string[]}
+ */
+export function runBodies(yaml) {
+  const lines = yaml.split("\n");
+  /** @type {string[]} */
+  const bodies = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*#/.test(line)) continue;
+    if (/^\s*defaults\s*:/.test(line)) continue;
+    const m = /^(\s*)(?:-\s+)?run:\s*(.*?)\s*$/.exec(line);
+    if (!m) continue;
+    const indent = m[1].length;
+    const rest = m[2].replace(/\s+#.*$/, "");
+    if (rest === "|" || rest === "|-" || rest === "|+" || rest === ">" || rest === ">-" || rest === ">+") {
+      /** @type {string[]} */
+      const chunk = [];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (next.trim() === "") {
+          chunk.push("");
+          i++;
+          continue;
+        }
+        const nextIndent = /^ */.exec(next)?.[0].length ?? 0;
+        if (nextIndent <= indent) break;
+        chunk.push(next);
+        i++;
+      }
+      bodies.push(chunk.join("\n"));
+      continue;
+    }
+    bodies.push(rest.replace(/^['"]|['"]$/g, ""));
+  }
+  return bodies;
+}
+
+/**
+ * @param {string} body
+ * @returns {string[]}
+ */
+function actionExpressions(body) {
+  /** @type {string[]} */
+  const exprs = [];
+  let from = 0;
+  while (from < body.length) {
+    const start = body.indexOf("${{", from);
+    if (start === -1) break;
+    let depth = 0;
+    let end = -1;
+    for (let k = start + 2; k < body.length; k++) {
+      const ch = body[k];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = k + 1;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      exprs.push(body.slice(start));
+      break;
+    }
+    exprs.push(body.slice(start, end));
+    from = end;
+  }
+  return exprs;
+}
+
+/**
+ * Rewrites bracket property access with a literal key to dot access.
+ * @param {string} expr
+ */
+function dotted(expr) {
+  return expr.replace(/\[\s*(['"])([A-Za-z0-9_-]+)\1\s*\]/g, ".$2");
+}
+
+/**
+ * @param {string} body
+ * @returns {boolean}
+ */
+export function pipesCurlToShell(body) {
+  const flat = body.replace(/\\\r?\n/g, " ");
+  const shellName = String.raw`(?:(?:\/\S+)?\/)?(?:ba|z|da|k|a)?sh\b`;
+  // Wrappers that still hand stdin to the shell: sudo [-flags], env [-flags], /usr/bin/env.
+  const wrappers = String.raw`(?:(?:(?:\/\S+\/)?sudo|(?:\/\S+\/)?env)\b(?:\s+-\S+)*\s+)*`;
+  const fetcher = String.raw`(?:curl|wget)\b`;
+  const patterns = [
+    // curl ... | [sudo -E] [/usr/bin/env] bash
+    new RegExp(String.raw`\b${fetcher}[^|\n]*\|\s*${wrappers}${shellName}`, "i"),
+    // bash <(curl ...), source <(curl ...), . <(curl ...)
+    new RegExp(String.raw`(?:\b(?:source|eval)\b|(?:^|[\s;&|(])\.|\b${shellName})\s*(?:-\S+\s+)*<\(\s*${fetcher}`, "im"),
+    // bash -c "$(curl ...)", eval "$(curl ...)", eval `curl ...`
+    new RegExp(
+      String.raw`(?:\beval\b|\b${shellName}\s+(?:-\S+\s+)*-[A-Za-z]*c\b)[^\n;|]*?(?:\$\(|\`)\s*${fetcher}`,
+      "i",
+    ),
+  ];
+  return patterns.some((pattern) => pattern.test(flat));
+}
+
+/** @param {string} yaml @returns {string[]} uses values that are not local and not a 40-hex pin */
+export function unpinnedUses(yaml) {
+  /** @type {string[]} */
+  const bad = [];
+  for (const line of yaml.split("\n")) {
+    if (line.trim().startsWith("#")) continue;
+    const m = /(?:^|\s)uses:\s*['"]?([^'"\s#]+)/.exec(line);
+    if (!m) continue;
+    const uses = m[1];
+    if (uses.startsWith("./")) continue;
+    const at = uses.lastIndexOf("@");
+    const ref = at === -1 ? "" : uses.slice(at + 1);
+    if (!/^[0-9a-f]{40}$/.test(ref)) bad.push(uses);
+  }
+  return bad;
+}
+
+/**
+ * @param {string} yaml
+ * @returns {boolean}
+ */
+export function triggersPullRequest(yaml) {
+  const jobsAt = yaml.search(/^jobs\s*:/m);
+  const head = jobsAt === -1 ? yaml : yaml.slice(0, jobsAt);
+  let inOn = false;
+  for (const line of head.split("\n")) {
+    if (/^\s*#/.test(line)) continue;
+    const top = /^(on|permissions|env|concurrency|name|jobs|defaults)\s*:/.exec(line);
+    if (top) {
+      inOn = top[1] === "on";
+      const inline = /^on\s*:\s*\[(.*)\]/.exec(line);
+      if (inline && inline[1].split(",").some((part) => part.trim() === "pull_request")) return true;
+      continue;
+    }
+    if (!inOn) continue;
+    if (/^\s*-\s*pull_request\s*(?:#.*)?$/.test(line)) return true;
+    if (/^\s*pull_request\s*:/.test(line)) return true;
+  }
+  return false;
+}
+
+/**
+ * @param {string} section
+ * @param {number} keyIndent
+ * @returns {{ found: boolean, writeAll: boolean, readAll: boolean, contents: string | null, idToken: string | null }}
+ */
+function permissionsAt(section, keyIndent) {
+  const absent = { found: false, writeAll: false, readAll: false, contents: null, idToken: null };
+  const re = new RegExp(`^${" ".repeat(keyIndent)}permissions\\s*:(.*)$`, "m");
+  const m = re.exec(section);
+  if (!m) return absent;
+  const rest = m[1].trim().replace(/\s+#.*$/, "");
+  /** @type {string[]} */
+  const lines = [];
+  if (!rest) {
+    const after = section.slice(m.index + m[0].length + 1);
+    for (const line of after.split("\n")) {
+      if (line.trim() === "") {
+        lines.push(line);
+        continue;
+      }
+      const ind = /^ */.exec(line)?.[0].length ?? 0;
+      if (ind <= keyIndent) break;
+      lines.push(line);
+    }
+  }
+  const text = rest || lines.join("\n");
+  const block = { found: true, writeAll: false, readAll: false, contents: null, idToken: null };
+  const one = text.trim().replace(/^(['"])(.*)\1$/, "$2");
+  if (one === "write-all") {
+    block.writeAll = true;
+    return block;
+  }
+  if (one === "read-all") {
+    block.readAll = true;
+    return block;
+  }
+  if (one === "{}" || one === "") return block;
+  // A flow mapping, { contents: write, id-token: write }, is one line per entry.
+  const entries = /^\{.*\}$/s.test(one) ? one.slice(1, -1).split(",") : text.split("\n");
+  for (const line of entries) {
+    const contents = /^\s*['"]?contents['"]?\s*:\s*['"]?([A-Za-z-]+)['"]?/.exec(line);
+    if (contents) block.contents = contents[1];
+    const idToken = /^\s*['"]?id-token['"]?\s*:\s*['"]?([A-Za-z-]+)['"]?/.exec(line);
+    if (idToken) block.idToken = idToken[1];
+  }
+  return block;
+}
+
+/**
+ * @param {{ found: boolean, writeAll: boolean, readAll: boolean, contents: string | null, idToken: string | null }} block
+ * @returns {{ contents: string, idToken: string }}
+ */
+function realizedPermissions(block) {
+  if (block.writeAll) return { contents: "write", idToken: "write" };
+  if (block.readAll) return { contents: "read", idToken: "read" };
+  return { contents: block.contents ?? "none", idToken: block.idToken ?? "none" };
+}
+
+/**
+ * @param {string} yaml
+ * @returns {{ id: string, condition: string, permissions: { found: boolean, writeAll: boolean, readAll: boolean, contents: string | null, idToken: string | null } }[]}
+ */
+function jobsOf(yaml) {
+  const start = yaml.search(/^jobs\s*:/m);
+  if (start === -1) return [];
+  const lines = yaml.slice(start).split("\n");
+  /** @type {{ id: string, lines: string[] }[]} */
+  const jobs = [];
+  /** @type {{ id: string, lines: string[] } | null} */
+  let current = null;
+  for (let i = 1; i < lines.length; i++) {
+    const job = /^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(lines[i]);
+    if (job) {
+      if (current) jobs.push(current);
+      current = { id: job[1], lines: [] };
+      continue;
+    }
+    if (current) current.lines.push(lines[i]);
+  }
+  if (current) jobs.push(current);
+  return jobs.map((job) => {
+    const body = job.lines.join("\n");
+    let condition = "";
+    const linesOfJob = job.lines;
+    for (let i = 0; i < linesOfJob.length; i++) {
+      const m = /^    if:\s*(.*)$/.exec(linesOfJob[i]);
+      if (!m) continue;
+      const rest = m[1].trim();
+      if (rest === "|" || rest === "|-" || rest === "|+" || rest === ">" || rest === ">-" || rest === ">+") {
+        /** @type {string[]} */
+        const chunk = [];
+        for (let j = i + 1; j < linesOfJob.length; j++) {
+          const next = linesOfJob[j];
+          if (next.trim() === "") {
+            chunk.push(next);
+            continue;
+          }
+          if ((/^ */.exec(next)?.[0].length ?? 0) <= 4) break;
+          chunk.push(next);
+        }
+        condition = chunk.join("\n");
+      } else {
+        condition = rest;
+      }
+      break;
+    }
+    return { id: job.id, condition, permissions: permissionsAt(body, 4) };
+  });
+}
+
+/**
+ * Split `text` on `op` (`&&` or `||`) outside parentheses.
+ * @param {string} text
+ * @param {"&&" | "||"} op
+ * @returns {string[]}
+ */
+function splitTopLevel(text, op) {
+  /** @type {string[]} */
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && text.startsWith(op, i)) {
+      parts.push(text.slice(start, i).trim());
+      i += op.length - 1;
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+/**
+ * True only when every top-level `||` alternative excludes a pull request.
+ * `&&` binds tighter than `||`, so `a && b || c` is `(a && b) || c` and `c`
+ * still runs on a pull request. An alternative excludes it when one of that
+ * alternative's own top-level `&&` conjuncts is exactly
+ * `github.event_name != 'pull_request'` or `startsWith(github.ref, 'refs/tags/...')`.
+ * An `||` inside parentheses is not a top-level alternative.
+ * @param {string} condition
+ */
+function excludesPullRequest(condition) {
+  const text = condition.replace(/\$\{\{\s*|\s*\}\}/g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  const exclusion =
+    /^(?:github\.event_name\s*!=\s*['"]pull_request['"]|startsWith\(\s*github\.ref\s*,\s*['"]refs\/tags\/[^'"]*['"]\s*\))$/;
+  const alternatives = splitTopLevel(text, "||");
+  if (alternatives.length === 0) return false;
+  return alternatives.every((alternative) =>
+    splitTopLevel(alternative, "&&").some((part) => exclusion.test(part)),
+  );
+}
+
+/**
+ * Supply-chain failures for workflow and composite-action YAML.
+ * `files` maps a display name to its text. An absent permissions block is not
+ * treated as read: on pull_request that is a failure, same as contents: write.
+ *
+ * @param {Record<string, string>} files
+ * @returns {string[]}
+ */
+export function supplyChainFailures(files) {
+  /** @type {string[]} */
+  const failures = [];
+  for (const [name, yaml] of Object.entries(files)) {
+    for (const body of runBodies(yaml)) {
+      if (pipesCurlToShell(body)) failures.push(`${name}: run pipes curl output to a shell`);
+      // Bracket access reaches the same values: matrix['dist_args'] is matrix.dist_args.
+      const exprs = actionExpressions(body).map(dotted);
+      if (exprs.some((expr) => /\bmatrix\b/.test(expr))) {
+        failures.push(`${name}: matrix expression in run`);
+      }
+      if (
+        exprs.some(
+          (expr) =>
+            /\bgithub\.ref_name\b/.test(expr) ||
+            /\bgithub\.head_ref\b/.test(expr) ||
+            /\bgithub\.event\b/.test(expr),
+        )
+      ) {
+        failures.push(`${name}: event expression in run`);
+      }
+    }
+    for (const uses of unpinnedUses(yaml)) failures.push(`${name}: unpinned action ${uses}`);
+    for (const match of yaml.matchAll(/@anthropic-ai\/claude-code(?:@([^\s'"]+))?/g)) {
+      if (match[1] && /^\d+\.\d+\.\d+$/.test(match[1])) continue;
+      failures.push(`${name}: claude-code install is not an exact version`);
+    }
+    const pulls = triggersPullRequest(yaml);
+    const jobsAt = yaml.search(/^jobs\s*:/m);
+    const head = jobsAt === -1 ? yaml : yaml.slice(0, jobsAt);
+    const workflowPerms = permissionsAt(head, 0);
+    if (workflowPerms.found && realizedPermissions(workflowPerms).idToken === "write") {
+      failures.push(`${name}: workflow permissions grant id-token: write`);
+    }
+    for (const job of jobsOf(yaml)) {
+      const block = job.permissions.found ? job.permissions : workflowPerms;
+      if (!block.found) {
+        if (pulls) failures.push(`${name}: job ${job.id} has no permissions on pull_request`);
+        continue;
+      }
+      const perms = realizedPermissions(block);
+      const onPullRequest = pulls && !excludesPullRequest(job.condition);
+      if (onPullRequest && perms.contents === "write") {
+        failures.push(`${name}: job ${job.id} holds contents: write on pull_request`);
+      }
+      if (onPullRequest && perms.idToken === "write") {
+        failures.push(`${name}: job ${job.id} holds id-token: write on pull_request`);
+      }
+      if (perms.idToken === "write" && job.id !== "publish") {
+        failures.push(`${name}: job ${job.id} holds id-token: write`);
+      }
+    }
+  }
+  return failures;
+}
+
 /**
  * Structural checks that need no actionlint. Returns the failures.
  * @param {string} repoRoot
@@ -571,6 +952,7 @@ export function structuralFailures(repoRoot) {
   } else {
     failures.push(...cargoStepsMissingLocked(readFileSync(verifyPath, "utf8"), "rust/verify.sh"));
   }
+  failures.push(...supplyChainFailures({ ...workflows, ...readCompositeActions(repoRoot) }));
   return failures;
 }
 

@@ -61,8 +61,6 @@ fn sha256_hex(data: &[u8]) -> String {
         padded.push(0);
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
-    // The padding above makes `padded` a whole number of 64-byte blocks, so
-    // both `as_chunks` remainders are empty.
     for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
@@ -770,19 +768,7 @@ fn sync_dismiss(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<
     put_body(input.conn, Entity::IssueSync, id, revision, &next_body)
 }
 
-/// What [`build_outbound_payload`] resolved for one outbound operation.
-struct OutboundPayload {
-    /// The issue-sync record, absent for `create_issue`.
-    sync_id: Option<String>,
-    outbound_opt_in: bool,
-    repo_slug: String,
-    issue_number: Option<i64>,
-    payload_json: String,
-    digest: String,
-    conflict_fields: Vec<String>,
-    conflicts_json: String,
-}
-
+#[allow(clippy::type_complexity)]
 fn build_outbound_payload(
     conn: &Connection,
     task_id: &str,
@@ -790,7 +776,17 @@ fn build_outbound_payload(
     repo_slug_input: Option<String>,
     fields_input: Vec<String>,
     remote_override: Option<&IssueSnapshot>,
-) -> Result<OutboundPayload> {
+) -> Result<(
+    Option<String>,
+    bool,
+    String,
+    Option<i64>,
+    Vec<String>,
+    String,
+    String,
+    Vec<String>,
+    String,
+)> {
     let (_, task_body) = require_live_task(conn, task_id)?;
     let local = IssueSnapshot::from_task_body(conn, &task_body)?;
     let existing_sync = load_sync_for_task(conn, task_id)?;
@@ -825,16 +821,17 @@ fn build_outbound_payload(
             |r| r.get(0),
         )?;
         let digest = sha256_hex(payload_json.as_bytes());
-        return Ok(OutboundPayload {
-            sync_id: None,
-            outbound_opt_in: true,
+        return Ok((
+            None,
+            true,
             repo_slug,
-            issue_number: None,
+            None,
+            selected,
             payload_json,
             digest,
-            conflict_fields: Vec::new(),
-            conflicts_json: "[]".into(),
-        });
+            Vec::new(),
+            "[]".into(),
+        ));
     }
 
     // update_issue
@@ -901,16 +898,17 @@ fn build_outbound_payload(
         |r| r.get(0),
     )?;
     let digest = sha256_hex(payload_json.as_bytes());
-    Ok(OutboundPayload {
-        sync_id: Some(sync_id),
-        outbound_opt_in: opt_in,
-        repo_slug: link_slug,
-        issue_number: Some(issue_number),
+    Ok((
+        Some(sync_id),
+        opt_in,
+        link_slug,
+        Some(issue_number),
+        selected,
         payload_json,
         digest,
         conflict_fields,
         conflicts_json,
-    })
+    ))
 }
 
 /// Pure read-only preview of an outbound GitHub issue operation. Writes nothing.
@@ -937,16 +935,17 @@ pub(super) fn preview(input: &Input<'_>) -> Result<String> {
         _ => return Err(Error::invalid("remote must be an object")),
     };
 
-    let OutboundPayload {
+    let (
         sync_id,
         outbound_opt_in,
-        repo_slug: resolved_slug,
+        resolved_slug,
         issue_number,
+        _,
         payload_json,
         digest,
         conflict_fields,
         conflicts_json,
-    } = build_outbound_payload(
+    ) = build_outbound_payload(
         input.conn,
         &task_id,
         &op,
@@ -1027,16 +1026,17 @@ fn outbox_enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
         return Err(Error::invalid("max_attempts must be at least 1"));
     }
 
-    let OutboundPayload {
+    let (
         sync_id,
-        outbound_opt_in: link_opt_in,
-        repo_slug: resolved_slug,
+        link_opt_in,
+        resolved_slug,
         issue_number,
+        _,
         payload_json,
         digest,
         conflict_fields,
-        conflicts_json: _,
-    } = build_outbound_payload(input.conn, &task_id, &op, repo_slug, fields, None)?;
+        _,
+    ) = build_outbound_payload(input.conn, &task_id, &op, repo_slug, fields, None)?;
 
     if op == "update_issue" && !link_opt_in {
         return Err(refuse(

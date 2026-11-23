@@ -6,6 +6,8 @@
 package verify
 
 import (
+	"errors"
+
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -79,7 +81,6 @@ type MCPResult struct {
 	NextActions      []NextAction `json:"next_actions"`
 	AdvisoryActions  []NextAction `json:"advisory_actions"`
 	AllowedNextTools []string     `json:"allowed_next_tools"`
-	CorrectionPath   string       `json:"correction_path,omitempty"`
 }
 
 // TaskCLIResult is one task entry inside the CLI verify --json envelope.
@@ -104,6 +105,9 @@ type TaskCLIResult struct {
 	Gaps                  []Gap        `json:"gaps"`
 	NextActions           []NextAction `json:"next_actions"`
 	AdvisoryActions       []NextAction `json:"advisory_actions"`
+	// NotRun is set only on an entry with status "not_run": a task a
+	// multi-task run reached after judging others, which it could not judge.
+	NotRun *NotRun `json:"not_run,omitempty"`
 }
 
 // CLIResult is the `dev verify --json` / `devcouncil verify --json` envelope.
@@ -121,6 +125,65 @@ type CLIResult struct {
 	TotalGaps                    int             `json:"total_gaps"`
 	Tasks                        []TaskCLIResult `json:"tasks"`
 	Error                        string          `json:"error,omitempty"`
+	// NotRun is set when the command ended without judging a task: the id is
+	// not in this store, or the store could not be read. It is absent on every
+	// run that judged something, and a not-run counts toward none of the
+	// verdict totals above.
+	NotRun *NotRun `json:"not_run,omitempty"`
+}
+
+// Reasons a verify can end without a verdict (NotRun.Reason).
+const (
+	NotRunTaskNotFound     = "task_not_found"
+	NotRunStoreUnavailable = "store_unavailable"
+	NotRunStoreError       = "store_error"
+)
+
+// NotRun says a verify did not run. It appears in two places and never beside
+// a verdict for the same task: top-level on CLIResult when the run judged
+// nothing (processed_tasks is 0), and on a tasks[] entry (status "not_run")
+// when an earlier task in the same run was judged and a later one could not
+// be. The totals never count it. It is not a verdict: "no such task here" is
+// a different answer from "this task has blocking gaps", and a board card id is
+// not a task in this store.
+type NotRun struct {
+	Reason string `json:"reason"`
+	TaskID string `json:"task_id,omitempty"`
+}
+
+// ErrTaskNotFound matches (errors.Is) the error VerifyTask returns for an id
+// this store does not hold. The error's text is unchanged — hosts surface it
+// verbatim (the stop gate's SkipReason, MCP verify_error).
+var ErrTaskNotFound = errors.New("task not found")
+
+// ErrStoreUnavailable is VerifyTask's error for a nil store.
+var ErrStoreUnavailable = errors.New("store unavailable")
+
+type taskNotFoundError struct{ id string }
+
+func (e taskNotFoundError) Error() string      { return "task " + e.id + " not found" }
+func (taskNotFoundError) Is(target error) bool { return target == ErrTaskNotFound }
+
+// storeReadError marks a failure to read the task from the store, keeping the
+// underlying text as is.
+type storeReadError struct{ err error }
+
+func (e storeReadError) Error() string { return e.err.Error() }
+func (e storeReadError) Unwrap() error { return e.err }
+
+// notRunReason classifies an error from VerifyTask as a not-run reason; ok is
+// false for an error that came from a run that was judging something.
+func notRunReason(err error) (reason string, ok bool) {
+	var read storeReadError
+	switch {
+	case errors.Is(err, ErrTaskNotFound):
+		return NotRunTaskNotFound, true
+	case errors.Is(err, ErrStoreUnavailable):
+		return NotRunStoreUnavailable, true
+	case errors.As(err, &read):
+		return NotRunStoreError, true
+	}
+	return "", false
 }
 
 // GateState is a resolved gate mode with its provenance. It is what the entry

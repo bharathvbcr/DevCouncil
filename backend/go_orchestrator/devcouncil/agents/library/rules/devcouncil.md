@@ -15,7 +15,7 @@ DevCouncil is **components and modules** (`devmap`, `dcstore`, `dcverify`, `dcgr
 
 ## Tasks and gates are opt-in
 
-DevCouncil host hooks are retired, so **interactive Shell and Write need no task lease**. Do not claim "Shell is gated", and do not check out a task in order to run a command. Use the `devcouncil_*` MCP tools when you actually want task state, scope or verification — and prefer them over guessing it. A host that uses MCP policy must honor its results. The `--write-gate` flag has been removed rather than kept as a refusal, and `integrations.<host>.write_gate` is no longer read: both named a pre-tool-use write gate that only the retired hooks ever installed. A copy left in an existing `config.yaml` is inert.
+DevCouncil host hooks are retired, so **interactive Shell and Write need no task lease**. Do not claim "Shell is gated", and do not check out a task in order to run a command. Use the `devcouncil_*` MCP tools when you actually want task state, scope or verification — and prefer them over guessing it. When one of them errors or times out, `dev tool call <same name> --args '<same JSON>'` answers it from the shell with the same text; say that you fell back. A host that uses MCP policy must honor its results. The `--write-gate` flag has been removed rather than kept as a refusal, and `integrations.<host>.write_gate` is no longer read: both named a pre-tool-use write gate that only the retired hooks ever installed. A copy left in an existing `config.yaml` is inert.
 
 Engineering skills live under `.agents/skills` (`devcouncil skills scaffold`).
 

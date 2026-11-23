@@ -3,6 +3,7 @@ package policy
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -33,6 +34,7 @@ var fileReaders = map[string]bool{
 	"cat": true, "head": true, "tail": true, "less": true, "more": true,
 	"tac": true, "nl": true, "base64": true, "xxd": true, "od": true,
 	"hexdump": true, "strings": true, "cp": true, "dd": true, "source": true, ".": true,
+	"jq": true, "cmp": true, "sed": true,
 }
 
 // maxGlobMatchesJudged bounds what one wildcard operand is expanded to.
@@ -56,13 +58,18 @@ const maxGlobMatchesJudged = 1024
 func secretOperandViolation(clause, root string) string {
 	words := shellWords(clause)
 	at := argumentCommandWord(words)
+	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""
+	effectiveGitRoot := root
 	if at >= 0 {
 		command = filepath.Base(words[at].text)
 		if isGitWord(words[at].text) {
 			command = "git"
 			gitSub = gitSubcommand(words[at+1:])
+			if gitRoot, _, escaped := resolveGitClauseWorktree(words, at, root); !escaped && gitRoot != "" {
+				effectiveGitRoot = gitRoot
+			}
 		}
 	}
 
@@ -70,14 +77,24 @@ func secretOperandViolation(clause, root string) string {
 	// files and sed -i's targets change a file without printing it; the write
 	// rungs judge them under path.secret, and calling them a read would both
 	// misname the refusal and displace the write rule that is the right one.
-	writtenList := argumentWriteTargets(clause).targets
-	written := make(map[string]bool, len(writtenList))
-	for _, w := range writtenList {
+	argWrites := argumentWriteTargetsInRoot(clause, root)
+	written := make(map[string]bool, len(argWrites.targets))
+	for _, w := range argWrites.targets {
 		written[w] = true
 	}
+	if command == "git" {
+		for _, sib := range argWrites.siblings {
+			if sameWorktreePath(sib.root, effectiveGitRoot) {
+				for _, w := range sib.writes.targets {
+					written[w] = true
+				}
+			}
+		}
+	}
 
-	judged := func(operand string) string {
-		return secretOperandReason(operand, root)
+	operandRoot := root
+	if command == "git" {
+		operandRoot = effectiveGitRoot
 	}
 
 	for i := 0; i < len(words); i++ {
@@ -95,13 +112,13 @@ func secretOperandViolation(clause, root string) string {
 				i++
 			}
 			if strings.Contains(text, "<") && !strings.Contains(text, "<<") && operand != "" {
-				if reason := judged(operand); reason != "" {
+				if reason := secretOperandReason(operand, root); reason != "" {
 					return fmt.Sprintf("an input redirection names %s", reason)
 				}
 			}
 			continue
 		}
-		if at < 0 || i <= at {
+		if framing || at < 0 || i <= at {
 			continue
 		}
 		reads := !nonReadingCommands[command]
@@ -130,7 +147,7 @@ func secretOperandViolation(clause, root string) string {
 				}
 				continue
 			}
-			if reason := judged(operand); reason != "" {
+			if reason := secretOperandReason(operand, operandRoot); reason != "" {
 				return fmt.Sprintf("`%s` names %s", command, reason)
 			}
 		}
@@ -159,10 +176,22 @@ func secretOperandReason(operand, root string) string {
 		if candidate == "" {
 			continue
 		}
-		if classifyReadOperand(root, candidate) == ReadSecretPath {
+		class := classifyReadOperand(root, candidate)
+		if class == ReadSecretPath {
 			return fmt.Sprintf("a path that holds credentials (`%s`), whose contents would enter the "+
 				"model's context. Read access to credential files is refused for the shell as it is for "+
 				"devcouncil_read_file.", candidate)
+		}
+		if class == ReadOutsideRoot {
+			candPath := filepath.FromSlash(normalizeSlashes(candidate))
+			if root != "" && !filepath.IsAbs(candPath) {
+				candPath = filepath.Join(root, candPath)
+			}
+			if SecretPathSpelling(candidate) || isOutsideCredentialTarget(candPath) {
+				return fmt.Sprintf("a path that holds credentials (`%s`), whose contents would enter the "+
+					"model's context. Read access to credential files is refused for the shell as it is for "+
+					"devcouncil_read_file.", candidate)
+			}
 		}
 		if root != "" && strings.ContainsAny(candidate, "*?[") {
 			if matched := globMatchesSecret(root, candidate); matched != "" {
@@ -174,14 +203,29 @@ func secretOperandReason(operand, root string) string {
 	return ""
 }
 
-// globMatchesSecret expands a wildcard operand against the tree and returns the
-// first match that holds credentials. Bounded: a pattern that expands to more
-// than maxGlobMatchesJudged is judged on the first that many.
-func globMatchesSecret(root, pattern string) string {
-	if filepath.IsAbs(pattern) {
-		return ""
+func isOutsideCredentialTarget(candPath string) bool {
+	slashed := filepath.ToSlash(candPath)
+	if SecretPathSpelling(slashed) || SecretPathSpelling(path.Clean(slashed)) {
+		return true
 	}
-	matches, err := filepath.Glob(filepath.Join(root, filepath.FromSlash(pattern)))
+	resolved, err := filepath.EvalSymlinks(candPath)
+	if err != nil {
+		return false
+	}
+	resolvedSlash := filepath.ToSlash(resolved)
+	return SecretPathSpelling(resolvedSlash) || SecretPathSpelling(path.Clean(resolvedSlash))
+}
+
+// globMatchesSecret expands a wildcard operand against the tree (or outside
+// root when prefixed with `..` or an absolute path) and returns the first match
+// that holds credentials. Bounded: a pattern that expands to more than
+// maxGlobMatchesJudged is judged on the first that many.
+func globMatchesSecret(root, pattern string) string {
+	globPat := filepath.FromSlash(normalizeSlashes(pattern))
+	if !filepath.IsAbs(globPat) {
+		globPat = filepath.Join(root, globPat)
+	}
+	matches, err := filepath.Glob(globPat)
 	if err != nil {
 		return ""
 	}
@@ -189,15 +233,17 @@ func globMatchesSecret(root, pattern string) string {
 		matches = matches[:maxGlobMatchesJudged]
 	}
 	for _, m := range matches {
-		rel, err := filepath.Rel(root, m)
-		if err != nil {
-			continue
-		}
 		if _, statErr := os.Lstat(m); statErr != nil {
 			continue
 		}
-		if ClassifyRead(root, filepath.ToSlash(rel)) == ReadSecretPath {
-			return filepath.ToSlash(rel)
+		if rel, err := filepath.Rel(root, m); err == nil {
+			relSlash := filepath.ToSlash(rel)
+			if ClassifyRead(root, relSlash) == ReadSecretPath {
+				return relSlash
+			}
+		}
+		if isOutsideCredentialTarget(m) {
+			return filepath.ToSlash(m)
 		}
 	}
 	return ""

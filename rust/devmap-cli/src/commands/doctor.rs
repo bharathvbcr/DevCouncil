@@ -8,8 +8,8 @@ use crate::cli::Cli;
 use crate::installation::{
     binaries_skew_warning, build_identity_json, duplicate_mcp_registration_warning,
     inventory_devmap_binaries, mcp_registration_inventory, missing_binary_warning,
-    plugin_cleanup_note, plugin_warning, profile_hooks_warning, stale_server_warning,
-    stray_state_warning,
+    plugin_cleanup_note, plugin_warning, post_tool_use_matcher_warning, profile_hooks_warning,
+    stale_server_warning, stray_state_warning,
 };
 use crate::output::emit_json;
 
@@ -63,9 +63,10 @@ fn doctor_report(
         "plugin_warning": plugin_warning(),
         "plugin_cleanup_note": plugin_cleanup_note(),
         "profile_hooks_warning": profile_hooks_warning(&std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())),
+        "post_tool_use_matcher_warning": post_tool_use_matcher_warning(&std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())),
         "stale_server_warning": stale_server_warning(root),
         "hooks_marker_dir_warning": crate::hook::marker_dir_refusal(
-            &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+            &crate::hook::canonicalize_existing(root).unwrap_or_else(|_| root.to_path_buf()),
         ),
         "mcp_registrations": mcp_registration_inventory(),
         "git": git_report(root),

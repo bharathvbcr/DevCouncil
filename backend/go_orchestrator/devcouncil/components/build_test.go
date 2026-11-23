@@ -50,6 +50,8 @@ func (healthyProber) Probe(bin string, args []string) ([]byte, error) {
 		return []byte(`{"id":"dcverify","verifier":"dc-verify"}`), nil
 	case joined == "health" && id == "dcgrep":
 		return []byte(`{"id":"dcgrep","ok":true}`), nil
+	case joined == "health" && id == "dcredact":
+		return []byte(`{"id":"dcredact","ok":true}`), nil
 	}
 	return []byte(`{"id":"` + id + `","version":"0.0.0"}`), nil
 }
@@ -128,13 +130,15 @@ func TestHealthChecksRequireEachComponentsOwnAnswer(t *testing.T) {
 		{"dcverify", `{"verifier":"dc-verify"}`, "did not report id"},
 		{"dcgrep", `{"id":"dcgrep","ok":false}`, "health failed"},
 		{"dcgrep", `{"ok":true}`, "did not report id"},
+		{"dcredact", `{"id":"dcredact","ok":false}`, "health failed"},
+		{"dcredact", `{"ok":true}`, "did not report id"},
 	} {
 		err := healthCheck(tc.id, "/built/"+tc.id, sickProber{sick: tc.id, reply: tc.reply})
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("%s %s: err = %v, want %q", tc.id, tc.reply, err, tc.want)
 		}
 	}
-	for _, id := range []string{"dcstore", "dcverify", "dcgrep", "devmap"} {
+	for _, id := range []string{"dcstore", "dcverify", "dcgrep", "dcredact", "devmap"} {
 		if err := healthCheck(id, "/built/"+id, healthyProber{}); err != nil {
 			t.Fatalf("%s: %v", id, err)
 		}

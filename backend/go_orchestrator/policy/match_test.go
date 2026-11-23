@@ -6,7 +6,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 )
 
-func TestMatchesAnyIsThePlannedPathLoop(t *testing.T) {
+func TestMatchesPlannedPathIsThePathMatchesLoop(t *testing.T) {
 	planned := []dc.PlannedFile{
 		{Path: "src/foo.go"},
 		{Path: "docs/*.md"},
@@ -29,12 +29,12 @@ func TestMatchesAnyIsThePlannedPathLoop(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("MatchesPlannedPath(%q) = %v, want %v", tc.path, got, tc.want)
 		}
-		patterns := make([]string, len(planned))
-		for i, pf := range planned {
-			patterns[i] = pf.Path
+		loop := false
+		for _, pf := range planned {
+			loop = loop || pathMatches(matcherOf(nil), pf.Path, dc.NormalizePlanPath(tc.path))
 		}
-		if any := matchesAny(patterns, NormalizePlannedCandidate(tc.path)); got != any {
-			t.Errorf("MatchesPlannedPath(%q) = %v but matchesAny = %v", tc.path, got, any)
+		if got != loop {
+			t.Errorf("MatchesPlannedPath(%q) = %v but the pathMatches loop = %v", tc.path, got, loop)
 		}
 	}
 }

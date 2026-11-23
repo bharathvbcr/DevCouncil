@@ -72,6 +72,32 @@ pub struct RepositoryRef {
 }
 
 impl RepositoryRef {
+    /// The repository a CLI read command answered from, in the shape the MCP
+    /// envelope reports it. `store` is the path the command actually opened
+    /// (the caller owns that fact; nothing is re-resolved here). `explicit_db`
+    /// pins the store and the root is inferred from it, as a pinned MCP server
+    /// does; `explicit_root` is `--root`; neither means the working directory.
+    pub fn for_cli_read(
+        store: &Path,
+        root_hint: &Path,
+        explicit_root: bool,
+        explicit_db: bool,
+    ) -> RepositoryRef {
+        let store = canonicalize_path(store);
+        if explicit_db {
+            return RepositoryRef {
+                root: infer_root_from_store(&store),
+                store,
+                resolved_from: "db",
+            };
+        }
+        RepositoryRef {
+            root: canonicalize_path(root_hint),
+            store,
+            resolved_from: if explicit_root { "root" } else { "cwd" },
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "root": self.root.display().to_string(),
@@ -402,7 +428,14 @@ will not be migrated in-place. Run `devmap build` in that repository. {err}",
             ))
         }
     };
-    match Store::open_read_only_with(path, MCP_READER_MEMORY) {
+    // A reader the server keeps for its whole life: a query that finds its
+    // freshness verdict aged out re-walks the tree itself (see
+    // `Store::enable_lazy_source_verification`). Every store this opens gets it.
+    let lazy = |store: Store| {
+        store.enable_lazy_source_verification();
+        store
+    };
+    match Store::open_read_only_with(path, MCP_READER_MEMORY).map(lazy) {
         Ok(store) => Ok(store),
         // The strict open found the full-text index to be the only fault. The
         // rest of the store is sound, so open it degraded: tools that do not
@@ -411,6 +444,7 @@ will not be migrated in-place. Run `devmap build` in that repository. {err}",
         // open finds beyond the index fails as whole-file damage.
         Err(err) if Store::sqlite_error_is_full_text_damage(&err) => {
             Store::open_read_only_with(path, MCP_READER_MEMORY.tolerating_full_text_damage())
+                .map(lazy)
                 .map_err(classify)
         }
         Err(err) => Err(classify(err)),
@@ -702,6 +736,29 @@ mod tests {
         let file = dir.join("store.sqlite");
         std::fs::write(&file, b"first").unwrap();
         file
+    }
+
+    /// The server's stores are the long-lived readers that re-walk an aged-out
+    /// freshness verdict on a query; a store opened any other way is not.
+    #[test]
+    fn a_store_the_server_opens_re_verifies_freshness_lazily() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-lazy-wiring-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("store.sqlite");
+        drop(Store::open(&file).unwrap());
+        assert!(!Store::open_read_only(&file)
+            .unwrap()
+            .lazy_source_verification_enabled());
+        let opened = super::open_mcp_store(&file).unwrap();
+        assert!(opened.lazy_source_verification_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
