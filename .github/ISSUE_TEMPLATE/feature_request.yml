@@ -1,0 +1,72 @@
+name: Feature Request
+description: Propose a new capability or an improvement to an existing one.
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement.
+
+        Two standing constraints shape what can be accepted, so it is worth knowing
+        them up front:
+
+        - **Components, not a monolith.** DevCouncil ships independently installable
+          binaries and libraries, and consumers (GitPulse, Manvi, Jarvis) update them
+          one at a time. A change to a shared schema or contract has a cost outside
+          this repository and needs a clear reason.
+        - **New dependencies need justification.** Say why the standard library or an
+          existing dependency cannot do the job.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Describe the situation you are in, not the solution you have in mind. What are
+        you trying to do, and where does DevCouncil get in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should DevCouncil do instead? Show the command, flag or output you would expect.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      options:
+        - devmap (code intelligence, graph, MCP tools)
+        - dcstore (tasks, leases, workbench)
+        - dcverify (verification and evidence)
+        - dcgrep (search)
+        - devcouncil / dev (Go host, installer)
+        - Shared schemas or contracts
+        - Language support
+        - Performance
+        - Documentation
+        - Packaging / distribution
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Including "do nothing": what happens if DevCouncil does not add this? Existing
+        workarounds are useful context.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and discussions for this proposal.
+          required: true
