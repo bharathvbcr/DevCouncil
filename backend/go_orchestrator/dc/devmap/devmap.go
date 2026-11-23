@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
@@ -86,14 +87,15 @@ type Client struct {
 	ownerCtx context.Context
 }
 
-// probeRun is one in-flight capability probe. waiters counts the callers still
-// blocked on it (guarded by Client.probeMu); when the last one leaves the probe
-// is cancelled and detached from the client, so nothing is left running for a
-// host that has moved on and no verdict is cached from the interruption.
+// probeRun is one in-flight capability probe, shared by every caller that
+// arrives while it runs. err is this run's own result, set before done closes,
+// so a waiter returns what its probe said rather than whatever the client's
+// cache holds by the time it wakes.
 type probeRun struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
-	waiters int
+	waiters int // callers still blocked on it; guarded by Client.probeMu
+	err     error
 }
 
 // The probe's bounds and the failure cooldown. Every devmap build reports the
@@ -152,15 +154,20 @@ func NewWarm(binary, root string) *Client {
 // errors, then one retry a minute later to notice a repaired install.
 //
 // The probe runs under its own deadline, detached from any single caller's
-// context (context.WithoutCancel, so one caller's cancellation is never the
-// binary's verdict: before this, one cancelled request cached "presumed hung"
+// context (context.WithoutCancel): one caller's cancellation is never the
+// binary's verdict (before this, one cancelled request cached "presumed hung"
 // for a minute in a long-lived host). A caller that is cancelled stops waiting
-// and gets its own context error back, uncached. The probe is not unowned,
-// though: it runs for as long as at least one caller waits, and when the last
-// waiter is cancelled the probe is cancelled too, its child killed and reaped,
-// and nothing is cached, so a cancelled host does not leave a devmap child
-// running for probeTimeout. A caller that arrives afterwards starts a fresh
-// probe.
+// and gets its own context error back, uncached.
+//
+// The probe deliberately outlives its callers: it runs to its verdict or to
+// probeTimeout, whichever is first, and the verdict is cached. Stopping it when
+// the last caller leaves would make a hung binary un-diagnosable for callers
+// whose own deadlines are shorter than probeTimeout, because every call would
+// start a fresh probe and wait out its own deadline instead of failing fast
+// from the cache. The cost is a window of at most probeTimeout in which a devmap
+// child (one `manifest --help`, no writes) can outlive a host that exits
+// without calling Close. Close ends an in-flight probe and waits for its child
+// to be reaped, so a host with a shutdown path leaves nothing behind.
 func (c *Client) Probe(ctx context.Context) error {
 	if c.probeParent != nil {
 		return c.probeParent.Probe(ctx)
@@ -181,12 +188,13 @@ func (c *Client) Probe(ctx context.Context) error {
 			defer cancel()
 			err := c.runProbe(pctx)
 			c.probeMu.Lock()
-			// An abandoned probe was detached from the client when its last
-			// waiter left; its outcome describes an interrupted question, not
-			// the binary, and a newer probe may already own c.probing.
-			if c.probing == run {
-				c.probeErr, c.probedAt, c.probing = err, time.Now(), nil
+			run.err = err
+			// A probe ended by Close describes an interrupted question, not the
+			// binary, so it is not cached.
+			if pctx.Err() == nil {
+				c.probeErr, c.probedAt = err, time.Now()
 			}
+			c.probing = nil
 			c.probeMu.Unlock()
 			close(run.done)
 		}()
@@ -199,17 +207,26 @@ func (c *Client) Probe(ctx context.Context) error {
 	case <-run.done:
 		c.probeMu.Lock()
 		defer c.probeMu.Unlock()
-		return c.probeErr
+		return run.err
 	case <-ctx.Done():
 		c.probeMu.Lock()
 		run.waiters--
-		if run.waiters == 0 && c.probing == run {
-			c.probing = nil
-			run.cancel()
-		}
 		c.probeMu.Unlock()
 		return ctx.Err()
 	}
+}
+
+// closeProbe ends any in-flight probe and waits (bounded by runProbe's reap
+// wait) for its child to be reaped.
+func (c *Client) closeProbe() {
+	c.probeMu.Lock()
+	run := c.probing
+	c.probeMu.Unlock()
+	if run == nil {
+		return
+	}
+	run.cancel()
+	<-run.done
 }
 
 // runProbe executes one capability question against the binary.
@@ -1237,21 +1254,27 @@ func (c *Client) invoke(ctx context.Context, timeout time.Duration, stdin []byte
 	// flight and a loaded machine, Start wedged here for the full 900-second
 	// package timeout with the 30-second context sitting unused.
 	//
-	// On the deadline path the goroutine is abandoned rather than waited for —
-	// it is blocked in the kernel and there is nothing to cancel. It owns the
-	// only references to stdout and stderr that anyone will read afterwards,
-	// which is why nothing below this select touches them on that path: a
-	// buffer still being written by an abandoned goroutine is a data race, and
-	// a partial answer read out of one would be worse than the timeout.
-	// With cleanup, because the child is a process-group leader that nothing else
-	// will reap: on cancel, RunBounded returned at once and left the SIGKILL to
-	// a goroutine the caller does not wait for, so a host exiting right after
-	// the cancel could outrun it and orphan a devmap that keeps writing
-	// .devcouncil/codeintel. RunBoundedWithCleanup holds the return (bounded to
-	// 100 ms) until the killed child has been reaped.
-	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, cmd.Run)
+	// On cancel or deadline, RunBoundedWithCleanup holds the return (bounded to
+	// 100 ms) until the killed child has been reaped. The child is a
+	// process-group leader nothing else will reap, and with RunBounded a host
+	// exiting right after the cancel could outrun the SIGKILL and orphan a devmap
+	// that keeps writing .devcouncil/codeintel. Only if the child still has not
+	// returned after that wait is the goroutine abandoned, blocked in the kernel
+	// with nothing to cancel; it then owns the only references to stdout and
+	// stderr, which is why nothing below touches them on that path: a buffer
+	// still being written by an abandoned goroutine is a data race, and a partial
+	// answer read out of one would be worse than the timeout.
+	var returned atomic.Bool
+	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, func() error {
+		defer returned.Store(true)
+		return cmd.Run()
+	})
 	if timedOut {
-		return invocation{}, fmt.Errorf("devmap %s did not return within %s (the process could not be started or reaped): %w",
+		if returned.Load() {
+			return invocation{}, fmt.Errorf("devmap %s was cancelled or passed its %s deadline; the child was stopped and reaped: %w",
+				args[0], timeout, ctx.Err())
+		}
+		return invocation{}, fmt.Errorf("devmap %s did not return within %s and its child was not reaped within the cleanup wait (the process could not be started or reaped): %w",
 			args[0], timeout, ctx.Err())
 	}
 	// Checked before runErr, and this order is the fix. Breaking the pipe is

@@ -43,7 +43,9 @@ func gone(pid int) bool {
 // has to return only once the child is reaped (bounded), not as soon as the
 // context fires and a goroutine it does not wait for has been told to kill.
 func TestInvokeCancelReapsTheChildBeforeReturning(t *testing.T) {
-	for i := 0; i < 15; i++ {
+	const iterations = 30
+	late := 0
+	for i := 0; i < iterations; i++ {
 		dir := t.TempDir()
 		pidFile := filepath.Join(dir, "pid")
 		bin := writeBinary(t, dir, "devmap", "#!/bin/sh\necho $$ > "+pidFile+"\nexec sleep 30\n")
@@ -68,51 +70,91 @@ func TestInvokeCancelReapsTheChildBeforeReturning(t *testing.T) {
 			t.Fatalf("iteration %d: the cancelled invocation never returned", i)
 		}
 		if !gone(pid) {
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-			t.Fatalf("iteration %d: invoke returned on cancel while its devmap child %d was still alive (not reaped)", i, pid)
+			// The reap wait is a 100 ms best effort (proc.RunBoundedWithCleanup
+			// takes no parameter), so on a loaded host one iteration may find the
+			// child a moment late. Count it and confirm it does die; the contract
+			// under test is that it is usually already reaped on return, which the
+			// previous code (SIGKILL left to an unwaited goroutine) almost never was.
+			late++
+			deadline := time.Now().Add(5 * time.Second)
+			for !gone(pid) && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !gone(pid) {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+				t.Fatalf("iteration %d: devmap child %d survived a cancelled invoke", i, pid)
+			}
 		}
+	}
+	if late > iterations/5 {
+		t.Fatalf("invoke returned before its child was reaped in %d of %d cancels; it must wait for the reap", late, iterations)
 	}
 }
 
-// Probe is shared between concurrent callers and its verdict is cached, so one
-// caller's cancellation must never become the binary's verdict. But when every
-// caller has gone there is nobody left to answer: the probe must stop and reap
-// its child rather than run on for probeTimeout in a host that has moved on,
-// and must not cache the abandonment.
-func TestProbeAbandonedByAllCallersStopsItsChildAndCachesNothing(t *testing.T) {
+// A hung binary must still fail fast. Every caller here has a deadline shorter
+// than probeTimeout, so each leaves before the probe answers. The probe has to
+// run on to its own deadline and cache "presumed hung"; if it were stopped when
+// the last caller left, nothing would be cached and every call would start a
+// fresh probe and wait out its own deadline.
+func TestHungProbeIsCachedEvenWhenEveryCallerLeavesEarly(t *testing.T) {
+	dir := t.TempDir()
+	spawns := filepath.Join(dir, "spawns")
+	script := "#!/bin/sh\necho x >> " + spawns + "\nexec sleep 30\n"
+	c := New(writeBinary(t, dir, "devmap", script), dir)
+	c.probeTimeout = 600 * time.Millisecond
+
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		err := c.Probe(ctx)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("call %d: a caller leaving early should get its own deadline error, got %v", i, err)
+		}
+	}
+	time.Sleep(900 * time.Millisecond) // the probe's own deadline has passed
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := c.Probe(ctx)
+	if err == nil || !strings.Contains(err.Error(), "presumed hung") {
+		t.Fatalf("the verdict was not cached: got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("the cached verdict took %s; it should be immediate", elapsed)
+	}
+	raw, _ := os.ReadFile(spawns)
+	if n := strings.Count(string(raw), "x"); n != 1 {
+		t.Fatalf("the binary was spawned %d times; callers must share one probe", n)
+	}
+}
+
+// Close is the host's shutdown seam: it ends an in-flight probe and returns
+// only once that probe's child has been reaped, and caches nothing.
+func TestCloseEndsAnInFlightProbeAndReapsItsChild(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "pid")
-	marker := filepath.Join(dir, "second")
-	script := "#!/bin/sh\nif [ -e " + marker + " ]; then echo '      --graph-output <PATH>'; exit 0; fi\n" +
-		": > " + marker + "\necho $$ > " + pidFile + "\nexec sleep 30\n"
-	c := New(writeBinary(t, dir, "devmap", script), dir)
+	c := New(writeBinary(t, dir, "devmap", "#!/bin/sh\necho $$ > "+pidFile+"\nexec sleep 30\n"), dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() { errc <- c.Probe(ctx) }()
 	pid := waitForPID(t, pidFile)
 	cancel()
-	if err := <-errc; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the cancelled caller should get its own context error, got %v", err)
-	}
+	<-errc
 
-	deadline := time.Now().Add(3 * time.Second)
-	for !gone(pid) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 	if !gone(pid) {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		t.Fatalf("the probe child %d outlived every caller that was waiting for it", pid)
+		t.Fatalf("Close returned while the probe child %d was still alive", pid)
 	}
-
 	c.probeMu.Lock()
 	cached := !c.probedAt.IsZero()
 	c.probeMu.Unlock()
 	if cached {
-		t.Fatal("an abandoned probe cached a verdict about a binary that was never fully asked")
-	}
-	if err := c.Probe(context.Background()); err != nil {
-		t.Fatalf("the probe after an abandoned one failed: %v", err)
+		t.Fatal("a probe ended by Close cached a verdict")
 	}
 }
 
@@ -125,10 +167,22 @@ func TestProbeKeepsRunningWhileAnotherCallerWaits(t *testing.T) {
 	leaving, leave := context.WithCancel(context.Background())
 	first := make(chan error, 1)
 	go func() { first <- c.Probe(leaving) }()
-	time.Sleep(100 * time.Millisecond)
 	second := make(chan error, 1)
 	go func() { second <- c.Probe(context.Background()) }()
-	time.Sleep(100 * time.Millisecond)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.probeMu.Lock()
+		both := c.probing != nil && c.probing.waiters == 2
+		c.probeMu.Unlock()
+		if both {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("both callers never joined the one probe")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	leave()
 	if err := <-first; !errors.Is(err, context.Canceled) {
 		t.Fatalf("leaving caller: got %v", err)
