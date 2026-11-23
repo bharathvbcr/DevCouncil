@@ -22,7 +22,14 @@ func pathStat(name string, follow bool) (info fs.FileInfo, result error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { result = errors.Join(result, root.Close()) }()
+	defer func() {
+		// Joined only when the close failed. errors.Join(err, nil) is still a
+		// wrapper, and os.IsNotExist does not look through one, so joining
+		// unconditionally made every missing leaf look like some other error.
+		if closeErr := root.Close(); closeErr != nil {
+			result = errors.Join(result, closeErr)
+		}
+	}()
 	if follow {
 		return root.Stat(filepath.Base(name))
 	}
