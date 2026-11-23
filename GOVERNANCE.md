@@ -44,16 +44,21 @@ Conduct violation.
 
 `main` is the only long-lived branch, and it is protected:
 
-- Contributors change it through pull requests only. A pull request needs one
-  approving review from a code owner, all conversations resolved, and the
-  required status checks passing.
-- Force pushes and deletion of `main` are blocked.
-- Release tags (`v*`) are protected: they cannot be moved or deleted once
-  published.
+- Contributors, including collaborators with write access, land changes through
+  pull requests. A pull request needs one approving review, code-owner review,
+  all conversations resolved, and the required status checks passing. New
+  commits dismiss stale approvals. Merge, squash and rebase merges are allowed.
+- The required checks are `test` (`ci.yml`), `Verify package`
+  (`npm-publish.yml`), and `Analyze (go)`, `Analyze (rust)` and
+  `Analyze (javascript-typescript)` (`codeql.yml`).
+- Force pushes to and deletion of `main` are blocked.
+- Release tags (`v*`) cannot be deleted, force-updated or moved.
+- The repository admin (the lead maintainer) can bypass the ruleset and push
+  directly. That is an administrative capability, not the normal path; the
+  maintainer's own changes usually go through pull requests too.
 
-The branch protection settings live in the repository's GitHub rulesets, which
-are the source of truth for the exact list of required checks and for who may
-bypass them.
+The repository's GitHub rulesets are the source of truth if this list and the
+settings ever differ.
 
 Every commit carries a DCO sign-off (`git commit -s`); see
 [CONTRIBUTING.md](CONTRIBUTING.md). Pull requests are merged by a maintainer

@@ -91,7 +91,10 @@ must pass `--locked`; `npm run check:workflows` enforces it.
 
 ## Sign-off (DCO)
 
-Every commit must carry a `Signed-off-by` line, certifying the
+Sign-off is required by project policy and checked in review. GitHub itself
+enforces it only for commits made in the web UI, so a missing line on a
+command-line commit is caught by the reviewer, not by a bot. Every commit must
+carry a `Signed-off-by` line, certifying the
 [Developer Certificate of Origin](https://developercertificate.org/): that you
 wrote the change or have the right to submit it under the project's
 [Apache 2.0 license](LICENSE). Add it with `git commit -s`. To fix commits that
@@ -107,10 +110,12 @@ section on cross-repository coordination first.
 
 ## Review and merge
 
-- `main` is protected. A pull request needs one approving review from a code
-  owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)), all conversations
-  resolved, and the required status checks green. Force pushes to `main` are
-  blocked.
+- `main` is protected. Contributors, including collaborators with write
+  access, land changes through pull requests. A pull request needs one approving
+  review with code-owner review ([`.github/CODEOWNERS`](.github/CODEOWNERS)),
+  all conversations resolved, and the required status checks green (`test`,
+  `Verify package`, and the three CodeQL `Analyze` jobs). New commits dismiss
+  stale approvals. Force pushes to `main` are blocked.
 - Review is best effort; this is a one-maintainer project, so allow a few days
   and ping the thread once if it goes quiet.
 - Keep the branch up to date with `main` and respond to review comments in the
