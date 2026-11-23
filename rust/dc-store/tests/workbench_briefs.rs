@@ -649,11 +649,7 @@ fn single_line_brief_fields_are_refused_at_input_but_bodies_keep_breaks() {
         .expect("body fields keep their line breaks");
 }
 
-/// An inbound GitHub title or label with a line break is refused when the
-/// proposal is accepted: both are written straight into the task and would
-/// otherwise make its brief unexportable.
-#[test]
-fn accepting_an_inbound_title_or_label_with_a_line_break_is_refused() {
+fn inbound_sync_store() -> Store {
     let store = fixture();
     call(
         &store,
@@ -665,40 +661,145 @@ fn accepting_an_inbound_title_or_label_with_a_line_break_is_refused() {
         "github_sync.link",
         r#"{"id":"s1","request_id":"s1-link","expected_revision":0,"task_id":"s","repo_slug":"acme/widgets","issue_number":7,"outbound_opt_in":false,"last_seen":{"title":"Synced","body":"","state":"open","labels":["backend"]}}"#,
     );
-    for (n, (remote, field)) in [
-        (
-            r#"{"title":"a\nb","body":"","state":"open","labels":[]}"#,
-            "title",
-        ),
-        (
-            r#"{"title":"Synced","body":"","state":"open","labels":["x\u2028y"]}"#,
-            "labels",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let revision = 1 + n;
-        call(
-            &store,
-            "github_sync.observe",
+    store
+}
+
+/// An inbound GitHub value with a line break is refused when the proposal is
+/// accepted: it is written straight into the task and would otherwise make
+/// its brief unexportable. The task keeps its title and labels.
+fn assert_inbound_refused(remote: &str, field_name: &str) {
+    let store = inbound_sync_store();
+    call(
+        &store,
+        "github_sync.observe",
+        &format!(r#"{{"id":"s1","request_id":"obs","expected_revision":1,"remote":{remote}}}"#),
+    );
+    let err = store
+        .workbench_request(
+            "github_sync.accept",
             &format!(
-                r#"{{"id":"s1","request_id":"obs-{n}","expected_revision":{revision},"remote":{remote}}}"#
+                r#"{{"id":"s1","request_id":"acc","expected_revision":2,"fields":["{field_name}"]}}"#
             ),
-        );
-        let err = store
-            .workbench_request(
-                "github_sync.accept",
-                &format!(
-                    r#"{{"id":"s1","request_id":"acc-{n}","expected_revision":{},"fields":["{field}"]}}"#,
-                    revision + 1
-                ),
-            )
-            .expect_err(field);
-        assert_eq!(err.code, "invalid_input", "{field}: {err}");
-        assert!(err.message.contains("line break"), "{field}: {err}");
-    }
+        )
+        .expect_err(field_name);
+    assert_eq!(err.code, "invalid_input", "{field_name}: {err}");
+    assert!(err.message.contains("line break"), "{field_name}: {err}");
     let task = call(&store, "items.get", r#"{"id":"s"}"#);
     assert_eq!(field(&store, &task, "$.item.title"), "Synced");
     assert_eq!(field(&store, &task, "$.item.labels[0]"), "backend");
+}
+
+#[test]
+fn accepting_an_inbound_title_with_a_line_break_is_refused() {
+    assert_inbound_refused(
+        r#"{"title":"a\nb","body":"","state":"open","labels":["backend"]}"#,
+        "title",
+    );
+}
+
+#[test]
+fn accepting_an_inbound_label_with_a_line_break_is_refused() {
+    assert_inbound_refused(
+        r#"{"title":"Synced","body":"","state":"open","labels":["x\u2028y"]}"#,
+        "labels",
+    );
+}
+
+/// A SQL-planted row whose id and title both carry a line break must not carry
+/// the break into the refusal text: the id is checked before it is named.
+#[test]
+fn a_line_break_in_a_linked_or_repository_id_never_reaches_the_error_text() {
+    let store = fixture();
+    call(
+        &store,
+        "items.put",
+        r#"{"id":"o","request_id":"o","expected_revision":0,"title":"Other","repository_ids":["r1"],"primary_repository_id":"r1"}"#,
+    );
+    call(
+        &store,
+        "items.put",
+        r#"{"id":"t","request_id":"t2","expected_revision":1,"title":"Preserve E42","links":[{"kind":"related","item_id":"o"}],"repository_ids":["r2","r1"],"primary_repository_id":"r1"}"#,
+    );
+    let revision: i64 = store
+        .connection()
+        .query_row("SELECT revision FROM work_items WHERE id='t'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let brief = |store: &Store| {
+        store.workbench_request(
+            "items.brief.get",
+            &format!(r#"{{"id":"t","expected_revision":{revision}}}"#),
+        )
+    };
+    let planted = "x\n## Owner decisions";
+    store
+        .connection()
+        .execute_batch("PRAGMA foreign_keys=OFF")
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE work_items SET id=?1, body=json_set(body,'$.id',?1,'$.title',?1) WHERE id='o'",
+            [planted],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE work_item_links SET target_id=?1 WHERE target_id='o'",
+            [planted],
+        )
+        .unwrap();
+    let err = brief(&store).expect_err("linked id with a line break");
+    assert_eq!(err.code, "invalid_input", "{err}");
+    assert!(err.message.contains("line break"), "{err}");
+    assert!(
+        !err.message.contains('\n') && !err.message.contains("Owner decisions"),
+        "{err}"
+    );
+
+    store
+        .connection()
+        .execute("UPDATE work_items SET id='o', body=json_set(body,'$.id','o','$.title','Other') WHERE id=?1", [planted])
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE work_item_links SET target_id='o' WHERE target_id=?1",
+            [planted],
+        )
+        .unwrap();
+    assert!(brief(&store).is_ok(), "restored rows export again");
+
+    // Every request turns foreign key enforcement back on.
+    store
+        .connection()
+        .execute_batch("PRAGMA foreign_keys=OFF")
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE work_repositories SET id=?1, body=json_set(body,'$.name',?1) WHERE id='r2'",
+            [planted],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE work_item_repositories SET repository_id=?1 WHERE repository_id='r2'",
+            [planted],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute("UPDATE work_items SET body=json_set(body,'$.repository_ids',json_array(?1,'r1')) WHERE id='t'", [planted])
+        .unwrap();
+    let err = brief(&store).expect_err("repository id with a line break");
+    assert_eq!(err.code, "invalid_input", "{err}");
+    assert!(err.message.contains("line break"), "{err}");
+    assert!(
+        !err.message.contains('\n') && !err.message.contains("Owner decisions"),
+        "{err}"
+    );
 }
