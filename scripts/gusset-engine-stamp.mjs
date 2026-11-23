@@ -28,29 +28,37 @@ import { fileURLToPath } from "node:url";
 export const ENGINE = "rust/gusset-engine";
 export const STAMP_NAME = "libgusset.stamp.json";
 
+/** A known way the inputs cannot be computed; anything else thrown is a bug. */
+export class InputError extends Error {}
+
 function git(cwd, ...args) {
   const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
-  if (r.status !== 0) throw new Error(`git ${args.join(" ")} (in ${cwd}): ${r.stderr.trim() || "failed"}`);
+  if (r.status !== 0) throw new InputError(`git ${args.join(" ")} (in ${cwd}): ${r.stderr.trim() || "failed"}`);
   return r.stdout.trim();
 }
 
 /**
- * The `path = "..."` values of dependency tables only ([dependencies],
- * [dev-/build-dependencies], [workspace.dependencies], [target.*.dependencies]
- * and their [dependencies.name] forms); [lib], [[bin]], [[test]] paths are targets.
- * Yields match-like arrays: m[1] is the path.
+ * Every `path = "..."` in a manifest that feeds the build, with its kind:
+ * "dep" for dependency tables ([dependencies], dev-/build-, [workspace.dependencies],
+ * [target.*.dependencies], their [dependencies.name] forms, [patch.*] and
+ * [replace]) and "target" for [lib], [[bin]], [[example]], [[test]], [[bench]].
+ *
+ * @returns {Generator<{ kind: "dep" | "target", table: string, path: string }>}
  */
-function* dependencyPaths(toml) {
-  const depTable = /^(?:workspace\.|target\..+\.)?(?:dev-|build-)?dependencies(?:\..+)?$/;
-  let inDeps = false;
+function* manifestPaths(toml) {
+  const depTable = /^(?:workspace\.|target\..+\.)?(?:dev-|build-)?dependencies(?:\..+)?$|^patch\..+$|^replace(?:\..+)?$/;
+  const targetTable = /^(?:lib|bin|example|test|bench)$/;
+  let kind;
+  let table = "";
   for (const line of toml.split("\n")) {
     const header = /^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*(?:#.*)?$/.exec(line);
     if (header) {
-      inDeps = depTable.test(header[1]);
+      table = header[1];
+      kind = depTable.test(table) ? "dep" : targetTable.test(table) ? "target" : undefined;
       continue;
     }
-    if (!inDeps) continue;
-    for (const m of line.matchAll(/\bpath\s*=\s*"([^"]+)"/g)) yield m;
+    if (!kind) continue;
+    for (const m of line.matchAll(/\bpath\s*=\s*"([^"]+)"/g)) yield { kind, table, path: m[1] };
   }
 }
 
@@ -61,17 +69,25 @@ export function enginePaths(root) {
   while (queue.length) {
     const rel = queue.shift();
     const toml = path.join(root, rel, "Cargo.toml");
-    if (!existsSync(toml)) throw new Error(`${toml} is missing (a path dependency of the engine)`);
-    for (const m of dependencyPaths(readFileSync(toml, "utf8"))) {
-      const dep = path.relative(root, path.resolve(root, rel, m[1])).split(path.sep).join("/");
+    if (!existsSync(toml)) throw new InputError(`${toml} is missing (a path dependency of the engine)`);
+    for (const entry of manifestPaths(readFileSync(toml, "utf8"))) {
+      const crateDir = path.resolve(root, rel);
+      const abs = path.resolve(crateDir, entry.path);
+      if (entry.kind === "target") {
+        // A target source outside the crate directory is an input the stamp cannot see.
+        if (!abs.startsWith(crateDir + path.sep)) {
+          throw new InputError(`${toml} [${entry.table}] path ${entry.path} resolves outside the crate directory; the engine stamp cannot cover it`);
+        }
+        continue;
+      }
+      const dep = path.relative(root, abs).split(path.sep).join("/");
       if (dep.startsWith("..") || path.isAbsolute(dep)) {
         // Outside the repository it must be the sibling gusset the manifests
         // expect (<root>/../gusset, resolved the way cargo does); its commit is
         // recorded instead. Anything else is an input the stamp cannot see.
         const sibling = path.resolve(root, "..", "gusset");
-        const abs = path.resolve(root, rel, m[1]);
         if (abs !== sibling && !abs.startsWith(sibling + path.sep)) {
-          throw new Error(`${toml} has a path dependency ${m[1]} outside the repository and outside ${sibling}; the engine stamp cannot cover it`);
+          throw new InputError(`${toml} has a path dependency ${entry.path} outside the repository and outside ${sibling}; the engine stamp cannot cover it`);
         }
         continue;
       }

@@ -50,7 +50,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { engineCflags, gussetPinCheck } from "./ci-local-checks.mjs";
-import { ENGINE, engineInputs, stampVerdict } from "./gusset-engine-stamp.mjs";
+import { ENGINE, InputError, engineInputs, stampVerdict } from "./gusset-engine-stamp.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ARCHIVE = "libgusset.a";
@@ -150,7 +150,7 @@ export function chooseEngine(loc, { engineDir, env, gusset }) {
     try {
       inputs = engineInputs(loc.root, gusset);
     } catch (e) {
-      throw new LaneError(e.message);
+      throw e instanceof InputError ? new LaneError(e.message) : e;
     }
     const build =
       `build one in the lane: rust/gusset-engine/cgo-env.sh --export (from ${loc.root}; cargo resolves the sibling gusset relative to the checkout, so this needs GUSSET_DIR-compatible layout); ` +

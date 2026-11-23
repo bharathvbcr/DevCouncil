@@ -8,7 +8,7 @@ import path from "node:path";
 import { describe, it, after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { engineInputs, stampedBuild, writeStamp } from "./gusset-engine-stamp.mjs";
-import { laneGoWork, locate, plan } from "./lane-env.mjs";
+import { chooseEngine, laneGoWork, locate, plan } from "./lane-env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GIT_ENV = {
@@ -330,13 +330,32 @@ describe("path dependencies outside the repository", () => {
     assert.equal(r.status, 1);
     assert.match(r.stderr, /^lane-env: .*path dependency[^\n]*\n$/);
   });
-  it("[lib] / [[bin]] / [[test]] path entries are not dependencies", () => {
+  const commitManifest = (f, toml) => {
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), toml);
+    git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "manifest");
+  };
+  const GUSSET = '[dependencies.gusset_core]\npath = "../../../gusset/crates/gusset"\n';
+  it("[lib]/[[bin]]/[[test]] paths must stay inside the crate; inside is fine", () => {
     const f = fixture();
-    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"),
-      '[lib]\npath = "../../../elsewhere/lib.rs"\n[[test]]\nname = "t"\npath = "../../../elsewhere/t.rs"\n[dependencies]\ndc-glob = { path = "../dc-glob" }\n[dependencies.gusset_core]\npath = "../../../gusset/crates/gusset"\n');
-    git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "targets");
-    assert.doesNotThrow(() => engineInputs(f.lane, f.gusset));
+    commitManifest(f, `[lib]\npath = "src/lib.rs"\n[[bin]]\nname = "b"\npath = "src/bin/b.rs"\n[dependencies]\ndc-glob = { path = "../dc-glob" }\n${GUSSET}`);
     assert.deepEqual(Object.keys(engineInputs(f.lane, f.gusset).stamp.trees).sort(), ["rust-toolchain.toml", "rust/dc-glob", "rust/gusset-engine"]);
+    for (const table of ["[lib]", "[[bin]]", "[[test]]", "[[example]]", "[[bench]]"]) {
+      commitManifest(f, `${table}\npath = "../dc-glob/src/lib.rs"\n${GUSSET}`);
+      assert.throws(() => engineInputs(f.lane, f.gusset), new RegExp(`\\[${table.replace(/[[\]]/g, "")}\\] path \\.\\./dc-glob/src/lib\\.rs resolves outside the crate`), table);
+    }
+  });
+  it("[patch.*] and [replace] paths count as path dependencies under the outside-repo rule", () => {
+    const f = fixture();
+    commitManifest(f, `[patch.crates-io]\nfoo = { path = "../dc-glob" }\n${GUSSET}`);
+    assert.ok("rust/dc-glob" in engineInputs(f.lane, f.gusset).stamp.trees);
+    commitManifest(f, `[patch.crates-io]\nfoo = { path = "../../../evil" }\n${GUSSET}`);
+    assert.throws(() => engineInputs(f.lane, f.gusset), /path dependency \.\.\/\.\.\/\.\.\/evil outside/);
+    commitManifest(f, `[replace."foo:1.0.0"]\npath = "../../../evil"\n${GUSSET}`);
+    assert.throws(() => engineInputs(f.lane, f.gusset), /path dependency .* outside/);
+  });
+  it("only known input errors become lane-env lines; a bug keeps its stack", () => {
+    const f = fixture();
+    assert.throws(() => chooseEngine({ root: null, mainRoot: f.main }, { env: {}, gusset: f.gusset }), TypeError);
   });
   it("are refused unless they are under the sibling gusset", () => {
     const f = fixture();
