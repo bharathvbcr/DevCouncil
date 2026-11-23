@@ -35,10 +35,14 @@ node scripts/lane-env.mjs -- go -C backend/go_orchestrator test ./cmd/devcouncil
 node scripts/lane-env.mjs --help
 ```
 
-It links the lane's own `rust/gusset-engine/target/release/libgusset.a` if
-present (build it with `rust/gusset-engine/cgo-env.sh`), else main's, only
-when the lane's engine sources match main's; otherwise it fails and names the
-build command. The sibling gusset must be at the setup-gusset pin. The two
+It links an archive only when its input stamp (written beside it by
+`ci:local`'s "gusset engine" step and `rust/gusset-engine/cgo-env.sh`) equals
+the lane's engine inputs exactly: the lane's own archive first, then main's.
+An unstamped, stale or dirty-built archive, or uncommitted engine inputs in the
+lane, fail closed and name the build command; commit engine changes, then
+rebuild. A `CGO_LDFLAGS` `-L` to another `libgusset.a` is refused. For a lane
+editing the engine, `--engine-dir <dir>` links `<dir>/libgusset.a` unchecked,
+with a warning. The sibling gusset must be at the setup-gusset pin. The two
 linker "search path ... not found" warnings are harmless. Do not hand-roll a
 `-modfile`.
 

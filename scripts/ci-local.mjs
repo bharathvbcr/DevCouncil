@@ -30,6 +30,7 @@ import {
   runSteps,
   tagVerdict,
 } from "./ci-local-checks.mjs";
+import { writeStamp } from "./gusset-engine-stamp.mjs";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
@@ -172,6 +173,8 @@ function ensureGussetEngine(ctx) {
   if (!existsSync(archive)) {
     throw fail(1, `${archive} is missing after cargo build`);
   }
+  // lane-env reuses an archive only if this stamp matches a checkout's inputs.
+  writeStamp(REPO_ROOT, path.dirname(siblingMod), path.dirname(archive));
   // Go hashes cgo flags, not the libraries they link: key the caches on the archive.
   return { env: { CGO_CFLAGS: engineCflags(archive, ctx.env) } };
 }

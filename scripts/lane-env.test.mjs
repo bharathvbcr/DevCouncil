@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
-  copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync,
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it, after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { chooseEngine, laneGoWork, locate, plan } from "./lane-env.mjs";
+import { writeStamp } from "./gusset-engine-stamp.mjs";
+import { laneGoWork, locate, plan } from "./lane-env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GIT_ENV = {
@@ -26,10 +27,9 @@ function git(cwd, ...args) {
   return r.stdout.trim();
 }
 const put = (file, text) => { mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, text); };
-const past = (file) => { const t = new Date(Date.now() - 3600_000); utimesSync(file, t, t); };
 
 /** A gusset repo, a main DevCouncil checkout with an engine archive, and one linked lane. */
-function fixture({ archive = true } = {}) {
+function fixture({ archive = true, stamp = true } = {}) {
   const top = realpathSync(mkdtempSync(path.join(tmpdir(), "lane-env-")));
   roots.push(top);
   const gusset = path.join(top, "gusset");
@@ -44,13 +44,20 @@ function fixture({ archive = true } = {}) {
   put(path.join(main, "backend/go_orchestrator/go.mod"), "module x\n");
   put(path.join(main, "tools/accuracy/go.mod"), "module y\n");
   put(path.join(main, ".github/actions/setup-gusset/action.yml"), `        ref: ${pin}\n`);
-  put(path.join(main, "rust/gusset-engine/Cargo.toml"), "[package]\n");
+  put(path.join(main, "rust/gusset-engine/Cargo.toml"),
+    '[dependencies]\ngusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }\ndc-glob = { path = "../dc-glob" }\n');
+  put(path.join(main, "rust/dc-glob/Cargo.toml"), "[package]\n");
+  put(path.join(main, "rust/dc-glob/src/lib.rs"), "// glob\n");
+  put(path.join(main, "rust-toolchain.toml"), "[toolchain]\nchannel = \"1.100\"\n");
   put(path.join(main, "rust/gusset-engine/src/lib.rs"), "// engine\n");
   mkdirSync(path.join(main, "scripts"), { recursive: true });
-  for (const f of ["lane-env.mjs", "ci-local-checks.mjs"]) copyFileSync(path.join(HERE, f), path.join(main, "scripts", f));
+  for (const f of ["lane-env.mjs", "ci-local-checks.mjs", "gusset-engine-stamp.mjs"]) copyFileSync(path.join(HERE, f), path.join(main, "scripts", f));
   git(main, "add", "."); git(main, "commit", "-qm", "m");
-  for (const f of ["rust/gusset-engine/Cargo.toml", "rust/gusset-engine/src/lib.rs"]) past(path.join(main, f));
-  if (archive) put(path.join(main, "rust/gusset-engine/target/release/libgusset.a"), "main-archive");
+  if (archive) {
+    const dir = path.join(main, "rust/gusset-engine/target/release");
+    put(path.join(dir, "libgusset.a"), "main-archive");
+    if (stamp) writeStamp(main, gusset, dir);
+  }
   const lane = path.join(main, ".gitpulse/worktrees/lane");
   git(main, "worktree", "add", "-q", "-b", "lane", lane);
   return { top, gusset, pin, main, lane, scripts: (root) => path.join(root, "scripts") };
@@ -99,15 +106,19 @@ describe("laneGoWork", () => {
   });
 });
 
-describe("chooseEngine / plan", () => {
+describe("engine choice by input stamp", () => {
   const opts = (f, extra = {}) => ({ scriptDir: f.scripts(f.lane), env: { ...process.env, CGO_LDFLAGS: "", ...extra } });
   const mainDir = (f) => path.join(f.main, "rust/gusset-engine/target/release");
+  const laneDir = (f) => path.join(f.lane, "rust/gusset-engine/target/release");
+  const edit = (f, rel, text = "// edited\n") => put(path.join(f.lane, rel), text);
+  const commit = (f) => { git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "edit"); };
+  const refused = (f, re, extra) => assert.throws(() => plan(f.lane, opts(f, extra)), re);
 
   it("main checkout: no environment at all", () => {
     const f = fixture();
     assert.deepEqual(plan(f.main, { scriptDir: f.scripts(f.main) }).env, {});
   });
-  it("(b) uses main's archive when the engine trees match, and hashes that archive", () => {
+  it("a matching stamp is accepted, and the hash covers that archive", () => {
     const f = fixture();
     const p = plan(f.lane, opts(f));
     assert.equal(p.engine.dir, mainDir(f));
@@ -118,56 +129,122 @@ describe("chooseEngine / plan", () => {
     put(path.join(mainDir(f), "libgusset.a"), "rebuilt");
     assert.notEqual(h(plan(f.lane, opts(f))), first);
   });
-  it("(a) prefers the lane's own archive over main's", () => {
+  it("the lane's own matching archive is preferred over main's", () => {
     const f = fixture();
-    const own = path.join(f.lane, "rust/gusset-engine/target/release");
-    put(path.join(own, "libgusset.a"), "lane-archive");
-    const p = plan(f.lane, opts(f));
-    assert.equal(p.engine.dir, own);
-    assert.match(p.engine.why, /lane's own/);
+    put(path.join(laneDir(f), "libgusset.a"), "lane-archive");
+    writeStamp(f.lane, f.gusset, laneDir(f));
+    assert.equal(plan(f.lane, opts(f)).engine.dir, laneDir(f));
   });
-  it("(c) fails, naming the build command, when the lane's engine differs from main's", () => {
+  it("an engine-adjacent path dependency (dc-glob) changed and committed in the lane is refused", () => {
     const f = fixture();
-    put(path.join(f.lane, "rust/gusset-engine/src/lib.rs"), "// edited\n");
-    git(f.lane, "commit", "-qam", "engine edit");
-    assert.throws(() => plan(f.lane, opts(f)), /differs from main's.*cgo-env\.sh.*ci:local -- --only "gusset engine"/s);
+    edit(f, "rust/dc-glob/src/lib.rs"); commit(f);
+    refused(f, /no libgusset\.a matches.*rust\/dc-glob differ.*cgo-env\.sh.*ci:local -- --only "gusset engine"/s);
   });
-  it("(c) fails on an uncommitted engine edit in the lane", () => {
+  it("dc-glob changed but uncommitted is refused", () => {
     const f = fixture();
-    put(path.join(f.lane, "rust/gusset-engine/src/lib.rs"), "// dirty\n");
-    assert.throws(() => plan(f.lane, opts(f)), /lane's rust\/gusset-engine has uncommitted/);
+    edit(f, "rust/dc-glob/src/lib.rs");
+    refused(f, /uncommitted changes.*rust\/dc-glob/s);
   });
-  it("(c) fails when main's archive is older than main's engine sources", () => {
+  it("an untracked engine file is refused even with status.showUntrackedFiles=no", () => {
     const f = fixture();
-    const t = new Date(Date.now() - 7200_000);
-    utimesSync(path.join(mainDir(f), "libgusset.a"), t, t);
-    assert.throws(() => plan(f.lane, opts(f)), /older than main's rust\/gusset-engine sources/);
+    git(f.main, "config", "status.showUntrackedFiles", "no");
+    edit(f, "rust/gusset-engine/src/new.rs", "// new\n");
+    assert.equal(git(f.lane, "status", "--porcelain", "--", "rust/gusset-engine"), "", "the repo config hides it from plain status");
+    refused(f, /uncommitted changes.*new\.rs/s);
   });
-  it("(c) fails when there is no archive anywhere", () => {
+  it("a lane's own archive gone stale (inputs changed after the stamp) is refused", () => {
+    const f = fixture();
+    put(path.join(laneDir(f), "libgusset.a"), "lane-archive");
+    writeStamp(f.lane, f.gusset, laneDir(f));
+    edit(f, "rust/gusset-engine/src/lib.rs"); commit(f);
+    refused(f, /the lane's own archive: .*other inputs.*main's archive: .*other inputs/s);
+  });
+  it("an archive built from a dirty tree is never reused, even after the changes are committed", () => {
+    const f = fixture();
+    put(path.join(laneDir(f), "libgusset.a"), "lane-archive");
+    edit(f, "rust/gusset-engine/src/lib.rs");
+    assert.equal(writeStamp(f.lane, f.gusset, laneDir(f)).dirty, true);
+    commit(f);
+    refused(f, /the lane's own archive: .*built from uncommitted sources/s);
+  });
+  it("an unstamped archive is refused with 'rebuild to stamp it'", () => {
+    const f = fixture({ stamp: false });
+    refused(f, /main's archive: .*no stamp.*rebuild to stamp it/s);
+  });
+  it("fails when there is no archive anywhere", () => {
     const f = fixture({ archive: false });
-    assert.throws(() => plan(f.lane, opts(f)), /no libgusset\.a in the lane or in .*ci:local/s);
+    refused(f, /no libgusset\.a matches.*none in .*ci:local/s);
   });
-  it("a caller's --engine-dir or CGO_LDFLAGS -L wins, even over a mismatched tree", () => {
+  it("a stale CGO_LDFLAGS -L to a different libgusset.a (an earlier eval) is refused", () => {
     const f = fixture();
-    put(path.join(f.lane, "rust/gusset-engine/src/lib.rs"), "// edited\n");
-    git(f.lane, "commit", "-qam", "engine edit");
+    const stale = path.join(f.top, "stale");
+    put(path.join(stale, "libgusset.a"), "stale");
+    refused(f, /already holds -L.*stale/, { CGO_LDFLAGS: `-L${stale}` });
+  });
+  it("CGO_LDFLAGS naming the chosen archive, or an unrelated -L, is fine and kept", () => {
+    const f = fixture();
+    assert.equal(plan(f.lane, opts(f, { CGO_LDFLAGS: `-L${mainDir(f)}` })).env.CGO_LDFLAGS, `-L${mainDir(f)}`);
+    const other = path.join(f.top, "other-libs");
+    mkdirSync(other);
+    assert.equal(plan(f.lane, opts(f, { CGO_LDFLAGS: `-L${other}` })).env.CGO_LDFLAGS, `-L${mainDir(f)} -L${other}`);
+  });
+  it("--engine-dir / DEVCOUNCIL_GUSSET_ENGINE_DIR bypass the stamp with a warning, even when dirty", () => {
+    const f = fixture();
+    edit(f, "rust/dc-glob/src/lib.rs");
     const mine = path.join(f.top, "mine");
     put(path.join(mine, "libgusset.a"), "mine");
-    assert.equal(plan(f.lane, { ...opts(f), engineDir: mine }).engine.dir, mine);
-    const p = plan(f.lane, opts(f, { CGO_LDFLAGS: `-L${mine}` }));
+    const p = plan(f.lane, { ...opts(f), engineDir: mine });
     assert.equal(p.engine.dir, mine);
-    assert.equal(p.env.CGO_LDFLAGS, `-L${mine}`);
-    assert.throws(() => chooseEngine({ root: f.lane, mainRoot: f.main }, { engineDir: path.join(f.top, "none"), env: {} }), /has no libgusset\.a/);
+    assert.match(p.engine.warnings[0], /WARNING.*without checking/);
+    assert.equal(plan(f.lane, opts(f, { DEVCOUNCIL_GUSSET_ENGINE_DIR: mine })).engine.dir, mine);
+    assert.throws(() => plan(f.lane, { ...opts(f), engineDir: path.join(f.top, "none") }), /has no libgusset\.a/);
+    const stale = path.join(f.top, "stale");
+    put(path.join(stale, "libgusset.a"), "stale");
+    assert.throws(() => plan(f.lane, { ...opts(f, { CGO_LDFLAGS: `-L${stale}` }), engineDir: mine }), /already holds -L.*stale/);
   });
   it("fails by name, not with a stack, when GUSSET_DIR does not exist", () => {
     const f = fixture();
-    assert.throws(() => plan(f.lane, opts(f, { GUSSET_DIR: path.join(f.top, "nope") })), /no gusset checkout at .*nope.*GUSSET_DIR/);
+    refused(f, /no gusset checkout at .*nope.*GUSSET_DIR/, { GUSSET_DIR: path.join(f.top, "nope") });
   });
   it("fails when the sibling gusset is not at the pin", () => {
     const f = fixture();
     put(path.join(f.gusset, "x"), "x");
     git(f.gusset, "add", "."); git(f.gusset, "commit", "-qm", "drift");
-    assert.throws(() => plan(f.lane, opts(f)), /CI pins/);
+    refused(f, /CI pins/);
+  });
+});
+
+describe("cgo-env.sh stamps what it builds (fake cargo)", () => {
+  it("writes a stamp lane-env accepts; --no-build leaves the stamp alone", () => {
+    const f = fixture({ archive: false });
+    const bin = path.join(f.top, "bin");
+    put(path.join(bin, "cargo"), `#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = --target-dir ] && td="$2"; shift; done
+mkdir -p "$td/release" && echo fake > "$td/release/libgusset.a"
+`);
+    spawnSync("chmod", ["+x", path.join(bin, "cargo")]);
+    const sh = path.join(f.main, "rust/gusset-engine/cgo-env.sh");
+    copyFileSync(path.join(HERE, "../rust/gusset-engine/cgo-env.sh"), sh);
+    mkdirSync(path.join(f.gusset, "crates/gusset"), { recursive: true });
+    writeFileSync(path.join(f.gusset, "crates/gusset/Cargo.toml"), "[package]\n");
+    git(f.gusset, "add", "."); git(f.gusset, "commit", "-qm", "crate");
+    // main's action.yml pin follows the sibling's new HEAD
+    put(path.join(f.main, ".github/actions/setup-gusset/action.yml"), `        ref: ${git(f.gusset, "rev-parse", "HEAD")}\n`);
+    git(f.main, "add", "."); git(f.main, "commit", "-qm", "sh");
+    git(f.lane, "merge", "-q", "lane", "--ff-only");
+    git(f.lane, "reset", "-q", "--hard", git(f.main, "rev-parse", "HEAD"));
+    const env = { ...GIT_ENV, PATH: `${bin}:${process.env.PATH}` };
+    const r = spawnSync("bash", [sh], { encoding: "utf8", env, cwd: f.main });
+    assert.equal(r.status, 0, r.stderr);
+    const stampPath = path.join(f.main, "rust/gusset-engine/target/release/libgusset.stamp.json");
+    const stamp = JSON.parse(readFileSync(stampPath, "utf8"));
+    assert.equal(stamp.dirty, false);
+    assert.deepEqual(Object.keys(stamp.trees).sort(), ["rust-toolchain.toml", "rust/dc-glob", "rust/gusset-engine"]);
+    const p = plan(f.lane, { scriptDir: f.scripts(f.lane), env: { ...process.env, CGO_LDFLAGS: "" } });
+    assert.equal(p.engine.dir, path.dirname(stampPath));
+    rmSync(stampPath);
+    assert.equal(spawnSync("bash", [sh, "--no-build"], { env, cwd: f.main }).status, 0);
+    assert.equal(existsSync(stampPath), false, "--no-build does not stamp");
   });
 });
 

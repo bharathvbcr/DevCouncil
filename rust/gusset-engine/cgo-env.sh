@@ -74,6 +74,12 @@ if [[ ! -f "$archive" ]]; then
   echo "cgo-env.sh: $archive is missing" >&2
   exit 1
 fi
+if [[ "$build" -eq 1 ]]; then
+  # Record what the archive was built from, for scripts/lane-env.mjs. A failure
+  # is loud but not fatal: the archive is fine, lane-env just refuses it.
+  node "$here/../../scripts/gusset-engine-stamp.mjs" write "$libdir" >&2 ||
+    echo "cgo-env.sh: could not write the engine stamp; lane-env.mjs will refuse this archive" >&2
+fi
 if command -v sha256sum >/dev/null 2>&1; then
   sum="$(sha256sum "$archive" | cut -c1-32)"
 else

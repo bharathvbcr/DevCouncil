@@ -14,22 +14,27 @@
  *   node scripts/lane-env.mjs -- go -C backend/go_orchestrator test ./cmd/devcouncil/... -count=1
  *   eval "$(node scripts/lane-env.mjs)"      # export GOWORK / CGO_* in this shell
  *   node scripts/lane-env.mjs --check        # print the plan, write nothing
- *   node scripts/lane-env.mjs --engine-dir <dir> -- <cmd>   # dir holds libgusset.a
+ *   node scripts/lane-env.mjs --engine-dir <dir> -- <cmd>   # unchecked bypass, warns
  *
  * Run it from anywhere inside the worktree. In the main checkout (not a linked
  * worktree) it does nothing: no exports, and with -- it runs the command as is.
  * Environment: GUSSET_DIR overrides the gusset checkout (default
  * <main checkout>/../gusset); the checkout must be at the setup-gusset pin.
  *
- * Which libgusset.a is linked, first match wins:
- *   1. --engine-dir, or a -L dir in a CGO_LDFLAGS you already set (it must hold libgusset.a);
- *   2. the lane's own rust/gusset-engine/target/release (build it with
- *      rust/gusset-engine/cgo-env.sh, which is what a lane that edits the engine needs);
- *   3. the main checkout's archive, only if the lane's committed AND working-tree
- *      rust/gusset-engine equals main's HEAD tree, main's engine tree is clean, and
- *      the archive is not older than its sources;
- *   4. otherwise it fails and names the build command. It never links an engine
- *      that does not match the lane's sources.
+ * Which libgusset.a is linked: one whose input stamp (libgusset.stamp.json,
+ * written next to it by ci-local's "gusset engine" step and by
+ * rust/gusset-engine/cgo-env.sh; see scripts/gusset-engine-stamp.mjs) equals the
+ * lane's inputs exactly: the git trees of rust/gusset-engine and its path
+ * dependencies (rust/dc-glob), rust-toolchain.toml, the sibling gusset commit.
+ * The lane's own archive is tried first, then main's. Never reused: an archive
+ * with no stamp ("rebuild to stamp it"), one built from uncommitted sources, or
+ * any archive while the lane's own engine inputs are uncommitted (commit first,
+ * then rebuild). If none matches it fails and names the build command.
+ * CGO_LDFLAGS already holding a -L to a different libgusset.a is refused, not
+ * overridden (unset it; an earlier eval of this script exports one).
+ * The one bypass is --engine-dir <dir> (or DEVCOUNCIL_GUSSET_ENGINE_DIR): it
+ * links <dir>/libgusset.a unchecked and prints a warning. Use it for a lane that
+ * is editing the engine and has built its own archive.
  * CGO_CFLAGS carries the hash of the archive chosen, so Go's caches follow it.
  *
  * The linker prints "ld: warning: search path ... not found" for the lane's
@@ -39,15 +44,15 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { engineCflags, gussetPinCheck } from "./ci-local-checks.mjs";
+import { ENGINE, engineInputs, stampVerdict } from "./gusset-engine-stamp.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ENGINE = path.join("rust", "gusset-engine");
 const ARCHIVE = "libgusset.a";
 
 class LaneError extends Error {}
@@ -113,54 +118,58 @@ export function laneGoWork(root, gussetDir) {
   }
 }
 
-function newestMtime(dir, files) {
-  return Math.max(0, ...files.map((f) => statSync(path.join(dir, f), { throwIfNoEntry: false })?.mtimeMs ?? 0));
+/** The -L directories of a CGO_LDFLAGS value that hold a libgusset.a. */
+function archiveDirsIn(ldflags) {
+  return [...(ldflags || "").matchAll(/(?:^|\s)-L(\S+)/g)].map((m) => m[1]).filter((d) => existsSync(path.join(d, ARCHIVE)));
 }
+const sameDir = (a, b) => realpathSync(a) === realpathSync(b);
 
 /**
- * Pick the engine archive directory per the rules in the header.
+ * Pick the engine archive directory per the rules in the header. An archive is
+ * used only when its stamp matches the lane's inputs exactly; the one explicit
+ * bypass is --engine-dir / DEVCOUNCIL_GUSSET_ENGINE_DIR, which warns.
  *
  * @param {{ root: string, mainRoot: string }} loc
- * @param {{ engineDir?: string, env: Record<string, string | undefined> }} opts
- * @returns {{ dir: string, why: string }}
+ * @param {{ engineDir?: string, env: Record<string, string | undefined>, gusset: string }} opts
+ * @returns {{ dir: string, why: string, warnings: string[] }}
  */
-export function chooseEngine(loc, { engineDir, env }) {
+export function chooseEngine(loc, { engineDir, env, gusset }) {
   const holds = (d) => existsSync(path.join(d, ARCHIVE));
-  if (engineDir) {
-    const d = path.resolve(engineDir);
-    if (!holds(d)) throw new LaneError(`--engine-dir ${d} has no ${ARCHIVE}`);
-    return { dir: d, why: "--engine-dir" };
+  const bypass = engineDir || env.DEVCOUNCIL_GUSSET_ENGINE_DIR;
+  let chosen;
+  if (bypass) {
+    const d = path.resolve(bypass);
+    if (!holds(d)) throw new LaneError(`the engine directory ${d} has no ${ARCHIVE}`);
+    chosen = {
+      dir: d,
+      why: "explicit engine directory (stamp NOT checked)",
+      warnings: [`WARNING: linking ${path.join(d, ARCHIVE)} without checking that it matches this lane's engine sources`],
+    };
+  } else {
+    const inputs = engineInputs(loc.root, gusset);
+    const build =
+      `build one in the lane: rust/gusset-engine/cgo-env.sh --export (from ${loc.root}; cargo resolves the sibling gusset relative to the checkout, so this needs GUSSET_DIR-compatible layout); ` +
+      `or, if the lane's engine inputs equal main's, build main's: (cd ${loc.mainRoot} && npm run ci:local -- --only "gusset engine"). ` +
+      "Commit engine changes first: an archive built from uncommitted sources is never reused";
+    if (inputs.stamp.dirty) {
+      throw new LaneError(`the lane's engine inputs have uncommitted changes (${inputs.dirtyFiles.slice(0, 5).join("; ")}); ${build}`);
+    }
+    const reasons = [];
+    for (const [name, root] of [["the lane's own archive", loc.root], ["main's archive", loc.mainRoot]]) {
+      const dir = path.join(root, ENGINE, "target", "release");
+      if (!holds(dir)) { reasons.push(`${name}: none in ${dir}`); continue; }
+      const v = stampVerdict(inputs, dir);
+      if (v.ok) { chosen = { dir, why: `${name} (stamp matches)`, warnings: [] }; break; }
+      reasons.push(`${name}: ${v.reason}`);
+    }
+    if (!chosen) throw new LaneError(`no libgusset.a matches this lane's engine inputs. ${reasons.join(". ")}. ${build}`);
   }
-  for (const m of (env.CGO_LDFLAGS || "").matchAll(/(?:^|\s)-L(\S+)/g)) {
-    if (holds(m[1])) return { dir: m[1], why: "CGO_LDFLAGS" };
-  }
-  if (env.CGO_LDFLAGS?.includes("-L")) {
-    throw new LaneError(`CGO_LDFLAGS names -L directories but none holds ${ARCHIVE}`);
-  }
-  const own = path.join(loc.root, ENGINE, "target", "release");
-  if (holds(own)) return { dir: own, why: "the lane's own archive" };
-
-  const build =
-    `build one in the lane: rust/gusset-engine/cgo-env.sh --export (run from ${loc.root}); ` +
-    `or, if the lane does not touch rust/gusset-engine, build main's: (cd ${loc.mainRoot} && npm run ci:local -- --only "gusset engine")`;
-  const mainDir = path.join(loc.mainRoot, ENGINE, "target", "release");
-  if (!holds(mainDir)) throw new LaneError(`no ${ARCHIVE} in the lane or in ${mainDir}; ${build}`);
-  const laneTree = git(loc.root, "rev-parse", `HEAD:${ENGINE}`);
-  const mainTree = git(loc.mainRoot, "rev-parse", `HEAD:${ENGINE}`);
-  if (laneTree !== mainTree) {
-    throw new LaneError(`the lane's ${ENGINE} (${laneTree.slice(0, 12)}) differs from main's (${mainTree.slice(0, 12)}), so main's archive does not match it; ${build}`);
-  }
-  for (const [where, dir] of [["lane", loc.root], ["main", loc.mainRoot]]) {
-    if (git(dir, "status", "--porcelain", "--", ENGINE)) {
-      throw new LaneError(`the ${where}'s ${ENGINE} has uncommitted changes, so main's archive may not match it; ${build}`);
+  for (const d of archiveDirsIn(env.CGO_LDFLAGS)) {
+    if (!sameDir(d, chosen.dir)) {
+      throw new LaneError(`CGO_LDFLAGS already holds -L${d}, which has a ${ARCHIVE} other than the one chosen (${chosen.dir}); it would win at link time. Unset CGO_LDFLAGS (an earlier eval of this script?) and retry`);
     }
   }
-  const sources = git(loc.mainRoot, "ls-files", "--", ENGINE).split("\n").filter(Boolean);
-  const archiveMtime = statSync(path.join(mainDir, ARCHIVE)).mtimeMs;
-  if (newestMtime(loc.mainRoot, sources) > archiveMtime) {
-    throw new LaneError(`main's ${ARCHIVE} is older than main's ${ENGINE} sources; ${build}`);
-  }
-  return { dir: mainDir, why: "main's archive (same engine tree)" };
+  return chosen;
 }
 
 /**
@@ -178,7 +187,7 @@ export function plan(cwd, opts = {}) {
   const gusset = realpathSync(wanted);
   const pin = gussetPinCheck(loc.root, gusset);
   if (!pin.ok) throw new LaneError(pin.message);
-  const engine = chooseEngine(loc, { engineDir: opts.engineDir, env });
+  const engine = chooseEngine(loc, { engineDir: opts.engineDir, env, gusset });
   noSpaces(engine.dir, "engine directory");
   const archive = path.join(engine.dir, ARCHIVE);
   const goWork = path.join(loc.gitDir, "devcouncil-lane", "go.work");
@@ -189,7 +198,7 @@ export function plan(cwd, opts = {}) {
     goWorkContent: laneGoWork(loc.root, gusset),
     env: {
       GOWORK: goWork,
-      CGO_LDFLAGS: env.CGO_LDFLAGS?.includes(`-L${engine.dir}`) ? env.CGO_LDFLAGS : `-L${engine.dir}${env.CGO_LDFLAGS ? ` ${env.CGO_LDFLAGS}` : ""}`,
+      CGO_LDFLAGS: archiveDirsIn(env.CGO_LDFLAGS).length ? env.CGO_LDFLAGS : `-L${engine.dir}${env.CGO_LDFLAGS ? ` ${env.CGO_LDFLAGS}` : ""}`,
       CGO_CFLAGS: engineCflags(archive, env),
     },
   };
@@ -210,7 +219,7 @@ function run(cmd, env) {
   return new Promise((resolve) => {
     const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit", env: { ...process.env, ...env } });
     const forward = (sig) => () => child.kill(sig);
-    const handlers = ["SIGINT", "SIGTERM"].map((s) => [s, forward(s)]);
+    const handlers = ["SIGINT", "SIGTERM", "SIGHUP"].map((s) => [s, forward(s)]);
     for (const [s, h] of handlers) process.on(s, h);
     const done = (r) => {
       for (const [s, h] of handlers) process.off(s, h);
@@ -255,11 +264,13 @@ async function main(argv) {
     return { code: 1 };
   }
   if (check) {
+    for (const w of p.engine?.warnings ?? []) console.error(`lane-env: ${w}`);
     console.log(p.loc.linked
       ? `linked worktree ${p.loc.root}\nGOWORK=${p.env.GOWORK}\nengine: ${p.engine.dir} (${p.engine.why})`
       : "main checkout: nothing to do");
     return { code: 0 };
   }
+  for (const w of p.engine?.warnings ?? []) console.error(`lane-env: ${w}`);
   materialize(p);
   if (cmd.length) return run(cmd, p.env);
   const q = (s) => `'${s.replaceAll("'", "'\\''")}'`;
