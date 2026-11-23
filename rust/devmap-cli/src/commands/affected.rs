@@ -1,7 +1,9 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_blast_radius, emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{
+    emit_blast_radius, emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read,
+};
 
 #[derive(clap::Args)]
 #[group(id = "Affected")]
@@ -56,7 +58,7 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
         report.tests.truncated,
     );
     if let Some(reason) = &report.tests.walk_incomplete {
-        outln!("warning: {reason}");
+        emit_walk_incomplete(reason);
     }
     emit_blast_radius(&report.blast_radius);
 }

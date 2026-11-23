@@ -1,7 +1,7 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Dead")]
@@ -54,7 +54,7 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
     if let Some(reason) = resp.walk_incomplete.as_ref() {
-        outln!("\nwalk incomplete: {reason}");
+        emit_walk_incomplete(reason);
     }
     for line in excluded_lines(resp.excluded.as_ref()) {
         outln!("{line}");

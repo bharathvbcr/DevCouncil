@@ -1,7 +1,9 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_scope, emit_search, emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{
+    emit_scope, emit_search, emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read,
+};
 
 #[derive(clap::Args)]
 #[group(id = "Ask")]
@@ -204,7 +206,7 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
     outln!("");
     emit_truncation(pack.shown, pack.hidden, pack.total, pack.truncated);
     if let Some(reason) = &pack.walk_incomplete {
-        outln!("warning: {reason}");
+        emit_walk_incomplete(reason);
     }
     let tests = &pack.related_tests;
     if !tests.items.is_empty() || tests.hidden > 0 || tests.walk_incomplete.is_some() {
@@ -239,7 +241,7 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
         }
         emit_truncation(tests.shown, tests.hidden, tests.total, tests.truncated);
         if let Some(reason) = &tests.walk_incomplete {
-            outln!("warning: related tests: {reason}");
+            emit_walk_incomplete(&format!("related tests: {reason}"));
         }
     }
     if let Some(gap) = &pack.coverage_gap {

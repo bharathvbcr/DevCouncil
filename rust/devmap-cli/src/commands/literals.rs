@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_truncation, open_for_read};
+use crate::output::{emit_truncation, emit_walk_incomplete, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Literals")]
@@ -51,6 +51,6 @@ fn emit_literals(report: &devmap_query::LiteralReport) {
     }
     emit_truncation(report.shown, report.hidden, report.total, report.truncated);
     if let Some(reason) = &report.walk_incomplete {
-        outln!("warning: {reason}");
+        emit_walk_incomplete(reason);
     }
 }

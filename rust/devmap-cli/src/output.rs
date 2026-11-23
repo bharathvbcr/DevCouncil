@@ -72,6 +72,7 @@ impl ReadStore {
 /// by name (`StackedStore::open_if_leased` runs `refuse_legacy_base_store_ref`
 /// for a lane with neither a store nor a lease).
 pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<ReadStore> {
+    VERBOSE.store(cli.verbose, std::sync::atomic::Ordering::Relaxed);
     let db = cli.db();
     if !db.is_file() {
         if cli.db.is_none() {
@@ -149,8 +150,13 @@ pub(crate) fn emit_unavailable(reason: &str) {
 /// this line is the only thing telling a caller their result was capped.
 /// PHASE1_CONTRACT.md:17 is explicit: never present a capped sample as
 /// complete coverage. A silent emitter does exactly that.
+///
+/// It names `--budget`: every command that prints it takes that flag (the
+/// token budget that decided how many rows fit), so it is the one that shows
+/// the rest.
 fn truncation_line(shown: u32, hidden: u32, total: u32, truncated: bool) -> Option<String> {
-    (truncated || hidden > 0).then(|| format!("shown {shown} of {total} ({hidden} hidden)"))
+    (truncated || hidden > 0)
+        .then(|| format!("shown {shown} of {total} ({hidden} hidden); raise --budget to show more"))
 }
 
 pub(crate) fn emit_truncation(shown: u32, hidden: u32, total: u32, truncated: bool) {
@@ -208,20 +214,66 @@ pub(crate) fn emit_scope(scope: Option<&devmap_query::ScopeReport>) {
     }
 }
 
+/// One edge as text mode prints it.
+fn edge_line(edge: &devmap_resolve::ResolvedEdge) -> String {
+    format!(
+        "{}  --{:?}-->  {}",
+        symbol_id(&edge.source_file, &edge.source_symbol),
+        edge.edge_kind,
+        symbol_id(&edge.target_file, &edge.target_symbol)
+    )
+}
+
+/// `<file>::<name>` once. The extractors store a symbol already qualified by
+/// its file, so prefixing the file again printed every path twice; a symbol
+/// that is a bare name (no file qualifier) still gets its file.
+fn symbol_id(file: &str, symbol: &str) -> String {
+    match symbol.strip_prefix(file) {
+        Some(rest) if rest.starts_with("::") => symbol.to_string(),
+        _ => format!("{file}::{symbol}"),
+    }
+}
+
+/// Characters of a `walk_incomplete` reason kept in the one-line text form.
+const WALK_INCOMPLETE_TEXT_CHARS: usize = 160;
+
+/// The text-mode form of a `walk_incomplete` reason: its first clause on one
+/// line, with the flags that carry the whole of it. The reason is a paragraph
+/// of several coverage clauses (up to a thousand characters) and every
+/// command repeated it; `--json` and `--verbose` keep it whole.
+fn walk_incomplete_line(reason: &str, verbose: bool) -> String {
+    if verbose {
+        return format!("warning: {reason}");
+    }
+    let flat = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = flat.split(';').next().unwrap_or(&flat).trim();
+    let clipped = if first.chars().count() > WALK_INCOMPLETE_TEXT_CHARS {
+        let head: String = first.chars().take(WALK_INCOMPLETE_TEXT_CHARS).collect();
+        format!("{}…", head.trim_end())
+    } else {
+        first.to_string()
+    };
+    format!("warning: {clipped} (result is partial; full detail: --verbose or --json)")
+}
+
+/// Set by [`open_for_read`] so the shared renderers can honour `--verbose`
+/// without every call site threading the flag through.
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn emit_walk_incomplete(reason: &str) {
+    outln!(
+        "{}",
+        walk_incomplete_line(reason, VERBOSE.load(std::sync::atomic::Ordering::Relaxed))
+    );
+}
+
 pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     if let ResolutionAvailability::Unavailable { reason } = &resp.resolution {
         emit_unavailable(reason);
         return;
     }
     for edge in &resp.items {
-        outln!(
-            "{}::{}  --{:?}-->  {}::{}",
-            edge.source_file,
-            edge.source_symbol,
-            edge.edge_kind,
-            edge.target_file,
-            edge.target_symbol
-        );
+        outln!("{}", edge_line(edge));
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
     // What a `--min-rung` floor cost, printed only when it cost something.
@@ -246,7 +298,7 @@ pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedE
     // one says the walk that produced `items` stopped before the graph ran out,
     // so `total` is the size of a partial answer.
     if let Some(reason) = &resp.walk_incomplete {
-        outln!("warning: {reason}");
+        emit_walk_incomplete(reason);
     }
     // Information about a complete answer, not a defect in it: no `warning:`.
     if let Some(note) = &resp.note {
@@ -292,7 +344,7 @@ pub(crate) fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
         radius.layers.truncated,
     );
     if let Some(reason) = &radius.layers.walk_incomplete {
-        outln!("warning: {reason}");
+        emit_walk_incomplete(reason);
     }
 }
 
@@ -328,6 +380,86 @@ mod tests {
 
         // Both.
         assert!(truncation_line(3, 7, 10, true).is_some());
+    }
+
+    fn edge(
+        source_file: &str,
+        source_symbol: &str,
+        target_file: &str,
+        target_symbol: &str,
+    ) -> devmap_resolve::ResolvedEdge {
+        devmap_resolve::ResolvedEdge {
+            source_file: source_file.into(),
+            target_file: target_file.into(),
+            source_symbol: source_symbol.into(),
+            target_symbol: target_symbol.into(),
+            edge_kind: devmap_extract::EdgeKind::Calls,
+            confidence: devmap_extract::Confidence(1.0),
+            resolution: None,
+            evidence: None,
+            details: None,
+        }
+    }
+
+    /// A stored symbol id is already `<file>::<name>`; the edge line must not
+    /// prepend the file a second time, on either end.
+    #[test]
+    fn an_edge_line_prints_a_file_path_once_per_symbol() {
+        let line = edge_line(&edge(
+            "crates/core/flags/hiargs.rs",
+            "crates/core/flags/hiargs.rs::HiArgs.searcher",
+            "crates/core/main.rs",
+            "crates/core/main.rs::search",
+        ));
+        assert_eq!(
+            line,
+            "crates/core/flags/hiargs.rs::HiArgs.searcher  --Calls-->  crates/core/main.rs::search"
+        );
+        assert_eq!(line.matches("hiargs.rs").count(), 1, "{line}");
+        assert_eq!(line.matches("main.rs").count(), 1, "{line}");
+    }
+
+    /// An id that is not file-qualified (a bare name from an unresolved or
+    /// external endpoint) still gets its file, so nothing loses its location.
+    #[test]
+    fn an_edge_line_qualifies_a_bare_symbol_with_its_file() {
+        let line = edge_line(&edge("a.rs", "run", "b.rs", "b.rs::go"));
+        assert_eq!(line, "a.rs::run  --Calls-->  b.rs::go");
+    }
+
+    /// The truncation line names the flag that shows the rest. Every command
+    /// that prints it takes `--budget` (clap: `budget`, short `-b`), the
+    /// token budget that decided how many rows fit.
+    #[test]
+    fn the_truncation_line_names_the_flag_that_shows_the_rest() {
+        let line = truncation_line(80, 159, 239, true).expect("capped");
+        assert!(line.starts_with("shown 80 of 239 (159 hidden)"), "{line}");
+        assert!(line.contains("--budget"), "{line}");
+        assert_eq!(truncation_line(10, 0, 10, false), None);
+    }
+
+    /// A multi-line, multi-clause reason prints as exactly one line in text
+    /// mode and points at the flags that show the rest; `--verbose` keeps all.
+    #[test]
+    fn a_walk_incomplete_reason_prints_as_one_line_in_text_mode() {
+        let reason = "the walk did not complete: stopped at depth 3; the result is a lower bound, \
+                      not the full blast radius; the analysis is partial: call extraction did not \
+                      cover the whole corpus:\n1 file(s) failed to parse,\n6 recovered by pattern";
+        let line = walk_incomplete_line(reason, false);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(
+            line.starts_with("warning: the walk did not complete"),
+            "{line}"
+        );
+        assert!(
+            line.contains("--verbose") && line.contains("--json"),
+            "{line}"
+        );
+        assert!(line.len() < reason.len(), "{line}");
+        assert_eq!(
+            walk_incomplete_line(reason, true),
+            format!("warning: {reason}")
+        );
     }
 
     /// `ensure_parent` actually creates the directory it promises.

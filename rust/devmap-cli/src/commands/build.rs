@@ -1336,7 +1336,11 @@ fn run_build(
                 || uninferred_receiver_calls > 0
                 || unresolved_member_calls > 0)
         {
-            summary.push(format!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers, {unresolved_member_calls} unresolved members (details: --verbose)"));
+            summary.extend(unresolved_summary(
+                unattributed_calls,
+                uninferred_receiver_calls,
+                unresolved_member_calls,
+            ));
         }
         progress.display.summary("Map ready", &summary);
         progress.display.report_loss();
@@ -2081,6 +2085,19 @@ fn affected_closure(
 /// than one they have to find. This is the readout that would have surfaced
 /// W0.2's bug class — CFML and Terraform contributing no call edges while
 /// reporting complete coverage — without anyone going looking for it.
+/// The summary rows for calls the resolver could not tie to a definition.
+fn unresolved_summary(unattributed: usize, uninferred: usize, members: usize) -> Vec<String> {
+    vec![
+        format!(
+            "  Unresolved: {unattributed} unattributed, {uninferred} uninferred receivers, {members} unresolved members (details: --verbose)"
+        ),
+        "    unattributed = a call to a bare name that matched no definition (worth a look); \
+         uninferred receivers = method calls whose receiver type was not inferred (a known \
+         limit); unresolved members = calls on a typed receiver whose type has no such member"
+            .to_string(),
+    ]
+}
+
 fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
     for line in resolution_rate_lines(rate) {
         outln!("{line}");
@@ -2210,6 +2227,25 @@ const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 mod tests {
     use super::*;
     use devmap_analyze::{LanguageResolution, ResolutionRate};
+
+    /// The build summary says what its three unresolved counts mean, in plain
+    /// words, and still carries every number and the `--verbose` pointer.
+    #[test]
+    fn the_unresolved_summary_explains_its_terms() {
+        let rows = unresolved_summary(1534, 10561, 7).join("\n");
+        for number in ["1534", "10561", "7"] {
+            assert!(rows.contains(number), "{rows}");
+        }
+        assert!(rows.contains("--verbose"), "{rows}");
+        assert!(
+            rows.contains("bare name") && rows.contains("matched no definition"),
+            "unattributed is not explained: {rows}"
+        );
+        assert!(
+            rows.contains("receiver") && rows.contains("not inferred"),
+            "uninferred receivers is not explained: {rows}"
+        );
+    }
 
     #[test]
     fn a_manifest_path_is_a_resolution_input_and_a_source_path_is_not() {
