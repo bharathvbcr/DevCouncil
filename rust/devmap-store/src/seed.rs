@@ -483,6 +483,46 @@ pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>>
     placed.map(Some)
 }
 
+/// File in a `resolution-reuse-*` directory that says which generation row its
+/// blobs were resolved for. Written by `devmap build`, last, and only while that
+/// generation is still the store's latest.
+pub const REUSE_BINDING_FILE: &str = "generation.json";
+
+/// [`seed_directory_cow`] for a `resolution-reuse-*` directory, from a donor
+/// whose writer lock the caller does not hold.
+///
+/// The donor's binding travels with the blobs, and stays true in the copy only
+/// when the donor did not write while it was copied: a build unbinds, rewrites
+/// blobs, then binds again. So the donor's binding is read before and after the
+/// copy and the copied binding is kept only when both reads are the same bytes.
+/// A binding that is absent, unreadable or changed is dropped from the copy,
+/// which makes the copy a cache that resolves every file once, never one that
+/// serves another generation's blobs. The decision is made on the staged
+/// directory, before it is renamed into place, so the target never holds a
+/// binding that was not checked; a binding that cannot be removed fails the
+/// seed (and the staged directory is discarded) rather than being placed.
+pub fn seed_reuse_directory(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    let binding = source_dir.join(REUSE_BINDING_FILE);
+    let before = std::fs::read(&binding).ok();
+    seed_directory_cow_with(source_dir, target_dir, &|staged| {
+        withdraw_unchecked_binding(staged, &binding, before.as_deref())
+    })
+}
+
+/// Drop the staged copy's binding unless the donor's binding at `donor_binding`
+/// is still exactly `before`, the bytes read before the copy began.
+fn withdraw_unchecked_binding(
+    staged: &Path,
+    donor_binding: &Path,
+    before: Option<&[u8]>,
+) -> Result<()> {
+    let after = std::fs::read(donor_binding).ok();
+    if before.is_none() || before != after.as_deref() {
+        remove_file_if_present(&staged.join(REUSE_BINDING_FILE))?;
+    }
+    Ok(())
+}
+
 /// Seed a flat cache directory (such as `resolution-reuse-1/`) via copy-on-write
 /// cloning when `target_dir` does not yet exist (`F9`).
 ///
@@ -490,6 +530,17 @@ pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>>
 /// syscall; on filesystems without directory `clonefile`, creates a staged
 /// directory and clones/copies regular file entries atomically before rename.
 pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option<SeedMethod>> {
+    seed_directory_cow_with(source_dir, target_dir, &|_| Ok(()))
+}
+
+/// [`seed_directory_cow`] with `before_place` run on the staged directory once
+/// it is complete and before it is renamed to `target_dir`. An error from it
+/// discards the staged directory and is returned.
+fn seed_directory_cow_with(
+    source_dir: &Path,
+    target_dir: &Path,
+    before_place: &dyn Fn(&Path) -> Result<()>,
+) -> Result<Option<SeedMethod>> {
     // Whatever a killed seed staged for this directory under a pid that is gone.
     let swept = sweep_dead_staging(target_dir);
     for failure in &swept.failures {
@@ -517,6 +568,10 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
     let staged = sidecar(target_dir, &format!(".seed-dir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     if try_clone(source_dir, &staged) {
+        if let Err(error) = before_place(&staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
         if let Err(error) = std::fs::rename(&staged, target_dir) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(error).with_context(|| format!("cannot place {}", target_dir.display()));
@@ -537,6 +592,7 @@ pub fn seed_directory_cow(source_dir: &Path, target_dir: &Path) -> Result<Option
                 method = SeedMethod::Copy;
             }
         }
+        before_place(&staged)?;
         std::fs::rename(&staged, target_dir)
             .with_context(|| format!("cannot place {}", target_dir.display()))?;
         Ok(())
@@ -1432,6 +1488,78 @@ mod tests {
         assert_eq!(sweep_dead_staging(&target).removed, 0, "idempotent");
         let absent = sweep_dead_staging(&tmp.join("absent-dir").join("x.sqlite"));
         assert_eq!((absent.removed, absent.failures.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn reuse_donor(label: &str, binding: Option<&[u8]>) -> (PathBuf, PathBuf, PathBuf) {
+        let tmp = temp_test_dir(label);
+        let source = tmp.join("src").join("resolution-reuse-1");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("blob.json"), b"{}").unwrap();
+        if let Some(bytes) = binding {
+            std::fs::write(source.join(REUSE_BINDING_FILE), bytes).unwrap();
+        }
+        let target = tmp.join("dst").join("resolution-reuse-1");
+        (tmp, source, target)
+    }
+
+    #[test]
+    fn a_donor_binding_unchanged_across_the_copy_is_placed_and_an_absent_one_is_not() {
+        let (tmp, source, target) = reuse_donor("reuse-binding-kept", Some(b"A"));
+        assert!(seed_reuse_directory(&source, &target).unwrap().is_some());
+        assert_eq!(
+            std::fs::read(target.join(REUSE_BINDING_FILE)).unwrap(),
+            b"A"
+        );
+        assert!(target.join("blob.json").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (tmp, source, target) = reuse_donor("reuse-binding-absent", None);
+        assert!(seed_reuse_directory(&source, &target).unwrap().is_some());
+        assert!(target.join("blob.json").is_file());
+        assert!(!target.join(REUSE_BINDING_FILE).exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The donor's binding is rewritten after the copy began and before the
+    /// staged directory is placed: the blobs may belong to either binding, so the
+    /// target keeps the blobs and no binding.
+    #[test]
+    fn a_donor_binding_that_changes_during_the_copy_leaves_the_target_unbound() {
+        let (tmp, source, target) = reuse_donor("reuse-binding-changed", Some(b"A"));
+        let binding = source.join(REUSE_BINDING_FILE);
+        let before = std::fs::read(&binding).ok();
+        let placed = seed_directory_cow_with(&source, &target, &|staged| {
+            std::fs::write(&binding, b"B")?;
+            withdraw_unchecked_binding(staged, &binding, before.as_deref())
+        })
+        .unwrap();
+        assert!(placed.is_some());
+        assert!(target.join("blob.json").is_file());
+        assert!(
+            !target.join(REUSE_BINDING_FILE).exists(),
+            "a binding that changed during the copy must not be placed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A staged binding that cannot be removed fails the seed: the staged
+    /// directory is discarded and no target directory is left.
+    #[test]
+    fn a_staged_binding_that_cannot_be_removed_fails_the_seed_and_leaves_no_target() {
+        let (tmp, source, target) = reuse_donor("reuse-binding-stuck", Some(b"A"));
+        let binding = source.join(REUSE_BINDING_FILE);
+        let result = seed_directory_cow_with(&source, &target, &|staged| {
+            // A non-empty directory where the file was: remove_file refuses it.
+            let staged_binding = staged.join(REUSE_BINDING_FILE);
+            std::fs::remove_file(&staged_binding)?;
+            std::fs::create_dir_all(staged_binding.join("held"))?;
+            withdraw_unchecked_binding(staged, &binding, None)
+        });
+        assert!(result.is_err(), "the removal error must be returned");
+        assert!(!target.exists(), "no target directory is left");
+        let staged = sidecar(&target, &format!(".seed-dir-{}", std::process::id()));
+        assert!(!staged.exists(), "the staged directory is discarded");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
