@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::edge_index::GenerationEdges;
 use devmap_analyze::model::*;
@@ -607,15 +607,86 @@ pub struct PendingClaim {
 #[path = "db/tests/agentic_queue_regressions.rs"]
 mod agentic_queue_regressions;
 
+thread_local! {
+    /// The cancel flag of the lazy source-freshness walk running on this
+    /// thread, if one is. See [`WalkCancelScope`].
+    static WALK_CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, [`lock_conn`] on this thread stops waiting for the connection
+/// once the flag is set, and fails as a cancelled walk does.
+///
+/// A lazy walk's reads wait for the connection behind whoever holds it (a
+/// writer, another query). The querying thread joins the walk, so a wait that
+/// ignored the cancel would carry the query past its budget. Only the walk's
+/// thread enters this scope, and only around its source reads; every other
+/// caller of `lock_conn` waits as before, and so does the repair after a walk
+/// panic, which runs outside the scope.
+pub(crate) struct WalkCancelScope;
+
+impl WalkCancelScope {
+    pub(crate) fn enter(cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        WALK_CANCEL.with(|slot| *slot.borrow_mut() = Some(cancel));
+        Self
+    }
+}
+
+impl Drop for WalkCancelScope {
+    fn drop(&mut self) {
+        WALK_CANCEL.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Waits for the connection. Without a [`WalkCancelScope`] on this thread that is
+/// a plain blocking lock. Inside one it polls `try_lock` every millisecond and
+/// returns `None` once the cancel is set. The result is the `lock` result, so a
+/// poisoned mutex hands back its guard in the error.
+fn wait_conn(
+    mutex: &Mutex<Connection>,
+) -> Option<std::sync::LockResult<MutexGuard<'_, Connection>>> {
+    // `try_with`: a thread tearing down its locals has no scope to consult.
+    let cancel = WALK_CANCEL
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten();
+    let Some(cancel) = cancel else {
+        return Some(mutex.lock());
+    };
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(Ok(guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(Err(poisoned)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// Fail closed: poisoned mutex is an error, never a panic.
+///
+/// A cancel-aware wait (the lazy walk's thread, see [`WalkCancelScope`]) polls
+/// every millisecond rather than queueing on the mutex, so on a busy store it
+/// can lose the connection to blocking lockers again and again until its cancel
+/// fires. It then ends as a cancelled walk, and the query answers null with the
+/// reason. That fails safe, and is accepted: the walk is an optional upgrade of
+/// the answer, never a condition of it.
 fn lock_conn(
     mutex: &Mutex<Connection>,
 ) -> std::result::Result<MutexGuard<'_, Connection>, rusqlite::Error> {
-    mutex
-        .lock()
-        .map_err(|_: PoisonError<MutexGuard<'_, Connection>>| {
-            refusal("store mutex poisoned — refusing to continue (fail-closed)")
-        })
+    match wait_conn(mutex) {
+        Some(Ok(guard)) => Ok(guard),
+        Some(Err(_)) => Err(refusal(
+            "store mutex poisoned — refusing to continue (fail-closed)",
+        )),
+        None => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            devmap_extract::BuildCancelled,
+        ))),
+    }
 }
 
 /// What a read-only open is asked for: the memory its connection may use for
@@ -821,6 +892,9 @@ pub(crate) struct LazyWalk {
     /// Stands in for the process-wide walk places.
     #[cfg(test)]
     pub(crate) slots: Option<std::sync::Arc<WalkSlots>>,
+    /// Makes the walk thread fail to start, as the operating system can.
+    #[cfg(test)]
+    pub(crate) fail_spawn: bool,
 }
 
 /// A count of lazy walks running, with the most that may run at once.
@@ -915,13 +989,24 @@ pub const SOURCE_FRESHNESS_MAX_AGE: std::time::Duration = std::time::Duration::f
 /// cancels it and answers `fresh: null` with the age and the reason, as it did
 /// before the walk existed.
 ///
-/// This is when the cancel is sent, not a bound on the query's wait: the walk
-/// runs on a scoped thread the query joins, and the walk reads its cancel flag
-/// only between and inside its scan phases, not while it reads the stored
-/// hashes or the discovery inventory (each holds the connection lock for one
-/// SQL read) or compares the delta. The query's wait is this budget plus the
-/// longest of those uncancellable steps. What the query-time path does bound is
-/// everyone else's wait: queries beside a running walk never join it.
+/// This is when the cancel is sent. The walk runs on a scoped thread the query
+/// joins, so the query's wait is this budget plus the time the walk takes to
+/// notice the cancel. It notices between and inside its scan phases, and while
+/// it waits for the connection (see [`WalkCancelScope`]), which is where a
+/// walk blocked behind a writer would otherwise carry the query past the
+/// budget.
+/// What it does not interrupt, once it holds the connection, is each single
+/// statement: the repository-root read, the stored-hash read, the
+/// discovery-inventory read and the final generation-and-pending read, each of
+/// which can also wait up to SQLite's `busy_timeout` (5 s, `Store::BUSY_TIMEOUT`)
+/// for another process's lock. Nor does it interrupt the in-memory delta
+/// comparison. The query's wait can exceed the budget by the longest of those.
+///
+/// One wait is unbounded by design: after a walk panic, the repair (a ROLLBACK
+/// of any transaction the unwind left open, then clearing the mutex poison)
+/// waits for the connection without a bound, because a store left poisoned
+/// would refuse every later query.
+/// Queries beside a running walk never join it.
 pub const SOURCE_FRESHNESS_WALK_BUDGET: std::time::Duration =
     std::time::Duration::from_millis(1500);
 

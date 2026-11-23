@@ -1948,3 +1948,158 @@ fn a_lease_that_disagrees_with_its_base_is_refused_by_every_lane_command() {
         "lease claims that were not refused: {unguarded:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ft-258f2788: the resolution-reuse binding names a generation row, so a seeded
+// lane keeps the donor's reuse cache instead of resolving every file twice.
+// ---------------------------------------------------------------------------
+
+fn text_of(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Twenty files that mention nothing else, in every checkout: an affected
+/// closure that is half the tree or more is not narrowed, so two files cannot
+/// show reuse. The same bytes in the donor and the lanes keep their trees equal.
+fn add_fillers(fx: &Fixture) {
+    for name in ["main", "lane", "cold"] {
+        let src = fx.at(name).join("src");
+        for index in 0..20 {
+            fs::write(
+                src.join(format!("filler_{index}.py")),
+                format!("def filler_{index}():\n    return {index}\n"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn build_text(fx: &Fixture, root: &Path) -> String {
+    let out = fx.devmap(root, &["build", "--manifest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    text_of(&out)
+}
+
+/// Edits only `b.py`, whose definitions nothing mentions, so the affected
+/// closure of one edit is that one file. Each revision adds another definition.
+fn edit_b(root: &Path, rev: u32) {
+    let b = root.join("src/b.py");
+    let mut text = fs::read_to_string(&b).unwrap();
+    text.push_str(&format!("\n\ndef epsilon_{rev}():\n    return {rev}\n"));
+    fs::write(b, text).unwrap();
+}
+
+/// The seeded lane and a cold lane carry the same edits (`revs` of `b.py`);
+/// their graphs agree.
+fn assert_lane_equals_cold(fx: &Fixture, lane: &Path, revs: &[u32]) {
+    let cold = fx.at("cold");
+    for rev in revs {
+        edit_b(&cold, *rev);
+    }
+    let out = fx.devmap(&cold, &["build", "--manifest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(graph(lane), graph(&cold));
+}
+
+#[test]
+fn a_seed_from_build_keeps_the_donors_reuse_cache_for_the_next_edit() {
+    let fx = Fixture::new();
+    add_fillers(&fx);
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit_b(&lane, 1);
+    let seeded = text_of(&seeded_build(&fx, &lane, &fx.main()));
+    assert!(
+        seeded.contains("Resolved 1 of 22 files"),
+        "the seed build reuses the donor's cache; output was:\n{seeded}"
+    );
+    edit_b(&lane, 2);
+    let next = build_text(&fx, &lane);
+    assert!(
+        next.contains("Resolved 1 of 22 files"),
+        "the next edit reuses the cache the seed build left; output was:\n{next}"
+    );
+    assert_lane_equals_cold(&fx, &lane, &[1, 2]);
+}
+
+#[test]
+fn a_diverged_devmap_seed_keeps_the_donors_reuse_cache_for_the_next_edit() {
+    let fx = Fixture::new();
+    add_fillers(&fx);
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit_b(&lane, 1);
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    edit_b(&lane, 2);
+    let next = build_text(&fx, &lane);
+    assert!(
+        next.contains("Resolved 1 of 22 files"),
+        "the edit after a diverged seed reuses the cache; output was:\n{next}"
+    );
+    assert_lane_equals_cold(&fx, &lane, &[1, 2]);
+}
+
+#[test]
+fn a_matching_devmap_seed_copies_a_binding_that_is_still_valid() {
+    let fx = Fixture::new();
+    add_fillers(&fx);
+    fx.build_main();
+    let lane = fx.at("lane");
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    edit_b(&lane, 1);
+    let next = build_text(&fx, &lane);
+    assert!(
+        next.contains("Resolved 1 of 22 files"),
+        "the first edit after a matching seed reuses the copied cache; output was:\n{next}"
+    );
+    edit_b(&lane, 2);
+    build_text(&fx, &lane);
+    assert_lane_equals_cold(&fx, &lane, &[1, 2]);
+}
+
+/// A drain after seeding is still refused: the copied binding names the donor's
+/// generation, the drain commits a newer one.
+#[test]
+fn a_drain_after_seeding_unbinds_the_copied_cache() {
+    let fx = Fixture::new();
+    add_fillers(&fx);
+    let lane = fx.at("lane");
+    for root in [fx.main(), lane.clone()] {
+        fs::write(root.join("src/c.py"), "def user():\n    return late()\n").unwrap();
+    }
+    fx.build_main();
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let a = lane.join("src/a.py");
+    let mut text = fs::read_to_string(&a).unwrap();
+    text.push_str("\n\ndef late():\n    return 3\n");
+    fs::write(&a, text).unwrap();
+    let lane_store = devmap_store::Store::open(store(&lane)).unwrap();
+    lane_store
+        .enqueue_pending_paths(&[a.to_string_lossy().into_owned()])
+        .unwrap();
+    let daemon = devmap_serve::Daemon::new(lane_store, lane.clone());
+    assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+    drop(daemon);
+
+    edit_b(&lane, 1);
+    let next = build_text(&fx, &lane);
+    assert!(
+        next.contains("Resolved 23 of 23 files"),
+        "a cache bound to a pre-drain generation resolves every file; output was:\n{next}"
+    );
+    let cold = fx.at("cold");
+    fs::write(cold.join("src/c.py"), "def user():\n    return late()\n").unwrap();
+    fs::write(cold.join("src/a.py"), fs::read_to_string(&a).unwrap()).unwrap();
+    edit_b(&cold, 1);
+    let out = fx.devmap(&cold, &["build", "--manifest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(graph(&lane), graph(&cold));
+}

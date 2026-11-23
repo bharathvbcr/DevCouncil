@@ -373,27 +373,20 @@ fn run_hook_inner(
         if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload)
             .filter(|(wt, _)| !selection.roots.iter().any(|root| root.starts_with(wt)))
         {
-            // Inside a shell call's rate window the previous start already
-            // covers this root; say nothing.
-            let wait = if shell_post {
-                shell_build_window_remaining(&wt)
-            } else {
-                None
-            };
-            if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
-                return Ok(HookOutcome {
-                    exit_code: 0,
-                    stdout: None,
-                    stderr_line: None,
-                    roots: vec![wt],
-                });
-            }
+            // Inside a shell call's rate window: held back until it ends where
+            // the platform can wait, started at once where it cannot.
+            let plan = window_plan(
+                shell_post
+                    .then(|| shell_build_window_remaining(&wt))
+                    .flatten(),
+                window_can_be_waited_out(),
+            );
             // A refused or failed spawn is exit 1 with its reason, as for every
             // other PostToolUse detach, never silence.
             let (exit_code, stderr_line) =
-                match detach_build_with(executable, &wt, Some(&main), wait) {
+                match detach_build_with(executable, &wt, Some(&main), plan.delay) {
                     Ok(spawned) => {
-                        if spawned && shell_post && wait.is_none() {
+                        if spawned && shell_post && plan.claims {
                             claim_shell_build_window(&wt);
                         }
                         (0, None)
@@ -478,19 +471,17 @@ fn run_hook_inner(
                 &selection.roots,
                 DETACH_BUDGET,
                 |executable, root| {
-                    let wait = if shell_post {
-                        shell_build_window_remaining(root)
-                    } else {
-                        None
-                    };
-                    if wait.is_some() && !WINDOW_CAN_BE_WAITED_OUT {
-                        return Ok(());
-                    }
-                    let spawned = detach_post_tool_root(executable, root, wait)?;
+                    let plan = window_plan(
+                        shell_post
+                            .then(|| shell_build_window_remaining(root))
+                            .flatten(),
+                        window_can_be_waited_out(),
+                    );
+                    let spawned = detach_post_tool_root(executable, root, plan.delay)?;
                     // A held-back start is not a start: the window it waits out
                     // is still the previous one. Nor is a call that only
                     // marked a running build dirty.
-                    if spawned && shell_post && wait.is_none() {
+                    if spawned && shell_post && plan.claims {
                         claim_shell_build_window(root);
                     }
                     Ok(())
@@ -1454,7 +1445,7 @@ fn pre_tool_use_sync(
     };
     // When the payload names a file and the index is query-ready, replace the
     // tool-name directive with that file's signature list. Silence still wins
-    // for empty / degraded / not query-ready indexes.
+    // for empty / not query-ready indexes; a degraded one is named, not dropped.
     let skeleton = file_path_from_payload(payload).and_then(|path| {
         let leftover = PRE_TOOL_USE_BUDGET.saturating_sub(started.elapsed());
         if leftover.is_zero() {
@@ -1476,7 +1467,9 @@ fn pre_tool_use_sync(
 /// The directive — or a file's signature list — or nothing when the index
 /// cannot back it.
 ///
-/// Silence is the correct output for an unbuilt, empty or degraded index.
+/// Silence is the correct output for an unbuilt, empty or not query-ready
+/// index. A query-ready store that carries a `degraded_reason` still answers,
+/// so it keeps its context behind one line naming the reason.
 /// Pointing an agent at `devmap_search` when the store cannot answer earns one
 /// empty result and a durable conclusion that the tool does not work — which
 /// is not hypothetical here: a sibling MCP server pinned to an older store
@@ -1496,12 +1489,31 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
     {
         return None;
     }
-    if status
+    // A degraded store that can still answer is worth naming, with the reason in
+    // front: dropping the context hid a usable index, and the directive alone
+    // would oversell it. A store that is not query-ready was dropped above.
+    // Trimmed, and an empty reason is no reason, as in `summarize_status`.
+    let degraded_line = status
         .get("degraded_reason")
-        .is_some_and(|reason| !reason.is_null())
-    {
-        return None;
-    }
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| {
+            // A store a newer devmap wrote must not be rebuilt by this one, and
+            // the cap would cut the reason before it says so: it is named whole.
+            if reason.contains(devmap_store::RESOLVER_NEWER_REASON) {
+                return format!(
+                    "DevMap index is degraded: {}; update devmap instead of rebuilding with \
+                     this one. Treat its answers as a lower bound.\n",
+                    devmap_store::RESOLVER_NEWER_REASON
+                );
+            }
+            format!(
+                "DevMap index is degraded: {}. Treat its answers as a lower bound.\n",
+                truncate(&context_line(reason), DEGRADED_REASON_CAP)
+            )
+        })
+        .unwrap_or_default();
     let nodes = status
         .get("node_count")
         .and_then(Value::as_u64)
@@ -1523,11 +1535,22 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
         .get("is_fresh")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // "Behind the working tree" is the typed claim `index_is_behind_the_tree`
+    // and `summarize_status` make: the source compared unequal, or edits are
+    // pending. `is_fresh` is also false for a resolver mismatch and when
+    // freshness was not measured; the tree has not necessarily moved then.
+    let behind = status.get("source_freshness").and_then(Value::as_bool) == Some(false)
+        || status
+            .get("pending_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|pending| pending > 0);
     let name = repo_context_label(root, "this repository");
-    let freshness = if fresh {
+    let freshness = if behind {
+        "behind the working tree, so its answers are a lower bound"
+    } else if fresh {
         "current"
     } else {
-        "behind the working tree, so its answers are a lower bound"
+        "not confirmed current, so its answers may be a lower bound"
     };
     let header = format!(
         "DevMap has {name} indexed: {nodes} symbols, {edges} edges, \
@@ -1542,8 +1565,16 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
     } else {
         PRE_TOOL_CONTEXT_CAP
     };
-    Some(truncate(&format!("{header} {body}"), cap))
+    // The degraded line sits outside the cap: counted in it, a long reason would
+    // cut the caveat the directive ends on.
+    Some(format!(
+        "{degraded_line}{}",
+        truncate(&format!("{header} {body}"), cap)
+    ))
 }
+
+/// Longest degraded reason the PreToolUse prefix line carries.
+const DEGRADED_REASON_CAP: usize = 160;
 
 /// Open the on-disk store and render one file's signature list for the hook.
 ///
@@ -2813,9 +2844,56 @@ fn detach_post_tool_root(
 }
 
 /// Whether the rest of a shell call's rate window can be waited out in the
-/// detached child. Only unix has a shell to wait in; elsewhere a call inside the
-/// window is dropped, as it was before.
+/// detached child. Only unix has a shell to wait in.
 const WINDOW_CAN_BE_WAITED_OUT: bool = cfg!(unix);
+
+/// [`WINDOW_CAN_BE_WAITED_OUT`], which a test on one platform may override for
+/// its own thread to drive the other platform's path.
+fn window_can_be_waited_out() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = TEST_CAN_WAIT.with(std::cell::Cell::get) {
+        return forced;
+    }
+    WINDOW_CAN_BE_WAITED_OUT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CAN_WAIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// What a shell call does about the rate window, decided from the window left
+/// and whether the platform can hold a start back.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowPlan {
+    /// How long the detached build is held back before it starts.
+    delay: Option<Duration>,
+    /// Whether this start opens the window. A held-back start is not a start,
+    /// and neither is one made inside a window it could not wait out.
+    claims: bool,
+}
+
+/// Where the window has time left and the platform cannot wait it out, the
+/// call starts a build at once and leaves the earlier window as it was. The
+/// alternative, dropping the call, left a write made inside the window
+/// unindexed with nothing said; the coalescing lock still bounds the cost to
+/// one running build.
+fn window_plan(remaining: Option<Duration>, can_wait: bool) -> WindowPlan {
+    match remaining {
+        None => WindowPlan {
+            delay: None,
+            claims: true,
+        },
+        Some(left) if can_wait => WindowPlan {
+            delay: Some(left),
+            claims: false,
+        },
+        Some(_) => WindowPlan {
+            delay: None,
+            claims: false,
+        },
+    }
+}
 
 fn detach_stack_sync(
     executable: &Path,
@@ -4915,6 +4993,23 @@ mod tests {
             fs::read_to_string(&self.starts).map_or(0, |text| text.lines().count())
         }
 
+        /// The dirty marker a hook leaves for a running build of the main checkout.
+        fn dirty_marker(&self) -> PathBuf {
+            state_dir(&self.main)
+                .join("codeintel")
+                .join(BUILD_DIRTY_MARKER)
+        }
+
+        /// The main checkout's builder has exited and will not run again: its
+        /// lock is gone and no marker is left for a rerun. The builder removes
+        /// the lock and then re-reads the marker to retake it, so a marker that
+        /// is present keeps that gap from reading as "finished". Where the
+        /// rerun budget is spent a marker stays behind on purpose, and a test
+        /// there waits on its own count instead.
+        fn builder_finished(&self) -> bool {
+            !self.main_lock().exists() && !self.dirty_marker().exists()
+        }
+
         fn lock(&self) -> PathBuf {
             coalesce_lock_dir(&self.lane, "build")
         }
@@ -5634,7 +5729,13 @@ mod tests {
             None,
         );
         assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-        thread::sleep(Duration::from_millis(300));
+        // A hook that starts a build takes its coalescing lock before it
+        // returns, and the stand-in holds it until released, so the lock is the
+        // observable that no builder was spawned: nothing to wait for.
+        assert!(
+            !lane.main_lock().exists(),
+            "a failed read-only command took the build lock"
+        );
         assert_eq!(lane.builds_started(), 0, "a failed read-only command built");
 
         let outcome = run_hook(
@@ -5851,10 +5952,9 @@ mod tests {
                 None,
             );
             assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
-            assert!(eventually(|| !lane.main_lock().exists()));
+            assert!(eventually(|| lane.builder_finished()));
         }
         let elapsed = begun.elapsed();
-        thread::sleep(Duration::from_millis(300));
         let windows = 1 + (elapsed.as_secs_f64() / 2.0) as usize;
         assert!(lane.builds_started() >= 1, "the first payload must build");
         assert!(
@@ -6430,22 +6530,35 @@ mod tests {
     #[test]
     fn an_unwritable_state_directory_is_reported_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
+        // root writes through a 0o555 directory, so there is no unwritable
+        // state to report; say so instead of passing on a check that never ran.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a read-only directory is writable");
+            return;
+        }
         let lane = Lane::new("trail-ro", true);
         let codeintel = state_dir(&lane.main).join("codeintel");
         fs::create_dir_all(&codeintel).unwrap();
         fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o555)).unwrap();
-        for payload in [
+        let outcomes: Vec<HookOutcome> = [
             shell_payload(&lane.main, "git merge feature"),
             edit_in_main(&lane),
-        ] {
-            let outcome = run_hook(HookEvent::PostToolUse, &payload, &lane.exe, None);
+        ]
+        .iter()
+        .map(|payload| run_hook(HookEvent::PostToolUse, payload, &lane.exe, None))
+        .collect();
+        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o755)).unwrap();
+        for outcome in &outcomes {
+            assert_eq!(outcome.exit_code, 1, "{:?}", outcome.stderr_line);
             assert!(
-                outcome.exit_code == 0 || outcome.exit_code == 1,
-                "{}",
-                outcome.exit_code
+                outcome
+                    .stderr_line
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "an unwritable state directory must say why: {:?}",
+                outcome.stderr_line
             );
         }
-        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(lane.builds_started(), 0);
     }
 
@@ -6632,8 +6745,7 @@ mod tests {
             eventually(|| lane.builds_started() >= 1),
             "a stale marker wedged the build"
         );
-        assert!(eventually(|| !lane.main_lock().exists()));
-        thread::sleep(Duration::from_millis(300));
+        assert!(eventually(|| lane.builder_finished()));
         assert_eq!(lane.builds_started(), 1, "a stale marker caused a rerun");
 
         // A writer that dirties the tree during every run.
@@ -6652,12 +6764,18 @@ mod tests {
             &lane.exe,
             None,
         );
-        assert!(eventually(|| lane.builds_started() > before));
-        assert!(eventually(|| !lane.main_lock().exists()));
-        thread::sleep(Duration::from_millis(500));
+        // The spent budget leaves its marker behind, so the builder is done
+        // when its lock is gone with every permitted run counted. An extra run
+        // would hold the lock past that count and fail the equality below.
+        let expected = 1 + MAX_TRAILING_RUNS as usize;
+        assert!(
+            eventually(|| !lane.main_lock().exists() && lane.builds_started() - before >= expected),
+            "{} builds, expected {expected}",
+            lane.builds_started() - before
+        );
         assert_eq!(
             lane.builds_started() - before,
-            1 + MAX_TRAILING_RUNS as usize,
+            expected,
             "one build plus the bounded trailing runs, no more"
         );
     }
@@ -6704,10 +6822,9 @@ mod tests {
             "no build started"
         );
         assert!(
-            eventually(|| !lane.main_lock().exists()),
+            eventually(|| lane.builder_finished()),
             "the lock outlived its builder"
         );
-        thread::sleep(Duration::from_millis(300));
         assert!(
             !marker.exists(),
             "a marker survived its builder with {} builds run",
@@ -8889,8 +9006,8 @@ mod tests {
                 r#"{"query_ready":false,"node_count":10}"#,
             ),
             (
-                "degraded",
-                r#"{"query_ready":true,"degraded_reason":"schema","node_count":10}"#,
+                "not query ready and degraded",
+                r#"{"query_ready":false,"degraded_reason":"schema","node_count":10}"#,
             ),
             ("empty", r#"{"query_ready":true,"node_count":0}"#),
             // Absent `query_ready` with a populated store. Without this case
@@ -8924,6 +9041,188 @@ mod tests {
             text.chars().count() <= PRE_TOOL_CONTEXT_CAP,
             "directive is {} chars, cap is {PRE_TOOL_CONTEXT_CAP}",
             text.chars().count()
+        );
+    }
+
+    /// A degraded store that can still answer keeps its context, led by one
+    /// line naming the reason; one that cannot answer stays silent.
+    #[test]
+    fn a_degraded_but_query_ready_index_keeps_its_context_behind_a_reason_line() {
+        let degraded = r#"{"query_ready":true,"degraded_reason":"watcher_lagging","node_count":10,
+                           "edge_count":20,"generation_id":3,"is_fresh":true}"#;
+        let text = compose_pre_tool_use(degraded, Path::new("/repo/Demo"), None)
+            .expect("a degraded but query-ready index still emits");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.contains("degraded"), "{text}");
+        assert!(first.contains("watcher_lagging"), "{text}");
+        assert!(text.contains("DevMap has Demo indexed"), "{text}");
+        assert!(text.contains("devmap_search"), "{text}");
+        // The reason line does not eat into the directive's own cap.
+        assert!(text.contains("walk_incomplete"), "{text}");
+        let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
+        assert!(rest.chars().count() <= PRE_TOOL_CONTEXT_CAP, "{rest}");
+    }
+
+    /// A blank or whitespace-only reason names nothing: no line, the plain
+    /// context, as for a null one. A padded reason is trimmed.
+    #[test]
+    fn an_empty_degraded_reason_adds_no_line_and_a_padded_one_is_trimmed() {
+        let plain = |reason: &str| {
+            let status = json!({"query_ready": true, "degraded_reason": reason,
+                                "node_count": 10, "is_fresh": true});
+            compose_pre_tool_use(&status.to_string(), Path::new("/repo/Demo"), None).expect("emits")
+        };
+        for blank in ["", "   ", "\t\n"] {
+            let text = plain(blank);
+            assert!(!text.contains("degraded"), "{blank:?}: {text}");
+            assert!(text.starts_with("DevMap has Demo indexed"), "{text}");
+        }
+        let text = plain("  watcher_lagging \n");
+        assert!(
+            text.starts_with("DevMap index is degraded: watcher_lagging. Treat"),
+            "{text}"
+        );
+    }
+
+    /// A store whose resolver stamp mismatches (`is_fresh:false`, source
+    /// unchanged) is not "behind the working tree"; one a newer devmap wrote
+    /// also keeps its "update devmap" instruction past the reason cap.
+    #[test]
+    fn a_resolver_mismatch_is_not_called_behind_the_tree() {
+        let older = r#"{"query_ready":true,"is_fresh":false,"analyzer_freshness":false,
+            "source_freshness":true,"pending_count":0,"node_count":10,"edge_count":20,
+            "generation_id":3,"degraded_reason":"resolver stamp differs from this build"}"#;
+        let text = compose_pre_tool_use(older, Path::new("/repo/Demo"), None).expect("emits");
+        assert!(!text.contains("behind the working tree"), "{text}");
+        assert!(text.contains("not confirmed current"), "{text}");
+
+        let newer = json!({"query_ready": true, "is_fresh": false, "analyzer_freshness": false,
+            "source_freshness": true, "pending_count": 0, "node_count": 10, "edge_count": 20,
+            "generation_id": 3,
+            "degraded_reason": format!("{} (stamp 9, this build 4){}",
+                devmap_store::RESOLVER_NEWER_REASON, " x".repeat(200))});
+        let text =
+            compose_pre_tool_use(&newer.to_string(), Path::new("/repo/Demo"), None).expect("emits");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(
+            first.contains(devmap_store::RESOLVER_NEWER_REASON),
+            "{text}"
+        );
+        assert!(
+            first.contains("update devmap instead of rebuilding"),
+            "{text}"
+        );
+        assert!(!text.contains("behind the working tree"), "{text}");
+
+        for behind in [
+            r#"{"query_ready":true,"is_fresh":false,"source_freshness":false,"node_count":1}"#,
+            r#"{"query_ready":true,"is_fresh":false,"source_freshness":true,"pending_count":2,"node_count":1}"#,
+        ] {
+            let text = compose_pre_tool_use(behind, Path::new("/repo/Demo"), None).unwrap();
+            assert!(text.contains("behind the working tree"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_degraded_index_that_is_not_query_ready_stays_silent() {
+        let status = r#"{"query_ready":false,"degraded_reason":"schema","node_count":10}"#;
+        assert!(compose_pre_tool_use(status, Path::new("/repo/Demo"), None).is_none());
+    }
+
+    #[test]
+    fn a_hostile_degraded_reason_stays_one_bounded_line() {
+        let reason = format!("bad\nreason{}", "x".repeat(500));
+        let status = json!({"query_ready": true, "degraded_reason": reason, "node_count": 10});
+        let text = compose_pre_tool_use(&status.to_string(), Path::new("/repo/Demo"), None)
+            .expect("emits");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.contains("bad\\u000areason"), "{text}");
+        assert!(
+            first.chars().count() < 260,
+            "{} chars",
+            first.chars().count()
+        );
+    }
+
+    /// Restores the thread's `window_can_be_waited_out` on drop.
+    #[cfg(unix)]
+    struct ForcedCanWait;
+
+    #[cfg(unix)]
+    impl ForcedCanWait {
+        fn new(can_wait: bool) -> Self {
+            TEST_CAN_WAIT.with(|cell| cell.set(Some(can_wait)));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForcedCanWait {
+        fn drop(&mut self) {
+            TEST_CAN_WAIT.with(|cell| cell.set(None));
+        }
+    }
+
+    /// Where a start cannot be held back (Windows), a shell write inside the
+    /// open rate window still starts a build at once. The old early return
+    /// dropped it, so the write was never indexed. Driven on unix by forcing
+    /// the platform answer through `run_hook`.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_write_inside_the_window_starts_a_build_where_it_cannot_wait() {
+        let lane = Lane::new("window-no-wait", true);
+        fs::write(&lane.release, b"").unwrap();
+        claim_shell_build_window(&lane.main);
+        assert!(
+            shell_build_window_remaining(&lane.main).is_some(),
+            "the window was not open"
+        );
+        let _forced = ForcedCanWait::new(false);
+        let outcome = run_hook(
+            HookEvent::PostToolUse,
+            &shell_payload(&lane.main, "git merge feature"),
+            &lane.exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        assert!(
+            eventually(|| lane.builds_started() == 1),
+            "a shell write inside the window was dropped"
+        );
+    }
+
+    /// The rate window's decision on every platform: where a start cannot be
+    /// held back, the call starts at once and does not claim the window.
+    #[test]
+    fn the_window_plan_never_drops_a_call_and_claims_only_a_fresh_window() {
+        let left = Some(Duration::from_millis(1500));
+        assert_eq!(
+            window_plan(None, true),
+            WindowPlan {
+                delay: None,
+                claims: true
+            }
+        );
+        assert_eq!(
+            window_plan(None, false),
+            WindowPlan {
+                delay: None,
+                claims: true
+            }
+        );
+        assert_eq!(
+            window_plan(left, true),
+            WindowPlan {
+                delay: left,
+                claims: false
+            }
+        );
+        assert_eq!(
+            window_plan(left, false),
+            WindowPlan {
+                delay: None,
+                claims: false
+            }
         );
     }
 
