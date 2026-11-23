@@ -31,7 +31,7 @@ use devmap_extract::extract_file;
 use devmap_extract::model::Extraction;
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
-use devmap_store::{Store, CURRENT_SCHEMA_VERSION, GENERATION_RETENTION};
+use devmap_store::{Store, WalCheckpointMode, CURRENT_SCHEMA_VERSION, GENERATION_RETENTION};
 
 #[cfg(unix)]
 #[path = "support/hold_uncommitted.rs"]
@@ -2355,10 +2355,6 @@ fn atk1_three_readers_in_a_second_process_race_never_answer_empty_or_partial() {
             }
         }
     }
-    eprintln!(
-        "atk1: reads={reads} answered={answered} refused={refused} violations={}",
-        violations.len()
-    );
     assert!(reads > 50, "the probe never got to read: {reads}");
     assert!(
         violations.is_empty(),
@@ -2376,8 +2372,21 @@ fn atk1_three_readers_in_a_second_process_race_never_answer_empty_or_partial() {
 
 // ---- attack 3 / 4 hooks ---------------------------------------------------
 
+/// One timed step of a writer that ran while a snapshot was open: its label,
+/// how long it took, and its outcome (`Err` carries SQLite's own error code
+/// when the failure was SQLite's, so no assertion reads a Debug string).
+type StarveEntry = (
+    &'static str,
+    Duration,
+    Result<(), Option<rusqlite::ErrorCode>>,
+);
+
+fn step_outcome<T>(result: Result<T, rusqlite::Error>) -> Result<(), Option<rusqlite::ErrorCode>> {
+    result.map(|_| ()).map_err(|error| error.sqlite_error_code())
+}
+
 thread_local! {
-    static STARVE_LOG: RefCell<Vec<(&'static str, Duration, String)>> = const { RefCell::new(Vec::new()) };
+    static STARVE_LOG: RefCell<Vec<StarveEntry>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs on the reading thread with the snapshot open: a second connection does
@@ -2393,17 +2402,13 @@ fn starving_pause() {
     let t = Instant::now();
     let (e, r, a) = pipeline(&[("src/z.py", "def zed():\n    return 1\n")]);
     let saved = writer.save_generation(&e, &r, &a);
-    log.push((
-        "save_generation",
-        t.elapsed(),
-        format!("{:?}", saved.map(|_| ())),
-    ));
+    log.push(("save_generation", t.elapsed(), step_outcome(saved)));
     let t = Instant::now();
     let pruned = writer.prune_generations_except_latest(1);
-    log.push(("prune", t.elapsed(), format!("{pruned:?}")));
+    log.push(("prune", t.elapsed(), step_outcome(pruned)));
     let t = Instant::now();
     let cp = writer.checkpoint_wal();
-    log.push(("checkpoint_wal", t.elapsed(), format!("{cp:?}")));
+    log.push(("checkpoint_wal", t.elapsed(), step_outcome(cp)));
     STARVE_LOG.with(|slot| *slot.borrow_mut() = log);
 }
 
@@ -2426,35 +2431,26 @@ fn atk3_a_writer_commit_prune_and_checkpoint_during_the_snapshot_are_bounded() {
         let (dir, store, old, _latest) = raced_generation();
         let guard = arm_pause(&dir, false);
         devmap_store::db::set_generation_read_pause(Some(starving_pause));
-        let t = Instant::now();
         let raced = read_list(&store, old);
-        let total = t.elapsed();
         let log = STARVE_LOG.with(|slot| slot.borrow().clone());
         let fires = pause_fires();
         drop(guard);
-        let after = store.checkpoint_wal();
+        let after = store.checkpoint_wal().expect("the checkpoint after the read");
         let refused_after = store.list_generation_paths(old).is_err();
         let _ = fs::remove_dir_all(&dir);
-        (
-            raced,
-            total,
-            log,
-            fires,
-            format!("{after:?}"),
-            refused_after,
-        )
+        (raced, log, fires, after, refused_after)
     });
-    let (raced, total, log, fires, after, refused_after) = outcome;
-    eprintln!("atk3: total={total:?} log={log:?} after={after}");
+    let (raced, log, fires, after, refused_after) = outcome;
     assert_eq!(fires, 1);
+    assert_eq!(log.len(), 3, "the writer's three steps did not all run");
     for (label, elapsed, result) in &log {
         assert!(
             *elapsed < Duration::from_secs(4),
-            "{label} took {elapsed:?}: {result}"
+            "{label} took {elapsed:?}: {result:?}"
         );
         assert!(
-            !result.contains("Err"),
-            "{label} failed while the snapshot was open: {result}"
+            result.is_ok(),
+            "{label} failed while the snapshot was open: {result:?}"
         );
     }
     let raced = raced.unwrap().expect("the snapshot read answered None");
@@ -2463,9 +2459,10 @@ fn atk3_a_writer_commit_prune_and_checkpoint_during_the_snapshot_are_bounded() {
         "the paused list lost its rows: {raced:?}"
     );
     assert!(refused_after, "the prune never committed");
-    assert!(
-        after.contains("Truncate") && after.contains("busy: 0"),
-        "WAL not truncatable once the read ended: {after}"
+    assert_eq!(
+        (after.busy, after.mode),
+        (0, WalCheckpointMode::Truncate),
+        "WAL not truncatable once the read ended: {after:?}"
     );
 }
 
@@ -2489,8 +2486,8 @@ fn atk4_a_panicking_pause_rolls_the_snapshot_back_and_fails_closed() {
     let other = Store::open(dir.join("index.sqlite")).unwrap();
     let cp = other.checkpoint_wal().unwrap();
     assert_eq!(
-        (cp.busy, format!("{:?}", cp.mode)),
-        (0, "Truncate".to_string()),
+        (cp.busy, cp.mode),
+        (0, WalCheckpointMode::Truncate),
         "{cp:?}"
     );
     // The poisoned handle refuses; it does not answer, and certainly not empty.
@@ -2533,10 +2530,26 @@ fn atk4_the_seam_is_thread_local_and_inert_when_unset() {
 
 // ---- attack 5 -------------------------------------------------------------
 
+/// SQLite's bound-variable limit on the connection this build links, read from
+/// the library rather than quoted (the bundled default is 32766 and
+/// `SQLITE_MAX_VARIABLE_NUMBER` can change it at build time).
+fn sqlite_variable_limit() -> usize {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    usize::try_from(connection.limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER).unwrap())
+        .unwrap()
+}
+
+/// The keyed ledger reads are chunked, never truncated and never refused for
+/// size: every list, up to far past SQLite's variable limit and across its
+/// exact boundary (limit - 1, limit, limit + 1 keys), is answered with the
+/// row that the one real key owns.
 #[test]
-fn atk5_key_lists_at_the_sqlite_variable_limit_are_answered_or_refused_never_empty() {
+fn atk5_key_lists_across_the_sqlite_variable_limit_are_all_answered() {
     let (dir, store, old, _latest) = raced_generation();
-    for filler in [100usize, 32_000, 32_700, 32_760, 32_764, 40_000, 100_000] {
+    let limit = sqlite_variable_limit();
+    let mut sizes = vec![100usize, limit - 1, limit, limit + 1, limit * 3];
+    sizes.sort_unstable();
+    for filler in sizes {
         let mut keys: Vec<String> = (0..filler).map(|n| format!("nokey{n}")).collect();
         keys.push("settle".to_string());
         for (label, only_attr) in [("naming", false), ("unattributed", true)] {
@@ -2545,22 +2558,21 @@ fn atk5_key_lists_at_the_sqlite_variable_limit_are_answered_or_refused_never_emp
             } else {
                 store.unresolved_sites_naming(old, &keys, 5)
             };
-            match got {
-                Ok(Some(m)) => {
-                    let rows = m.get("settle").map(|(r, _)| r.len()).unwrap_or(0);
-                    assert!(
-                        rows >= 1,
-                        "{label} keys={}: Ok(Some) but settle lost its rows",
-                        keys.len()
-                    );
-                    eprintln!(
-                        "atk5 {label} keys={}: answered, settle rows={rows}",
-                        keys.len()
-                    );
-                }
-                Ok(None) => panic!("{label} keys={}: None for a live generation", keys.len()),
-                Err(e) => eprintln!("atk5 {label} keys={}: honest Err: {e}", keys.len()),
-            }
+            let answered = got
+                .unwrap_or_else(|error| panic!("{label} keys={}: refused: {error}", keys.len()))
+                .unwrap_or_else(|| panic!("{label} keys={}: None for a live generation", keys.len()));
+            let rows = answered.get("settle").map_or(0, |(rows, _)| rows.len());
+            assert!(
+                rows >= 1,
+                "{label} keys={}: answered, but settle lost its rows",
+                keys.len()
+            );
+            assert_eq!(
+                answered.len(),
+                keys.len(),
+                "{label} keys={}: a key has no entry in the answer",
+                keys.len()
+            );
         }
     }
     let _ = fs::remove_dir_all(&dir);
@@ -2598,8 +2610,7 @@ fn busy_writer_pause() {
     conn.busy_timeout(Duration::from_millis(300)).unwrap();
     let t = Instant::now();
     let r = conn.execute("DELETE FROM unresolved_rows", []);
-    STARVE_LOG
-        .with(|slot| *slot.borrow_mut() = vec![("raw_delete", t.elapsed(), format!("{r:?}"))]);
+    STARVE_LOG.with(|slot| *slot.borrow_mut() = vec![("raw_delete", t.elapsed(), step_outcome(r))]);
 }
 
 #[test]
@@ -2625,16 +2636,7 @@ fn atk6_a_store_in_rollback_journal_mode() {
     }
     assert_eq!(mode_of(&path).to_lowercase(), "delete");
     // read-only open on a rollback-mode file.
-    let ro = Store::open_read_only(&path);
-    eprintln!(
-        "atk6: open_read_only on DELETE-mode: {}",
-        if ro.is_ok() {
-            "ok".to_string()
-        } else {
-            format!("{:?}", ro.as_ref().err())
-        }
-    );
-    let ro = ro.expect("read-only open on a rollback-mode copy");
+    let ro = Store::open_read_only(&path).expect("read-only open on a rollback-mode copy");
     let baseline = read_list(&ro, old).unwrap().unwrap();
     assert!(baseline.iter().any(|p| p == "src/a.py"));
     assert_eq!(
@@ -2651,16 +2653,18 @@ fn atk6_a_store_in_rollback_journal_mode() {
         let log = STARVE_LOG.with(|slot| slot.borrow().clone());
         (raced, pause_fires(), log)
     });
-    eprintln!("atk6: writer during rollback-mode snapshot: {log:?}");
     assert_eq!(fires, 1);
     assert_eq!(raced.unwrap().unwrap(), baseline);
     assert!(log[0].1 < Duration::from_secs(3), "{log:?}");
     assert!(
-        log[0].2.contains("DatabaseBusy") || log[0].2.contains("DatabaseLocked"),
+        matches!(
+            log[0].2,
+            Err(Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        ),
         "the writer was not refused as busy: {log:?}"
     );
-    // Full Store::open converts to WAL: show it.
+    // Full Store::open converts to WAL.
     drop(Store::open(&path).unwrap());
-    eprintln!("atk6: after Store::open, journal_mode = {}", mode_of(&path));
+    assert_eq!(mode_of(&path).to_lowercase(), "wal");
     let _ = fs::remove_dir_all(&dir);
 }

@@ -60,6 +60,10 @@ libc.workspace = true
 # Already a workspace dependency built for devmap-store, so no new crate enters
 # the tree — the same reasoning devmap-serve records for its own dev use.
 rusqlite.workspace = true
+# The pause seam (`set_generation_read_pause`) the pruned-generation tests race.
+# A dev-dependency feature does not reach release builds under resolver 3.
+devmap-store = { path = "../devmap-store", default-features = false, features = ["test-hooks"] }
+
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
