@@ -186,11 +186,12 @@ fn run_integrate(
     // only. It is keyed on the documents as they stand after this run, not on
     // `changed`: an entry that was already current still breaks, and a removal
     // (`retire_beside_plugin`) leaves nothing to break.
-    let registered = report
-        .global_mcp
-        .iter()
-        .chain(report.project_mcp.iter())
-        .any(|outcome| document_registers_executable(&outcome.path, &executable));
+    let names_executable = |outcome: &integrate::McpMergeOutcome, project_scope: bool| {
+        integrate::registered_devmap_command(host, &outcome.path, project_scope)
+            .is_some_and(|command| command_names_executable(&command, &executable))
+    };
+    let registered = report.global_mcp.iter().any(|o| names_executable(o, false))
+        || report.project_mcp.iter().any(|o| names_executable(o, true));
     if let Some(warning) = claude::mcp_receipt_note(&executable, registered) {
         report.notes.push(warning);
     }
@@ -282,46 +283,19 @@ fn run_integrate(
     Ok(())
 }
 
-/// True when the host document at `path` registers `devmap` with `executable`
-/// as its command, as written by Claude/Cursor-style JSON (`mcpServers`),
-/// OpenCode (`mcp`, a command array) or Codex TOML (`mcp_servers`).
+/// True when a registered `command` is `executable`, as written or resolved.
 ///
-/// A document that is missing, oversized or unparsable registers nothing.
-fn document_registers_executable(path: &Path, executable: &Path) -> bool {
-    const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() || meta.len() > MAX_DOCUMENT_BYTES {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let command: Option<String> = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        let entry = json
-            .pointer("/mcpServers/devmap/command")
-            .or_else(|| json.pointer("/mcp/devmap/command/0"));
-        entry.and_then(|v| v.as_str()).map(str::to_owned)
-    } else if let Ok(toml) = text.parse::<toml::Table>() {
-        toml.get("mcp_servers")
-            .and_then(|servers| servers.get("devmap"))
-            .and_then(|entry| entry.get("command"))
-            .and_then(|command| command.as_str())
-            .map(str::to_owned)
-    } else {
-        None
-    };
-    let Some(command) = command else {
-        return false;
-    };
-    let command = Path::new(&command);
+/// Only an absolute command is resolved: a bare `devmap` is looked up on
+/// `PATH` by the host, never against this process's working directory.
+fn command_names_executable(command: &str, executable: &Path) -> bool {
+    let command = Path::new(command);
     command == executable
-        || matches!(
-            (command.canonicalize(), executable.canonicalize()),
-            (Ok(a), Ok(b)) if a == b
-        )
+        || (command.is_absolute()
+            && executable.is_absolute()
+            && matches!(
+                (command.canonicalize(), executable.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            ))
 }
 
 /// Map context for integrate: prefer an on-disk repo map, else an empty shell

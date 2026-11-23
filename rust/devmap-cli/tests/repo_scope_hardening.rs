@@ -992,8 +992,32 @@ fn integrate_claude_notes_a_lane_binary_only_while_an_entry_names_it() {
     let home = scratch("lane-note-retire-home");
     let project = scratch("lane-note-retire-project");
     install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
-    claude_json_with_devmap(&home);
+    std::fs::write(
+        home.join(".claude.json"),
+        serde_json::json!({"mcpServers": {"devmap": {"command": bin_arg, "args": ["mcp"]}}}).to_string(),
+    )
+    .unwrap();
     let retired = integrate_claude(&home, &project, &["--binary", &bin_arg]);
     assert_eq!(claude_json_outcome(&retired, &home)["changed"], true, "{retired}");
     assert!(!has_lane_note(&retired), "a removal breaks nothing: {retired}");
+    assert!(devmap_entry(&home.join(".claude.json")).is_none(), "{retired}");
+}
+
+/// Warp's document *is* the server map (no container key), so a reader that
+/// hard-codes `mcpServers` misses it.
+#[test]
+fn integrate_warp_notes_a_lane_binary_in_a_rootless_document() {
+    let bin = lane_binary();
+    let bin_arg = bin.display().to_string();
+    let home = scratch("lane-warp-home");
+    let project = scratch("lane-warp-project");
+    let project_arg = project.display().to_string();
+    let out = run_in(
+        &project,
+        &["--json", "integrate", "warp", "--project-root", &project_arg, "--binary", &bin_arg],
+        Some(&home),
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = one_json(&out, "integrate warp");
+    assert!(has_lane_note(&report), "{report}");
 }

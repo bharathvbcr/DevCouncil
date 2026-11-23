@@ -2282,6 +2282,46 @@ pub fn empty_map() -> Value {
     json!({})
 }
 
+/// The `command` of the `devmap` server that the host document at `path`
+/// registers, read as the integrator itself reads it.
+///
+/// `project_scope` is true for a document in `report.project_mcp` and false for
+/// one in `report.global_mcp`. A project document is read without following a
+/// link ([`read_project_doc`]); a user-level one is read through
+/// [`read_host_config`], because dotfile symlinks are normal there. The shape
+/// (container key, JSON or TOML, argv form) is the host's own
+/// [`Host::project_document`] when `path` is that document, Codex's user-level
+/// `config.toml` included, and the `mcpServers` shape otherwise. `None` when
+/// the document is missing, unreadable, unparsable or has no `devmap` command.
+pub(crate) fn registered_devmap_command(
+    host: Host,
+    path: &Path,
+    project_scope: bool,
+) -> Option<String> {
+    let own = host.project_document();
+    let own_shape =
+        (project_scope && path.ends_with(own.rel)) || (!project_scope && host == Host::Codex);
+    let doc = if own_shape {
+        own
+    } else {
+        Host::Claude.project_document()
+    };
+    let text = if project_scope {
+        read_project_doc(path).ok().flatten()?
+    } else {
+        read_host_config(path).ok()?
+    };
+    let document: Value = match doc.format {
+        DocFormat::Json => serde_json::from_str(&text).ok()?,
+        DocFormat::Toml => serde_json::to_value(text.parse::<toml::Table>().ok()?).ok()?,
+    };
+    let command = server_of(&document, &doc, MCP_SERVER_NAME)?.get("command")?;
+    command
+        .as_str()
+        .or_else(|| command.as_array()?.first()?.as_str())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
