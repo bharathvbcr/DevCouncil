@@ -6,6 +6,7 @@ import (
 	"crypto/sha1" // #nosec G505 -- the commit-graph trailer is a SHA-1 of the file
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -110,9 +111,14 @@ func gitOutIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(testsupport.Tool(t, "git"), args...)
 	cmd.Dir = dir
+	cmd.Env = testGitEnv()
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("git %v in %s: %v", args, dir, err)
+		var stderr []byte
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+			stderr = ee.Stderr
+		}
+		t.Fatalf("git %v in %s: %v %s", args, dir, err, stderr)
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -786,6 +792,7 @@ func TestGitlinkMoreThanTheBoundIsRefusedNotSampled(t *testing.T) {
 	}
 	cmd := exec.Command(testsupport.Tool(t, "git"), "update-index", "--add", "--index-info")
 	cmd.Dir = root
+	cmd.Env = testGitEnv()
 	cmd.Stdin = &index
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("update-index: %v %s", err, out)
