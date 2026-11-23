@@ -1,0 +1,31 @@
+name: Dependency review
+
+# Blocks a pull request that adds a dependency with a known vulnerability.
+# Needs the dependency graph, which is on for public repositories.
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+# One run per workflow and ref: a newer push supersedes the one in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    name: Dependency review
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
