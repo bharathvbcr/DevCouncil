@@ -21,6 +21,23 @@ Use the resolved map for navigation, then inspect actual source. Check query
 freshness, coverage gaps, confidence and truncation. An affected-test list
 suggests tests to run; it does not record a test result.
 
+## Testing Go packages that link Gusset from a linked worktree
+
+`cmd/devcouncil` and `gussetfn` link a sibling Gusset checkout and
+`libgusset.a`; from `.gitpulse/worktrees/<lane>` the `go.mod` replace
+(`../../../gusset`) and the archive path do not resolve ("[setup failed]").
+Run those tests through the lane wrapper, which writes a `go.work` in the
+worktree's private git dir (nothing in the tree changes) and points the linker
+at the main checkout's archive. In the main checkout it is a no-op.
+
+```bash
+node scripts/lane-env.mjs -- go -C backend/go_orchestrator test ./cmd/devcouncil/... -count=1
+node scripts/lane-env.mjs --help
+```
+
+Build the archive once in the main checkout first (`node scripts/ci-local.mjs
+--only "gusset engine"`). Do not hand-roll a `-modfile`.
+
 ## Connect the chosen host
 
 Preview and apply standalone code-navigation integration:
