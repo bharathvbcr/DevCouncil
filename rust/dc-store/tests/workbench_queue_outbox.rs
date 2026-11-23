@@ -10,6 +10,8 @@ use std::sync::{
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
+mod support;
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -61,12 +63,12 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
 }
 
 fn call(s: &Store, method: &str, input: &str) -> String {
-    s.workbench_request(method, input)
+    s.workbench_request(method, &support::real_checkouts(input))
         .unwrap_or_else(|e| panic!("{method} {input}: {e}"))
 }
 
 fn refuse(s: &Store, method: &str, input: &str, code: &str) -> String {
-    match s.workbench_request(method, input) {
+    match s.workbench_request(method, &support::real_checkouts(input)) {
         Ok(ok) => panic!("expected {method} {input} to fail ({code}), got {ok}"),
         Err(e) => {
             assert_eq!(e.code, code, "{method} {input}: {}", e.message);

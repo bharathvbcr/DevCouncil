@@ -4,6 +4,8 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
+mod support;
+
 fn fixture() -> (Store, Arc<AtomicI64>) {
     let mut store = Store::open_in_memory().unwrap();
     let clock = Arc::new(AtomicI64::new(1000));
@@ -28,36 +30,42 @@ fn request(store: &Store, method: &str, input: &str) -> Result<String, dc_store:
     store.workbench_request(method, &fixture_input(input))
 }
 
-/// POSIX fixture paths (`/checkout`, `/worktrees/…`, `local:/moved/.git`) are
-/// absolute on Unix. On Windows `Path::is_absolute` is false for them, and
-/// `runs.prepare` refuses the cwd before the test's own assertion. The same
-/// paths are embedded inside `effective_configuration` as `\"/checkout`, which
-/// the plain `:"/` rewrite never sees. A drive prefix keeps the forward
-/// slashes the fixtures compare.
+/// The fixtures name POSIX checkouts (`/checkout`, `/worktrees/…`,
+/// `local:/moved/.git`). `runs.prepare` resolves checkout paths and refuses one
+/// that is not a directory, so each is rewritten to a real directory under the
+/// temp dir; on Windows the same rewrite also makes them absolute.
 fn fixture_input(input: &str) -> String {
-    if cfg!(windows) {
-        input
-            .replace("local:/", "local:C:/")
-            .replace(r#":\"/"#, r#":\"C:/"#)
-            .replace(":\"/", ":\"C:/")
-    } else {
-        input.to_owned()
-    }
+    support::real_checkouts(input)
 }
 
 #[test]
-fn a_posix_fixture_path_is_drive_absolute_on_windows() {
+fn a_fixture_checkout_is_rewritten_to_a_real_directory() {
     let raw = r#"{"cwd":"/worktrees/a","git_dir":"/checkout/.git","identity_key":"local:/moved/.git","effective_configuration":"{\"cwd\":\"/checkout\"}"}"#;
     let got = fixture_input(raw);
-    if cfg!(windows) {
-        assert!(got.contains(r#""cwd":"C:/worktrees/a""#), "{got}");
-        assert!(got.contains(r#""git_dir":"C:/checkout/.git""#), "{got}");
-        assert!(got.contains("local:C:/moved/.git"), "{got}");
-        assert!(got.contains(r#"{\"cwd\":\"C:/checkout\"}"#), "{got}");
-        assert!(std::path::Path::new("C:/worktrees/a").is_absolute());
-    } else {
-        assert_eq!(got, raw);
+    let root = support::checkout_root();
+    assert!(
+        got.contains(&format!(r#""cwd":"{root}/worktrees/a""#)),
+        "{got}"
+    );
+    assert!(
+        got.contains(&format!(r#""git_dir":"{root}/checkout/.git""#)),
+        "{got}"
+    );
+    assert!(got.contains(&format!("local:{root}/moved/.git")), "{got}");
+    assert!(
+        got.contains(&format!(r#"{{\"cwd\":\"{root}/checkout\"}}"#)),
+        "{got}"
+    );
+    for dir in ["worktrees/a", "checkout", "moved"] {
+        assert!(
+            std::path::Path::new(&format!("{root}/{dir}")).is_dir(),
+            "{dir}"
+        );
     }
+    assert_eq!(
+        fixture_input(r#"{"cwd":"relative"}"#),
+        r#"{"cwd":"relative"}"#
+    );
 }
 fn text(store: &Store, raw: &str, path: &str) -> String {
     store

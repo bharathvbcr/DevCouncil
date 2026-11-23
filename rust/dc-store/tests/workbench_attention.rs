@@ -4,6 +4,8 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
+mod support;
+
 fn call(s: &Store, method: &str, input: &str) -> String {
     s.workbench_request(method, input)
         .unwrap_or_else(|e| panic!("{method}: {e}"))
@@ -23,11 +25,7 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     let clock = Arc::new(AtomicI64::new(1000));
     let time = clock.clone();
     s.set_clock(move || time.load(Ordering::SeqCst));
-    let cwd = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let cwd = support::checkout_dir("checkout");
     call(
         &s,
         "repositories.put",
@@ -297,11 +295,7 @@ fn stale_updates_invalid_scopes_and_permission_fields_are_refused() {
 #[test]
 fn native_run_outcome_is_a_notice_and_does_not_mean_task_completion() {
     let (s, _) = fixture();
-    let cwd = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let cwd = support::checkout_dir("checkout");
     call(
         &s,
         "runs.prepare",

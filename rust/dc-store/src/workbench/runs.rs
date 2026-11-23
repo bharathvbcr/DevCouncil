@@ -52,19 +52,62 @@ pub(super) fn active_on_repository(
 
 /// Whether a specific working tree checkout has an active, prepared, or unresolved
 /// run that occupies the local checkout (`skip_checkout_occupancy` runs do not).
+///
+/// Directories are compared resolved, on both sides: a row stored before
+/// checkout paths were resolved still holds whatever spelling the host sent,
+/// and a stored path that no longer resolves is an error, never a free slot.
 pub(super) fn has_active_checkout(
     conn: &rusqlite::Connection,
     repository_id: &str,
     git_dir: &str,
     now: i64,
 ) -> Result<bool> {
-    Ok(conn.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND json_extract(body,'$.git_dir')=?3 AND coalesce(json_extract(body,'$.skip_checkout_occupancy'),0)=0 AND {ACTIVE})"
-        ),
-        params![now, repository_id, git_dir],
-        |r| r.get(0),
-    )?)
+    let wanted = canonical_directory(git_dir)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT json_extract(body,'$.git_dir') FROM work_runs WHERE repository_id=?2 AND coalesce(json_extract(body,'$.skip_checkout_occupancy'),0)=0 AND {ACTIVE}"
+    ))?;
+    let rows = stmt.query_map(params![now, repository_id], |row| {
+        row.get::<_, Option<String>>(0)
+    })?;
+    for row in rows {
+        let Some(stored) = row? else {
+            return Err(Error::invalid(
+                "an active run is missing git_dir; refusing to treat its checkout as free",
+            ));
+        };
+        if canonical_directory(&stored)? == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// One directory, one spelling. `..`, a symlink and a trailing slash collapse
+/// to the same string. A path that is missing, is a file, or is a symlink to a
+/// file is an error: failing to resolve a directory is neither a free checkout
+/// nor a match. The message names `path` as supplied, not the target.
+pub(super) fn canonical_directory(path: &str) -> Result<String> {
+    let canonical = std::fs::canonicalize(path)
+        .ok()
+        .filter(|canonical| canonical.is_dir())
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "checkout path does not resolve to a directory: {path}"
+            ))
+        })?;
+    canonical
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::invalid("checkout path is not valid Unicode after resolving it"))
+}
+
+/// `local:` keys name a directory and compare resolved. Any other key, such as
+/// `fixture:`, stays an exact string compare and is not rewritten.
+fn same_registered_checkout(identity: &str, common: &str) -> Result<bool> {
+    match identity.strip_prefix("local:") {
+        Some(registered) => Ok(canonical_directory(registered)? == common),
+        None => Ok(identity == format!("local:{common}")),
+    }
 }
 
 fn refuse(code: &'static str, message: &str) -> Error {
@@ -555,8 +598,8 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         ));
     }
     let cwd = absolute_path(input, "cwd")?;
-    let git_dir = absolute_path(input, "git_dir")?;
-    let common = absolute_path(input, "git_common_dir")?;
+    let git_dir = canonical_directory(&absolute_path(input, "git_dir")?)?;
+    let common = canonical_directory(&absolute_path(input, "git_common_dir")?)?;
     let head = input.text("head_oid", 64)?;
     let head_ref = input.text("head_ref", 1024)?;
     if head_ref.as_ref().is_some_and(|s| {
@@ -618,7 +661,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         [&repository_id],
         |r| r.get(0),
     )?;
-    if identity != format!("local:{common}") {
+    if !same_registered_checkout(&identity, &common)? {
         return Err(refuse(
             "repository_mismatch",
             "the supplied Git common directory does not match the registered repository",

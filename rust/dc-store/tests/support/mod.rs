@@ -107,3 +107,51 @@ pub fn plant_db(db: &Path, id: &str, status: &str, scope: &str) {
         reply.stdout
     );
 }
+
+/// A resolved directory under the system temp dir, shared by every suite in the
+/// process, standing in for the checkouts the workbench fixtures name. `runs`
+/// resolves checkout paths and refuses one that is not a directory, so a
+/// fictional `/checkout` cannot stand in for a real one.
+pub fn checkout_root() -> &'static str {
+    static ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let path = std::env::temp_dir().join("dc-store-fixture-checkouts");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(&path)
+            .unwrap()
+            .to_str()
+            .expect("temp paths are unicode")
+            .replace('\\', "/")
+    })
+}
+
+/// A fixture checkout `name` under [`checkout_root`], with its `.git`
+/// directory created, as the path the fixtures use for `cwd`, `git_dir` and
+/// `local:` identity keys.
+pub fn checkout_dir(name: &str) -> String {
+    let path = format!("{}/{name}", checkout_root());
+    std::fs::create_dir_all(format!("{path}/.git")).unwrap();
+    path
+}
+
+/// Rewrites the fixture checkouts `/checkout`, `/worktrees`, `/moved`,
+/// `/clone` and `/tmp` (JSON string values and `local:` identity keys,
+/// escaped or not) to directories under [`checkout_root`] and creates each
+/// one. A fixture that names none of those prefixes passes through unchanged.
+pub fn real_checkouts(input: &str) -> String {
+    let root = checkout_root();
+    let mut out = input.to_owned();
+    for name in ["checkout", "worktrees", "moved", "clone", "tmp"] {
+        for lead in ["\"", "local:"] {
+            out = out.replace(&format!("{lead}/{name}"), &format!("{lead}{root}/{name}"));
+        }
+    }
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find(root) {
+        rest = &rest[at..];
+        let end = rest.find(['"', '\\']).unwrap_or(rest.len());
+        std::fs::create_dir_all(&rest[..end]).unwrap();
+        rest = &rest[end..];
+    }
+    out
+}
