@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it, after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { stampedBuild, writeStamp } from "./gusset-engine-stamp.mjs";
+import { engineInputs, stampedBuild, writeStamp } from "./gusset-engine-stamp.mjs";
 import { laneGoWork, locate, plan } from "./lane-env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -322,6 +322,22 @@ describe("stampedBuild (what ensureGussetEngine runs around cargo)", () => {
 });
 
 describe("path dependencies outside the repository", () => {
+  it("a refused input surfaces as one lane-env line and exit 1, not a stack", () => {
+    const f = fixture();
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), '[dependencies]\nevil = { path = "../../../evil" }\n');
+    git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "evil dep");
+    const r = spawnSync(process.execPath, [path.join(f.lane, "scripts/lane-env.mjs"), "--check"], { cwd: f.lane, encoding: "utf8", env: GIT_ENV });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /^lane-env: .*path dependency[^\n]*\n$/);
+  });
+  it("[lib] / [[bin]] / [[test]] path entries are not dependencies", () => {
+    const f = fixture();
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"),
+      '[lib]\npath = "../../../elsewhere/lib.rs"\n[[test]]\nname = "t"\npath = "../../../elsewhere/t.rs"\n[dependencies]\ndc-glob = { path = "../dc-glob" }\n[dependencies.gusset_core]\npath = "../../../gusset/crates/gusset"\n');
+    git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "targets");
+    assert.doesNotThrow(() => engineInputs(f.lane, f.gusset));
+    assert.deepEqual(Object.keys(engineInputs(f.lane, f.gusset).stamp.trees).sort(), ["rust-toolchain.toml", "rust/dc-glob", "rust/gusset-engine"]);
+  });
   it("are refused unless they are under the sibling gusset", () => {
     const f = fixture();
     put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"),

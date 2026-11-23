@@ -146,7 +146,12 @@ export function chooseEngine(loc, { engineDir, env, gusset }) {
       warnings: [`WARNING: linking ${path.join(d, ARCHIVE)} without checking that it matches this lane's engine sources`],
     };
   } else {
-    const inputs = engineInputs(loc.root, gusset);
+    let inputs;
+    try {
+      inputs = engineInputs(loc.root, gusset);
+    } catch (e) {
+      throw new LaneError(e.message);
+    }
     const build =
       `build one in the lane: rust/gusset-engine/cgo-env.sh --export (from ${loc.root}; cargo resolves the sibling gusset relative to the checkout, so this needs GUSSET_DIR-compatible layout); ` +
       `or, if the lane's engine inputs equal main's, build main's: (cd ${loc.mainRoot} && npm run ci:local -- --only "gusset engine"). ` +

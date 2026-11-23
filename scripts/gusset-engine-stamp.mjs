@@ -4,7 +4,7 @@
  * consumer can tell whether it still matches a checkout's sources.
  *
  *   node scripts/gusset-engine-stamp.mjs begin <archive-dir> <gusset-dir>   # deletes the old stamp, prints the inputs
- *   node scripts/gusset-engine-stamp.mjs write <archive-dir> <gusset-dir> <inputs-from-begin>
+ *   node scripts/gusset-engine-stamp.mjs write <archive-dir> <gusset-dir> < inputs-from-begin
  *
  * A build is: begin (delete the old stamp, record the inputs), build, write
  * (only if the inputs are unchanged by the build and the archive exists). A
@@ -34,6 +34,26 @@ function git(cwd, ...args) {
   return r.stdout.trim();
 }
 
+/**
+ * The `path = "..."` values of dependency tables only ([dependencies],
+ * [dev-/build-dependencies], [workspace.dependencies], [target.*.dependencies]
+ * and their [dependencies.name] forms); [lib], [[bin]], [[test]] paths are targets.
+ * Yields match-like arrays: m[1] is the path.
+ */
+function* dependencyPaths(toml) {
+  const depTable = /^(?:workspace\.|target\..+\.)?(?:dev-|build-)?dependencies(?:\..+)?$/;
+  let inDeps = false;
+  for (const line of toml.split("\n")) {
+    const header = /^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*(?:#.*)?$/.exec(line);
+    if (header) {
+      inDeps = depTable.test(header[1]);
+      continue;
+    }
+    if (!inDeps) continue;
+    for (const m of line.matchAll(/\bpath\s*=\s*"([^"]+)"/g)) yield m;
+  }
+}
+
 /** Repository-relative engine inputs: the engine, its path dependencies, the toolchain file. */
 export function enginePaths(root) {
   const out = [ENGINE];
@@ -42,7 +62,7 @@ export function enginePaths(root) {
     const rel = queue.shift();
     const toml = path.join(root, rel, "Cargo.toml");
     if (!existsSync(toml)) throw new Error(`${toml} is missing (a path dependency of the engine)`);
-    for (const m of readFileSync(toml, "utf8").matchAll(/\bpath\s*=\s*"([^"]+)"/g)) {
+    for (const m of dependencyPaths(readFileSync(toml, "utf8"))) {
       const dep = path.relative(root, path.resolve(root, rel, m[1])).split(path.sep).join("/");
       if (dep.startsWith("..") || path.isAbsolute(dep)) {
         // Outside the repository it must be the sibling gusset the manifests
@@ -172,9 +192,9 @@ export function stampVerdict(inputs, dir) {
 
 const entry = process.argv[1];
 if (entry !== undefined && realpathSync(path.resolve(entry)) === realpathSync(fileURLToPath(import.meta.url))) {
-  const [cmd, archiveDir, gusset, beforeJson] = process.argv.slice(2);
-  if (!["begin", "write"].includes(cmd) || !archiveDir || !gusset || (cmd === "write" && !beforeJson)) {
-    console.error("usage: gusset-engine-stamp.mjs begin <archive-dir> <gusset-dir> | write <archive-dir> <gusset-dir> <inputs-from-begin>");
+  const [cmd, archiveDir, gusset] = process.argv.slice(2);
+  if (!["begin", "write"].includes(cmd) || !archiveDir || !gusset) {
+    console.error("usage: gusset-engine-stamp.mjs begin <archive-dir> <gusset-dir> | write <archive-dir> <gusset-dir>  (the output of begin on stdin)");
     process.exit(2);
   }
   const root = realpathSync(git(path.dirname(fileURLToPath(import.meta.url)), "rev-parse", "--show-toplevel"));
@@ -186,7 +206,7 @@ if (entry !== undefined && realpathSync(path.resolve(entry)) === realpathSync(fi
     }
     console.log(JSON.stringify(before));
   } else {
-    const r = finishStamp(root, path.resolve(gusset), archiveDir, JSON.parse(beforeJson));
+    const r = finishStamp(root, path.resolve(gusset), archiveDir, JSON.parse(readFileSync(0, "utf8")));
     console.error(`gusset-engine-stamp: ${r.written ? `wrote ${stampFile(archiveDir)} (${r.reason})` : `no stamp written: ${r.reason}`}`);
     process.exit(r.written ? 0 : 3);
   }

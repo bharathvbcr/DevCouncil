@@ -84,7 +84,7 @@ fi
 if [[ "$build" -eq 1 ]]; then
   # The stamp (for scripts/lane-env.mjs) is written only if the inputs are
   # unchanged by the build. Not fatal: the archive is fine, it is just unstamped.
-  if [[ -z "$before" ]] || ! node "$stamp_js" write "$libdir" "$gusset_dir" "$before" >&2; then
+  if [[ -z "$before" ]] || ! printf '%s' "$before" | node "$stamp_js" write "$libdir" "$gusset_dir" >&2; then
     echo "cgo-env.sh: no engine stamp was written; lane-env.mjs will refuse this archive as unstamped" >&2
   fi
 fi
