@@ -1,0 +1,57 @@
+# Path-to-label map for .github/workflows/labeler.yml (actions/labeler v5+ syntax).
+# The label names must exist in the repository; the action does not create them.
+# Paths are listed explicitly rather than as `**/*.ts` or `**/go.mod`, which
+# would also match the fixtures under rust/testdata/.
+'area: rust':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'rust/**'
+          - 'rust-toolchain.toml'
+
+'area: go':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'backend/**/*.go'
+          - 'backend/go_orchestrator/go.mod'
+          - 'benchmarks/plots/**/*.go'
+          - 'tools/accuracy/**/*.go'
+          - 'go.work'
+
+'area: frontend':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'rust/devmap-query/assets/**'
+          - 'antigravity/sidecars/**'
+
+'area: docs':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/**'
+          - '*.md'
+
+'area: ci':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - 'scripts/ci-local*.mjs'
+          - 'scripts/check-workflows*.mjs'
+          - 'dist-workspace.toml'
+
+'area: deps':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'package-lock.json'
+          - 'rust/Cargo.lock'
+          - 'rust/dc-sparse-encode/Cargo.lock'
+          - 'rust/gusset-engine/Cargo.lock'
+          - 'rust/rank-eval/Cargo.lock'
+          - 'backend/go_orchestrator/go.mod'
+          - 'benchmarks/plots/go.mod'
+          - 'tools/accuracy/go.mod'
+          - 'tools/accuracy/go.sum'
+
+'area: schemas':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'schemas/**'
+          - 'backend/contracts/**'

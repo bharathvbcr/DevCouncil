@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/bharathvbcr/DevCouncil/security/advisories/new
+    about: Do not open a public issue. Report it privately through a GitHub security advisory; see SECURITY.md.
+  - name: Question or help using DevCouncil
+    url: https://github.com/bharathvbcr/DevCouncil/discussions
+    about: Ask in Discussions. See SUPPORT.md for where each kind of question goes.
+  - name: Contributing guide
+    url: https://github.com/bharathvbcr/DevCouncil/blob/main/CONTRIBUTING.md
+    about: Development setup, the checks to run, and how pull requests are reviewed.
