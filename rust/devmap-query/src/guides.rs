@@ -1425,7 +1425,9 @@ mod tests {
             "source inspection is allowed once the absence is reported: {text}"
         );
         assert!(
-            text.contains("`devmap gap-record` is a devmap command and fails when devmap is absent"),
+            text.contains(
+                "`devmap gap-record` is a devmap command and fails when devmap is absent"
+            ),
             "the gap-record command cannot be the way to report that devmap is absent: {text}"
         );
         assert!(
@@ -1433,7 +1435,9 @@ mod tests {
             "the steps an absent devmap replaces must be named as skippable: {text}"
         );
         assert!(
-            text.contains("A `deferred`, timed-out or `ok: false` facet is likewise not a clean answer"),
+            text.contains(
+                "A `deferred`, timed-out or `ok: false` facet is likewise not a clean answer"
+            ),
             "a slow or failed Insights facet is not a clean answer: {text}"
         );
         assert!(
