@@ -47,6 +47,7 @@ pub mod model;
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.
 mod git_metadata;
+pub mod agent_text;
 pub mod paths;
 pub mod progress;
 pub mod safe_fs;
