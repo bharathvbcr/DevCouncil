@@ -35,8 +35,12 @@ node scripts/lane-env.mjs -- go -C backend/go_orchestrator test ./cmd/devcouncil
 node scripts/lane-env.mjs --help
 ```
 
-Build the archive once in the main checkout first (`node scripts/ci-local.mjs
---only "gusset engine"`). Do not hand-roll a `-modfile`.
+It links the lane's own `rust/gusset-engine/target/release/libgusset.a` if
+present (build it with `rust/gusset-engine/cgo-env.sh`), else main's, only
+when the lane's engine sources match main's; otherwise it fails and names the
+build command. The sibling gusset must be at the setup-gusset pin. The two
+linker "search path ... not found" warnings are harmless. Do not hand-roll a
+`-modfile`.
 
 ## Connect the chosen host
 

@@ -5,7 +5,8 @@
  * never reported as a pass.
  */
 import { spawnSync } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { createHash } from "node:crypto";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 /**
@@ -79,6 +80,41 @@ export function gussetPinVerdict(pin, siblingHead) {
     };
   }
   return { ok: true, message: `Gusset sibling is at the pin ${pin.slice(0, 12)}` };
+}
+
+/**
+ * ensureGussetEngine's and lane-env's pin check: read the pin from the
+ * checkout's setup-gusset action and compare it with the sibling's HEAD.
+ *
+ * @param {string} repoRoot
+ * @param {string} sibling
+ * @returns {{ ok: boolean, message: string }}
+ */
+export function gussetPinCheck(repoRoot, sibling) {
+  const actionPath = path.join(repoRoot, ".github", "actions", "setup-gusset", "action.yml");
+  const pin = existsSync(actionPath) ? gussetPin(readFileSync(actionPath, "utf8")) : undefined;
+  const head = spawnSync("git", ["-C", sibling, "rev-parse", "HEAD"], { encoding: "utf8", shell: false });
+  return gussetPinVerdict(pin, head.status === 0 ? head.stdout.trim() : "");
+}
+
+/**
+ * The CGO_CFLAGS that key Go's build and test caches on the archive actually
+ * linked (rust/gusset-engine/cgo-env.sh does the same in shell). Go hashes cgo
+ * flags, not the libraries they link, so a rebuilt archive is otherwise not
+ * relinked and a cached "ok" is replayed against the old one. Seeded from
+ * `go env`, which reports the process env, a `go env -w` setting or Go's
+ * default; an earlier hash flag is replaced, never stacked.
+ *
+ * @param {string} archive
+ * @param {Record<string, string | undefined>} env
+ * @returns {string}
+ */
+export function engineCflags(archive, env) {
+  const sum = createHash("sha256").update(readFileSync(archive)).digest("hex").slice(0, 32);
+  const goEnv = spawnSync("go", ["env", "CGO_CFLAGS"], { env, encoding: "utf8", shell: false });
+  const current = goEnv.status === 0 ? goEnv.stdout.trim() : (env.CGO_CFLAGS || "-O2 -g");
+  const base = current.replace(/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=\S*/g, "").trim();
+  return `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}`;
 }
 
 /**
