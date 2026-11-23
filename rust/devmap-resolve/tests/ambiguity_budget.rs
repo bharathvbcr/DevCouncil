@@ -731,7 +731,10 @@ fn a_callee_name_cannot_forge_a_call_site_clause_in_the_budget_note() {
     };
     // The note as the analysis hands it on: the budget sentence, then the
     // query layer's own call-site clause, joined with `"; "`.
-    let note = format!("{}; 7 call site(s) the resolver could not bind", gap.describe());
+    let note = format!(
+        "{}; 7 call site(s) the resolver could not bind",
+        gap.describe()
+    );
 
     let anchors: Vec<&str> = note
         .split("; ")
