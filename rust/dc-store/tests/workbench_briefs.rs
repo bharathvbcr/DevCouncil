@@ -648,3 +648,57 @@ fn single_line_brief_fields_are_refused_at_input_but_bodies_keep_breaks() {
     put(r#","description":"a\nb","acceptance_criteria":["c\nd"],"logs":"e\r\nf""#)
         .expect("body fields keep their line breaks");
 }
+
+/// An inbound GitHub title or label with a line break is refused when the
+/// proposal is accepted: both are written straight into the task and would
+/// otherwise make its brief unexportable.
+#[test]
+fn accepting_an_inbound_title_or_label_with_a_line_break_is_refused() {
+    let store = fixture();
+    call(
+        &store,
+        "items.put",
+        r#"{"id":"s","request_id":"s","expected_revision":0,"title":"Synced","labels":["backend"],"repository_ids":["r1"],"primary_repository_id":"r1"}"#,
+    );
+    call(
+        &store,
+        "github_sync.link",
+        r#"{"id":"s1","request_id":"s1-link","expected_revision":0,"task_id":"s","repo_slug":"acme/widgets","issue_number":7,"outbound_opt_in":false,"last_seen":{"title":"Synced","body":"","state":"open","labels":["backend"]}}"#,
+    );
+    for (n, (remote, field)) in [
+        (
+            r#"{"title":"a\nb","body":"","state":"open","labels":[]}"#,
+            "title",
+        ),
+        (
+            r#"{"title":"Synced","body":"","state":"open","labels":["x\u2028y"]}"#,
+            "labels",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let revision = 1 + n;
+        call(
+            &store,
+            "github_sync.observe",
+            &format!(
+                r#"{{"id":"s1","request_id":"obs-{n}","expected_revision":{revision},"remote":{remote}}}"#
+            ),
+        );
+        let err = store
+            .workbench_request(
+                "github_sync.accept",
+                &format!(
+                    r#"{{"id":"s1","request_id":"acc-{n}","expected_revision":{},"fields":["{field}"]}}"#,
+                    revision + 1
+                ),
+            )
+            .expect_err(field);
+        assert_eq!(err.code, "invalid_input", "{field}: {err}");
+        assert!(err.message.contains("line break"), "{field}: {err}");
+    }
+    let task = call(&store, "items.get", r#"{"id":"s"}"#);
+    assert_eq!(field(&store, &task, "$.item.title"), "Synced");
+    assert_eq!(field(&store, &task, "$.item.labels[0]"), "backend");
+}

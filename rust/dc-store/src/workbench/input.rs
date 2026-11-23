@@ -9,7 +9,7 @@ pub(super) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_LOGS_BYTES: usize = 256 * 1024;
 
 /// Characters that end a line in a brief. Header fields must not hold them.
-const LINE_BREAKS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+pub(super) const LINE_BREAKS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 
 /// Refuse a line break in a single-line field. The message names the field
 /// and never echoes the value, so a rejection cannot carry a forged heading.

@@ -707,6 +707,9 @@ fn sync_accept(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<(
                 )?;
             }
             "labels" => {
+                for label in &remote.labels {
+                    reject_line_break("label", label)?;
+                }
                 let labels_arr = encode_string_array(input.conn, &remote.labels)?;
                 task_body = input.conn.query_row(
                     "SELECT json_set(?1,'$.labels',json(?2))",

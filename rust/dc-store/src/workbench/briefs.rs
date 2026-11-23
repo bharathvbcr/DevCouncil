@@ -210,7 +210,7 @@ fn links_section(input: &Input<'_>, id: &str, markdown: &mut String) -> Result<(
     }
     markdown.push_str("\n## Linked tasks\n");
     for (relation, other, title, status, deleted) in rows.iter().take(128) {
-        reject_line_break("linked task title", title)?;
+        reject_line_break(&format!("linked task {other} title"), title)?;
         reject_line_break("linked task id", other)?;
         reject_line_break("linked task status", status)?;
         let state = if *deleted { "deleted" } else { status.as_str() };
@@ -231,7 +231,14 @@ fn reference(input: &Input<'_>, entity: Entity, id: &str) -> Result<(String, Str
         conn: input.conn,
         raw: &snapshot,
     };
-    let name = value.header_required_text("name", 300)?;
+    let kind = match entity {
+        Entity::Repository => "repository",
+        _ => "workspace",
+    };
+    if let Some(raw) = value.text("name", 300)? {
+        reject_line_break(&format!("{kind} {id} name"), &raw)?;
+    }
+    let name = value.required_text("name", 300)?;
     let revision = value.integer("revision", None, MAX_INTEGER)?;
     value.integer("updated_at", None, MAX_INTEGER)?;
     Ok((snapshot, format!("{name} [{id}] (revision {revision})")))
