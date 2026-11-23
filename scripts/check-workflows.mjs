@@ -846,6 +846,19 @@ function excludesPullRequest(condition) {
 }
 
 /**
+ * Jobs other than npm's `publish` that may hold `id-token: write`, as
+ * `<workflow file>#<job id>`. Each one is named here with why it needs the
+ * token. Being listed does not lift the pull_request rule: a listed job that
+ * runs on pull_request still fails.
+ *
+ * - `scorecard.yml#analysis`: OpenSSF Scorecard signs the results it
+ *   publishes to api.scorecard.dev with the job's OIDC token. The workflow
+ *   runs only on pushes to main, the weekly schedule and
+ *   branch_protection_rule, never on pull_request.
+ */
+const ID_TOKEN_JOBS = new Set(["scorecard.yml#analysis"]);
+
+/**
  * Supply-chain failures for workflow and composite-action YAML.
  * `files` maps a display name to its text. An absent permissions block is not
  * treated as read: on pull_request that is a failure, same as contents: write.
@@ -901,7 +914,7 @@ export function supplyChainFailures(files) {
       if (onPullRequest && perms.idToken === "write") {
         failures.push(`${name}: job ${job.id} holds id-token: write on pull_request`);
       }
-      if (perms.idToken === "write" && job.id !== "publish") {
+      if (perms.idToken === "write" && job.id !== "publish" && !ID_TOKEN_JOBS.has(`${name}#${job.id}`)) {
         failures.push(`${name}: job ${job.id} holds id-token: write`);
       }
     }
