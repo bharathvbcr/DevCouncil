@@ -1,7 +1,9 @@
 name: Scorecard
 
 # OpenSSF Scorecard supply-chain analysis of the default branch. Results go to
-# code scanning and, because the repository is public, to the Scorecard API.
+# code scanning only. Publishing to the Scorecard API (publish_results: true)
+# needs id-token: write, and scripts/check-workflows.mjs allows that grant to the
+# npm `publish` job alone, so results are not published and there is no badge.
 # Follows the example in ossf/scorecard-action (examples/scorecard.yml).
 on:
   # For the Branch-Protection check. Only the default branch is supported.
@@ -31,7 +33,6 @@ jobs:
     if: ${{ github.event.repository.default_branch == github.ref_name }}
     permissions:
       security-events: write # Upload SARIF to code scanning.
-      id-token: write # Sign results published to api.scorecard.dev.
       contents: read
       actions: read
     steps:
@@ -45,7 +46,7 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
-          publish_results: true
+          publish_results: false
 
       - name: Upload artifact
         if: ${{ always() }}
