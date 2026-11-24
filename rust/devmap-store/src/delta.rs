@@ -711,6 +711,18 @@ mod tests {
             Ok(Some(_)) => panic!("a delta with no tables opened as a store"),
             Err(error) => panic!("an uncommitted delta was refused: {error:#}"),
         }
+        // Not a permanent state: the next writer open (every `seed --sync-delta`
+        // goes through `DeltaStore::open`) creates the schema in this same file,
+        // and the delta then reads as a store.
+        let writer = DeltaStore::open(&path).unwrap();
+        writer
+            .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+            .unwrap();
+        drop(writer);
+        let healed = DeltaStore::open_read_only(&path)
+            .unwrap()
+            .expect("a writer's open heals a schema-less delta");
+        assert_eq!(healed.dirty_file_count().unwrap(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
