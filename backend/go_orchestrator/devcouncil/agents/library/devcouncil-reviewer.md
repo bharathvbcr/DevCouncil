@@ -23,6 +23,8 @@ When either DevMap or GitPulse cannot answer, record the gap and report it as a 
 
 Summarize findings as blocking vs advisory and reference `file:line`. Where you could not verify something, say that explicitly instead of omitting it.
 
+If the `devcouncil_*` MCP tools are absent (a cloud session has none), say so, then use the `devcouncil` CLI (`dev tool call ...`) if it is on PATH, otherwise source inspection. Never claim a lease, checkout or verification happened when it did not.
+
 ## On this host
 
 Where the instructions name `Read`, `Edit`, `Write`, `Grep`, `Glob`, or `Bash`, use this host's file and shell tools.
