@@ -5334,6 +5334,8 @@ mod damage_recovery_tests {
             !Arc::ptr_eq(&before, &after),
             "the connection that saw damage must not be served again"
         );
+        // Windows cannot delete a store file while a connection holds it open.
+        drop((before, after, slot));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5351,6 +5353,8 @@ mod damage_recovery_tests {
 
         let named = slot.reopen(&a).expect("reopens a by path");
         assert_eq!(named.path(), Some(a.as_path()));
+        // Windows cannot delete a store file while a connection holds it open.
+        drop((resolved, named, slot));
         std::fs::remove_dir_all(root_a).unwrap();
         std::fs::remove_dir_all(root_b).unwrap();
     }

@@ -998,6 +998,8 @@ mod tests {
         assert_eq!(super::MCP_READER_MEMORY.mmap_bytes, 0);
         let plain = Store::open_read_only(&store_path).expect("a plain read-only open");
         assert_eq!(plain.memory_settings().unwrap().cache_kib, 65_536);
+        // Windows cannot delete a store file while a connection holds it open.
+        drop((opened, plain));
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 

@@ -148,6 +148,8 @@ fn a_reader_that_tolerates_it_opens_a_store_with_a_damaged_index_and_search_alon
         Store::sqlite_error_is_full_text_damage(&refused),
         "refused with the typed full-text error: {refused:?}"
     );
+    // Windows cannot delete a file a connection still holds open.
+    drop(store);
     cleanup(&db);
 }
 
@@ -159,6 +161,8 @@ fn a_healthy_store_opened_tolerantly_is_not_degraded() {
             .unwrap();
     assert!(store.full_text_damage().is_none());
     assert_eq!(store.search_fts("alpha", 5).unwrap().len(), 1);
+    // Windows cannot delete a file a connection still holds open.
+    drop(store);
     cleanup(&db);
 }
 
@@ -181,6 +185,8 @@ fn damage_outside_the_index_is_not_called_index_damage() {
     );
     // The index still searches.
     assert_eq!(store.search_fts("alpha", 5).unwrap().len(), 1);
+    // Windows cannot delete a file a connection still holds open.
+    drop(store);
     cleanup(&db);
 }
 
