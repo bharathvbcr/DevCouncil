@@ -60,11 +60,21 @@ pub async fn excluded_path_stays_out(root: &Path, excluded: &str, control: &str)
         .collect();
 
     let store_path = devmap_extract::paths::store_path(root);
-    let socket = PathBuf::from("/tmp").join(format!(
-        "devmap-ig-{}-{}.sock",
-        std::process::id(),
-        excluded.len()
-    ));
+    // Windows serves over a named pipe: a `/tmp/..` path is not a legal pipe
+    // name there (os error 123), and the daemon stops before it serves.
+    let socket = if cfg!(windows) {
+        PathBuf::from(format!(
+            r"\\.\pipe\devmap-ig-{}-{}",
+            std::process::id(),
+            excluded.len()
+        ))
+    } else {
+        PathBuf::from("/tmp").join(format!(
+            "devmap-ig-{}-{}.sock",
+            std::process::id(),
+            excluded.len()
+        ))
+    };
     let _ = std::fs::remove_file(&socket);
     let daemon = Daemon::new(Store::open(&store_path).unwrap(), root.to_path_buf())
         .with_store_path(store_path.clone())

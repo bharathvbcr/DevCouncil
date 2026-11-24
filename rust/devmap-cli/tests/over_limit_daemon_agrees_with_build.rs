@@ -171,7 +171,13 @@ async fn a_watched_file_growing_past_the_limit_settles_without_retries() {
     let store_path = devmap_extract::paths::store_path(&root);
     // Short and outside the tree: a Unix socket path is capped at 100 bytes
     // portably, and macOS `temp_dir()` alone spends most of that.
-    let socket = PathBuf::from("/tmp").join(format!("devmap-ol-{}.sock", std::process::id()));
+    // Windows serves over a named pipe, where `/tmp/..` is not a legal name
+    // (os error 123).
+    let socket = if cfg!(windows) {
+        PathBuf::from(format!(r"\\.\pipe\devmap-ol-{}", std::process::id()))
+    } else {
+        PathBuf::from("/tmp").join(format!("devmap-ol-{}.sock", std::process::id()))
+    };
     let _ = std::fs::remove_file(&socket);
     let daemon = Daemon::new(Store::open(&store_path).unwrap(), root.clone())
         .with_store_path(store_path.clone())
