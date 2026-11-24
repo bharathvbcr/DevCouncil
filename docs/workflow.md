@@ -141,7 +141,10 @@ other revision (`rust/gusset-engine/check-pin.sh`).
   `setup-go` steps use `go-version-file: backend/go_orchestrator/go.mod`, so CI
   follows `go.mod`, and `goModToolchain` in `scripts/ci-local-checks.mjs` falls
   back to the `go` line when there is no `toolchain` line. A bump also needs a
-  golangci-lint built for the new release, and `gofmt` run under it.
+  golangci-lint built for the new release, and `gofmt` run under it. The same
+  holds for the `govulncheck` pin in `analysis-plane.yml`: it builds SSA with
+  the `golang.org/x/tools` it was released against, and an older one can panic
+  on a newer release's syntax (v1.1.4 did under Go 1.27).
 - **Gusset:** move the `ref` in `.github/actions/setup-gusset/action.yml` in the
   same change as the code that needs it, and rebuild `rust/gusset-engine` with
   `--locked`.
