@@ -25,7 +25,7 @@
  * which ignores status.showUntrackedFiles); a dirty stamp is never reusable.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -239,6 +239,7 @@ export function parseToml(text, label) {
   };
 
   const top = mk();
+  const headers = new WeakSet();
   let cur = top;
   for (;;) {
     space();
@@ -266,6 +267,10 @@ export function parseToml(text, label) {
         t = Array.isArray(t[k]) ? t[k].at(-1) : t[k];
         if (!isTable(t)) fail("a table header runs through a value that is not a table");
       });
+      if (!isArray) {
+        if (headers.has(t)) fail("a table header is defined twice");
+        headers.add(t);
+      }
       cur = t;
       continue;
     }
@@ -369,6 +374,8 @@ function workspaceMembersInside(ws, crateDir, toml) {
     const at = where(toml, ws);
     if (!Array.isArray(ws[name]) || ws[name].some((m) => typeof m !== "string")) throw new InputError(`${at} [workspace] ${name} is not a list of strings; the engine stamp cannot cover it`);
     for (const member of ws[name]) {
+      // A glob before a .. ("*/../../evil") hides the escape from the prefix check.
+      if (member.split(/[\\/]/).includes("..")) throw new InputError(`${at} [workspace] ${name} entry ${member} has a .. segment; the engine stamp cannot cover where it leads`);
       const prefix = member.split(/[*?[{]/)[0];
       const abs = path.resolve(crateDir, prefix || ".");
       if (abs !== crateDir && !abs.startsWith(crateDir + path.sep)) {
@@ -416,6 +423,7 @@ export function enginePaths(root) {
     const rel = queue.shift();
     const crateDir = path.resolve(root, rel);
     const toml = path.join(crateDir, "Cargo.toml");
+    if (lstatSync(crateDir, { throwIfNoEntry: false })?.isSymbolicLink()) throw new InputError(`${rel} is a symlink under the engine inputs; the engine stamp hashes only its link text, not what it points to`);
     if (!existsSync(toml)) throw new InputError(`${toml} is missing (a path dependency of the engine)`);
     const doc = parseToml(readFileSync(toml, "utf8"), toml);
     const refs = manifestRefs(doc, toml);
@@ -481,6 +489,12 @@ export function enginePaths(root) {
 export function engineInputs(root, gussetDir) {
   const paths = enginePaths(root);
   const trees = Object.fromEntries(paths.map((p) => [p, git(root, "rev-parse", `HEAD:${p}`)]));
+  for (const line of git(root, "ls-tree", "-r", "HEAD", "--", ...paths).split("\n").filter(Boolean)) {
+    // Refused rather than followed: a link inside the inputs (a member directory, a
+    // path dependency, Cargo.lock) can lead outside the crate and the repository,
+    // and the tree hash covers only its link text.
+    if (line.startsWith("120000 ")) throw new InputError(`${line.split("\t")[1]} is a symlink under the engine inputs; the engine stamp hashes only its link text, not what it points to`);
+  }
   const dirtyFiles = [
     ...git(root, "status", "--porcelain", "--untracked-files=all", "--", ...paths).split("\n").filter(Boolean),
     ...git(gussetDir, "status", "--porcelain", "--untracked-files=all").split("\n").filter(Boolean).map((l) => `gusset: ${l}`),

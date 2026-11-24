@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
-import { InputError, engineInputs, stampVerdict, writeStamp } from "./gusset-engine-stamp.mjs";
+import { InputError, engineInputs, parseToml, stampVerdict, writeStamp } from "./gusset-engine-stamp.mjs";
 
 // Manifest forms the engine stamp must read or refuse. The six escaping forms
 // are the ones the 2026-11-24 review (of a64f991b) showed being accepted.
@@ -44,7 +44,7 @@ function fixture(engineToml = `[dependencies]\n${GUSSET}dc-glob = { path = "../d
   put(path.join(repo, "rust/Cargo.toml"), WORKSPACE);
   put(path.join(repo, "rust/dc-glob/Cargo.toml"), DC_GLOB);
   put(path.join(repo, "rust/dc-glob/src/lib.rs"), "// glob\n");
-  put(path.join(repo, "rust/gusset-engine/Cargo.toml"), outer ? engineToml : `${engineToml}\n[workspace]\n`);
+  put(path.join(repo, "rust/gusset-engine/Cargo.toml"), outer || /^\[workspace\]/m.test(engineToml) ? engineToml : `${engineToml}\n[workspace]\n`);
   put(path.join(repo, "rust/gusset-engine/Cargo.lock"), "# lock\n");
   put(path.join(repo, "rust/gusset-engine/src/lib.rs"), "// engine\n");
   put(path.join(repo, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.100"\n');
@@ -167,7 +167,7 @@ describe("inherited workspace keys are inputs", () => {
 });
 
 describe("workspace members and the engine's own workspace root", () => {
-  const OUTSIDE = /\[workspace\] (members|default-members|exclude) entry .* resolves outside the crate directory/;
+  const OUTSIDE = /\[workspace\] (members|default-members|exclude) entry .* (resolves outside the crate directory|has a \.\. segment)/;
   it("members, default-members and exclude outside the crate directory are refused (literal and glob)", () => {
     for (const ws of [
       'members = ["../evil"]',
@@ -175,6 +175,10 @@ describe("workspace members and the engine's own workspace root", () => {
       'exclude = ["../evil"]',
       'members = ["../*"]',
       'members = ["../../../evil/crates/*"]',
+      'members = ["*/../../evil"]',
+      'default-members = ["s[r]c/../../evil"]',
+      'members = ["sr?/../../evil"]',
+      'exclude = ["{a,b}/../../evil"]',
     ]) {
       refused(fixture(`[dependencies]\n${GUSSET}[workspace]\n${ws}\n`, { outer: true }), OUTSIDE, ws);
     }
@@ -233,4 +237,44 @@ describe("every inherited key form is an input", () => {
       assert.ok("rust/Cargo.toml" in inputs(f).stamp.trees, name);
     });
   }
+});
+
+describe("symlinks under the inputs are refused, not followed", () => {
+  const link = (f, target, rel) => {
+    symlinkSync(target, path.join(f.repo, rel));
+    git(f.repo, "add", "."); git(f.repo, "commit", "-qm", `link ${rel}`);
+  };
+  const SYMLINK = /is a symlink under the engine inputs/;
+  it("a symlinked workspace member directory", () => {
+    const f = fixture(`[dependencies]\n${GUSSET}[workspace]\nmembers = ["link"]\n`, { outer: true });
+    mkdirSync(path.join(f.top, "outside"));
+    link(f, path.join(f.top, "outside"), "rust/gusset-engine/link");
+    refused(f, SYMLINK, "member");
+  });
+  it("a Cargo.lock that is a symlink", () => {
+    const f = fixture();
+    put(path.join(f.top, "outside.lock"), "# elsewhere\n");
+    git(f.repo, "rm", "-q", "rust/gusset-engine/Cargo.lock");
+    link(f, path.join(f.top, "outside.lock"), "rust/gusset-engine/Cargo.lock");
+    refused(f, SYMLINK, "lock");
+  });
+  it("a path dependency through a symlinked directory, inside the crate or beside it", () => {
+    for (const [dep, where] of [["vendor", "rust/gusset-engine/vendor"], ["../vendor", "rust/vendor"]]) {
+      const f = fixture(`[dependencies]\n${GUSSET}evil = { path = "${dep}" }\n`);
+      mkdirSync(path.join(f.top, "outside"));
+      link(f, path.join(f.top, "outside"), where);
+      refused(f, SYMLINK, dep);
+    }
+  });
+});
+
+describe("a duplicate table header is refused (cargo rejects it)", () => {
+  it("[a] twice, [a.b] twice, but [[a]] repeated and a super-table after its child are fine", () => {
+    assert.throws(() => parseToml("[a]\nx = 1\n[a]\ny = 2\n", "m"), /table header is defined twice/);
+    assert.throws(() => parseToml("[a.b]\n[c]\n[a.b]\n", "m"), /table header is defined twice/);
+    parseToml("[[a]]\nx = 1\n[a.s]\n[[a]]\n[a.s]\n[b.c]\n[b]\n", "m");
+  });
+  it("a manifest with two [workspace] headers is refused by the stamp", () => {
+    refused(fixture(`[workspace]\n[dependencies]\n${GUSSET}[workspace]\n`, { outer: true }), /table header is defined twice/, "dup");
+  });
 });
