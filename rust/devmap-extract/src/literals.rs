@@ -135,10 +135,9 @@ thread_local! {
 ///
 /// The newline offsets are found once, on the first lookup, and each lookup is
 /// a binary search. Counting newlines from the start of the file for every site
-/// cost (sites x file size): 4,096 literals at the end of a 1 MB file took 3 s
-/// of the file's 5 s extraction budget, against 0.13 s for the same bytes with
-/// the literals at the start. Sites arrive out of order (const uses are
-/// recorded after the walk), so a running count would not do.
+/// cost (sites x file size): about 0.45 s of extraction for 4,096 literals at
+/// the end of a 1 MB file (release build). Sites arrive out of order (const
+/// uses are recorded after the walk), so a running count would not do.
 struct LineStarts<'a> {
     source: &'a str,
     newlines: OnceCell<Vec<usize>>,
@@ -644,10 +643,10 @@ mod line_starts_tests {
         }
     }
 
-    /// 4,096 literals after ~900 KB of comments, the shape that took 3 s of
-    /// the 5 s file budget when every site counted newlines from byte 0. The
-    /// bound is on bytes read for line numbers, not on time: the file is read
-    /// once, however many sites it has.
+    /// 4,096 literals after ~900 KB of filler, where counting newlines from
+    /// byte 0 for every site read about 3.9 GB. The bound is on bytes read for
+    /// line numbers, not on time: the file is read once, however many sites
+    /// it has.
     #[test]
     fn many_literals_late_in_a_large_file_read_it_once_for_line_numbers() {
         let filler: String = (0..12_000)
@@ -673,13 +672,22 @@ mod line_starts_tests {
 
         assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(sites.len(), MAX_LITERALS_PER_FILE);
-        for site in &sites {
-            assert_eq!(
-                site.line,
-                counted_line(&source, site.start_byte),
-                "{}",
-                site.value
-            );
+        // The oracle in one pass: the line each byte starts on, counted
+        // forward. Calling `counted_line` per site here is the very cost under
+        // test, and took ~20 s in a debug build.
+        let mut by_start: Vec<_> = sites.iter().collect();
+        by_start.sort_by_key(|site| site.start_byte);
+        let (mut line, mut at) = (1u32, 0usize);
+        for site in by_start {
+            line += u32::try_from(
+                source.as_bytes()[at..site.start_byte]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count(),
+            )
+            .unwrap();
+            at = site.start_byte;
+            assert_eq!(site.line, line, "{}", site.value);
         }
         let read = LINE_BYTES_READ.with(|read| read.get());
         assert!(
