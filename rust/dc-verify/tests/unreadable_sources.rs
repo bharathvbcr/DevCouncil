@@ -160,6 +160,9 @@ fn a_directory_where_the_source_should_be_is_degraded() {
     );
 }
 
+// Unix only: a FIFO is a POSIX file type; Git for Windows' `mkfifo` makes no
+// such node, so the source reads as missing rather than as a non-regular file.
+#[cfg(unix)]
 #[test]
 fn a_fifo_where_the_source_should_be_is_degraded_without_being_opened() {
     let root = Root::new();

@@ -393,6 +393,9 @@ fn adv_missing_binary_backslash_file_reports_degraded_not_clean() {
     );
 }
 
+// Unix only: a backslash is a path separator on Windows, so the fixture file
+// name `assets\\my spaced dir\\café.bin` cannot exist there.
+#[cfg(unix)]
 #[test]
 fn adv_backslash_binary_path_with_spaces_and_utf8_is_scanned() {
     let root = Root::new();

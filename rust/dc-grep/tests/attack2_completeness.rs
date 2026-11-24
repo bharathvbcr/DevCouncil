@@ -328,9 +328,16 @@ fn the_per_class_report_sums_caps_and_keeps_hostile_names_as_data() {
     for n in 0..55 {
         repo.write(&format!("cap{n:02}.txt"), &many);
     }
-    repo.write("ctl\tname\nx.txt", &many);
-    repo.write("esc\u{1b}[31mred.txt", &many);
-    repo.write("quote\"name\\.txt", &many);
+    // Windows cannot create a name with a control character, a quote or a
+    // backslash (os error 123), so the hostile three exist on Unix only.
+    let hostile: &[&str] = if cfg!(unix) {
+        &["ctl\tname\nx.txt", "esc\u{1b}[31mred.txt", "quote\"name\\.txt"]
+    } else {
+        &[]
+    };
+    for name in hostile {
+        repo.write(name, &many);
+    }
     let built = repo.index();
     let by = built["lexical_unindexed_by_class"]
         .as_object()
@@ -355,7 +362,7 @@ fn the_per_class_report_sums_caps_and_keeps_hostile_names_as_data() {
             );
         }
     }
-    assert_eq!(by["term_cap"]["count"], 58, "{built}");
+    assert_eq!(by["term_cap"]["count"], 55 + hostile.len(), "{built}");
     assert_eq!(by["term_cap"]["sample"].as_array().unwrap().len(), 50);
     let ranked = repo.rank("ordinary_alpaca");
     assert_eq!(
