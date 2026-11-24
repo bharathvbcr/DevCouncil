@@ -297,7 +297,7 @@ impl WatchBacklog {
 
     /// Stand in for one raw event the OS has offered and the consumer has not
     /// yet folded in, so a test can hold the backlog busy deterministically.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn pretend_event_in_flight(&self, in_flight: bool) {
         if in_flight {
             self.0.queued.fetch_add(1, Ordering::SeqCst);

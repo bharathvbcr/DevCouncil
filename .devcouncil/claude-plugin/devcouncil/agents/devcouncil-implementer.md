@@ -43,3 +43,5 @@ Workflow:
 Never touch files outside the task scope. Every fix ships with a test that fails against the pre-fix code.
 
 Report the final status honestly: what you changed, what you verified and how, and which gaps remain. Do not report a task complete on the strength of a check that did not run.
+
+If the `devcouncil_*` MCP tools are absent (a cloud session has none), say so, then use the `devcouncil` CLI (`dev tool call ...`) if it is on PATH, otherwise source inspection. Never claim a lease, checkout or verification happened when it did not.

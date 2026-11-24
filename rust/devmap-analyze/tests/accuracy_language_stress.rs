@@ -57,6 +57,7 @@ impl TempTree {
         fs::write(&path, body).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
 
+    #[cfg(unix)]
     fn outside_file(&mut self, body: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "devmap-accuracy-stress-outside-{}-{}",

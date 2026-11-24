@@ -757,6 +757,7 @@ fn pruning_keeps_the_pre_upgrade_backup_it_was_called_for() {
 }
 
 /// Unicode, spaces and a quote in the directory name, and a symlinked profile.
+#[cfg(unix)]
 #[test]
 fn an_awkward_or_symlinked_profile_path_is_backed_up_beside_the_real_file() {
     let dir = Scratch::new();
@@ -790,6 +791,7 @@ fn an_awkward_or_symlinked_profile_path_is_backed_up_beside_the_real_file() {
 }
 
 /// A profile directory that cannot be written refuses the upgrade.
+#[cfg(unix)]
 #[test]
 fn an_unwritable_backup_directory_refuses_the_upgrade() {
     use std::os::unix::fs::PermissionsExt;
@@ -1275,6 +1277,7 @@ fn a_failed_retire_copy_still_names_the_backup_it_moved_aside() {
 
 /// A directory whose listing fails cannot be shown to be under the bound, so
 /// nothing is moved into it.
+#[cfg(unix)]
 #[test]
 fn an_unlistable_directory_refuses_to_move_a_backup_aside() {
     use std::os::unix::fs::PermissionsExt;

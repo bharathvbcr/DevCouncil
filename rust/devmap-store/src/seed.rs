@@ -354,17 +354,16 @@ fn source_is_writable(path: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    if !meta.is_file() || meta.permissions().readonly() {
-        return false;
-    }
+    let writable = meta.is_file() && !meta.permissions().readonly();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o200 == 0 {
-            return false;
-        }
+        writable && meta.permissions().mode() & 0o200 != 0
     }
-    true
+    #[cfg(not(unix))]
+    {
+        writable
+    }
 }
 
 fn try_heal_or_pin_wal_and_clone(source: &Path, staged: &Path) -> Result<SeedMethod> {
@@ -809,6 +808,9 @@ pub fn set_file_writable(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         let mut perms = std::fs::metadata(path)?.permissions();
+        // The lint warns that this makes a Unix file world-writable. This arm is
+        // compiled off Unix only, where the readonly flag is the whole mode.
+        #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(path, perms)
             .with_context(|| format!("cannot clear readonly {}", path.display()))?;
@@ -1255,6 +1257,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(target_os = "macos")]
     fn sealed_snapshot_with_head(path: &Path, head: &str) {
         {
             let store = Store::open(path).unwrap();

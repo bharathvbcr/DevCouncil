@@ -149,9 +149,12 @@ fn trigram_admission_matches_dbd0193a() {
             .join(" "),
     );
     repo.write("sub/inner.txt", b"needle inner\n");
-    std::os::unix::fs::symlink("plain.txt", repo.0.join("link_to_file.txt")).unwrap();
-    std::os::unix::fs::symlink("sub", repo.0.join("link_to_dir")).unwrap();
-    std::os::unix::fs::symlink("nonexistent", repo.0.join("dangling")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("plain.txt", repo.0.join("link_to_file.txt")).unwrap();
+        std::os::unix::fs::symlink("sub", repo.0.join("link_to_dir")).unwrap();
+        std::os::unix::fs::symlink("nonexistent", repo.0.join("dangling")).unwrap();
+    }
 
     let built = repo.index();
     let stamps: Value =

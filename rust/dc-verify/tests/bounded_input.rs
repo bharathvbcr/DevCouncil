@@ -204,6 +204,7 @@ fn adv_coverage_dev_zero_stops_at_the_cap() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_coverage_symlink_to_a_small_profile_is_not_a_silent_success() {
     let dir = scratch("covlink");
