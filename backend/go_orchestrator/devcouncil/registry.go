@@ -7,9 +7,11 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/stopgate"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gate"
@@ -49,6 +51,21 @@ type Registry struct {
 	Store *store.Client
 	Gate  *gate.Gate
 	Lease *LeaseService
+
+	// OpenGate, when set, rebuilds the write gate whenever the repository's
+	// config.yaml changes (gatescfg.ConfigKey, the key gates.mode is already
+	// re-read on), so a corrected config reaches a running host without a
+	// restart. Gate then holds the last build and is replaced on each one.
+	// A rebuild that fails leaves no gate: policy_check_write answers
+	// not_initialized with the reason until the file is fixed, never the
+	// previous gate (which may be looser than what the file now says) and never
+	// "off".
+	OpenGate func() (*gate.Gate, error)
+
+	gateMu    sync.Mutex
+	gateBuilt bool
+	gateKey   gatescfg.FileKey
+	gateErr   error
 }
 
 // NewRegistry builds the MCP registry. Store/Gate may be nil when the project
@@ -393,6 +410,26 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 	}
 }
 
+// CurrentGate is the write gate for the config as it is on disk now: the one
+// Gate holds, or, when OpenGate is set, one rebuilt if config.yaml changed since
+// the last build. err is why there is no gate.
+func (r *Registry) CurrentGate() (*gate.Gate, error) {
+	if r.OpenGate == nil {
+		return r.Gate, nil
+	}
+	key := gatescfg.ConfigKey(r.Root)
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	if !r.gateBuilt || key != r.gateKey {
+		r.Gate, r.gateErr = r.OpenGate()
+		if r.gateErr != nil {
+			r.Gate = nil
+		}
+		r.gateKey, r.gateBuilt = key, true
+	}
+	return r.Gate, r.gateErr
+}
+
 // callPolicyCheck judges a write against the named task's scope. It used to
 // read only path: task_id was dropped without a word, so the ladder stopped at
 // task.absent and a caller asking "is this in my task's scope?" got an answer
@@ -416,7 +453,12 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		return ErrorPayload{OK: false, Code: "invalid_argument",
 			Error: "devcouncil_policy_check_write: task_id is empty; omit it to ask without a task"}
 	}
-	if r.Gate == nil {
+	g, gateErr := r.CurrentGate()
+	if g == nil {
+		if gateErr != nil {
+			return ErrorPayload{OK: false, Code: "not_initialized",
+				Error: "the write gate could not be built from this directory's config, so this path was not judged: " + gateErr.Error()}
+		}
 		// Not a verdict. This used to answer `ok: true, allowed: true` with a
 		// note, so a host whose gate failed to build (an unreadable
 		// config.yaml, a refused flag) reported every path writable — a check
@@ -443,7 +485,7 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		}
 		task = stored.Domain()
 	}
-	d, err := r.Gate.EvaluateWrite(path, task, op)
+	d, err := g.EvaluateWrite(path, task, op)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "policy_error"}
 	}
