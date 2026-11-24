@@ -72,7 +72,6 @@ impl ReadStore {
 /// by name (`StackedStore::open_if_leased` runs `refuse_legacy_base_store_ref`
 /// for a lane with neither a store nor a lease).
 pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<ReadStore> {
-    VERBOSE.store(cli.verbose, std::sync::atomic::Ordering::Relaxed);
     let db = cli.db();
     if !db.is_file() {
         if cli.db.is_none() {
@@ -151,16 +150,41 @@ pub(crate) fn emit_unavailable(reason: &str) {
 /// PHASE1_CONTRACT.md:17 is explicit: never present a capped sample as
 /// complete coverage. A silent emitter does exactly that.
 ///
-/// It names `--budget`: every command that prints it takes that flag (the
-/// token budget that decided how many rows fit), so it is the one that shows
-/// the rest.
-fn truncation_line(shown: u32, hidden: u32, total: u32, truncated: bool) -> Option<String> {
-    (truncated || hidden > 0)
-        .then(|| format!("shown {shown} of {total} ({hidden} hidden); raise --budget to show more"))
+/// `widen` is the flag text the *caller* knows widens its own answer: most
+/// commands are sized by `--budget` alone, `explore` also by `--limit`. A
+/// caller with nothing that widens the answer passes `None` and the line says
+/// nothing about it, rather than naming a flag that does not help.
+fn truncation_line(
+    shown: u32,
+    hidden: u32,
+    total: u32,
+    truncated: bool,
+    widen: Option<&str>,
+) -> Option<String> {
+    (truncated || hidden > 0).then(|| {
+        let mut line = format!("shown {shown} of {total} ({hidden} hidden)");
+        if let Some(flag) = widen {
+            line.push_str(&format!("; raise {flag} to show more"));
+        }
+        line
+    })
 }
 
-pub(crate) fn emit_truncation(shown: u32, hidden: u32, total: u32, truncated: bool) {
-    if let Some(line) = truncation_line(shown, hidden, total, truncated) {
+/// The flag text for a command whose answer is sized by `--budget` alone.
+pub(crate) const WIDEN_BUDGET: &str = "--budget";
+
+/// `explore` sizes its definitions list by `--limit` (how many to consider)
+/// and `--budget` (how many of those fit), so either can be the one that binds.
+pub(crate) const WIDEN_LIMIT_OR_BUDGET: &str = "--limit or --budget";
+
+pub(crate) fn emit_truncation(
+    shown: u32,
+    hidden: u32,
+    total: u32,
+    truncated: bool,
+    widen: Option<&str>,
+) {
+    if let Some(line) = truncation_line(shown, hidden, total, truncated, widen) {
         outln!("{line}");
     }
 }
@@ -181,7 +205,13 @@ pub(crate) fn emit_search(resp: &devmap_query::Response<devmap_query::SymbolHit>
             hit.symbol_name
         );
     }
-    emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+    emit_truncation(
+        resp.shown,
+        resp.hidden,
+        resp.total,
+        resp.truncated,
+        Some(WIDEN_BUDGET),
+    );
 }
 
 /// One line naming what a scoped answer was ranked over, so a short list in
@@ -246,28 +276,33 @@ fn walk_incomplete_line(reason: &str, verbose: bool) -> String {
         return format!("warning: {reason}");
     }
     let flat = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    let first = flat.split(';').next().unwrap_or(&flat).trim();
+    let mut clauses = flat.split(';').map(str::trim).filter(|c| !c.is_empty());
+    let first = clauses.next().unwrap_or("");
+    let dropped = clauses.count();
     let clipped = if first.chars().count() > WALK_INCOMPLETE_TEXT_CHARS {
         let head: String = first.chars().take(WALK_INCOMPLETE_TEXT_CHARS).collect();
         format!("{}…", head.trim_end())
     } else {
         first.to_string()
     };
-    format!("warning: {clipped} (result is partial; full detail: --verbose or --json)")
+    let more = if dropped > 0 {
+        format!("+{dropped} more caveats; ")
+    } else {
+        String::new()
+    };
+    format!("warning: {clipped} ({more}full detail: --verbose or --json)")
 }
 
-/// Set by [`open_for_read`] so the shared renderers can honour `--verbose`
-/// without every call site threading the flag through.
-static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn emit_walk_incomplete(reason: &str) {
-    outln!(
-        "{}",
-        walk_incomplete_line(reason, VERBOSE.load(std::sync::atomic::Ordering::Relaxed))
-    );
+/// Print the text-mode `walk_incomplete` line; `verbose` is the CLI's
+/// `--verbose`, which keeps the whole reason.
+pub(crate) fn emit_walk_incomplete(reason: &str, verbose: bool) {
+    outln!("{}", walk_incomplete_line(reason, verbose));
 }
 
-pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
+pub(crate) fn emit_edges(
+    resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>,
+    verbose: bool,
+) {
     if let ResolutionAvailability::Unavailable { reason } = &resp.resolution {
         emit_unavailable(reason);
         return;
@@ -275,7 +310,13 @@ pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedE
     for edge in &resp.items {
         outln!("{}", edge_line(edge));
     }
-    emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+    emit_truncation(
+        resp.shown,
+        resp.hidden,
+        resp.total,
+        resp.truncated,
+        Some(WIDEN_BUDGET),
+    );
     // What a `--min-rung` floor cost, printed only when it cost something.
     //
     // Without it a narrowed answer is indistinguishable at the terminal from a
@@ -298,7 +339,7 @@ pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedE
     // one says the walk that produced `items` stopped before the graph ran out,
     // so `total` is the size of a partial answer.
     if let Some(reason) = &resp.walk_incomplete {
-        emit_walk_incomplete(reason);
+        emit_walk_incomplete(reason, verbose);
     }
     // Information about a complete answer, not a defect in it: no `warning:`.
     if let Some(note) = &resp.note {
@@ -306,7 +347,7 @@ pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedE
     }
 }
 
-pub(crate) fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
+pub(crate) fn emit_blast_radius(radius: &devmap_query::BlastRadius, verbose: bool) {
     if !radius.unmatched_targets.is_empty() {
         outln!(
             "warning: no indexed traversal start for: {}",
@@ -342,9 +383,10 @@ pub(crate) fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
         radius.layers.hidden,
         radius.layers.total,
         radius.layers.truncated,
+        Some(WIDEN_BUDGET),
     );
     if let Some(reason) = &radius.layers.walk_incomplete {
-        emit_walk_incomplete(reason);
+        emit_walk_incomplete(reason, verbose);
     }
 }
 
@@ -362,16 +404,16 @@ mod tests {
     #[test]
     fn a_capped_result_is_always_reported_as_capped() {
         // Complete: nothing hidden, not flagged.
-        assert_eq!(truncation_line(10, 0, 10, false), None);
+        assert_eq!(truncation_line(10, 0, 10, false, None), None);
 
         // Flagged by the budget even though nothing is hidden.
         assert!(
-            truncation_line(10, 0, 10, true).is_some(),
+            truncation_line(10, 0, 10, true, None).is_some(),
             "a budget-truncated result must say so even with nothing hidden"
         );
 
         // Rows dropped without the flag.
-        let line = truncation_line(3, 7, 10, false)
+        let line = truncation_line(3, 7, 10, false, None)
             .expect("hidden rows must be reported even when not flagged");
         assert!(
             line.contains('3') && line.contains("10") && line.contains('7'),
@@ -379,7 +421,7 @@ mod tests {
         );
 
         // Both.
-        assert!(truncation_line(3, 7, 10, true).is_some());
+        assert!(truncation_line(3, 7, 10, true, None).is_some());
     }
 
     fn edge(
@@ -427,15 +469,24 @@ mod tests {
         assert_eq!(line, "a.rs::run  --Calls-->  b.rs::go");
     }
 
-    /// The truncation line names the flag that shows the rest. Every command
-    /// that prints it takes `--budget` (clap: `budget`, short `-b`), the
-    /// token budget that decided how many rows fit.
+    /// The truncation line names the flag its caller says widens the answer.
     #[test]
     fn the_truncation_line_names_the_flag_that_shows_the_rest() {
-        let line = truncation_line(80, 159, 239, true).expect("capped");
+        let line = truncation_line(80, 159, 239, true, Some(WIDEN_BUDGET)).expect("capped");
         assert!(line.starts_with("shown 80 of 239 (159 hidden)"), "{line}");
-        assert!(line.contains("--budget"), "{line}");
-        assert_eq!(truncation_line(10, 0, 10, false), None);
+        assert!(line.contains("raise --budget to show more"), "{line}");
+        assert_eq!(truncation_line(10, 0, 10, false, Some(WIDEN_BUDGET)), None);
+    }
+
+    /// `explore` is sized by `--limit` as well as `--budget`: with `--limit 5` the
+    /// list stays at five at any budget, so naming `--budget` alone would be
+    /// false. A caller that has no flag that widens its answer says nothing.
+    #[test]
+    fn the_truncation_line_names_each_commands_own_widening_flag() {
+        let line = truncation_line(20, 97, 117, true, Some(WIDEN_LIMIT_OR_BUDGET)).expect("capped");
+        assert!(line.contains("raise --limit or --budget"), "{line}");
+        let bare = truncation_line(20, 97, 117, true, None).expect("capped");
+        assert_eq!(bare, "shown 20 of 117 (97 hidden)");
     }
 
     /// A multi-line, multi-clause reason prints as exactly one line in text
@@ -456,9 +507,25 @@ mod tests {
             "{line}"
         );
         assert!(line.len() < reason.len(), "{line}");
+        // Two clauses were dropped; the line says so rather than hiding them.
+        assert!(line.contains("+2 more caveats"), "{line}");
+        // A reason with a single clause drops nothing and claims nothing.
+        let single = walk_incomplete_line("the walk did not complete: stopped at depth 3", false);
+        assert!(!single.contains("more caveat"), "{single}");
+    }
+
+    /// `--verbose` reaches the renderer as a parameter and keeps the whole
+    /// reason: every clause, in order, with its original line breaks.
+    #[test]
+    fn a_verbose_walk_incomplete_prints_the_whole_reason() {
+        let reason = "first clause; second clause;\nthird clause";
         assert_eq!(
             walk_incomplete_line(reason, true),
             format!("warning: {reason}")
+        );
+        assert_ne!(
+            walk_incomplete_line(reason, false),
+            walk_incomplete_line(reason, true)
         );
     }
 

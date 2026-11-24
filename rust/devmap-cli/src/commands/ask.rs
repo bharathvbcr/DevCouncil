@@ -2,7 +2,8 @@ use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
 use crate::output::{
-    emit_scope, emit_search, emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read,
+    emit_scope, emit_search, emit_truncation, emit_unavailable, emit_walk_incomplete,
+    open_for_read, WIDEN_BUDGET,
 };
 
 #[derive(clap::Args)]
@@ -52,7 +53,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             if cli.json {
                 store.emit_answer(cli, serde_json::to_value(&pack)?)?;
             } else {
-                emit_evidence_pack(&pack);
+                emit_evidence_pack(&pack, cli.verbose);
                 store.warn_incomplete()?;
             }
         }
@@ -84,7 +85,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
 /// The file list is short enough to decide what to read; the source blocks
 /// below it mean the obvious reads are already done. A folded unit points at
 /// the block that shows it instead of printing its lines twice.
-fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
+fn emit_evidence_pack(pack: &devmap_query::EvidencePack, verbose: bool) {
     if let ResolutionAvailability::Unavailable { reason } = &pack.resolution {
         emit_unavailable(reason);
         return;
@@ -204,9 +205,15 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
         }
     }
     outln!("");
-    emit_truncation(pack.shown, pack.hidden, pack.total, pack.truncated);
+    emit_truncation(
+        pack.shown,
+        pack.hidden,
+        pack.total,
+        pack.truncated,
+        Some(WIDEN_BUDGET),
+    );
     if let Some(reason) = &pack.walk_incomplete {
-        emit_walk_incomplete(reason);
+        emit_walk_incomplete(reason, verbose);
     }
     let tests = &pack.related_tests;
     if !tests.items.is_empty() || tests.hidden > 0 || tests.walk_incomplete.is_some() {
@@ -239,9 +246,15 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
                 }
             );
         }
-        emit_truncation(tests.shown, tests.hidden, tests.total, tests.truncated);
+        emit_truncation(
+            tests.shown,
+            tests.hidden,
+            tests.total,
+            tests.truncated,
+            Some(WIDEN_BUDGET),
+        );
         if let Some(reason) = &tests.walk_incomplete {
-            emit_walk_incomplete(&format!("related tests: {reason}"));
+            emit_walk_incomplete(&format!("related tests: {reason}"), verbose);
         }
     }
     if let Some(gap) = &pack.coverage_gap {

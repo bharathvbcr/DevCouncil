@@ -3,6 +3,7 @@ use devmap_query::ResolutionAvailability;
 use crate::cli::Cli;
 use crate::output::{
     emit_blast_radius, emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read,
+    WIDEN_BUDGET,
 };
 
 #[derive(clap::Args)]
@@ -32,13 +33,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json {
         store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
-        emit_affected(&report);
+        emit_affected(&report, cli.verbose);
         store.warn_incomplete()?;
     }
     Ok(())
 }
 
-fn emit_affected(report: &devmap_query::AffectedTestsReport) {
+fn emit_affected(report: &devmap_query::AffectedTestsReport, verbose: bool) {
     if let ResolutionAvailability::Unavailable { reason } = &report.tests.resolution {
         emit_unavailable(reason);
         return;
@@ -56,9 +57,10 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
         report.tests.hidden,
         report.tests.total,
         report.tests.truncated,
+        Some(WIDEN_BUDGET),
     );
     if let Some(reason) = &report.tests.walk_incomplete {
-        emit_walk_incomplete(reason);
+        emit_walk_incomplete(reason, verbose);
     }
-    emit_blast_radius(&report.blast_radius);
+    emit_blast_radius(&report.blast_radius, verbose);
 }

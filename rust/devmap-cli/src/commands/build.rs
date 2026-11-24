@@ -2077,6 +2077,20 @@ fn affected_closure(
     Ok(Some(affected))
 }
 
+/// The summary rows for calls the resolver could not tie to a definition.
+fn unresolved_summary(unattributed: usize, uninferred: usize, members: usize) -> Vec<String> {
+    vec![
+        format!(
+            "  Unresolved: {unattributed} unattributed, {uninferred} uninferred receivers, {members} unresolved members (details: --verbose)"
+        ),
+        "    unattributed = a call to a bare name that no rule could bind although an indexed \
+         symbol shares its name (may be a real resolver miss); uninferred receivers = method \
+         calls whose receiver type was not inferred (a known limit, not a defect); unresolved \
+         members = calls on a typed receiver whose type declares no member of that name"
+            .to_string(),
+    ]
+}
+
 /// Render the resolution rate under the human build summary.
 ///
 /// Per language and sorted worst-first, because the corpus figure is not
@@ -2085,19 +2099,6 @@ fn affected_closure(
 /// than one they have to find. This is the readout that would have surfaced
 /// W0.2's bug class — CFML and Terraform contributing no call edges while
 /// reporting complete coverage — without anyone going looking for it.
-/// The summary rows for calls the resolver could not tie to a definition.
-fn unresolved_summary(unattributed: usize, uninferred: usize, members: usize) -> Vec<String> {
-    vec![
-        format!(
-            "  Unresolved: {unattributed} unattributed, {uninferred} uninferred receivers, {members} unresolved members (details: --verbose)"
-        ),
-        "    unattributed = a call to a bare name that matched no definition (worth a look); \
-         uninferred receivers = method calls whose receiver type was not inferred (a known \
-         limit); unresolved members = calls on a typed receiver whose type has no such member"
-            .to_string(),
-    ]
-}
-
 fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
     for line in resolution_rate_lines(rate) {
         outln!("{line}");
@@ -2238,11 +2239,13 @@ mod tests {
         }
         assert!(rows.contains("--verbose"), "{rows}");
         assert!(
-            rows.contains("bare name") && rows.contains("matched no definition"),
+            rows.contains("bare name") && rows.contains("shares its name"),
             "unattributed is not explained: {rows}"
         );
         assert!(
-            rows.contains("receiver") && rows.contains("not inferred"),
+            rows.contains("receiver")
+                && rows.contains("not inferred")
+                && rows.contains("declares no member"),
             "uninferred receivers is not explained: {rows}"
         );
     }

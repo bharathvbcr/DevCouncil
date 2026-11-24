@@ -134,7 +134,8 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, global = true, default_value_t = ProgressMode::Auto)]
     pub(crate) progress: ProgressMode,
 
-    /// Include build phase timings, reclaim details and resolution breakdowns.
+    /// Include build phase timings, reclaim details and resolution breakdowns,
+    /// and print the full walk_incomplete detail instead of its one-line form.
     #[arg(long, short, global = true)]
     pub(crate) verbose: bool,
 

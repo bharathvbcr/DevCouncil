@@ -61,7 +61,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json {
         store.emit_answer(cli, serde_json::to_value(&resp)?)?;
     } else {
-        emit_edges(&resp);
+        emit_edges(&resp, cli.verbose);
         store.warn_incomplete()?;
     }
     Ok(())

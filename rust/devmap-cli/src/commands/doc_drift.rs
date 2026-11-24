@@ -1,7 +1,9 @@
 use devmap_query::DocDriftReport;
 
 use crate::cli::Cli;
-use crate::output::{emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read};
+use crate::output::{
+    emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read, WIDEN_BUDGET,
+};
 
 #[derive(clap::Args)]
 #[group(id = "DocDrift")]
@@ -34,13 +36,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json {
         store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
-        emit_doc_drift(&report);
+        emit_doc_drift(&report, cli.verbose);
         store.warn_incomplete()?;
     }
     Ok(())
 }
 
-fn emit_doc_drift(report: &DocDriftReport) {
+fn emit_doc_drift(report: &DocDriftReport, verbose: bool) {
     if !report.available {
         emit_unavailable(report.walk_incomplete.as_deref().unwrap_or("no generation"));
         return;
@@ -58,9 +60,15 @@ fn emit_doc_drift(report: &DocDriftReport) {
             outln!("    now in: {}", finding.current_locations.join(", "));
         }
     }
-    emit_truncation(report.shown, report.hidden, report.total, report.truncated);
+    emit_truncation(
+        report.shown,
+        report.hidden,
+        report.total,
+        report.truncated,
+        Some(WIDEN_BUDGET),
+    );
     if let Some(reason) = &report.walk_incomplete {
-        emit_walk_incomplete(reason);
+        emit_walk_incomplete(reason, verbose);
     }
     let counts = |map: &std::collections::BTreeMap<String, u32>| {
         if map.is_empty() {
