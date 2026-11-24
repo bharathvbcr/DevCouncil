@@ -145,6 +145,9 @@ pub async fn excluded_path_stays_out(root: &Path, excluded: &str, control: &str)
     let hashes = reader.latest_file_hashes().unwrap();
     handle.request_shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(30), running).await;
+    // Sampled here and again after the CLI's status, so a failure below names
+    // the queued path and whether the daemon or the CLI queued it.
+    let pending_after_shutdown = reader.get_pending_paths().unwrap();
     assert!(
         drained,
         "the control edit to {control} was never drained within {bound:?}"
@@ -161,5 +164,10 @@ pub async fn excluded_path_stays_out(root: &Path, excluded: &str, control: &str)
         status.degraded_reason
     );
     let cli_status = json(root, &["--json", "status"]);
-    assert_eq!(cli_status["is_fresh"], true, "{cli_status}");
+    let pending_after_cli = reader.get_pending_paths().unwrap();
+    assert_eq!(
+        cli_status["is_fresh"], true,
+        "pending after the daemon shut down: {pending_after_shutdown:?}; \
+         pending after the CLI status: {pending_after_cli:?}; status: {cli_status}"
+    );
 }
