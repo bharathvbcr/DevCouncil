@@ -553,3 +553,32 @@ func TestPublishedArtifactCarriesThePlatformExecutableName(t *testing.T) {
 		t.Fatalf("republishing the same bytes = %q, %v; want %q", again, err, path)
 	}
 }
+
+// TestOnlyAnUpliftBlockedByARunningImageIsRetried pins what cargoBin treats as
+// transient. On Windows cargo cannot replace target/debug/<bin>.exe while
+// another package's test is running it and exits 101 with "Access is denied
+// (os error 5)"; that is waited out. A compile error, or a cargo that failed
+// for any other reason, must still fail the build at once, or a broken build
+// would spin until its deadline.
+func TestOnlyAnUpliftBlockedByARunningImageIsRetried(t *testing.T) {
+	exit101 := errors.New("exit status 101")
+	blocked := "error: failed to remove file `D:\\a\\rust\\target\\debug\\devmap.exe`\n\nCaused by:\n  Access is denied. (os error 5)\n"
+	cases := []struct {
+		name string
+		err  error
+		log  string
+		want bool
+	}{
+		{"uplift refused by a running image", exit101, blocked, true},
+		{"the same log with no failure is not a retry", nil, blocked, false},
+		{"a compile error", exit101, "error[E0425]: cannot find value `x` in this scope\n", false},
+		{"access denied somewhere other than the uplift", exit101, "error: could not read `Cargo.toml`: Access is denied. (os error 5)\n", false},
+		{"an uplift that failed for another reason", exit101, "error: failed to remove file `target/debug/devmap`\n  No such device (os error 19)\n", false},
+		{"an empty log", exit101, "", false},
+	}
+	for _, c := range cases {
+		if got := upliftBlockedByRunningImage(c.err, []byte(c.log)); got != c.want {
+			t.Errorf("%s: upliftBlockedByRunningImage = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

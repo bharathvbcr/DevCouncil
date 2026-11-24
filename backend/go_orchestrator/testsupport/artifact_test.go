@@ -124,7 +124,7 @@ func TestPublishArtifactNamesTheCopyAfterItsContents(t *testing.T) {
 	}
 
 	sum := sha256.Sum256(data)
-	want := filepath.Join(target, testBinDir, "dcstore-"+hex.EncodeToString(sum[:])[:16], "dcstore")
+	want := filepath.Join(target, testBinDir, "dcstore-"+hex.EncodeToString(sum[:])[:16], executableName("dcstore"))
 	if path != want {
 		t.Fatalf("published to\n  %s\nwant the content-addressed\n  %s\n"+
 			"the name is what lets concurrent processes converge without agreeing "+
