@@ -15,7 +15,11 @@
  * it with the lane's own inputs. The inputs are the committed git trees of
  * rust/gusset-engine and every path dependency under the repository, read from
  * the Cargo.toml files (rust/dc-glob today; its own path deps too), the blob of
- * rust-toolchain.toml, and the sibling gusset's HEAD. Cargo.lock is inside the
+ * rust-toolchain.toml, the blob of the workspace root manifest (rust/Cargo.toml)
+ * when a crate inherits version, license, lints or a dependency from it, and the
+ * sibling gusset's HEAD. Manifests are parsed as TOML (parseToml) and classified
+ * by structure; a manifest that cannot be read, or a path key the stamp cannot
+ * classify, is refused (InputError) rather than skipped. Cargo.lock is inside the
  * engine tree, so it is covered. "dirty" is any uncommitted or untracked change
  * under those inputs or in the gusset sibling (git status --untracked-files=all,
  * which ignores status.showUntrackedFiles); a dirty stamp is never reusable.
@@ -37,57 +41,378 @@ function git(cwd, ...args) {
   return r.stdout.trim();
 }
 
+class Raw {
+  constructor(text) {
+    this.text = text;
+  }
+}
+const isTable = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof Raw);
+const newTable = () => Object.create(null);
+const isSpace = (c) => c === " " || c === "\t" || c === "\r" || c === "\n";
+const ESCAPES = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" };
+const BARE_KEY = /[A-Za-z0-9_-]+/y;
+const BARE_VALUE = /[^\s,\]}#]+/y;
+
 /**
- * Every `path = "..."` in a manifest that feeds the build, with its kind:
- * "dep" for dependency tables ([dependencies], dev-/build-, [workspace.dependencies],
- * [target.*.dependencies], their [dependencies.name] forms, [patch.*] and
- * [replace]) and "target" for [lib], [[bin]], [[example]], [[test]], [[bench]].
- *
- * @returns {Generator<{ kind: "dep" | "target", table: string, path: string }>}
+ * A TOML 1.0 reader (tables, arrays of tables, dotted and quoted keys, basic and
+ * literal strings in both single- and multi-line form, inline tables, arrays).
+ * Scalars other than strings and booleans come back as Raw. It exists so the
+ * stamp classifies manifests by structure, never by the spelling of a line, and
+ * it throws an InputError on anything it cannot read completely.
  */
-function* manifestPaths(toml) {
-  const depTable = /^(?:workspace\.|target\..+\.)?(?:dev-|build-)?dependencies(?:\..+)?$|^patch\..+$|^replace(?:\..+)?$/;
-  const targetTable = /^(?:lib|bin|example|test|bench)$/;
-  let kind;
-  let table = "";
-  for (const line of toml.split("\n")) {
-    const header = /^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*(?:#.*)?$/.exec(line);
-    if (header) {
-      table = header[1];
-      kind = depTable.test(table) ? "dep" : targetTable.test(table) ? "target" : undefined;
+export function parseToml(src, label) {
+  let i = 0;
+  const fail = (why) => {
+    throw new InputError(`${label}: cannot read this manifest (${why}, line ${src.slice(0, i).split("\n").length}); the engine stamp refuses a manifest it cannot parse completely`);
+  };
+  const peek = (s) => src.startsWith(s, i);
+  const ws = () => {
+    while (src[i] === " " || src[i] === "\t") i++;
+  };
+  const comment = () => {
+    if (src[i] === "#") while (i < src.length && src[i] !== "\n") i++;
+  };
+  const space = () => {
+    for (;;) {
+      ws();
+      comment();
+      if (src[i] === "\n" || src[i] === "\r") i++;
+      else return;
+    }
+  };
+  const eol = () => {
+    ws();
+    comment();
+    if (i < src.length && src[i] !== "\n" && src[i] !== "\r") fail("unexpected text after a value or header");
+  };
+  const basic = (multi) => {
+    const q = multi ? '"""' : '"';
+    i += q.length;
+    if (multi) {
+      if (src[i] === "\r") i++;
+      if (src[i] === "\n") i++;
+    }
+    let out = "";
+    for (;;) {
+      if (i >= src.length) fail("unterminated string");
+      if (peek(q)) {
+        if (!multi) {
+          i++;
+          return out;
+        }
+        let extra = 0;
+        while (extra < 2 && src[i + 3 + extra] === '"') extra++;
+        i += 3 + extra;
+        return out + '"'.repeat(extra);
+      }
+      const c = src[i];
+      if (c === "\n" && !multi) fail("newline in a single-line string");
+      if (c !== "\\") {
+        out += c;
+        i++;
+        continue;
+      }
+      const e = src[i + 1];
+      if (e === "u" || e === "U") {
+        const len = e === "u" ? 4 : 8;
+        const hex = src.slice(i + 2, i + 2 + len);
+        const cp = Number.parseInt(hex, 16);
+        if (hex.length !== len || !/^[0-9a-fA-F]+$/.test(hex) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) fail("bad unicode escape");
+        out += String.fromCodePoint(cp);
+        i += 2 + len;
+      } else if (multi && e !== undefined && isSpace(e)) {
+        i++;
+        while (i < src.length && isSpace(src[i])) i++;
+      } else if (e !== undefined && Object.hasOwn(ESCAPES, e)) {
+        out += ESCAPES[e];
+        i += 2;
+      } else {
+        fail("unknown escape in a string");
+      }
+    }
+  };
+  const literal = (multi) => {
+    const q = multi ? "'''" : "'";
+    i += q.length;
+    if (multi) {
+      if (src[i] === "\r") i++;
+      if (src[i] === "\n") i++;
+    }
+    const end = src.indexOf(q, i);
+    if (end < 0) fail("unterminated string");
+    let text = src.slice(i, end);
+    if (!multi && /[\r\n]/.test(text)) fail("newline in a single-line string");
+    i = end + q.length;
+    for (let extra = 0; multi && extra < 2 && src[i] === "'"; extra++, i++) text += "'";
+    return text;
+  };
+  const key = () => {
+    if (src[i] === '"') return basic(false);
+    if (src[i] === "'") return literal(false);
+    BARE_KEY.lastIndex = i;
+    const m = BARE_KEY.exec(src);
+    if (!m) fail("expected a key");
+    i += m[0].length;
+    return m[0];
+  };
+  const keyPath = () => {
+    const keys = [key()];
+    for (;;) {
+      ws();
+      if (src[i] !== ".") return keys;
+      i++;
+      ws();
+      keys.push(key());
+    }
+  };
+  const assign = (table, keys, v) => {
+    let t = table;
+    for (const k of keys.slice(0, -1)) {
+      if (t[k] === undefined) t[k] = newTable();
+      if (!isTable(t[k])) fail("a dotted key runs through a value that is not a table");
+      t = t[k];
+    }
+    const last = keys.at(-1);
+    if (Object.hasOwn(t, last)) fail("duplicate key");
+    t[last] = v;
+  };
+  const value = () => {
+    const c = src[i];
+    if (c === '"') return basic(peek('"""'));
+    if (c === "'") return literal(peek("'''"));
+    if (c === "[") {
+      i++;
+      const arr = [];
+      for (;;) {
+        space();
+        if (src[i] === "]") break;
+        arr.push(value());
+        space();
+        if (src[i] === ",") i++;
+        else if (src[i] !== "]") fail("expected , or ] in an array");
+      }
+      i++;
+      return arr;
+    }
+    if (c === "{") {
+      i++;
+      const t = newTable();
+      for (;;) {
+        space();
+        if (src[i] === "}") break;
+        const keys = keyPath();
+        ws();
+        if (src[i] !== "=") fail("expected = in an inline table");
+        i++;
+        space();
+        assign(t, keys, value());
+        space();
+        if (src[i] === ",") i++;
+        else if (src[i] !== "}") fail("expected , or } in an inline table");
+      }
+      i++;
+      return t;
+    }
+    BARE_VALUE.lastIndex = i;
+    const m = BARE_VALUE.exec(src);
+    if (!m) fail("expected a value");
+    i += m[0].length;
+    return m[0] === "true" ? true : m[0] === "false" ? false : new Raw(m[0]);
+  };
+
+  const top = newTable();
+  let cur = top;
+  for (;;) {
+    space();
+    if (i >= src.length) return top;
+    if (src[i] === "[") {
+      const isArray = src[i + 1] === "[";
+      i += isArray ? 2 : 1;
+      ws();
+      const keys = keyPath();
+      ws();
+      const close = isArray ? "]]" : "]";
+      if (!peek(close)) fail("unterminated table header");
+      i += close.length;
+      eol();
+      let t = top;
+      keys.forEach((k, j) => {
+        if (isArray && j === keys.length - 1) {
+          if (t[k] === undefined) t[k] = [];
+          if (!Array.isArray(t[k])) fail("an array of tables redefines a table");
+          t[k].push(newTable());
+          t = t[k].at(-1);
+          return;
+        }
+        if (t[k] === undefined) t[k] = newTable();
+        t = Array.isArray(t[k]) ? t[k].at(-1) : t[k];
+        if (!isTable(t)) fail("a table header runs through a value that is not a table");
+      });
+      cur = t;
       continue;
     }
-    if (!kind) continue;
-    for (const m of line.matchAll(/\bpath\s*=\s*"([^"]+)"/g)) yield { kind, table, path: m[1] };
+    const keys = keyPath();
+    ws();
+    if (src[i] !== "=") fail("expected =");
+    i++;
+    ws();
+    assign(cur, keys, value());
+    eol();
   }
 }
 
-/** Repository-relative engine inputs: the engine, its path dependencies, the toolchain file. */
+const DEP_TABLES = ["dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies"];
+const TARGET_TABLES = ["lib", "bin", "example", "test", "bench"];
+
+/**
+ * Everything in a parsed manifest that names a path or a workspace to inherit
+ * from, classified by structure:
+ *   "dep"    a dependency (every [dependencies]-like table, at the top level,
+ *            under [target.*] and under [workspace], plus [patch.*.*] and
+ *            [replace.*]); an entry that is just { workspace = true } is an
+ *            "inherit" of that name from the workspace root;
+ *   "target" [lib], [[bin]], [[example]], [[test]], [[bench]] paths and
+ *            [package] build, which must stay inside the crate.
+ * Any other table holding a key named "path" is refused: a path the stamp
+ * cannot classify is an input it cannot see, so it must not be skipped.
+ *
+ * @returns {{ entries: Array<{ kind: "dep" | "target", table: string, key?: string, path?: string, inherit?: string }>, inherits: boolean, isRoot: boolean, workspace?: string }}
+ */
+export function manifestRefs(doc, label) {
+  const entries = [];
+  const consumed = new Set();
+  const pathOf = (o, table, key = "path") => {
+    if (typeof o[key] !== "string" || o[key] === "") throw new InputError(`${label} [${table}] ${key} is not a non-empty string; the engine stamp cannot cover it`);
+    return o[key];
+  };
+  const dependency = (spec, table) => {
+    if (!isTable(spec)) return;
+    if ("path" in spec) {
+      consumed.add(spec);
+      entries.push({ kind: "dep", table, path: pathOf(spec, table) });
+    }
+  };
+  const depTable = (t, table) => {
+    if (!isTable(t)) return;
+    for (const [name, spec] of Object.entries(t)) {
+      dependency(spec, table);
+      if (isTable(spec) && spec.workspace === true) entries.push({ kind: "dep", table, inherit: name });
+    }
+  };
+  for (const name of DEP_TABLES) depTable(doc[name], name);
+  depTable(doc.workspace?.dependencies, "workspace.dependencies");
+  for (const [cfg, t] of Object.entries(isTable(doc.target) ? doc.target : {})) {
+    for (const name of DEP_TABLES) depTable(t?.[name], `target.${cfg}.${name}`);
+  }
+  for (const [registry, t] of Object.entries(isTable(doc.patch) ? doc.patch : {})) {
+    for (const spec of Object.values(isTable(t) ? t : {})) dependency(spec, `patch.${registry}`);
+  }
+  for (const spec of Object.values(isTable(doc.replace) ? doc.replace : {})) dependency(spec, "replace");
+  for (const name of TARGET_TABLES) {
+    for (const t of Array.isArray(doc[name]) ? doc[name] : [doc[name]]) {
+      if (!isTable(t) || !("path" in t)) continue;
+      consumed.add(t);
+      entries.push({ kind: "target", table: name, path: pathOf(t, name) });
+    }
+  }
+  const build = doc.package?.build;
+  if (typeof build === "string") entries.push({ kind: "target", table: "package", key: "build", path: build });
+  else if (build !== undefined && typeof build !== "boolean") throw new InputError(`${label} [package] build is neither a path nor a boolean; the engine stamp cannot cover it`);
+
+  let inherits = false;
+  const scan = (node, where) => {
+    if (Array.isArray(node)) return node.forEach((n, k) => scan(n, `${where}[${k}]`));
+    if (!isTable(node)) return;
+    if ("path" in node && !consumed.has(node)) {
+      throw new InputError(`${label}: a path key at ${where || "the top level"} is not in a table the engine stamp classifies (dependencies, patch, replace, lib, bin, example, test, bench); it cannot be covered`);
+    }
+    if (node.workspace === true) inherits = true;
+    for (const [k, v] of Object.entries(node)) scan(v, where ? `${where}.${k}` : k);
+  };
+  scan(doc, "");
+  const workspace = doc.package?.workspace;
+  if (workspace !== undefined && typeof workspace !== "string") throw new InputError(`${label} [package] workspace is not a path; the engine stamp cannot cover it`);
+  return { entries, inherits, isRoot: isTable(doc.workspace), workspace };
+}
+
+const posix = (p) => p.split(path.sep).join("/");
+
+/**
+ * The workspace root a crate inherits from: itself if it declares [workspace],
+ * the directory [package] workspace names, or the nearest ancestor directory
+ * (inside the repository) whose Cargo.toml declares one.
+ *
+ * @returns {{ dir: string, doc: object }}
+ */
+function workspaceRootOf(root, crateDir, refs, toml) {
+  const inside = (d) => d === root || d.startsWith(root + path.sep);
+  const candidates = [];
+  if (refs.workspace !== undefined) {
+    const named = path.resolve(crateDir, refs.workspace);
+    candidates.push(path.basename(named) === "Cargo.toml" ? path.dirname(named) : named);
+  } else {
+    for (let d = path.dirname(crateDir); inside(d); d = path.dirname(d)) candidates.push(d);
+  }
+  for (const dir of candidates) {
+    if (!inside(dir)) throw new InputError(`${toml} names a workspace root ${dir} outside the repository; the engine stamp cannot cover it`);
+    const manifest = path.join(dir, "Cargo.toml");
+    if (!existsSync(manifest)) continue;
+    const doc = parseToml(readFileSync(manifest, "utf8"), manifest);
+    if (isTable(doc.workspace)) return { dir, doc };
+  }
+  throw new InputError(`${toml} inherits from a workspace root but none was found inside the repository; the engine stamp cannot cover it`);
+}
+
+/**
+ * Repository-relative engine inputs: the engine, its path dependencies, the
+ * toolchain file, and the workspace root manifest of every crate that inherits
+ * from one (version, license, lints, dependencies: all live in that file).
+ */
 export function enginePaths(root) {
   const out = [ENGINE];
   const queue = [ENGINE];
   while (queue.length) {
     const rel = queue.shift();
-    const toml = path.join(root, rel, "Cargo.toml");
+    const crateDir = path.resolve(root, rel);
+    const toml = path.join(crateDir, "Cargo.toml");
     if (!existsSync(toml)) throw new InputError(`${toml} is missing (a path dependency of the engine)`);
-    for (const entry of manifestPaths(readFileSync(toml, "utf8"))) {
-      const crateDir = path.resolve(root, rel);
-      const abs = path.resolve(crateDir, entry.path);
+    const doc = parseToml(readFileSync(toml, "utf8"), toml);
+    const refs = manifestRefs(doc, toml);
+    let inheritedFrom;
+    if (refs.inherits || refs.entries.some((e) => e.inherit !== undefined)) {
+      inheritedFrom = refs.isRoot ? { dir: crateDir, doc } : workspaceRootOf(root, crateDir, refs, toml);
+      if (inheritedFrom.dir !== crateDir) {
+        const rootToml = posix(path.relative(root, path.join(inheritedFrom.dir, "Cargo.toml")));
+        if (!out.includes(rootToml)) out.push(rootToml);
+      }
+    }
+    for (const entry of refs.entries) {
+      let { path: entryPath } = entry;
+      let base = crateDir;
+      if (entry.inherit !== undefined) {
+        const declared = inheritedFrom.doc.workspace?.dependencies?.[entry.inherit];
+        if (declared === undefined) throw new InputError(`${toml} inherits dependency ${entry.inherit}, which is not declared in the workspace.dependencies of ${inheritedFrom.dir}/Cargo.toml`);
+        if (!isTable(declared) || !("path" in declared)) continue;
+        if (typeof declared.path !== "string" || declared.path === "") throw new InputError(`${inheritedFrom.dir}/Cargo.toml workspace.dependencies.${entry.inherit} path is not a non-empty string; the engine stamp cannot cover it`);
+        entryPath = declared.path;
+        base = inheritedFrom.dir;
+      }
+      const abs = path.resolve(base, entryPath);
       if (entry.kind === "target") {
         // A target source outside the crate directory is an input the stamp cannot see.
         if (!abs.startsWith(crateDir + path.sep)) {
-          throw new InputError(`${toml} [${entry.table}] path ${entry.path} resolves outside the crate directory; the engine stamp cannot cover it`);
+          throw new InputError(`${toml} [${entry.table}] ${entry.key ?? "path"} ${entry.path} resolves outside the crate directory; the engine stamp cannot cover it`);
         }
         continue;
       }
-      const dep = path.relative(root, abs).split(path.sep).join("/");
+      const dep = posix(path.relative(root, abs));
       if (dep.startsWith("..") || path.isAbsolute(dep)) {
         // Outside the repository it must be the sibling gusset the manifests
         // expect (<root>/../gusset, resolved the way cargo does); its commit is
         // recorded instead. Anything else is an input the stamp cannot see.
         const sibling = path.resolve(root, "..", "gusset");
         if (abs !== sibling && !abs.startsWith(sibling + path.sep)) {
-          throw new InputError(`${toml} has a path dependency ${entry.path} outside the repository and outside ${sibling}; the engine stamp cannot cover it`);
+          throw new InputError(`${toml} has a path dependency ${entryPath} outside the repository and outside ${sibling}; the engine stamp cannot cover it`);
         }
         continue;
       }
