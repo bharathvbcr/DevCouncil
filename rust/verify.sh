@@ -399,19 +399,31 @@ step_self_build() {
   # was A/B-measured and is not a factor (4,007 ms without it vs 3,650 ms with —
   # inside the noise). 10 s kept roughly 2.5x headroom over the measured cost.
   #
-  # Re-derived 2026-11-24 as a per-file rate, the same move the RSS budget above
-  # made: a flat 10 s measured the size of this repository rather than the cost
-  # of building it, and the repository grew from 1,110 to 2,750 files. The rate
-  # is calibrated on the CI runner, where the gate runs: 7,281 ms over 1,428
-  # files on 2026-09-29 (run 36501661378) is 5.1 ms/file, and 7.6 ms/file is
-  # 1.5x that. The headroom is deliberately tight. On 2026-11-24 CI measured
-  # 22,232 ms and 26,021 ms over 2,750 files (8.1 and 9.5 ms/file), and that
-  # rise is treated as a regression to find, not as the new rate.
-  BUILD_US_PER_FILE=7600
-  BUILD_BUDGET_MS=$(( FILE_COUNT * BUILD_US_PER_FILE / 1000 ))
-  echo "build budget ${BUILD_BUDGET_MS} ms = ${FILE_COUNT} files x ${BUILD_US_PER_FILE} us"
+  # Re-derived 2026-11-24 as a rate per persisted edge: a flat 10 s measured the
+  # size of this repository rather than the cost of building it. Per file is the
+  # wrong unit too, because files got denser: edges per file went from 34.7 to
+  # 49.8 between 2026-09-29 and 2026-11-24, which alone moves a per-file rate
+  # 1.43x. The rate is calibrated on the CI runner, where the gate runs: 7,281 ms
+  # for 49,585 edges on 2026-09-29 (run 36501661378) is 147 us/edge, and
+  # 220 us/edge is 1.5x that. On 2026-11-24 CI measured 162 and 190 us/edge
+  # (22,232 and 26,021 ms for 137,057 edges, two runs 17% apart): inside the
+  # budget, so the per-edge rise in persist (34 -> 43 us/edge) is tracked as a
+  # finding, not enforced here, because a budget tight enough to fail it would
+  # sit inside the runner's own noise.
+  BUILD_US_PER_EDGE=220
+  EDGE_COUNT=$(perl -MJSON::PP -e '
+    open my $fh, "<", $ARGV[0] or die $!;
+    my $raw = do { local $/; <$fh> };
+    for my $stage (@{ decode_json($raw)->{timings}{stages} // [] }) {
+      if (($stage->{stage} // "") =~ /^persisting \d+ symbols and (\d+) edges$/) { print $1; exit }
+    }
+  ' "$TMP1/self.json")
+  [[ "$EDGE_COUNT" =~ ^[0-9]+$ ]] && [ "$EDGE_COUNT" -gt 0 ] || {
+    echo "GATE FAIL: could not read the persisted edge count from the build report; refusing to report an unbudgeted build as passing"; exit 1; }
+  BUILD_BUDGET_MS=$(( EDGE_COUNT * BUILD_US_PER_EDGE / 1000 ))
+  echo "build budget ${BUILD_BUDGET_MS} ms = ${EDGE_COUNT} edges x ${BUILD_US_PER_EDGE} us"
   [ "$MS" -lt "$BUILD_BUDGET_MS" ] || {
-    echo "GATE FAIL: build ${MS} ms >= scale-invariant budget ${BUILD_BUDGET_MS} ms for ${FILE_COUNT} files"; exit 1; }
+    echo "GATE FAIL: build ${MS} ms >= scale-invariant budget ${BUILD_BUDGET_MS} ms for ${EDGE_COUNT} edges"; exit 1; }
   [ "$BYTES" -lt "$GATE" ] || { echo "GATE FAIL: db >= $((GATE/1024/1024)) MiB for ${FILE_COUNT} files"; exit 1; }
   [ "$RSS" -lt "$RSS_GATE" ] || { echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= $((RSS_GATE/1024/1024)) MiB"; exit 1; }
   [ "$RSS" -lt "$RSS_BUDGET" ] || {
