@@ -170,6 +170,7 @@ func TestAttackLegitUntrackedNamesAreCollected(t *testing.T) {
 	}
 	for i, name := range names {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			testsupport.RequireFileNameHere(t, name)
 			root := gitRepo(t)
 			writeFile(t, root, name, "INNOCENT-CONTENT\n")
 			_, diff, _, err := verify.CollectGitState(context.Background(), root)
@@ -545,6 +546,7 @@ func TestAttackTrackedHostileNamesWithSecretAreScanned(t *testing.T) {
 	names := []string{"odd\nname.txt", "tab\tname.txt", `back\slash.txt`, "-leading.txt", "q\"uote.txt", "éé.txt", "sp ace/b/in b/x.txt"}
 	for i, name := range names {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			testsupport.RequireFileNameHere(t, name)
 			root := gitRepo(t)
 			writeFile(t, root, name, "one\n")
 			attackCommit(t, root, "add")

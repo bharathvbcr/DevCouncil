@@ -3,6 +3,7 @@ package gatescfg
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -220,6 +221,9 @@ func TestUnreadableConfigFailsClosed(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads chmod-000 files")
 	}
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no mode bit that makes a file unreadable to its owner; os.Chmod(0) leaves it readable")
+	}
 	root := t.TempDir()
 	path := writeCfg(t, root, "gates:\n  mode: off\n")
 	if err := os.Chmod(path, 0); err != nil {
@@ -323,7 +327,8 @@ func TestResolveFollowsTheFileWithoutRestart(t *testing.T) {
 	if got := Resolve(root).VerificationMode; got != ModeEnforce {
 		t.Fatalf("after gate set = %s, want enforce", got)
 	}
-	if os.Geteuid() != 0 {
+	// The unreadable half needs a mode bit that denies the owner; Windows has none.
+	if os.Geteuid() != 0 && runtime.GOOS != "windows" {
 		if err := os.Chmod(path, 0); err != nil {
 			t.Fatal(err)
 		}
