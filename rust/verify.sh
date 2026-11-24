@@ -397,10 +397,21 @@ step_self_build() {
   # of 1,088, so the 5 s budget measured work the build no longer does. Quiet-run
   # measurements after the change: 3.0 s, 3.65 s, 4.0 s. The ledger added by D17
   # was A/B-measured and is not a factor (4,007 ms without it vs 3,650 ms with —
-  # inside the noise). 10 s keeps roughly 2.5x headroom over the measured cost so
-  # the gate catches a real regression rather than the machine being busy, which
-  # is what a wall-clock budget on a shared runner actually observes.
-  [ "$MS" -lt 10000 ] || { echo "GATE FAIL: build >= 10 s"; exit 1; }
+  # inside the noise). 10 s kept roughly 2.5x headroom over the measured cost.
+  #
+  # Re-derived 2026-11-24 as a per-file rate, the same move the RSS budget above
+  # made: a flat 10 s measured the size of this repository rather than the cost
+  # of building it, and the repository grew from 1,110 to 2,750 files. The rate
+  # is calibrated on the CI runner, where the gate runs: 7,281 ms over 1,428
+  # files on 2026-09-29 (run 36501661378) is 5.1 ms/file, and 7.6 ms/file is
+  # 1.5x that. The headroom is deliberately tight. On 2026-11-24 CI measured
+  # 22,232 ms and 26,021 ms over 2,750 files (8.1 and 9.5 ms/file), and that
+  # rise is treated as a regression to find, not as the new rate.
+  BUILD_US_PER_FILE=7600
+  BUILD_BUDGET_MS=$(( FILE_COUNT * BUILD_US_PER_FILE / 1000 ))
+  echo "build budget ${BUILD_BUDGET_MS} ms = ${FILE_COUNT} files x ${BUILD_US_PER_FILE} us"
+  [ "$MS" -lt "$BUILD_BUDGET_MS" ] || {
+    echo "GATE FAIL: build ${MS} ms >= scale-invariant budget ${BUILD_BUDGET_MS} ms for ${FILE_COUNT} files"; exit 1; }
   [ "$BYTES" -lt "$GATE" ] || { echo "GATE FAIL: db >= $((GATE/1024/1024)) MiB for ${FILE_COUNT} files"; exit 1; }
   [ "$RSS" -lt "$RSS_GATE" ] || { echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= $((RSS_GATE/1024/1024)) MiB"; exit 1; }
   [ "$RSS" -lt "$RSS_BUDGET" ] || {
