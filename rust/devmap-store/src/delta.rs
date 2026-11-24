@@ -727,8 +727,7 @@ mod tests {
         let began = std::time::Instant::now();
         let error = reader
             .load_snapshot()
-            .err()
-            .expect("a snapshot cannot be read through an exclusive writer");
+            .expect_err("a snapshot cannot be read through an exclusive writer");
         assert!(
             began.elapsed() < Duration::from_secs(2),
             "{:?}",
