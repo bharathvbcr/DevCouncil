@@ -1384,12 +1384,55 @@ fn resolve_hook_executable(
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = dir.join(executable);
-        if candidate.is_file() {
-            return candidate.canonicalize().map_err(|_| unresolved());
+        for name in executable_names(executable) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate.canonicalize().map_err(|_| unresolved());
+            }
         }
     }
     Err(unresolved())
+}
+
+/// The file names one `PATH` directory is probed for, in the order a shell
+/// would try them: the name as given, then (Windows only, and only for a name
+/// with no extension) the name with each `PATHEXT` extension, so `devmap`
+/// finds `devmap.exe`. Unix probes the name as given and nothing else.
+fn executable_names(executable: &Path) -> Vec<std::ffi::OsString> {
+    #[cfg(windows)]
+    {
+        executable_names_with(executable, std::env::var_os("PATHEXT").as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        vec![executable.as_os_str().to_os_string()]
+    }
+}
+
+/// [`executable_names`] with `PATHEXT` passed in. An unset or empty variable
+/// falls back to Windows' own default list. Extensions are used as written (the
+/// Windows file system matches them case-insensitively), skipping empty entries.
+#[cfg(any(windows, test))]
+fn executable_names_with(
+    executable: &Path,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Vec<std::ffi::OsString> {
+    let mut names = vec![executable.as_os_str().to_os_string()];
+    if executable.extension().is_some() {
+        return names;
+    }
+    let pathext = pathext
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    for ext in pathext.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let ext = ext.strip_prefix('.').unwrap_or(ext);
+        let mut name = executable.as_os_str().to_os_string();
+        name.push(".");
+        name.push(ext);
+        names.push(name);
+    }
+    names
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -2410,6 +2453,60 @@ mod tests {
         let relative = config_dir_from(home, os("seat"));
         assert!(relative.is_absolute(), "{relative:?}");
         assert!(relative.ends_with("seat"), "{relative:?}");
+    }
+
+    /// Windows: `--binary devmap` with only `devmap.exe` on `PATH` resolves,
+    /// trying `PATHEXT` in order (default list when unset), and a name that
+    /// already has an extension is never expanded. The name-building runs on
+    /// every platform; the on-disk resolution is Windows-only.
+    #[test]
+    fn pathext_expands_a_bare_name_in_order_and_leaves_an_extension_alone() {
+        let names = |name: &str, pathext: Option<&str>| -> Vec<String> {
+            executable_names_with(Path::new(name), pathext.map(std::ffi::OsStr::new))
+                .into_iter()
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            names("devmap", Some(".EXE;.cmd; ;.Bat")),
+            ["devmap", "devmap.EXE", "devmap.cmd", "devmap.Bat"]
+        );
+        assert_eq!(
+            names("devmap", None),
+            [
+                "devmap",
+                "devmap.COM",
+                "devmap.EXE",
+                "devmap.BAT",
+                "devmap.CMD"
+            ]
+        );
+        assert_eq!(names("devmap", Some("")), names("devmap", None));
+        assert_eq!(names("devmap.exe", Some(".EXE")), ["devmap.exe"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_hook_executable_finds_its_exe_through_pathext_on_windows() {
+        let dir = std::env::temp_dir().join(format!("devmap-hook-exe-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devmap.exe"), b"x").unwrap();
+        let path_var = std::env::join_paths([dir.as_path()]).unwrap();
+        let resolved =
+            resolve_hook_executable(Path::new("devmap"), Some(path_var.as_os_str())).unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(
+            resolved
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("devmap.exe")),
+            "{resolved:?}"
+        );
+        assert!(
+            resolve_hook_executable(Path::new("no-such-devmap"), Some(path_var.as_os_str()))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
