@@ -131,7 +131,11 @@ fn process_is_alive(pid: u32) -> bool {
         let rc = unsafe { libc::kill(pid, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        devmap_extract::process::windows_is_running(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -281,14 +285,20 @@ pub fn remove_staged_writer_lock(staged: &Path) -> Result<()> {
     let name = name.unwrap_or_default();
     let lock = staged.with_file_name(format!("{name}.writer.lock"));
     match std::fs::symlink_metadata(&lock) {
-        Ok(meta) if meta.file_type().is_file() => remove_file_if_present(&lock),
+        Ok(meta) if meta.file_type().is_file() => remove_file_if_present(&lock)?,
         Ok(_) => bail!(
             "refusing to remove {}: it is not a regular file",
             lock.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", lock.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", lock.display()))
+        }
     }
+    // Windows byte-range locks forbid reading the locked file, so the lock's
+    // holder is recorded in a companion `<lock>.owner` (see `lock_writer_at`).
+    // It is this staged build's too, and the lock is not the only file it left.
+    remove_file_if_present(&staged.with_file_name(format!("{name}.writer.lock.owner")))
 }
 
 /// Unlink `path`. A path that is already absent is success; any other failure
