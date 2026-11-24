@@ -145,6 +145,11 @@ impl Store {
     /// ([`Self::generation_snapshot`]): a prune that commits between them,
     /// from another connection, is invisible to the select, so a generation
     /// the check found is listed with the files it had, never as `[]`.
+    ///
+    /// A caller that wants "the latest generation's files" must not resolve the
+    /// id in a separate call and pass it here: a prune between the two is a
+    /// refusal for a store that is not empty. [`Self::latest_generation_paths`]
+    /// is that read in one snapshot.
     pub fn list_generation_paths(&self, generation_id: u32) -> Result<Vec<String>> {
         let conn = lock_conn(&self.conn)?;
         let Some(snapshot) = Self::generation_snapshot(&conn, generation_id)? else {
@@ -154,6 +159,33 @@ impl Store {
                  re-read the latest generation id and ask again"
             )));
         };
+        Self::generation_paths_in(&snapshot, generation_id)
+    }
+
+    /// The latest generation and every file it indexed, read in one snapshot.
+    ///
+    /// `None` when the store holds no generation. The id and the files cannot
+    /// disagree: a prune that commits after the snapshot is taken is invisible
+    /// to the select, so the answer is the generation as it was when it was
+    /// pinned — never a refusal for a store that was only being pruned, which
+    /// is what `latest_generation_id()` followed by
+    /// [`Self::list_generation_paths`] returned when a prune landed between the
+    /// two calls.
+    pub fn latest_generation_paths(&self) -> Result<Option<(u32, Vec<String>)>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            generation,
+            Self::generation_paths_in(&snapshot, generation)?,
+        )))
+    }
+
+    fn generation_paths_in(
+        snapshot: &rusqlite::Connection,
+        generation_id: u32,
+    ) -> Result<Vec<String>> {
         let mut stmt = snapshot.prepare(
             "SELECT DISTINCT p.path FROM generation_nodes n
              JOIN paths p ON p.id = n.file_id
