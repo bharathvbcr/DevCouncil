@@ -1363,6 +1363,21 @@ pub fn hook_executable(executable: &Path) -> anyhow::Result<PathBuf> {
     resolve_hook_executable(executable, std::env::var_os("PATH").as_deref())
 }
 
+/// A fixture executable path that is absolute on the platform under test: a
+/// path with no drive letter is not absolute on Windows, and a hook executable
+/// that is not absolute is refused there, so a Unix-looking fixture would be
+/// refused for the wrong reason. `unix_path` keeps its text (hostile characters
+/// included); on Windows it gains a `C:` drive and backslash separators.
+#[cfg(test)]
+pub(crate) fn absolute_fixture(unix_path: &str) -> PathBuf {
+    debug_assert!(unix_path.starts_with('/'), "{unix_path}");
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", unix_path.replace('/', "\\")))
+    } else {
+        PathBuf::from(unix_path)
+    }
+}
+
 fn resolve_hook_executable(
     executable: &Path,
     path_var: Option<&std::ffi::OsStr>,
@@ -2440,21 +2455,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_config_dir_is_the_variable_when_set_and_non_empty() {
-        let home = Path::new("/home/u");
-        let os = |value: &str| Some(std::ffi::OsString::from(value));
-        assert_eq!(config_dir_from(home, None), home.join(".claude"));
-        assert_eq!(config_dir_from(home, os("")), home.join(".claude"));
-        assert_eq!(
-            config_dir_from(home, os("/seat/one")),
-            PathBuf::from("/seat/one")
-        );
-        let relative = config_dir_from(home, os("seat"));
-        assert!(relative.is_absolute(), "{relative:?}");
-        assert!(relative.ends_with("seat"), "{relative:?}");
-    }
-
     /// Windows: `--binary devmap` with only `devmap.exe` on `PATH` resolves,
     /// trying `PATHEXT` in order (default list when unset), and a name that
     /// already has an extension is never expanded. The name-building runs on
@@ -2507,6 +2507,21 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_config_dir_is_the_variable_when_set_and_non_empty() {
+        let home = Path::new("/home/u");
+        let os = |value: &str| Some(std::ffi::OsString::from(value));
+        assert_eq!(config_dir_from(home, None), home.join(".claude"));
+        assert_eq!(config_dir_from(home, os("")), home.join(".claude"));
+        assert_eq!(
+            config_dir_from(home, os("/seat/one")),
+            PathBuf::from("/seat/one")
+        );
+        let relative = config_dir_from(home, os("seat"));
+        assert!(relative.is_absolute(), "{relative:?}");
+        assert!(relative.ends_with("seat"), "{relative:?}");
     }
 
     #[test]
@@ -3091,8 +3106,11 @@ mod tests {
     /// permission event.
     #[test]
     fn the_post_tool_use_matcher_covers_shell_calls_and_stays_off_permission_events() {
-        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
-            .expect("normal emission");
+        let block = hooks_block(
+            &absolute_fixture("/usr/local/bin/devmap"),
+            &["hook".to_string()],
+        )
+        .expect("normal emission");
         let matcher = block["hooks"]["PostToolUse"][0]["matcher"]
             .as_str()
             .unwrap();
@@ -3121,8 +3139,11 @@ mod tests {
     /// Bash only, on a non-permission event, and its coverage row says handled.
     #[test]
     fn a_failed_shell_call_reaches_the_post_tool_use_hook() {
-        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
-            .expect("normal emission");
+        let block = hooks_block(
+            &absolute_fixture("/usr/local/bin/devmap"),
+            &["hook".to_string()],
+        )
+        .expect("normal emission");
         let group = &block["hooks"]["PostToolUseFailure"][0];
         assert_eq!(group["matcher"], "Bash");
         let command = group["hooks"][0]["command"].as_str().unwrap();
@@ -3143,7 +3164,8 @@ mod tests {
     /// which are the fields the hook reads.
     #[test]
     fn cursor_shell_refresh_is_a_post_tool_use_entry_for_shell() {
-        let doc = cursor_hooks_document(Path::new("/usr/local/bin/devmap")).unwrap();
+        let exe = absolute_fixture("/usr/local/bin/devmap");
+        let doc = cursor_hooks_document(&exe).unwrap();
         let entries = doc["hooks"]["postToolUse"].as_array().unwrap();
         let shell: Vec<_> = entries
             .iter()
@@ -3152,7 +3174,7 @@ mod tests {
         assert_eq!(shell.len(), 1, "{entries:?}");
         assert_eq!(
             shell[0]["command"],
-            "'/usr/local/bin/devmap' hook post-tool-use"
+            format!("'{}' hook post-tool-use", exe.display())
         );
         assert!(doc["hooks"].get("afterShellExecution").is_none());
     }
@@ -3163,7 +3185,7 @@ mod tests {
     #[test]
     fn codex_hooks_json_omits_events_codex_does_not_document() {
         let files = render_plugin_bundle(
-            Path::new("/usr/local/bin/devmap"),
+            &absolute_fixture("/usr/local/bin/devmap"),
             Path::new("/tmp/devmap.sqlite"),
             Some("0.0.0"),
             &["hook".to_string()],
@@ -3200,7 +3222,7 @@ mod tests {
     #[test]
     fn every_rendered_hooks_json_carries_the_shell_matcher() {
         let files = render_plugin_bundle(
-            Path::new("/usr/local/bin/devmap"),
+            &absolute_fixture("/usr/local/bin/devmap"),
             Path::new("/tmp/devmap.sqlite"),
             Some("0.0.0"),
             &["hook".to_string()],
@@ -3273,12 +3295,16 @@ mod tests {
                 "shell expanded the executable path ({status}): {command}"
             );
         }
-        let ordinary = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
+        let ordinary_exe = absolute_fixture("/usr/local/bin/devmap");
+        let ordinary = hooks_block(&ordinary_exe, &["hook".to_string()])
             .expect("an absolute path with no shell metacharacters must validate");
         let sample = ordinary["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert_eq!(sample, "'/usr/local/bin/devmap' hook session-start");
+        assert_eq!(
+            sample,
+            format!("'{}' hook session-start", ordinary_exe.display())
+        );
         let cursor = cursor_hooks_document(&exe).expect("cursor hooks use the same quoting");
         let cursor_cmd = cursor["hooks"]["sessionStart"][0]["command"]
             .as_str()
@@ -3306,12 +3332,17 @@ mod tests {
     #[test]
     fn hooks_block_refuses_a_path_that_single_quotes_cannot_hold() {
         for path in ["/tmp/a\nb/devmap", "/tmp/a\rb/devmap", "/tmp/a\0b/devmap"] {
-            let err = hooks_block(Path::new(path), &["hook".into()])
+            let path = absolute_fixture(path);
+            let err = hooks_block(&path, &["hook".into()])
                 .expect_err("newline, CR, or NUL must not be emitted");
             let text = err.to_string();
             assert!(
                 text.contains("newline") && text.contains("NUL"),
                 "{path:?} -> {text}"
+            );
+            assert!(
+                !text.contains("absolute"),
+                "{path:?} must be refused for its bytes, not for being relative: {text}"
             );
         }
     }
@@ -3334,14 +3365,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let subst = "$(touch \"$MARKER\")";
         let tick = "`touch \"$MARKER\"`";
+        // Every case is an absolute path: hooks are never emitted bare (ba667f3f),
+        // and the hostile text is what each one still carries.
         let paths = [
             format!("/tmp/{subst}/devmap"),
             format!("/tmp/{tick}/devmap"),
             format!("/tmp/o'{subst}/devmap"),
             format!("/tmp/'{subst}'/devmap"),
             "/tmp/foo'; touch \"$MARKER\"; echo '/devmap".to_string(),
-            format!("'{subst}"),
-            format!("{subst}'"),
+            format!("/tmp/'{subst}"),
+            format!("/tmp/{subst}'"),
             format!("/tmp/my bin/{subst}/devmap"),
             format!("/tmp/δé/{subst}/devmap"),
             format!("/tmp/路径/{tick}/devmap"),
@@ -3351,7 +3384,7 @@ mod tests {
             format!("/tmp/a\u{202e}{tick}/devmap"),
             format!("/tmp/foo # {subst}"),
             format!("/tmp/<({subst})/devmap"),
-            format!("a'b'c'{subst}"),
+            format!("/tmp/a'b'c'{subst}"),
         ];
         for path in &paths {
             let block = hooks_block(Path::new(path), &["hook".to_string()])
@@ -3447,9 +3480,12 @@ mod tests {
             "/tmp/`touch x`\r/devmap",
             "/tmp/o'$(touch x)\0/devmap",
         ] {
+            let path = absolute_fixture(path);
+            let err = hooks_block(&path, &["hook".into()])
+                .expect_err(&format!("emitted a command for {path:?}"));
             assert!(
-                hooks_block(Path::new(path), &["hook".into()]).is_err(),
-                "emitted a command for {path:?}"
+                err.to_string().contains("newline"),
+                "{path:?} must be refused for its bytes: {err}"
             );
         }
     }
