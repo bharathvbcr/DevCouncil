@@ -323,6 +323,11 @@ func foldReport(receipt *Receipt, root string, mode Mode, report *devmap.Integra
 			}
 		}
 	}
+	// A foreign file devmap kept is not current: the asset it would write is
+	// missing, which an "unchanged" record (Changed is false) would hide.
+	for _, kept := range report.KeptForeign {
+		receipt.Files[rel(kept)] = "needs_attention"
+	}
 	receipt.Notes = append(receipt.Notes, report.Notes...)
 }
 

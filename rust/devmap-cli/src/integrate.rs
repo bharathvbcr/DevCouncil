@@ -142,6 +142,9 @@ pub struct IntegrateReport {
     /// The caller's servers from `--servers-stdin`, one outcome each.
     pub servers: Vec<McpMergeOutcome>,
     pub notes: Vec<String>,
+    /// Files DevMap left alone because it did not generate them, so its own
+    /// asset is not installed there.
+    pub kept: Vec<PathBuf>,
     /// Under `--check`, whether every asset already matched. The report is
     /// returned either way, so a caller can see *which* file differs.
     pub check_ok: bool,
@@ -411,6 +414,7 @@ fn integrate_into(
             force,
         )?;
         plugin_kept = !assets.kept.is_empty();
+        report.kept.extend(assets.kept.iter().cloned());
         report.hooks.extend(assets.outcomes);
         // The Go host records an outcome's note as "unchanged"; report.notes is
         // what it copies into its receipt, so the refusal is said there too.
@@ -2449,27 +2453,60 @@ fn generated_hooks(document: &Value) -> bool {
     handlers > 0
 }
 
-/// True for `'<abs>' hook <event>` (what is written now) or `"<abs>" hook
-/// <event>` (an earlier release): a quoted absolute path to an executable named
-/// `devmap`, then `hook`, then an event DevMap installs a handler for. `dev hook
-/// pre-tool-use` or `npx husky hook stop` are other tools' hooks.
+/// True for `<exe> hook <event>`, where `<exe>` is what DevMap writes or wrote
+/// for its own binary: a quoted absolute path to an executable named `devmap`,
+/// or the bare name `devmap` ([`claude::plugin_command`] emits it when `devmap`
+/// on `PATH` is this binary). `'…'` is the form written now
+/// (`shell_single_quote`, with `'\''` for an apostrophe), `"…"` an earlier
+/// release's. The event must be one DevMap installs a handler for. `dev hook
+/// pre-tool-use` and `npx husky hook stop` are other tools' hooks.
 fn is_devmap_hook_command(command: &str) -> bool {
-    let Some(quote) = command.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
+    let Some((executable, tail)) = split_quoted_word(command) else {
         return false;
     };
-    let rest = &command[1..];
-    let Some(end) = rest.find(quote) else {
-        return false;
-    };
-    let (path, tail) = (&rest[..end], &rest[end + 1..]);
-    let named_devmap = Path::new(path)
-        .file_stem()
-        .is_some_and(|stem| stem == "devmap");
-    named_devmap
-        && Path::new(path).is_absolute()
+    let is_devmap = executable == claude::PLUGIN_NAME
+        || (Path::new(&executable).is_absolute()
+            && Path::new(&executable)
+                .file_stem()
+                .is_some_and(|stem| stem == claude::PLUGIN_NAME));
+    is_devmap
         && tail
             .strip_prefix(" hook ")
             .is_some_and(|event| claude::DEVMAP_HOOKS.iter().any(|h| h.hook_event == event))
+}
+
+/// Split the shell word at the start of `command` into its value and the rest.
+/// Understands only what DevMap writes: a bare word, a `"…"` word, and the
+/// `'…'` form `shell_single_quote` produces, where an apostrophe inside is
+/// spelled `'\''`. Anything else is not a word this module wrote.
+fn split_quoted_word(command: &str) -> Option<(String, &str)> {
+    match command.chars().next()? {
+        '"' => {
+            let rest = &command[1..];
+            let end = rest.find('"')?;
+            Some((rest[..end].to_string(), &rest[end + 1..]))
+        }
+        '\'' => {
+            let mut value = String::new();
+            let mut rest = &command[1..];
+            loop {
+                let end = rest.find('\'')?;
+                value.push_str(&rest[..end]);
+                rest = &rest[end + 1..];
+                match rest.strip_prefix("\\''") {
+                    Some(after) => {
+                        value.push('\'');
+                        rest = after;
+                    }
+                    None => return Some((value, rest)),
+                }
+            }
+        }
+        _ => {
+            let end = command.find(' ').unwrap_or(command.len());
+            Some((command[..end].to_string(), &command[end..]))
+        }
+    }
 }
 
 /// Save `content` beside `path` as `<name>.devcouncil-backup-<id>` through a
@@ -2814,6 +2851,35 @@ mod plugin_asset_tests {
         assert!(note.contains(".devcouncil-backup-"), "{note}");
         assert!(!note.starts_with("wrote"), "{note}");
         fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn hooks_written_for_a_bare_executable_name_are_devmaps() {
+        let hooks = claude::codex_hooks_block(Path::new("devmap"), &["hook".to_string()]).unwrap();
+        assert!(generated_hooks(&hooks), "{hooks}");
+        // The double-quoted bare form of an earlier release, with an event
+        // Codex no longer gets (case L).
+        let old = serde_json::json!({"hooks": {"PostToolUseFailure": [{"hooks": [
+            {"type": "command", "command": "\"devmap\" hook post-tool-use"}]}]}});
+        assert!(is_devmap_hook_command("\"devmap\" hook post-tool-use"));
+        assert!(generated_hooks(&old), "{old}");
+        assert!(!is_devmap_hook_command("devmapper hook stop"));
+        assert!(!is_devmap_hook_command("'devmap' hookx stop"));
+    }
+
+    #[test]
+    fn a_path_with_an_apostrophe_in_it_is_still_devmaps() {
+        let exe = Path::new("/opt/it's/devmap");
+        let hooks = claude::codex_hooks_block(exe, &["hook".to_string()]).unwrap();
+        let command = hooks["hooks"].as_object().unwrap().values().next().unwrap()[0]["hooks"][0]
+            ["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            command.starts_with("'/opt/it'\\''s/devmap' hook "),
+            "{command}"
+        );
+        assert!(generated_hooks(&hooks), "{hooks}");
+        assert!(!is_devmap_hook_command("'/opt/it'\\''s/other' hook stop"));
     }
 }
 

@@ -226,6 +226,7 @@ fn run_integrate(
                     "note": m.note,
                 })).collect::<Vec<_>>(),
                 "notes": report.notes,
+                "kept_foreign": report.kept.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dry_run": dry_run,
                 "check": check,
                 "check_ok": report.check_ok,
