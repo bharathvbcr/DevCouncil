@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use devmap_extract::model::Extraction;
@@ -114,13 +115,60 @@ impl std::fmt::Display for DeltaDamaged {
 
 impl std::error::Error for DeltaDamaged {}
 
-/// Tag `result`'s error as damage to the delta at `path`, if it is damage.
+/// How long a read-only delta open or read waits for a lock by default, and so
+/// how long every caller that does not pass its own bound can block.
+pub const DEFAULT_READ_WAIT: Duration = Duration::from_secs(5);
+
+/// A read of the stacked delta store gave up waiting for another process's lock
+/// (`SQLITE_BUSY` / `SQLITE_LOCKED`) inside the caller's wait bound.
+///
+/// Not damage and not an empty delta: the delta was never looked at. A caller
+/// with a deadline (the hook) reports "could not look" rather than a clean or
+/// empty answer. Carried as error context, reachable with `downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaBusy {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for DeltaBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the stacked delta store {} is busy: another process holds a write lock on it; \
+             wait for that writer (often a running `devmap seed --sync-delta`) to finish and retry",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for DeltaBusy {}
+
+fn is_lock_contention(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
+/// Tag `result`'s error with what it says about the delta at `path`: damage
+/// ([`DeltaDamaged`]) or lock contention ([`DeltaBusy`]). A busy error is never
+/// labelled damage.
 fn tag_damage<T>(path: &Path, result: Result<T>) -> Result<T> {
     result.map_err(|error| {
         if crate::Store::is_database_corrupt(&error)
             && error.downcast_ref::<DeltaDamaged>().is_none()
         {
             error.context(DeltaDamaged {
+                path: path.to_path_buf(),
+            })
+        } else if is_lock_contention(&error) && error.downcast_ref::<DeltaBusy>().is_none() {
+            error.context(DeltaBusy {
                 path: path.to_path_buf(),
             })
         } else {
@@ -185,10 +233,35 @@ impl DeltaStore {
     /// be read without creating those sidecars: in a read-only directory that is
     /// an error naming the reason, never an empty or stale answer.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
-        tag_damage(path.as_ref(), Self::open_read_only_untagged(path.as_ref()))
+        Self::open_read_only_within(path, DEFAULT_READ_WAIT)
     }
 
-    fn open_read_only_untagged(path: &Path) -> Result<Option<Self>> {
+    /// [`open_read_only`](Self::open_read_only) that waits at most `wait` for a
+    /// lock, on the open and on every later read through this store (see
+    /// [`limit_wait`](Self::limit_wait)). A writer that outlasts it fails with a
+    /// [`DeltaBusy`]-tagged error. The delta stays in rollback-journal mode, so a
+    /// reader cannot read through a writer's lock: the bound makes the refusal
+    /// prompt and typed, not the read possible.
+    pub fn open_read_only_within<P: AsRef<Path>>(path: P, wait: Duration) -> Result<Option<Self>> {
+        tag_damage(
+            path.as_ref(),
+            Self::open_read_only_untagged(path.as_ref(), wait),
+        )
+    }
+
+    /// Bound how long any later statement on this connection waits for a lock.
+    /// A caller that spends part of a deadline between statements lowers it to
+    /// what is left, so open and reads together stay inside the deadline.
+    pub fn limit_wait(&self, wait: Duration) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("delta store mutex poisoned"))?;
+        conn.busy_timeout(wait.max(Duration::from_millis(1)))?;
+        Ok(())
+    }
+
+    fn open_read_only_untagged(path: &Path, wait: Duration) -> Result<Option<Self>> {
         let path = path.to_path_buf();
         if !path.is_file() {
             return Ok(None);
@@ -207,7 +280,7 @@ impl DeltaStore {
         )
         .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(wait.max(Duration::from_millis(1)))?;
         // SQLite opens lazily: read now, so a refusal is reported here.
         conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
             row.get::<_, i64>(0)
@@ -563,6 +636,111 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// A delta file with one row, and a second connection holding it exclusively
+    /// (as a `seed --sync-delta` mid-commit does) until the returned connection
+    /// is rolled back.
+    fn exclusively_held_delta(tag: &str) -> (PathBuf, PathBuf, rusqlite::Connection) {
+        let dir = temp_dir(tag);
+        let path = dir.join("delta.sqlite");
+        {
+            let writer = DeltaStore::open(&path).unwrap();
+            writer
+                .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+                .unwrap();
+        }
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let _: String = holder
+            .query_row("PRAGMA locking_mode=EXCLUSIVE", [], |r| r.get(0))
+            .unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        (dir, path, holder)
+    }
+
+    /// A reader with a caller-supplied bound gives up on a writer that outlasts
+    /// it with the typed [`DeltaBusy`], long before the 5 s default, and keeps
+    /// the "wait for that writer" wording. It is not damage and not empty.
+    /// (Card ft-983bd7bc: without the bound this open blocked for the full 5 s.)
+    #[test]
+    fn open_read_only_within_returns_a_typed_busy_inside_its_bound() {
+        let (dir, path, holder) = exclusively_held_delta("busy-open");
+        let began = std::time::Instant::now();
+        let refused = DeltaStore::open_read_only_within(&path, Duration::from_millis(50));
+        let took = began.elapsed();
+        let error = match refused {
+            Ok(_) => panic!("a reader cannot read through an exclusive writer"),
+            Err(error) => error,
+        };
+        assert!(
+            took < Duration::from_secs(2),
+            "bounded open took {took:?} against a 50 ms bound (default is {DEFAULT_READ_WAIT:?})"
+        );
+        let busy = error
+            .downcast_ref::<DeltaBusy>()
+            .unwrap_or_else(|| panic!("not tagged busy: {error:#}"));
+        assert_eq!(busy.path, path);
+        assert!(
+            error.downcast_ref::<DeltaDamaged>().is_none(),
+            "a busy delta is not a damaged one: {error:#}"
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("another process holds a write lock on it")
+                && text.contains("wait for that writer"),
+            "{text}"
+        );
+        // EXCLUSIVE locking mode keeps the file lock past ROLLBACK: only closing
+        // the connection releases the delta.
+        holder.execute_batch("ROLLBACK;").unwrap();
+        drop(holder);
+        let reader = DeltaStore::open_read_only_within(&path, Duration::from_millis(50))
+            .unwrap()
+            .expect("exists");
+        assert_eq!(reader.dirty_file_count().unwrap(), 1);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound also covers reads after the open, and `limit_wait` lowers it to
+    /// what a deadline has left: a writer that arrives after the open is refused
+    /// as busy, promptly, never read as an empty delta.
+    #[test]
+    fn a_read_after_the_open_honours_the_bound_and_limit_wait() {
+        let dir = temp_dir("busy-read");
+        let path = dir.join("delta.sqlite");
+        {
+            let writer = DeltaStore::open(&path).unwrap();
+            writer
+                .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+                .unwrap();
+        }
+        let reader = DeltaStore::open_read_only_within(&path, DEFAULT_READ_WAIT)
+            .unwrap()
+            .expect("exists");
+        reader.limit_wait(Duration::from_millis(50)).unwrap();
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let _: String = holder
+            .query_row("PRAGMA locking_mode=EXCLUSIVE", [], |r| r.get(0))
+            .unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let began = std::time::Instant::now();
+        let error = reader
+            .load_snapshot()
+            .err()
+            .expect("a snapshot cannot be read through an exclusive writer");
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(
+            error.downcast_ref::<DeltaBusy>().is_some(),
+            "not tagged busy: {error:#}"
+        );
+        assert!(error.downcast_ref::<DeltaDamaged>().is_none());
+        holder.execute_batch("ROLLBACK;").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A read of `delta.sqlite` writes nothing: after its last writer closes (and

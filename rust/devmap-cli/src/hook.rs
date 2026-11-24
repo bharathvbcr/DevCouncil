@@ -1586,7 +1586,9 @@ fn render_skeleton_context(root: &Path, absolute: &Path, budget: Duration) -> Op
     if budget.is_zero() {
         return None;
     }
-    let hook_store = HookStore::open(root).ok().flatten()?;
+    let hook_store = HookStore::open(root, budget.saturating_sub(started.elapsed()))
+        .ok()
+        .flatten()?;
     if started.elapsed() >= budget {
         return None;
     }
@@ -1680,7 +1682,7 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
     if !has_store {
         return None;
     }
-    let hook_store = match HookStore::open(root) {
+    let hook_store = match HookStore::open(root, budget.saturating_sub(started.elapsed())) {
         Ok(Some(hook_store)) => hook_store,
         Ok(None) => {
             return Some(
@@ -1688,7 +1690,17 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
                     .into(),
             );
         }
-        Err(reason) => {
+        // A writer held the delta past the budget: the delta was never looked
+        // at, which is not an empty or clean blast.
+        Err(HookOpenError::DeltaBusy) => {
+            return Some(
+                "DevMap blast: could not look (delta busy): another process holds the stacked \
+                 delta's write lock (often a running `devmap seed --sync-delta`) past the hook \
+                 budget; this is not an empty or clean result, so no blast was computed."
+                    .into(),
+            );
+        }
+        Err(HookOpenError::Other(reason)) => {
             return Some(format!(
                 "DevMap blast: the stacked index could not be opened ({reason}); \
                  list is empty because the store was unavailable."
@@ -1988,11 +2000,22 @@ enum HookStore {
     Stacked(Box<devmap_query::StackedStore>),
 }
 
+/// Why [`HookStore::open`] could not give a store.
+#[derive(Debug, PartialEq, Eq)]
+enum HookOpenError {
+    /// The stacked delta was locked by a writer for the whole wait: not looked
+    /// at, reported as such, never as an empty delta.
+    DeltaBusy,
+    Other(String),
+}
+
 impl HookStore {
     /// `Ok(None)`: nothing is stored here. `Err`: a lane's lease exists but its
     /// store cannot be opened; the text names the recovery command, so the hook
-    /// can say why instead of "could not be opened".
-    fn open(root: &Path) -> Result<Option<Self>, String> {
+    /// can say why instead of "could not be opened". `wait` is what is left of
+    /// the hook's budget: a stacked lane's delta is waited for at most that long
+    /// and a writer that outlasts it is [`HookOpenError::DeltaBusy`].
+    fn open(root: &Path, wait: Duration) -> Result<Option<Self>, HookOpenError> {
         let plain = [
             root.join(".devcouncil/codeintel/devmap.sqlite"),
             root.join(".devmap/codeintel/devmap.sqlite"),
@@ -2004,9 +2027,15 @@ impl HookStore {
                 .ok()
                 .map(|store| Self::Plain(Box::new(store))));
         }
-        devmap_query::StackedStore::open_if_leased(root)
+        devmap_query::StackedStore::open_if_leased_within(root, wait)
             .map(|opened| opened.map(|stacked| Self::Stacked(Box::new(stacked))))
-            .map_err(|err| format!("{err:#}"))
+            .map_err(|err| {
+                if err.downcast_ref::<devmap_store::DeltaBusy>().is_some() {
+                    HookOpenError::DeltaBusy
+                } else {
+                    HookOpenError::Other(format!("{err:#}"))
+                }
+            })
     }
 
     fn store(&self) -> &devmap_store::Store {
@@ -9563,6 +9592,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A writer holding the lane's delta past the hook's budget is "could not
+    /// look (delta busy)", within the budget: never an empty or clean blast, and
+    /// never the generic "could not be opened" (card ft-983bd7bc).
+    #[test]
+    fn a_busy_delta_is_could_not_look_not_a_clean_blast() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-busy-delta");
+        let delta_path = devmap_extract::paths::stack_delta_path(lane.canonicalize().unwrap());
+        {
+            let delta = devmap_store::DeltaStore::open(&delta_path).unwrap();
+            delta.tombstone_file("gone.rs", "CAS_TOMBSTONE", 1).unwrap();
+        }
+        let holder = rusqlite::Connection::open(&delta_path).unwrap();
+        let _: String = holder
+            .query_row("PRAGMA locking_mode=EXCLUSIVE", [], |r| r.get(0))
+            .unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let opened = HookStore::open(&lane, Duration::from_millis(50));
+        assert!(
+            matches!(opened, Err(HookOpenError::DeltaBusy)),
+            "a delta held past the budget must be typed busy"
+        );
+        let payload = json!({"file_path": lane.join("lib.rs").to_str().unwrap()});
+        let started = Instant::now();
+        let note = compose_write_blast(&lane, &payload, POST_TOOL_BLAST_BUDGET)
+            .expect("a busy delta must still speak");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(3),
+            "the hook waited {took:?} for a writer (budget {POST_TOOL_BLAST_BUDGET:?})"
+        );
+        assert!(note.contains("could not look (delta busy)"), "{note}");
+        assert!(!note.contains("impacted:"), "no blast was computed: {note}");
+        assert!(
+            !note.contains("list is empty because"),
+            "busy must not read as an empty list: {note}"
+        );
+        holder.execute_batch("ROLLBACK;").unwrap();
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The hook only reads: with the store a materialize placed and a lease
     /// that outlived it, its open answers from the store and deletes nothing.
     #[test]
@@ -9578,7 +9649,7 @@ mod tests {
         // The interrupted state: the store is placed, the lease is back.
         std::fs::write(&lease_path, &lease_bytes).unwrap();
         assert!(matches!(
-            HookStore::open(&lane),
+            HookStore::open(&lane, Duration::from_secs(10)),
             Ok(Some(HookStore::Plain(_)))
         ));
         assert!(lease_path.is_file(), "the hook's read left the lease alone");
