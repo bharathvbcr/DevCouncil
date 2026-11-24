@@ -938,3 +938,86 @@ fn user_and_project_scope_entries_are_one_claude_server() {
         "beside the plugin both scope entries are named: {payload}"
     );
 }
+
+/// A registered linked worktree with a `devmap` file under `rust/target/debug`,
+/// so the receipt's lane note can be tested wherever the suite itself runs.
+fn lane_binary() -> PathBuf {
+    let root = scratch("lane-note");
+    let git = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let main = root.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let lane = root.join("lane");
+    git(&main, &["worktree", "add", "-q", lane.to_str().unwrap(), "-b", "lane"]);
+    let bin = lane.join("rust/target/debug/devmap");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, b"x").unwrap();
+    bin
+}
+
+fn has_lane_note(report: &Value) -> bool {
+    report["notes"]
+        .as_array()
+        .is_some_and(|notes| notes.iter().any(|n| n.as_str().is_some_and(|n| n.contains("linked worktree"))))
+}
+
+/// The lane note follows the documents after the run: a write and an
+/// already-current entry both name the lane binary and get the note; a
+/// `retire_beside_plugin` removal leaves nothing to break and gets none.
+#[test]
+fn integrate_claude_notes_a_lane_binary_only_while_an_entry_names_it() {
+    let bin = lane_binary();
+    let bin_arg = bin.display().to_string();
+    let home = scratch("lane-note-home");
+    let project = scratch("lane-note-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), false);
+    let wrote = integrate_claude(&home, &project, &["--binary", &bin_arg]);
+    assert_eq!(claude_json_outcome(&wrote, &home)["changed"], true, "{wrote}");
+    assert!(has_lane_note(&wrote), "a write names the lane binary: {wrote}");
+    let current = integrate_claude(&home, &project, &["--binary", &bin_arg]);
+    assert_eq!(claude_json_outcome(&current, &home)["changed"], false, "{current}");
+    assert!(has_lane_note(&current), "an already-current entry still breaks: {current}");
+
+    let home = scratch("lane-note-retire-home");
+    let project = scratch("lane-note-retire-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    std::fs::write(
+        home.join(".claude.json"),
+        serde_json::json!({"mcpServers": {"devmap": {"command": bin_arg, "args": ["mcp"]}}}).to_string(),
+    )
+    .unwrap();
+    let retired = integrate_claude(&home, &project, &["--binary", &bin_arg]);
+    assert_eq!(claude_json_outcome(&retired, &home)["changed"], true, "{retired}");
+    assert!(!has_lane_note(&retired), "a removal breaks nothing: {retired}");
+    assert!(devmap_entry(&home.join(".claude.json")).is_none(), "{retired}");
+}
+
+/// Warp's document *is* the server map (no container key), so a reader that
+/// hard-codes `mcpServers` misses it.
+#[test]
+fn integrate_warp_notes_a_lane_binary_in_a_rootless_document() {
+    let bin = lane_binary();
+    let bin_arg = bin.display().to_string();
+    let home = scratch("lane-warp-home");
+    let project = scratch("lane-warp-project");
+    let project_arg = project.display().to_string();
+    let out = run_in(
+        &project,
+        &["--json", "integrate", "warp", "--project-root", &project_arg, "--binary", &bin_arg],
+        Some(&home),
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = one_json(&out, "integrate warp");
+    assert!(has_lane_note(&report), "{report}");
+}

@@ -1872,17 +1872,108 @@ pub(crate) fn path_is_hashed_test_binary(path: &Path) -> bool {
     })
 }
 
-/// Refuse to put a hashed test binary into an MCP command.
+/// Why `path` is a cargo build product inside a linked worktree, if it is.
+///
+/// A path with a `target` component followed by a profile directory and then
+/// the binary (`target/<profile>/devmap`, `target/<triple>/<profile>/devmap`) is
+/// build output whatever the profile is called. Every `target` component is
+/// tried, and the ancestors above it are asked whether any is a linked worktree
+/// that git itself registered, through `devmap_extract::paths::main_checkout_of`:
+/// that excludes submodules and any folder that merely looks like a worktree.
+/// A lane's checkout is removed when it lands, and the binary goes with it, so
+/// the host that stored the path fails `posix_spawn` with ENOENT. The primary
+/// checkout's own `target/` is not matched: it outlives any lane. A deleted
+/// worktree cannot be confirmed, so it is not named.
+pub(crate) fn worktree_build_output_warning(path: &Path) -> Option<String> {
+    worktree_build_output_warning_at(path).or_else(|| {
+        let resolved = path.canonicalize().ok()?;
+        worktree_build_output_warning_at(&resolved)
+    })
+}
+
+/// `worktree_build_output_warning` for one spelling of the path.
+///
+/// A bare-repository common dir is not recognised as a main checkout by
+/// `main_checkout_of`, so a worktree of a bare repo is not named.
+fn worktree_build_output_warning_at(path: &Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    let is_target = |c: &std::path::Component<'_>| {
+        matches!(c, std::path::Component::Normal(name) if *name == "target")
+    };
+    for (index, _) in components.iter().enumerate().filter(|(_, c)| is_target(c)) {
+        // `target`, a profile directory, and the file itself.
+        if components.len() < index + 3 {
+            continue;
+        }
+        let above: PathBuf = components[..index].iter().collect();
+        for dir in above.ancestors() {
+            if let Some(main) = devmap_extract::paths::main_checkout_of(dir) {
+                return Some(format!(
+                    "the MCP command {} is build output inside the linked worktree {} \
+                     (main checkout {}); the entry will break when that worktree is \
+                     removed. Register an installed devmap, or pass --binary.",
+                    path.display(),
+                    dir.display(),
+                    main.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The `notes` line for a receipt: the warning, but only when an MCP entry
+/// naming `executable` is registered after the run. Otherwise nothing will
+/// break. This covers MCP entries only: the hook and plugin writers also embed
+/// the binary path and are not checked (card ft-502e29ba).
+pub(crate) fn mcp_receipt_note(executable: &Path, registered: bool) -> Option<String> {
+    if registered {
+        worktree_build_output_warning(executable)
+    } else {
+        None
+    }
+}
+
+/// True the first time `path` is seen in this process. A poisoned lock still
+/// holds a valid list, so it is recovered rather than dropping the warning.
+fn first_sighting(path: &Path) -> bool {
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.iter().any(|p| p == path) {
+        return false;
+    }
+    seen.push(path.to_path_buf());
+    true
+}
+
+/// Print `worktree_build_output_warning` once per path per process.
+///
+/// Stderr only: `mcp --print-config` keeps stdout to the JSON a host consumes.
+fn warn_on_worktree_build_output(executable: &Path) {
+    if let Some(message) = worktree_build_output_warning(executable) {
+        if first_sighting(executable) {
+            eprintln!("warning: {message}");
+        }
+    }
+}
+
+/// Refuse to put a hashed test binary into an MCP command; warn on a linked
+/// worktree's build output.
 ///
 /// A symlink is followed. The lexical path of a deleted worktree does not
 /// exist, so a failed canonicalize is not treated as safe: the path components
 /// are checked either way. A missing ordinary path stays allowed, which is
-/// what the config writers' unit tests hand in.
+/// what the config writers' unit tests hand in. Build output in a linked
+/// worktree is only warned about: `CARGO_BIN_EXE_devmap` is that path whenever
+/// the integration tests run in a lane.
 pub(crate) fn refuse_hashed_test_binary(executable: &Path) -> anyhow::Result<()> {
     let canonical = executable.canonicalize().ok();
     let lexical = path_is_hashed_test_binary(executable);
     let via_link = canonical.as_deref().is_some_and(path_is_hashed_test_binary);
     if !lexical && !via_link {
+        warn_on_worktree_build_output(executable);
         return Ok(());
     }
     let shown = if via_link {
@@ -3517,6 +3608,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "protocol.file.allow=always", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-wt-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.canonicalize().expect("canonical scratch dir")
+    }
+
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("repo dir");
+        git_in(dir, &["init", "-q"]);
+        git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Build output in a worktree git registered warns and is still accepted:
+    /// `CARGO_BIN_EXE_devmap` is exactly that path when the suite runs in a lane.
+    #[test]
+    fn a_registered_linked_worktrees_build_output_warns_and_is_accepted() {
+        let root = scratch_dir("lane");
+        let main = root.join("main");
+        init_repo(&main);
+        let lane = root.join("lane");
+        git_in(&main, &["worktree", "add", "-q", lane.to_str().expect("utf8"), "-b", "lane"]);
+        let primary_bin = main.join("rust/target/debug/devmap");
+        let cases = [
+            lane.join("rust/target/debug/devmap"),
+            lane.join("rust/target/aarch64-apple-darwin/release/devmap"),
+            lane.join("rust/target/custom-profile/devmap"),
+            lane.join("target/x/target/ci/devmap"),
+        ];
+        let warned: Vec<_> = cases
+            .iter()
+            .map(|p| (p.clone(), worktree_build_output_warning(p)))
+            .collect();
+        let accepted: Vec<_> = cases.iter().map(|p| mcp_entry(p, None, None)).collect();
+        let primary = worktree_build_output_warning(&primary_bin);
+        let note_direct = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), true);
+        let note_unregistered = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), false);
+        // A path no writer above has used, so the set has not seen it yet.
+        let unseen = lane.join("rust/target/debug/unseen-devmap");
+        let first = first_sighting(&unseen);
+        let second = first_sighting(&unseen);
+        let source_file = worktree_build_output_warning(&lane.join("rust/src/target"));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, warning) in warned {
+            let warning = warning.unwrap_or_else(|| panic!("{} was not flagged", path.display()));
+            assert!(warning.contains("removed"), "{warning}");
+            assert!(warning.contains("--binary"), "{warning}");
+            assert!(warning.contains(&*path.to_string_lossy()), "{warning}");
+        }
+        for entry in accepted {
+            entry.expect("a warning is not a refusal");
+        }
+        assert!(first && !second, "stderr warns once per path");
+        assert!(note_direct.is_some(), "receipt note missing");
+        assert!(note_unregistered.is_none(), "nothing registered, nothing will break");
+        assert!(primary.is_none(), "the main checkout outlives any lane: {primary:?}");
+        assert!(source_file.is_none(), "a file named target is not build output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_a_lanes_build_output_warns_and_notes() {
+        let root = scratch_dir("link");
+        let main = root.join("main");
+        init_repo(&main);
+        let lane = root.join("lane");
+        git_in(&main, &["worktree", "add", "-q", lane.to_str().expect("utf8"), "-b", "lane"]);
+        let binary = lane.join("rust/target/debug/devmap");
+        std::fs::create_dir_all(binary.parent().expect("parent")).expect("lane target");
+        std::fs::write(&binary, b"x").expect("lane binary");
+        let link = root.join("devmap");
+        std::os::unix::fs::symlink(&binary, &link).expect("symlink");
+        let warning = worktree_build_output_warning(&link);
+        let note = mcp_receipt_note(&link, true);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(warning.is_some(), "a symlink into a lane was not flagged");
+        assert!(note.is_some(), "the receipt note is missing for the symlink");
+    }
+
+    #[test]
+    fn a_submodules_target_and_a_plain_worktrees_folder_are_not_flagged() {
+        let root = scratch_dir("neg");
+        let sub_src = root.join("sub-src");
+        init_repo(&sub_src);
+        let main = root.join("main");
+        init_repo(&main);
+        git_in(&main, &["submodule", "add", "-q", sub_src.to_str().expect("utf8"), "vendor/sub"]);
+        let submodule_bin = main.join("vendor/sub/target/debug/devmap");
+        let outside_git = root.join("not-a-repo/worktrees/lane/rust/target/debug/devmap");
+        let flagged = [
+            worktree_build_output_warning(&submodule_bin),
+            worktree_build_output_warning(&outside_git),
+        ];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(flagged, [None, None]);
     }
 
     /// The ENOENT from 2026-10-29 was this path: a hashed copy under
