@@ -239,9 +239,10 @@ func runReviewKeygen(args []string) int {
 		console.Errorf("review keygen: %v\n", err)
 		return 1
 	}
-	// O_EXCL so an existing key is never overwritten; 0600 so it is not
-	// group- or world-readable, which LoadSigningKey also enforces on read.
-	file, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Never overwrites an existing key, and the file is owner-only (0600, or an
+	// owner-only DACL on Windows) before any secret byte is written, which
+	// LoadSigningKey also enforces on read.
+	file, err := dc.CreateSigningKeyFile(out)
 	if err != nil {
 		console.Errorf("review keygen: %v\n", err)
 		return 1

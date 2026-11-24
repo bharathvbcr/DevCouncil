@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -114,18 +113,22 @@ func TestAnUntrustedOrAbsentKeyIsRefused(t *testing.T) {
 // keygen writes a usable private key and a signer line that loads back to the
 // same key, and the private file must be 0600.
 func TestKeygenRoundTrips(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("LoadSigningKey refuses every key file on Windows, which reports 0666 for any writable " +
-			"file, so a signing key can never be loaded there; whether to change that refusal is an " +
-			"owner decision (see the report on this change), not something a test fixture can settle")
-	}
 	keyFile, signerLine, err := GenerateSigningKey("manvi-prod")
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "k.json")
-	if err := os.WriteFile(keyPath, keyFile, 0o600); err != nil {
+	// Through the same creator keygen uses, so on Windows the file carries the
+	// owner-only DACL LoadSigningKey requires.
+	f, err := CreateSigningKeyFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 	keyID, priv, err := LoadSigningKey(keyPath)
@@ -155,16 +158,15 @@ func TestKeygenRoundTrips(t *testing.T) {
 	}
 }
 
-// A loose-permission private key is refused, as an ssh client refuses one.
+// A loose-permission private key is refused, as an ssh client refuses one: a
+// group/world-readable mode on Unix, a DACL that admits Users on Windows.
 func TestALoosePrivateKeyIsRefused(t *testing.T) {
 	keyFile, _, err := GenerateSigningKey("k")
 	if err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "k.json")
-	if err := os.WriteFile(path, keyFile, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeLooseKeyFile(t, path, keyFile)
 	if _, _, err := LoadSigningKey(path); err == nil {
 		t.Error("a group/world-readable signing key was accepted")
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
@@ -77,14 +78,18 @@ func writeRecord(t *testing.T, subject string) string {
 // reviewKey makes a signing key with `review keygen` and returns its path.
 func reviewKey(t *testing.T) string {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("review signing keys cannot be loaded on Windows: LoadSigningKey refuses any key file whose " +
-			"mode is not 0600, and Windows reports 0666 for every writable file (see the report on this change)")
-	}
 	keyPath := filepath.Join(t.TempDir(), "k.json")
 	code, out := cli(t, "review", "keygen", "--key-id", "test", "--out", keyPath)
 	if code != 0 {
 		t.Fatalf("keygen: %d %s", code, out)
+	}
+	if runtime.GOOS == "windows" {
+		// Windows has no mode bits to assert; what matters is that keygen's
+		// owner-only DACL passes the check the loader enforces.
+		if _, _, err := dc.LoadSigningKey(keyPath); err != nil {
+			t.Fatalf("keygen's key file was refused: %v", err)
+		}
+		return keyPath
 	}
 	info, err := os.Stat(keyPath)
 	if err != nil {
