@@ -435,9 +435,11 @@ function workspaceMembersInside(ws, crateDir, toml, root) {
     if (ws[name] === undefined) continue;
     const at = where(toml, ws);
     if (!Array.isArray(ws[name]) || ws[name].some((m) => typeof m !== "string")) throw new InputError(`${at} [workspace] ${name} is not a list of strings; the engine stamp cannot cover it`);
-    for (const member of ws[name]) {
+    for (const raw of ws[name]) {
       // A glob before a .. ("*/../../evil") hides the escape from the prefix check.
-      if (member.split(/[\\/]/).includes("..")) throw new InputError(`${at} [workspace] ${name} entry ${member} has a .. segment; the engine stamp cannot cover where it leads`);
+      if (raw.split(/[\\/]/).includes("..")) throw new InputError(`${at} [workspace] ${name} entry ${raw} has a .. segment; the engine stamp cannot cover where it leads`);
+      // Judged in normal form: "./*/x" is "*/x", and "././t*/x" is "t*/x".
+      const member = raw.split(/[\\/]+/).filter((seg) => seg !== "" && seg !== ".").join("/") || ".";
       const prefix = member.split(/[*?[{]/)[0];
       const isGlob = prefix !== member;
       // A glob is judged by the directory it starts in. One in the first path

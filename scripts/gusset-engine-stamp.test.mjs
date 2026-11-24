@@ -411,4 +411,15 @@ describe("only the engine's own target/ is tolerated build output", () => {
       refused(f, /starts with a glob in its first path segment/, member);
     }
   });
+  it("a leading ./ does not hide a glob or the target/ dir: members are judged in normal form", () => {
+    for (const member of ["./*/x", "./t*/x", "././*/x", ".//*/x", "./target/x"]) {
+      const f = fixture(`[dependencies]\n${GUSSET}[workspace]\nmembers = ["${member}"]\n`, { outer: true });
+      put(path.join(f.repo, E, "target/x/Cargo.toml"), "[package]\nname = 'x'\n");
+      refused(f, /starts with a glob in its first path segment|build output/, member);
+    }
+  });
+  it("an in-crate committed ./tools/* member is still accepted", () => {
+    const f = fixture(`[dependencies]\n${GUSSET}[workspace]\nmembers = ["./tools/*", "./", "."]\n`, { outer: true });
+    assert.ok("rust/gusset-engine" in inputs(f).stamp.trees);
+  });
 });
