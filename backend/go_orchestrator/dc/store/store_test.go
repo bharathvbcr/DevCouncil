@@ -325,6 +325,7 @@ func TestAvailableNeverManufacturesTheStoreItChecks(t *testing.T) {
 // ok. A store that cannot assert the index is now unavailable, because the
 // alternative is two agents in one working tree.
 func TestAvailableRequiresTheExclusionIndexAssertion(t *testing.T) {
+	testsupport.RequireShellFakes(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "old-store.sh")
 	body := fmt.Sprintf("#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":%d,\"active_leases\":0}'\n", SchemaVersion)

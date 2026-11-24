@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // TestColdStartContentionYieldsNoLockErrors covers the case its neighbour below
@@ -191,6 +193,7 @@ func TestUnreachableStoreNeverReportsAValidLease(t *testing.T) {
 	}
 
 	write := func(name, body string) string {
+		testsupport.RequireShellFakes(t)
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -275,6 +278,7 @@ func TestUnreachableStoreNeverReportsAValidLease(t *testing.T) {
 // report no code, both of which are at least errors; renew was the one that
 // turned an unreadable reply into a plausible answer.
 func TestAJSONNullIsNotAnAnswer(t *testing.T) {
+	testsupport.RequireShellFakes(t)
 	dir := t.TempDir()
 	nul := filepath.Join(dir, "null.sh")
 	if err := os.WriteFile(nul, []byte("#!/bin/sh\necho null\n"), 0o755); err != nil {

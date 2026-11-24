@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -137,6 +138,11 @@ func buildFakeDevmap() (string, error) {
 			return
 		}
 		out := filepath.Join(dir, "devmap")
+		if runtime.GOOS == "windows" {
+			// `go build -o` writes exactly the name it is given, and Windows
+			// will not run a file that lacks an executable extension.
+			out += ".exe"
+		}
 		// No -race on the helper: an instrumented child is the thing that
 		// exhausts shadow memory when two dozen run at once.
 		cmd := exec.Command("go", "build", "-o", out, ".")

@@ -110,6 +110,7 @@ func TestAssertOneDiagnosedObjectRefusesANonZeroExitWithNoError(t *testing.T) {
 }
 
 func TestRunChildReturnsStdoutAndAZeroExit(t *testing.T) {
+	RequireShellFakes(t)
 	script := filepath.Join(t.TempDir(), "ok.sh")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -127,6 +128,7 @@ func TestRunChildReturnsStdoutAndAZeroExit(t *testing.T) {
 }
 
 func TestRunChildReturnsANonZeroExitAsADiagnosedOutcome(t *testing.T) {
+	RequireShellFakes(t)
 	script := filepath.Join(t.TempDir(), "fail.sh")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho '{\"ok\":false,\"error\":\"denied\"}'\nexit 2\n"), 0o755); err != nil {
 		t.Fatal(err)

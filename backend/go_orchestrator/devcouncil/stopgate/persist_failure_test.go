@@ -24,6 +24,7 @@ import (
 // the client to one process per command (`dcstore --db <path> <command> ...`).
 func storeThatCannotRecordRuns(t *testing.T) *store.Client {
 	t.Helper()
+	testsupport.RequireShellFakes(t)
 	real := testsupport.DCStore(t)
 	dir := t.TempDir()
 	wrapper := filepath.Join(dir, "dcstore")
