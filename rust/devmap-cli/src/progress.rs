@@ -584,6 +584,7 @@ fn phase_detail(detail: &str) -> &str {
         "reading" => "Reading source files",
         "checking content hashes" => "Spotting what changed",
         "persist:write" => "Writing the graph",
+        "persist:reuse_cache" => "Saving resolutions for the next build",
         "persist:prune_generations" => "Tidying older maps",
         "persist:prune_extractions" => "Tidying cached files",
         "persist:vacuum" => "Reclaiming space",

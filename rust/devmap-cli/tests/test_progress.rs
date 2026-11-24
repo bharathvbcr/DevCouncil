@@ -1469,6 +1469,36 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
          {charged}s charged of {whole}s: {write}"
     );
 
+    // The same rule one level up. The stage that holds `persist:write` named
+    // the write, the prunes and the vacuum, but not the resolution-reuse cache
+    // written between them: 168 MB of JSON on a 1,297-file repository, which
+    // reached `--json` only as a second "persisting" took beyond its parts.
+    let holder = stages
+        .iter()
+        .find(|stage| {
+            stage["sub"]
+                .as_array()
+                .is_some_and(|subs| subs.iter().any(|sub| sub["stage"] == "persist:write"))
+        })
+        .unwrap_or_else(|| panic!("some stage holds persist:write: {payload}"));
+    let persist_parts: Vec<&str> = holder["sub"]
+        .as_array()
+        .expect("the holder has sub-phases")
+        .iter()
+        .map(|part| part["stage"].as_str().unwrap_or("<unnamed>"))
+        .collect();
+    assert_eq!(
+        persist_parts,
+        vec![
+            "persist:write",
+            "persist:reuse_cache",
+            "persist:prune_generations",
+            "persist:prune_extractions",
+            "persist:vacuum",
+        ],
+        "every part of persisting is timed by name: {holder}"
+    );
+
     fs::remove_dir_all(root).expect("remove fixture tree");
 }
 
