@@ -30,8 +30,9 @@ use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use support::{
-    classify_startup, finalize_pass_flag, graph_proves_equivalence, require_ipc_probe,
-    retry_file_operation, ProbeAdmission, StartBarrier, StartupDecision,
+    classify_startup, daemon_exit_report, finalize_pass_flag, graph_proves_equivalence,
+    require_ipc_probe, retry_file_operation, ProbeAdmission, StartBarrier, StartupDecision,
+    DAEMON_EXIT_LOG_TAIL_BYTES,
 };
 
 #[cfg(windows)]
@@ -116,6 +117,11 @@ fn run() -> Result<()> {
         "rayon_workers_per_process": 2,
         "binary_sha256": binary_hash,
         "platform": platform_string(),
+        // Each daemon's file watcher holds one inotify instance on Linux, and
+        // the kernel caps them per user. Null where the file does not exist.
+        "inotify_max_user_instances": fs::read_to_string("/proc/sys/fs/inotify/max_user_instances")
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok()),
         "ipc_transport": if cfg!(windows) { "named_pipe" } else { "unix_socket" },
         "ipc_probe_process": probe.is_some(),
         "latency_includes_probe_startup": probe.is_some(),
@@ -402,16 +408,14 @@ fn execute(
             .collect()
     };
 
+    // Each daemon's current log, by daemon index. `log_paths` grows on every
+    // restart, so its position is not an index.
+    let mut daemon_logs: Vec<PathBuf> = Vec::with_capacity(roots.len());
     for i in 0..roots.len() {
-        active.push(Mutex::new(start_daemon(
-            binary,
-            &roots[i],
-            &endpoints[i],
-            scratch,
-            i,
-            env,
-            log_paths,
-        )?));
+        let (child, log) =
+            start_daemon(binary, &roots[i], &endpoints[i], scratch, i, env, log_paths)?;
+        active.push(Mutex::new(child));
+        daemon_logs.push(log);
     }
 
     let n = roots.len();
@@ -425,6 +429,7 @@ fn execute(
             env,
             scratch,
             &endpoints[i],
+            &daemon_logs[i],
         )?;
     }
     println!("{n} daemons answering IPC concurrently");
@@ -556,8 +561,10 @@ fn execute(
             {
                 let mut child = active[i].lock().expect("child");
                 stop(&mut child, true)?;
-                *child =
+                let (restarted, log) =
                     start_daemon(binary, &roots[i], &endpoints[i], scratch, i, env, log_paths)?;
+                *child = restarted;
+                daemon_logs[i] = log;
             }
             kills += 1;
             let mut child = active[i].lock().expect("child");
@@ -569,15 +576,17 @@ fn execute(
                 env,
                 scratch,
                 &endpoints[i],
+                &daemon_logs[i],
             )?;
         }
 
         let daemons: &[Mutex<Child>] = active;
+        let daemon_logs = &daemon_logs;
         parallel(args.build_workers, (0..n).collect(), |i| {
             let deadline = Instant::now() + Duration::from_secs(120);
             while Instant::now() < deadline {
-                if daemons[i].lock().expect("child").try_wait()?.is_some() {
-                    bail!("daemon {i} exited during resync");
+                if let Some(status) = daemons[i].lock().expect("child").try_wait()? {
+                    return Err(daemon_exited(i, "resync", status, &daemon_logs[i]));
                 }
                 let snap = snapshot(&dbs[i])?;
                 let names: std::collections::HashSet<String> = snap
@@ -709,10 +718,12 @@ fn ready_one(
     env: &HashMap<OsString, OsString>,
     scratch: &Path,
     endpoint: &Path,
+    log_path: &Path,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        let exited = child.try_wait()?.is_some();
+        let exit = child.try_wait()?;
+        let exited = exit.is_some();
         let can_attempt = cfg!(windows) || endpoint.exists();
         let mut ipc_ok = None;
         if !exited && can_attempt {
@@ -731,13 +742,38 @@ fn ready_one(
         }
         match classify_startup(exited, can_attempt, ipc_ok) {
             StartupDecision::Ready => return Ok(()),
-            StartupDecision::Exited => bail!("daemon {i} exited during startup"),
+            StartupDecision::Exited => {
+                let status = exit.expect("Exited is only decided for a child that exited");
+                return Err(daemon_exited(i, "startup", status, log_path));
+            }
             StartupDecision::Retry => thread::sleep(Duration::from_millis(50)),
         }
     }
     bail!("daemon {i} failed to bind")
 }
 
+/// The error for daemon `i` exiting during `phase`, carrying its exit status
+/// and the end of its own log. A log that cannot be read is said so, not
+/// reported as empty.
+fn daemon_exited(i: usize, phase: &str, status: ExitStatus, log_path: &Path) -> anyhow::Error {
+    let tail = File::open(log_path).and_then(|mut log| {
+        let len = log.metadata()?.len();
+        let window = DAEMON_EXIT_LOG_TAIL_BYTES as u64 + 1;
+        log.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+        let mut buf = Vec::new();
+        log.read_to_end(&mut buf)?;
+        Ok(buf)
+    });
+    match tail {
+        Ok(bytes) => anyhow::anyhow!(daemon_exit_report(i, phase, &status.to_string(), &bytes)),
+        Err(error) => anyhow::anyhow!(
+            "daemon {i} exited during {phase} ({status}); its log {} could not be read: {error}",
+            log_path.display()
+        ),
+    }
+}
+
+/// Starts daemon `i` and returns it with the path of the log it writes.
 fn start_daemon(
     binary: &Path,
     root: &Path,
@@ -746,19 +782,19 @@ fn start_daemon(
     i: usize,
     env: &HashMap<OsString, OsString>,
     log_paths: &mut Vec<PathBuf>,
-) -> Result<Child> {
+) -> Result<(Child, PathBuf)> {
     let log_path = scratch.join(format!(
         "daemon-{i}-{}.log",
         RUN_TAG.fetch_add(1, Ordering::Relaxed)
     ));
     let log = File::create(&log_path)?;
     let log_err = log.try_clone()?;
-    log_paths.push(log_path);
+    log_paths.push(log_path.clone());
     let mut cmd = Command::new(binary);
     cmd.arg("serve").arg(root).arg("--socket").arg(endpoint);
     configure(&mut cmd, env);
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
-    cmd.spawn().context("serve")
+    Ok((cmd.spawn().context("serve")?, log_path))
 }
 
 fn mutate(
