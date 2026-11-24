@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -207,7 +208,13 @@ func TestVerifyTaskPersistsTheCommandsTheRunExecuted(t *testing.T) {
 	t.Setenv(verify.AllowNoRigorEnv, "1")
 	ctx := context.Background()
 	root := modifiedRepo(t)
-	client := plantRepoTask(t, root, "TASK-EVIDENCE", "echo boom >&2; false")
+	// The line goes to the platform's shell (cmd.exe on Windows), which does not
+	// read `;` as a separator, so Windows spells the same two steps its way.
+	failing := "echo boom >&2; false"
+	if runtime.GOOS == "windows" {
+		failing = "echo boom 1>&2& exit 1"
+	}
+	client := plantRepoTask(t, root, "TASK-EVIDENCE", failing)
 	result, gaps, err := verify.VerifyTask(ctx, root, client, "TASK-EVIDENCE", verify.GateState{Mode: "enforce"}, "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +227,7 @@ func TestVerifyTaskPersistsTheCommandsTheRunExecuted(t *testing.T) {
 	if err := json.Unmarshal([]byte(commandsJSON), &cmds); err != nil || len(cmds) != 1 {
 		t.Fatalf("commands_json=%s err=%v", commandsJSON, err)
 	}
-	if cmds[0].Command != "echo boom >&2; false" || cmds[0].ExitCode != 1 || !strings.Contains(cmds[0].Tail, "boom") {
+	if cmds[0].Command != failing || cmds[0].ExitCode != 1 || !strings.Contains(cmds[0].Tail, "boom") {
 		t.Fatalf("command evidence lost: %+v", cmds[0])
 	}
 	if !finished.After(started) {

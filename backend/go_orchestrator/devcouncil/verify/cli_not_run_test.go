@@ -226,6 +226,7 @@ func TestNotRunHumanLineEscapesControlCharacters(t *testing.T) {
 	}
 	// A hostile task id in the not-found line is quoted too.
 	client = store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
