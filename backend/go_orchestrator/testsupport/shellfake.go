@@ -9,6 +9,22 @@ import (
 	"testing"
 )
 
+// AbsoluteFixturePath spells a Unix-absolute fixture path so that it is
+// absolute on the platform under test.
+//
+// Tests hand products a path that is never executed or opened and only has to
+// be absolute and recognisable ("/opt/devcouncil-test/bin/devmap"). Windows
+// reads that as rooted but not absolute (no drive), and the products are right
+// to refuse it as relative, so the fixture gets a drive there. Forward slashes
+// are kept: they are valid on Windows, and unlike backslashes they need no
+// escaping when the path is written into JSON and read back by the test.
+func AbsoluteFixturePath(unixPath string) string {
+	if runtime.GOOS == "windows" {
+		return "C:" + unixPath
+	}
+	return unixPath
+}
+
 // RequireShellFakes skips the calling test on Windows, where a fake binary
 // written as a `#!/bin/sh` script cannot be run.
 //

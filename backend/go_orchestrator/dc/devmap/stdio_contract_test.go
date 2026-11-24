@@ -119,7 +119,8 @@ func TestStdioHarnessNeverReachesSeatConfig(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", seat)
 	home := t.TempDir()
 	root := fixtureRepo(t)
-	servers := []byte(`{"servers":[{"name":"contract-probe","command":"/opt/probe/bin/probe","args":["mcp"]}]}`)
+	servers := []byte(`{"servers":[{"name":"contract-probe","command":"` +
+		testsupport.AbsoluteFixturePath("/opt/probe/bin/probe") + `","args":["mcp"]}]}`)
 
 	doc := devmapStdout(t, bin, home, servers,
 		"--json", "integrate", "claude", "--project-root", root, "--servers-stdin")
@@ -192,7 +193,8 @@ func TestTheLiveStdioContractReplay(t *testing.T) {
 	contract := loadContract(t)
 	home := t.TempDir()
 	root := fixtureRepo(t)
-	servers := []byte(`{"servers":[{"name":"contract-probe","command":"/opt/probe/bin/probe","args":["mcp"]}]}`)
+	servers := []byte(`{"servers":[{"name":"contract-probe","command":"` +
+		testsupport.AbsoluteFixturePath("/opt/probe/bin/probe") + `","args":["mcp"]}]}`)
 
 	check := func(name string, doc map[string]any) {
 		t.Helper()

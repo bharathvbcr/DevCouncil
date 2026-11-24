@@ -21,13 +21,13 @@ import (
 
 // fakeSelf stands in for this devcouncil binary in the entries written. It is
 // never executed; it only has to be absolute and recognisable.
-const fakeSelf = "/opt/devcouncil-test/bin/devcouncil"
+var fakeSelf = testsupport.AbsoluteFixturePath("/opt/devcouncil-test/bin/devcouncil")
 
 // fakeDevmap is the devmap command written into the host entries. The binary
 // that runs is testsupport's copy under target/devcouncil-testbin, and devmap
 // refuses to register that path, because it goes away with the worktree. This
 // one is never executed either; it only has to be absolute.
-const fakeDevmap = "/opt/devcouncil-test/bin/devmap"
+var fakeDevmap = testsupport.AbsoluteFixturePath("/opt/devcouncil-test/bin/devmap")
 
 // devmapForTest returns a devmap binary and isolates every user-level config
 // location devmap honours (HOME and the overrides in testsupport.HostConfigEnv).

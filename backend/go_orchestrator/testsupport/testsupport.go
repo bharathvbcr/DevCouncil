@@ -332,6 +332,30 @@ func Devmap(t testing.TB) string {
 	return cargoBin(t, "devmap-cli", "devmap")
 }
 
+// StableCopy returns a content-addressed copy of the executable at path, for a
+// test that was handed a binary by PATH or an environment variable rather than
+// built one through cargoBin.
+//
+// Such a path is often the cargo output itself (CI puts target/debug on PATH).
+// Executing it holds it open, and Windows will not let cargo replace a running
+// image, so a test that runs it makes every concurrent `cargo build` in another
+// package fail its uplift (see upliftBlockedByRunningImage). The copy lives in
+// the OS temp directory, named after its own hash, and is not removed: another
+// test process may be about to run it.
+func StableCopy(t testing.TB, path string) string {
+	t.Helper()
+	data, err := readStableArtifact(path)
+	if err != nil {
+		t.Fatalf("copying %s: %v", path, err)
+	}
+	binary := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	copied, err := publishArtifact(filepath.Join(os.TempDir(), "devcouncil-stable"), binary, data)
+	if err != nil {
+		t.Fatalf("copying %s: %v", path, err)
+	}
+	return copied
+}
+
 // cargoBin builds one binary and returns the path to a stable copy of it.
 //
 // The copy is the point. `cargo build` does not leave its output alone: every
