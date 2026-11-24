@@ -394,11 +394,46 @@ fn p3_root_flag_and_positional_cannot_split_the_endpoint_from_the_store() {
 
 // ---- Probe 4: commands not exercised ----------------------------------------
 
+/// `out`'s stdout with the repository and scratch paths, then the repository's
+/// bare name, replaced by placeholders.
+///
+/// The paths are replaced inside the decoded JSON strings, not in the raw
+/// bytes: `--json` escapes each `\` of a Windows path as `\\`, so the raw text
+/// never contains the path as `Path::to_str` spells it. Matched in the raw
+/// bytes, the paths were left in place and the bare-name pass then rewrote the
+/// `rel` inside the scratch directory's own name on one side only.
 fn normalised(out: &Output, base: &Path, repo: &Path, name: &str) -> String {
-    String::from_utf8_lossy(&out.stdout)
-        .replace(repo.to_str().unwrap(), "<R>")
-        .replace(base.to_str().unwrap(), "<B>")
-        .replace(name, "<N>")
+    let swap = |text: &str| {
+        text.replace(repo.to_str().unwrap(), "<R>")
+            .replace(base.to_str().unwrap(), "<B>")
+            .replace(name, "<N>")
+    };
+    let raw = String::from_utf8_lossy(&out.stdout);
+    match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        Ok(value) => serde_json::to_string(&map_strings(value, &swap)).unwrap(),
+        Err(_) => swap(&raw),
+    }
+}
+
+/// `value` with every string, object keys included, passed through `swap`.
+fn map_strings(value: serde_json::Value, swap: &dyn Fn(&str) -> String) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(swap(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| map_strings(item, swap))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, item)| (swap(&key), map_strings(item, swap)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn pair(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
