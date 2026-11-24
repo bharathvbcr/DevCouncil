@@ -687,6 +687,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_refused_and_nothing_is_written() {
         let base = scratch("symlink");

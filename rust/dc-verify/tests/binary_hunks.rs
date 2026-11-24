@@ -141,6 +141,7 @@ fn adv_key_past_the_probe_is_not_clean() {
     assert!(!reply.contains(&key), "the reply quotes the credential");
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_binary_symlink_target_is_not_in_the_reply() {
     let root = Root::new();
@@ -163,6 +164,7 @@ fn adv_binary_symlink_target_is_not_in_the_reply() {
     assert!(refused, "a binary symlink was a clean scan");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_planned_binary_symlink_is_not_followed() {
     let root = Root::new();
@@ -222,6 +224,7 @@ fn a_deleted_binary_with_a_git_binary_patch_is_not_an_unreadable_read() {
     assert!(reply.contains("\"stub_ast_degraded\":[]"), "{reply}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_binary_scan_that_could_not_read_says_it_was_the_secret_scan() {
     let root = Root::new();
@@ -239,6 +242,7 @@ fn a_binary_scan_that_could_not_read_says_it_was_the_secret_scan() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_directory_in_a_binary_path_is_not_followed() {
     let root = Root::new();

@@ -692,6 +692,9 @@ fn require_sealed(file: &File, what: &str, lease_path: Option<&Path>) -> Result<
     if !meta.is_file() {
         bail!("{what} is not a regular file");
     }
+    // The mode check below is Unix-only; the hint is only for its refusal.
+    #[cfg(not(unix))]
+    let _ = lease_path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -3684,6 +3687,7 @@ fn normalize_rel_path(rel_path: &str) -> Result<String> {
 
 /// Paths that differ from the base: `git status` plus `base_head..HEAD`.
 /// Every git failure is an `Err`; an empty set only ever means "clean".
+#[cfg(feature = "parse")]
 fn git_changed_paths_against_head(worktree_root: &Path, base: &Store) -> Result<BTreeSet<String>> {
     git_changed_paths_within(worktree_root, base, GIT_BOUNDS.deadline)
 }
@@ -3840,6 +3844,7 @@ mod tests {
     use std::process::Command;
     #[cfg(feature = "parse")]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::sync::Arc;
 
     /// `with_fake_git` replaces `PATH` for the whole process, so every test that
@@ -3866,7 +3871,7 @@ mod tests {
         GIT_PATH_SHARED.with(|held| held.borrow_mut().push(guard));
     }
 
-    #[cfg(feature = "parse")]
+    #[cfg(all(feature = "parse", unix))]
     fn release_git_path_shared() {
         GIT_PATH_SHARED.with(|held| held.borrow_mut().clear());
     }
@@ -4357,7 +4362,7 @@ mod tests {
     }
 
     /// `<common_git_dir>/devmap/bases`.
-    #[cfg(feature = "parse")]
+    #[cfg(all(feature = "parse", unix))]
     fn bases_dir_of(anchor: &Path) -> PathBuf {
         bases_root_dir(&registered_common_git_dir(&anchor.canonicalize().unwrap()).unwrap())
     }
@@ -5138,7 +5143,7 @@ mod tests {
     }
 
     /// 3: git that fails, hangs, or returns garbage must not read as a clean delta.
-    #[cfg(feature = "parse")]
+    #[cfg(all(feature = "parse", unix))]
     fn with_fake_git<T>(root: &Path, body: &str, f: impl FnOnce() -> T) -> T {
         use std::os::unix::fs::PermissionsExt;
         let bin = root.join("fakebin");
@@ -5554,7 +5559,7 @@ mod tests {
 
     /// A cache entry that looks honest (the honest manifest, verbatim) but holds
     /// another repository's `base.sqlite`.
-    #[cfg(all(feature = "parse", unix))]
+    #[cfg(all(feature = "parse", target_os = "macos"))]
     fn a2_impostor_dir(bases: &Path, entry: &Path, other: &Path) -> PathBuf {
         let imp_dir = bases.join("imp-dir");
         fs::create_dir_all(&imp_dir).unwrap();

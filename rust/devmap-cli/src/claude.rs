@@ -3339,6 +3339,7 @@ mod tests {
     /// Registering it is the failure. A checkout's own `target/debug` or
     /// `target/release` binary stays a valid absolute command, because
     /// `mcp --print-config` is specified to name the binary that ran.
+    #[cfg(unix)]
     #[test]
     fn a_hashed_test_binary_is_refused_as_an_mcp_command() {
         let stale = Path::new(

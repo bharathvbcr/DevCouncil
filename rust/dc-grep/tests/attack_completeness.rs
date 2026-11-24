@@ -8,6 +8,7 @@
 //! fixed-seed xorshift; no dependency is added.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +66,7 @@ impl Repo {
 impl Drop for Repo {
     fn drop(&mut self) {
         // Restore anything a test locked so the tree can be removed.
+        #[cfg(unix)]
         fn unlock(dir: &std::path::Path) {
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
             if let Ok(entries) = fs::read_dir(dir) {
@@ -77,6 +79,7 @@ impl Drop for Repo {
                 }
             }
         }
+        #[cfg(unix)]
         unlock(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }
@@ -100,6 +103,7 @@ impl Rng {
 /// An unreadable directory hides every file under it from the walk. The walk
 /// counts it in `walk_errors`; `rank` has no field for that, so it answers
 /// `complete: true` over a tree it could not read.
+#[cfg(unix)]
 #[test]
 fn an_unreadable_directory_does_not_leave_the_ranking_complete() {
     let repo = Repo::new();
@@ -148,6 +152,7 @@ fn a_document_over_the_term_cap_does_not_leave_the_ranking_complete() {
 
 /// An unreadable file (mode 000) is skipped silently, after being counted in
 /// `files_seen`.
+#[cfg(unix)]
 #[test]
 fn an_unreadable_file_does_not_leave_the_ranking_complete() {
     let repo = Repo::new();

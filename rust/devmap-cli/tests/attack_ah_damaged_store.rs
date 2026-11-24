@@ -10,6 +10,7 @@
 use crate::a_damaged_store_is_reported_and_refused::{
     assert_untouched, devmap_at, drop_sidecars, fixture, identity, smash_page_of,
 };
+#[cfg(unix)]
 use std::fs;
 
 const OWNERSHIP_REFUSAL: &str = "one store cannot serve two live worktrees";
@@ -85,6 +86,7 @@ fn a_damaged_store_of_another_live_worktree_is_refused_not_set_aside() {
 /// The store's own path is a symlink to another live worktree's store. The
 /// writer lock refuses a symlinked store path outright (so this one is refused
 /// on base as well, for that reason and not for ownership), and nothing is moved.
+#[cfg(unix)]
 #[test]
 fn a_damaged_store_reached_through_a_symlinked_file_is_refused_not_set_aside() {
     let a = fixture("link-a");
@@ -113,6 +115,7 @@ fn a_damaged_store_reached_through_a_symlinked_file_is_refused_not_set_aside() {
 /// The store's *directory* is a symlink to another live worktree's state
 /// directory. The managed-directory opener refuses a link in the path (also on
 /// base, so again not an ownership refusal), and nothing is moved.
+#[cfg(unix)]
 #[test]
 fn a_damaged_store_reached_through_a_symlinked_directory_is_refused_not_set_aside() {
     let a = fixture("dirlink-a");
@@ -135,6 +138,7 @@ fn a_damaged_store_reached_through_a_symlinked_directory_is_refused_not_set_asid
 
 /// A damaged store whose file cannot be written is refused and stays where it
 /// is, unchanged.
+#[cfg(unix)]
 #[test]
 fn a_damaged_read_only_store_is_refused_not_set_aside() {
     use std::os::unix::fs::PermissionsExt;

@@ -425,6 +425,7 @@ include!("../../testsupport/restriction.rs");
 /// must follow a writer that commits in place. A quiescent WAL store has no
 /// `-wal`, and opening it `?immutable=1` would pin the reader to the bytes it
 /// first read: no locking, no change detection, no view of later frames.
+#[cfg(unix)]
 #[test]
 fn a_long_lived_reader_sees_a_commit_made_in_place_after_it_opened() {
     use std::os::unix::fs::MetadataExt;

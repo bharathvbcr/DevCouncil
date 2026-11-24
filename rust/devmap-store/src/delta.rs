@@ -554,6 +554,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn names_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()

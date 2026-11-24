@@ -196,10 +196,12 @@ pub const SHARE_BLOCK_BYTES: usize = 4096;
 
 /// A file smaller than this is written whole: cloning it saves nothing worth
 /// the extra open and read-back.
+#[cfg(unix)]
 const MIN_PATCHED_BYTES: u64 = 64 * 1024;
 
 /// Compared and written in strides of this many blocks, so a rewrite touching
 /// scattered blocks does not hold the whole file in memory twice.
+#[cfg(unix)]
 const PATCH_STRIDE_BLOCKS: usize = 256;
 
 #[cfg(all(test, unix))]

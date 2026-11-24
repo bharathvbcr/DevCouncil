@@ -926,12 +926,14 @@ impl Resolved {
     /// of `rustup.exe` under the tool's own name, not links, so the file's name
     /// and the looked-up name agree.
     pub fn command(&self) -> Command {
-        let mut command = session_command(&self.path);
+        let command = session_command(&self.path);
         #[cfg(unix)]
-        {
+        let command = {
             use std::os::unix::process::CommandExt;
+            let mut command = command;
             command.arg0(&self.name);
-        }
+            command
+        };
         command
     }
 }
@@ -1068,17 +1070,14 @@ fn is_executable(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        true
+        meta.is_file()
     }
 }
 
@@ -2936,6 +2935,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     include!("../../testsupport/proxy.rs");
 
     #[test]

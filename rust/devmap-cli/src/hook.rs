@@ -3725,9 +3725,23 @@ pub(crate) fn canonical_hook_executable_with_seed(
 struct SpawnOptions {
     /// Wait this long (whole seconds, rounded up) before the first run, holding
     /// the lock meanwhile, so triggers arriving in the wait coalesce onto it.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "Windows has no shell to delay or loop in; see spawn_detached_with"
+        )
+    )]
     delay: Option<Duration>,
     /// Run again when [`BUILD_DIRTY_MARKER`] reappears during a run: up to
     /// [`MAX_TRAILING_RUNS`] reruns per build, never an unbounded loop.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "Windows has no shell to delay or loop in; see spawn_detached_with"
+        )
+    )]
     rerun_when_dirty: bool,
 }
 
@@ -5175,8 +5189,10 @@ mod tests {
 
     // ---- SessionStart catching an index up to a tree that has moved ----------------
 
+    #[cfg(unix)]
     const DRIFTED_BY_SOURCE: &str = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
         "source_freshness":false,"pending_count":0,"generation_id":7,"node_count":3,"edge_count":2}"#;
+    #[cfg(unix)]
     const DRIFTED_BY_PENDING_EDITS: &str = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
         "source_freshness":true,"pending_count":4,"generation_id":7,"node_count":3,"edge_count":2}"#;
 
