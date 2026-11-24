@@ -1447,11 +1447,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The pid of a child that has exited and been reaped. `true` is not a
+    /// Windows program (it resolves only where Git's `usr/bin` is on PATH), so
+    /// there the child is `cmd /C exit`.
     fn dead_pid() -> u32 {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let mut command = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "exit"]);
+            cmd
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = command.spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
         pid
+    }
+
+    /// A child that keeps running until the test kills it, so its pid is live
+    /// for the whole sweep on every platform. The caller kills and reaps it.
+    fn live_child() -> std::process::Child {
+        let mut command = if cfg!(windows) {
+            let mut ping = std::process::Command::new("ping");
+            ping.args(["-n", "120", "127.0.0.1"]);
+            ping
+        } else {
+            let mut sleep = std::process::Command::new("sleep");
+            sleep.arg("120");
+            sleep
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
     }
 
     #[test]
@@ -1590,8 +1620,13 @@ mod tests {
         let stale = sidecar(&target, &format!(".seed-dir-{dead}"));
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("partial"), b"x").unwrap();
-        // pid 1 is always running (signalling it is refused, not "no such process").
-        let live = sidecar(&target, ".seed-dir-1");
+        // A pid the liveness probe must call running: a child that is still
+        // running. pid 1 stood in for it, but that is a Unix fact (init always
+        // runs); Windows has no pid 1, so the probe there rightly called it
+        // dead and the sweep cleared the directory this assertion keeps. This
+        // process's own pid would not do: the sweep skips it before probing.
+        let mut running = live_child();
+        let live = sidecar(&target, &format!(".seed-dir-{}", running.id()));
         std::fs::create_dir_all(&live).unwrap();
 
         // The producer's own name is what the sweep is matched against.
@@ -1610,8 +1645,11 @@ mod tests {
             target.join("entry").is_file(),
             "the seed itself still lands"
         );
+        let live_kept = live.exists();
+        let _ = running.kill();
+        let _ = running.wait();
         assert!(
-            live.exists(),
+            live_kept,
             "a name this sweep cannot show dead is left alone"
         );
         let _ = std::fs::remove_dir_all(&tmp);
