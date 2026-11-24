@@ -1353,13 +1353,43 @@ pub(crate) fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
 /// MCP entries still use [`plugin_command`]'s bare-name rule; hooks must be
 /// absolute because Cursor/Codex do not expand a bare name the same way, and a
 /// bare `devmap` that clap-rejects exits 2 and blocks the agent.
-pub fn hook_executable(executable: &Path) -> PathBuf {
+///
+/// [`plugin_command`] hands this the bare name whenever `devmap` on `PATH` is
+/// this binary (a CI runner with `target/debug` on `PATH`, a `cargo install`).
+/// A bare name is therefore looked up on `PATH` exactly as a shell would, and
+/// the file it finds is the answer. A name that cannot be resolved is an error:
+/// a hook command that is not absolute is never emitted.
+pub fn hook_executable(executable: &Path) -> anyhow::Result<PathBuf> {
+    resolve_hook_executable(executable, std::env::var_os("PATH").as_deref())
+}
+
+fn resolve_hook_executable(
+    executable: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<PathBuf> {
     if executable.is_absolute() {
-        return executable.to_path_buf();
+        return Ok(executable.to_path_buf());
     }
-    executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_path_buf())
+    let unresolved = || {
+        anyhow::anyhow!(
+            "cannot make the hook executable {} absolute; pass --binary with an absolute path",
+            executable.display()
+        )
+    };
+    if executable.components().count() != 1 {
+        return executable.canonicalize().map_err(|_| unresolved());
+    }
+    let path_var = path_var.ok_or_else(unresolved)?;
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(executable);
+        if candidate.is_file() {
+            return candidate.canonicalize().map_err(|_| unresolved());
+        }
+    }
+    Err(unresolved())
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -1502,7 +1532,7 @@ fn hooks_block_without(
             subcommands.join(", ")
         );
     }
-    let exe = hook_executable(executable);
+    let exe = hook_executable(executable)?;
     let exe_text = utf8_path("the devmap executable path", &exe)?;
 
     // Groups are keyed by (event, matcher): two handlers that fire on the same
@@ -1682,7 +1712,7 @@ pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
 /// `postToolUse` entry, matcher `Shell` (Cursor's name for the terminal tool),
 /// is the shell-write refresh; `afterFileEdit` never fires for a shell write.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
-    let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
+    let exe = utf8_path("the devmap executable path", &hook_executable(executable)?)?;
     let session_start = hook_shell_command(&exe, "session-start")?;
     let after_file_edit = hook_shell_command(&exe, "post-tool-use")?;
     let shell_write = after_file_edit.clone();
@@ -2344,6 +2374,28 @@ fn manifest_version(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `plugin_command` answers the bare name when `devmap` on `PATH` is this
+    /// binary (CI puts `target/debug` on `PATH`); a hook must still be absolute.
+    #[test]
+    fn a_bare_hook_executable_is_resolved_on_path_and_never_left_bare() {
+        let dir = std::env::temp_dir().join(format!("devmap-hook-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devmap"), b"x").unwrap();
+        let path_var = std::env::join_paths([Path::new(""), dir.as_path()]).unwrap();
+
+        let resolved =
+            resolve_hook_executable(Path::new("devmap"), Some(path_var.as_os_str())).unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(resolved.ends_with("devmap"), "{resolved:?}");
+
+        let missing =
+            resolve_hook_executable(Path::new("no-such-devmap"), Some(path_var.as_os_str()));
+        assert!(missing.is_err(), "an unresolvable name must be refused");
+        assert!(resolve_hook_executable(Path::new("devmap"), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_config_dir_is_the_variable_when_set_and_non_empty() {
