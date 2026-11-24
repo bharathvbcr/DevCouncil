@@ -105,9 +105,8 @@ fn create_store_under_lock(
     })
     .map_err(|error| {
         anyhow::anyhow!(
-            "a new devmap store at {} could not be created: the writer lock that keeps a \
-             seed's placement and this creation apart could not be taken: {error:#}",
-            db.display()
+            "a new devmap store at {db:?} could not be created: the writer lock that keeps a \
+             seed's placement and this creation apart could not be taken: {error:#}"
         )
     })?;
     if let Some(waited) = reported {

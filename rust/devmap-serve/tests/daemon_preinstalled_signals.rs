@@ -26,6 +26,20 @@ async fn a_stop_signal_sent_before_the_loop_starts_ends_the_loop() {
         .status()
         .unwrap();
     assert!(sent.success());
+    // tokio only marks the signal pending in the handler; the driver delivers it
+    // to listeners when it runs. Let it run now, so a subscription made after
+    // this point would miss the signal.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Premise: a fresh subscriber made now does not see the signal.
+    let mut fresh = ShutdownSignals::install().expect("fresh signals install");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fresh.recv())
+            .await
+            .is_err(),
+        "a new subscription saw the earlier signal, so the test proves nothing"
+    );
+    drop(fresh);
 
     let daemon = Daemon::new(store, dir.clone())
         .with_store_path(db.clone())

@@ -590,14 +590,6 @@ impl Daemon {
             .map(|counters| counters.logical_bytes)
     }
 
-    /// Tell the daemon which file its store lives in, so it can notice the file
-    /// being deleted or replaced out from under it.
-    ///
-    /// Passed in rather than read back off the `Store`, which does not expose
-    /// the path it was opened from. On Unix the file's device and inode are
-    /// recorded here, before [`Self::run_loop`], via [`StoreFileIdentity`].
-    /// Recorded on the first tick instead, a replacement that landed before
-    /// that tick would be stored as the file this daemon opened.
     /// Use stop-signal streams the caller installed earlier, so a SIGTERM or
     /// SIGINT that arrived during startup (store creation, migration) stops
     /// the daemon as soon as its loop runs instead of being lost.
@@ -609,6 +601,14 @@ impl Daemon {
         self
     }
 
+    /// Tell the daemon which file its store lives in, so it can notice the file
+    /// being deleted or replaced out from under it.
+    ///
+    /// Passed in rather than read back off the `Store`, which does not expose
+    /// the path it was opened from. On Unix the file's device and inode are
+    /// recorded here, before [`Self::run_loop`], via [`StoreFileIdentity`].
+    /// Recorded on the first tick instead, a replacement that landed before
+    /// that tick would be stored as the file this daemon opened.
     pub fn with_store_path(mut self, store_path: std::path::PathBuf) -> Self {
         #[cfg(unix)]
         {
