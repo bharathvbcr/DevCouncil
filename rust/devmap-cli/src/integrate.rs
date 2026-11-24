@@ -200,6 +200,7 @@ pub fn integrate(
     dry_run: bool,
     check: bool,
     hand_written: devmap_query::guides::HandWrittenGuides,
+    force: bool,
 ) -> anyhow::Result<IntegrateReport> {
     let writes = !dry_run && !check;
     if writes {
@@ -215,6 +216,7 @@ pub fn integrate(
             true,
             false,
             hand_written,
+            force,
         )
         .context("nothing was written: the plan was refused")?;
     }
@@ -231,6 +233,7 @@ pub fn integrate(
         dry_run,
         check,
         hand_written,
+        force,
         &mut report,
     ) {
         Ok(()) => Ok(report),
@@ -266,6 +269,7 @@ fn integrate_into(
     dry_run: bool,
     check: bool,
     hand_written: devmap_query::guides::HandWrittenGuides,
+    force: bool,
     report: &mut IntegrateReport,
 ) -> anyhow::Result<()> {
     let root = project_root
@@ -398,8 +402,13 @@ fn integrate_into(
     if host == Host::Codex {
         let plugin_dir = root.join(".codex-plugin");
         let hooks_dir = root.join("hooks");
-        let outcome =
-            write_codex_plugin_assets(&plugin_dir, &hooks_dir, executable, dry_run || check)?;
+        let outcome = write_codex_plugin_assets(
+            &plugin_dir,
+            &hooks_dir,
+            executable,
+            dry_run || check,
+            force,
+        )?;
         report.hooks.extend(outcome);
     }
 
@@ -1652,7 +1661,16 @@ pub fn merge_opencode_plugin(
     let plugin_ref = claude::utf8_path("the opencode plugin path", &plugin_rel)?.replace('\\', "/");
 
     let source = opencode_plugin_source(executable)?;
-    let current = fs::read_to_string(&plugin_abs).ok();
+    // A read error other than "not found" is an error: `.ok()` made a module
+    // this process could not open look absent, and it was then overwritten.
+    let current = match fs::read_to_string(&plugin_abs) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => bail!(
+            "{}: {err}; not replacing a module that could not be read",
+            plugin_abs.display()
+        ),
+    };
     let module_changed = current.as_deref() != Some(source.as_str());
     if module_changed && !dry_run {
         if let Some(parent) = plugin_abs.parent() {
@@ -2234,11 +2252,26 @@ pub fn merge_codex_mcp(
 }
 
 /// Write `.codex-plugin/plugin.json` and `.codex-plugin/hooks/hooks.json`.
+///
+/// Both files sit at a path a person may already use for their own Codex
+/// plugin, so neither is replaced on the strength of "the bytes differ":
+///
+/// - A read error other than "not found" is an error. It was an empty document
+///   before, which made a file this module could not open look absent and then
+///   overwrote it.
+/// - A file this installer did not generate ([`generated_manifest`],
+///   [`generated_hooks`]) is left byte-identical and reported as such. With
+///   `force` it is saved beside itself first, under the
+///   `<name>.devcouncil-backup-<id>` name the Go side's `backupBeside` uses, and
+///   then replaced.
+/// - A file this installer did generate, from an older release, is updated in
+///   place with no backup.
 pub fn write_codex_plugin_assets(
     plugin_dir: &Path,
     _hooks_dir: &Path,
     executable: &Path,
     read_only: bool,
+    force: bool,
 ) -> anyhow::Result<Vec<McpMergeOutcome>> {
     let mut out = Vec::new();
     let version = env!("CARGO_PKG_VERSION");
@@ -2247,34 +2280,393 @@ pub fn write_codex_plugin_assets(
     let hooks = claude::codex_hooks_block(executable, &["hook".to_string()])?;
     let hooks_path = plugin_dir.join("hooks").join("hooks.json");
 
-    for (path, value, note) in [
-        (&manifest_path, &manifest, "wrote .codex-plugin/plugin.json"),
-        (&hooks_path, &hooks, "wrote .codex-plugin/hooks/hooks.json"),
-    ] {
-        let changed = if path.is_file() {
-            let existing = read_host_config(path).unwrap_or_default();
-            let pretty = {
-                let mut text = serde_json::to_string_pretty(value)?;
-                text.push('\n');
-                text
-            };
-            existing != pretty
-        } else {
-            true
+    type Generated = fn(&Value) -> bool;
+    let documents: [(&PathBuf, &Value, &str, Generated); 2] = [
+        (
+            &manifest_path,
+            &manifest,
+            "wrote .codex-plugin/plugin.json",
+            generated_manifest,
+        ),
+        (
+            &hooks_path,
+            &hooks,
+            "wrote .codex-plugin/hooks/hooks.json",
+            generated_hooks,
+        ),
+    ];
+    for (path, value, note, generated) in documents {
+        let pretty = {
+            let mut text = serde_json::to_string_pretty(value)?;
+            text.push('\n');
+            text
         };
-        if changed && !read_only {
+        let mut backup = None;
+        match read_host_config(path) {
+            Ok(existing) if existing == pretty => continue,
+            Ok(existing) => {
+                let ours = serde_json::from_str::<Value>(&existing)
+                    .map(|document| generated(&document))
+                    .unwrap_or(false);
+                if !ours {
+                    if !force {
+                        out.push(McpMergeOutcome {
+                            path: path.to_path_buf(),
+                            changed: false,
+                            removed_stale_db: false,
+                            note: format!(
+                                "{} present but not generated by DevMap; left unchanged \
+                                 (--force saves it beside itself and replaces it)",
+                                path.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    if !read_only {
+                        backup = Some(
+                            backup_beside(path, existing.as_bytes())
+                                .with_context(|| format!("backing up {}", path.display()))?,
+                        );
+                    }
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                bail!(
+                    "{}: {err}; not replacing a document this installer could not read",
+                    path.display()
+                );
+            }
+        }
+        if !read_only {
             write_json_pretty(path, value)?;
         }
-        if changed {
-            out.push(McpMergeOutcome {
-                path: path.to_path_buf(),
-                changed: true,
-                removed_stale_db: false,
-                note: note.into(),
-            });
-        }
+        out.push(McpMergeOutcome {
+            path: path.to_path_buf(),
+            changed: true,
+            removed_stale_db: false,
+            note: match backup {
+                Some(saved) => format!("{note}; the previous file is saved as {}", saved.display()),
+                None => note.into(),
+            },
+        });
     }
     Ok(out)
+}
+
+/// True when `document` has the shape [`claude::codex_plugin_manifest`] emits,
+/// whatever release wrote it: the keys that function sets and no others, under
+/// this installer's plugin name. A manifest with an extra key, or another
+/// name, is somebody's own.
+fn generated_manifest(document: &Value) -> bool {
+    let Some(object) = document.as_object() else {
+        return false;
+    };
+    object.get("name").and_then(Value::as_str) == Some(claude::PLUGIN_NAME)
+        && object.get("hooks").and_then(Value::as_str) == Some("./hooks/hooks.json")
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "name" | "description" | "version" | "hooks"))
+}
+
+/// True when `document` is a `{"hooks": {...}}` block whose every handler is a
+/// `<executable> hook <event>` command, the only handler
+/// [`claude::codex_hooks_block`] writes. One user-written handler makes the
+/// whole file the user's.
+fn generated_hooks(document: &Value) -> bool {
+    let Some(object) = document.as_object() else {
+        return false;
+    };
+    if object.len() != 1 {
+        return false;
+    }
+    let Some(events) = object.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    let mut handlers = 0usize;
+    for groups in events.values() {
+        let Some(groups) = groups.as_array() else {
+            return false;
+        };
+        for group in groups {
+            let Some(group_handlers) = group.get("hooks").and_then(Value::as_array) else {
+                return false;
+            };
+            for handler in group_handlers {
+                let ours = handler.get("type").and_then(Value::as_str) == Some("command")
+                    && handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| command.contains(" hook "));
+                if !ours {
+                    return false;
+                }
+                handlers += 1;
+            }
+        }
+    }
+    handlers > 0
+}
+
+/// Save `content` beside `path` as `<name>.devcouncil-backup-<id>`, created
+/// exclusively so an earlier backup is never overwritten, and return where it
+/// went.
+fn backup_beside(path: &Path, content: &[u8]) -> io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "document has no file name"))?;
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let mut leaf = name.to_os_string();
+        leaf.push(format!(
+            ".devcouncil-backup-{:x}{:x}{:x}",
+            std::process::id(),
+            nanos,
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let backup = path.with_file_name(leaf);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                file.write_all(content)?;
+                file.sync_all()?;
+                return Ok(backup);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused backup name after 16 tries",
+    ))
+}
+
+#[cfg(test)]
+mod plugin_asset_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const EXE: &str = "/opt/devmap/bin/devmap";
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-plugin-assets-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_assets(
+        plugin: &Path,
+        read_only: bool,
+        force: bool,
+    ) -> anyhow::Result<Vec<McpMergeOutcome>> {
+        write_codex_plugin_assets(
+            plugin,
+            &plugin.join("hooks"),
+            Path::new(EXE),
+            read_only,
+            force,
+        )
+    }
+
+    fn backups_of(dir: &Path, name: &str) -> Vec<PathBuf> {
+        let prefix = format!("{name}.devcouncil-backup-");
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|leaf| leaf.to_str())
+                    .is_some_and(|leaf| leaf.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    const FOREIGN_MANIFEST: &str =
+        "{\n  \"name\": \"my-own-plugin\",\n  \"skills\": \"./skills\"\n}\n";
+
+    #[test]
+    fn a_foreign_plugin_manifest_is_left_byte_identical_without_force() {
+        let dir = scratch("foreign");
+        let plugin = dir.join(".codex-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("plugin.json"), FOREIGN_MANIFEST).unwrap();
+        let outcomes = write_assets(&plugin, false, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(plugin.join("plugin.json")).unwrap(),
+            FOREIGN_MANIFEST
+        );
+        assert!(backups_of(&plugin, "plugin.json").is_empty());
+        let kept = outcomes
+            .iter()
+            .find(|o| o.path.ends_with("plugin.json"))
+            .expect("the kept manifest is reported");
+        assert!(!kept.changed, "{kept:?}");
+        assert!(kept.note.contains("not generated by DevMap"), "{kept:?}");
+        // The hooks file beside it is still this installer's to write.
+        assert!(plugin.join("hooks").join("hooks.json").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn force_saves_a_foreign_manifest_beside_itself_then_replaces_it() {
+        let dir = scratch("force");
+        let plugin = dir.join(".codex-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("plugin.json"), FOREIGN_MANIFEST).unwrap();
+        let outcomes = write_assets(&plugin, false, true).unwrap();
+        let saved = backups_of(&plugin, "plugin.json");
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(fs::read_to_string(&saved[0]).unwrap(), FOREIGN_MANIFEST);
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(plugin.join("plugin.json")).unwrap()).unwrap();
+        assert_eq!(written["name"], claude::PLUGIN_NAME);
+        let note = &outcomes
+            .iter()
+            .find(|o| o.path.ends_with("plugin.json"))
+            .unwrap()
+            .note;
+        assert!(note.contains(&saved[0].display().to_string()), "{note}");
+        // A second forced run finds its own file: nothing to save again.
+        write_assets(&plugin, false, true).unwrap();
+        assert_eq!(backups_of(&plugin, "plugin.json").len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dry_run_with_force_neither_writes_nor_saves() {
+        let dir = scratch("force-dry");
+        let plugin = dir.join(".codex-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("plugin.json"), FOREIGN_MANIFEST).unwrap();
+        let outcomes = write_assets(&plugin, true, true).unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|o| o.path.ends_with("plugin.json") && o.changed));
+        assert_eq!(
+            fs::read_to_string(plugin.join("plugin.json")).unwrap(),
+            FOREIGN_MANIFEST
+        );
+        assert!(backups_of(&plugin, "plugin.json").is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_manifest_refuses_instead_of_reading_as_empty() {
+        let dir = scratch("unreadable");
+        let plugin = dir.join(".codex-plugin");
+        // A directory at the manifest path: it opens, and is not a file.
+        fs::create_dir_all(plugin.join("plugin.json")).unwrap();
+        for force in [false, true] {
+            let err = write_assets(&plugin, false, force).unwrap_err();
+            assert!(err.to_string().contains("plugin.json"), "{err}");
+            assert!(plugin.join("plugin.json").is_dir(), "force={force}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_denied_manifest_refuses_instead_of_being_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("denied");
+        let plugin = dir.join(".codex-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        let path = plugin.join("plugin.json");
+        fs::write(&path, FOREIGN_MANIFEST).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
+        if fs::File::open(&path).is_ok() {
+            // A user that bypasses file modes: the case cannot arise.
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let err = write_assets(&plugin, false, false).unwrap_err();
+        assert!(err.to_string().contains("plugin.json"), "{err}");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), FOREIGN_MANIFEST);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_manifest_an_earlier_release_generated_is_still_updated_in_place() {
+        let dir = scratch("generated");
+        let plugin = dir.join(".codex-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            "{\n  \"name\": \"devmap\",\n  \"description\": \"an older description\",\n  \"version\": \"0.0.1\",\n  \"hooks\": \"./hooks/hooks.json\"\n}\n",
+        )
+        .unwrap();
+        let outcomes = write_assets(&plugin, false, false).unwrap();
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(plugin.join("plugin.json")).unwrap()).unwrap();
+        assert_eq!(written["version"], env!("CARGO_PKG_VERSION"));
+        assert!(outcomes
+            .iter()
+            .any(|o| o.path.ends_with("plugin.json") && o.changed));
+        assert!(backups_of(&plugin, "plugin.json").is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_hooks_file_with_a_handler_of_the_users_is_kept_without_force() {
+        let dir = scratch("foreign-hooks");
+        let plugin = dir.join(".codex-plugin");
+        let hooks = plugin.join("hooks").join("hooks.json");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let theirs = "{\"hooks\":{\"PostToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"./lint.sh\"}]}]}}";
+        fs::write(&hooks, theirs).unwrap();
+        write_assets(&plugin, false, false).unwrap();
+        assert_eq!(fs::read_to_string(&hooks).unwrap(), theirs);
+        write_assets(&plugin, false, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(&backups_of(hooks.parent().unwrap(), "hooks.json")[0]).unwrap(),
+            theirs
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_opencode_module_refuses_instead_of_reading_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("opencode-module");
+        let module = devmap_extract::paths::state_dir(&root)
+            .join("integrations")
+            .join(OPENCODE_PLUGIN_FILE);
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, "// the user's own module\n").unwrap();
+        fs::set_permissions(&module, fs::Permissions::from_mode(0o200)).unwrap();
+        if fs::File::open(&module).is_ok() {
+            // A user that bypasses file modes: the case cannot arise.
+            fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let err = merge_opencode_plugin(&root, Path::new(EXE), false).unwrap_err();
+        assert!(err.to_string().contains(OPENCODE_PLUGIN_FILE), "{err}");
+        fs::set_permissions(&module, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&module).unwrap(),
+            "// the user's own module\n"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 }
 
 /// Build a minimal map value for integrate when the store is unavailable.
@@ -3113,7 +3505,7 @@ command = \"x\"\n";
         let plugin = dir.join(".codex-plugin");
         let hooks = dir.join("hooks");
         let outcomes =
-            write_codex_plugin_assets(&plugin, &hooks, Path::new("/tmp/fake-devmap"), false)
+            write_codex_plugin_assets(&plugin, &hooks, Path::new("/tmp/fake-devmap"), false, false)
                 .unwrap();
         assert!(!outcomes.is_empty());
         assert!(plugin.join("plugin.json").is_file());
@@ -3588,6 +3980,7 @@ command = \"x\"\n";
             false,
             false,
             devmap_query::guides::HandWrittenGuides::Preserve,
+            false,
         );
         assert!(
             result.is_err(),
@@ -3626,6 +4019,7 @@ command = \"x\"\n";
             false,
             true,
             devmap_query::guides::HandWrittenGuides::Preserve,
+            false,
         )
         .unwrap();
         assert!(!check.check_ok, "a missing server is drift");
@@ -3647,6 +4041,7 @@ command = \"x\"\n";
             false,
             false,
             devmap_query::guides::HandWrittenGuides::Preserve,
+            false,
         )
         .unwrap();
         assert!(registered(Host::Warp, &root, "devcouncil").is_some());
@@ -3663,6 +4058,7 @@ command = \"x\"\n";
             false,
             true,
             devmap_query::guides::HandWrittenGuides::Preserve,
+            false,
         )
         .unwrap();
         assert!(
