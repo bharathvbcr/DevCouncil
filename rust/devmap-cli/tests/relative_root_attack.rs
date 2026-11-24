@@ -22,7 +22,18 @@ fn scratch(tag: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
+    plain(dir.canonicalize().unwrap())
+}
+
+/// `canonicalize` spells a Windows path `\\?\C:\..`, which no user types and
+/// which the commands echo back as given; the plain `C:\..` spelling is the
+/// one the relative-root anchoring produces, so fixtures use it to make the
+/// two spellings comparable. A no-op on Unix paths.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 fn repo(parent: &Path, name: &str) -> PathBuf {
@@ -70,7 +81,14 @@ fn files(root: &Path) -> BTreeSet<String> {
             if path.is_dir() {
                 walk(base, &path, into);
             } else {
-                into.insert(path.strip_prefix(base).unwrap().display().to_string());
+                // Forward slashes on every platform: callers match `x/a.rs`.
+                into.insert(
+                    path.strip_prefix(base)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                        .replace('\\', "/"),
+                );
             }
         }
     }
@@ -177,11 +195,14 @@ fn p1_the_recorded_repo_root_does_not_depend_on_the_spelling() {
     };
     let plain = open(&a);
     let dotdot = open(&b);
+    // Same parent, same spelling of it; only the directory name differs.
     assert_eq!(
-        plain.replace("/a", ""),
-        dotdot.replace("/b", ""),
+        Path::new(&plain).parent(),
+        Path::new(&dotdot).parent(),
         "recorded roots differ in shape: {plain} vs {dotdot}"
     );
+    assert_eq!(Path::new(&plain).file_name(), Some("a".as_ref()));
+    assert_eq!(Path::new(&dotdot).file_name(), Some("b".as_ref()));
     assert!(
         !dotdot.contains(".."),
         "a `..` was stored as the repo root: {dotdot}"
@@ -603,6 +624,11 @@ fn p5_dash_and_newline_roots_are_refused_and_create_nothing() {
         if odd.contains('\0') {
             continue;
         }
+        // Win32 strips a trailing space, so `x ` names the existing `x` there
+        // and is rightly accepted; every other spelling is still refused.
+        if cfg!(windows) && odd == "x " {
+            continue;
+        }
         for args in [
             vec!["build", "--manifest", "--full", odd],
             vec!["--root", odd, "build"],
@@ -633,7 +659,9 @@ fn p5_a_dash_root_names_itself_in_the_refusal() {
     assert!(!out.status.success(), "{}", text(&out));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("No such file") || err.contains("not a directory"),
+        err.contains("No such file")
+            || err.contains("not a directory")
+            || err.contains("cannot find the file"),
         "{err}"
     );
 }

@@ -2515,9 +2515,12 @@ mod tests {
         let os = |value: &str| Some(std::ffi::OsString::from(value));
         assert_eq!(config_dir_from(home, None), home.join(".claude"));
         assert_eq!(config_dir_from(home, os("")), home.join(".claude"));
+        // A drive-less `/seat/one` is not absolute on Windows and gains the
+        // current drive, so the fixture is absolute on every platform.
+        let seat = absolute_fixture("/seat/one");
         assert_eq!(
-            config_dir_from(home, os("/seat/one")),
-            PathBuf::from("/seat/one")
+            config_dir_from(home, os(seat.to_str().unwrap())),
+            seat
         );
         let relative = config_dir_from(home, os("seat"));
         assert!(relative.is_absolute(), "{relative:?}");
@@ -2530,9 +2533,10 @@ mod tests {
         let os = |value: &str| Some(std::ffi::OsString::from(value));
         assert_eq!(global_config_from(home, None), home.join(".claude.json"));
         assert_eq!(global_config_from(home, os("")), home.join(".claude.json"));
+        let seat = absolute_fixture("/seat/one");
         assert_eq!(
-            global_config_from(home, os("/seat/one")),
-            PathBuf::from("/seat/one/.claude.json")
+            global_config_from(home, os(seat.to_str().unwrap())),
+            seat.join(".claude.json")
         );
     }
 
