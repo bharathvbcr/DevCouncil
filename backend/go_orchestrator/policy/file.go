@@ -917,6 +917,15 @@ func NormalizeRepoPath(root, raw string) (string, bool) {
 		return "", true
 	}
 
+	if rootedOffRoot(cleaned) {
+		// "/etc/passwd" and "C:foo" are not absolute on Windows, so joining
+		// them under root would read them as files inside it, while the kernel
+		// opens them relative to the current drive or that drive's directory.
+		// The gate and the kernel would be naming different files, and the
+		// gate's answer ("inside") would be the permissive one.
+		return filepath.ToSlash(cleaned), true
+	}
+
 	var candidate string
 	if filepath.IsAbs(cleaned) {
 		candidate = cleaned
@@ -940,6 +949,18 @@ func NormalizeRepoPath(root, raw string) (string, bool) {
 		return "", true
 	}
 	return rel, false
+}
+
+// rootedOffRoot reports whether p names a place by a root or a volume without
+// being absolute, which only happens where an absolute path needs a drive:
+// "/etc/passwd" (rooted at the current drive), `\\x` and "C:foo" (relative to
+// that drive's current directory) on Windows. Where "/" alone makes a path
+// absolute, nothing is rooted off root and this is false.
+func rootedOffRoot(p string) bool {
+	if filepath.IsAbs(p) {
+		return false
+	}
+	return filepath.VolumeName(p) != "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`)
 }
 
 // settlePath applies the two normalisations to a fixed point, and reports

@@ -2,6 +2,7 @@ package policy
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -61,6 +62,12 @@ type bindingSegment struct {
 func lineBindings(command string) map[string][]string {
 	values := map[string][]string{}
 	home, _ := os.UserHomeDir()
+	// A Windows home is "C:\Users\x", and a backslash fails literalBindingValue
+	// (it is a shell escape), which dropped the whole binding: "~/.ssh/k" was
+	// then judged as the relative path it spells, inside the repository, while
+	// the shell writes it under the home directory. The shell that runs the
+	// command reads the slash spelling of the same place.
+	home = filepath.ToSlash(home)
 	add := func(name, value string) {
 		if home != "" && (value == "~" || strings.HasPrefix(value, "~/")) {
 			value = home + value[1:]

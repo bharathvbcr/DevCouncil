@@ -7,10 +7,16 @@ import (
 	"time"
 )
 
-// ConfigureGroup is a no-op where process groups are not available. WaitDelay
+// ConfigureGroup arms no process group where none is available. WaitDelay
 // still bounds the call, so the timeout holds; only the orphaned grandchild
-// survives, which is the lesser of the two failures.
-func ConfigureGroup(cmd *exec.Cmd) {}
+// survives, which is the lesser of the two failures. On Windows it replaces
+// os/exec's default cancel with one that does not report a child that had
+// already exited as a failure to cancel it (see cancelOnWindows).
+func ConfigureGroup(cmd *exec.Cmd) {
+	if cancel := cancelOnWindows(cmd); cancel != nil {
+		cmd.Cancel = cancel
+	}
+}
 
 // ConfigureOwnGroup and KillGroup are no-ops where process groups are not
 // available. A persistent child is still ended by closing its stdin and by the

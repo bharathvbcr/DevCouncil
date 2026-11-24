@@ -527,3 +527,29 @@ func TestBuiltBinaryIsNotAPathCargoRewrites(t *testing.T) {
 		}
 	}
 }
+
+// TestPublishedArtifactCarriesThePlatformExecutableName pins the file name a
+// published copy gets. On Windows cargo writes <bin>.exe, and the bare name is
+// neither what readStableArtifact must open nor something CreateProcess will
+// run, so a published copy without the suffix fails every test that execs it.
+func TestPublishedArtifactCarriesThePlatformExecutableName(t *testing.T) {
+	want := "tool"
+	if runtime.GOOS == "windows" {
+		want = "tool.exe"
+	}
+	if got := executableName("tool"); got != want {
+		t.Fatalf("executableName(%q) = %q, want %q on %s", "tool", got, want, runtime.GOOS)
+	}
+	path, err := publishArtifact(t.TempDir(), "tool", []byte("bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != want {
+		t.Fatalf("published %q, want a file named %q", path, want)
+	}
+	// A second publish of the same bytes lands on the same path and succeeds.
+	again, err := publishArtifact(filepath.Dir(filepath.Dir(filepath.Dir(path))), "tool", []byte("bytes"))
+	if err != nil || again != path {
+		t.Fatalf("republishing the same bytes = %q, %v; want %q", again, err, path)
+	}
+}
