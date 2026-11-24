@@ -391,3 +391,24 @@ describe("one rule: nothing under an input may be neither in HEAD nor shown dirt
     }
   });
 });
+
+describe("only the engine's own target/ is tolerated build output", () => {
+  const E = "rust/gusset-engine";
+  it("an ignored rust/dc-glob/target/g.rs is refused", () => {
+    const f = fixture();
+    put(path.join(f.repo, "rust/dc-glob/target/g.rs"), "// a source, not build output\n");
+    refused(f, /ignored file\(s\) under the engine inputs \(rust\/dc-glob\/target\/\)/, "dc-glob target");
+  });
+  it("the engine's real target/ is still exempt", () => {
+    const f = fixture();
+    put(path.join(f.repo, E, "target/release/libgusset.a"), "a");
+    assert.ok(E in inputs(f).stamp.trees);
+  });
+  it("a members glob that starts with a glob can expand into the engine's target/, and is refused", () => {
+    for (const member of ["*/x", "t*/x", "?arget/x", "[t]arget/x", "{target,src}/x"]) {
+      const f = fixture(`[dependencies]\n${GUSSET}[workspace]\nmembers = ["${member}"]\n`, { outer: true });
+      put(path.join(f.repo, E, "target/x/Cargo.toml"), "[package]\nname = 'x'\n");
+      refused(f, /starts with a glob in its first path segment/, member);
+    }
+  });
+});

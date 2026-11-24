@@ -34,7 +34,8 @@
  * names the files and the --engine-dir escape.
  *
  * NOT covered, by design: source-level paths that leave the crate (include!,
- * #[path] or include_str! pointing outside the input directories); .cargo/config.toml
+ * #[path] or include_str! pointing outside the input directories) or into the
+ * engine's own target/ (ENGINE_TARGET, the one ignored tree that is tolerated); .cargo/config.toml
  * at the repository, a parent or the user level; RUSTFLAGS and other
  * environment; the installed toolchain beyond the pinned channel in
  * rust-toolchain.toml; symlinks inside the sibling gusset (only its HEAD and
@@ -50,6 +51,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ENGINE = "rust/gusset-engine";
+/** Where the engine build puts its output (cgo-env.sh and ci-local.mjs pass --target-dir <engine>/target); the only ignored tree the stamp tolerates. */
+export const ENGINE_TARGET = `${ENGINE}/target`;
 export const STAMP_NAME = "libgusset.stamp.json";
 
 /** A known way the inputs cannot be computed; anything else thrown is a bug. */
@@ -436,13 +439,18 @@ function workspaceMembersInside(ws, crateDir, toml, root) {
       // A glob before a .. ("*/../../evil") hides the escape from the prefix check.
       if (member.split(/[\\/]/).includes("..")) throw new InputError(`${at} [workspace] ${name} entry ${member} has a .. segment; the engine stamp cannot cover where it leads`);
       const prefix = member.split(/[*?[{]/)[0];
-      const abs = path.resolve(crateDir, prefix || ".");
+      const isGlob = prefix !== member;
+      // A glob is judged by the directory it starts in. One in the first path
+      // segment (*/x, t*/x) can expand into the crate's own target/, so it is refused.
+      const dirPrefix = isGlob ? prefix.slice(0, prefix.lastIndexOf("/") + 1) : prefix;
+      if (isGlob && dirPrefix === "") throw new InputError(`${at} [workspace] ${name} glob ${member} starts with a glob in its first path segment, which can expand into the crate's target/; the engine stamp cannot cover it`);
+      const abs = path.resolve(crateDir, dirPrefix || ".");
       if (abs !== crateDir && !abs.startsWith(crateDir + path.sep)) {
         throw new InputError(`${at} [workspace] ${name} entry ${member} resolves outside the crate directory; the engine stamp cannot cover it`);
       }
       refuseBuildOutput(abs, crateDir, `${at} [workspace] ${name} entry ${member}`);
       if (name === "exclude" || abs === crateDir) continue;
-      if (prefix === member) {
+      if (!isGlob) {
         committed(root, path.join(abs, "Cargo.toml"), `${at} [workspace] ${name} entry ${member}: its Cargo.toml`);
       } else if (run(root, ["check-ignore", "-q", "--", path.relative(root, abs).split(path.sep).join("/")]).status === 0) {
         throw new InputError(`${at} [workspace] ${name} glob ${member} starts in an ignored directory; members found there are not in HEAD and the engine stamp cannot cover them`);
@@ -559,7 +567,7 @@ export function enginePaths(root) {
  */
 function unhashedFiles(root, paths) {
   const listed = (args) => run(root, ["ls-files", "-z", ...args, "--", ...paths]).stdout.split("\0").filter(Boolean);
-  const ignored = listed(["-o", "-i", "--exclude-standard", "--directory"]).filter((f) => !paths.some((p) => f === `${p}/target/`));
+  const ignored = listed(["-o", "-i", "--exclude-standard", "--directory"]).filter((f) => f !== `${ENGINE_TARGET}/`);
   const flagged = listed(["-v"]).filter((l) => /^[a-zS] /.test(l)).map((l) => l.slice(2));
   const refuse = (what, files) => {
     const shown = files.slice(0, 3).join(", ");
