@@ -179,8 +179,20 @@ fn a4_many_scoped_definitions_times_many_calls_is_bounded() {
     // stub_ast::step_count_tests, which a loaded machine cannot flake.
     assert!(took < Duration::from_secs(10), "took {took:?}");
     // The probe's calls are outside every definition's scope, so the alias is
-    // in force: the exact verdict is a block, never a clean file.
-    assert!(blocked(&r) || r.unparsed.iter().any(|u| u.reason == "alias-walk-budget"));
+    // in force: the verdict is a block, never a clean file. Two budgets may
+    // stop the work first, and each leaves the file unparsed rather than
+    // clean: the alias walk's step cap, and `PARSE_BUDGET` (2 s) on the parse
+    // itself. This ~1.9 MB file reaches the second on a slow runner (2.62 s
+    // on ubuntu CI, where only the first was accepted and the test failed).
+    let over_budget = dc_verify::stub_ast::Unparsed::OverBudget.as_str();
+    assert!(
+        blocked(&r)
+            || r.unparsed
+                .iter()
+                .any(|u| u.reason == "alias-walk-budget" || u.reason == over_budget),
+        "neither blocked nor stopped by a budget: {:?}",
+        r.unparsed.iter().map(|u| u.reason).collect::<Vec<_>>()
+    );
 }
 
 // ---- unreadable sources ------------------------------------------------------
