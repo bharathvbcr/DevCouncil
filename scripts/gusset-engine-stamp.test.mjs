@@ -47,6 +47,9 @@ function fixture(engineToml = `[dependencies]\n${GUSSET}dc-glob = { path = "../d
   put(path.join(repo, "rust/gusset-engine/Cargo.toml"), outer || /^\[workspace\]/m.test(engineToml) ? engineToml : `${engineToml}\n[workspace]\n`);
   put(path.join(repo, "rust/gusset-engine/Cargo.lock"), "# lock\n");
   put(path.join(repo, "rust/gusset-engine/src/lib.rs"), "// engine\n");
+  put(path.join(repo, "rust/gusset-engine/src/bin/b.rs"), "// bin\n");
+  put(path.join(repo, "rust/gusset-engine/build.rs"), "// build\n");
+  put(path.join(repo, "rust/gusset-engine/tools/x/Cargo.toml"), "[package]\n");
   put(path.join(repo, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.100"\n');
   git(repo, "add", "."); git(repo, "commit", "-qm", "m");
   return { top, gusset, repo };
@@ -276,5 +279,46 @@ describe("a duplicate table header is refused (cargo rejects it)", () => {
   });
   it("a manifest with two [workspace] headers is refused by the stamp", () => {
     refused(fixture(`[workspace]\n[dependencies]\n${GUSSET}[workspace]\n`, { outer: true }), /table header is defined twice/, "dup");
+  });
+});
+
+describe("every path the stamp relies on must be in HEAD", () => {
+  // gen/ and target/ are gitignored: their files are in no tree, and git status does not report them.
+  const ignored = (toml, make) => {
+    const f = fixture(toml, { outer: false });
+    commit(f, ".gitignore", "target/\ngen/\n");
+    make(f);
+    return f;
+  };
+  const NOT_COMMITTED = /is not committed in HEAD|ignored directory|build output/;
+  it("an [lib] path or build script in an ignored directory", () => {
+    for (const toml of [`[lib]\npath = "gen/lib.rs"\n[dependencies]\n${GUSSET}`, `[package]\nbuild = "gen/build.rs"\n[dependencies]\n${GUSSET}`]) {
+      const f = ignored(toml, (g) => put(path.join(g.repo, "rust/gusset-engine/gen/lib.rs"), "// x\n") || put(path.join(g.repo, "rust/gusset-engine/gen/build.rs"), "// x\n"));
+      refused(f, /is not committed in HEAD/, toml);
+    }
+  });
+  it("a literal or glob workspace member in an ignored directory", () => {
+    for (const [ws, re] of [['members = ["gen/x"]', /is not committed in HEAD/], ['default-members = ["gen/x"]', /is not committed in HEAD/], ['members = ["gen/*"]', /ignored directory/]]) {
+      const f = ignored(`[dependencies]\n${GUSSET}[workspace]\n${ws}\n`, (g) => put(path.join(g.repo, "rust/gusset-engine/gen/x/Cargo.toml"), "[package]\nname = 'x'\n"));
+      refused(f, re, ws);
+    }
+  });
+  it("a member (or anything) under the engine's target/", () => {
+    const f = ignored(`[dependencies]\n${GUSSET}[workspace]\nmembers = ["target/link"]\n`, (g) => {
+      mkdirSync(path.join(g.repo, "rust/gusset-engine/target"), { recursive: true });
+      symlinkSync(g.top, path.join(g.repo, "rust/gusset-engine/target/link"));
+    });
+    refused(f, /build output/, "target member");
+    const g = ignored(`[lib]\npath = "target/gen.rs"\n[dependencies]\n${GUSSET}`, (h) => put(path.join(h.repo, "rust/gusset-engine/target/gen.rs"), "// x\n"));
+    refused(g, /build output/, "target lib");
+  });
+  it("a path dependency or Cargo.lock that is not in HEAD", () => {
+    const f = ignored(`[dependencies]\n${GUSSET}evil = { path = "gen/dep" }\n`, (g) => put(path.join(g.repo, "rust/gusset-engine/gen/dep/Cargo.toml"), "[package]\nname = 'dep'\n"));
+    refused(f, NOT_COMMITTED, "dep");
+    const h = fixture();
+    commit(h, ".gitignore", "target/\nCargo.lock\n");
+    git(h.repo, "rm", "-q", "--cached", "rust/gusset-engine/Cargo.lock");
+    git(h.repo, "commit", "-qm", "untrack lock");
+    refused(h, /Cargo\.lock is not committed in HEAD/, "lock");
   });
 });

@@ -367,7 +367,28 @@ const posix = (p) => p.split(path.sep).join("/");
  * its own crate directory builds crates whose sources the stamp does not hash.
  * An entry is judged by its fixed prefix (before the first glob character).
  */
-function workspaceMembersInside(ws, crateDir, toml) {
+/**
+ * A path the stamp relies on must be in HEAD: the stamp hashes HEAD's trees and
+ * `git status` does not report ignored files, so an ignored or untracked file
+ * could change what is built while the stamp stays identical.
+ */
+function committed(root, abs, what) {
+  for (let d = abs; d !== root && d.startsWith(root + path.sep); d = path.dirname(d)) {
+    if (lstatSync(d, { throwIfNoEntry: false })?.isSymbolicLink()) throw new InputError(`${path.relative(root, d)} is a symlink under the engine inputs; the engine stamp hashes only its link text, not what it points to`);
+  }
+  const rel = path.relative(root, abs).split(path.sep).join("/");
+  if (spawnSync("git", ["-C", root, "cat-file", "-e", `HEAD:${rel}`]).status !== 0) {
+    throw new InputError(`${what} ${rel} is not committed in HEAD (it is ignored or untracked); the engine stamp cannot cover it`);
+  }
+}
+
+/** Nothing under a crate's target/ is a source: it is build output (and ignored). */
+function refuseBuildOutput(abs, crateDir, what) {
+  const target = path.join(crateDir, "target");
+  if (abs === target || abs.startsWith(target + path.sep)) throw new InputError(`${what} points into ${target}, which is build output; the engine stamp cannot cover it`);
+}
+
+function workspaceMembersInside(ws, crateDir, toml, root) {
   if (!isTable(ws)) return;
   for (const name of ["members", "default-members", "exclude"]) {
     if (ws[name] === undefined) continue;
@@ -380,6 +401,13 @@ function workspaceMembersInside(ws, crateDir, toml) {
       const abs = path.resolve(crateDir, prefix || ".");
       if (abs !== crateDir && !abs.startsWith(crateDir + path.sep)) {
         throw new InputError(`${at} [workspace] ${name} entry ${member} resolves outside the crate directory; the engine stamp cannot cover it`);
+      }
+      refuseBuildOutput(abs, crateDir, `${at} [workspace] ${name} entry ${member}`);
+      if (name === "exclude" || abs === crateDir) continue;
+      if (prefix === member) {
+        committed(root, path.join(abs, "Cargo.toml"), `${at} [workspace] ${name} entry ${member}: its Cargo.toml`);
+      } else if (spawnSync("git", ["-C", root, "check-ignore", "-q", "--", path.relative(root, abs).split(path.sep).join("/")]).status === 0) {
+        throw new InputError(`${at} [workspace] ${name} glob ${member} starts in an ignored directory; members found there are not in HEAD and the engine stamp cannot cover them`);
       }
     }
   }
@@ -432,8 +460,9 @@ export function enginePaths(root) {
       // Cargo.lock from that root, none of which the stamp could see.
       if (!refs.isRoot) throw new InputError(`${toml} must declare its own [workspace] (an empty one is enough): without it cargo builds the engine under an outer workspace root whose [patch], [profile] and Cargo.lock the engine stamp cannot cover`);
       if (!existsSync(path.join(crateDir, "Cargo.lock"))) throw new InputError(`${path.join(crateDir, "Cargo.lock")} is missing: the engine's lockfile must sit in the engine directory so the stamp covers it`);
+      committed(root, path.join(crateDir, "Cargo.lock"), `${toml}: the engine's lockfile`);
     }
-    workspaceMembersInside(doc.workspace, crateDir, toml);
+    workspaceMembersInside(doc.workspace, crateDir, toml, root);
     let inheritedFrom;
     if (refs.inherits || refs.entries.some((e) => e.inherit !== undefined)) {
       inheritedFrom = refs.isRoot ? { dir: crateDir, doc } : workspaceRootOf(root, crateDir, refs, toml);
@@ -459,6 +488,8 @@ export function enginePaths(root) {
         if (!abs.startsWith(crateDir + path.sep)) {
           throw new InputError(`${entry.at} [${entry.table}] ${entry.key ?? "path"} ${entry.path} resolves outside the crate directory; the engine stamp cannot cover it`);
         }
+        refuseBuildOutput(abs, crateDir, `${entry.at} [${entry.table}] ${entry.key ?? "path"} ${entry.path}`);
+        committed(root, abs, `${entry.at} [${entry.table}] ${entry.key ?? "path"}`);
         continue;
       }
       const dep = posix(path.relative(root, abs));
@@ -473,6 +504,7 @@ export function enginePaths(root) {
         continue;
       }
       if (out.includes(dep)) continue;
+      committed(root, path.join(abs, "Cargo.toml"), `${entry.at} path dependency ${entryPath}: its Cargo.toml`);
       out.push(dep);
       queue.push(dep);
     }

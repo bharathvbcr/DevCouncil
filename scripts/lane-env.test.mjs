@@ -346,6 +346,7 @@ describe("path dependencies outside the repository", () => {
   const GUSSET = '[dependencies.gusset_core]\npath = "../../../gusset/crates/gusset"\n';
   it("[lib]/[[bin]]/[[test]] paths must stay inside the crate; inside is fine", () => {
     const f = fixture();
+    put(path.join(f.lane, "rust/gusset-engine/src/bin/b.rs"), "// bin\n");
     commitManifest(f, `[lib]\npath = "src/lib.rs"\n[[bin]]\nname = "b"\npath = "src/bin/b.rs"\n[dependencies]\ndc-glob = { path = "../dc-glob" }\n${GUSSET}`);
     assert.deepEqual(Object.keys(engineInputs(f.lane, f.gusset).stamp.trees).sort(), ["rust-toolchain.toml", "rust/dc-glob", "rust/gusset-engine"]);
     for (const table of ["[lib]", "[[bin]]", "[[test]]", "[[example]]", "[[bench]]"]) {
