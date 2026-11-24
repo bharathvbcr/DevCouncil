@@ -97,12 +97,29 @@ fn page_size(bytes: &[u8]) -> usize {
     }
 }
 
+/// Damage `len` bytes at `from` in place, the way a bad sector or a stray
+/// writer damages a store: same file, same length, same modification time.
+///
+/// The time is put back because it is half of the slot's file identity off
+/// Unix (`StoreFileIdentity`: length and mtime there, device and inode on
+/// Unix). With the write's new mtime the slot saw another file on Windows and
+/// reopened it afresh, so these tests never reached the cached-handle paths
+/// they exist for. It is set through the writing handle, which stops NTFS from
+/// stamping the write's own time when the handle closes.
 fn overwrite(db: &Path, from: usize, len: usize) {
     use std::io::{Seek, SeekFrom, Write};
     let mut file = std::fs::OpenOptions::new().write(true).open(db).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
     file.seek(SeekFrom::Start(from as u64)).unwrap();
     file.write_all(&vec![0xFF; len]).unwrap();
     file.sync_all().unwrap();
+    file.set_modified(modified).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(
+        std::fs::metadata(db).unwrap().modified().unwrap(),
+        modified,
+        "damage in place must keep the file's identity"
+    );
 }
 
 /// Overwrite every page after the first with 0xFF, in place. Returns the
