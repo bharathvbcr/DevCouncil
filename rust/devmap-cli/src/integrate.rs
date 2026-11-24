@@ -2466,9 +2466,14 @@ fn is_devmap_hook_command(command: &str) -> bool {
     };
     let is_devmap = executable == claude::PLUGIN_NAME
         || (Path::new(&executable).is_absolute()
-            && Path::new(&executable)
-                .file_stem()
-                .is_some_and(|stem| stem == claude::PLUGIN_NAME));
+            && Path::new(&executable).file_name().is_some_and(|name| {
+                // Exactly `devmap`, or `devmap.exe` (any case, on every platform):
+                // `devmap.sh` or `devmap.py` is somebody's wrapper, not this binary.
+                name == claude::PLUGIN_NAME
+                    || name
+                        .to_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("devmap.exe"))
+            }));
     is_devmap
         && tail
             .strip_prefix(" hook ")
@@ -2880,6 +2885,23 @@ mod plugin_asset_tests {
         );
         assert!(generated_hooks(&hooks), "{hooks}");
         assert!(!is_devmap_hook_command("'/opt/it'\\''s/other' hook stop"));
+    }
+    #[test]
+    fn only_a_file_named_devmap_is_devmaps_executable() {
+        assert!(!is_devmap_hook_command(
+            "'/opt/devmap.sh' hook session-start"
+        ));
+        assert!(!is_devmap_hook_command(
+            "'/opt/devmap.py' hook session-start"
+        ));
+        assert!(is_devmap_hook_command("'/opt/devmap' hook session-start"));
+        assert!(is_devmap_hook_command(
+            "'/opt/devmap.exe' hook session-start"
+        ));
+        #[cfg(windows)]
+        assert!(is_devmap_hook_command(
+            "'C:\\x\\devmap.exe' hook session-start"
+        ));
     }
 }
 
