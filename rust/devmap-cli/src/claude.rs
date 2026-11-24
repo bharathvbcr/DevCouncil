@@ -1897,9 +1897,7 @@ pub(crate) fn worktree_build_output_warning(path: &Path) -> Option<String> {
 /// `main_checkout_of`, so a worktree of a bare repo is not named.
 fn worktree_build_output_warning_at(path: &Path) -> Option<String> {
     let components: Vec<_> = path.components().collect();
-    let is_target = |c: &std::path::Component<'_>| {
-        matches!(c, std::path::Component::Normal(name) if *name == "target")
-    };
+    let is_target = |c: &std::path::Component<'_>| matches!(c, std::path::Component::Normal(name) if *name == "target");
     for (index, _) in components.iter().enumerate().filter(|(_, c)| is_target(c)) {
         // `target`, a profile directory, and the file itself.
         if components.len() < index + 3 {
@@ -3615,7 +3613,12 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
-            .args(["-c", "protocol.file.allow=always", "-c", "commit.gpgsign=false"])
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
             .output()
             .expect("git runs");
@@ -3653,7 +3656,17 @@ mod tests {
         let main = root.join("main");
         init_repo(&main);
         let lane = root.join("lane");
-        git_in(&main, &["worktree", "add", "-q", lane.to_str().expect("utf8"), "-b", "lane"]);
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                lane.to_str().expect("utf8"),
+                "-b",
+                "lane",
+            ],
+        );
         let primary_bin = main.join("rust/target/debug/devmap");
         let cases = [
             lane.join("rust/target/debug/devmap"),
@@ -3686,9 +3699,18 @@ mod tests {
         }
         assert!(first && !second, "stderr warns once per path");
         assert!(note_direct.is_some(), "receipt note missing");
-        assert!(note_unregistered.is_none(), "nothing registered, nothing will break");
-        assert!(primary.is_none(), "the main checkout outlives any lane: {primary:?}");
-        assert!(source_file.is_none(), "a file named target is not build output");
+        assert!(
+            note_unregistered.is_none(),
+            "nothing registered, nothing will break"
+        );
+        assert!(
+            primary.is_none(),
+            "the main checkout outlives any lane: {primary:?}"
+        );
+        assert!(
+            source_file.is_none(),
+            "a file named target is not build output"
+        );
     }
 
     #[cfg(unix)]
@@ -3698,7 +3720,17 @@ mod tests {
         let main = root.join("main");
         init_repo(&main);
         let lane = root.join("lane");
-        git_in(&main, &["worktree", "add", "-q", lane.to_str().expect("utf8"), "-b", "lane"]);
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                lane.to_str().expect("utf8"),
+                "-b",
+                "lane",
+            ],
+        );
         let binary = lane.join("rust/target/debug/devmap");
         std::fs::create_dir_all(binary.parent().expect("parent")).expect("lane target");
         std::fs::write(&binary, b"x").expect("lane binary");
@@ -3708,7 +3740,10 @@ mod tests {
         let note = mcp_receipt_note(&link, true);
         let _ = std::fs::remove_dir_all(&root);
         assert!(warning.is_some(), "a symlink into a lane was not flagged");
-        assert!(note.is_some(), "the receipt note is missing for the symlink");
+        assert!(
+            note.is_some(),
+            "the receipt note is missing for the symlink"
+        );
     }
 
     #[test]
@@ -3718,7 +3753,16 @@ mod tests {
         init_repo(&sub_src);
         let main = root.join("main");
         init_repo(&main);
-        git_in(&main, &["submodule", "add", "-q", sub_src.to_str().expect("utf8"), "vendor/sub"]);
+        git_in(
+            &main,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                sub_src.to_str().expect("utf8"),
+                "vendor/sub",
+            ],
+        );
         let submodule_bin = main.join("vendor/sub/target/debug/devmap");
         let outside_git = root.join("not-a-repo/worktrees/lane/rust/target/debug/devmap");
         let flagged = [
