@@ -428,8 +428,10 @@ fn execute(
             probe_admission,
             env,
             scratch,
-            &endpoints[i],
-            &daemon_logs[i],
+            DaemonFiles {
+                endpoint: &endpoints[i],
+                log: &daemon_logs[i],
+            },
         )?;
     }
     println!("{n} daemons answering IPC concurrently");
@@ -575,8 +577,10 @@ fn execute(
                 probe_admission,
                 env,
                 scratch,
-                &endpoints[i],
-                &daemon_logs[i],
+                DaemonFiles {
+                    endpoint: &endpoints[i],
+                    log: &daemon_logs[i],
+                },
             )?;
         }
 
@@ -710,6 +714,13 @@ fn execute(
     Ok(())
 }
 
+/// The files one daemon owns: the endpoint it serves on and the log it writes.
+#[derive(Clone, Copy)]
+struct DaemonFiles<'a> {
+    endpoint: &'a Path,
+    log: &'a Path,
+}
+
 fn ready_one(
     i: usize,
     child: &mut Child,
@@ -717,9 +728,12 @@ fn ready_one(
     probe_admission: &ProbeAdmission,
     env: &HashMap<OsString, OsString>,
     scratch: &Path,
-    endpoint: &Path,
-    log_path: &Path,
+    files: DaemonFiles<'_>,
 ) -> Result<()> {
+    let DaemonFiles {
+        endpoint,
+        log: log_path,
+    } = files;
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let exit = child.try_wait()?;
