@@ -257,6 +257,9 @@ func namesRoot(root, operand string) bool {
 		return false
 	}
 	candidate := operand
+	if rootedOffRoot(normalizeSlashes(candidate)) {
+		return false
+	}
 	if !filepath.IsAbs(candidate) {
 		candidate = filepath.Join(rootResolved, candidate)
 	}

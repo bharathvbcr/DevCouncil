@@ -49,6 +49,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -487,7 +488,7 @@ func buildAndPublish(stop time.Time, boundBy, crates, crate, binary string) (str
 		return "", log.Bytes(), runErr
 	}
 
-	data, err := readStableArtifact(filepath.Join(target, "debug", binary))
+	data, err := readStableArtifact(filepath.Join(target, "debug", executableName(binary)))
 	if err != nil {
 		return "", log.Bytes(), err
 	}
@@ -617,7 +618,7 @@ func readStableArtifact(path string) ([]byte, error) {
 func publishArtifact(target, binary string, data []byte) (string, error) {
 	sum := sha256.Sum256(data)
 	dir := filepath.Join(target, testBinDir, binary+"-"+hex.EncodeToString(sum[:])[:16])
-	path := filepath.Join(dir, binary)
+	path := filepath.Join(dir, executableName(binary))
 	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(data)) {
 		return path, nil
 	}
@@ -643,9 +644,26 @@ func publishArtifact(target, binary string, data []byte) (string, error) {
 		return "", err
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
+		// Where a running executable cannot be replaced (Windows), losing the
+		// race to a concurrent publisher of the same bytes is a success: the
+		// name is the content's hash, so what is there is what was written.
+		if info, statErr := os.Stat(path); statErr == nil && info.Size() == int64(len(data)) {
+			return path, nil
+		}
 		return "", err
 	}
 	return path, nil
+}
+
+// executableName is the file name cargo gives a binary target on this
+// platform: the bare name, plus ".exe" on Windows. Looking for the bare name
+// there finds nothing, so every build was reported as unreadable after fifty
+// attempts although cargo had finished.
+func executableName(binary string) string {
+	if runtime.GOOS == "windows" {
+		return binary + ".exe"
+	}
+	return binary
 }
 
 // Tool checks that an external command the test depends on exists.
