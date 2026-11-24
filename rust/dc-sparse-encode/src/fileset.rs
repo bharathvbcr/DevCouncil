@@ -102,7 +102,7 @@ fn list(root: &Path, max_files: usize) -> Result<Selection, String> {
 }
 
 /// The script's walk: sorted, skipping hidden and dependency directories,
-/// symlinks, and files over the size ceiling. It does not read `.gitignore`.
+/// symlinks, and files at or over the size ceiling (dcgrep skips at `>=`). It does not read `.gitignore`.
 pub fn walk(root: &Path, max_files: usize) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
     let _omitted = walk_into(root, max_files, &mut found)?;
@@ -136,7 +136,7 @@ fn walk_into(dir: &Path, max_files: usize, found: &mut Vec<PathBuf>) -> Result<b
             subdirs.push(path);
             continue;
         }
-        if !meta.is_file() || !is_source(&path) || meta.len() > MAX_FILE_BYTES {
+        if !meta.is_file() || !is_source(&path) || meta.len() >= MAX_FILE_BYTES {
             continue;
         }
         if found.len() >= max_files {
@@ -472,27 +472,30 @@ mod tests {
     }
 
     #[test]
-    fn size_ceiling_is_inclusive_and_one_byte_over_is_not() {
+    fn size_ceiling_is_exclusive_like_dcgrep() {
+        // dcgrep skips a file at `len >= max_file_bytes`, so the walk must too:
+        // a file of exactly MAX_FILE_BYTES is one the index would decline.
         let tree = TempTree::new();
         let root = tree.path();
-        let exact = root.join("exact.rs");
-        let over = root.join("over.rs");
-        let exact_len = MAX_FILE_BYTES as usize;
-        fs::write(&exact, vec![b'x'; exact_len])
-            .unwrap_or_else(|err| panic!("write {}: {err}", exact.display()));
-        fs::write(&over, vec![b'y'; exact_len + 1])
+        let under = root.join("a_under.rs");
+        let at = root.join("b_at.rs");
+        let over = root.join("c_over.rs");
+        let len = MAX_FILE_BYTES as usize;
+        fs::write(&under, vec![b'x'; len - 1])
+            .unwrap_or_else(|err| panic!("write {}: {err}", under.display()));
+        fs::write(&at, vec![b'y'; len])
+            .unwrap_or_else(|err| panic!("write {}: {err}", at.display()));
+        fs::write(&over, vec![b'z'; len + 1])
             .unwrap_or_else(|err| panic!("write {}: {err}", over.display()));
-        assert_eq!(fs::metadata(&exact).unwrap().len(), MAX_FILE_BYTES);
-        assert_eq!(fs::metadata(&over).unwrap().len(), MAX_FILE_BYTES + 1);
-        assert!(exact < over);
+        assert_eq!(fs::metadata(&under).unwrap().len(), MAX_FILE_BYTES - 1);
+        assert_eq!(fs::metadata(&at).unwrap().len(), MAX_FILE_BYTES);
         let selection = select(root, 1, true).unwrap();
         assert!(selection.via_walk);
         assert!(
             !selection.truncated,
-            "one byte over the ceiling is not an omission"
+            "files at or over the ceiling are not omissions"
         );
-        assert_eq!(selection.files, vec![exact]);
-        assert!(!selection.files.contains(&over));
+        assert_eq!(selection.files, vec![under]);
     }
 
     #[test]
@@ -578,6 +581,45 @@ mod tests {
                 sealed.display()
             ),
         }
+    }
+
+    #[test]
+    fn unreadable_directory_after_a_full_cap_is_an_error() {
+        // The look-ahead that detects an omission reads past a full cap, so an
+        // unreadable directory there is reported, not silently called complete.
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "a.rs", "fn a() {}\n");
+        let sealed = root.join("sealed");
+        write_file(&sealed, "missed.rs", "fn missed() {}\n");
+        let _restore = RestoreMode::new(sealed.clone());
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+            .unwrap_or_else(|err| panic!("chmod {}: {err}", sealed.display()));
+        if fs::read_dir(&sealed).is_ok() {
+            eprintln!(
+                "skipping: {} is still readable (running as root?), so mode 000 cannot seal it",
+                sealed.display()
+            );
+            return;
+        }
+        match select(root, 1, true) {
+            Ok(selection) => panic!(
+                "cap full, unreadable {} returned Ok truncated={} files={:?}",
+                sealed.display(),
+                selection.truncated,
+                selection.files
+            ),
+            Err(err) => assert!(
+                err.contains(&sealed.display().to_string()),
+                "error should name {}: {err}",
+                sealed.display()
+            ),
+        }
+        assert!(
+            walk(root, 1).is_err(),
+            "public walk() reaches the same look-ahead"
+        );
     }
 
     #[test]
