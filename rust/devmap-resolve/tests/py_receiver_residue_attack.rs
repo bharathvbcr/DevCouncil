@@ -2,8 +2,8 @@
 //! asserts the correct Python behaviour; a failing probe is a finding.
 //! Precision probes assert "no wrong edge"; recall probes are labelled.
 
-use devmap_extract::extract_file;
 use devmap_extract::model::{EdgeKind, Extraction};
+use devmap_extract::{extract_file, extract_file_with_budget};
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
 use std::time::Instant;
@@ -13,6 +13,31 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
         .iter()
         .map(|(path, source)| extract_file(path, source))
         .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    resolver.resolve_all(&extractions).unwrap()
+}
+
+/// Wide enough that no CI runner's slowness decides a fixture's extraction: a
+/// file refused for budget keeps no symbols, so the resolver then has nothing
+/// to resolve and a scale test reads "0 of N" for a reason that is the clock.
+const FIXTURE_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// [`resolve`] for the scale probes: the extraction budget is [`FIXTURE_PARSE_BUDGET`],
+/// and a file refused for budget fails loudly here instead of resolving to nothing.
+fn resolve_at_scale(files: &[(&str, &str)]) -> ResolutionResult {
+    let extractions: Vec<Extraction> = files
+        .iter()
+        .map(|(path, source)| extract_file_with_budget(path, source, FIXTURE_PARSE_BUDGET))
+        .collect();
+    for extraction in &extractions {
+        assert!(
+            !extraction.is_budget_refusal(),
+            "precondition: {} was refused for parse budget, so nothing could resolve: {:?}",
+            extraction.file_path,
+            extraction.parse_outcome
+        );
+    }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     resolver.resolve_all(&extractions).unwrap()
@@ -1257,28 +1282,7 @@ fn s01_thousands_of_factories_bounded_and_correct() {
         src.push_str(&format!("def use{i}():\n    return make{i}().run()\n\n"));
     }
     let t = Instant::now();
-    // Under the default 5 s parse budget this file was a budget refusal on a
-    // windows-latest run (S01_ELAPSED_MS 5374): `Failed`, no symbols, and
-    // "0/3000 resolved" named the resolver for the extractor's refusal. The
-    // bound this probe sets is its own `took` check below, so the extraction
-    // gets a budget no runner reaches and must be shown to have run.
-    let extraction = devmap_extract::extract_file_with_budget(
-        "big.py",
-        &src,
-        std::time::Duration::from_secs(600),
-    );
-    assert!(
-        !matches!(
-            extraction.parse_outcome,
-            devmap_extract::model::ParseOutcome::Failed { .. }
-        ),
-        "precondition: big.py was parsed, not refused: {:?}",
-        extraction.parse_outcome
-    );
-    let extractions = vec![extraction];
-    let mut resolver = Resolver::new();
-    resolver.index_extractions(&extractions);
-    let res = resolver.resolve_all(&extractions).unwrap();
+    let res = resolve_at_scale(&[("big.py", &src)]);
     let took = t.elapsed();
     eprintln!("S01_ELAPSED_MS {}", took.as_millis());
     let mut hit = 0;
