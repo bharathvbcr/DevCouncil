@@ -335,4 +335,5 @@ fn a_server_reached_through_a_link_is_started_under_the_name_it_was_looked_up_by
     let _ = fs::remove_dir_all(&base);
 }
 
+#[cfg(unix)]
 include!("../../testsupport/proxy.rs");

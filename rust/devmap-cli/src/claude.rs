@@ -1353,13 +1353,101 @@ pub(crate) fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
 /// MCP entries still use [`plugin_command`]'s bare-name rule; hooks must be
 /// absolute because Cursor/Codex do not expand a bare name the same way, and a
 /// bare `devmap` that clap-rejects exits 2 and blocks the agent.
-pub fn hook_executable(executable: &Path) -> PathBuf {
-    if executable.is_absolute() {
-        return executable.to_path_buf();
+///
+/// [`plugin_command`] hands this the bare name whenever `devmap` on `PATH` is
+/// this binary (a CI runner with `target/debug` on `PATH`, a `cargo install`).
+/// A bare name is therefore looked up on `PATH` exactly as a shell would, and
+/// the file it finds is the answer. A name that cannot be resolved is an error:
+/// a hook command that is not absolute is never emitted.
+pub fn hook_executable(executable: &Path) -> anyhow::Result<PathBuf> {
+    resolve_hook_executable(executable, std::env::var_os("PATH").as_deref())
+}
+
+/// A fixture executable path that is absolute on the platform under test: a
+/// path with no drive letter is not absolute on Windows, and a hook executable
+/// that is not absolute is refused there, so a Unix-looking fixture would be
+/// refused for the wrong reason. `unix_path` keeps its text (hostile characters
+/// included); on Windows it gains a `C:` drive and backslash separators.
+#[cfg(test)]
+pub(crate) fn absolute_fixture(unix_path: &str) -> PathBuf {
+    debug_assert!(unix_path.starts_with('/'), "{unix_path}");
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", unix_path.replace('/', "\\")))
+    } else {
+        PathBuf::from(unix_path)
     }
-    executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_path_buf())
+}
+
+fn resolve_hook_executable(
+    executable: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<PathBuf> {
+    if executable.is_absolute() {
+        return Ok(executable.to_path_buf());
+    }
+    let unresolved = || {
+        anyhow::anyhow!(
+            "cannot make the hook executable {} absolute; pass --binary with an absolute path",
+            executable.display()
+        )
+    };
+    if executable.components().count() != 1 {
+        return executable.canonicalize().map_err(|_| unresolved());
+    }
+    let path_var = path_var.ok_or_else(unresolved)?;
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in executable_names(executable) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate.canonicalize().map_err(|_| unresolved());
+            }
+        }
+    }
+    Err(unresolved())
+}
+
+/// The file names one `PATH` directory is probed for, in the order a shell
+/// would try them: the name as given, then (Windows only, and only for a name
+/// with no extension) the name with each `PATHEXT` extension, so `devmap`
+/// finds `devmap.exe`. Unix probes the name as given and nothing else.
+fn executable_names(executable: &Path) -> Vec<std::ffi::OsString> {
+    #[cfg(windows)]
+    {
+        executable_names_with(executable, std::env::var_os("PATHEXT").as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        vec![executable.as_os_str().to_os_string()]
+    }
+}
+
+/// [`executable_names`] with `PATHEXT` passed in. An unset or empty variable
+/// falls back to Windows' own default list. Extensions are used as written (the
+/// Windows file system matches them case-insensitively), skipping empty entries.
+#[cfg(any(windows, test))]
+fn executable_names_with(
+    executable: &Path,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Vec<std::ffi::OsString> {
+    let mut names = vec![executable.as_os_str().to_os_string()];
+    if executable.extension().is_some() {
+        return names;
+    }
+    let pathext = pathext
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    for ext in pathext.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let ext = ext.strip_prefix('.').unwrap_or(ext);
+        let mut name = executable.as_os_str().to_os_string();
+        name.push(".");
+        name.push(ext);
+        names.push(name);
+    }
+    names
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -1502,7 +1590,7 @@ fn hooks_block_without(
             subcommands.join(", ")
         );
     }
-    let exe = hook_executable(executable);
+    let exe = hook_executable(executable)?;
     let exe_text = utf8_path("the devmap executable path", &exe)?;
 
     // Groups are keyed by (event, matcher): two handlers that fire on the same
@@ -1682,7 +1770,7 @@ pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
 /// `postToolUse` entry, matcher `Shell` (Cursor's name for the terminal tool),
 /// is the shell-write refresh; `afterFileEdit` never fires for a shell write.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
-    let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
+    let exe = utf8_path("the devmap executable path", &hook_executable(executable)?)?;
     let session_start = hook_shell_command(&exe, "session-start")?;
     let after_file_edit = hook_shell_command(&exe, "post-tool-use")?;
     let shell_write = after_file_edit.clone();
@@ -2345,6 +2433,82 @@ fn manifest_version(dir: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// `plugin_command` answers the bare name when `devmap` on `PATH` is this
+    /// binary (CI puts `target/debug` on `PATH`); a hook must still be absolute.
+    #[test]
+    fn a_bare_hook_executable_is_resolved_on_path_and_never_left_bare() {
+        let dir = std::env::temp_dir().join(format!("devmap-hook-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devmap"), b"x").unwrap();
+        let path_var = std::env::join_paths([Path::new(""), dir.as_path()]).unwrap();
+
+        let resolved =
+            resolve_hook_executable(Path::new("devmap"), Some(path_var.as_os_str())).unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(resolved.ends_with("devmap"), "{resolved:?}");
+
+        let missing =
+            resolve_hook_executable(Path::new("no-such-devmap"), Some(path_var.as_os_str()));
+        assert!(missing.is_err(), "an unresolvable name must be refused");
+        assert!(resolve_hook_executable(Path::new("devmap"), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows: `--binary devmap` with only `devmap.exe` on `PATH` resolves,
+    /// trying `PATHEXT` in order (default list when unset), and a name that
+    /// already has an extension is never expanded. The name-building runs on
+    /// every platform; the on-disk resolution is Windows-only.
+    #[test]
+    fn pathext_expands_a_bare_name_in_order_and_leaves_an_extension_alone() {
+        let names = |name: &str, pathext: Option<&str>| -> Vec<String> {
+            executable_names_with(Path::new(name), pathext.map(std::ffi::OsStr::new))
+                .into_iter()
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            names("devmap", Some(".EXE;.cmd; ;.Bat")),
+            ["devmap", "devmap.EXE", "devmap.cmd", "devmap.Bat"]
+        );
+        assert_eq!(
+            names("devmap", None),
+            [
+                "devmap",
+                "devmap.COM",
+                "devmap.EXE",
+                "devmap.BAT",
+                "devmap.CMD"
+            ]
+        );
+        assert_eq!(names("devmap", Some("")), names("devmap", None));
+        assert_eq!(names("devmap.exe", Some(".EXE")), ["devmap.exe"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_hook_executable_finds_its_exe_through_pathext_on_windows() {
+        let dir = std::env::temp_dir().join(format!("devmap-hook-exe-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devmap.exe"), b"x").unwrap();
+        let path_var = std::env::join_paths([dir.as_path()]).unwrap();
+        let resolved =
+            resolve_hook_executable(Path::new("devmap"), Some(path_var.as_os_str())).unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(
+            resolved
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("devmap.exe")),
+            "{resolved:?}"
+        );
+        assert!(
+            resolve_hook_executable(Path::new("no-such-devmap"), Some(path_var.as_os_str()))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_config_dir_is_the_variable_when_set_and_non_empty() {
         let home = Path::new("/home/u");
@@ -2942,8 +3106,11 @@ mod tests {
     /// permission event.
     #[test]
     fn the_post_tool_use_matcher_covers_shell_calls_and_stays_off_permission_events() {
-        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
-            .expect("normal emission");
+        let block = hooks_block(
+            &absolute_fixture("/usr/local/bin/devmap"),
+            &["hook".to_string()],
+        )
+        .expect("normal emission");
         let matcher = block["hooks"]["PostToolUse"][0]["matcher"]
             .as_str()
             .unwrap();
@@ -2972,8 +3139,11 @@ mod tests {
     /// Bash only, on a non-permission event, and its coverage row says handled.
     #[test]
     fn a_failed_shell_call_reaches_the_post_tool_use_hook() {
-        let block = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
-            .expect("normal emission");
+        let block = hooks_block(
+            &absolute_fixture("/usr/local/bin/devmap"),
+            &["hook".to_string()],
+        )
+        .expect("normal emission");
         let group = &block["hooks"]["PostToolUseFailure"][0];
         assert_eq!(group["matcher"], "Bash");
         let command = group["hooks"][0]["command"].as_str().unwrap();
@@ -2994,7 +3164,8 @@ mod tests {
     /// which are the fields the hook reads.
     #[test]
     fn cursor_shell_refresh_is_a_post_tool_use_entry_for_shell() {
-        let doc = cursor_hooks_document(Path::new("/usr/local/bin/devmap")).unwrap();
+        let exe = absolute_fixture("/usr/local/bin/devmap");
+        let doc = cursor_hooks_document(&exe).unwrap();
         let entries = doc["hooks"]["postToolUse"].as_array().unwrap();
         let shell: Vec<_> = entries
             .iter()
@@ -3003,7 +3174,7 @@ mod tests {
         assert_eq!(shell.len(), 1, "{entries:?}");
         assert_eq!(
             shell[0]["command"],
-            "'/usr/local/bin/devmap' hook post-tool-use"
+            format!("'{}' hook post-tool-use", exe.display())
         );
         assert!(doc["hooks"].get("afterShellExecution").is_none());
     }
@@ -3014,7 +3185,7 @@ mod tests {
     #[test]
     fn codex_hooks_json_omits_events_codex_does_not_document() {
         let files = render_plugin_bundle(
-            Path::new("/usr/local/bin/devmap"),
+            &absolute_fixture("/usr/local/bin/devmap"),
             Path::new("/tmp/devmap.sqlite"),
             Some("0.0.0"),
             &["hook".to_string()],
@@ -3051,7 +3222,7 @@ mod tests {
     #[test]
     fn every_rendered_hooks_json_carries_the_shell_matcher() {
         let files = render_plugin_bundle(
-            Path::new("/usr/local/bin/devmap"),
+            &absolute_fixture("/usr/local/bin/devmap"),
             Path::new("/tmp/devmap.sqlite"),
             Some("0.0.0"),
             &["hook".to_string()],
@@ -3124,12 +3295,16 @@ mod tests {
                 "shell expanded the executable path ({status}): {command}"
             );
         }
-        let ordinary = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
+        let ordinary_exe = absolute_fixture("/usr/local/bin/devmap");
+        let ordinary = hooks_block(&ordinary_exe, &["hook".to_string()])
             .expect("an absolute path with no shell metacharacters must validate");
         let sample = ordinary["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert_eq!(sample, "'/usr/local/bin/devmap' hook session-start");
+        assert_eq!(
+            sample,
+            format!("'{}' hook session-start", ordinary_exe.display())
+        );
         let cursor = cursor_hooks_document(&exe).expect("cursor hooks use the same quoting");
         let cursor_cmd = cursor["hooks"]["sessionStart"][0]["command"]
             .as_str()
@@ -3157,12 +3332,17 @@ mod tests {
     #[test]
     fn hooks_block_refuses_a_path_that_single_quotes_cannot_hold() {
         for path in ["/tmp/a\nb/devmap", "/tmp/a\rb/devmap", "/tmp/a\0b/devmap"] {
-            let err = hooks_block(Path::new(path), &["hook".into()])
+            let path = absolute_fixture(path);
+            let err = hooks_block(&path, &["hook".into()])
                 .expect_err("newline, CR, or NUL must not be emitted");
             let text = err.to_string();
             assert!(
                 text.contains("newline") && text.contains("NUL"),
                 "{path:?} -> {text}"
+            );
+            assert!(
+                !text.contains("absolute"),
+                "{path:?} must be refused for its bytes, not for being relative: {text}"
             );
         }
     }
@@ -3185,14 +3365,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let subst = "$(touch \"$MARKER\")";
         let tick = "`touch \"$MARKER\"`";
+        // Every case is an absolute path: hooks are never emitted bare (ba667f3f),
+        // and the hostile text is what each one still carries.
         let paths = [
             format!("/tmp/{subst}/devmap"),
             format!("/tmp/{tick}/devmap"),
             format!("/tmp/o'{subst}/devmap"),
             format!("/tmp/'{subst}'/devmap"),
             "/tmp/foo'; touch \"$MARKER\"; echo '/devmap".to_string(),
-            format!("'{subst}"),
-            format!("{subst}'"),
+            format!("/tmp/'{subst}"),
+            format!("/tmp/{subst}'"),
             format!("/tmp/my bin/{subst}/devmap"),
             format!("/tmp/δé/{subst}/devmap"),
             format!("/tmp/路径/{tick}/devmap"),
@@ -3202,7 +3384,7 @@ mod tests {
             format!("/tmp/a\u{202e}{tick}/devmap"),
             format!("/tmp/foo # {subst}"),
             format!("/tmp/<({subst})/devmap"),
-            format!("a'b'c'{subst}"),
+            format!("/tmp/a'b'c'{subst}"),
         ];
         for path in &paths {
             let block = hooks_block(Path::new(path), &["hook".to_string()])
@@ -3298,9 +3480,12 @@ mod tests {
             "/tmp/`touch x`\r/devmap",
             "/tmp/o'$(touch x)\0/devmap",
         ] {
+            let path = absolute_fixture(path);
+            let err = hooks_block(&path, &["hook".into()])
+                .expect_err(&format!("emitted a command for {path:?}"));
             assert!(
-                hooks_block(Path::new(path), &["hook".into()]).is_err(),
-                "emitted a command for {path:?}"
+                err.to_string().contains("newline"),
+                "{path:?} must be refused for its bytes: {err}"
             );
         }
     }
@@ -3339,6 +3524,7 @@ mod tests {
     /// Registering it is the failure. A checkout's own `target/debug` or
     /// `target/release` binary stays a valid absolute command, because
     /// `mcp --print-config` is specified to name the binary that ran.
+    #[cfg(unix)]
     #[test]
     fn a_hashed_test_binary_is_refused_as_an_mcp_command() {
         let stale = Path::new(

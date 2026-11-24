@@ -10,6 +10,7 @@
 //! bumps the same counter as the classes below.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +64,7 @@ impl Repo {
 
 impl Drop for Repo {
     fn drop(&mut self) {
+        #[cfg(unix)]
         fn unlock(dir: &std::path::Path) {
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
             if let Ok(entries) = fs::read_dir(dir) {
@@ -75,6 +77,7 @@ impl Drop for Repo {
                 }
             }
         }
+        #[cfg(unix)]
         unlock(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }
@@ -124,6 +127,7 @@ fn a_clean_tree_is_complete_with_both_counts_reported_as_zero() {
     assert_eq!(ranked["lexical_limit_reason"], Value::Null, "{ranked}");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_file_is_counted_not_skipped() {
     let repo = Repo::new();
@@ -140,6 +144,7 @@ fn an_unreadable_file_is_counted_not_skipped() {
     assert_eq!(ranked["lexical_limit_reason"], Value::Null, "{ranked}");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_directory_is_a_walk_error_and_nothing_else() {
     let repo = Repo::new();

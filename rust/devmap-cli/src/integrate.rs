@@ -2912,7 +2912,12 @@ mod tests {
     fn cursor_hooks_are_marker_owned_camel_case() {
         let dir = scratch("cursor-hooks");
         let path = dir.join(".cursor").join("hooks.json");
-        let outcome = merge_cursor_hooks(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let outcome = merge_cursor_hooks(
+            &path,
+            &crate::claude::absolute_fixture("/tmp/fake-devmap"),
+            false,
+        )
+        .unwrap();
         assert!(outcome.changed);
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["generatedBy"], "devmap");
@@ -2926,7 +2931,12 @@ mod tests {
         assert!(cmd.contains("hook session-start"), "{cmd}");
         assert!(!cmd.contains("\"args\""), "{cmd}");
         // Second merge is a no-op.
-        let again = merge_cursor_hooks(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let again = merge_cursor_hooks(
+            &path,
+            &crate::claude::absolute_fixture("/tmp/fake-devmap"),
+            false,
+        )
+        .unwrap();
         assert!(!again.changed);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2938,7 +2948,12 @@ mod tests {
     fn cursor_hooks_inject_first_navigation_on_post_tool_use_never_on_permission_events() {
         let dir = scratch("cursor-nav-hooks");
         let path = dir.join(".cursor").join("hooks.json");
-        merge_cursor_hooks(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        merge_cursor_hooks(
+            &path,
+            &crate::claude::absolute_fixture("/tmp/fake-devmap"),
+            false,
+        )
+        .unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         for forbidden in [
             "preToolUse",
@@ -3112,9 +3127,13 @@ command = \"x\"\n";
         let dir = scratch("codex-plugin");
         let plugin = dir.join(".codex-plugin");
         let hooks = dir.join("hooks");
-        let outcomes =
-            write_codex_plugin_assets(&plugin, &hooks, Path::new("/tmp/fake-devmap"), false)
-                .unwrap();
+        let outcomes = write_codex_plugin_assets(
+            &plugin,
+            &hooks,
+            &crate::claude::absolute_fixture("/tmp/fake-devmap"),
+            false,
+        )
+        .unwrap();
         assert!(!outcomes.is_empty());
         assert!(plugin.join("plugin.json").is_file());
         assert!(plugin.join("hooks").join("hooks.json").is_file());

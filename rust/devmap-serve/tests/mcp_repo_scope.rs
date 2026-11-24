@@ -1513,6 +1513,7 @@ async fn the_same_repo_cwd_refusal_holds_via_symlink_dotdot_and_case() {
 /// so an in-place `devmap build` (same inode) never evicts it. The cached
 /// connection must therefore follow the writer: an `?immutable=1` open of a
 /// quiescent WAL store answers from the generation it first read.
+#[cfg(unix)]
 #[test]
 fn a_cached_store_follows_a_build_that_writes_in_place() {
     use std::os::unix::fs::MetadataExt;
