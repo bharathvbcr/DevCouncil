@@ -42,20 +42,40 @@ Conduct violation.
 
 ## Branches and merging
 
-`main` is the only long-lived branch, and it is protected:
+`main` is the stable release branch and `dev` is the long-lived development
+integration branch. Both, along with the reserved branch groups below, are
+protected by active GitHub rulesets:
 
-- Contributors, including collaborators with write access, land changes through
-  pull requests. A pull request needs one approving review, code-owner review,
-  all conversations resolved, and the required status checks passing. New
-  commits dismiss stale approvals. Merge, squash and rebase merges are allowed.
-- The required checks are `test` (`ci.yml`), `Verify package`
-  (`npm-publish.yml`), and `Analyze (go)`, `Analyze (rust)` and
-  `Analyze (javascript-typescript)` (`codeql.yml`).
-- Force pushes to and deletion of `main` are blocked.
-- Release tags (`v*`) cannot be deleted, force-updated or moved.
-- The repository admin (the lead maintainer) can bypass the ruleset and push
-  directly. That is an administrative capability, not the normal path; the
-  maintainer's own changes usually go through pull requests too.
+- **`main`** ("main: pull requests and checks"):
+  - Contributors, including collaborators with write access, land changes through
+    pull requests. A pull request needs one approving review, code-owner review,
+    all conversations resolved, and the required status checks passing. New
+    commits dismiss stale approvals. Merge, squash and rebase merges are allowed.
+  - The required checks are `test` (`ci.yml`), `Verify package`
+    (`npm-publish.yml`), and `Analyze (go)`, `Analyze (rust)` and
+    `Analyze (javascript-typescript)` (`codeql.yml`).
+  - Force pushes to and deletion of `main` are blocked.
+- **`dev`** ("dev: development split"):
+  - Blocks unauthorized creation, deletion and force-push, and requires
+    pull-request review (one approving review, code-owner review, stale
+    approvals dismissed, all conversations resolved). Required CI status checks
+    remain gated on `main` until CI triggers include `dev`.
+- **Reserved branch groups** ("branch groups: release/\*\*, devmap/\*\*,
+  schema/\*\*, core/\*\*, host/\*\*"):
+  - `release/**` (release stabilization lines), `devmap/**` (DevMap Rust
+    code-intelligence crates), `schema/**` (cross-repository shared schemas and
+    contracts), `core/**` (shared `dc-*` core crates), and `host/**` (Go host
+    and orchestrator) restrict creation, deletion and force-push and require
+    pull-request review.
+- **`archive/**`** ("archive/\*\*: immutable"):
+  - Blocks creation, updates, deletion and force-push so archived snapshots
+    remain read-only.
+- **Release tags (`v*`)** ("release tags: immutable"): cannot be deleted,
+  force-updated or moved.
+- **Admin bypass:** The repository admin (the lead maintainer) can bypass the
+  rulesets and push directly. That is an administrative capability, not the
+  normal path; the maintainer's own changes usually go through pull requests
+  too.
 
 The repository's GitHub rulesets are the source of truth if this list and the
 settings ever differ.
