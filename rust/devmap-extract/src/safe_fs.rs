@@ -42,6 +42,35 @@ fn is_transient_windows_refusal(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
+/// Run `operation` on a name that a concurrent caller may be renaming, and
+/// on Windows wait out the refusals that race gives (see
+/// [`is_transient_windows_refusal`]) for at most two seconds. Elsewhere it
+/// runs once: POSIX neither refuses a rename because of an open handle nor an
+/// open because of a rename in flight.
+///
+/// The race goes both ways on Windows. A rename is refused while another
+/// handle holds the file without delete sharing, which every `safe_fs` open
+/// does. An open is refused while a rename is in flight, because `std`'s
+/// rename holds the file with `DELETE` access and `safe_fs` opens do not
+/// share delete. [`PinnedDir::rename_child`] runs its rename through this; a
+/// caller that opens a name it then renames, such as
+/// `session_log::rotate_live`, runs that open through it too.
+pub fn through_a_racing_rename<T>(operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        rename_through_transient_refusals(
+            operation,
+            is_transient_windows_refusal,
+            WINDOWS_RENAME_BUDGET,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let mut operation = operation;
+        operation()
+    }
+}
+
 /// Run `rename`, repeating it while `transient` calls its error one that
 /// passes by itself, for at most `budget`.
 ///
@@ -52,11 +81,11 @@ fn is_transient_windows_refusal(error: &io::Error) -> bool {
 /// source away, the retry ends in `NotFound`, which callers already read as
 /// "someone else claimed it".
 #[cfg_attr(not(windows), allow(dead_code))]
-fn rename_through_transient_refusals(
-    mut rename: impl FnMut() -> io::Result<()>,
+fn rename_through_transient_refusals<T>(
+    mut rename: impl FnMut() -> io::Result<T>,
     transient: impl Fn(&io::Error) -> bool,
     budget: std::time::Duration,
-) -> io::Result<()> {
+) -> io::Result<T> {
     let deadline = std::time::Instant::now() + budget;
     let mut delay = std::time::Duration::from_millis(1);
     loop {
@@ -227,11 +256,7 @@ impl PinnedDir {
         #[cfg(windows)]
         {
             let (from, to) = (self.path.join(from), self.path.join(to));
-            rename_through_transient_refusals(
-                || std::fs::rename(&from, &to),
-                is_transient_windows_refusal,
-                WINDOWS_RENAME_BUDGET,
-            )
+            through_a_racing_rename(|| std::fs::rename(&from, &to))
         }
     }
 
@@ -1098,6 +1123,45 @@ mod rename_retry_tests {
         .expect_err("the source is gone");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(calls.get(), 2);
+    }
+
+    /// An open that meets a rename in flight is retried like a rename is, and
+    /// hands back what it opened: `rotate_live` checks the live log through
+    /// this before claiming it, and that open was the step overlapping
+    /// SessionEnd reports failed on with os error 32.
+    #[test]
+    fn an_open_that_meets_a_rename_in_flight_is_waited_out_and_returns_its_value() {
+        let calls = Cell::new(0);
+        let opened = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(sharing_violation())
+                } else {
+                    Ok("the opened file")
+                }
+            },
+            is_transient_windows_refusal,
+            Duration::from_secs(2),
+        )
+        .expect("the open succeeds once the rename has finished");
+        assert_eq!(opened, "the opened file");
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// Off Windows the operation runs once: a POSIX open or rename is never
+    /// refused for a racing handle, so an error there is the answer.
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_a_racing_rename_is_not_retried() {
+        let calls = Cell::new(0);
+        let error = through_a_racing_rename(|| -> io::Result<()> {
+            calls.set(calls.get() + 1);
+            Err(sharing_violation())
+        })
+        .expect_err("returned as is");
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
