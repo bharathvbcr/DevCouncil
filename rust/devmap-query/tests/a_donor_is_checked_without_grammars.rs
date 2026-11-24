@@ -46,6 +46,9 @@ fn tmp_dir(label: &str) -> PathBuf {
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(root)
+        // Git for Windows checks a worktree out with CRLF under its default
+        // autocrlf=true, which would make every lane look edited.
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -160,7 +163,11 @@ fn add_lane(donor: &Path, lane: &Path) {
             "-q",
             "-b",
             "lane",
-            lane.to_str().unwrap(),
+            // git cannot create the leading directories of a `\\?\` verbatim
+            // path, which is what `canonicalize` gives on Windows.
+            lane.to_str()
+                .unwrap()
+                .trim_start_matches(r"\\?\"),
         ],
     );
 }

@@ -3922,6 +3922,9 @@ mod tests {
     fn run_git_ok(cwd: &Path, args: &[&str]) {
         let out = Command::new("git")
             .current_dir(cwd)
+            // Git for Windows checks a worktree out with CRLF under its default
+            // autocrlf=true, which would make every lane look edited.
+            .args(["-c", "core.autocrlf=false"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
