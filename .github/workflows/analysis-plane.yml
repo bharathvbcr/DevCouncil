@@ -210,11 +210,15 @@ jobs:
         run: go test ./... -count=1 -race
 
       # Known vulnerabilities in the module graph this host builds with. The
-      # tool is installed at a pinned version, not `latest`.
+      # tool is installed at a pinned version, not `latest`. The pin moves with
+      # the Go release: govulncheck builds SSA with the golang.org/x/tools it was
+      # released against, and v1.1.4's x/tools v0.29.0 panicked on this module
+      # under Go 1.27 ("unexpected expr: *ast.KeyValueExpr", Linux build only).
+      # v1.9.0 is built with x/tools v0.52.0.
       - name: Vulnerability scan
         working-directory: backend/go_orchestrator
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
       # The live-contract tests are the only check that the field names this
