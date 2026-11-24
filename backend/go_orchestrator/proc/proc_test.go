@@ -3,6 +3,9 @@ package proc
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,16 +88,12 @@ func TestEverySubprocessBoundaryUsesTheBound(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for n, line := range strings.Split(string(body), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "//") {
-				continue
-			}
-			if strings.Contains(trimmed, "cmd.Run()") {
-				rel, _ := filepath.Rel(root, path)
-				offenders = append(offenders, rel+":"+strings.TrimSpace(line)+" (line "+itoa(n+1)+")")
-			}
+		rel, _ := filepath.Rel(root, path)
+		found, err := unboundedCmdRuns(rel, body)
+		if err != nil {
+			return err
 		}
+		offenders = append(offenders, found...)
 		return nil
 	})
 	if err != nil {
@@ -102,6 +101,109 @@ func TestEverySubprocessBoundaryUsesTheBound(t *testing.T) {
 	}
 	if len(offenders) > 0 {
 		t.Fatalf("these calls bypass the process-wide wait bound:\n  %s", strings.Join(offenders, "\n  "))
+	}
+}
+
+// unboundedCmdRuns returns one "path:text (line N)" entry for every cmd.Run()
+// call in src that is not lexically inside a func literal passed directly to
+// RunBounded or RunBoundedWithCleanup (bare or as proc.X). Parsing instead of
+// matching text means comments and strings never count, and a closure that is
+// merely assigned to a variable does not count as bounded.
+func unboundedCmdRuns(filename string, src []byte) ([]string, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(src), "\n")
+	isBound := func(fn ast.Expr) bool {
+		switch f := fn.(type) {
+		case *ast.Ident:
+			return f.Name == "RunBounded" || f.Name == "RunBoundedWithCleanup"
+		case *ast.SelectorExpr:
+			pkg, ok := f.X.(*ast.Ident)
+			return ok && pkg.Name == "proc" && (f.Sel.Name == "RunBounded" || f.Sel.Name == "RunBoundedWithCleanup")
+		}
+		return false
+	}
+	var offenders []string
+	// stack holds the ancestors of the node being visited; a nil visit pops.
+	var stack []ast.Node
+	ast.Inspect(file, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if call, ok := n.(*ast.CallExpr); ok && len(call.Args) == 0 {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
+				if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "cmd" && !boundedByClosure(stack, isBound) {
+					line := fset.Position(call.Pos()).Line
+					offenders = append(offenders, filename+":"+strings.TrimSpace(lines[line-1])+" (line "+itoa(line)+")")
+				}
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+	return offenders, nil
+}
+
+// boundedByClosure reports whether the innermost func literal around the
+// visited node is itself a direct argument of a bounding call.
+func boundedByClosure(stack []ast.Node, isBound func(ast.Expr) bool) bool {
+	for i := len(stack) - 1; i >= 0; i-- {
+		lit, ok := stack[i].(*ast.FuncLit)
+		if !ok {
+			continue
+		}
+		if i == 0 {
+			return false
+		}
+		call, ok := stack[i-1].(*ast.CallExpr)
+		if !ok || !isBound(call.Fun) {
+			return false
+		}
+		for _, arg := range call.Args {
+			if arg == ast.Expr(lit) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func TestUnboundedCmdRunsScanner(t *testing.T) {
+	const head = "package p\nfunc f() error {\n"
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"bare call is flagged", "return cmd.Run()\n", 1},
+		{"closure passed to RunBoundedWithCleanup is accepted", "err, _ := proc.RunBoundedWithCleanup(ctx, func() error {\nreturn cmd.Run()\n})\nreturn err\n", 0},
+		{"closure passed to RunBounded is accepted", "err, _ := RunBounded(ctx, func() error { return cmd.Run() })\nreturn err\n", 0},
+		{"assigned closure is still flagged", "g := func() error { return cmd.Run() }\nreturn g()\n", 1},
+		{"closure passed to another call is flagged", "return other(ctx, func() error { return cmd.Run() })\n", 1},
+		{"goroutine inside a bounded closure is flagged", "RunBounded(ctx, func() error {\ngo func() { _ = cmd.Run() }()\nreturn nil\n})\nreturn nil\n", 1},
+		{"named function passed to RunBounded is flagged", "NAMED", 1},
+		{"line comment is ignored", "// return cmd.Run()\nreturn nil\n", 0},
+		{"block comment and string are ignored", "/* cmd.Run() */\ns := \"cmd.Run()\"\n_ = s\nreturn nil\n", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := head + tc.body + "}\n"
+			if tc.body == "NAMED" {
+				src = "package p\nfunc run() error { return cmd.Run() }\nfunc f() error {\nerr, _ := proc.RunBounded(ctx, run)\nreturn err\n}\n"
+			}
+			got, err := unboundedCmdRuns("x.go", []byte(src))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != tc.want {
+				t.Fatalf("want %d offenders, got %d: %v", tc.want, len(got), got)
+			}
+		})
 	}
 }
 
