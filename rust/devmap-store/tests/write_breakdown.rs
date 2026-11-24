@@ -363,6 +363,9 @@ fn literal_tree(revision: usize, modules: usize) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Largest share of a write the unnamed remainder may take.
+const OTHER_SHARE_LIMIT: f64 = 0.25;
+
 /// The three regions that used to hide in `other` have names, and with them
 /// `other` is a minor remainder rather than half the write.
 ///
@@ -418,10 +421,17 @@ fn the_regions_that_hid_in_other_are_named_and_other_is_a_remainder() {
                 breakdown.parts()
             );
         }
+        // The regression this guards is `other` at 55% of the write (1.63 s of
+        // 2.96 s). The bound was 15%, a local measurement; ubuntu CI's debug
+        // build measured the cold write's `other` at 15.1% twice (18 ms of a
+        // 121 ms write, where fixed per-write costs that no span names weigh
+        // more), so 15% sat on that runner's steady value, not above it. 25%
+        // clears it and still fails the 55% shape by a wide margin.
         assert!(
-            part("other") < total * 0.15,
-            "{shape}: `other` is {:.1}% of the write, not under 15%: {:?}",
+            part("other") < total * OTHER_SHARE_LIMIT,
+            "{shape}: `other` is {:.1}% of the write, not under {:.0}%: {:?}",
             100.0 * part("other") / total,
+            100.0 * OTHER_SHARE_LIMIT,
             breakdown.parts()
         );
     }

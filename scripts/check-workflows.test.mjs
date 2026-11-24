@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
@@ -329,6 +329,70 @@ jobs:
       assert.match(verify, /cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe/);
       assert.match(verify, /cargo build --release --locked -q -p devmap-soak/);
       assert.match(verify, /cargo run --release --locked -q -p devmap-soak/);
+    });
+
+    // `cargo run -p <pkg>` with no --bin or --example stops working the day
+    // that package gains a second binary target ("could not determine which
+    // binary to run"). devmap-soak's src/bin/diskwatch.rs did exactly that to
+    // verify.sh's soak step. Every unpinned call must name a one-binary package.
+    it("pins the binary on every cargo run whose package has more than one", () => {
+      const rustDir = path.join(root, "rust");
+      /** @param {string} dir @returns {string[]} */
+      const binTargets = (dir) => {
+        const pkgDir = path.join(rustDir, dir);
+        const manifest = readFileSync(path.join(pkgDir, "Cargo.toml"), "utf8");
+        const names = new Set();
+        const claimed = new Set();
+        for (const section of manifest.split(/^\[\[bin\]\]\s*$/m).slice(1)) {
+          const body = section.split(/^\[/m)[0];
+          const name = /^name\s*=\s*"([^"]+)"/m.exec(body)?.[1];
+          if (name) names.add(name);
+          const binPath = /^path\s*=\s*"([^"]+)"/m.exec(body)?.[1];
+          if (binPath) claimed.add(path.normalize(binPath));
+        }
+        if (/^autobins\s*=\s*false/m.test(manifest)) return [...names];
+        const pkgName = /^name\s*=\s*"([^"]+)"/m.exec(manifest)?.[1] ?? dir;
+        if (existsSync(path.join(pkgDir, "src", "main.rs")) && !claimed.has(path.normalize("src/main.rs"))) {
+          names.add(pkgName);
+        }
+        const binDir = path.join(pkgDir, "src", "bin");
+        if (existsSync(binDir)) {
+          for (const entry of readdirSync(binDir, { withFileTypes: true })) {
+            const rel = entry.isDirectory() ? `src/bin/${entry.name}/main.rs` : `src/bin/${entry.name}`;
+            if (claimed.has(path.normalize(rel))) continue;
+            if (entry.isFile() && entry.name.endsWith(".rs")) names.add(entry.name.slice(0, -3));
+            if (entry.isDirectory() && existsSync(path.join(binDir, entry.name, "main.rs"))) names.add(entry.name);
+          }
+        }
+        return [...names];
+      };
+      const members = new Map(workspaceMembers(rustDir).map((m) => [m.name, m.dir]));
+      const sources = [
+        ["rust/verify.sh", readFileSync(path.join(rustDir, "verify.sh"), "utf8")],
+        ...workflowFiles(path.join(root, ".github", "workflows")).map((f) => [
+          `.github/workflows/${f}`,
+          readFileSync(path.join(root, ".github", "workflows", f), "utf8"),
+        ]),
+      ];
+      const ambiguous = [];
+      let checked = 0;
+      for (const [file, text] of sources) {
+        for (const line of text.split("\n")) {
+          if (/^\s*#/.test(line)) continue;
+          const call = /\bcargo run\b([^\n]*)/.exec(line)?.[1];
+          if (call === undefined) continue;
+          const args = call.split(" -- ")[0];
+          const pkg = /(?:^|\s)(?:-p|--package)\s+([\w-]+)/.exec(args)?.[1];
+          if (!pkg || /(?:^|\s)--(?:bin|example)\b/.test(args)) continue;
+          const dir = members.get(pkg);
+          assert.ok(dir, `${file}: cargo run -p ${pkg} names no workspace member`);
+          checked += 1;
+          const bins = binTargets(dir);
+          if (bins.length !== 1) ambiguous.push(`${file}: cargo run -p ${pkg} (binaries: ${bins.join(", ") || "none"})`);
+        }
+      }
+      assert.ok(checked > 0, "found no unpinned cargo run to check; the scan no longer reads the call sites");
+      assert.deepEqual(ambiguous, []);
     });
 
     it("ignores comments, cargo run, cargo fmt, cargo mutants, and echo of a cargo verb", () => {

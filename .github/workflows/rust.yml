@@ -165,6 +165,14 @@ jobs:
           cargo test --locked -p devmap-cli --test it -- worktree_stress_support:: --nocapture
           cargo build --locked -p devmap-cli --example worktree_stress --example ipc_probe
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # Each daemon's watcher holds one inotify instance, and the kernel
+            # caps them per user (fs.inotify.max_user_instances). The runner
+            # user already holds some, so 128 daemons cannot fit under a cap of
+            # 128: main's last three runs lost daemon 107, 111 and 121 at startup.
+            echo "fs.inotify.max_user_instances before: $(sysctl -n fs.inotify.max_user_instances)"
+            sudo sysctl -w fs.inotify.max_user_instances=1024
+          fi
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: ${{ always() }}

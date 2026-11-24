@@ -168,6 +168,31 @@ pub fn classify_startup(
     StartupDecision::Retry
 }
 
+/// Bytes of a dead daemon's own log carried into the harness error.
+pub const DAEMON_EXIT_LOG_TAIL_BYTES: usize = 2048;
+
+/// The error for a daemon that exited while the harness waited on it. It names
+/// how the process ended (an error exit and a kill by signal are different
+/// failures) and ends with that daemon's own log. Without that log, a receipt
+/// that showed other daemons' logs could not say why this one died.
+pub fn daemon_exit_report(i: usize, phase: &str, status: &str, log: &[u8]) -> String {
+    let start = log.len().saturating_sub(DAEMON_EXIT_LOG_TAIL_BYTES);
+    let mut tail = &log[start..];
+    if start > 0 {
+        // Start on a whole line, unless one line is longer than the window.
+        if let Some(newline) = tail.iter().position(|&b| b == b'\n') {
+            tail = &tail[newline + 1..];
+        }
+    }
+    let text = String::from_utf8_lossy(tail);
+    let text = text.trim();
+    if text.is_empty() {
+        format!("daemon {i} exited during {phase} ({status}); its log is empty")
+    } else {
+        format!("daemon {i} exited during {phase} ({status}); its log ends:\n{text}")
+    }
+}
+
 /// A failed run cannot keep `passed: true`. Cleanup failure is the same class.
 pub fn finalize_pass_flag(passed: bool, has_error: bool, cleanup_failed: bool) -> bool {
     passed && !has_error && !cleanup_failed
