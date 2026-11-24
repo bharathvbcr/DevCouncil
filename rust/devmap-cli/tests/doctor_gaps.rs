@@ -381,10 +381,7 @@ fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
         !names_path(warning, &researcher),
         "the printed opt-out did not clear it: {opt_out} -> {payload}"
     );
-    assert!(
-        names_path(warning, &gitpulse_only),
-        "{payload}"
-    );
+    assert!(names_path(warning, &gitpulse_only), "{payload}");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cwd);
 }

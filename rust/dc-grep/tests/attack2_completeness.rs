@@ -331,7 +331,11 @@ fn the_per_class_report_sums_caps_and_keeps_hostile_names_as_data() {
     // Windows cannot create a name with a control character, a quote or a
     // backslash (os error 123), so the hostile three exist on Unix only.
     let hostile: &[&str] = if cfg!(unix) {
-        &["ctl\tname\nx.txt", "esc\u{1b}[31mred.txt", "quote\"name\\.txt"]
+        &[
+            "ctl\tname\nx.txt",
+            "esc\u{1b}[31mred.txt",
+            "quote\"name\\.txt",
+        ]
     } else {
         &[]
     };

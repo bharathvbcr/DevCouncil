@@ -201,8 +201,14 @@ fn p1_the_recorded_repo_root_does_not_depend_on_the_spelling() {
         Path::new(&dotdot).parent(),
         "recorded roots differ in shape: {plain} vs {dotdot}"
     );
-    assert_eq!(Path::new(&plain).file_name(), Some("a".as_ref()));
-    assert_eq!(Path::new(&dotdot).file_name(), Some("b".as_ref()));
+    assert_eq!(
+        Path::new(&plain).file_name(),
+        Some(std::ffi::OsStr::new("a"))
+    );
+    assert_eq!(
+        Path::new(&dotdot).file_name(),
+        Some(std::ffi::OsStr::new("b"))
+    );
     assert!(
         !dotdot.contains(".."),
         "a `..` was stored as the repo root: {dotdot}"

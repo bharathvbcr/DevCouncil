@@ -2518,10 +2518,7 @@ mod tests {
         // A drive-less `/seat/one` is not absolute on Windows and gains the
         // current drive, so the fixture is absolute on every platform.
         let seat = absolute_fixture("/seat/one");
-        assert_eq!(
-            config_dir_from(home, os(seat.to_str().unwrap())),
-            seat
-        );
+        assert_eq!(config_dir_from(home, os(seat.to_str().unwrap())), seat);
         let relative = config_dir_from(home, os("seat"));
         assert!(relative.is_absolute(), "{relative:?}");
         assert!(relative.ends_with("seat"), "{relative:?}");

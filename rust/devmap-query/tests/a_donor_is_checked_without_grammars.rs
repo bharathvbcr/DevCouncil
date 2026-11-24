@@ -165,9 +165,7 @@ fn add_lane(donor: &Path, lane: &Path) {
             "lane",
             // git cannot create the leading directories of a `\\?\` verbatim
             // path, which is what `canonicalize` gives on Windows.
-            lane.to_str()
-                .unwrap()
-                .trim_start_matches(r"\\?\"),
+            lane.to_str().unwrap().trim_start_matches(r"\\?\"),
         ],
     );
 }
