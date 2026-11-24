@@ -1257,7 +1257,28 @@ fn s01_thousands_of_factories_bounded_and_correct() {
         src.push_str(&format!("def use{i}():\n    return make{i}().run()\n\n"));
     }
     let t = Instant::now();
-    let res = resolve(&[("big.py", &src)]);
+    // Under the default 5 s parse budget this file was a budget refusal on a
+    // windows-latest run (S01_ELAPSED_MS 5374): `Failed`, no symbols, and
+    // "0/3000 resolved" named the resolver for the extractor's refusal. The
+    // bound this probe sets is its own `took` check below, so the extraction
+    // gets a budget no runner reaches and must be shown to have run.
+    let extraction = devmap_extract::extract_file_with_budget(
+        "big.py",
+        &src,
+        std::time::Duration::from_secs(600),
+    );
+    assert!(
+        !matches!(
+            extraction.parse_outcome,
+            devmap_extract::model::ParseOutcome::Failed { .. }
+        ),
+        "precondition: big.py was parsed, not refused: {:?}",
+        extraction.parse_outcome
+    );
+    let extractions = vec![extraction];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let res = resolver.resolve_all(&extractions).unwrap();
     let took = t.elapsed();
     eprintln!("S01_ELAPSED_MS {}", took.as_millis());
     let mut hit = 0;

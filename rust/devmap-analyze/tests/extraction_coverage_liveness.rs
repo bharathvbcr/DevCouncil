@@ -739,7 +739,21 @@ fn a_file_whose_calls_were_cut_at_the_ceiling_is_still_a_partial_parse_once_stor
         source.push_str("    other();\n");
     }
     source.push_str("}\nfn other() {}\n");
-    let fresh = extract_file("big.rs", &source);
+    // Under the default 5 s budget a file this size is sometimes a budget
+    // refusal on a loaded runner (seen on windows-latest): `Failed`, no calls,
+    // and the precondition below then failed for a reason it did not name. The
+    // budget is not what this test is about, so it gets one no runner reaches
+    // and asserts that the extraction ran.
+    let fresh = devmap_extract::extract_file_with_budget(
+        "big.rs",
+        &source,
+        std::time::Duration::from_secs(600),
+    );
+    assert!(
+        !matches!(fresh.parse_outcome, ParseOutcome::Failed { .. }),
+        "precondition: the extraction ran rather than being refused: {:?}",
+        fresh.parse_outcome
+    );
     assert_eq!(
         fresh.calls.len(),
         ceiling,
