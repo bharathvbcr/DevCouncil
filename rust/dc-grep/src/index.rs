@@ -1369,8 +1369,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.count, 12, "{found:?}");
+        // Off Unix a search never plans from the trigram snapshot (no precise
+        // file versions, `Candidates::load`), so it has no staleness to report.
+        let stale = if cfg!(unix) { built.files_indexed } else { 0 };
         assert_eq!(
-            found.index.files_stale as usize, built.files_indexed,
+            found.index.files_stale as usize, stale,
             "a search reports staleness for the trigram snapshot's files only: {:?}",
             found.index
         );
@@ -1644,12 +1647,17 @@ mod tests {
         fs::write(&cut, bytes).unwrap();
         assert!(oversized_is_text(&fs::File::open(&cut).unwrap()));
 
-        // A descriptor that opens and cannot be read: a directory.
-        let unreadable = fs::File::open(&root).unwrap();
-        assert!(
-            oversized_is_text(&unreadable),
-            "an unreadable prefix must count as a shortfall"
-        );
+        // A descriptor that opens and cannot be read: a directory. Unix only:
+        // `File::open` on a directory is refused outright on Windows (access
+        // denied), so no such descriptor exists there.
+        #[cfg(unix)]
+        {
+            let unreadable = fs::File::open(&root).unwrap();
+            assert!(
+                oversized_is_text(&unreadable),
+                "an unreadable prefix must count as a shortfall"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1900,8 +1908,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.count, 1, "{response:?}");
+        // Off Unix a search is a live scan by design (`Candidates::load`).
+        let status = if cfg!(unix) { "used" } else { "scan" };
         assert_eq!(
-            response.index.status, "used",
+            response.index.status, status,
             "the slot is still a coherent index: {response:?}"
         );
         assert_eq!(

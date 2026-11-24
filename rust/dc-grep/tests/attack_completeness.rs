@@ -400,9 +400,12 @@ fn staleness_through_search_and_rank_for_files_past_the_trigram_ceiling() {
     assert!(ok, "{found}");
     eprintln!("search index block: {}", found["index"]);
     assert_eq!(found["count"], 260, "search must still find every file");
+    // Off Unix a search never plans from the trigram snapshot (no precise file
+    // versions), so it has no staleness to report.
+    let stale = if cfg!(unix) { indexed } else { 0 };
     assert_eq!(
         found["index"]["files_stale"].as_u64().unwrap(),
-        indexed,
+        stale,
         "search reports staleness for the trigram snapshot only: {}",
         found["index"]
     );
