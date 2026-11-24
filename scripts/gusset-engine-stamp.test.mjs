@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
@@ -320,5 +320,74 @@ describe("every path the stamp relies on must be in HEAD", () => {
     git(h.repo, "rm", "-q", "--cached", "rust/gusset-engine/Cargo.lock");
     git(h.repo, "commit", "-qm", "untrack lock");
     refused(h, /Cargo\.lock is not committed in HEAD/, "lock");
+  });
+});
+
+describe("one rule: nothing under an input may be neither in HEAD nor shown dirty", () => {
+  const E = "rust/gusset-engine";
+  const UNSEEN = /under the engine inputs/;
+  it("an ignored auto-discovered build.rs", () => {
+    const f = fixture();
+    git(f.repo, "rm", "-q", `${E}/build.rs`);
+    commit(f, ".gitignore", "target/\nbuild.rs\n");
+    put(path.join(f.repo, E, "build.rs"), "// ignored, but cargo runs it\n");
+    refused(f, /ignored file\(s\) under the engine inputs \(rust\/gusset-engine\/build\.rs\)/, "build.rs");
+  });
+  it("a glob member expanding into an ignored subdirectory", () => {
+    const f = fixture(`[dependencies]\n${GUSSET}[workspace]\nmembers = ["crates/*"]\n`, { outer: true });
+    commit(f, `${E}/crates/a/Cargo.toml`, "[package]\nname = 'a'\n");
+    commit(f, ".gitignore", "target/\ngen/\n");
+    put(path.join(f.repo, E, "crates/gen/Cargo.toml"), "[package]\nname = 'gen'\n");
+        refused(f, /ignored file\(s\) under the engine inputs \(rust\/gusset-engine\/crates\/gen\/\)/, "crates/gen");
+  });
+  it("an ignored src/gen.rs, a skip-worktree file and an assume-unchanged file", () => {
+    const f = fixture();
+    commit(f, ".gitignore", "target/\ngen.rs\n");
+    put(path.join(f.repo, E, "src/gen.rs"), "// ignored module\n");
+    refused(f, /ignored file\(s\).*src\/gen\.rs/, "ignored module");
+    rmSync(path.join(f.repo, E, "src/gen.rs"));
+    assert.ok(E in inputs(f).stamp.trees);
+    git(f.repo, "update-index", "--skip-worktree", `${E}/src/lib.rs`);
+    put(path.join(f.repo, E, "src/lib.rs"), "// edited, and git status will not say so\n");
+    refused(f, /index-flagged.*src\/lib\.rs/, "skip-worktree");
+    git(f.repo, "update-index", "--no-skip-worktree", `${E}/src/lib.rs`);
+    git(f.repo, "update-index", "--assume-unchanged", `${E}/src/lib.rs`);
+    refused(f, /index-flagged.*src\/lib\.rs/, "assume-unchanged");
+  });
+  it("a gitlink under the inputs", () => {
+    const f = fixture();
+    git(f.repo, "update-index", "--add", "--cacheinfo", `160000,${git(f.repo, "rev-parse", "HEAD")},${E}/sub`);
+    git(f.repo, "commit", "-qm", "gitlink");
+    refused(f, /rust\/gusset-engine\/sub is a gitlink/, "gitlink");
+  });
+  it("the crate's own target/ is skipped, and a message lists at most three files and the count", () => {
+    const f = fixture();
+    put(path.join(f.repo, E, "target/release/libgusset.a"), "a");
+    assert.ok(E in inputs(f).stamp.trees);
+    commit(f, ".gitignore", "target/\n*.bak\n");
+    for (const n of "abcde") put(path.join(f.repo, E, `src/${n}.bak`), "x");
+    refused(f, /5 ignored file\(s\) under the engine inputs \(.*, and 2 more\)/, "count");
+  });
+  it("a git that does not finish is a refusal, and every git child runs with fsmonitor disabled", () => {
+    const f = fixture();
+    const bin = path.join(f.top, "bin");
+    const log = path.join(f.top, "env.log");
+    const real = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
+    put(path.join(bin, "git"), `#!/bin/sh\necho "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_VALUE_0" >> '${log}'\nif [ -n "$SLOW" ]; then sleep 5; fi\nexec '${real}' "$@"\n`);
+    chmodSync(path.join(bin, "git"), 0o755);
+    const saved = { PATH: process.env.PATH, MS: process.env.GUSSET_STAMP_GIT_TIMEOUT_MS };
+    try {
+      process.env.PATH = `${bin}${path.delimiter}${saved.PATH}`;
+      assert.ok(E in inputs(f).stamp.trees);
+      assert.match(readFileSync(log, "utf8"), /^1 core\.fsmonitor false$/m);
+      process.env.SLOW = "1";
+      process.env.GUSSET_STAMP_GIT_TIMEOUT_MS = "300";
+      refused(f, /did not finish within 300 ms/, "timeout");
+    } finally {
+      delete process.env.SLOW;
+      process.env.PATH = saved.PATH;
+      if (saved.MS === undefined) delete process.env.GUSSET_STAMP_GIT_TIMEOUT_MS;
+      else process.env.GUSSET_STAMP_GIT_TIMEOUT_MS = saved.MS;
+    }
   });
 });

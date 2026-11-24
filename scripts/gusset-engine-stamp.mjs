@@ -23,6 +23,26 @@
  * engine tree, so it is covered. "dirty" is any uncommitted or untracked change
  * under those inputs or in the gusset sibling (git status --untracked-files=all,
  * which ignores status.showUntrackedFiles); a dirty stamp is never reusable.
+ *
+ * The one rule that closes the class: the stamp is a tree hash plus a dirty
+ * flag, so it is sound for every file under an input that is in HEAD or shows
+ * as dirty, and engineInputs refuses when anything under an input is neither:
+ * an ignored file (other than a crate's target/), an index-flagged file
+ * (assume-unchanged, skip-worktree), a gitlink or a symlink. That is what keeps
+ * cargo's auto-discovery (build.rs, src/lib.rs, src/bin/*), workspace globs and
+ * mod/include!/#[path] from reaching a file the stamp does not see. A refusal
+ * names the files and the --engine-dir escape.
+ *
+ * NOT covered, by design: source-level paths that leave the crate (include!,
+ * #[path] or include_str! pointing outside the input directories); .cargo/config.toml
+ * at the repository, a parent or the user level; RUSTFLAGS and other
+ * environment; the installed toolchain beyond the pinned channel in
+ * rust-toolchain.toml; symlinks inside the sibling gusset (only its HEAD and
+ * dirty state are recorded).
+ *
+ * Every git child runs with a bounded timeout (a timeout is a refusal, never a
+ * pass) and with fsmonitor disabled through its environment, deliberately: a
+ * wedged fsmonitor daemon must not be able to hang lane-env.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -35,8 +55,26 @@ export const STAMP_NAME = "libgusset.stamp.json";
 /** A known way the inputs cannot be computed; anything else thrown is a bug. */
 export class InputError extends Error {}
 
+const gitTimeoutMs = () => Number(process.env.GUSSET_STAMP_GIT_TIMEOUT_MS) || 30_000;
+
+/** The child environment: the caller's, plus core.fsmonitor=false (appended after any GIT_CONFIG_* pairs). */
+function gitEnv() {
+  const n = Number(process.env.GIT_CONFIG_COUNT) || 0;
+  return { ...process.env, GIT_CONFIG_COUNT: String(n + 1), [`GIT_CONFIG_KEY_${n}`]: "core.fsmonitor", [`GIT_CONFIG_VALUE_${n}`]: "false" };
+}
+
+/** Run git; a timeout or a failure to start is an InputError, so it can never read as a pass. */
+function run(cwd, args) {
+  const ms = gitTimeoutMs();
+  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: gitEnv(), timeout: ms, killSignal: "SIGKILL" });
+  if (r.error || r.signal) {
+    throw new InputError(`git ${args.join(" ")} (in ${cwd}) did not finish within ${ms} ms (${r.error?.code ?? r.signal}); refused rather than assumed clean`);
+  }
+  return r;
+}
+
 function git(cwd, ...args) {
-  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  const r = run(cwd, args);
   if (r.status !== 0) throw new InputError(`git ${args.join(" ")} (in ${cwd}): ${r.stderr.trim() || "failed"}`);
   return r.stdout.trim();
 }
@@ -377,7 +415,7 @@ function committed(root, abs, what) {
     if (lstatSync(d, { throwIfNoEntry: false })?.isSymbolicLink()) throw new InputError(`${path.relative(root, d)} is a symlink under the engine inputs; the engine stamp hashes only its link text, not what it points to`);
   }
   const rel = path.relative(root, abs).split(path.sep).join("/");
-  if (spawnSync("git", ["-C", root, "cat-file", "-e", `HEAD:${rel}`]).status !== 0) {
+  if (run(root, ["cat-file", "-e", `HEAD:${rel}`]).status !== 0) {
     throw new InputError(`${what} ${rel} is not committed in HEAD (it is ignored or untracked); the engine stamp cannot cover it`);
   }
 }
@@ -406,7 +444,7 @@ function workspaceMembersInside(ws, crateDir, toml, root) {
       if (name === "exclude" || abs === crateDir) continue;
       if (prefix === member) {
         committed(root, path.join(abs, "Cargo.toml"), `${at} [workspace] ${name} entry ${member}: its Cargo.toml`);
-      } else if (spawnSync("git", ["-C", root, "check-ignore", "-q", "--", path.relative(root, abs).split(path.sep).join("/")]).status === 0) {
+      } else if (run(root, ["check-ignore", "-q", "--", path.relative(root, abs).split(path.sep).join("/")]).status === 0) {
         throw new InputError(`${at} [workspace] ${name} glob ${member} starts in an ignored directory; members found there are not in HEAD and the engine stamp cannot cover them`);
       }
     }
@@ -514,6 +552,24 @@ export function enginePaths(root) {
 }
 
 /**
+ * Refuse when anything under an input is neither in HEAD nor shown by git
+ * status: ignored files (a crate's own target/ is build output and is skipped)
+ * and index-flagged files (assume-unchanged, skip-worktree), whose edits git
+ * status does not report.
+ */
+function unhashedFiles(root, paths) {
+  const listed = (args) => run(root, ["ls-files", "-z", ...args, "--", ...paths]).stdout.split("\0").filter(Boolean);
+  const ignored = listed(["-o", "-i", "--exclude-standard", "--directory"]).filter((f) => !paths.some((p) => f === `${p}/target/`));
+  const flagged = listed(["-v"]).filter((l) => /^[a-zS] /.test(l)).map((l) => l.slice(2));
+  const refuse = (what, files) => {
+    const shown = files.slice(0, 3).join(", ");
+    throw new InputError(`${files.length} ${what} under the engine inputs (${shown}${files.length > 3 ? `, and ${files.length - 3} more` : ""}): the engine stamp covers only files in HEAD or shown dirty, so these could change the build unseen. Remove or commit them`);
+  };
+  if (ignored.length) refuse("ignored file(s)", ignored);
+  if (flagged.length) refuse("index-flagged (assume-unchanged or skip-worktree) file(s)", flagged);
+}
+
+/**
  * @param {string} root repository (or linked worktree) root
  * @param {string} gussetDir the sibling gusset checkout
  * @returns {{ stamp: { version: 1, trees: Record<string, string>, gusset: string, dirty: boolean }, dirtyFiles: string[] }}
@@ -525,8 +581,10 @@ export function engineInputs(root, gussetDir) {
     // Refused rather than followed: a link inside the inputs (a member directory, a
     // path dependency, Cargo.lock) can lead outside the crate and the repository,
     // and the tree hash covers only its link text.
+    if (line.startsWith("160000 ")) throw new InputError(`${line.split("\t")[1]} is a gitlink (submodule) under the engine inputs; its contents are not in the stamp's tree hash`);
     if (line.startsWith("120000 ")) throw new InputError(`${line.split("\t")[1]} is a symlink under the engine inputs; the engine stamp hashes only its link text, not what it points to`);
   }
+  unhashedFiles(root, paths);
   const dirtyFiles = [
     ...git(root, "status", "--porcelain", "--untracked-files=all", "--", ...paths).split("\n").filter(Boolean),
     ...git(gussetDir, "status", "--porcelain", "--untracked-files=all").split("\n").filter(Boolean).map((l) => `gusset: ${l}`),
