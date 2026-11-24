@@ -33,8 +33,8 @@ pub use db::{
     QuerySourceFreshness, ReaderMemory, ResolverStamp, SearchNarrowing, SearchPage,
     SourceTreeDelta, Store, StoreStatus, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
     UnresolvedSiteRow, UnresolvedSitesByName, UnsupportedSchema, VacuumAction, VacuumOutcome,
-    WalCheckpointMode, WalCheckpointResult, WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
-    RESOLVER_NEWER_REASON, UNAVAILABLE_HEAD,
+    WalCheckpointMode, WalCheckpointResult, WriteBreakdown, WriterLock, WriterLockWait,
+    MAX_PENDING_ATTEMPTS, RESOLVER_NEWER_REASON, UNAVAILABLE_HEAD,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

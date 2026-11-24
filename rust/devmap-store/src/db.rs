@@ -1148,6 +1148,23 @@ pub struct WriterLock {
     path: Option<std::path::PathBuf>,
 }
 
+/// What a writer-lock wait looks like to the caller watching it: the lock file,
+/// how long the wait has run and the bound it will end at.
+#[derive(Debug, Clone, Copy)]
+pub struct WriterLockWait<'a> {
+    pub lock_path: &'a Path,
+    pub waited: std::time::Duration,
+    pub bound: std::time::Duration,
+}
+
+impl WriterLockWait<'_> {
+    /// The pid the holder recorded, or `"unknown"`. Reads the lock file, so a
+    /// watcher that reports on every poll should ask only when it reports.
+    pub fn holder_pid(&self) -> String {
+        Store::writer_lock_holder(self.lock_path)
+    }
+}
+
 impl WriterLock {
     /// The lock file backing this guard, or `None` for an in-memory store.
     pub fn path(&self) -> Option<&Path> {
