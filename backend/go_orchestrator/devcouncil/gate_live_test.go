@@ -44,6 +44,7 @@ func TestALiveHostFollowsTheGateConfigAndFailsClosedWhenItCannotRead(t *testing.
 		t.Fatal(err)
 	}
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}

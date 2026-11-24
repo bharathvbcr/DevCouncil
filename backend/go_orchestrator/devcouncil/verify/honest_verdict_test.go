@@ -166,6 +166,7 @@ func readRun(t *testing.T, db, taskID string) (commands string, started, finishe
 func plantRepoTask(t *testing.T, root, id, command string) *store.Client {
 	t.Helper()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +256,7 @@ func TestVerifyTaskWithUnreadableGitIsBlockedNotAnEmptyDiff(t *testing.T) {
 func TestPersistedGapsFromASkippedRunAreNotBlocking(t *testing.T) {
 	ctx := context.Background()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	in := verificationInput(failingRun)
 	in.GateMode = "off"
 	gaps, meta := verify.Run(ctx, in)

@@ -27,6 +27,7 @@ func TestRealStoreStopGateCannotPassAFailedCommandFromItsOutput(t *testing.T) {
 				t.Fatalf("git fixture: %v %s", err, out)
 			}
 			client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+			t.Cleanup(client.Close)
 			ctx := context.Background()
 			if _, err := client.ActiveLeases(ctx); err != nil {
 				t.Fatal(err)

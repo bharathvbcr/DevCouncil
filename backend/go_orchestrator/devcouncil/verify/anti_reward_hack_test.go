@@ -549,6 +549,7 @@ func TestVerifyTaskFailsClosedOnDeletedOrSymlinkedChangeReadOnlyOracles(t *testi
 		}
 
 		client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+		t.Cleanup(client.Close)
 		if _, err := client.ActiveLeases(ctx); err != nil {
 			t.Fatal(err)
 		}

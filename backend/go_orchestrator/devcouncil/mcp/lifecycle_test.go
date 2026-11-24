@@ -38,6 +38,7 @@ func startLiveHost(t *testing.T, command string) *liveHost {
 	t.Helper()
 	root := t.TempDir()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}

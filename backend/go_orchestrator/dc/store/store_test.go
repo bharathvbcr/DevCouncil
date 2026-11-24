@@ -294,14 +294,20 @@ func TestAvailableNeverManufacturesTheStoreItChecks(t *testing.T) {
 
 	// A command that does work still creates the store; that is how every cold
 	// start begins, and the fix must not break it.
-	if _, err := New(binary(t), real).ActiveLeases(ctx); err != nil {
+	cold := New(binary(t), real)
+	t.Cleanup(cold.Close)
+	if _, err := cold.ActiveLeases(ctx); err != nil {
 		t.Fatalf("cold start: %v", err)
 	}
-	if err := New(binary(t), real).Available(ctx); err != nil {
+	healthy := New(binary(t), real)
+	t.Cleanup(healthy.Close)
+	if err := healthy.Available(ctx); err != nil {
 		t.Fatalf("a real store reported unavailable: %v", err)
 	}
 
-	if err := New(binary(t), typo).Available(ctx); err == nil {
+	missing := New(binary(t), typo)
+	t.Cleanup(missing.Close)
+	if err := missing.Available(ctx); err == nil {
 		t.Fatal("a store that does not exist reported itself healthy")
 	}
 	if _, err := os.Stat(typo); !os.IsNotExist(err) {

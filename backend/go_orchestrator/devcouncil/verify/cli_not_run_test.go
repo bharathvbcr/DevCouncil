@@ -109,6 +109,7 @@ func storedRows(t *testing.T, client *store.Client, taskID string) (gaps, runs i
 
 func TestVerifyUnknownTaskIsNotRunAgainstARealStore(t *testing.T) {
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +138,7 @@ func TestVerifyUnknownTaskIsNotRunAgainstARealStore(t *testing.T) {
 
 func TestVerifyUnknownTaskHumanModeSaysNotRun(t *testing.T) {
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
