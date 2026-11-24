@@ -201,7 +201,16 @@ mod tests {
         let mut held = Vec::new();
         let start = Instant::now();
         let mut timed_out = false;
-        for _ in 0..4096 {
+        // `UnixListener::bind` asks the kernel for its maximum backlog, which is
+        // `net.core.somaxconn` (128 on old kernels, 4096 on current ones, and
+        // tunable much higher). The accept queue holds one more than that, so
+        // the connect that blocks is the one after `somaxconn + 1`; a fixed
+        // count that happens to equal the default never reaches it.
+        let backlog = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .unwrap_or(4096);
+        for _ in 0..backlog + 64 {
             match connect_within(&path, Duration::from_millis(200)) {
                 Ok(stream) => held.push(stream),
                 Err(e) => {
@@ -213,7 +222,7 @@ mod tests {
         }
         assert!(
             timed_out,
-            "{} connects never filled the backlog",
+            "{} connects never filled the backlog (somaxconn {backlog})",
             held.len()
         );
         assert!(start.elapsed() < Duration::from_secs(5));
