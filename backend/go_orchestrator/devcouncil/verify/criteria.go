@@ -26,6 +26,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // criterionExecutor names the evidence that discharges a criterion.
@@ -227,7 +228,7 @@ func judgeReview(taskID string, criterion dc.AcceptanceCriterion, ev ReviewEvide
 // the review recorded.
 func checkRubric(root string, rubric dc.ReviewRubric) string {
 	rel := filepath.FromSlash(rubric.Path)
-	if filepath.IsAbs(rel) || rel != filepath.Clean(rel) || rel == "." ||
+	if filepath.IsAbs(rel) || safefile.RootedOffRoot(rel) || rel != filepath.Clean(rel) || rel == "." ||
 		strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
 		return "the rubric path " + rubric.Path + " is not a clean path inside the repository"
 	}
