@@ -27,6 +27,49 @@ fn refused(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
 }
 
+/// How long a Windows rename waits for a transient refusal to pass.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_RENAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Windows refuses to rename a file another handle has open without delete
+/// sharing: `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_LOCK_VIOLATION` (33). Opening a file only to check it, as
+/// `session_log::rotate_live` does before claiming the live log, is enough to
+/// cause this. POSIX renames an open file without complaint. The refusal ends
+/// when that handle closes.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_transient_windows_refusal(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Run `rename`, repeating it while `transient` calls its error one that
+/// passes by itself, for at most `budget`.
+///
+/// A refusal that is not transient, or one still standing when the budget
+/// ends, is returned as the last attempt's error, so a destination that really
+/// is refused fails (only after the wait) and never reads as success. When the
+/// handle that blocked the rename belonged to a racer that then moved the
+/// source away, the retry ends in `NotFound`, which callers already read as
+/// "someone else claimed it".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rename_through_transient_refusals(
+    mut rename: impl FnMut() -> io::Result<()>,
+    transient: impl Fn(&io::Error) -> bool,
+    budget: std::time::Duration,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match rename() {
+            Err(error) if transient(&error) && std::time::Instant::now() + delay < deadline => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn check_child_name(name: &OsStr) -> io::Result<()> {
     let mut components = Path::new(name).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -183,7 +226,12 @@ impl PinnedDir {
         }
         #[cfg(windows)]
         {
-            std::fs::rename(self.path.join(from), self.path.join(to))
+            let (from, to) = (self.path.join(from), self.path.join(to));
+            rename_through_transient_refusals(
+                || std::fs::rename(&from, &to),
+                is_transient_windows_refusal,
+                WINDOWS_RENAME_BUDGET,
+            )
         }
     }
 
@@ -975,4 +1023,97 @@ fn windows_information(file: &File) -> io::Result<WindowsInformation> {
     }
     // SAFETY: the successful call initialized every field.
     Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(test)]
+mod rename_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    fn sharing_violation() -> io::Error {
+        io::Error::from_raw_os_error(32)
+    }
+
+    #[test]
+    fn a_transient_refusal_is_waited_out_and_the_rename_then_succeeds() {
+        let calls = Cell::new(0);
+        let result = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 4 {
+                    Err(sharing_violation())
+                } else {
+                    Ok(())
+                }
+            },
+            is_transient_windows_refusal,
+            Duration::from_secs(2),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            calls.get(),
+            4,
+            "succeeds on the first attempt after the refusal passes"
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_outlasts_the_budget_is_the_error_never_success() {
+        let calls = Cell::new(0);
+        let started = std::time::Instant::now();
+        let error = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                Err(sharing_violation())
+            },
+            is_transient_windows_refusal,
+            Duration::from_millis(100),
+        )
+        .expect_err("a refusal that never passes must fail");
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert!(calls.get() > 1, "it retried");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded by its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_racer_that_moved_the_source_ends_the_retry_as_not_found() {
+        let calls = Cell::new(0);
+        let error = rename_through_transient_refusals(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(sharing_violation())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+            },
+            is_transient_windows_refusal,
+            Duration::from_secs(2),
+        )
+        .expect_err("the source is gone");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn only_access_sharing_and_lock_refusals_are_transient() {
+        for code in [5, 32, 33] {
+            assert!(is_transient_windows_refusal(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        let not_transient = [
+            io::Error::from_raw_os_error(2),
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::other("anything else"),
+        ];
+        for error in not_transient {
+            assert!(!is_transient_windows_refusal(&error), "{error:?}");
+        }
+    }
 }
