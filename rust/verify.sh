@@ -485,7 +485,7 @@ step_soak() {
   cargo build --release --locked -q -p devmap-soak || {
     echo "GATE FAIL: the soak harness (devmap-soak) did not build"; rm -rf "$SOAK_DIR"; exit 1; }
   SOAK_STATUS=0
-  SOAK_OUT=$(cargo run --release --locked -q -p devmap-soak -- "$SOAK_DIR" 5 2>&1) || SOAK_STATUS=$?
+  SOAK_OUT=$(cargo run --release --locked -q -p devmap-soak --bin soak -- "$SOAK_DIR" 5 2>&1) || SOAK_STATUS=$?
   if [ "$SOAK_STATUS" -eq 0 ] && printf '%s\n' "$SOAK_OUT" | tail -2 | grep -q "SOAK SMOKE OK"; then
     echo "incremental equivalence OK (5 cycles, growth not asserted)"
   else
