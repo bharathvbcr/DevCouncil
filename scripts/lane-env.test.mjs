@@ -45,7 +45,8 @@ function fixture({ archive = true, stamp = true } = {}) {
   put(path.join(main, "tools/accuracy/go.mod"), "module y\n");
   put(path.join(main, ".github/actions/setup-gusset/action.yml"), `        ref: ${pin}\n`);
   put(path.join(main, "rust/gusset-engine/Cargo.toml"),
-    '[dependencies]\ngusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }\ndc-glob = { path = "../dc-glob" }\n');
+    '[workspace]\n\n[dependencies]\ngusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }\ndc-glob = { path = "../dc-glob" }\n');
+  put(path.join(main, "rust/gusset-engine/Cargo.lock"), "# lock\n");
   put(path.join(main, "rust/dc-glob/Cargo.toml"), "[package]\n");
   put(path.join(main, "rust/dc-glob/src/lib.rs"), "// glob\n");
   put(path.join(main, "rust-toolchain.toml"), "[toolchain]\nchannel = \"1.100\"\n");
@@ -324,14 +325,22 @@ describe("stampedBuild (what ensureGussetEngine runs around cargo)", () => {
 describe("path dependencies outside the repository", () => {
   it("a refused input surfaces as one lane-env line and exit 1, not a stack", () => {
     const f = fixture();
-    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), '[dependencies]\nevil = { path = "../../../evil" }\n');
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), '[workspace]\n[dependencies]\nevil = { path = "../../../evil" }\n');
     git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "evil dep");
     const r = spawnSync(process.execPath, [path.join(f.lane, "scripts/lane-env.mjs"), "--check"], { cwd: f.lane, encoding: "utf8", env: GIT_ENV });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /^lane-env: .*path dependency[^\n]*\n$/);
   });
+  it("a refused input names the escape hatch", () => {
+    const f = fixture();
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), '[workspace]\n[dependencies]\nevil = { path = "../../../evil" }\n');
+    git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "evil dep");
+    const r = spawnSync(process.execPath, [path.join(f.lane, "scripts/lane-env.mjs"), "--check"], { cwd: f.lane, encoding: "utf8", env: GIT_ENV });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Cargo\.toml:\d+ has a path dependency[^\n]*--engine-dir <dir> or DEVCOUNCIL_GUSSET_ENGINE_DIR=<dir>/);
+  });
   const commitManifest = (f, toml) => {
-    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), toml);
+    put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"), `[workspace]\n${toml}`);
     git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "manifest");
   };
   const GUSSET = '[dependencies.gusset_core]\npath = "../../../gusset/crates/gusset"\n';
@@ -360,7 +369,7 @@ describe("path dependencies outside the repository", () => {
   it("are refused unless they are under the sibling gusset", () => {
     const f = fixture();
     put(path.join(f.lane, "rust/gusset-engine/Cargo.toml"),
-      '[dependencies]\ngusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }\nevil = { path = "../../../evil" }\n');
+      '[workspace]\n\n[dependencies]\ngusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }\nevil = { path = "../../../evil" }\n');
     git(f.lane, "add", "."); git(f.lane, "commit", "-qm", "evil dep");
     assert.throws(() => plan(f.lane, { scriptDir: f.scripts(f.lane), env: { ...process.env, CGO_LDFLAGS: "" } }),
       /path dependency \.\.\/\.\.\/\.\.\/evil outside the repository and outside/);

@@ -150,7 +150,9 @@ export function chooseEngine(loc, { engineDir, env, gusset }) {
     try {
       inputs = engineInputs(loc.root, gusset);
     } catch (e) {
-      throw e instanceof InputError ? new LaneError(e.message) : e;
+      throw e instanceof InputError
+        ? new LaneError(`${e.message}. To link an archive without this check: --engine-dir <dir> or DEVCOUNCIL_GUSSET_ENGINE_DIR=<dir> (stamp NOT checked, with a warning)`)
+        : e;
     }
     const build =
       `build one in the lane: rust/gusset-engine/cgo-env.sh --export (from ${loc.root}; cargo resolves the sibling gusset relative to the checkout, so this needs GUSSET_DIR-compatible layout); ` +

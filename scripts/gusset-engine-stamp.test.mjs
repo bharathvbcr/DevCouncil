@@ -31,7 +31,7 @@ const WORKSPACE = '[workspace]\nmembers = ["dc-glob"]\n\n[workspace.package]\nve
 const DC_GLOB = '[package]\nname = "dc-glob"\nversion.workspace = true\nlicense.workspace = true\n\n[lints]\nworkspace = true\n';
 
 /** A repository with rust/Cargo.toml (the workspace root), rust/dc-glob (a member), the engine (its own workspace), and a sibling gusset. */
-function fixture(engineToml = `[workspace]\n\n[dependencies]\n${GUSSET}dc-glob = { path = "../dc-glob" }\n`) {
+function fixture(engineToml = `[dependencies]\n${GUSSET}dc-glob = { path = "../dc-glob" }\n`, { outer = false } = {}) {
   const top = realpathSync(mkdtempSync(path.join(tmpdir(), "engine-stamp-")));
   roots.push(top);
   const gusset = path.join(top, "gusset");
@@ -44,7 +44,8 @@ function fixture(engineToml = `[workspace]\n\n[dependencies]\n${GUSSET}dc-glob =
   put(path.join(repo, "rust/Cargo.toml"), WORKSPACE);
   put(path.join(repo, "rust/dc-glob/Cargo.toml"), DC_GLOB);
   put(path.join(repo, "rust/dc-glob/src/lib.rs"), "// glob\n");
-  put(path.join(repo, "rust/gusset-engine/Cargo.toml"), engineToml);
+  put(path.join(repo, "rust/gusset-engine/Cargo.toml"), outer ? engineToml : `${engineToml}\n[workspace]\n`);
+  put(path.join(repo, "rust/gusset-engine/Cargo.lock"), "# lock\n");
   put(path.join(repo, "rust/gusset-engine/src/lib.rs"), "// engine\n");
   put(path.join(repo, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.100"\n');
   git(repo, "add", "."); git(repo, "commit", "-qm", "m");
@@ -78,7 +79,6 @@ describe("manifest path forms that escape the repository are refused, never skip
   it("a path key outside every table the stamp classifies is refused by name", () => {
     for (const toml of [
       `[dependencies]\n${GUSSET}[features]\npath = []\n`,
-      `[dependencies]\n${GUSSET}[package.metadata.x]\npath = "../../../evil"\n`,
       `[dependencies]\n${GUSSET}[unknown-table]\nthing = { path = "../../../evil" }\n`,
     ]) {
       refused(fixture(toml), /path .*not in a table the engine stamp classifies/, toml);
@@ -164,4 +164,73 @@ describe("inherited workspace keys are inputs", () => {
     commit(f, "rust/dc-glob/Cargo.toml", `${DC_GLOB}\n[dependencies]\nmissing.workspace = true\n`);
     refused(f, /missing.*not declared in .*workspace\.dependencies/, "undeclared");
   });
+});
+
+describe("workspace members and the engine's own workspace root", () => {
+  const OUTSIDE = /\[workspace\] (members|default-members|exclude) entry .* resolves outside the crate directory/;
+  it("members, default-members and exclude outside the crate directory are refused (literal and glob)", () => {
+    for (const ws of [
+      'members = ["../evil"]',
+      'members = ["."]\ndefault-members = [".", "../evil"]',
+      'exclude = ["../evil"]',
+      'members = ["../*"]',
+      'members = ["../../../evil/crates/*"]',
+    ]) {
+      refused(fixture(`[dependencies]\n${GUSSET}[workspace]\n${ws}\n`, { outer: true }), OUTSIDE, ws);
+    }
+  });
+  it("members that stay inside the crate, or an empty [workspace], are fine; a non-list is refused", () => {
+    for (const ws of ["", 'members = ["."]', 'members = ["sub/*", "tools/x"]', "members = []"]) {
+      assert.ok("rust/gusset-engine" in inputs(fixture(`[dependencies]\n${GUSSET}[workspace]\n${ws}\n`, { outer: true })).stamp.trees, ws);
+    }
+    refused(fixture(`[dependencies]\n${GUSSET}[workspace]\nmembers = "x"\n`, { outer: true }), /members is not a list of strings/, "string");
+  });
+  it("an engine without its own [workspace] is refused: an outer root's patch, profile and lockfile are invisible", () => {
+    for (const toml of [
+      `[package]\nworkspace = ".."\n[dependencies]\n${GUSSET}`,
+      `[package]\nname = "e"\n[dependencies]\n${GUSSET}`,
+    ]) {
+      refused(fixture(toml, { outer: true }), /must declare its own \[workspace\]/, toml);
+    }
+  });
+  it("an engine without a Cargo.lock in its directory is refused", () => {
+    const f = fixture();
+    git(f.repo, "rm", "-q", "rust/gusset-engine/Cargo.lock");
+    git(f.repo, "commit", "-qm", "rm lock");
+    refused(f, /Cargo\.lock is missing/, "lock");
+  });
+});
+
+describe("manifest spellings cargo accepts", () => {
+  it("a BOM, space-separated datetimes, the \\e escape and path under [package.metadata] are not refusals", () => {
+    const f = fixture(`\uFEFF[package]\nname = "e"\nwhen = 1979-05-27 07:32:00Z\nesc = "a\\e[0m"\nd = 1979-05-27\n[package.metadata.x]\npath = "../../../evil"\n[dependencies]\n${GUSSET}dc-glob = { path = "../dc-glob" }\n`);
+    assert.ok("rust/dc-glob" in inputs(f).stamp.trees);
+  });
+});
+
+describe("refusals say where, and the line names a way out", () => {
+  it("an unclassified path names file:line", () => {
+    refused(fixture(`[dependencies]\n${GUSSET}\n[unknown]\nx = { path = "../../../evil" }\n`), /rust\/gusset-engine\/Cargo\.toml:\d+: a path key at unknown\.x /, "line");
+  });
+  it("a dependency and a target path name file:line", () => {
+    refused(fixture(`[dependencies]\n${GUSSET}evil = { path = "../../../evil" }\n`), /Cargo\.toml:3 has a path dependency/, "dep line");
+    refused(fixture(`[dependencies]\n${GUSSET}[lib]\npath = "../x.rs"\n`), /Cargo\.toml:3 \[lib\] path/, "target line");
+  });
+});
+
+describe("every inherited key form is an input", () => {
+  const cases = {
+    "edition.workspace": '[package]\nname = "dc-glob"\nedition.workspace = true\n',
+    "table-form [package.rust-version]": '[package]\nname = "dc-glob"\n\n[package.rust-version]\nworkspace = true\n',
+    "[lints] workspace": '[package]\nname = "dc-glob"\n\n[lints]\nworkspace = true\n',
+    "a workspace dependency with features": '[package]\nname = "dc-glob"\n\n[dependencies]\nserde = { workspace = true, features = ["derive"] }\n',
+  };
+  for (const [name, toml] of Object.entries(cases)) {
+    it(name, () => {
+      const f = fixture();
+      commit(f, "rust/Cargo.toml", `${WORKSPACE}\n[workspace.dependencies]\nserde = "1"\n`);
+      commit(f, "rust/dc-glob/Cargo.toml", toml);
+      assert.ok("rust/Cargo.toml" in inputs(f).stamp.trees, name);
+    });
+  }
 });
