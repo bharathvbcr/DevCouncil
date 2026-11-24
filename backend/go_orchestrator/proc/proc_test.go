@@ -136,7 +136,7 @@ func unboundedCmdRuns(filename string, src []byte) ([]string, error) {
 		}
 		if call, ok := n.(*ast.CallExpr); ok && len(call.Args) == 0 {
 			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
-				if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "cmd" && !boundedByClosure(stack, isBound) {
+				if isCmdReceiver(sel.X) && !boundedByClosure(stack, isBound) {
 					line := fset.Position(call.Pos()).Line
 					offenders = append(offenders, filename+":"+strings.TrimSpace(lines[line-1])+" (line "+itoa(line)+")")
 				}
@@ -146,6 +146,18 @@ func unboundedCmdRuns(filename string, src []byte) ([]string, error) {
 		return true
 	})
 	return offenders, nil
+}
+
+// isCmdReceiver reports whether x is the identifier cmd or a selector chain
+// whose final name is cmd (s.cmd, a.b.cmd), which the old text scan also matched.
+func isCmdReceiver(x ast.Expr) bool {
+	switch r := x.(type) {
+	case *ast.Ident:
+		return r.Name == "cmd"
+	case *ast.SelectorExpr:
+		return r.Sel.Name == "cmd"
+	}
+	return false
 }
 
 // boundedByClosure reports whether the innermost func literal around the
@@ -186,6 +198,9 @@ func TestUnboundedCmdRunsScanner(t *testing.T) {
 		{"assigned closure is still flagged", "g := func() error { return cmd.Run() }\nreturn g()\n", 1},
 		{"closure passed to another call is flagged", "return other(ctx, func() error { return cmd.Run() })\n", 1},
 		{"goroutine inside a bounded closure is flagged", "RunBounded(ctx, func() error {\ngo func() { _ = cmd.Run() }()\nreturn nil\n})\nreturn nil\n", 1},
+		{"field receiver s.cmd.Run() is flagged", "return s.cmd.Run()\n", 1},
+		{"nested field receiver a.b.cmd.Run() is flagged", "return a.b.cmd.Run()\n", 1},
+		{"field receiver bounded by a closure is accepted", "err, _ := proc.RunBounded(ctx, func() error { return s.cmd.Run() })\nreturn err\n", 0},
 		{"named function passed to RunBounded is flagged", "NAMED", 1},
 		{"line comment is ignored", "// return cmd.Run()\nreturn nil\n", 0},
 		{"block comment and string are ignored", "/* cmd.Run() */\ns := \"cmd.Run()\"\n_ = s\nreturn nil\n", 0},
