@@ -72,3 +72,20 @@ func TestProbeThatCouldNotStartIsNotRunNeverOK(t *testing.T) {
 		}
 	}
 }
+
+// The probe's frames must be byte-stable. json/v2 orders map keys randomly
+// unless told otherwise, which put `"id":2}` on the wire in about one run in
+// eight and left the fake servers (which match `"id":2,`) silent until the
+// probe's budget ran out.
+func TestProbeFramesAreByteStable(t *testing.T) {
+	want := `{"id":2,"jsonrpc":"2.0","method":"tools/list"}` + "\n"
+	for i := 0; i < 500; i++ {
+		var buf strings.Builder
+		if err := sendFrame(&buf, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}); err != nil {
+			t.Fatal(err)
+		}
+		if buf.String() != want {
+			t.Fatalf("frame %d = %q, want %q", i, buf.String(), want)
+		}
+	}
+}

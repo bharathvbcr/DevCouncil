@@ -191,8 +191,12 @@ func probeMCPServer(parent context.Context, spec mcpServerSpec, budget time.Dura
 	return report
 }
 
+// sendFrame writes one JSON-RPC frame. Map keys are sorted: encoding/json/v2
+// otherwise emits them in Go's random map order, so the same frame reached the
+// server as `"id":2,` or `"id":2}` depending on the run, and a server that
+// matches the id by its bytes (the shell fakes in the tests) missed it.
 func sendFrame(w io.Writer, frame map[string]any) error {
-	data, err := json.Marshal(frame)
+	data, err := json.Marshal(frame, json.Deterministic(true))
 	if err != nil {
 		return err
 	}
