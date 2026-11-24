@@ -295,8 +295,15 @@ fn m5_one_over_the_record_cap_is_degraded_not_clean() {
     body.push_str("use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n");
     let (took, r) = timed(&body);
     eprintln!("cap+1: {took:?} reasons={:?}", reasons(&r));
-    // 50_001 records: either the walk resolved and blocked or it degraded.
-    assert!(blocked(&r) || reasons(&r) == vec!["alias-walk-budget"]);
+    // 50_001 records: either the walk resolved and blocked or it degraded. On a
+    // slow runner the parse of this ~1 MB file can pass `PARSE_BUDGET` (2 s)
+    // before the walk runs; that also leaves it unparsed, never clean.
+    let over_budget = dc_verify::stub_ast::Unparsed::OverBudget.as_str();
+    let reasons = reasons(&r);
+    assert!(
+        blocked(&r) || reasons == vec!["alias-walk-budget"] || reasons == vec![over_budget],
+        "neither blocked nor stopped by a budget: {reasons:?}"
+    );
 }
 
 #[test]
