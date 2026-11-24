@@ -145,6 +145,7 @@ func blobOf(t *testing.T, root, body string) string {
 	t.Helper()
 	cmd := exec.Command(testsupport.Tool(t, "git"), "hash-object", "-w", "--stdin")
 	cmd.Dir = root
+	cmd.Env = testGitEnv()
 	cmd.Stdin = strings.NewReader(body)
 	out, err := cmd.Output()
 	if err != nil {

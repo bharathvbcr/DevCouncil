@@ -54,6 +54,9 @@ CREATE INDEX IF NOT EXISTS idx_delta_edges_source ON delta_edges(source_symbol);
 CREATE INDEX IF NOT EXISTS idx_delta_edges_target ON delta_edges(target_symbol);
 "#;
 
+/// The tables [`DELTA_SCHEMA_DDL`] creates; a read-only open counts them.
+const DELTA_TABLE_COUNT: i64 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaFileRecord {
     pub path: String,
@@ -210,11 +213,22 @@ impl DeltaStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .with_context(|| format!("cannot open delta store {}", path.display()))?;
         Self::configure(&conn)?;
-        conn.execute_batch(DELTA_SCHEMA_DDL)
-            .with_context(|| format!("cannot initialize delta schema at {}", path.display()))?;
+        // One transaction, so a reader that opens while the file is being
+        // created sees either no delta tables or all of them, never some: each
+        // statement of the batch would otherwise commit on its own, and a reader
+        // between two of them would find `delta_files` but not `delta_edges`.
+        // Deferred, so reopening a delta whose schema exists still takes no
+        // write lock: every statement is then an `IF NOT EXISTS` no-op.
+        let schema = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .and_then(|tx| {
+                tx.execute_batch(DELTA_SCHEMA_DDL)?;
+                tx.commit()
+            });
+        schema.with_context(|| format!("cannot initialize delta schema at {}", path.display()))?;
         Ok(Self {
             conn: Mutex::new(conn),
             path,
@@ -281,44 +295,62 @@ impl DeltaStore {
         .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         conn.busy_timeout(wait.max(Duration::from_millis(1)))?;
-        // SQLite opens lazily: read now, so a refusal is reported here.
-        conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(|err| {
-            let code = match &err {
-                rusqlite::Error::SqliteFailure(e, _) => Some(*e),
-                _ => None,
-            };
-            let why = match code {
-                Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
-                    "an interrupted writer left a hot rollback journal that a read-only open \
+        // SQLite opens lazily: read now, so a refusal is reported here. The read
+        // is the delta tables that exist, which also says whether a writer has
+        // committed the schema yet.
+        let tables = conn
+            .prepare(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+                 ('delta_files', 'delta_symbols', 'delta_edges')",
+            )
+            .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
+            .map_err(|err| {
+                let code = match &err {
+                    rusqlite::Error::SqliteFailure(e, _) => Some(*e),
+                    _ => None,
+                };
+                let why = match code {
+                    Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
+                        "an interrupted writer left a hot rollback journal that a read-only open \
                          cannot roll back; run `devmap seed --sync-delta`"
-                }
-                Some(e)
-                    if matches!(
-                        e.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) =>
-                {
-                    "another process holds a write lock on it; wait for that writer (often a \
+                    }
+                    Some(e)
+                        if matches!(
+                            e.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) =>
+                    {
+                        "another process holds a write lock on it; wait for that writer (often a \
                          running `devmap seed --sync-delta`) to finish and retry"
-                }
-                Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
-                    "a WAL-mode delta from an earlier build in a read-only state directory is \
+                    }
+                    Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
+                        "a WAL-mode delta from an earlier build in a read-only state directory is \
                          unreadable, not empty"
-                }
-                _ => "the database could not be read",
-            };
-            anyhow::Error::new(err).context(format!(
-                "delta store {} cannot be read ({why})",
+                    }
+                    _ => "the database could not be read",
+                };
+                anyhow::Error::new(err).context(format!(
+                    "delta store {} cannot be read ({why})",
+                    path.display()
+                ))
+            })?;
+        match tables {
+            // A writer has created the file but not yet committed the schema, so
+            // nothing has been written to it: that is no delta, as a missing
+            // file is, not a store whose first query fails.
+            0 => Ok(None),
+            DELTA_TABLE_COUNT => Ok(Some(Self {
+                conn: Mutex::new(conn),
+                path,
+            })),
+            // The schema is created in one transaction, so only damage or a
+            // build older than that leaves part of it.
+            found => bail!(
+                "delta store {} cannot be read: it has {found} of the {DELTA_TABLE_COUNT} delta \
+                 tables, so its schema is incomplete; run `devmap seed --sync-delta`",
                 path.display()
-            ))
-        })?;
-        Ok(Some(Self {
-            conn: Mutex::new(conn),
-            path,
-        }))
+            ),
+        }
     }
 
     pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
@@ -656,6 +688,84 @@ mod tests {
             .unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
         (dir, path, holder)
+    }
+
+    /// A reader that opens between a writer creating `delta.sqlite` and
+    /// committing its schema finds no delta tables. Nothing has been written,
+    /// so that is no delta, as a missing file is; before this the open returned
+    /// a store whose first read failed with "no such table: delta_files"
+    /// (`a3_sync_delta_racing_a_reader_never_refuses_or_serves_a_torn_delta`).
+    #[test]
+    fn a_delta_whose_schema_is_not_committed_yet_reads_as_no_delta() {
+        let dir = temp_dir("schema-not-committed");
+        let path = dir.join("delta.sqlite");
+        // What a writer leaves before its schema commits: the file exists and
+        // holds no table.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 0;")
+            .unwrap();
+        assert!(path.is_file());
+        match DeltaStore::open_read_only(&path) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a delta with no tables opened as a store"),
+            Err(error) => panic!("an uncommitted delta was refused: {error:#}"),
+        }
+        // Not a permanent state: the next writer open (every `seed --sync-delta`
+        // goes through `DeltaStore::open`) creates the schema in this same file,
+        // and the delta then reads as a store.
+        let writer = DeltaStore::open(&path).unwrap();
+        writer
+            .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+            .unwrap();
+        drop(writer);
+        let healed = DeltaStore::open_read_only(&path)
+            .unwrap()
+            .expect("a writer's open heals a schema-less delta");
+        assert_eq!(healed.dirty_file_count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Part of the schema is never served as a delta: its first read would fail.
+    /// The writer creates the schema in one transaction, so only damage or an
+    /// older build leaves this, and the open says so.
+    #[test]
+    fn a_delta_with_part_of_its_schema_is_refused_by_name() {
+        let dir = temp_dir("schema-partial");
+        let path = dir.join("delta.sqlite");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE delta_files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, \
+                 tombstoned INTEGER NOT NULL, extraction_json TEXT, updated_at_ms INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let error = match DeltaStore::open_read_only(&path) {
+            Ok(None) => panic!("a delta with a table was read as no delta"),
+            Ok(Some(_)) => {
+                panic!("a delta missing delta_symbols and delta_edges opened as a store")
+            }
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("1 of the 3 delta tables") && text.contains("seed --sync-delta"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The schema a writer creates is whole: a fresh delta reads as a store.
+    #[test]
+    fn a_freshly_created_delta_reads_as_an_empty_store() {
+        let dir = temp_dir("schema-fresh");
+        let path = dir.join("delta.sqlite");
+        drop(DeltaStore::open(&path).unwrap());
+        let reader = DeltaStore::open_read_only(&path)
+            .unwrap()
+            .expect("a created delta is a store");
+        assert_eq!(reader.dirty_file_count().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A reader with a caller-supplied bound gives up on a writer that outlasts

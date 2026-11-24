@@ -5650,15 +5650,30 @@ mod tests {
             eventually(|| lane.builds_started() >= 1),
             "no seeded build started"
         );
+        // Every hook has returned (the scope joined) and the first build is
+        // held on `release`: a second builder spawned beside it would have
+        // started by now. Coalescing means exactly one runs at a time.
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            lane.builds_started(),
+            1,
+            "the lock did not coalesce the seeds: a second builder ran beside the first"
+        );
         fs::write(&lane.release, b"").unwrap();
         assert!(
             eventually(|| !lane.lock().exists()),
             "the lock outlived its build"
         );
-        assert_eq!(
-            lane.builds_started(),
-            1,
-            "the lock did not coalesce the seeds"
+        // The builder clears the dirty marker before its run starts, so a hook
+        // that reached `acquire_or_mark_dirty` after that point left a fresh
+        // marker and earns exactly one trailing rerun (its edit may have missed
+        // the snapshot). Whether a thread lands there depends on spawn latency,
+        // which is why this was 1 on a fast runner and 2 under load. Sixteen
+        // seeds still start at most one build plus one rerun.
+        let started = lane.builds_started();
+        assert!(
+            (1..=2).contains(&started),
+            "sixteen seeds started {started} builds; coalescing allows one plus one trailing rerun"
         );
     }
 
