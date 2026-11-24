@@ -88,3 +88,25 @@ pub fn bounded_git(
 pub fn dirty_state(program: &OsStr, repo: &Path, bound: Duration) -> Option<bool> {
     bounded_git(program, repo, &["status", "--porcelain"], bound).map(|text| !text.is_empty())
 }
+
+/// The `DEVMAP_GIT_DIRTY` value: `"1"`, `"0"`, or `"unknown"` when the state
+/// could not be read. Consumers must treat anything but `"0"` as possibly dirty.
+pub fn dirty_env(dirty: Option<bool>) -> &'static str {
+    match dirty {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => "unknown",
+    }
+}
+
+/// The embedded build id. Outside a git checkout there is no hash and the id is
+/// plain `unknown` (a suffix would be noise); otherwise an unreadable dirty
+/// state is named `-dirty-unknown` rather than guessed clean.
+pub fn build_id(hash: Option<&str>, dirty: Option<bool>) -> String {
+    match (hash, dirty) {
+        (None, _) => "unknown".to_string(),
+        (Some(hash), Some(true)) => format!("{hash}-dirty"),
+        (Some(hash), Some(false)) => hash.to_string(),
+        (Some(hash), None) => format!("{hash}-dirty-unknown"),
+    }
+}

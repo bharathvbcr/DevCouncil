@@ -130,6 +130,7 @@ mod test_socket_path;
 mod test_store;
 mod test_stress;
 mod test_workspace;
+#[cfg(unix)]
 mod the_build_script_bounds_its_git_reads;
 mod the_churn_window_is_an_artifact_input;
 mod the_cli_envelope_names_its_repository;

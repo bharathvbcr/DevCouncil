@@ -107,3 +107,29 @@ fn output_larger_than_a_pipe_buffer_is_read_in_full() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.expect("answered").len() >= 999_000);
 }
+
+#[test]
+fn the_dirty_env_names_the_unknown_state() {
+    assert_eq!(build_git::dirty_env(Some(false)), "0");
+    assert_eq!(build_git::dirty_env(Some(true)), "1");
+    assert_eq!(build_git::dirty_env(None), "unknown");
+}
+
+#[test]
+fn the_build_id_names_what_was_and_was_not_read() {
+    assert_eq!(build_git::build_id(Some("abc"), Some(false)), "abc");
+    assert_eq!(build_git::build_id(Some("abc"), Some(true)), "abc-dirty");
+    assert_eq!(build_git::build_id(Some("abc"), None), "abc-dirty-unknown");
+    // Outside a git checkout (git exits 128) there is no hash: the id stays
+    // "unknown", with no dirty suffix.
+    assert_eq!(build_git::build_id(None, None), "unknown");
+    let (dir, no_repo) = fake_git("norepo", "exit 128");
+    let hash = build_git::bounded_git(
+        &OsString::from(&no_repo),
+        Path::new("."),
+        &["rev-parse", "HEAD"],
+        Duration::from_secs(5),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(build_git::build_id(hash.as_deref(), None), "unknown");
+}

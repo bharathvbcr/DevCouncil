@@ -6,7 +6,7 @@
 
 mod build_git;
 
-use build_git::{bounded_git, dirty_state, GIT_BOUND};
+use build_git::{bounded_git, build_id, dirty_env, dirty_state, GIT_BOUND};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,22 +24,22 @@ fn main() {
     );
 
     let git = OsStr::new("git");
-    let git_hash = bounded_git(git, &repo, &["rev-parse", "--short=12", "HEAD"], GIT_BOUND)
-        .unwrap_or_else(|| "unknown".to_string());
+    let hash = bounded_git(git, &repo, &["rev-parse", "--short=12", "HEAD"], GIT_BOUND);
     // `None` is "could not be read in time" (a hung fsmonitor daemon, say), which
-    // is not the same claim as clean: the id says so rather than guessing.
-    let dirty = dirty_state(git, &repo, GIT_BOUND);
-    let build_id = match dirty {
-        Some(true) => format!("{git_hash}-dirty"),
-        Some(false) => git_hash.clone(),
-        None => format!("{git_hash}-dirty-unknown"),
+    // is not the same claim as clean. With no hash there is no checkout to be
+    // dirty or clean, so the state is unknown too.
+    let dirty = match hash {
+        Some(_) => dirty_state(git, &repo, GIT_BOUND),
+        None => None,
     };
+    let build_id = build_id(hash.as_deref(), dirty);
+    let git_hash = hash.unwrap_or_else(|| "unknown".to_string());
     let build_time = unix_utc();
 
     println!("cargo:rustc-env=DEVMAP_GIT_HASH={git_hash}");
     println!(
         "cargo:rustc-env=DEVMAP_GIT_DIRTY={}",
-        if dirty == Some(true) { "1" } else { "0" }
+        dirty_env(dirty)
     );
     println!("cargo:rustc-env=DEVMAP_BUILD_TIME={build_time}");
     println!("cargo:rustc-env=DEVMAP_BUILD_ID={build_id}");
