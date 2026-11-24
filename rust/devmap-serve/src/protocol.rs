@@ -4351,6 +4351,7 @@ mod tests {
 
     /// Lays an enclosing repository with a healthy HEAD above `root`, so a walk
     /// that steps over `root`'s own broken `.git` is told apart from one that stops.
+    #[cfg(unix)]
     fn healthy_enclosing_repo(root: &std::path::Path) {
         let enclosing = root.parent().unwrap().join(".git");
         std::fs::create_dir_all(&enclosing).unwrap();

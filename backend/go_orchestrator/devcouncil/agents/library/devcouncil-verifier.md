@@ -29,6 +29,8 @@ Report the blocking gaps effective under the current mode, whether the changed c
 
 **Say which checks ran.** A check that could not run must never be reported the same way as a check that ran and passed — name it and say why it was skipped. That applies to these two tools as well: when DevMap or GitPulse could not answer, record the gap and report it as a gap rather than falling back to grep and presenting the result as confirmed.
 
+If the `devcouncil_*` MCP tools are absent (a cloud session has none), say so, then use the `devcouncil` CLI (`dev tool call ...`) if it is on PATH, otherwise source inspection. Never claim a lease, checkout or verification happened when it did not.
+
 ## On this host
 
 Where the instructions name `Read`, `Edit`, `Write`, `Grep`, `Glob`, or `Bash`, use this host's file and shell tools.

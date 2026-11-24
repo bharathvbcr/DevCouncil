@@ -1586,7 +1586,9 @@ fn render_skeleton_context(root: &Path, absolute: &Path, budget: Duration) -> Op
     if budget.is_zero() {
         return None;
     }
-    let hook_store = HookStore::open(root).ok().flatten()?;
+    let hook_store = HookStore::open(root, budget.saturating_sub(started.elapsed()))
+        .ok()
+        .flatten()?;
     if started.elapsed() >= budget {
         return None;
     }
@@ -1680,7 +1682,7 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
     if !has_store {
         return None;
     }
-    let hook_store = match HookStore::open(root) {
+    let hook_store = match HookStore::open(root, budget.saturating_sub(started.elapsed())) {
         Ok(Some(hook_store)) => hook_store,
         Ok(None) => {
             return Some(
@@ -1688,7 +1690,17 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
                     .into(),
             );
         }
-        Err(reason) => {
+        // A writer held the delta past the budget: the delta was never looked
+        // at, which is not an empty or clean blast.
+        Err(HookOpenError::DeltaBusy) => {
+            return Some(
+                "DevMap blast: could not look (delta busy): another process holds the stacked \
+                 delta's write lock (often a running `devmap seed --sync-delta`) past the hook \
+                 budget; this is not an empty or clean result, so no blast was computed."
+                    .into(),
+            );
+        }
+        Err(HookOpenError::Other(reason)) => {
             return Some(format!(
                 "DevMap blast: the stacked index could not be opened ({reason}); \
                  list is empty because the store was unavailable."
@@ -1988,11 +2000,22 @@ enum HookStore {
     Stacked(Box<devmap_query::StackedStore>),
 }
 
+/// Why [`HookStore::open`] could not give a store.
+#[derive(Debug, PartialEq, Eq)]
+enum HookOpenError {
+    /// The stacked delta was locked by a writer for the whole wait: not looked
+    /// at, reported as such, never as an empty delta.
+    DeltaBusy,
+    Other(String),
+}
+
 impl HookStore {
     /// `Ok(None)`: nothing is stored here. `Err`: a lane's lease exists but its
     /// store cannot be opened; the text names the recovery command, so the hook
-    /// can say why instead of "could not be opened".
-    fn open(root: &Path) -> Result<Option<Self>, String> {
+    /// can say why instead of "could not be opened". `wait` is what is left of
+    /// the hook's budget: a stacked lane's delta is waited for at most that long
+    /// and a writer that outlasts it is [`HookOpenError::DeltaBusy`].
+    fn open(root: &Path, wait: Duration) -> Result<Option<Self>, HookOpenError> {
         let plain = [
             root.join(".devcouncil/codeintel/devmap.sqlite"),
             root.join(".devmap/codeintel/devmap.sqlite"),
@@ -2004,9 +2027,15 @@ impl HookStore {
                 .ok()
                 .map(|store| Self::Plain(Box::new(store))));
         }
-        devmap_query::StackedStore::open_if_leased(root)
+        devmap_query::StackedStore::open_if_leased_within(root, wait)
             .map(|opened| opened.map(|stacked| Self::Stacked(Box::new(stacked))))
-            .map_err(|err| format!("{err:#}"))
+            .map_err(|err| {
+                if err.downcast_ref::<devmap_store::DeltaBusy>().is_some() {
+                    HookOpenError::DeltaBusy
+                } else {
+                    HookOpenError::Other(format!("{err:#}"))
+                }
+            })
     }
 
     fn store(&self) -> &devmap_store::Store {
@@ -3725,9 +3754,23 @@ pub(crate) fn canonical_hook_executable_with_seed(
 struct SpawnOptions {
     /// Wait this long (whole seconds, rounded up) before the first run, holding
     /// the lock meanwhile, so triggers arriving in the wait coalesce onto it.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "Windows has no shell to delay or loop in; see spawn_detached_with"
+        )
+    )]
     delay: Option<Duration>,
     /// Run again when [`BUILD_DIRTY_MARKER`] reappears during a run: up to
     /// [`MAX_TRAILING_RUNS`] reruns per build, never an unbounded loop.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "Windows has no shell to delay or loop in; see spawn_detached_with"
+        )
+    )]
     rerun_when_dirty: bool,
 }
 
@@ -5175,8 +5218,10 @@ mod tests {
 
     // ---- SessionStart catching an index up to a tree that has moved ----------------
 
+    #[cfg(unix)]
     const DRIFTED_BY_SOURCE: &str = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
         "source_freshness":false,"pending_count":0,"generation_id":7,"node_count":3,"edge_count":2}"#;
+    #[cfg(unix)]
     const DRIFTED_BY_PENDING_EDITS: &str = r#"{"query_ready":true,"rebuild_required":false,"is_fresh":false,
         "source_freshness":true,"pending_count":4,"generation_id":7,"node_count":3,"edge_count":2}"#;
 
@@ -5636,15 +5681,30 @@ mod tests {
             eventually(|| lane.builds_started() >= 1),
             "no seeded build started"
         );
+        // Every hook has returned (the scope joined) and the first build is
+        // held on `release`: a second builder spawned beside it would have
+        // started by now. Coalescing means exactly one runs at a time.
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            lane.builds_started(),
+            1,
+            "the lock did not coalesce the seeds: a second builder ran beside the first"
+        );
         fs::write(&lane.release, b"").unwrap();
         assert!(
             eventually(|| !lane.lock().exists()),
             "the lock outlived its build"
         );
-        assert_eq!(
-            lane.builds_started(),
-            1,
-            "the lock did not coalesce the seeds"
+        // The builder clears the dirty marker before its run starts, so a hook
+        // that reached `acquire_or_mark_dirty` after that point left a fresh
+        // marker and earns exactly one trailing rerun (its edit may have missed
+        // the snapshot). Whether a thread lands there depends on spawn latency,
+        // which is why this was 1 on a fast runner and 2 under load. Sixteen
+        // seeds still start at most one build plus one rerun.
+        let started = lane.builds_started();
+        assert!(
+            (1..=2).contains(&started),
+            "sixteen seeds started {started} builds; coalescing allows one plus one trailing rerun"
         );
     }
 
@@ -9547,6 +9607,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A writer holding the lane's delta past the hook's budget is "could not
+    /// look (delta busy)", within the budget: never an empty or clean blast, and
+    /// never the generic "could not be opened" (card ft-983bd7bc).
+    #[test]
+    fn a_busy_delta_is_could_not_look_not_a_clean_blast() {
+        let (base, _main, lane) = stacked_lane_fixture("stacked-busy-delta");
+        let delta_path = devmap_extract::paths::stack_delta_path(lane.canonicalize().unwrap());
+        {
+            let delta = devmap_store::DeltaStore::open(&delta_path).unwrap();
+            delta.tombstone_file("gone.rs", "CAS_TOMBSTONE", 1).unwrap();
+        }
+        let holder = rusqlite::Connection::open(&delta_path).unwrap();
+        let _: String = holder
+            .query_row("PRAGMA locking_mode=EXCLUSIVE", [], |r| r.get(0))
+            .unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let opened = HookStore::open(&lane, Duration::from_millis(50));
+        assert!(
+            matches!(opened, Err(HookOpenError::DeltaBusy)),
+            "a delta held past the budget must be typed busy"
+        );
+        let payload = json!({"file_path": lane.join("lib.rs").to_str().unwrap()});
+        let started = Instant::now();
+        let note = compose_write_blast(&lane, &payload, POST_TOOL_BLAST_BUDGET)
+            .expect("a busy delta must still speak");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(3),
+            "the hook waited {took:?} for a writer (budget {POST_TOOL_BLAST_BUDGET:?})"
+        );
+        assert!(note.contains("could not look (delta busy)"), "{note}");
+        assert!(!note.contains("impacted:"), "no blast was computed: {note}");
+        assert!(
+            !note.contains("list is empty because"),
+            "busy must not read as an empty list: {note}"
+        );
+        holder.execute_batch("ROLLBACK;").unwrap();
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The hook only reads: with the store a materialize placed and a lease
     /// that outlived it, its open answers from the store and deletes nothing.
     #[test]
@@ -9562,7 +9664,7 @@ mod tests {
         // The interrupted state: the store is placed, the lease is back.
         std::fs::write(&lease_path, &lease_bytes).unwrap();
         assert!(matches!(
-            HookStore::open(&lane),
+            HookStore::open(&lane, Duration::from_secs(10)),
             Ok(Some(HookStore::Plain(_)))
         ));
         assert!(lease_path.is_file(), "the hook's read left the lease alone");

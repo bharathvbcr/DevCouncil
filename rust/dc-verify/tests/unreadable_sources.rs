@@ -33,6 +33,7 @@ impl Root {
 impl Drop for Root {
     fn drop(&mut self) {
         // A test may leave a file it made unreadable.
+        #[cfg(unix)]
         let _ = std::fs::set_permissions(
             self.0.join("src/a.rs"),
             std::os::unix::fs::PermissionsExt::from_mode(0o644),
@@ -113,6 +114,7 @@ fn no_root_is_degraded() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_source_is_degraded_as_outside_the_tree() {
     let root = Root::new();
@@ -125,6 +127,7 @@ fn a_symlinked_source_is_degraded_as_outside_the_tree() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_parent_directory_is_degraded_as_outside_the_tree() {
     let root = Root::new();
@@ -173,6 +176,7 @@ fn a_fifo_where_the_source_should_be_is_degraded_without_being_opened() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_source_is_degraded() {
     let root = Root::new();

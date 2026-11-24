@@ -33,7 +33,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 mod support_ignored;
 
+/// Cycles run at least. Whether a cycle's query lands inside the window (the
+/// daemon has noticed the edit, has not yet published the rebuild) depends on
+/// how fast the host rebuilds relative to the sampling, so the run continues
+/// past this until [`MIN_WINDOW_SAMPLES`] cycles have measured the window.
 const CYCLES: usize = 20;
+/// Cycles whose query saw the tree differing before and after, under one
+/// unchanged generation: the only samples that can catch a `true` lie.
+const MIN_WINDOW_SAMPLES: usize = 5;
+/// Bound on the extra cycles. A host that never produces the window in this
+/// many tries fails the self-check below instead of passing unmeasured.
+const MAX_CYCLES: usize = 120;
 const SETTLE_BOUND: Duration = Duration::from_secs(30);
 /// How long after a settled rebuild the daemon may take to publish its verified
 /// verdict (a tree walk) before the envelope's `null` counts as a failure.
@@ -191,7 +201,12 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
     );
 
     let mut tally = Tally::default();
-    for cycle in 0..CYCLES {
+    let mut cycles_run = 0;
+    for cycle in 0..MAX_CYCLES {
+        if cycle >= CYCLES && cycle - tally.racy_inconclusive >= MIN_WINDOW_SAMPLES {
+            break;
+        }
+        cycles_run = cycle + 1;
         // Quiescent: ask for a verified verdict, then query. `status` verifies,
         // so the next query may say `true`, and it is what makes (1) possible.
         let status = ipc(&socket, json!({"cmd": "status"})).await;
@@ -237,7 +252,9 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
                     tree_differs(&root, &reader),
                 );
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Fine-grained: a rebuild of this tree takes tens of milliseconds, so
+            // a 50 ms poll oversleeps the window on a fast host.
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let g0 = generation(&reader);
         let differs0 = tree_differs(&root, &reader);
@@ -323,7 +340,7 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
     let _ = std::fs::remove_dir_all(&root);
 
     eprintln!(
-        "envelope freshness over {CYCLES} cycles: racy true/false/null = {}/{}/{} \
+        "envelope freshness over {cycles_run} cycles: racy true/false/null = {}/{}/{} \
          ({} inconclusive); settled true/null = {}/{}",
         tally.racy_true,
         tally.racy_false,
@@ -333,17 +350,17 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
         tally.settled_null
     );
     assert!(
-        CYCLES - tally.racy_inconclusive >= 5,
-        "only {} of {CYCLES} racy samples saw the tree differing before and after the query; the \
+        cycles_run - tally.racy_inconclusive >= MIN_WINDOW_SAMPLES,
+        "only {} of {cycles_run} racy samples saw the tree differing before and after the query; the \
          test is not measuring the window it exists for",
-        CYCLES - tally.racy_inconclusive
+        cycles_run - tally.racy_inconclusive
     );
     assert!(
-        tally.settled_true >= CYCLES,
+        tally.settled_true >= cycles_run,
         "only {} settled samples read fresh:true out of {} (no `status` between rebuild and \
          query); the daemon is not publishing a verified verdict after its drains",
         tally.settled_true,
-        2 * CYCLES
+        2 * cycles_run
     );
     assert!(
         tally.violations.is_empty(),

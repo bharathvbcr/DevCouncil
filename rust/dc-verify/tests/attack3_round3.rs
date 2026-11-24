@@ -202,6 +202,7 @@ impl Root {
 
 impl Drop for Root {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = std::fs::set_permissions(
             self.0.join("src/a.rs"),
             std::os::unix::fs::PermissionsExt::from_mode(0o644),
@@ -272,6 +273,7 @@ fn u_a_fifo_in_place_of_the_source_is_named_and_does_not_hang() {
     named_or_found(&out);
 }
 
+#[cfg(unix)]
 #[test]
 fn u_a_symlink_loop_as_the_source_is_named() {
     let root = Root::new();
@@ -283,6 +285,7 @@ fn u_a_symlink_loop_as_the_source_is_named() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn u_a_symlinked_directory_component_is_named() {
     let root = Root::new();
@@ -311,6 +314,7 @@ fn u_an_empty_source_is_named() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn u_a_permission_denied_source_is_named() {
     let root = Root::new();

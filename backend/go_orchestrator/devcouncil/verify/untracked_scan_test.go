@@ -21,6 +21,19 @@ import (
 // contains it.
 func exampleAWSKey() string { return "AKIA" + "IOSFODNN7EXAMPLE" }
 
+// testGitEnv is the environment every fixture git command in this package
+// runs under: a fixed identity, so commands that write commits (commit,
+// commit-tree, merge) work on a runner with no user.email, and no system or
+// global config, so the host's settings never reach a fixture. Without it a
+// helper passes on a developer machine (whose global config, or macOS's
+// hostname fallback, supplies an identity) and exits 128 on a Linux runner.
+func testGitEnv() []string {
+	return append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+}
+
 func gitRepo(t *testing.T) string {
 	t.Helper()
 	git := testsupport.Tool(t, "git")
@@ -29,10 +42,7 @@ func gitRepo(t *testing.T) string {
 		t.Helper()
 		cmd := exec.Command(git, args...)
 		cmd.Dir = root
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
-			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+		cmd.Env = testGitEnv()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v %s", args, err, out)
 		}
@@ -157,10 +167,7 @@ func runGitIn(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(testsupport.Tool(t, "git"), args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
-		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
-		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+	cmd.Env = testGitEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v in %s: %v %s", args, dir, err, out)
 	}

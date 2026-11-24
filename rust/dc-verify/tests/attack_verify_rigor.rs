@@ -599,6 +599,7 @@ fn attack_binary_renamed_with_edits_is_scanned_or_degraded() {
     assert!(!run.all().contains(&k), "reply quotes the credential");
 }
 
+#[cfg(unix)]
 #[test]
 fn attack_binary_in_a_symlinked_parent_directory_is_not_read() {
     let root = Root::new();
@@ -636,6 +637,7 @@ fn attack_binary_dotdot_path_is_degraded_not_read() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn attack_stub_scan_reads_nothing_through_a_symlinked_parent() {
     // A symlinked parent directory must not feed the AST a file from outside

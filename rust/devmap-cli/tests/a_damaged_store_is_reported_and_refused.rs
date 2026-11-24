@@ -139,20 +139,31 @@ pub(crate) fn set_aside(dir: &Path) -> Vec<PathBuf> {
 
 /// A store file as it is on disk: its identity for "nothing touched it".
 ///
-/// The bytes, and the (device, inode) the name resolves to, so a rename and
-/// rewrite that happens to produce the same bytes is still a difference.
+/// The bytes, and on Unix the (device, inode) the name resolves to, so a
+/// rename and rewrite that happens to produce the same bytes is still a
+/// difference. Stable `std` exposes no file identity on Windows, so there the
+/// bytes alone are compared.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     bytes: Vec<u8>,
+    #[cfg(unix)]
     dev_ino: (u64, u64),
 }
 
+#[cfg(unix)]
 pub(crate) fn identity(db: &Path) -> Identity {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(db).unwrap();
     Identity {
         bytes: fs::read(db).unwrap(),
         dev_ino: (meta.dev(), meta.ino()),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn identity(db: &Path) -> Identity {
+    Identity {
+        bytes: fs::read(db).unwrap(),
     }
 }
 

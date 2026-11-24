@@ -208,6 +208,9 @@ func lexicalRepoRel(root, raw string) (string, bool) {
 	if !settled {
 		return "", false
 	}
+	if rootedOffRoot(cleaned) {
+		return "", false
+	}
 	if filepath.IsAbs(cleaned) {
 		rel, err := filepath.Rel(filepath.Clean(root), cleaned)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
