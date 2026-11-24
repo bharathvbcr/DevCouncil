@@ -3,7 +3,8 @@
 //! The request timeout answers the client and trips the request's `Cancel`;
 //! the `spawn_blocking` task it left behind cannot be aborted. Before the
 //! analysis consulted that token, a `blast` or `suspects` that outlived its
-//! 30 s timeout kept spawning git for a client that had gone.
+//! 30 s timeout kept spawning git for a client that had gone. The whole-graph
+//! views (`routes`, `api_impact`, `cypher`) are held to the same rule.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -174,6 +175,49 @@ fn a_cancelled_suspects_says_it_was_cut_short() {
     );
     assert!(exhausted(&report), "{report:#}");
     assert_eq!(report["complete"], json!(false), "{report:#}");
+}
+
+/// The whole-graph views (`routes`, `api_impact`, `cypher`) read every edge and
+/// extraction and, for the first two, scan source files. A request the client
+/// has abandoned must come back as the same `QueryCancelled` the engine arms
+/// return, never as a value that reads like a finished answer.
+#[test]
+fn a_cancelled_whole_graph_view_answers_query_cancelled_not_a_full_value() {
+    let f = fixture();
+    let requests = [
+        json!({"version": 1, "cmd": "routes"}),
+        json!({"version": 1, "cmd": "api_impact", "route": "/api/thing"}),
+        json!({"version": 1, "cmd": "cypher", "query": "MATCH (a)-[r:calls]->(b) RETURN a, b LIMIT 5"}),
+    ];
+    for request in requests {
+        let name = request["cmd"].as_str().unwrap().to_string();
+        let live = dispatch(
+            &f.store,
+            serde_json::from_value(request.clone()).expect("a request"),
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        );
+        assert!(
+            live.is_ok(),
+            "{name}: an uncancelled request answers: {live:?}"
+        );
+
+        let cancel = devmap_query::Cancel::new();
+        cancel.cancel();
+        let cut = dispatch(
+            &f.store,
+            serde_json::from_value(request).expect("a request"),
+            &cancel,
+            &UnappliedEdits::default(),
+        );
+        let error = cut.expect_err(&format!("{name}: a cancelled request must not answer Ok"));
+        assert!(
+            error
+                .downcast_ref::<devmap_query::QueryCancelled>()
+                .is_some(),
+            "{name}: expected QueryCancelled, got {error:#}"
+        );
+    }
 }
 
 // ---- the store graph's basis reads through the program it was given ----
