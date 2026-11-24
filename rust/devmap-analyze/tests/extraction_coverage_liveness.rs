@@ -18,8 +18,8 @@
 //! unconditionally.
 
 use devmap_analyze::*;
-use devmap_extract::extract_file;
 use devmap_extract::model::*;
+use devmap_extract::{extract_file, extract_file_with_budget};
 use devmap_resolve::Resolver;
 
 /// `lib.py` declares `helper` and `dangling`; `app.py` imports and calls
@@ -731,6 +731,9 @@ fn a_powershell_recovery_does_not_cap_python_findings() {
 /// clean file, and the coverage row written from the fresh extraction was gone.
 /// The cut now rides on `parse_outcome`, which is stored, the way the notebook
 /// and embedded extractors carry theirs. This asserts on the STORED form.
+/// Wide enough that no CI runner's slowness decides a fixture's extraction.
+const FIXTURE_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
 #[test]
 fn a_file_whose_calls_were_cut_at_the_ceiling_is_still_a_partial_parse_once_stored() {
     let ceiling = devmap_extract::treesitter::MAX_FILE_CALLS;
@@ -739,7 +742,17 @@ fn a_file_whose_calls_were_cut_at_the_ceiling_is_still_a_partial_parse_once_stor
         source.push_str("    other();\n");
     }
     source.push_str("}\nfn other() {}\n");
-    let fresh = extract_file("big.rs", &source);
+    // This test is about the call ceiling, not about parse speed, so the file
+    // gets a budget no runner reaches. Under the default 5 s one a loaded macOS
+    // CI runner refuses this ~400 KB file outright (a budget refusal keeps no
+    // calls at all), and the test then measured the clock, not the ceiling.
+    let fresh = extract_file_with_budget("big.rs", &source, FIXTURE_PARSE_BUDGET);
+    assert!(
+        !fresh.is_budget_refusal(),
+        "precondition: the fixture must not be refused for budget, or it never reaches the \
+         ceiling: {:?}",
+        fresh.parse_outcome
+    );
     assert_eq!(
         fresh.calls.len(),
         ceiling,

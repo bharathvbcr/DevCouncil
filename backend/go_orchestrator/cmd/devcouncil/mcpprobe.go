@@ -191,8 +191,15 @@ func probeMCPServer(parent context.Context, spec mcpServerSpec, budget time.Dura
 	return report
 }
 
+// sendFrame writes one JSON-RPC frame as a line. encoding/json/v2 writes a
+// map's members in iteration order unless asked not to, so without
+// Deterministic the same frame reached a server with its members in a
+// different order from one probe to the next. A server is entitled to read
+// members in any order, but the bytes a probe sends should not change between
+// runs: a diagnostic that reports "no answer" because of how its own request
+// was spelled is reporting on itself.
 func sendFrame(w io.Writer, frame map[string]any) error {
-	data, err := json.Marshal(frame)
+	data, err := json.Marshal(frame, json.Deterministic(true))
 	if err != nil {
 		return err
 	}
