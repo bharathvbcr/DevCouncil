@@ -379,10 +379,13 @@ fn literal_tree(revision: usize, modules: usize) -> Vec<(String, String)> {
 /// to a fresh store. That does not loosen what it guards: a region hiding in
 /// `other` (the 30–55% this test was written against) is in every trial, so
 /// the best of them still fails. Every trial must charge every named span.
+/// One trial's shape, its `other` fraction, and every named span's seconds.
+type Trial<'a> = (&'a str, f64, Vec<(&'static str, f64)>);
+
 #[test]
 fn the_regions_that_hid_in_other_are_named_and_other_is_a_remainder() {
     const TRIALS: usize = 3;
-    let mut fractions: Vec<(&str, f64, Vec<(&'static str, f64)>)> = Vec::new();
+    let mut fractions: Vec<Trial> = Vec::new();
     for trial in 0..TRIALS {
         let dir = tmp_dir(&format!("write-breakdown-named-regions-{trial}"));
         let store = Store::open(dir.join("devmap.sqlite")).unwrap();

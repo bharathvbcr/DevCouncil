@@ -1090,7 +1090,7 @@ mod rename_retry_tests {
         let error = rename_through_transient_refusals(
             || {
                 calls.set(calls.get() + 1);
-                Err(sharing_violation())
+                Err::<(), _>(sharing_violation())
             },
             is_transient_windows_refusal,
             Duration::from_millis(100),
@@ -1112,7 +1112,7 @@ mod rename_retry_tests {
             || {
                 calls.set(calls.get() + 1);
                 if calls.get() == 1 {
-                    Err(sharing_violation())
+                    Err::<(), _>(sharing_violation())
                 } else {
                     Err(io::Error::from(io::ErrorKind::NotFound))
                 }
