@@ -108,8 +108,16 @@ jobs:
         working-directory: rust
         run: cargo build --locked -p devmap-cli --bin devmap
 
+      # A copy, not target/debug, which another test package's cargo build
+      # unlinks mid-run (see analysis-plane.yml's step of the same name). Only
+      # when the build above produced one: that step is not fatal.
       - name: Put devmap on PATH
-        run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
+        run: |
+          if [ -x rust/target/debug/devmap ]; then
+            mkdir -p "$RUNNER_TEMP/devmap-bin"
+            cp rust/target/debug/devmap "$RUNNER_TEMP/devmap-bin/devmap"
+            echo "$RUNNER_TEMP/devmap-bin" >> "$GITHUB_PATH"
+          fi
 
       # Fatal: nothing else here can run the full suite without it. The steps
       # after it are gated on its outcome and say so, instead of failing with a
