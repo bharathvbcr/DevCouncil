@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gitrev"
 )
 
 func main() {
@@ -58,20 +60,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
-// escapeData escapes a workflow command's message the way the runner reads it:
-// `%`, CR and LF, so a value cannot end the command and start another.
-func escapeData(s string) string {
-	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(s)
-}
+// escapeData escapes a workflow command's message the way the runner reads it.
+// Delegates to the shared devcouncil/gitrev implementation.
+func escapeData(s string) string { return gitrev.EscapeData(s) }
 
 // annotate renders a workflow command with an escaped message. Every value
 // this program writes after `::` goes through here or group, because paths and
 // test names come from the tree under test.
-func annotate(level, msg string) string {
-	return "::" + level + "::" + escapeData(msg)
-}
+func annotate(level, msg string) string { return gitrev.Annotate(level, msg) }
 
-func group(title string) string { return "::group::" + escapeData(title) }
+func group(title string) string { return gitrev.Group(title) }
 
 type listFlag []string
 
@@ -106,7 +104,7 @@ func planCmd(ctx context.Context, args []string, stdout io.Writer) (int, error) 
 		return 2, fmt.Errorf("repository %q: %w", *repo, err)
 	}
 	o.Repo = root
-	if o.BaseRef == "" || !refToken.MatchString(o.BaseRef) || strings.HasPrefix(o.BaseRef, "-") {
+	if !gitrev.IsRefToken(o.BaseRef) {
 		return 2, fmt.Errorf("--base-ref %q is not a branch name", o.BaseRef)
 	}
 	if o.Trigger == "" {
