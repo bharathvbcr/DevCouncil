@@ -14,7 +14,13 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gitrev"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/prgate"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
+
+// subprocessWaitDelay bounds how long a child's output pipes may stay open
+// after it is killed at the deadline, so a grandchild holding them cannot keep
+// the run alive (the group kill reaches it; this bounds the reap).
+const subprocessWaitDelay = 5 * time.Second
 
 // RunRequest carries the validated PR parameters handed to a gate Runner.
 type RunRequest struct {
@@ -130,12 +136,18 @@ func (r *CLIRunner) Run(ctx context.Context, req RunRequest) (prgate.Report, err
 			"-c", "submodule.recurse=false",
 		}, args...)
 		cmd := exec.CommandContext(runCtx, "git", hardened...)
+		proc.ConfigureGroup(cmd)
+		cmd.WaitDelay = subprocessWaitDelay
 		cmd.Dir = repoDir
 		cmd.Env = env
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
+		err, timedOut := proc.RunBounded(runCtx, cmd.Run)
+		if timedOut {
+			return "", fmt.Errorf("git %s did not finish within the run's deadline", args[0])
+		}
+		if err != nil {
 			return "", fmt.Errorf("git %s failed: %w", args[0], err)
 		}
 		return strings.TrimSpace(stdout.String()), nil
@@ -205,12 +217,19 @@ func (r *CLIRunner) Run(ctx context.Context, req RunRequest) (prgate.Report, err
 	}
 
 	cmd := exec.CommandContext(runCtx, r.DevCouncilBin, args...)
+	proc.ConfigureGroup(cmd)
+	cmd.WaitDelay = subprocessWaitDelay
 	cmd.Dir = workDir
 	cmd.Env = append(append([]string(nil), baseEnv...), "GOTOOLCHAIN=local")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr, timedOut := proc.RunBounded(runCtx, cmd.Run)
+	// A run cut off at its deadline is not a verdict, whatever it left in
+	// --json-out: the report may be one the killed process was still writing.
+	if timedOut {
+		return prgate.Report{}, fmt.Errorf("devcouncil pr-gate did not finish within %s", timeout)
+	}
 
 	// `devcouncil pr-gate` exits 1 on findings and 2 on degraded/error while
 	// still emitting a valid JSON report to `--json-out`.
