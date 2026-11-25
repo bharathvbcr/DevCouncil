@@ -6,11 +6,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
+
+// skipUnlessUnlinkWhileOpen skips on Windows, which refuses to delete or
+// rename over a file a process holds open. The stale-inode hazard these tests
+// guard against needs that: there, the warm child's open handle keeps the
+// path itself from being deleted or replaced.
+func skipUnlessUnlinkWhileOpen(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows refuses to delete or replace a database a warm child holds open, so there is no unlinked inode to answer from")
+	}
+}
 
 func acquireT1(c *Client) (*Lease, error) {
 	return c.Acquire(context.Background(), AcquireRequest{TaskID: "T1", Owner: "o", TTL: 15 * time.Minute})
@@ -19,6 +31,7 @@ func acquireT1(c *Client) (*Lease, error) {
 // A warm pooled child holds the database it opened. When the path is deleted
 // the pool must refuse rather than keep answering from the unlinked file.
 func TestAWarmPoolRefusesAfterTheDatabaseIsDeleted(t *testing.T) {
+	skipUnlessUnlinkWhileOpen(t)
 	c := client(t)
 	t.Cleanup(c.Close)
 	if _, err := c.ActiveLeases(context.Background()); err != nil { // creates the store
@@ -38,6 +51,7 @@ func TestAWarmPoolRefusesAfterTheDatabaseIsDeleted(t *testing.T) {
 // Replacing the file leaves the warm child on the old inode. Two clients must
 // not each lease the same task, one per file.
 func TestAWarmPoolNeverLeasesTheSameTaskOnAReplacedDatabase(t *testing.T) {
+	skipUnlessUnlinkWhileOpen(t)
 	warm := client(t)
 	t.Cleanup(warm.Close)
 	seedTask(t, warm, "T1")
