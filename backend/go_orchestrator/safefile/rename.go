@@ -28,10 +28,17 @@ func renameWithRetry(rename func(old, new string) error, transient func(error) b
 	delay := time.Millisecond
 	for {
 		err := rename(old, new)
-		if err == nil || !transient(err) || !time.Now().Add(delay).Before(deadline) {
+		if err == nil || !transient(err) {
 			return err
 		}
-		time.Sleep(delay)
+		// Give up only once the budget is spent, and never sleep past it. Giving
+		// up when the next back-off would cross the deadline ended a 60 ms
+		// budget after about 31 ms (1+2+4+8+16), half of the wait unused.
+		left := time.Until(deadline)
+		if left <= 0 {
+			return err
+		}
+		time.Sleep(min(delay, left))
 		if delay < 50*time.Millisecond {
 			delay *= 2
 		}

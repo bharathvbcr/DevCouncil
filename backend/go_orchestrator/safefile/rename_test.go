@@ -36,14 +36,16 @@ func TestRenameReturnsANonTransientRefusalAtOnce(t *testing.T) {
 }
 
 // A transient refusal that never clears is still a failure, carrying the
-// refusal itself, and the wait ends at the budget.
+// refusal itself, and the wait ends at the budget, not short of it: the loop
+// once gave up when its next back-off would cross the deadline, so a 60 ms
+// budget ended after about 31 ms of sleeps.
 func TestRenameGivesUpAtTheBudgetWithTheLastRefusal(t *testing.T) {
 	start := time.Now()
 	err := renameWithRetry(func(string, string) error { return errBusy }, func(error) bool { return true }, "a", "b", 60*time.Millisecond)
 	if !errors.Is(err, errBusy) {
 		t.Fatalf("err = %v, want the refusal", err)
 	}
-	if waited := time.Since(start); waited < 40*time.Millisecond || waited > 2*time.Second {
+	if waited := time.Since(start); waited < 55*time.Millisecond || waited > 2*time.Second {
 		t.Fatalf("waited %s for a 60ms budget", waited)
 	}
 }

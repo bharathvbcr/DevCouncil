@@ -401,7 +401,7 @@ func TestNewClientRefusesUnboundedOrUnusableSettings(t *testing.T) {
 func TestSocketPathPrefersTheOverride(t *testing.T) {
 	env := map[string]string{"HOME": "/Users/x"}
 	get := func(k string) string { return env[k] }
-	if p, err := SocketPath(get); err != nil || p != "/Users/x/Library/Caches/qd/qd.sock" {
+	if p, err := SocketPath(get); err != nil || p != filepath.FromSlash("/Users/x/Library/Caches/qd/qd.sock") {
 		t.Fatalf("got %q, %v", p, err)
 	}
 	env[SocketEnv] = "/tmp/q.sock"

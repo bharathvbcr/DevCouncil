@@ -186,7 +186,8 @@ func TestTheWriterAppendsWholeLinesWithPrivateModes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if mode := info.Mode().Perm(); mode != 0o700 {
+		// The same holds for directories, which Windows reports as 0777.
+		if mode := info.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o700 {
 			t.Fatalf("%s mode %o, want 700", dir, mode)
 		}
 	}
