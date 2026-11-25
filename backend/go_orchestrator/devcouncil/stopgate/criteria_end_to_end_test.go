@@ -55,6 +55,7 @@ func linkCriterion(t *testing.T, db, taskID, method string) {
 }
 
 func TestTheShippedHostDispatchesOnVerificationMethod(t *testing.T) {
+	useBuiltDCVerify(t)
 	cases := []struct {
 		method      string
 		wantStatus  string
@@ -104,6 +105,7 @@ func TestTheShippedHostDispatchesOnVerificationMethod(t *testing.T) {
 // criterion. Then the author changes the code, and the same review no longer
 // vouches for it.
 func TestARecordedReviewDischargesLLMReviewUntilTheContentMoves(t *testing.T) {
+	useBuiltDCVerify(t)
 	ctx := context.Background()
 	root := repoWithWorkingTreeChange(t, "src/app.go", "package app\n")
 	rubric := "# Feature spec standard\nEvery failure mode is named.\n"
