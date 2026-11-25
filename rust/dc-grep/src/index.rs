@@ -1543,6 +1543,7 @@ mod tests {
     /// name cannot be spelled exactly was recording an absolute path; macOS
     /// cannot create a non-UTF-8 name to walk, so the normalisation every cause
     /// shares is tested directly, with a name that is not UTF-8.
+    #[cfg(unix)]
     #[test]
     fn a_left_out_path_is_recorded_relative_to_the_root_for_every_cause() {
         use super::root_relative;

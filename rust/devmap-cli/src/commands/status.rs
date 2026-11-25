@@ -351,8 +351,10 @@ fn kernel_capabilities() -> serde_json::Value {
             "html": has_command("html"),
             "seed": has_command("seed"),
             "manifest_graph_output": accepts("manifest", "graph-output"),
+            "manifest_repo_map_only": accepts("manifest", "repo-map-only"),
             "manifest_stamp_flags": stamp_flags,
             "build_manifest": accepts("build", "manifest"),
+            "build_repo_map": accepts("build", "repo-map"),
         })
     })
 }

@@ -215,9 +215,14 @@ pub fn measure_in(
     let outcome = match exited.recv_timeout(limit.saturating_sub(started.elapsed())) {
         Ok(outcome) => Ok(outcome),
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            // `dc_proc` signals exist on Unix only. Off Unix `/usr/bin/time`
+            // does not exist either, so the spawn above has already failed
+            // and this arm is unreachable there.
             #[cfg(unix)]
-            let _ = dc_proc::signal_group(leader, dc_proc::Signal::Kill);
-            let _ = dc_proc::signal_process(leader, dc_proc::Signal::Kill);
+            {
+                let _ = dc_proc::signal_group(leader, dc_proc::Signal::Kill);
+                let _ = dc_proc::signal_process(leader, dc_proc::Signal::Kill);
+            }
             // The kill ends the wait, so the join is prompt.
             let _ = waiter.join();
             builds.finished(leader);

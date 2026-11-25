@@ -34,3 +34,5 @@ Read `truncated` and `walk_incomplete` on every DevMap envelope. A blast radius 
 When either DevMap or GitPulse cannot answer, record the gap and report it as a gap. Do not fall back to grep and present the result as if the graph had confirmed it.
 
 Summarize findings as blocking vs advisory and reference `file:line`. Where you could not verify something, say that explicitly instead of omitting it.
+
+If the `devcouncil_*` MCP tools are absent (a cloud session has none), say so, then use the `devcouncil` CLI (`dev tool call ...`) if it is on PATH, otherwise source inspection. Never claim a lease, checkout or verification happened when it did not.

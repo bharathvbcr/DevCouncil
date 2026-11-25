@@ -1,0 +1,489 @@
+name: DevCouncil PR Gate (post)
+
+# Trusted default-branch PR Gate analysis + poster workflow for BOTH same-repo
+# and fork pull requests.
+#
+# Security architecture (default-branch `workflow_run` + two-job privilege split):
+#   - Triggered by `on: workflow_run` on `.github/workflows/pr-gate.yml`, so
+#     GitHub ALWAYS executes BOTH `analysis` and `post` from the trusted default
+#     branch — never from an untrusted PR merge commit.
+#   - Strictly filters `workflow_run.path == '.github/workflows/pr-gate.yml'`,
+#     `event == 'pull_request'`, and skips `cancelled` / `action_required` runs
+#     (preventing attacker-added workflows with the same name from triggering
+#     this workflow and avoiding spurious errors on unapproved first-time forks).
+#   - Downloads ZERO artifacts from the triggering `pull_request` workflow.
+#   - Job 1 (`analysis`, `permissions: contents: read` ONLY):
+#       * Resolves PR number, base SHA, head SHA, and repo IDs strictly via the
+#         GitHub API, verifying `pr.head.sha == workflow_run.head_sha` and
+#         `pr.head.repo.id == workflow_run.head_repository.id`.
+#       * Checks out the trusted default branch, builds `devcouncil`, `devmap`,
+#         `dcverify`, and `dcredact` (`GOTOOLCHAIN=local`) into `$RUNNER_TEMP`
+#         outside `$GITHUB_WORKSPACE`.
+#       * Checks out the PR head into `_pr_head` strictly as DATA
+#         (`persist-credentials: false`), verifies `HEAD == head_sha`, runs the
+#         trusted default-branch `action.yml`, and uploads `pr-gate-artifacts`.
+#   - Job 2 (`post`, `needs: analysis`, `permissions: pull-requests: write,
+#     statuses: write`):
+#       * Checks out NOTHING.
+#       * Downloads Job 1's trusted `pr-gate-artifacts` from THIS run, enforces
+#         symlink/size/schema/SHA/marker/conclusion checks, re-verifies the live
+#         GitHub PR head SHA and head repo ID, and posts the `devcouncil/pr-gate`
+#         commit status and bot-authored sticky PR comment for BOTH same-repo
+#         and fork PRs (failing closed to `error` on missing/corrupt artifacts).
+#
+# Branch-protection guidance:
+#   - Require ONLY the `devcouncil/pr-gate` commit status (never the
+#     `DevCouncil PR Gate (post)` or `(analysis)` job names: `workflow_run`
+#     check runs attach to the default-branch commit, not the PR head, and a PR
+#     could define a same-named job under `pull_request`).
+#   - Protect `.github/workflows/**` with CODEOWNERS so a same-repo collaborator
+#     cannot add a `pull_request` workflow requesting `statuses: write`.
+
+on:
+  workflow_run:
+    workflows: ["DevCouncil PR Gate"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+env:
+  RUST_TEST_THREADS: "2"
+  TOKIO_WORKER_THREADS: "2"
+  GOTOOLCHAIN: local
+
+jobs:
+  analysis:
+    name: DevCouncil PR Gate (analysis)
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.path == '.github/workflows/pr-gate.yml' &&
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'action_required'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Resolve and verify pull request metadata from GitHub API
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPO_ID: ${{ github.repository_id }}
+          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_HEAD_REPO_ID: ${{ github.event.workflow_run.head_repository.id }}
+          WR_PULL_REQUESTS_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$WR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::DevCouncil PR Gate: invalid workflow_run.head_sha"
+            exit 2
+          fi
+          if ! [[ "$WR_HEAD_REPO_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::DevCouncil PR Gate: invalid workflow_run.head_repository.id"
+            exit 2
+          fi
+
+          # 1. Try workflow_run.pull_requests (populated for same-repo PRs).
+          PR_MATCHES="$(
+            printf '%s' "$WR_PULL_REQUESTS_JSON" | jq -c \
+              --arg sha "$WR_HEAD_SHA" \
+              --argjson repo_id "$WR_HEAD_REPO_ID" \
+              --argjson base_repo_id "$GITHUB_REPO_ID" \
+              '(. // []) | map(select(.head.sha == $sha and (.head.repo.id // 0) == $repo_id and (.base.repo.id // 0) == $base_repo_id))'
+          )"
+          MATCH_COUNT="$(printf '%s' "$PR_MATCHES" | jq 'length')"
+
+          # 2. Fast fallback for fork PRs (where workflow_run.pull_requests is empty):
+          #    try GET /repos/{r}/commits/{sha}/pulls first before paginating all open PRs.
+          if [ "$MATCH_COUNT" -eq 0 ]; then
+            COMMIT_PULLS="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${GITHUB_REPOSITORY}/commits/${WR_HEAD_SHA}/pulls?per_page=100" 2>/dev/null || echo "[]"
+            )"
+            PR_MATCHES="$(
+              printf '%s' "$COMMIT_PULLS" | jq -c \
+                --arg sha "$WR_HEAD_SHA" \
+                --argjson repo_id "$WR_HEAD_REPO_ID" \
+                --argjson base_repo_id "$GITHUB_REPO_ID" \
+                '(. // []) | map(select(.state == "open" and .head.sha == $sha and (.head.repo.id // 0) == $repo_id and (.base.repo.id // 0) == $base_repo_id))'
+            )"
+            MATCH_COUNT="$(printf '%s' "$PR_MATCHES" | jq 'length')"
+          fi
+
+          # 3. Full fallback: paginate open PRs and match state==open, head.sha,
+          #    head.repo.id, AND base.repo.id.
+          if [ "$MATCH_COUNT" -eq 0 ]; then
+            PR_MATCHES="$(
+              gh api --paginate \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" \
+                | jq -s -c \
+                  --arg sha "$WR_HEAD_SHA" \
+                  --argjson repo_id "$WR_HEAD_REPO_ID" \
+                  --argjson base_repo_id "$GITHUB_REPO_ID" \
+                  'add | map(select(.state == "open" and .head.sha == $sha and (.head.repo.id // 0) == $repo_id and (.base.repo.id // 0) == $base_repo_id))'
+            )"
+            MATCH_COUNT="$(printf '%s' "$PR_MATCHES" | jq 'length')"
+          fi
+
+          # Fail closed unless exactly ONE open PR matches (0 or >1 is ambiguous).
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "::error::DevCouncil PR Gate: expected exactly 1 matching open PR for workflow_run head SHA and repo ID (found ${MATCH_COUNT})"
+            exit 2
+          fi
+
+          PR_NUMBER="$(printf '%s' "$PR_MATCHES" | jq -r '.[0].number // ""')"
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::DevCouncil PR Gate: invalid matched PR number"
+            exit 2
+          fi
+
+          # 3. Fetch authoritative PR details directly from GitHub API.
+          PR_JSON="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
+          )"
+          LIVE_STATE="$(printf '%s' "$PR_JSON" | jq -r '.state // ""')"
+          LIVE_HEAD_SHA="$(printf '%s' "$PR_JSON" | jq -r '.head.sha // ""')"
+          LIVE_BASE_SHA="$(printf '%s' "$PR_JSON" | jq -r '.base.sha // ""')"
+          LIVE_HEAD_REPO_ID="$(printf '%s' "$PR_JSON" | jq -r '.head.repo.id // ""')"
+          LIVE_BASE_REPO_ID="$(printf '%s' "$PR_JSON" | jq -r '.base.repo.id // ""')"
+
+          if [ "$LIVE_STATE" != "open" ]; then
+            echo "::error::DevCouncil PR Gate: matched PR #${PR_NUMBER} is not open"
+            exit 2
+          fi
+          if ! [[ "$LIVE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$LIVE_HEAD_SHA" != "$WR_HEAD_SHA" ]; then
+            echo "::error::DevCouncil PR Gate: live PR head SHA does not match workflow_run.head_sha"
+            exit 2
+          fi
+          if ! [[ "$LIVE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::DevCouncil PR Gate: invalid live PR base SHA"
+            exit 2
+          fi
+          if [ "$LIVE_HEAD_REPO_ID" != "$WR_HEAD_REPO_ID" ] || [ "$LIVE_BASE_REPO_ID" != "$GITHUB_REPO_ID" ]; then
+            echo "::error::DevCouncil PR Gate: live PR repository IDs do not match workflow_run"
+            exit 2
+          fi
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "head_sha=$LIVE_HEAD_SHA"
+            echo "base_sha=$LIVE_BASE_SHA"
+            echo "head_repo_id=$LIVE_HEAD_REPO_ID"
+            echo "base_repo_id=$LIVE_BASE_REPO_ID"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout trusted default-branch commit (workflow_run GITHUB_SHA) for gate build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (from trusted default branch; no cache save in workflow_run)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+          cache: false
+
+      - name: Set up Rust (from trusted default branch)
+        uses: ./.github/actions/setup-rust
+
+      - name: Restore Rust build cache (read-only; never save from workflow_run)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          workspaces: rust
+          save-if: false
+
+      - name: Set up Gusset (from trusted default branch)
+        uses: ./.github/actions/setup-gusset
+
+      - name: Build devmap, dcverify, and dcredact (from trusted default branch)
+        working-directory: rust
+        run: cargo build --locked -p devmap-cli --bin devmap -p dc-verify --bin dcverify -p dc-redact-cli --bin dcredact
+
+      - name: Build devcouncil (from trusted default branch) and stage binaries outside workspace
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          BIN_DIR="$RUNNER_TEMP/devcouncil-pr-gate-bin"
+          rm -rf "$BIN_DIR"
+          mkdir -p "$BIN_DIR"
+          (cd backend/go_orchestrator && go build -o "$BIN_DIR/devcouncil" ./cmd/devcouncil)
+          cp rust/target/debug/devmap "$BIN_DIR/devmap"
+          cp rust/target/debug/dcverify "$BIN_DIR/dcverify"
+          cp rust/target/debug/dcredact "$BIN_DIR/dcredact"
+          chmod +x "$BIN_DIR/devcouncil" "$BIN_DIR/devmap" "$BIN_DIR/dcverify" "$BIN_DIR/dcredact"
+
+      - name: Fetch PR base history into _pr_head as data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.pr.outputs.base_sha }}
+          path: _pr_head
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout untrusted PR HEAD into _pr_head as data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/pull/${{ steps.pr.outputs.pr_number }}/head
+          path: _pr_head
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify _pr_head contains base commit and matches verified head SHA
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git -C _pr_head -c core.hooksPath=/dev/null -c core.fsmonitor=false cat-file -e "${BASE_SHA}^{commit}"
+          ACTUAL_HEAD="$(git -C _pr_head -c core.hooksPath=/dev/null -c core.fsmonitor=false rev-parse HEAD)"
+          if [ "$ACTUAL_HEAD" != "$HEAD_SHA" ]; then
+            echo "::error::DevCouncil PR Gate: _pr_head HEAD (${ACTUAL_HEAD}) does not match verified PR head SHA (${HEAD_SHA})"
+            exit 2
+          fi
+
+      - name: Run DevCouncil PR Gate (from trusted default branch against _pr_head)
+        id: gate
+        uses: ./
+        with:
+          mode: enforce
+          repo: ${{ github.workspace }}/_pr_head
+          binary-dir: ${{ runner.temp }}/devcouncil-pr-gate-bin
+          dcredact: ${{ runner.temp }}/devcouncil-pr-gate-bin/dcredact
+          base-sha: ${{ steps.pr.outputs.base_sha }}
+          head-sha: ${{ steps.pr.outputs.head_sha }}
+          build-index: "true"
+          timeout: "10m"
+          post-comment: "false"
+          post-status: "false"
+
+      - name: Write trusted PR Gate metadata
+        if: ${{ always() && steps.pr.outputs.pr_number != '' }}
+        env:
+          OUT_DIR: ${{ runner.temp }}/devcouncil-pr-gate-out
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_REPO_ID: ${{ steps.pr.outputs.head_repo_id }}
+          BASE_REPO_ID: ${{ steps.pr.outputs.base_repo_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          jq -n \
+            --arg schema "devcouncil.pr_gate_meta/v1" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg base_sha "$BASE_SHA" \
+            --argjson head_repo_id "$HEAD_REPO_ID" \
+            --argjson base_repo_id "$BASE_REPO_ID" \
+            '{schema: $schema, pr_number: $pr_number, head_sha: $head_sha, base_sha: $base_sha, head_repo_id: $head_repo_id, base_repo_id: $base_repo_id}' \
+            > "$OUT_DIR/pr-gate-meta.json"
+
+      - name: Upload trusted PR Gate artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pr-gate-artifacts
+          path: |
+            ${{ runner.temp }}/devcouncil-pr-gate-out/pr-gate-meta.json
+            ${{ runner.temp }}/devcouncil-pr-gate-out/pr-gate.json
+            ${{ runner.temp }}/devcouncil-pr-gate-out/pr-gate.md
+            ${{ runner.temp }}/devcouncil-pr-gate-out/pr-gate.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  post:
+    name: DevCouncil PR Gate (post)
+    needs: analysis
+    if: ${{ always() && !cancelled() && needs.analysis.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      # Checks out NOTHING from the PR or repository.
+      - name: Download trusted PR Gate artifacts from analysis job
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: pr-gate-artifacts
+          path: ${{ runner.temp }}/pr-gate-artifacts
+
+      - name: Validate trusted artifacts and post commit status + sticky comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPO_ID: ${{ github.repository_id }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_HEAD_REPO_ID: ${{ github.event.workflow_run.head_repository.id }}
+          ANALYSIS_RESULT: ${{ needs.analysis.result }}
+          ART_DIR: ${{ runner.temp }}/pr-gate-artifacts
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$WORKFLOW_RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::DevCouncil PR Gate: invalid workflow_run.head_sha"
+            exit 2
+          fi
+
+          post_status() {
+            local sha="$1"
+            local state="$2"
+            local desc="$3"
+            desc="${desc:0:140}"
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/statuses/${sha}" \
+              -f state="$state" \
+              -f context="devcouncil/pr-gate" \
+              -f description="$desc" >/dev/null
+          }
+
+          fail_closed() {
+            local desc="$1"
+            echo "::error::${desc}"
+            post_status "$WORKFLOW_RUN_HEAD_SHA" "error" "$desc"
+            exit 2
+          }
+
+          META_FILE="$ART_DIR/pr-gate-meta.json"
+          JSON_FILE="$ART_DIR/pr-gate.json"
+          MD_FILE="$ART_DIR/pr-gate.md"
+
+          # Require regular, non-symlink artifact files.
+          for f in "$META_FILE" "$JSON_FILE" "$MD_FILE"; do
+            if [ -L "$f" ] || [ ! -f "$f" ]; then
+              fail_closed "devcouncil pr-gate: analysis failed before producing required artifacts"
+            fi
+          done
+
+          # Enforce strict size caps BEFORE parsing with jq.
+          META_BYTES="$(wc -c < "$META_FILE")"
+          JSON_BYTES="$(wc -c < "$JSON_FILE")"
+          MD_BYTES="$(wc -c < "$MD_FILE")"
+          if [ "$META_BYTES" -gt 65536 ] || [ "$JSON_BYTES" -gt 2097152 ] || [ "$MD_BYTES" -ge 65536 ]; then
+            fail_closed "devcouncil pr-gate: report artifact exceeded size cap"
+          fi
+
+          # Strictly validate pr-gate-meta.json.
+          if ! jq -e 'type == "object"' "$META_FILE" >/dev/null 2>&1; then
+            fail_closed "devcouncil pr-gate: malformed pr-gate-meta.json"
+          fi
+          META_SCHEMA="$(jq -r 'if (.schema | type) == "string" then .schema else "" end' "$META_FILE")"
+          PR_NUMBER="$(jq -r 'if (.pr_number | type) == "number" and (.pr_number == (.pr_number | floor)) and .pr_number > 0 then (.pr_number | tostring) else "" end' "$META_FILE")"
+          META_HEAD_SHA="$(jq -r 'if (.head_sha | type) == "string" then .head_sha else "" end' "$META_FILE")"
+          META_HEAD_REPO_ID="$(jq -r 'if (.head_repo_id | type) == "number" and (.head_repo_id == (.head_repo_id | floor)) and .head_repo_id > 0 then (.head_repo_id | tostring) else "" end' "$META_FILE")"
+          META_BASE_REPO_ID="$(jq -r 'if (.base_repo_id | type) == "number" and (.base_repo_id == (.base_repo_id | floor)) and .base_repo_id > 0 then (.base_repo_id | tostring) else "" end' "$META_FILE")"
+
+          if [ "$META_SCHEMA" != "devcouncil.pr_gate_meta/v1" ]; then
+            fail_closed "devcouncil pr-gate: invalid metadata schema"
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            fail_closed "devcouncil pr-gate: invalid pr_number in metadata"
+          fi
+          if ! [[ "$META_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$META_HEAD_SHA" != "$WORKFLOW_RUN_HEAD_SHA" ]; then
+            fail_closed "devcouncil pr-gate: metadata head_sha does not match workflow_run head_sha"
+          fi
+          if [ "$META_HEAD_REPO_ID" != "$WORKFLOW_RUN_HEAD_REPO_ID" ] || [ "$META_BASE_REPO_ID" != "$GITHUB_REPO_ID" ]; then
+            fail_closed "devcouncil pr-gate: metadata repo IDs do not match workflow_run"
+          fi
+
+          # Strictly validate pr-gate.json.
+          if ! jq -e 'type == "object"' "$JSON_FILE" >/dev/null 2>&1; then
+            fail_closed "devcouncil pr-gate: malformed pr-gate.json"
+          fi
+          SCHEMA="$(jq -r 'if (.schema | type) == "string" then .schema else "" end' "$JSON_FILE")"
+          REPORT_HEAD="$(jq -r 'if (.head_sha | type) == "string" then .head_sha else "" end' "$JSON_FILE")"
+          OUTCOME="$(jq -r 'if (.outcome | type) == "string" then .outcome else "" end' "$JSON_FILE")"
+          SHOULD_POST="$(jq -r 'if (.should_post | type) == "boolean" then (.should_post | tostring) else "false" end' "$JSON_FILE")"
+          STATUS_STATE="$(jq -r 'if (.status_state | type) == "string" then .status_state else "" end' "$JSON_FILE")"
+          STATUS_DESC="$(jq -r 'if (.status_description | type) == "string" then .status_description else "" end' "$JSON_FILE")"
+
+          if [ "$SCHEMA" != "devcouncil.pr_gate/v1" ]; then
+            fail_closed "devcouncil pr-gate: invalid report schema"
+          fi
+
+          if [ "$OUTCOME" = "skipped" ] || [ "$SHOULD_POST" != "true" ]; then
+            exit 0
+          fi
+
+          if [ "$REPORT_HEAD" != "$META_HEAD_SHA" ]; then
+            fail_closed "devcouncil pr-gate: report head_sha does not match metadata head_sha"
+          fi
+
+          case "$STATUS_STATE" in
+            success|failure|error) ;;
+            *)
+              fail_closed "devcouncil pr-gate: invalid status_state in report"
+              ;;
+          esac
+
+          # Defense in depth: never post success if the analysis job itself did not succeed.
+          if [ "$STATUS_STATE" = "success" ] && [ "$ANALYSIS_RESULT" != "success" ]; then
+            fail_closed "devcouncil pr-gate: analysis job did not succeed"
+          fi
+
+          # Verify pr-gate.md carries the sticky comment marker on line 1.
+          if [ "$(head -n 1 "$MD_FILE")" != "<!-- devcouncil:pr-gate -->" ] || ! grep -Fq "<!-- devcouncil:pr-gate -->" "$MD_FILE"; then
+            fail_closed "devcouncil pr-gate: invalid markdown report marker"
+          fi
+
+          # Cross-check BOTH head_sha AND head.repo.id against the live GitHub PR API
+          # so stale artifacts or cross-PR SHA reuse are rejected.
+          LIVE_PR="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
+          )"
+          LIVE_HEAD_SHA="$(printf '%s' "$LIVE_PR" | jq -r '.head.sha // ""')"
+          LIVE_HEAD_REPO_ID="$(printf '%s' "$LIVE_PR" | jq -r '.head.repo.id // ""')"
+          if ! [[ "$LIVE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$LIVE_HEAD_SHA" != "$META_HEAD_SHA" ]; then
+            fail_closed "devcouncil pr-gate: artifact head_sha does not match live PR head SHA"
+          fi
+          if [ "$LIVE_HEAD_REPO_ID" != "$META_HEAD_REPO_ID" ]; then
+            fail_closed "devcouncil pr-gate: live PR head repo ID does not match metadata"
+          fi
+
+          # Post commit status on the verified PR head SHA.
+          post_status "$META_HEAD_SHA" "$STATUS_STATE" "$STATUS_DESC"
+
+          # Post or update the bot-authored sticky PR comment (both same-repo and fork PRs).
+          EXISTING_ID="$(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq '.[] | select(.user.type == "Bot" and .user.login == "github-actions[bot]" and (.body | contains("<!-- devcouncil:pr-gate -->"))) | .id' \
+              | head -n 1
+          )"
+          if [ -n "$EXISTING_ID" ]; then
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" \
+              -F body=@"$MD_FILE" >/dev/null
+          else
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -F body=@"$MD_FILE" >/dev/null
+          fi

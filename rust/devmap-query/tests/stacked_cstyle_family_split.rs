@@ -6,6 +6,10 @@
 //!
 //! This file owns its process: it shells out to `git`, and the in-crate stacked
 //! tests hold a lock around the `git` path that a shared target would not honour.
+//!
+//! Every test here is already `#[cfg(unix)]`; gating the file keeps its helpers
+//! from being dead code on targets where no test uses them.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

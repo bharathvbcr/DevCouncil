@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 mod support;
 
 use support::{
-    classify_startup, finalize_pass_flag, graph_proves_equivalence, require_ipc_probe,
-    retry_file_operation, AdmissionTimeout, ProbeAdmission, StartBarrier, StartupDecision,
+    classify_startup, daemon_exit_report, finalize_pass_flag, graph_proves_equivalence,
+    require_ipc_probe, retry_file_operation, AdmissionTimeout, ProbeAdmission, StartBarrier,
+    StartupDecision, DAEMON_EXIT_LOG_TAIL_BYTES,
 };
 
 fn windows_error(code: i32) -> io::Error {
@@ -242,4 +243,52 @@ fn timeout_zero_admission_refuses_a_second_slot_immediately() {
         })
         .expect("outer slot");
     assert!(start.elapsed() < Duration::from_millis(200));
+}
+
+#[test]
+fn a_dead_daemon_is_reported_with_its_own_exit_and_log() {
+    // CI's 128-daemon run failed three times as only "daemon 121 exited during
+    // startup": no exit status, and log samples from daemons 0-3 instead.
+    let mut log = Vec::new();
+    for line in 0..400 {
+        log.extend_from_slice(format!("early line {line}\n").as_bytes());
+    }
+    log.extend_from_slice(b"Error: Too many open files (os error 24)\n");
+    let report = daemon_exit_report(121, "startup", "exit status: 1", &log);
+    assert!(
+        report.starts_with("daemon 121 exited during startup (exit status: 1)"),
+        "{report}"
+    );
+    assert!(
+        report.ends_with("Error: Too many open files (os error 24)"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("early line 0\n"),
+        "the tail is bounded: {report}"
+    );
+    let tail = report
+        .split_once("its log ends:\n")
+        .expect("a log section")
+        .1;
+    assert!(
+        tail.len() <= DAEMON_EXIT_LOG_TAIL_BYTES,
+        "{} bytes",
+        tail.len()
+    );
+    assert!(
+        tail.starts_with("early line "),
+        "the tail starts on a whole line: {tail:.40}"
+    );
+
+    assert_eq!(
+        daemon_exit_report(7, "resync", "signal: 9 (SIGKILL)", b"\n  \n"),
+        "daemon 7 exited during resync (signal: 9 (SIGKILL)); its log is empty"
+    );
+    let unbroken = vec![b'x'; DAEMON_EXIT_LOG_TAIL_BYTES * 2];
+    let report = daemon_exit_report(1, "startup", "exit status: 2", &unbroken);
+    assert!(
+        report.ends_with(&"x".repeat(DAEMON_EXIT_LOG_TAIL_BYTES)),
+        "one long line keeps its window"
+    );
 }

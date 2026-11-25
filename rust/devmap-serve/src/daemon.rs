@@ -630,7 +630,7 @@ impl Daemon {
 
     /// Whether the walk in flight has been told to stop, by a drain or a
     /// shutdown. What a test observes instead of the walk's own thread.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn walk_in_flight_cancelled(&self) -> bool {
         let current = self.walk_token.lock().unwrap_or_else(|e| e.into_inner());
         current
@@ -3335,6 +3335,7 @@ mod tests {
         (root, store)
     }
 
+    #[cfg(unix)]
     fn persisted_paths(daemon: &Daemon) -> Vec<String> {
         let mut paths: Vec<String> = daemon
             .store

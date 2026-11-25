@@ -46,10 +46,7 @@ func TestASignalCancelsRunningCallsAndTheirProcessGroupsBeforeServeReturns(t *te
 				t.Errorf("Serve took %v to return after %v; the drain is bounded at 5s", took, sig)
 			}
 			// Serve has returned: nothing it started may still be running.
-			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-				t.Fatalf("pid %d outlived Serve after %v (kill -0: %v)", pid, sig, err)
-			}
+			requireStoppedAfterServe(t, pid, sig.String())
 			var stopped *mcp.SignalError
 			if !errors.As(served, &stopped) || stopped.Signal != sig {
 				t.Fatalf("Serve returned %v for %v, want a *mcp.SignalError naming it", served, sig)
