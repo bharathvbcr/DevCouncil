@@ -38,6 +38,7 @@ exported_unreferenced	apps/web/src/v/lexicalthis.ts::Gateway.open	nothing in the
 exported_unreferenced	apps/web/src/v/loggeruser.ts::useLogger	nothing in the fixture references it
 live	apps/web/src/v/spreadcore.ts::spreadCore	spread, aliased and Object.assign-ed by spreadbuild.ts (a module-scope reference to an exported const is not yet read as a use)
 live	apps/web/src/v/spreadcore.ts::spreadLater	spread by spreadbuild.ts layeredW (same gap as spreadCore)
+live	apps/web/src/ctx/AuthContext.tsx::makeAuth.signOut	factory-object member (extract 102); called as auth.signOut() in PaperList.tsx through useAuth()'s Auth type, which the resolver does not yet bind to makeAuth's returned literal
 exported_unreferenced	apps/web/src/v/spreadcore.ts::spreadCore.warn	probe member nothing calls
 exported_unreferenced	apps/web/src/v/spreaduser.ts::useSpread	probe nothing references
 exported_unreferenced	apps/web/src/v/spreaduser.ts::useAssign	probe nothing references

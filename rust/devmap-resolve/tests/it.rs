@@ -235,6 +235,8 @@ mod typed_receivers;
 #[cfg(feature = "parse")]
 mod typescript_core_shapes;
 #[cfg(feature = "parse")]
+mod typescript_factory_objects;
+#[cfg(feature = "parse")]
 mod typescript_interface_dispatch;
 #[cfg(feature = "parse")]
 mod typescript_object_spread;
