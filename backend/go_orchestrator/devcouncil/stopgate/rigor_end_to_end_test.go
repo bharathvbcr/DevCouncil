@@ -83,6 +83,17 @@ func newStore(t *testing.T) *store.Client {
 	return client
 }
 
+// useBuiltDCVerify points the host at the dcverify this test run built. The
+// host resolves dcverify off PATH, excluding candidates inside the repository
+// under analysis, then from ~/.local/bin. Without the override a test depended
+// on what happened to be there: an installed copy on a developer's machine,
+// and on CI rust/target/debug while that sat on PATH. When CI stopped putting
+// it there, every test that expects a verified verdict read "degraded".
+func useBuiltDCVerify(t *testing.T) {
+	t.Helper()
+	t.Setenv(dcverify.BinaryEnv, testsupport.DCVerify(t))
+}
+
 // TestTheShippedHostBlocksACredentialInTheWorkingTree is GAP-P7-DCVERIFY-UNWIRED
 // stated as a behaviour rather than as a wiring diagram.
 //
@@ -91,11 +102,7 @@ func newStore(t *testing.T) *store.Client {
 // `verify.Run` recorded `rigor_applied: []` and never spawned a verifier, so
 // nothing in the pipeline had looked at the added line at all.
 func TestTheShippedHostBlocksACredentialInTheWorkingTree(t *testing.T) {
-	// The host resolves dcverify off PATH, excluding candidates inside the
-	// repository under analysis. In this checkout the binary lives under the
-	// cargo target directory, so the override is how a test points at the build
-	// it just made rather than at whatever happens to be installed.
-	t.Setenv(dcverify.BinaryEnv, testsupport.DCVerify(t))
+	useBuiltDCVerify(t)
 
 	root := repoWithWorkingTreeChange(t, "src/handler.go",
 		"// placeholder\nconst awsKey = \"AKIAIOSFODNN7EXAMPLE\"\n")
@@ -140,7 +147,7 @@ func TestTheShippedHostBlocksACredentialInTheWorkingTree(t *testing.T) {
 // optional: a rigor layer that blocks everything is indistinguishable from one
 // that works, and far easier to write by accident.
 func TestACleanWorkingTreeStillVerifies(t *testing.T) {
-	t.Setenv(dcverify.BinaryEnv, testsupport.DCVerify(t))
+	useBuiltDCVerify(t)
 
 	root := repoWithWorkingTreeChange(t, "src/handler.go",
 		"// placeholder\nconst answer = 42\n")

@@ -1123,8 +1123,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v100 keeps a Python file's readable module-level `sys.path` entries and
     // adds a file-wide veto row when a module-level insert's directory cannot
     // be read (see cache.rs).
+    // v102 adds Svelte 5 `{@attach}` / `{...props}` / `{#each (... as T[]) as x}`
+    // repairs, error-localized TS/Rust/Shell parse repairs, Rust string
+    // line-continuation whitespace stripping, and JS/TS factory-returned object
+    // methods + factory return shape facts (see cache.rs).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "101",
+        EXTRACTION_SCHEMA_VERSION, "102",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

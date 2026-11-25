@@ -216,6 +216,10 @@ def main():
         root = Path(scratch)
         source = "def needle():\n    return 42\n\ndef caller():\n    return needle()\n"
         (root / "example.py").write_text(source)
+        # `federate` reads a multi-repo manifest; this one declares the fixture
+        # alone. Written before the build so the index is not stale against it.
+        federate_manifest = root / "federate.json"
+        federate_manifest.write_text('{"version": 1, "repos": [{"name": "fixture", "root": "."}]}\n')
         # `suspects` and `blast` read git history, so the fixture is a repository.
         for git_args in (["init", "-q"], ["add", "example.py"],
                          ["-c", "user.name=stress", "-c", "user.email=stress@example.invalid",
@@ -239,6 +243,10 @@ def main():
             ["ask", "where is needle defined"], ["skeleton", "example.py"],
             ["suspects", "needle", "--since", "HEAD"], ["blast", "--since", "HEAD"],
             ["literals", "needle"], ["doc-drift"], ["version"],
+            # Offline forms only: `cache push`/`pull` need a relay and a token.
+            ["cache", "status"],
+            ["federate", "status", "--workspace", str(federate_manifest)],
+            ["federate", "impact", "--workspace", str(federate_manifest), "needle"],
             ["gap-record", "--tool", "stress", "--gap-id", "stress", "--reason", "stress fixture"],
         ]
         for query in queries:
