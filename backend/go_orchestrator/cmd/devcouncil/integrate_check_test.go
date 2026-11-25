@@ -25,7 +25,8 @@ func integrateEnv(t *testing.T) (home, repo string) {
 	if err := os.MkdirAll(installedDir, 0o755); err != nil {
 		t.Fatalf("mkdir installed bin: %v", err)
 	}
-	devmapBin := filepath.Join(installedDir, "devmap")
+	// devmap.exe on Windows, or the staged copy is a file Windows will not run.
+	devmapBin := filepath.Join(installedDir, testsupport.ExecutableName("devmap"))
 	rawBin, err := os.ReadFile(builtBin)
 	if err != nil {
 		t.Fatalf("read built devmap: %v", err)
