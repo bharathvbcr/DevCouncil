@@ -1841,6 +1841,8 @@ fn create_private_temp_dir() -> Result<PathBuf> {
     let mix =
         sha256_hex(format!("{}-{nanos}-{}", std::process::id(), next_unique_suffix()).as_bytes());
     let tmp_dir = std::env::temp_dir().join(format!("devmap-cache-{}", &mix[..24]));
+    // Only Unix has a mode to set.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
