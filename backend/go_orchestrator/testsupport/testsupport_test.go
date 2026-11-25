@@ -554,6 +554,33 @@ func TestPublishedArtifactCarriesThePlatformExecutableName(t *testing.T) {
 	}
 }
 
+// TestAStableCopyIsNotUnderTheTestBinDirectory pins where StableCopy puts its
+// copies. devmap refuses to register an MCP command at any path that crosses a
+// testBinDir directory, so a stable copy there (where it used to go) made
+// `devmap integrate` refuse every test that drove it on Windows.
+func TestAStableCopyIsNotUnderTheTestBinDirectory(t *testing.T) {
+	temp := t.TempDir()
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(name, temp)
+	}
+	src := filepath.Join(t.TempDir(), ExecutableName("tool"))
+	if err := os.WriteFile(src, []byte("stable copy bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copied := StableCopy(t, src)
+	for part := range strings.SplitSeq(filepath.ToSlash(copied), "/") {
+		if part == testBinDir {
+			t.Fatalf("StableCopy put %s under a %s directory, which devmap refuses to register", copied, testBinDir)
+		}
+	}
+	if !strings.HasPrefix(copied, temp) {
+		t.Fatalf("StableCopy wrote %s outside the temp directory %s", copied, temp)
+	}
+	if data, err := os.ReadFile(copied); err != nil || string(data) != "stable copy bytes" {
+		t.Fatalf("the copy holds %q, %v", data, err)
+	}
+}
+
 // TestOnlyAnUpliftBlockedByARunningImageIsRetried pins what cargoBin treats as
 // transient. On Windows cargo cannot replace target/debug/<bin>.exe while
 // another package's test is running it and exits 101 with "Access is denied

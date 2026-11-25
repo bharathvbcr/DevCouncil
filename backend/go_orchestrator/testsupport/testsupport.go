@@ -342,6 +342,12 @@ func Devmap(t testing.TB) string {
 // package fail its uplift (see upliftBlockedByRunningImage). The copy lives in
 // the OS temp directory, named after its own hash, and is not removed: another
 // test process may be about to run it.
+//
+// It is not under a testBinDir directory. That name marks cargoBin's hashed
+// builds, and devmap refuses to register an MCP command at any path that
+// crosses it (`refuse_hashed_test_binary`), so a stable copy there failed every
+// test that drives `devmap integrate` on Windows, the one platform that copies:
+// "refusing to register an MCP command at ...\devcouncil-testbin\...".
 func StableCopy(t testing.TB, path string) string {
 	t.Helper()
 	data, err := readStableArtifact(path)
@@ -349,7 +355,7 @@ func StableCopy(t testing.TB, path string) string {
 		t.Fatalf("copying %s: %v", path, err)
 	}
 	binary := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	copied, err := publishArtifact(filepath.Join(os.TempDir(), "devcouncil-stable"), binary, data)
+	copied, err := publishInto(filepath.Join(os.TempDir(), "devcouncil-stable"), binary, data)
 	if err != nil {
 		t.Fatalf("copying %s: %v", path, err)
 	}
@@ -689,8 +695,13 @@ func readStableArtifact(path string) ([]byte, error) {
 // An entry that already exists is left alone: its name is its content, so it
 // cannot differ from what we would write.
 func publishArtifact(target, binary string, data []byte) (string, error) {
+	return publishInto(filepath.Join(target, testBinDir), binary, data)
+}
+
+// publishInto is publishArtifact under parent itself, with no testBinDir.
+func publishInto(parent, binary string, data []byte) (string, error) {
 	sum := sha256.Sum256(data)
-	dir := filepath.Join(target, testBinDir, binary+"-"+hex.EncodeToString(sum[:])[:16])
+	dir := filepath.Join(parent, binary+"-"+hex.EncodeToString(sum[:])[:16])
 	path := filepath.Join(dir, ExecutableName(binary))
 	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(data)) {
 		return path, nil
