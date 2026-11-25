@@ -170,6 +170,23 @@ type optArgs struct {
 	all map[string][]string
 	// missing reports an option that needed a value and had none.
 	missing bool
+	// operandAt is the index in args of each operand, in order.
+	operandAt []int
+	// seen is every option occurrence in command-line order, with where its
+	// name and its value stand in args.
+	seen []optOccurrence
+}
+
+// optOccurrence is one option as written.
+type optOccurrence struct {
+	name string // "-x" or "--name"
+	// at is the index in args of the word that names the option.
+	at int
+	// valueAt is the index of the word holding the value: at when the value is
+	// attached (`-A3`, `--glob=x`), a later word when it stood apart, -1 for a
+	// flag or a value that was missing.
+	valueAt int
+	value   string
 }
 
 // parseOptArgs splits args the way getopt does: clusters of short options, a
@@ -177,12 +194,29 @@ type optArgs struct {
 // options with their value after = or, for the names in longValue, in the next
 // word, and "--" ending the options. A lone "-" is an operand.
 func parseOptArgs(args []shellWord, shortValue string, longValue ...string) optArgs {
+	arity := make(map[string]int, len(longValue))
+	for _, name := range longValue {
+		arity[name] = 1
+	}
+	return parseOptArgsArity(args, shortValue, arity)
+}
+
+// parseOptArgsArity is parseOptArgs for long options that take more than one
+// word: longArity maps a name to how many words follow it (`jq --arg NAME
+// VALUE` takes two). The value recorded is the last of them.
+func parseOptArgsArity(args []shellWord, shortValue string, longArity map[string]int) optArgs {
 	out := optArgs{opts: map[string]string{}, all: map[string][]string{}}
+	record := func(name string, at, valueAt int, value string) {
+		out.opts[name] = value
+		out.all[name] = append(out.all[name], value)
+		out.seen = append(out.seen, optOccurrence{name: name, at: at, valueAt: valueAt, value: value})
+	}
 	endOfOptions := false
 	for k := 0; k < len(args); k++ {
 		w := args[k].text
 		if endOfOptions || w == "-" || !strings.HasPrefix(w, "-") {
 			out.operands = append(out.operands, w)
+			out.operandAt = append(out.operandAt, k)
 			continue
 		}
 		if w == "--" {
@@ -190,37 +224,44 @@ func parseOptArgs(args []shellWord, shortValue string, longValue ...string) optA
 			continue
 		}
 		if long, ok := strings.CutPrefix(w, "--"); ok {
+			at := k
 			name, value, hasValue := strings.Cut(long, "=")
-			if !hasValue && containsString(longValue, name) {
-				if k+1 >= len(args) {
+			valueAt := -1
+			if hasValue {
+				valueAt = at
+			} else if n := longArity[name]; n > 0 {
+				if k+n >= len(args) {
 					out.missing = true
+					k = len(args) - 1
 				} else {
-					k++
+					k += n
+					valueAt = k
 					value = args[k].text
 				}
 			}
-			out.opts["--"+name] = value
-			out.all["--"+name] = append(out.all["--"+name], value)
+			record("--"+name, at, valueAt, value)
 			continue
 		}
 		cluster := w[1:]
 		for c := 0; c < len(cluster); c++ {
+			name := "-" + string(cluster[c])
 			if strings.IndexByte(shortValue, cluster[c]) < 0 {
-				out.opts["-"+string(cluster[c])] = ""
-				out.all["-"+string(cluster[c])] = append(out.all["-"+string(cluster[c])], "")
+				record(name, k, -1, "")
 				continue
 			}
+			at, valueAt := k, k
 			value := cluster[c+1:]
 			if value == "" {
 				if k+1 >= len(args) {
 					out.missing = true
+					valueAt = -1
 				} else {
 					k++
+					valueAt = k
 					value = args[k].text
 				}
 			}
-			out.opts["-"+string(cluster[c])] = value
-			out.all["-"+string(cluster[c])] = append(out.all["-"+string(cluster[c])], value)
+			record(name, at, valueAt, value)
 			break
 		}
 	}
