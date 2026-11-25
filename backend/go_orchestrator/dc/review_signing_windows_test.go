@@ -41,7 +41,11 @@ func TestWindowsKeyDACLDecisions(t *testing.T) {
 	}{
 		{"owner only", ownerOnlySDDL, ""},
 		{"owner, SYSTEM and Administrators", "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)", ""},
-		{"a deny entry only narrows access", "D:P(D;;FR;;;BU)(A;;FA;;;OW)", ""},
+		// The deny names Anonymous Logon, which no owner's token holds. A deny
+		// to Users (the first version) also denies the owner, who is a member,
+		// and FR includes READ_CONTROL, so the descriptor itself could not be
+		// read and the load correctly failed closed.
+		{"a deny entry only narrows access", "D:P(D;;FR;;;AN)(A;;FA;;;OW)", ""},
 		{"Users", "D:P(A;;FA;;;OW)(A;;FR;;;BU)", "S-1-5-32-545"},
 		{"Authenticated Users", "D:P(A;;FA;;;OW)(A;;FR;;;AU)", "S-1-5-11"},
 		{"Everyone", "D:P(A;;FA;;;OW)(A;;FR;;;WD)", "S-1-1-0"},
