@@ -1,3 +1,4 @@
+use notify::event::ModifyKind;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -503,6 +504,28 @@ pub(crate) fn whole_tree_rescan(root: &Path) -> Vec<String> {
     vec![root.to_string_lossy().into_owned()]
 }
 
+/// Whether an event is the OS reporting that a directory itself was modified,
+/// as opposed to created, removed or renamed.
+///
+/// The Windows backend of `notify` watches `FILE_NOTIFY_CHANGE_LAST_WRITE` and
+/// maps `FILE_ACTION_MODIFIED` to `Modify(Any)` for whatever path it names
+/// (`notify-6.1.1/src/windows.rs`), and a directory whose last-write time moved
+/// because a child was created or written is such a path. Admitted, it queued
+/// the directory (`src`) after the child's own event: CI saw `src` pending once
+/// the control file had drained and the daemon had stopped (that the directory
+/// report arrives after the drain is inferred from that, not observed). The
+/// child's own event is the information; the parent's is a duplicate of it.
+/// Create, remove and rename of a directory are not touched by this.
+fn is_directory_self_modify(kind: &EventKind, is_dir: bool) -> bool {
+    is_dir
+        && matches!(
+            kind,
+            EventKind::Modify(
+                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other
+            )
+        )
+}
+
 /// The paths one watcher event asks the daemon to re-examine.
 ///
 /// Split out of the receive loop so each class of event can be asserted
@@ -535,6 +558,7 @@ fn watch_event_paths(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     ) {
+        let kind = event.kind;
         event
             .paths
             .into_iter()
@@ -555,6 +579,12 @@ fn watch_event_paths(
                         );
                         return whole_tree_rescan(root).into_iter().next();
                     }
+                }
+                // Only Windows reports a directory as modified because of what
+                // changed inside it; elsewhere such an event is a real change
+                // to the directory (a mode that lost `+x`) and stays admitted.
+                if cfg!(windows) && is_directory_self_modify(&kind, path.is_dir()) {
+                    return None;
                 }
                 admitted_watch_path(root, &path, ignore_cache)
             })
@@ -1885,6 +1915,50 @@ mod tests {
             walked.iter().all(|(path, _)| path != "x.ts"),
             "precondition: the cold walk excludes it too: {walked:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory reported as modified is not a change to anything in it.
+    #[test]
+    fn a_directory_reported_modified_is_not_a_change_to_its_contents() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::WriteTime)),
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+        ] {
+            assert!(is_directory_self_modify(&kind, true), "{kind:?}");
+            assert!(!is_directory_self_modify(&kind, false), "a file: {kind:?}");
+        }
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        ] {
+            assert!(
+                !is_directory_self_modify(&kind, true),
+                "a directory that appeared, vanished or moved is still a change: {kind:?}"
+            );
+        }
+    }
+
+    /// The Windows report of a directory modified because a child was written
+    /// reaches nothing, while the child's own event still does.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_modified_parent_directory_is_not_enqueued() {
+        let root = scratch_root("parent-modified");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/y.ts"), "export const y = 1;\n").unwrap();
+        let mut cache = IgnoreVerdictCache::default();
+        let parent =
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src"));
+        assert!(watch_event_paths(&root, parent, &mut cache).is_empty());
+        let child =
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src/y.ts"));
+        assert_eq!(watch_event_paths(&root, child, &mut cache).len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
