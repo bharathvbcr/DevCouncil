@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 func TestNormalizeEmptyIsOff(t *testing.T) {
@@ -353,7 +355,10 @@ func TestSetVerificationModeNeverShowsReadersAMissingConfig(t *testing.T) {
 				return
 			default:
 			}
-			if _, err := os.ReadFile(path); err != nil {
+			// The read every reader of this file uses: on Windows a plain
+			// os.ReadFile is refused while a rename lands, which is a wait,
+			// not a missing config.
+			if _, err := safefile.ReadFile(path); err != nil {
 				missing <- err
 				return
 			}
