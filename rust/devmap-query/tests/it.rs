@@ -111,6 +111,8 @@ mod preview_containment;
 #[cfg(feature = "parse")]
 mod preview_unreadable_file;
 #[cfg(feature = "parse")]
+mod qualified_symbol_queries;
+#[cfg(feature = "parse")]
 mod query_cancellation;
 #[cfg(feature = "parse")]
 mod refusal_cost_probe;
