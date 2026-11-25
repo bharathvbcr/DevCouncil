@@ -1,6 +1,7 @@
 package devmap
 
 import (
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -29,6 +30,24 @@ func TestPlainPathStripsOnlyTheVerbatimPrefixesThatNameADriveOrShare(t *testing.
 		if got := PlainPath(c.in); got != c.want {
 			t.Errorf("PlainPath(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestRelativeToPassesAPathOutsideTheRootThroughWhole: a path the root does not
+// contain is not a repository path, so it comes back as given, never as one
+// climbing out with `..`. On Windows filepath.Rel spells that climb `..\`,
+// which a "../" check missed: integrate's receipts were keyed
+// ../../../../../../runneradmin/... when the root was the 8.3 spelling of the
+// same temp directory.
+func TestRelativeToPassesAPathOutsideTheRootThroughWhole(t *testing.T) {
+	base := t.TempDir()
+	outside := filepath.Join(base, "other", "x.md")
+	if got := RelativeTo(filepath.Join(base, "repo"), outside); got != outside {
+		t.Fatalf("RelativeTo = %q, want the path itself, %q", got, outside)
+	}
+	inside := filepath.Join(base, "repo", ".agents", "a.md")
+	if got := RelativeTo(filepath.Join(base, "repo"), inside); got != ".agents/a.md" {
+		t.Fatalf("RelativeTo = %q, want .agents/a.md", got)
 	}
 }
 

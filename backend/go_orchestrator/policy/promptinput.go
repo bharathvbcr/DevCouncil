@@ -213,7 +213,9 @@ func lexicalRepoRel(root, raw string) (string, bool) {
 	}
 	if filepath.IsAbs(cleaned) {
 		rel, err := filepath.Rel(filepath.Clean(root), cleaned)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		// Slash form, as below: Windows answers `..\x`, which skipped the
+		// resolved-root retry and refused a path that was inside it.
+		if err != nil || rel == ".." || strings.HasPrefix(filepath.ToSlash(rel), "../") {
 			resolved, rerr := filepath.EvalSymlinks(root)
 			if rerr != nil {
 				return "", false

@@ -390,8 +390,16 @@ func RelativeTo(root, p string) string {
 		roots = append(roots, resolved)
 	}
 	for _, base := range roots {
-		if rel, err := filepath.Rel(base, p); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
-			return filepath.ToSlash(rel)
+		// Judged in slash form: filepath.Rel answers `..\x` on Windows, which a
+		// "../" prefix check never matched, so a path outside the first root
+		// tried (the 8.3 spelling of a temp dir, say) came back as
+		// ../../runneradmin/... instead of being tried against the next.
+		rel, err := filepath.Rel(base, p)
+		if err != nil {
+			continue
+		}
+		if rel = filepath.ToSlash(rel); rel != ".." && !strings.HasPrefix(rel, "../") {
+			return rel
 		}
 	}
 	return p
