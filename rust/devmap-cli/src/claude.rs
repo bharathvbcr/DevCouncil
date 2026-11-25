@@ -1159,7 +1159,7 @@ pub const MARKETPLACE_NAME: &str = "devmap-local";
 pub const MCP_SERVER_NAME: &str = "devmap";
 const PLUGIN_HOMEPAGE: &str = "https://github.com/bharathvbcr/DevCouncil";
 const PLUGIN_REPOSITORY: &str = "https://github.com/bharathvbcr/DevCouncil.git";
-const PLUGIN_LICENSE: &str = "Apache-2.0";
+const PLUGIN_LICENSE: &str = "MIT OR Apache-2.0";
 
 /// Bundle-relative path of the plugin mark, and the bytes themselves.
 ///

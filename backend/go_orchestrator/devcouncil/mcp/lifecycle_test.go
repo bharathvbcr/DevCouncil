@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -145,6 +146,44 @@ func waitGone(t *testing.T, pid int, what string) {
 	t.Fatalf("pid %d survived %s", pid, what)
 }
 
+// stoppedRunning reports whether pid has stopped running: it no longer exists,
+// or it is a zombie nobody has reaped yet. The group kill takes the `sh` parent
+// with it, so the `sleep` is reparented to init and reaped asynchronously, and
+// kill -0 succeeds on a zombie: an ESRCH-only check right after Serve returns
+// races the reaper, not the host. A ps that cannot be run fails closed.
+func stoppedRunning(pid int) bool {
+	if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		// ps lists nothing for a pid that is gone.
+		return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+	}
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+// requireStoppedAfterServe fails unless pid has stopped running once Serve has
+// returned. The short window covers SIGKILL delivery to a process the group
+// kill already reached; a process the host failed to kill is a `sleep` with
+// minutes left, so it is still running long after the window closes.
+func requireStoppedAfterServe(t *testing.T, pid int, what string) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !stoppedRunning(pid) {
+		if time.Now().After(deadline) {
+			err := syscall.Kill(pid, 0)
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("pid %d outlived Serve after %s (kill -0: %v)", pid, what, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 const sleeper = "sleep 120 & echo $! > PIDFILE; wait"
 
 func TestNotificationsCancelledStopsTheMatchingCall(t *testing.T) {
@@ -200,10 +239,7 @@ func TestEOFCancelsRunningCallsAndTheirProcessGroupsBeforeServeReturns(t *testin
 		t.Fatal("Serve did not return after stdin closed")
 	}
 	// Serve has returned: nothing it started may still be running.
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-		t.Fatalf("pid %d outlived Serve (kill -0: %v)", pid, err)
-	}
+	requireStoppedAfterServe(t, pid, "stdin closed")
 }
 
 // The budget of a call comes from DEVCOUNCIL_MCP_CALL_TIMEOUT_MS, and the

@@ -1,0 +1,37 @@
+name: DevCouncil PR Gate
+
+# Minimal, zero-checkout `pull_request` trigger for DevCouncil PR Gate.
+#
+# Security architecture:
+#   - This workflow runs with `permissions: contents: read` ONLY, checks out
+#     NOTHING, executes ZERO code from the PR, and uploads NO artifacts.
+#   - Its sole purpose is to trigger `.github/workflows/pr-gate-post.yml` via
+#     `on: workflow_run`, which GitHub ALWAYS executes from the trusted default
+#     branch — making both analysis AND status/comment posting completely immune
+#     to PR edits of `.github/workflows/pr-gate.yml` or attacker-added workflows.
+#   - Branch protection: require ONLY the `devcouncil/pr-gate` commit status
+#     (never `DevCouncil PR Gate (post)` or `(analysis)` job names: `workflow_run`
+#     check runs attach to the default branch, and a PR could define a same-named
+#     job), and protect `.github/workflows/**` with CODEOWNERS so same-repo PRs
+#     cannot introduce a workflow requesting `statuses: write`.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trigger:
+    name: DevCouncil PR Gate (trigger)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Trigger default-branch workflow_run analysis
+        run: echo "DevCouncil PR Gate trigger completed; trusted analysis runs in workflow_run."
