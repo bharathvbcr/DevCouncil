@@ -50,6 +50,13 @@ func setupGateWorktreeEnv(t *testing.T) (mainRoot, wtB, outsideDir string) {
 	return mainRoot, wtB, outsideDir
 }
 
+// shellPath spells a path for an unquoted word of a command line. The gate
+// parses the line as a shell does, where a backslash escapes the character
+// after it, so a Windows path pasted in as is (C:\Users\...) reaches it as
+// C:Users... and names nothing. Forward slashes are what git and every POSIX
+// shell on Windows accept, and the gate reads them as the same path.
+func shellPath(p string) string { return filepath.ToSlash(p) }
+
 func newGateAtRoot(t *testing.T, root string, overrides map[string]string) *Gate {
 	t.Helper()
 	reg := flags.New()
@@ -110,7 +117,7 @@ func TestGateRegisteredSiblingWorktreeWritesAndShellRedirects(t *testing.T) {
 	// pinned that as intended (2026-11-17 Fable ruling replaces it).
 	for _, cmd := range []string{
 		"git -C ../wt-b checkout -- docs/notes.md",
-		"git -C " + wtB + " checkout -- docs/notes.md",
+		"git -C " + shellPath(wtB) + " checkout -- docs/notes.md",
 	} {
 		d, err := g.EvaluateCommand(cmd, task)
 		if err != nil {
@@ -132,7 +139,7 @@ func TestGateRegisteredSiblingWorktreeWritesAndShellRedirects(t *testing.T) {
 	}
 
 	// Outside reads via jq/cat/head/sed -n pass the full gate, while sed -i write to outside fails as outside_root.
-	outFile := filepath.Join(outsideDir, "scratch.json")
+	outFile := shellPath(filepath.Join(outsideDir, "scratch.json"))
 	if err := os.WriteFile(outFile, []byte(`{"a":1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +226,7 @@ func TestGateRefusesAnUnjudgedWriteInARegisteredSiblingWorktree(t *testing.T) {
 	for name, task := range map[string]*dc.Task{"scoped": scoped, "unscoped": unscoped} {
 		for _, cmd := range []string{
 			"git -C ../wt-b apply fix.patch",
-			"git -C " + wtB + " apply fix.patch",
+			"git -C " + shellPath(wtB) + " apply fix.patch",
 			"git -C ../wt-b apply --apply fix.patch",
 		} {
 			d, err := g.EvaluateCommand(cmd, task)
@@ -283,7 +290,7 @@ func TestGateOnlyLetsGitReadAndRecordInARegisteredSiblingWorktree(t *testing.T) 
 	}
 	for name, task := range map[string]*dc.Task{"scoped": scoped, "unscoped": unscoped} {
 		for _, sub := range refused {
-			for _, target := range []string{"../wt-b", wtB} {
+			for _, target := range []string{"../wt-b", shellPath(wtB)} {
 				cmd := "git -C " + target + " " + sub
 				d, err := g.EvaluateCommand(cmd, task)
 				if err != nil {
