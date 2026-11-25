@@ -189,7 +189,14 @@ func TestResolveComponentRefusesLocalBinInsideRoot(t *testing.T) {
 // A file that is not executable is not a program, on either rung.
 func TestResolveComponentRefusesNonExecutableLocalBin(t *testing.T) {
 	root, home := componentFixture(t)
-	path := filepath.Join(home, ".local", "bin", toolFile)
+	// Windows has no execute bit: a file is a program by its extension, so
+	// tool-under-test.exe is one whatever it holds. The same refusal there is
+	// for a file whose name carries no executable extension.
+	name := toolFile
+	if runtime.GOOS == "windows" {
+		name = "tool-under-test"
+	}
+	path := filepath.Join(home, ".local", "bin", name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}

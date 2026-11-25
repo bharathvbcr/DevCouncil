@@ -536,7 +536,7 @@ func buildAndPublish(stop time.Time, boundBy, crates, crate, binary string) (str
 		return "", log.Bytes(), runErr
 	}
 
-	data, err := readStableArtifact(filepath.Join(target, "debug", executableName(binary)))
+	data, err := readStableArtifact(filepath.Join(target, "debug", ExecutableName(binary)))
 	if err != nil {
 		return "", log.Bytes(), err
 	}
@@ -691,7 +691,7 @@ func readStableArtifact(path string) ([]byte, error) {
 func publishArtifact(target, binary string, data []byte) (string, error) {
 	sum := sha256.Sum256(data)
 	dir := filepath.Join(target, testBinDir, binary+"-"+hex.EncodeToString(sum[:])[:16])
-	path := filepath.Join(dir, executableName(binary))
+	path := filepath.Join(dir, ExecutableName(binary))
 	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(data)) {
 		return path, nil
 	}
@@ -728,11 +728,12 @@ func publishArtifact(target, binary string, data []byte) (string, error) {
 	return path, nil
 }
 
-// executableName is the file name cargo gives a binary target on this
-// platform: the bare name, plus ".exe" on Windows. Looking for the bare name
-// there finds nothing, so every build was reported as unreadable after fifty
-// attempts although cargo had finished.
-func executableName(binary string) string {
+// ExecutableName is the file name a program has on this platform: the bare
+// name, plus ".exe" on Windows. Looking for the bare name there finds nothing,
+// so every cargo build was reported as unreadable after fifty attempts
+// although cargo had finished, and a test that plants a stand-in under the
+// bare name plants something Windows never runs.
+func ExecutableName(binary string) string {
 	if runtime.GOOS == "windows" {
 		return binary + ".exe"
 	}

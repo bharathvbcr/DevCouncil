@@ -537,8 +537,8 @@ func TestPublishedArtifactCarriesThePlatformExecutableName(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		want = "tool.exe"
 	}
-	if got := executableName("tool"); got != want {
-		t.Fatalf("executableName(%q) = %q, want %q on %s", "tool", got, want, runtime.GOOS)
+	if got := ExecutableName("tool"); got != want {
+		t.Fatalf("ExecutableName(%q) = %q, want %q on %s", "tool", got, want, runtime.GOOS)
 	}
 	path, err := publishArtifact(t.TempDir(), "tool", []byte("bytes"))
 	if err != nil {

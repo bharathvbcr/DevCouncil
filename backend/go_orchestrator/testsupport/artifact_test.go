@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -124,7 +125,7 @@ func TestPublishArtifactNamesTheCopyAfterItsContents(t *testing.T) {
 	}
 
 	sum := sha256.Sum256(data)
-	want := filepath.Join(target, testBinDir, "dcstore-"+hex.EncodeToString(sum[:])[:16], executableName("dcstore"))
+	want := filepath.Join(target, testBinDir, "dcstore-"+hex.EncodeToString(sum[:])[:16], ExecutableName("dcstore"))
 	if path != want {
 		t.Fatalf("published to\n  %s\nwant the content-addressed\n  %s\n"+
 			"the name is what lets concurrent processes converge without agreeing "+
@@ -143,7 +144,9 @@ func TestPublishArtifactNamesTheCopyAfterItsContents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat the published copy: %v", err)
 	}
-	if info.Mode().Perm()&0o111 == 0 {
+	// Windows has no execute bit: a file runs by its extension, which the
+	// name check above already pins to .exe, and its mode always reads 0666.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
 		t.Fatalf("the published copy is not executable (mode %v); every caller execs it",
 			info.Mode())
 	}

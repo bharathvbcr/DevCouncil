@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // The replay seeds its repository with git init, config and commit, run from
@@ -31,7 +32,8 @@ func TestSeedRepositoryNeverRunsAGitInsideTheCheckout(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n: > '"+marker+"'\n"), 0o755); err != nil {
+	// git.exe on Windows: a planted file Windows would not run tests nothing.
+	if err := os.WriteFile(filepath.Join(bin, testsupport.ExecutableName("git")), []byte("#!/bin/sh\n: > '"+marker+"'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
