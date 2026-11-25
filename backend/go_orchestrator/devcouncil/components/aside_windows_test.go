@@ -30,30 +30,11 @@ func TestHelperProcessSleeps(t *testing.T) {
 // now moves aside, the new one takes its name, and once the old process exits
 // the next install sweeps the aside copy away.
 func TestInstallAtomicReplacesARunningProgram(t *testing.T) {
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	image, err := os.ReadFile(self)
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "tool.exe")
-	if err := os.WriteFile(dest, image, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	cmd := runCopyOfSelf(t, dest)
 	src := filepath.Join(t.TempDir(), "new.exe")
 	if err := os.WriteFile(src, []byte("new"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, dest, "-test.run=^TestHelperProcessSleeps$")
-	proc.ConfigureGroup(cmd)
-	cmd.Env = append(os.Environ(), helperSleepEnv+"=1")
-	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	exited := false
@@ -81,4 +62,62 @@ func TestInstallAtomicReplacesARunningProgram(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertOnlyEntry(t, dir, "tool.exe")
+}
+
+// TestInstallHostWhileDevcouncilRuns: `devcouncil components install host` is
+// run by the devcouncil.exe it replaces. go build cannot write over a running
+// image on Windows, so the host is built in a stage and replaced like a
+// component.
+func TestInstallHostWhileDevcouncilRuns(t *testing.T) {
+	src := t.TempDir()
+	if err := osMkdirCheckout(src); err != nil {
+		t.Fatal(err)
+	}
+	prefix := t.TempDir()
+	bindir := filepath.Join(prefix, "bin")
+	if err := os.MkdirAll(bindir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(bindir, hostBinaryName())
+	cmd := runCopyOfSelf(t, out)
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	cs, err := Resolve([]string{"host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Install(cs, Options{Prefix: prefix, Runner: &fakeRunner{}, SourceRoot: src}); err != nil {
+		t.Fatalf("install host while devcouncil.exe runs: %v", err)
+	}
+	if got, _ := os.ReadFile(out); string(got) != "fake host build" {
+		t.Fatalf("devcouncil.exe holds %d bytes, want the new build", len(got))
+	}
+}
+
+// runCopyOfSelf copies this test binary to path and starts it sleeping, as a
+// stand-in for a component someone is running.
+func runCopyOfSelf(t *testing.T, path string) *exec.Cmd {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, image, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, path, "-test.run=^TestHelperProcessSleeps$")
+	proc.ConfigureGroup(cmd)
+	cmd.Env = append(os.Environ(), helperSleepEnv+"=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd
 }

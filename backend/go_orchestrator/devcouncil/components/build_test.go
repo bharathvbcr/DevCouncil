@@ -353,7 +353,7 @@ type envRunner struct {
 func (r *envRunner) Run(name string, args []string, dir string, env []string) error {
 	r.calls = append(r.calls, name+" "+strings.Join(args, " "))
 	r.envs = append(r.envs, env)
-	return nil
+	return writeGoBuildOutput(name, args)
 }
 
 // The host links the Gusset engine on Unix. Building it from a checkout must

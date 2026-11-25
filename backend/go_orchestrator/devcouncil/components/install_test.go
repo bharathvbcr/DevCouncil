@@ -17,6 +17,22 @@ type fakeRunner struct {
 
 func (f *fakeRunner) Run(name string, args []string, dir string, env []string) error {
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
+	return writeGoBuildOutput(name, args)
+}
+
+// writeGoBuildOutput leaves what a successful `go build -o out` leaves: a file
+// at out. Windows installs the host from that file (staged, then replaced
+// into bin, with the devc/dev aliases copied from it), so a fake that wrote
+// nothing failed the host step there for want of it.
+func writeGoBuildOutput(name string, args []string) error {
+	if name != "go" || len(args) == 0 || args[0] != "build" {
+		return nil
+	}
+	for i := range len(args) - 1 {
+		if args[i] == "-o" {
+			return os.WriteFile(args[i+1], []byte("fake host build"), 0o755)
+		}
+	}
 	return nil
 }
 

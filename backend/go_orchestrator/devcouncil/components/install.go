@@ -292,8 +292,13 @@ func PlannedCommands(cs []Component, o Options) []string {
 				cmds = append(cmds, fmt.Sprintf("bash %s  # build the Gusset engine; its CGO_* lines go to the next command",
 					shellQuote(filepath.Join(src, "rust", "gusset-engine", "cgo-env.sh"))))
 			}
-			cmds = append(cmds, fmt.Sprintf("go -C %s build -o %s ./cmd/devcouncil",
-				shellQuote(filepath.Join(src, "backend", "go_orchestrator")), shellQuote(out)))
+			if runtime.GOOS == "windows" {
+				cmds = append(cmds, fmt.Sprintf("go -C %s build -o <stage>\\%s ./cmd/devcouncil, then copy it beside %s and rename it into place (a running copy moves aside)",
+					shellQuote(filepath.Join(src, "backend", "go_orchestrator")), hostBinaryName(), shellQuote(out)))
+			} else {
+				cmds = append(cmds, fmt.Sprintf("go -C %s build -o %s ./cmd/devcouncil",
+					shellQuote(filepath.Join(src, "backend", "go_orchestrator")), shellQuote(out)))
+			}
 			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "devc"))))
 			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "dev"))))
 		} else {
@@ -527,8 +532,26 @@ func installHost(src, prefix string, o Options) error {
 				return fmt.Errorf("build host: %w", err)
 			}
 		}
-		if err := run.Run("go", []string{"build", "-o", out, "./cmd/devcouncil"}, mod, env); err != nil {
+		build := out
+		if runtime.GOOS == "windows" {
+			// Windows will not let go build write over a running
+			// devcouncil.exe, and the one running this install is usually
+			// it. Build in a stage and replace through installAtomic, which
+			// moves a running copy aside.
+			stage, err := os.MkdirTemp("", "devcouncil-host-")
+			if err != nil {
+				return fmt.Errorf("build host: %w", err)
+			}
+			defer os.RemoveAll(stage)
+			build = filepath.Join(stage, hostBinaryName())
+		}
+		if err := run.Run("go", []string{"build", "-o", build, "./cmd/devcouncil"}, mod, env); err != nil {
 			return fmt.Errorf("build host: %w", err)
+		}
+		if build != out {
+			if err := installAtomic(build, out); err != nil {
+				return fmt.Errorf("install host: %w", err)
+			}
 		}
 		signForMacOS(out, run)
 	} else {
