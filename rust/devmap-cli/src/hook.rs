@@ -596,7 +596,7 @@ pub fn select_roots(payload: &Value, pinned_root: Option<&Path>) -> anyhow::Resu
     }
 
     // Tier 3: cwd worktree
-    if let Some(cwd) = string_path(payload, "cwd") {
+    if let Some(cwd) = payload_cwd(payload) {
         let (selected, tier_capped) = store_roots_from([cwd]);
         capped |= tier_capped;
         if !selected.is_empty() {
@@ -743,6 +743,14 @@ fn string_path(payload: &Value, key: &str) -> Option<PathBuf> {
     payload.get(key).and_then(Value::as_str).map(PathBuf::from)
 }
 
+/// The payload's `cwd`, only when it is a directory that exists. Nothing runs
+/// in a directory that does not exist, nor in a file, so such a `cwd` names no
+/// tree. Walking up from it found the nearest indexed ancestor and started a
+/// build there for a command that never ran in that checkout.
+fn payload_cwd(payload: &Value) -> Option<PathBuf> {
+    string_path(payload, "cwd").filter(|cwd| cwd.is_dir())
+}
+
 /// A character that would open another line, reorder, hide text or otherwise
 /// act as a control inside hook context: the shared agent-visible set
 /// ([`devmap_query::bounded::is_agent_unsafe`]). Tab is spacing, not a new
@@ -812,7 +820,7 @@ fn unindexed_context_name(root: &Path) -> String {
 /// worktree is no decision the hook takes on the user's behalf. Any other
 /// unindexed tree keeps the rule that a hook never creates a store.
 fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value> {
-    let cwd = canonicalize_existing(&string_path(payload, "cwd")?).ok()?;
+    let cwd = canonicalize_existing(&payload_cwd(payload)?).ok()?;
     let root = devmap_extract::git_worktree_root(&cwd)?;
     if is_unsafe_root(&root) || store_exists(&root) {
         return None;
@@ -2951,7 +2959,7 @@ fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, 
         candidates.push(fp);
     }
     candidates.extend(apply_patch_paths(payload));
-    if let Some(cwd) = string_path(payload, "cwd") {
+    if let Some(cwd) = payload_cwd(payload) {
         candidates.push(cwd);
     }
     for candidate in candidates.into_iter().take(MAX_HOOK_ROOT_CANDIDATES) {
@@ -6623,7 +6631,15 @@ mod tests {
     }
 
     /// A working directory that names no indexed repository starts nothing and
-    /// creates nothing, however it is spelled.
+    /// creates nothing, however it is spelled. That includes one that does not
+    /// exist inside an indexed checkout: a shell cannot run there, so walking up
+    /// from it to the checkout's store starts a build for a command that never
+    /// ran in that tree.
+    ///
+    /// The builds are detached, so the stand-in records its start some time
+    /// after the hook returns, and a count taken at once usually reads 0 even
+    /// when a build was scheduled. The coalescing locks are taken before the
+    /// spawn, so their absence is the check that does not depend on timing.
     #[cfg(unix)]
     #[test]
     fn a_hostile_shell_cwd_starts_nothing_and_creates_nothing() {
@@ -6644,6 +6660,9 @@ mod tests {
             PathBuf::from("relative/path"),
             PathBuf::from(""),
             lane.main.join("a.rs/not-a-dir"),
+            lane.main.join("gone"),
+            lane.lane.join("a.rs/not-a-dir"),
+            lane.lane.join("a.rs"),
         ];
         for cwd in cwds {
             for command in ["git merge feature", "rm x"] {
@@ -6657,6 +6676,11 @@ mod tests {
                     outcome.exit_code != 2,
                     "{cwd:?}: {command}: {:?}",
                     outcome.stderr_line
+                );
+                assert!(
+                    !lane.main_lock().exists() && !lane.lock().exists(),
+                    "{cwd:?}: {command}: a build was scheduled for {:?}",
+                    outcome.roots
                 );
             }
         }
