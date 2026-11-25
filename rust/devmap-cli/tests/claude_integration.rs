@@ -942,7 +942,7 @@ fn the_plugin_manifest_carries_every_identity_field() {
         );
     }
     assert_eq!(
-        manifest["license"], "Apache-2.0",
+        manifest["license"], "MIT OR Apache-2.0",
         "both bundles ship the repository's own license"
     );
     std::fs::remove_dir_all(&dir).ok();

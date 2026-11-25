@@ -28,28 +28,40 @@ fn the_declared_license_is_the_one_the_repository_ships() {
     // declaration rather than a copy of it that could itself drift.
     let declared = env!("CARGO_PKG_LICENSE");
     assert_eq!(
-        declared, "Apache-2.0",
-        "the crate declares {declared:?}; the repository's LICENSE is Apache-2.0"
+        declared, "MIT OR Apache-2.0",
+        "the crate declares {declared:?}; the repository is dual-licensed MIT OR Apache-2.0"
     );
 
-    let license = repo_root().join("LICENSE");
+    let root = repo_root();
+    let license = root.join("LICENSE");
     let text = std::fs::read_to_string(&license)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", license.display()));
     assert!(
-        text.contains("Apache License") && text.contains("Version 2.0"),
-        "LICENSE is not the Apache 2.0 text the manifest declares"
+        text.contains("LICENSE-MIT") && text.contains("LICENSE-APACHE"),
+        "LICENSE must point to both LICENSE-MIT and LICENSE-APACHE"
     );
+
+    let apache = root.join("LICENSE-APACHE");
+    let apache_text = std::fs::read_to_string(&apache)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", apache.display()));
     assert!(
-        !text.contains("Permission is hereby granted, free of charge"),
-        "LICENSE contains the MIT grant"
+        apache_text.contains("Apache License") && apache_text.contains("Version 2.0"),
+        "LICENSE-APACHE is not the Apache 2.0 text the manifest declares"
+    );
+
+    let mit = root.join("LICENSE-MIT");
+    let mit_text = std::fs::read_to_string(&mit)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", mit.display()));
+    assert!(
+        mit_text.contains("Permission is hereby granted, free of charge"),
+        "LICENSE-MIT is not the MIT License text the manifest declares"
     );
 }
 
 #[test]
 fn every_workspace_manifest_declares_that_same_license() {
-    // One `LICENSE` governs the tree, so a second workspace declaring something
-    // else is the same defect in another file. `rust/` (the dc-* analysis
-    // plane) declared MIT for exactly as long as this one did.
+    // One dual license governs the tree, so a second workspace declaring something
+    // else is the same defect in another file.
     let root = repo_root();
     let mut checked = 0usize;
     for manifest in ["rust/Cargo.toml"] {
@@ -65,7 +77,7 @@ fn every_workspace_manifest_declares_that_same_license() {
             .unwrap_or_else(|| panic!("{manifest} declares no license"));
         assert_eq!(
             line.trim(),
-            r#"license = "Apache-2.0""#,
+            r#"license = "MIT OR Apache-2.0""#,
             "{manifest} disagrees with the repository's LICENSE"
         );
         checked += 1;
@@ -77,8 +89,8 @@ fn every_workspace_manifest_declares_that_same_license() {
 #[test]
 fn the_plugin_manifest_emits_the_license_the_crate_declares() {
     // The plugin bundle is what a user installs, and its manifest names a
-    // licence. It said Apache-2.0 while the crate said MIT.
-    let plugin_license = "Apache-2.0";
+    // licence. Keep it aligned with the crate's declared SPDX expression.
+    let plugin_license = "MIT OR Apache-2.0";
     assert_eq!(
         env!("CARGO_PKG_LICENSE"),
         plugin_license,

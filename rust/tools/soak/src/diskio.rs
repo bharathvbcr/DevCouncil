@@ -393,7 +393,23 @@ mod tests {
             file.write_all(&vec![1u8; 2 * MIB as usize]).expect("write");
             file.sync_all().expect("sync");
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Wait for the sampler to record the write rather than for a fixed
+        // time: on a loaded runner its thread can get fewer turns than the
+        // interval promises (a macOS CI run saw 2 readings after 100 ms).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = sampler.readings();
+            let grew = match (seen.first(), seen.last()) {
+                (Some(first), Some(last)) => {
+                    last.counters.logical_bytes - first.counters.logical_bytes >= 2 * MIB
+                }
+                _ => false,
+            };
+            if (seen.len() >= 3 && grew) || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let (readings, failure) = sampler.finish();
         let _ = std::fs::remove_file(&path);
         assert!(failure.is_none(), "{failure:?}");

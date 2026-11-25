@@ -60,6 +60,14 @@ pub(crate) struct Args {
     /// refresh only the block and need no flag.
     #[arg(long, requires = "guides")]
     pub(crate) adopt_guides: bool,
+    /// Write `repo_map.json` only and skip serializing/writing `code_graph.json`.
+    ///
+    /// Preserves any existing `code_graph.json` record (with its original
+    /// generation) in the artifact sidecar so `devmap status` accurately
+    /// reports `repo_map` as current and `code_graph` as lagging without
+    /// paying to rewrite a multi-tens-of-MB code graph on routine refreshes.
+    #[arg(long, conflicts_with_all = ["graph_output", "compact_graph_output"])]
+    pub(crate) repo_map_only: bool,
     /// Replace a Python-schema or otherwise foreign repo map / code graph.
     #[arg(long, default_value_t = false)]
     pub(crate) force: bool,
@@ -77,6 +85,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         compact_graph_output,
         guides,
         adopt_guides,
+        repo_map_only,
         force,
         stamps,
         inventory,
@@ -91,6 +100,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             output: &resolve_map_output(output, path),
             graph_output: &resolve_graph_output(graph_output, path),
             compact_graph_output: compact_graph_output.as_deref(),
+            include_code_graph: !*repo_map_only,
             force: *force,
             stamps,
             inventory: (*inventory).into(),
@@ -124,6 +134,9 @@ pub(crate) struct ManifestRequest<'a> {
     pub(crate) output: &'a std::path::Path,
     pub(crate) graph_output: &'a std::path::Path,
     pub(crate) compact_graph_output: Option<&'a std::path::Path>,
+    /// When `false` (`--repo-map` / `--repo-map-only`), emit `repo_map.json`
+    /// only and skip generating or rewriting `code_graph.json`.
+    pub(crate) include_code_graph: bool,
     pub(crate) force: bool,
     pub(crate) stamps: &'a StampFlags,
     pub(crate) inventory: InventoryLimits,
@@ -140,7 +153,7 @@ pub(crate) struct ManifestOutcome {
     /// therefore ours to leave" are different facts and only one is a problem.
     guides: Vec<devmap_query::guides::GuideOutcome>,
     output: std::path::PathBuf,
-    graph_output: std::path::PathBuf,
+    graph_output: Option<std::path::PathBuf>,
     compact_graph_output: Option<std::path::PathBuf>,
     generation_id: u32,
     /// True when the artifacts on disk were already exactly the ones this run
@@ -364,24 +377,34 @@ pub(crate) fn write_consumer_artifacts(
     let stamp_generated_head = stamped.generated_head.clone();
 
     let stamp_path = artifact_stamp_path(request.db);
+    let previous_stamp = ArtifactStamp::read(&stamp_path);
     // Role, not position: the sidecar is read by consumers that cannot rebuild
     // the writer's spelling of these paths, so each output is named.
-    let mut outputs: Vec<(&str, &std::path::Path)> = vec![
-        ("repo_map", dest.as_path()),
-        ("code_graph", graph_dest.as_path()),
-    ];
-    if let Some(compact) = &compact_dest {
-        outputs.push(("compact_graph", compact.as_path()));
+    let mut outputs: Vec<(&str, &std::path::Path)> = vec![("repo_map", dest.as_path())];
+    if request.include_code_graph {
+        outputs.push(("code_graph", graph_dest.as_path()));
+        if let Some(compact) = &compact_dest {
+            outputs.push(("compact_graph", compact.as_path()));
+        }
     }
     let stamp_holds = phase(request.progress, "artifacts:stamp_check", || {
-        Ok(ArtifactStamp::read(&stamp_path)
-            .is_some_and(|stamp| stamp.still_current(&inputs, &outputs)))
+        Ok(previous_stamp.as_ref().is_some_and(|stamp| {
+            if request.include_code_graph {
+                stamp.still_current(&inputs, &outputs)
+            } else {
+                stamp.still_current_roles(&inputs, &outputs)
+            }
+        }))
     })?;
     if stamp_holds {
         return Ok(ManifestOutcome {
             output: dest,
-            graph_output: graph_dest,
-            compact_graph_output: compact_dest,
+            graph_output: request.include_code_graph.then_some(graph_dest),
+            compact_graph_output: if request.include_code_graph {
+                compact_dest
+            } else {
+                None
+            },
             generation_id: gen_id,
             artifacts_unchanged: true,
             guides,
@@ -419,22 +442,29 @@ pub(crate) fn write_consumer_artifacts(
                 &edges,
                 Some(tree.as_path()),
             );
-            let (graph_json, compact_graph_json) = generate_code_graph_encodings(
-                &extractions,
-                &analysis,
-                &edges,
-                &freshness,
-                repo_root.as_deref(),
-                compact_dest.is_some(),
-            )?;
+            let (graph_json, compact_graph_json) = if request.include_code_graph {
+                let (graph, compact) = generate_code_graph_encodings(
+                    &extractions,
+                    &analysis,
+                    &edges,
+                    &freshness,
+                    repo_root.as_deref(),
+                    compact_dest.is_some(),
+                )?;
+                (Some(graph), compact)
+            } else {
+                (None, None)
+            };
             Ok((json_str, graph_json, compact_graph_json))
         })?;
 
     phase(request.progress, "artifacts:write", || {
         ensure_parent(&dest)?;
         write_manifest_atomically(&dest, &json_str, request.force)?;
-        ensure_parent(&graph_dest)?;
-        write_verbose_code_graph_atomically(&graph_dest, &graph_json, request.force)?;
+        if let Some(graph_json) = &graph_json {
+            ensure_parent(&graph_dest)?;
+            write_verbose_code_graph_atomically(&graph_dest, graph_json, request.force)?;
+        }
         // Written through the same clobber guard as the verbose artifact. A
         // foreign file at this path is refused for the same reason: the guard's
         // question is "did this kernel write what is already here", and the
@@ -460,6 +490,11 @@ pub(crate) fn write_consumer_artifacts(
     phase(request.progress, "artifacts:stamp_write", || {
         match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
             Ok(stamp) => {
+                let stamp = if request.include_code_graph {
+                    stamp
+                } else {
+                    stamp.with_preserved_outputs(previous_stamp.as_ref())
+                };
                 if let Err(error) = stamp.write(&stamp_path) {
                     note(format!(
                         "  note: could not record the artifact stamp at {} ({error}); \
@@ -478,8 +513,12 @@ pub(crate) fn write_consumer_artifacts(
 
     Ok(ManifestOutcome {
         output: dest,
-        graph_output: graph_dest,
-        compact_graph_output: compact_dest,
+        graph_output: request.include_code_graph.then_some(graph_dest),
+        compact_graph_output: if request.include_code_graph {
+            compact_dest
+        } else {
+            None
+        },
         generation_id: gen_id,
         artifacts_unchanged: false,
         guides,
@@ -494,15 +533,25 @@ pub(crate) fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::R
         return emit_json(cli, &manifest_json(outcome));
     }
     if outcome.artifacts_unchanged {
-        outln!(
-            "Artifacts already current for generation #{} ({:?}, {:?}).",
-            outcome.generation_id,
-            outcome.output,
-            outcome.graph_output
-        );
+        if let Some(graph_output) = &outcome.graph_output {
+            outln!(
+                "Artifacts already current for generation #{} ({:?}, {:?}).",
+                outcome.generation_id,
+                outcome.output,
+                graph_output
+            );
+        } else {
+            outln!(
+                "Repo map already current for generation #{} ({:?}).",
+                outcome.generation_id,
+                outcome.output,
+            );
+        }
     } else {
         outln!("Manifest written to {:?}", outcome.output);
-        outln!("Code graph written to {:?}", outcome.graph_output);
+        if let Some(graph_output) = &outcome.graph_output {
+            outln!("Code graph written to {:?}", graph_output);
+        }
         if let Some(destination) = &outcome.compact_graph_output {
             outln!("Interned code graph written to {:?}", destination);
         }

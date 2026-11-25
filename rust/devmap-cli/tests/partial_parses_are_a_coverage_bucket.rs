@@ -10,6 +10,12 @@
 //! grammar mis-parses; the fixture here is `suspend { … }` — the standard
 //! library's `suspend` function with a trailing lambda, valid Kotlin the linked
 //! grammar turns into an error region that swallows the rest of the file.
+//!
+//! Extraction schema 102 repairs `import('m').Ref<T>` before parsing (see
+//! `devmap-extract/tests/parse_repair_regressions.rs`), so that line no longer
+//! leaves an error region. The TypeScript fixtures below use an unclosed type
+//! literal instead (`type R<T> = { a: T;`), which still swallows every later
+//! declaration — the same shape of loss the audit found.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,7 +81,7 @@ fn the_ts_import_type_erasure_is_listed_and_caveats_dead_and_impact() {
     std::fs::write(
         root.join("contexts/AuthContext.tsx"),
         "import { readSession } from './session';\n\
-         type R<T> = import('m').Ref<T>;\n\
+         type R<T> = { a: T;\n\
          export function AuthProvider() { return null; }\n\
          export function useAuth() { return readSession(); }\n",
     )
@@ -292,7 +298,7 @@ fn an_extension_function_beside_a_kotlin_error_region_is_emitted_or_covered() {
 #[test]
 fn the_capped_partial_parse_listing_keeps_the_biggest_hole() {
     let root = scratch("cap-order");
-    let erasure = "type R<T> = import('m').Ref<T>;\n";
+    let erasure = "type R<T> = { a: T;\n";
     for index in 0..(devmap_store::COVERAGE_GAP_SAMPLE + 5) {
         std::fs::write(
             root.join(format!("a{index:02}.tsx")),
