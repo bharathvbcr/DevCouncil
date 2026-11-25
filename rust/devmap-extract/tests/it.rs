@@ -142,6 +142,8 @@ mod non_swift_byte_compare;
 mod notebook_completeness;
 mod one_ignore_owner;
 #[cfg(feature = "parse")]
+mod parse_repair_regressions;
+#[cfg(feature = "parse")]
 mod powershell_stays_pattern_recovered;
 #[cfg(feature = "parse")]
 mod python_attack3_fixes;

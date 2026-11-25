@@ -141,3 +141,113 @@ fn code_that_holds_an_ampersand_is_untouched() {
         assert!(is_clean(&e), "{source:?}: {:?}", e.parse_outcome);
     }
 }
+
+#[test]
+fn svelte5_attachments_parse_clean_and_extract_references_and_calls() {
+    let source = "\
+<script lang=\"ts\">
+  function trackMenu(node: HTMLElement) { return () => {}; }
+  function watchActivity(key: string) { return (node: HTMLElement) => {}; }
+  let activityKey = \"k\";
+</script>
+<div {@attach trackMenu} {@attach watchActivity(activityKey)}>hi</div>
+";
+    let e = ex("src/Menu.svelte", source);
+    assert!(is_clean(&e), "outcome: {:?}", e.parse_outcome);
+    assert!(
+        e.references.iter().any(|r| r.name == "trackMenu"),
+        "missing trackMenu reference: {:?}",
+        e.references
+    );
+    assert!(
+        e.calls.iter().any(|c| c.callee_name == "watchActivity"),
+        "missing watchActivity call: {:?}",
+        e.calls
+    );
+    assert!(
+        e.references.iter().any(|r| r.name == "activityKey"),
+        "missing activityKey reference: {:?}",
+        e.references
+    );
+}
+
+#[test]
+fn svelte5_attachment_marker_inside_script_style_comment_or_attr_is_not_rewritten() {
+    let source = "\
+<script lang=\"ts\">
+  const doc = \"<div {@attach raw}>\";
+  function ok() { return doc; }
+</script>
+<!-- <div {@attach commented}> -->
+<div title=\"literal @attach text\" data-a=\"1\">{ok()}</div>
+<style>/* <div {@attach styled}> */</style>
+";
+    let e = ex("src/NonAttach.svelte", source);
+    assert!(is_clean(&e), "outcome: {:?}", e.parse_outcome);
+    assert!(
+        e.literals.iter().any(|l| l.value == "<div {@attach raw}>"),
+        "script literal must keep original bytes: {:?}",
+        e.literals
+    );
+    assert!(
+        !e.references
+            .iter()
+            .any(|r| r.name == "commented" || r.name == "styled"),
+        "comment/style attachments must not become code references: {:?}",
+        e.references
+    );
+}
+
+#[test]
+fn svelte_spread_attributes_parse_clean_while_bare_spread_stays_partial() {
+    let valid = "\
+<script lang=\"ts\">
+  function extraAttrs(id: string) { return { id }; }
+  let { ...rest } = $props();
+</script>
+<button {...rest} {...extraAttrs(\"ok\")}>go</button>
+";
+    let e = ex("src/Spread.svelte", valid);
+    assert!(is_clean(&e), "outcome: {:?}", e.parse_outcome);
+    assert!(
+        e.references.iter().any(|r| r.name == "rest"),
+        "missing rest reference: {:?}",
+        e.references
+    );
+    assert!(
+        e.calls.iter().any(|c| c.callee_name == "extraAttrs"),
+        "missing extraAttrs call: {:?}",
+        e.calls
+    );
+
+    let broken = "<button {...}>bad</button>\n";
+    let b = ex("src/BadSpread.svelte", broken);
+    assert!(
+        matches!(b.parse_outcome, ParseOutcome::Partial { .. }),
+        "bare {{...}} must stay Partial, got {:?}",
+        b.parse_outcome
+    );
+}
+
+#[test]
+fn svelte_each_with_ts_as_assertion_parses_clean_and_binds_loop_item() {
+    let source = "\
+<script lang=\"ts\">
+  type Tool = \"devmap\" | \"manvi\";
+  function label(t: Tool) { return t; }
+</script>
+{#each ([\"devmap\", \"manvi\"] as Tool[]) as t (t)}
+  <span>{label(t)}</span>
+{/each}
+{#each [\"a\", \"b\"] as item, idx}
+  <span>{item}{idx}</span>
+{/each}
+";
+    let e = ex("src/EachAs.svelte", source);
+    assert!(is_clean(&e), "outcome: {:?}", e.parse_outcome);
+    assert!(
+        e.calls.iter().any(|c| c.callee_name == "label"),
+        "missing label call: {:?}",
+        e.calls
+    );
+}

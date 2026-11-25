@@ -363,6 +363,12 @@ fn literal_tree(revision: usize, modules: usize) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Largest share of a write the unnamed remainder may take.
+const OTHER_SHARE_LIMIT: f64 = 0.25;
+
+/// One trial's shape, its `other` fraction, and every named span's seconds.
+type Trial<'a> = (&'a str, f64, Vec<(&'static str, f64)>);
+
 /// The three regions that used to hide in `other` have names, and with them
 /// `other` is a minor remainder rather than half the write.
 ///
@@ -379,9 +385,14 @@ fn literal_tree(revision: usize, modules: usize) -> Vec<(String, String)> {
 /// to a fresh store. That does not loosen what it guards: a region hiding in
 /// `other` (the 30–55% this test was written against) is in every trial, so
 /// the best of them still fails. Every trial must charge every named span.
-/// One trial's shape, its `other` fraction, and every named span's seconds.
-type Trial<'a> = (&'a str, f64, Vec<(&'static str, f64)>);
-
+///
+/// The bound is `OTHER_SHARE_LIMIT`, 25%. The regression this guards is
+/// `other` at 55% of the write (1.63 s of 2.96 s). The bound was 15%, a local
+/// measurement; ubuntu CI's debug build measured the cold write's `other` at
+/// 15.1% twice (18 ms of a 121 ms write, where fixed per-write costs that no
+/// span names weigh more), so 15% sat on that runner's steady value, not above
+/// it, and a steady value is not noise that more trials remove. 25% clears it
+/// and still fails the 55% shape by a wide margin.
 #[test]
 fn the_regions_that_hid_in_other_are_named_and_other_is_a_remainder() {
     const TRIALS: usize = 3;
@@ -444,9 +455,10 @@ fn the_regions_that_hid_in_other_are_named_and_other_is_a_remainder() {
             .map(|(_, fraction, _)| *fraction)
             .fold(f64::INFINITY, f64::min);
         assert!(
-            best < 0.15,
-            "{shape}: `other` is at least {:.1}% of the write in all {TRIALS} trials, not under 15%: {:?}",
+            best < OTHER_SHARE_LIMIT,
+            "{shape}: `other` is at least {:.1}% of the write in all {TRIALS} trials, not under {:.0}%: {:?}",
             100.0 * best,
+            100.0 * OTHER_SHARE_LIMIT,
             trials
                 .iter()
                 .map(|(_, fraction, parts)| (format!("{:.1}%", 100.0 * fraction), parts))

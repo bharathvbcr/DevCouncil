@@ -64,7 +64,7 @@ edition = "2021"
 # so it is the only one this workspace can claim to support.
 rust-version = "1.100"
 authors = ["DevCouncil Team"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 
 # Kernel crates share grammar and runtime deps. Analysis-plane crates that
