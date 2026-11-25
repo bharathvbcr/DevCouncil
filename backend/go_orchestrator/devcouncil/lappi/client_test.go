@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -298,9 +299,17 @@ func TestAReplyWrittenAtAcceptIsReadEvenWhenTheRequestWriteFails(t *testing.T) {
 		if err := l.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if res.Reading != BackendFailed || res.Kind != "deadline_exceeded" {
-			t.Fatalf("round %d: got %s/%q, want backend_failed/deadline_exceeded", round, res.Reading, res.Kind)
+		if res.Reading == BackendFailed && res.Kind == "deadline_exceeded" {
+			continue
 		}
+		// Windows closes a socket with unread data abortively, and the reset
+		// discards what the peer had buffered but not yet read: the reply is
+		// gone before the client can read it. That is a hang-up, and must
+		// read as one; nothing else is acceptable there either.
+		if runtime.GOOS == "windows" && res.Reading == Unavailable && res.Kind == UnavailableClosedWithoutReply {
+			continue
+		}
+		t.Fatalf("round %d: got %s/%q, want backend_failed/deadline_exceeded", round, res.Reading, res.Kind)
 	}
 }
 
