@@ -11,6 +11,7 @@ pub(crate) mod ask;
 pub(crate) mod ast;
 pub(crate) mod blast;
 pub(crate) mod build;
+pub(crate) mod cache;
 pub(crate) mod claude;
 pub(crate) mod clones;
 pub(crate) mod cypher;
@@ -20,6 +21,7 @@ pub(crate) mod doc_drift;
 pub(crate) mod doctor;
 pub(crate) mod explore;
 pub(crate) mod export;
+pub(crate) mod federate;
 pub(crate) mod freshness;
 pub(crate) mod gap_record;
 pub(crate) mod history;
@@ -56,6 +58,7 @@ pub(crate) mod workspace;
 pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build(args) => build::run(cli, progress, args),
+        Commands::Cache(args) => cache::run(cli, args),
         Commands::Seed(args) => seed::run(cli, args),
         Commands::Search(args) => search::run(cli, args),
         Commands::Ask(args) => ask::run(cli, args),
@@ -73,6 +76,7 @@ pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyho
         Commands::Affected(args) => affected::run(cli, args),
         Commands::Preview(args) => preview::run(cli, args),
         Commands::Workspace(args) => workspace::run(cli, args),
+        Commands::Federate(args) => federate::run(cli, args),
         Commands::Savings(args) => savings::run(cli, args),
         Commands::Clones(args) => clones::run(cli, args),
         Commands::Manifest(args) => manifest::run(cli, args),

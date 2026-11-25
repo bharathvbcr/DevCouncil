@@ -186,6 +186,47 @@ fn the_version_line_names_the_resolution_reuse_epoch() {
     );
 }
 
+/// The version line names the stacked-worktree lease format this binary reads
+/// and writes.
+///
+/// GitPulse's schema parity check judges the `devmap` on `PATH` by its
+/// `--version` line alone and reads `/stack lease format (\d+)/` (standalone,
+/// ended by `,`). Without the phrase it reported every installed build as
+/// unverifiable for the lease format. The number must be this binary's own
+/// `STACK_FORMAT_VERSION`, named exactly once, after the extraction schema (so
+/// the first-`schema` parsers keep reading the store number) and before the
+/// resolution reuse epoch (which must stay immediately before the build id).
+#[test]
+fn the_version_line_names_the_stack_lease_format() {
+    let root = fixture("version-stack-lease");
+    let output = run(&root, &["--version"]);
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let phrase = format!("stack lease format {}", devmap_query::STACK_FORMAT_VERSION);
+    let at = text
+        .find(&phrase)
+        .unwrap_or_else(|| panic!("the lease format must be named as {phrase:?}: {text:?}"));
+    assert_eq!(
+        text.matches("stack lease format").count(),
+        1,
+        "the lease format must be named once, or a parity reader sees two answers: {text:?}"
+    );
+    assert!(
+        text[at + phrase.len()..].starts_with(", "),
+        "the lease format number must stand alone, ended by a comma: {text:?}"
+    );
+    let extract = text
+        .find("extract schema")
+        .unwrap_or_else(|| panic!("the extraction schema must be named: {text:?}"));
+    let epoch = text
+        .find("resolution reuse epoch")
+        .unwrap_or_else(|| panic!("the resolution reuse epoch must be named: {text:?}"));
+    assert!(
+        extract < at && at < epoch,
+        "the lease format goes after the extraction schema and before the epoch: {text:?}"
+    );
+}
+
 /// The no-op build carries `timings` like every other build result.
 ///
 /// The unchanged early return is the most frequent build in the system — a

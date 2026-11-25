@@ -13,6 +13,7 @@ import (
 )
 
 func TestRealStoreStopGateCannotPassAFailedCommandFromItsOutput(t *testing.T) {
+	useBuiltDCVerify(t)
 	for _, test := range []struct {
 		name, command string
 		passed        bool

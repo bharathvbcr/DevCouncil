@@ -74,6 +74,7 @@ var commands = map[string]func(args []string) int{
 	"integrations": runIntegrate,
 	"skills":       runSkills,
 	"verify":       runVerify,
+	"pr-gate":      runPRGate,
 	"tool":         runTool,
 	"grep":         runGrep,
 	"search":       runSearch,
@@ -163,6 +164,8 @@ Usage:
   devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
                                    --check writes nothing and exits 1 if any file is missing or differs
   devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local] [--coverage PATH]
+  devcouncil pr-gate --base SHA [--head SHA] [--repo DIR] [--mode enforce|advisory|off]
+                                   Deterministic static PR verification gate (JSON, Markdown, SARIF, annotations)
   devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
                                    Search via the ` + "`dcgrep`" + ` client (missing binary is an error, never an empty match list)
   devcouncil search QUERY [--type symbol|structural|literal|regex] [--path DIR] [--max N] [--json]
