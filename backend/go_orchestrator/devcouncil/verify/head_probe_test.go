@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -29,6 +30,12 @@ func committedRepo(t *testing.T) string {
 // (a shell fragment), and runs the real git for everything else.
 func failingGit(t *testing.T, revParse string) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		// Windows runs a program by its extension, so an extensionless script
+		// named git is never found and the real git answers instead: the probe
+		// was never broken and the test read success as a defect.
+		t.Skip("the planted git is a shell script")
+	}
 	real := testsupport.Tool(t, "git")
 	script := "#!/bin/sh\n" +
 		"for a in \"$@\"; do\n" +

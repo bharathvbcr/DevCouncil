@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -222,7 +223,13 @@ func TestGitlinkMovedRangesOfEveryShapeAreDegraded(t *testing.T) {
 			subCommitFile(t, subDir, "other.txt", attackSecretLine(), "unrelated root")
 		},
 		"files with awkward names": func(t *testing.T, subDir string) {
-			for _, name := range []string{`back\slash.txt`, "tab\tname.txt", "sp ace/in dir.txt", "éé.txt"} {
+			names := []string{`back\slash.txt`, "tab\tname.txt", "sp ace/in dir.txt", "éé.txt"}
+			if runtime.GOOS == "windows" {
+				// NTFS cannot name a file with a tab, and a backslash is its
+				// separator: neither spelling can exist on disk there.
+				names = names[2:]
+			}
+			for _, name := range names {
 				subCommitFile(t, subDir, name, attackSecretLine(), "adds "+strconv.Quote(name))
 				runGitIn(t, subDir, "rm", "-q", "--", name)
 				runGitIn(t, subDir, "commit", "-qm", "removes it")
@@ -521,6 +528,9 @@ func TestAttack2UnscannableSubmoduleDoesNotHideTheOther(t *testing.T) {
 // Paths that differ only by a trailing space are two files: a move under one
 // is not hidden by the other.
 func TestAttack2TrailingSpaceTwinPathsInOneCommitAreDegraded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Win32 strips a trailing space, so f.txt and \"f.txt \" are one file there and the twins cannot exist")
+	}
 	key := exampleAWSKey()
 	root, subDir := submoduleRepoWith(t, map[string]string{"s.txt": "ok\n"})
 	writeFile(t, subDir, "f.txt", "clean\n")

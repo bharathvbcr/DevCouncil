@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -442,6 +443,9 @@ func TestAttackUntrackedSecretInNestedSubmoduleIsScanned(t *testing.T) {
 // A git that answers `version` and then never returns must not hold the
 // verification past the caller's deadline.
 func TestAttackHangingGitHonoursTheCallersDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the planted git is a shell script")
+	}
 	realGit := testsupport.Tool(t, "git")
 	bin := t.TempDir()
 	script := "#!/bin/sh\nif [ \"$1\" = \"version\" ] || [ \"$1\" = \"--version\" ]; then exec " + realGit + " \"$@\"; fi\nexec sleep 25\n"

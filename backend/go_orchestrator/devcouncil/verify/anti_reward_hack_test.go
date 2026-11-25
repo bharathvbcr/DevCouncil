@@ -740,7 +740,10 @@ func TestLinuxBwrapReadOnlySandboxBuilderAndFailClosedRefusal(t *testing.T) {
 		5*time.Second,
 		verify.EnvPolicy{},
 	)
-	if !blockedOut.Skipped || blockedOut.ExitCode >= 0 || !strings.Contains(blockedOut.Reason, "Permission denied") {
+	// The stub is a shell script, which Windows cannot run, so there is no
+	// stderr to carry there; failing closed and the canary below still hold.
+	wantDetail := runtime.GOOS != "windows"
+	if !blockedOut.Skipped || blockedOut.ExitCode >= 0 || (wantDetail && !strings.Contains(blockedOut.Reason, "Permission denied")) {
 		t.Fatalf("blocked bwrap must fail closed with Skipped=true and stderr detail, got %+v", blockedOut)
 	}
 	gotCanary, err := os.ReadFile(canary)
