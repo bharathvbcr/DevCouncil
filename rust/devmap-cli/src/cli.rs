@@ -402,6 +402,8 @@ impl From<ResolveLimitFlags> for devmap_resolve::ResolutionLimits {
 pub(crate) enum Commands {
     /// Cold or incremental build of the code-intelligence graph
     Build(commands::build::Args),
+    /// Pack, unpack, inspect, push, or pull remote devmap store/CSR caches
+    Cache(commands::cache::Args),
     /// Seed or stack a linked worktree's index from a registered checkout
     Seed(commands::seed::Args),
     Search(commands::search::Args),
@@ -523,6 +525,8 @@ pub(crate) enum Commands {
     /// the wrong one for a question: "who calls this" does not stop at a
     /// repository boundary when the caller is a sibling service.
     Workspace(commands::workspace::Args),
+    /// Cross-repo org graph federation across a multi-repo workspace manifest
+    Federate(commands::federate::Args),
     /// Report what the map cost against what reading files would have.
     ///
     /// Every figure is bytes divided by 4, which is an estimate and is labelled
@@ -989,6 +993,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         }
         // No numeric query arguments reach the engine from these.
         Commands::Build(_)
+        | Commands::Cache(_)
         | Commands::Seed(_)
         | Commands::Status(_)
         | Commands::Doctor
@@ -1004,6 +1009,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Freshness(_)
         | Commands::Repair(_)
         | Commands::Workspace(_)
+        | Commands::Federate(_)
         | Commands::Serve(_)
         | Commands::Mcp(_)
         | Commands::Html(_)

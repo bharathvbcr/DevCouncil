@@ -94,6 +94,8 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Affected(_) => ("Affected tests", "Following the test trails"),
         Commands::Preview(_) => ("Edit preview", "Trying the next shape"),
         Commands::Workspace(_) => ("Workspace", "Connecting your repositories"),
+        Commands::Federate(_) => ("Federate", "Querying across repositories"),
+        Commands::Cache(_) => ("Cache", "Syncing store cache"),
         Commands::Savings(_) => ("Savings", "Counting the shortcuts"),
         Commands::Clones(_) => ("Similar code", "Finding familiar shapes"),
         Commands::Manifest(_) => ("Manifest", "Packing the essentials"),
