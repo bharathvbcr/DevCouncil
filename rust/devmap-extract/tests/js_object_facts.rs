@@ -104,10 +104,20 @@ fn a_mutation_in_a_callable_is_marked() {
 fn only_a_module_scope_const_is_recorded() {
     let all = facts(
         "a.ts",
-        "let a = { ...core };\nvar b = core;\nfunction f() { const c = { ...core }; return c; }\nconst { d } = core;\n",
+        "let a = { ...core };\nvar b = core;\nfunction f() { const c = { ...core }; use(c); }\nconst { d } = core;\n",
     );
     assert!(all.is_empty(), "got {all:?}");
     assert!(facts("a.py", "w = {**core}\n").is_empty());
+
+    // A factory that returns its local const object records the factory's
+    // return shape under `"f()"` and never leaks the local name `"c"`.
+    let returned = facts(
+        "a.ts",
+        "function f() { const c = { ...core }; return c; }\n",
+    );
+    assert_eq!(returned.len(), 1, "got {returned:?}");
+    assert_eq!(returned[0].name, "f()");
+    assert_eq!(returned[0].parts, vec![JsObjectPart::Spread("core".into())]);
 }
 
 fn writes<'a>(all: &'a [JsObjectFact], name: &str) -> Vec<&'a JsObjectFact> {
@@ -189,5 +199,65 @@ fn an_embedded_script_carries_its_facts_at_file_offsets() {
     assert!(
         source[fact.start_byte..].starts_with("w ="),
         "the fact's offset is in the .vue file's own coordinates: {fact:?}"
+    );
+}
+
+#[test]
+fn factory_return_shapes_and_local_factory_spreads_are_recorded_soundly() {
+    let source = "\
+import { createTabActions } from './tabActions';
+import { createViewNavigation } from './viewNavigation';
+
+export function createStore() {
+  const tabActions = createTabActions();
+  const viewNav = createViewNavigation();
+  function refresh() {}
+  const store = {
+    trustRepo: (p: string) => p,
+    ...tabActions,
+    refresh,
+    ...viewNav,
+  };
+  return store;
+}
+
+export const mkConcise = () => ({ ping: () => 1 });
+
+export function multiReturn(flag: boolean) {
+  if (flag) return { a() {} };
+  return { b() {} };
+}
+
+export function taintedSpread() {
+  const actions = createTabActions();
+  patch(actions);
+  return { ...actions, own() {} };
+}
+";
+    let all = facts("store.ts", source);
+    assert_eq!(
+        declared(&all, "createStore()").parts,
+        vec![
+            JsObjectPart::Inline("trustRepo".into()),
+            spread("createTabActions()"),
+            JsObjectPart::Forward {
+                key: "refresh".into(),
+                value: "refresh".into(),
+            },
+            spread("createViewNavigation()"),
+        ]
+    );
+    assert_eq!(
+        declared(&all, "mkConcise()").parts,
+        vec![JsObjectPart::Inline("ping".into())]
+    );
+    assert!(
+        !all.iter().any(|f| f.name == "multiReturn()"),
+        "multi-return factory must abstain: {all:?}"
+    );
+    assert_eq!(
+        declared(&all, "taintedSpread()").parts,
+        vec![spread("actions"), JsObjectPart::Inline("own".into())],
+        "escaped local factory binding must not be rewritten to a factory spread"
     );
 }

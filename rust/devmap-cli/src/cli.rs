@@ -51,7 +51,14 @@ fn non_empty(value: &Option<String>) -> Option<String> {
 /// parity check (`check-vendor-schema.mjs`) reads exactly that phrase and
 /// reports a build without it as unverifiable.
 ///
-/// `resolution reuse epoch N` follows the extraction schema so a parity check
+/// `stack lease format N` follows the extraction schema: it is
+/// `devmap_query::STACK_FORMAT_VERSION`, the on-disk format of a stacked
+/// worktree's lease, and a reader that only has the binary cannot otherwise
+/// tell which lease format it reads or writes. GitPulse's parity check reads
+/// `/stack lease format (\d+)/` and reports a build without it as
+/// unverifiable.
+///
+/// `resolution reuse epoch N` follows the lease format so a parity check
 /// can verify an installed binary's resolver epoch; every reader of this line
 /// matches a labelled, standalone number (or the first `schema`), so the new
 /// item sits before `build` without moving any of them.
@@ -68,11 +75,12 @@ pub(crate) fn version_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| {
         format!(
-            "{} (store schema {}, code graph schema {}, extract schema {}, resolution reuse epoch {}, build {})",
+            "{} (store schema {}, code graph schema {}, extract schema {}, stack lease format {}, resolution reuse epoch {}, build {})",
             env!("CARGO_PKG_VERSION"),
             devmap_store::CURRENT_SCHEMA_VERSION,
             devmap_query::CODE_GRAPH_SCHEMA_VERSION,
             devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
+            devmap_query::STACK_FORMAT_VERSION,
             devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH,
             env!("DEVMAP_BUILD_ID")
         )
@@ -402,6 +410,8 @@ impl From<ResolveLimitFlags> for devmap_resolve::ResolutionLimits {
 pub(crate) enum Commands {
     /// Cold or incremental build of the code-intelligence graph
     Build(commands::build::Args),
+    /// Pack, unpack, inspect, push, or pull remote devmap store/CSR caches
+    Cache(commands::cache::Args),
     /// Seed or stack a linked worktree's index from a registered checkout
     Seed(commands::seed::Args),
     Search(commands::search::Args),
@@ -523,6 +533,8 @@ pub(crate) enum Commands {
     /// the wrong one for a question: "who calls this" does not stop at a
     /// repository boundary when the caller is a sibling service.
     Workspace(commands::workspace::Args),
+    /// Cross-repo org graph federation across a multi-repo workspace manifest
+    Federate(commands::federate::Args),
     /// Report what the map cost against what reading files would have.
     ///
     /// Every figure is bytes divided by 4, which is an estimate and is labelled
@@ -989,6 +1001,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         }
         // No numeric query arguments reach the engine from these.
         Commands::Build(_)
+        | Commands::Cache(_)
         | Commands::Seed(_)
         | Commands::Status(_)
         | Commands::Doctor
@@ -1004,6 +1017,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Freshness(_)
         | Commands::Repair(_)
         | Commands::Workspace(_)
+        | Commands::Federate(_)
         | Commands::Serve(_)
         | Commands::Mcp(_)
         | Commands::Html(_)

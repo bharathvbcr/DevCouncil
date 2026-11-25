@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gitrev"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
@@ -127,30 +128,11 @@ type Options struct {
 	Timeout time.Duration
 }
 
-var (
-	zeroSHA   = regexp.MustCompile(`^0+$`)
-	refToken  = regexp.MustCompile(`^[A-Za-z0-9._/@~^-]+$`)
-	shaSyntax = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
-)
-
 // resolveRev turns a revision into a full commit id, refusing anything git
-// could read as an option.
+// could read as an option. Delegates to the shared devcouncil/gitrev helper.
 func resolveRev(ctx context.Context, run Runner, repo, rev string) (string, error) {
-	if rev == "" || strings.HasPrefix(rev, "-") || !refToken.MatchString(rev) {
-		return "", fmt.Errorf("%q is not a usable revision", rev)
-	}
-	out, err := run.Output(ctx, repo, "git", "rev-parse", "--verify", "--quiet", rev+"^{commit}")
-	if err != nil {
-		return "", err
-	}
-	sha := strings.TrimSpace(string(out))
-	if !fullSHAre.MatchString(sha) {
-		return "", fmt.Errorf("git rev-parse %s answered %q", rev, sha)
-	}
-	return sha, nil
+	return gitrev.ResolveRev(ctx, run, repo, rev)
 }
-
-var fullSHAre = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 
 // resolveBase picks the revision the change is measured from.
 //
@@ -171,8 +153,8 @@ func resolveBase(ctx context.Context, run Runner, o Options) (base, head string,
 		base, err = resolveRev(ctx, run, o.Repo, o.Base)
 		return base, head, err
 	}
-	if o.Event == "push" && o.RefName == o.BaseRef && o.Before != "" && !zeroSHA.MatchString(o.Before) {
-		if !shaSyntax.MatchString(o.Before) {
+	if o.Event == "push" && o.RefName == o.BaseRef && o.Before != "" && !gitrev.IsZeroSHA(o.Before) {
+		if !gitrev.IsSHASyntax(o.Before) {
 			return "", head, fmt.Errorf("the push's before id %q is not a commit id", o.Before)
 		}
 		base, err = resolveRev(ctx, run, o.Repo, o.Before)
@@ -185,13 +167,9 @@ func resolveBase(ctx context.Context, run Runner, o Options) (base, head string,
 	if _, err := resolveRev(ctx, run, o.Repo, remote); err != nil {
 		return "", head, fmt.Errorf("resolve %s: %w", remote, err)
 	}
-	out, err := run.Output(ctx, o.Repo, "git", "merge-base", remote, head)
+	base, err = gitrev.MergeBase(ctx, run, o.Repo, remote, head)
 	if err != nil {
 		return "", head, fmt.Errorf("merge-base %s HEAD: %w", remote, err)
-	}
-	base = strings.TrimSpace(string(out))
-	if !fullSHAre.MatchString(base) {
-		return "", head, fmt.Errorf("git merge-base answered %q", base)
 	}
 	if base == head {
 		// HEAD is the default branch's tip (a manual run there): the merge
