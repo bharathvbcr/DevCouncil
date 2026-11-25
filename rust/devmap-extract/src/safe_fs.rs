@@ -914,6 +914,134 @@ fn open_regular_child(
     }
 }
 
+/// Which file a handle or a path names: the volume and the file's index on it.
+///
+/// Unix reads device and inode. Windows reads the volume serial number and the
+/// 128-bit file id (`FILE_ID_INFO`); a volume that cannot answer that falls
+/// back to the 64-bit index `GetFileInformationByHandle` gives. A rename keeps
+/// it and a copy, a replacement by rename or a delete-and-recreate does not,
+/// which is what separates "the same file" from "a file that looks the same"
+/// when length and modification time cannot (`CopyFile` keeps the time, and
+/// NTFS stamps writes coarsely). This is the one owner: callers that need to
+/// know whether a file was replaced take it from here rather than from
+/// `std::os::unix::fs::MetadataExt`, which is absent on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    volume: u64,
+    index: u128,
+}
+
+impl FileIdentity {
+    /// The identity of an open file.
+    pub fn of_file(file: &File) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            Ok(Self {
+                volume: metadata.dev(),
+                index: u128::from(metadata.ino()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            windows_identity(file)
+        }
+    }
+
+    /// The identity of the file at `path` (symlinks followed, as
+    /// `std::fs::metadata` does). On Windows the file is opened for attribute
+    /// access only, with every share mode, so asking never blocks a rename or
+    /// delete of it by another process.
+    pub fn of_path(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path)?;
+            Ok(Self {
+                volume: metadata.dev(),
+                index: u128::from(metadata.ino()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_READ_ATTRIBUTES; FILE_SHARE_READ | WRITE | DELETE;
+            // FILE_FLAG_BACKUP_SEMANTICS so a directory can be asked too.
+            let file = std::fs::OpenOptions::new()
+                .access_mode(0x80)
+                .share_mode(0x1 | 0x2 | 0x4)
+                .custom_flags(0x0200_0000)
+                .open(path)?;
+            windows_identity(&file)
+        }
+    }
+
+    /// The identity as `(device, index low 64 bits, index high 64 bits)`, for
+    /// a record that stores the three as plain integers. The high half is zero
+    /// on Unix and on NTFS.
+    pub fn parts(&self) -> (u64, u64, u64) {
+        (self.volume, self.index as u64, (self.index >> 64) as u64)
+    }
+
+    /// The inverse of [`parts`](Self::parts).
+    pub fn from_parts(volume: u64, index_low: u64, index_high: u64) -> Self {
+        Self {
+            volume,
+            index: (u128::from(index_high) << 64) | u128::from(index_low),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_identity(file: &File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    // FILE_ID_INFO: the volume serial number and a 128-bit file id.
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+    // FILE_INFO_BY_HANDLE_CLASS::FileIdInfo (18 in windows-sys); the struct is
+    // a u64 and a FILE_ID_128, 24 bytes.
+    const FILE_ID_INFO_CLASS: i32 = 18;
+    const _: [(); 24] = [(); std::mem::size_of::<FileIdInfo>()];
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let mut information = std::mem::MaybeUninit::<FileIdInfo>::uninit();
+    // SAFETY: File owns a live handle; `information` is writable storage of
+    // exactly the size passed, and is read only after the call succeeded.
+    let answered = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ID_INFO_CLASS,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of::<FileIdInfo>() as u32,
+        )
+    } != 0;
+    if answered {
+        // SAFETY: the successful call initialized every field.
+        let information = unsafe { information.assume_init() };
+        return Ok(FileIdentity {
+            volume: information.volume_serial_number,
+            index: u128::from_le_bytes(information.file_id),
+        });
+    }
+    // A filesystem that has no 128-bit id still has the 64-bit index.
+    let information = windows_information(file)?;
+    Ok(FileIdentity {
+        volume: u64::from(information.volume),
+        index: (u128::from(information.index_high) << 32) | u128::from(information.index_low),
+    })
+}
+
 /// Whether the handle held and the file now at the name are one file.
 ///
 /// unix compares device and inode. Windows compares volume serial and file
@@ -938,9 +1066,7 @@ fn same_identity(
     named_file: &File,
     _named: &std::fs::Metadata,
 ) -> io::Result<bool> {
-    let a = windows_information(held_file)?;
-    let b = windows_information(named_file)?;
-    Ok(a.volume == b.volume && a.index_high == b.index_high && a.index_low == b.index_low)
+    Ok(FileIdentity::of_file(held_file)? == FileIdentity::of_file(named_file)?)
 }
 
 #[cfg(windows)]
@@ -1179,5 +1305,85 @@ mod rename_retry_tests {
         for error in not_transient {
             assert!(!is_transient_windows_refusal(&error), "{error:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod file_identity_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-fileid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_copy_with_the_same_length_and_time_is_another_file() {
+        let dir = scratch("copy");
+        let original = dir.join("a.bin");
+        std::fs::write(&original, b"same bytes").unwrap();
+        let copy = dir.join("b.bin");
+        // `std::fs::copy` keeps the modification time on Windows and the
+        // length everywhere: nothing the metadata shows tells them apart.
+        std::fs::copy(&original, &copy).unwrap();
+        assert_ne!(
+            FileIdentity::of_path(&original).unwrap(),
+            FileIdentity::of_path(&copy).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_keeps_the_identity_and_a_replacement_by_rename_changes_it() {
+        let dir = scratch("rename");
+        let original = dir.join("a.bin");
+        std::fs::write(&original, b"first").unwrap();
+        let before = FileIdentity::of_path(&original).unwrap();
+        let moved = dir.join("moved.bin");
+        std::fs::rename(&original, &moved).unwrap();
+        assert_eq!(before, FileIdentity::of_path(&moved).unwrap());
+
+        let impostor = dir.join("impostor.bin");
+        std::fs::write(&impostor, b"first").unwrap();
+        // The original stays on disk under another name, so its index cannot
+        // be reused by the replacement.
+        std::fs::rename(&impostor, dir.join("a.bin")).unwrap();
+        assert_ne!(before, FileIdentity::of_path(&dir.join("a.bin")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handle_and_its_path_agree_and_a_missing_path_is_an_error() {
+        let dir = scratch("handle");
+        let path = dir.join("a.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            FileIdentity::of_file(&file).unwrap(),
+            FileIdentity::of_path(&path).unwrap()
+        );
+        assert!(FileIdentity::of_path(&dir.join("absent")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_parts_round_trip_including_a_128_bit_index() {
+        let identity = FileIdentity::from_parts(7, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888);
+        assert_eq!(
+            identity.parts(),
+            (7, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888)
+        );
+        assert_ne!(
+            identity,
+            FileIdentity::from_parts(7, 0x1111_2222_3333_4444, 0)
+        );
     }
 }

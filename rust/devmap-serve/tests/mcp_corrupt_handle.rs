@@ -100,9 +100,9 @@ fn page_size(bytes: &[u8]) -> usize {
 /// Damage `len` bytes at `from` in place, the way a bad sector or a stray
 /// writer damages a store: same file, same length, same modification time.
 ///
-/// The time is put back because it is half of the slot's file identity off
-/// Unix (`StoreFileIdentity`: length and mtime there, device and inode on
-/// Unix). With the write's new mtime the slot saw another file on Windows and
+/// The time is put back because it is part of the slot's file identity off
+/// Unix (`StoreFileIdentity`: file id, length and mtime there, device and inode
+/// on Unix). With the write's new mtime the slot saw another file on Windows and
 /// reopened it afresh, so these tests never reached the cached-handle paths
 /// they exist for. It is set through the writing handle, which stops NTFS from
 /// stamping the write's own time when the handle closes.

@@ -117,15 +117,22 @@ impl RepositoryRef {
 ///
 /// Unix compares `(dev, ino)`, which a recreated file cannot share with one
 /// this process still holds open (the open handle keeps the inode allocated).
-/// Elsewhere std has no stable file id, so size and mtime stand in: a write
-/// to the store also changes them, which costs a reopen and never a stale
-/// answer.
+/// Elsewhere the file id from `devmap_extract::safe_fs::FileIdentity` stands in, together with size
+/// and mtime: a write to the store also changes those, which costs a reopen
+/// and never a stale answer. Size and mtime alone were not enough: a file put
+/// in the store's place by `rename` can have the same length and, when it is a
+/// copy, the same modification time, and a damaged store replaced that way was
+/// still taken for the file the damage was found in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreFileIdentity {
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    /// `None` when the id could not be read; the size and time then decide, as
+    /// they did before the id was read at all.
+    #[cfg(not(unix))]
+    id: Option<devmap_extract::safe_fs::FileIdentity>,
     #[cfg(not(unix))]
     len: u64,
     #[cfg(not(unix))]
@@ -133,10 +140,12 @@ pub struct StoreFileIdentity {
 }
 
 impl StoreFileIdentity {
-    pub fn of(metadata: &std::fs::Metadata) -> Self {
+    /// The identity of the file at `path`, whose metadata is `metadata`.
+    pub fn of(metadata: &std::fs::Metadata, path: &Path) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let _ = path;
             Self {
                 dev: metadata.dev(),
                 ino: metadata.ino(),
@@ -145,6 +154,7 @@ impl StoreFileIdentity {
         #[cfg(not(unix))]
         {
             Self {
+                id: devmap_extract::safe_fs::FileIdentity::of_path(path).ok(),
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
             }
@@ -286,7 +296,7 @@ impl StoreLru {
             let current = stat(key)
                 .ok()
                 .filter(std::fs::Metadata::is_file)
-                .map(|metadata| StoreFileIdentity::of(&metadata));
+                .map(|metadata| StoreFileIdentity::of(&metadata, key));
             if current != Some(recorded) {
                 self.entries.remove(pos);
                 return CacheLookup::Evicted;
@@ -561,7 +571,7 @@ impl DamageStamp {
             .ok()
             .map(|wal| (wal.len(), wal.modified().ok()));
         Some(Self {
-            identity: StoreFileIdentity::of(&metadata),
+            identity: StoreFileIdentity::of(&metadata, store),
             len: metadata.len(),
             modified: metadata.modified().ok(),
             wal,
@@ -764,7 +774,7 @@ mod tests {
     #[test]
     fn a_hit_on_an_unchanged_file_costs_one_stat_and_returns_the_same_store() {
         let file = scratch_file("steady");
-        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap());
+        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap(), &file);
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut cache = StoreLru::new();
         cache.insert(
@@ -799,7 +809,7 @@ mod tests {
     #[test]
     fn a_replaced_or_vanished_file_evicts_its_entry() {
         let file = scratch_file("replaced");
-        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap());
+        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap(), &file);
         let mut cache = StoreLru::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
         cache.insert(
@@ -850,7 +860,7 @@ mod tests {
 
     fn opened_entry(cache: &mut StoreLru, tag: &str) -> (PathBuf, Arc<Store>) {
         let file = scratch_file(tag);
-        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap());
+        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap(), &file);
         let store = Arc::new(Store::open_in_memory().unwrap());
         cache.insert(
             file.clone(),

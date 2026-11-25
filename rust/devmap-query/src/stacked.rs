@@ -108,6 +108,15 @@ pub struct FileRecord {
     pub ctime_ns: u64,
     pub ino: u64,
     pub dev: u64,
+    /// The high 64 bits of a 128-bit file id (ReFS). Zero on Unix and NTFS, and
+    /// then absent from the JSON, so a lease written before this field existed
+    /// reads as it always did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ino_hi: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// What identifies a published base: generation id, donor `HEAD`, donor root,
@@ -613,6 +622,7 @@ fn file_record(file: &File, sha256: String) -> Result<FileRecord> {
             ctime_ns: nanos(meta.ctime(), meta.ctime_nsec()),
             ino: meta.ino(),
             dev: meta.dev(),
+            ino_hi: 0,
         })
     }
     #[cfg(not(unix))]
@@ -623,13 +633,21 @@ fn file_record(file: &File, sha256: String) -> Result<FileRecord> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        // No device and inode here, and no portable change clock: a copy keeps
+        // its length and (on Windows) its modification time, so without the
+        // file id a swapped-in copy of the base was indistinguishable from it.
+        // An unreadable id is an error, not a zero that two files could share.
+        let (dev, ino, ino_hi) = devmap_extract::safe_fs::FileIdentity::of_file(file)
+            .context("cannot read the file id of an admitted file")?
+            .parts();
         Ok(FileRecord {
             sha256,
             len: meta.len(),
             mtime_ns,
             ctime_ns: mtime_ns,
-            ino: 0,
-            dev: 0,
+            ino,
+            dev,
+            ino_hi,
         })
     }
 }
@@ -642,15 +660,23 @@ fn check_identity(file: &File, record: &FileRecord, what: &str, lease_path: &Pat
     if now != *record {
         bail!(
             "the lane's {what} was replaced or modified after it was admitted \
-             (recorded len/mtime_ns/ctime_ns/ino/dev {:?}, now {:?}); {}",
+             (recorded len/mtime_ns/ctime_ns/ino/dev/ino_hi {:?}, now {:?}); {}",
             (
                 record.len,
                 record.mtime_ns,
                 record.ctime_ns,
                 record.ino,
-                record.dev
+                record.dev,
+                record.ino_hi
             ),
-            (now.len, now.mtime_ns, now.ctime_ns, now.ino, now.dev),
+            (
+                now.len,
+                now.mtime_ns,
+                now.ctime_ns,
+                now.ino,
+                now.dev,
+                now.ino_hi
+            ),
             restack_hint(lease_path)
         );
     }
@@ -4550,6 +4576,21 @@ mod tests {
         let a = StackedStore::open(&lane_a).unwrap();
         assert!(!symbol_names(&a, "src/svc.go").is_empty());
         let _ = remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn a_file_record_without_a_high_file_id_reads_and_a_zero_one_is_not_written() {
+        let old = r#"{"sha256":"ab","len":1,"mtime_ns":2,"ctime_ns":3,"ino":4,"dev":5}"#;
+        let record: FileRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.ino_hi, 0);
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let wide = FileRecord {
+            ino_hi: 9,
+            ..record
+        };
+        let round: FileRecord =
+            serde_json::from_str(&serde_json::to_string(&wide).unwrap()).unwrap();
+        assert_eq!(round, wide);
     }
 
     #[cfg(feature = "parse")]
