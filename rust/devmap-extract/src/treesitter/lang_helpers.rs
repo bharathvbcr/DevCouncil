@@ -1190,7 +1190,7 @@ pub(super) fn rust_function_local_type(item: Node, source: &str, bare: &str) -> 
 /// to every attribute, including `#[test]` and `#[no_mangle]`.
 pub(super) fn rust_attribute_paths(node: Node, source: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    let mut sibling = node.prev_sibling();
+    let mut sibling = crate::parent_index::prev_sibling_of(node);
     while let Some(candidate) = sibling {
         match candidate.kind() {
             "line_comment" | "block_comment" => {}
@@ -1203,7 +1203,7 @@ pub(super) fn rust_attribute_paths(node: Node, source: &str) -> Vec<String> {
             }
             _ => break,
         }
-        sibling = candidate.prev_sibling();
+        sibling = crate::parent_index::prev_sibling_of(candidate);
     }
     paths
 }

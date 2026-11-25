@@ -1099,16 +1099,22 @@ fn run_build(
     // The generation is committed. A cache write that fails must not fail it:
     // the next edit resolves every file the cache cannot prove, which is the
     // same graph. The diagnostic carries the error text.
-    if let Err(error) = persist_resolution_reuse(
-        path,
-        &store,
-        gen_id,
-        &extractions,
-        &produced,
-        full_resolve,
-        &limits,
-        usage,
-    ) {
+    //
+    // Timed as its own sub-phase. It writes one JSON blob per resolved file,
+    // 168 MB for this repository's 1,297 files, and as an untimed span it
+    // showed up only as 0.9-1.0 s that "persisting" took beyond its parts.
+    if let Err(error) = progress.timed("persist:reuse_cache", || {
+        persist_resolution_reuse(
+            path,
+            &store,
+            gen_id,
+            &extractions,
+            &produced,
+            full_resolve,
+            &limits,
+            usage,
+        )
+    }) {
         progress.display.diagnostic(format_args!(
             "resolution reuse: the generation was committed but the reuse cache was not updated: {error}"
         ));
