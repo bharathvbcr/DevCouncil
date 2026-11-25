@@ -89,12 +89,15 @@ func TestADirectoryChangeInsideAGroupIsStillADirectoryChange(t *testing.T) {
 // the length cap into a suggestion. The worst case is a line that is nothing
 // but unreadable clauses, each of which used to end the walk at once.
 //
-// The bound is on how the cost grows, not on a wall clock: a quarter-length
-// line and a full-length one are timed in turn, best of three each, and the
-// full one may cost at most 8x the quarter. Linear work gives about 4x and
-// quadratic about 16x on any host. A fixed limit could not tell those apart
-// from a busy runner: a loaded macOS CI host took 5.03 s for a line that
-// takes 0.27 s on an idle one.
+// The bound is on how the cost grows: a quarter-length line and a full-length
+// one are timed in turn, best of three each, and the full one may cost at most
+// 8x the quarter. Linear work gives about 4x on any host (3.9-4.3x measured,
+// under -race and a parallel suite too). A quadratic term fails the check once
+// it costs more than twice the linear work at the cap; one that small is not
+// caught. A tight wall-clock limit could not tell growth from a busy runner: a
+// loaded macOS CI host took 5.03 s for a line that takes 0.27 s on an idle
+// one. The 60 s backstop is only for a hang or a gross slowdown, which a ratio
+// alone would pass.
 func TestScanningEveryClauseStaysBounded(t *testing.T) {
 	gate := CommandGate{HardRules: true}
 	task := &dc.Task{ID: "TASK-001"}
@@ -114,6 +117,9 @@ func TestScanningEveryClauseStaysBounded(t *testing.T) {
 			t.Fatalf("got %s", d.Rule)
 		}
 		bestQuarter, bestFull = min(bestQuarter, q), min(bestFull, f)
+	}
+	if bestFull > 60*time.Second {
+		t.Fatalf("a %d-byte line of directory changes took %s at best", len(full), bestFull)
 	}
 	ratio := float64(bestFull) / float64(max(bestQuarter, time.Microsecond))
 	t.Logf("full %s, quarter %s, %.1fx", bestFull, bestQuarter, ratio)
