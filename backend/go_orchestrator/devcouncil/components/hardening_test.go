@@ -291,6 +291,16 @@ func (f *failingRunner) Run(name string, args []string, dir string, env []string
 	if f.failSubstr != "" && strings.Contains(joined, f.failSubstr) {
 		return os.ErrPermission
 	}
+	// A successful `go build -o out` leaves out on disk, as the real one does.
+	// Windows installs the devc/dev aliases as copies of it, not symlinks, so a
+	// fake that wrote nothing failed the host step there for want of a file.
+	if name == "go" && len(args) > 0 && args[0] == "build" {
+		for i := range len(args) - 1 {
+			if args[i] == "-o" {
+				return os.WriteFile(args[i+1], []byte("fake host build"), 0o755)
+			}
+		}
+	}
 	return nil
 }
 

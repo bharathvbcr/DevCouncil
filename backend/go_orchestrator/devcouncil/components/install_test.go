@@ -218,7 +218,8 @@ func TestInstallSrcFlagSelectsTheCheckout(t *testing.T) {
 		if code != 0 {
 			t.Errorf("%s: exit %d", name, code)
 		}
-		if !strings.Contains(out.String(), "go -C ") || !strings.Contains(out.String(), "backend/go_orchestrator") {
+		// The plan names paths natively: backend\go_orchestrator on Windows.
+		if !strings.Contains(out.String(), "go -C ") || !strings.Contains(out.String(), filepath.Join("backend", "go_orchestrator")) {
 			t.Errorf("%s: plan does not build from the checkout:\n%s", name, out.String())
 		}
 	}
