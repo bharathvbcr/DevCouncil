@@ -101,7 +101,7 @@ describe("check:workflows", () => {
     const pins = {
       "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
       "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1 # v7",
-      "actions/setup-go": "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0",
+      "actions/setup-go": "d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0",
       "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7",
       "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8",
     };

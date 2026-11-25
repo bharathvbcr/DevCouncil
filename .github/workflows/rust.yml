@@ -220,7 +220,7 @@ jobs:
       # missing. Feature-off is still the thing under test here; the host is
       # a fixture. It links the Gusset umbrella archive, so that sibling and
       # staticlib have to exist before `go build`.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -264,7 +264,7 @@ jobs:
       - name: Install gate dependencies
         run: sudo apt-get update && sudo apt-get install -y sqlite3 rsync
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -306,7 +306,7 @@ jobs:
           # most never warm one and every rerun rebuilds from nothing.
           cache-on-failure: true
           workspaces: rust/gusset-engine
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
