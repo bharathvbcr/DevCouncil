@@ -317,8 +317,11 @@ const asideMarker = ".devcouncil-old-"
 // its name; the process already running keeps its image. A copy still in use
 // cannot be deleted yet and is left for sweepAside on a later install. If the
 // second write fails too, the old copy goes back where it was.
+//
+// Only a regular file is moved: a directory or link at dest is not a binary
+// this install put there, and relocating it would hide someone's data.
 func replaceAside(dest string, refused error, write func() error) error {
-	if _, err := os.Lstat(dest); err != nil {
+	if info, err := os.Lstat(dest); err != nil || !info.Mode().IsRegular() {
 		return refused
 	}
 	aside := dest + asideMarker + strconv.FormatInt(time.Now().UnixNano(), 10)

@@ -84,6 +84,33 @@ func TestReplaceAsideReportsTheRefusalWhenThereIsNothingToMove(t *testing.T) {
 	}
 }
 
+// TestReplaceAsideNeverMovesADirectory: a directory named like the binary is
+// not an in-use program. Windows CI caught the first version moving it aside
+// and installing over its name (TestAPartialInstallRecordsWhatItPutOnDisk).
+func TestReplaceAsideNeverMovesADirectory(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "tool.exe")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dest, "keep")
+	if err := os.WriteFile(keep, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refused := errors.New("is a directory")
+	called := false
+	err := replaceAside(dest, refused, func() error { called = true; return nil })
+	if !errors.Is(err, refused) || called {
+		t.Fatalf("err = %v, retried = %v; want the refusal and no retry", err, called)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("the directory's contents moved: %v", err)
+	}
+	if left := asideEntries(t, dir); len(left) != 0 {
+		t.Fatalf("aside copies left: %q", left)
+	}
+}
+
 // TestSweepAsideRemovesOnlyThisBinarysAsideCopies: siblings that merely share a
 // prefix, and other binaries' aside copies, are not this binary's to remove.
 func TestSweepAsideRemovesOnlyThisBinarysAsideCopies(t *testing.T) {
