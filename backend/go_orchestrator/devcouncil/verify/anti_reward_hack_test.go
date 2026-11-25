@@ -754,6 +754,12 @@ func TestLinuxBwrapReadOnlySandboxBuilderAndFailClosedRefusal(t *testing.T) {
 	// Hostile parent TMPDIR pointing INSIDE the repository root must NOT place
 	// sandbox scratch directories inside `realParent` or break Linux bwrap / Darwin Seatbelt,
 	// and Linux bwrap must supply writable XDG_CACHE_HOME / GOCACHE inside realTmp!
+	if runtime.GOOS == "windows" {
+		// Everything below runs a shell-script bwrap to inspect the sandbox's
+		// environment, which Windows cannot execute. The fail-closed and
+		// canary checks above have run; the rest is a Unix-only fixture.
+		t.Skip("the remaining checks run a shell-script bwrap")
+	}
 	inRepoTmp := filepath.Join(realParent, ".hostile-tmpdir")
 	if err := os.MkdirAll(inRepoTmp, 0o755); err != nil {
 		t.Fatal(err)
