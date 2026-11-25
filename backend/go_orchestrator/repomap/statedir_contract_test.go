@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
@@ -67,10 +68,13 @@ func TestStateDirAgreesWithDevmapOnEveryRung(t *testing.T) {
 			if err := json.Unmarshal(out, &paths); err != nil {
 				t.Fatal(err)
 			}
-			if got := StateDir(root); got != paths.StateDir {
+			// devmap reports Windows paths in their verbatim spelling
+			// (`\\?\C:\...`); the same file in the plain spelling is what this
+			// package answers, so the report is read through the one converter.
+			if got, want := StateDir(root), devmap.PlainPath(paths.StateDir); got != want {
 				t.Errorf("StateDir = %s, devmap says %s", got, paths.StateDir)
 			}
-			if got := CodeGraphPath(root); got != paths.CodeGraph {
+			if got, want := CodeGraphPath(root), devmap.PlainPath(paths.CodeGraph); got != want {
 				t.Errorf("CodeGraphPath = %s, devmap says %s", got, paths.CodeGraph)
 			}
 		})

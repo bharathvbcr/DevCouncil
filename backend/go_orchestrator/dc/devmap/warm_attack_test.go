@@ -92,9 +92,7 @@ func writeAttackWrapper(t *testing.T, mode, root string) string {
 		"#!/bin/sh\nexport GO_WANT_WARM_ATTACK_HELPER=1\nexport WARM_ATTACK_MODE=%q\nexport WARM_ATTACK_ROOT=%q\nexec %q -test.run=^TestWarmMCPStressHelperProcess$ -- \"$@\"\n",
 		mode, root, os.Args[0],
 	)
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, wrapper, script)
 	return wrapper
 }
 

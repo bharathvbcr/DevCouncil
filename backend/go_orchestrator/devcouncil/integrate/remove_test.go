@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -166,10 +167,20 @@ func TestApplyAccumulatesItsReceipt(t *testing.T) {
 			t.Fatalf("second apply changed %s: %s", path, state)
 		}
 	}
-	recorded := mustRead(t, filepath.Join(root, receiptRel("claude")))
+	// Read as the receipt's own reader does: a raw byte search missed every
+	// Windows path, which JSON stores with its backslashes escaped.
+	repo, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	recorded, err := readAppliedReceipt(repo, "claude")
+	if err != nil || recorded == nil {
+		t.Fatalf("receipt after a no-op apply: %+v, %v", recorded, err)
+	}
 	for path, state := range first.Files {
-		if state == "wrote" && !bytes.Contains(recorded, []byte(path)) {
-			t.Fatalf("receipt lost %s after a no-op apply:\n%s", path, recorded)
+		if state == "wrote" && !slices.Contains(recorded.Wrote, path) {
+			t.Fatalf("receipt lost %s after a no-op apply: %q", path, recorded.Wrote)
 		}
 	}
 }

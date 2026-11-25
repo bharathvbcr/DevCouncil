@@ -47,6 +47,7 @@ func enforcingGate(t *testing.T, root string) *gate.Gate {
 func scopedStore(t *testing.T) *store.Client {
 	t.Helper()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}

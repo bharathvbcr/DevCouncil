@@ -315,6 +315,12 @@ func resolveCanonicalSandboxPaths(rawPath string) (declaredAbs, realAbs string, 
 			return "", "", fmt.Errorf("sandbox path %q contains unsafe control byte 0x%02x", rawPath, rawPath[i])
 		}
 	}
+	// "/x" and `\x` are rooted at the current drive on Windows and are not
+	// absolute there; filepath.Abs would quietly give them the working
+	// directory's drive. Refuse them rather than guess which drive was meant.
+	if safefile.RootedOffRoot(rawPath) {
+		return "", "", fmt.Errorf("sandbox path %q names a root without a drive, so it is not absolute", rawPath)
+	}
 	abs, err := filepath.Abs(rawPath)
 	if err != nil {
 		return "", "", err
@@ -403,7 +409,9 @@ func BuildLinuxBwrapReadOnlyArgs(rawRoot, scratchTmp, command string) (execDir, 
 	}
 	sep := string(filepath.Separator)
 	for _, p := range []string{declaredRoot, realRoot, declaredTmp, canonTmp} {
-		if p == sep {
+		// A drive root ("C:\") is the filesystem root on Windows, where sep
+		// alone is only "rooted at the current drive".
+		if p == filepath.VolumeName(p)+sep {
 			return "", "", nil, errors.New("refusing filesystem root \"/\" as repository or scratch path")
 		}
 	}

@@ -206,6 +206,7 @@ exit 1
 
 func writeDevmapScript(t *testing.T, script string) string {
 	t.Helper()
+	testsupport.RequireShellFakes(t)
 	path := filepath.Join(t.TempDir(), "devmap")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)

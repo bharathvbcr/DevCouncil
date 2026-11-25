@@ -10,6 +10,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/fnmatch"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Path pattern sets, ported verbatim from DevCouncil's policy engine. They are
@@ -951,17 +952,9 @@ func NormalizeRepoPath(root, raw string) (string, bool) {
 	return rel, false
 }
 
-// rootedOffRoot reports whether p names a place by a root or a volume without
-// being absolute, which only happens where an absolute path needs a drive:
-// "/etc/passwd" (rooted at the current drive), `\\x` and "C:foo" (relative to
-// that drive's current directory) on Windows. Where "/" alone makes a path
-// absolute, nothing is rooted off root and this is false.
-func rootedOffRoot(p string) bool {
-	if filepath.IsAbs(p) {
-		return false
-	}
-	return filepath.VolumeName(p) != "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`)
-}
+// rootedOffRoot is safefile.RootedOffRoot: a path rooted or volumed without
+// being absolute, which a Windows join under the repository would escape.
+func rootedOffRoot(p string) bool { return safefile.RootedOffRoot(p) }
 
 // settlePath applies the two normalisations to a fixed point, and reports
 // whether it reached one.

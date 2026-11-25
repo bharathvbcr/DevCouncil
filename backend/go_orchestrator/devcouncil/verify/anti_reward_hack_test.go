@@ -549,6 +549,7 @@ func TestVerifyTaskFailsClosedOnDeletedOrSymlinkedChangeReadOnlyOracles(t *testi
 		}
 
 		client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+		t.Cleanup(client.Close)
 		if _, err := client.ActiveLeases(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -739,7 +740,10 @@ func TestLinuxBwrapReadOnlySandboxBuilderAndFailClosedRefusal(t *testing.T) {
 		5*time.Second,
 		verify.EnvPolicy{},
 	)
-	if !blockedOut.Skipped || blockedOut.ExitCode >= 0 || !strings.Contains(blockedOut.Reason, "Permission denied") {
+	// The stub is a shell script, which Windows cannot run, so there is no
+	// stderr to carry there; failing closed and the canary below still hold.
+	wantDetail := runtime.GOOS != "windows"
+	if !blockedOut.Skipped || blockedOut.ExitCode >= 0 || (wantDetail && !strings.Contains(blockedOut.Reason, "Permission denied")) {
 		t.Fatalf("blocked bwrap must fail closed with Skipped=true and stderr detail, got %+v", blockedOut)
 	}
 	gotCanary, err := os.ReadFile(canary)
@@ -750,6 +754,12 @@ func TestLinuxBwrapReadOnlySandboxBuilderAndFailClosedRefusal(t *testing.T) {
 	// Hostile parent TMPDIR pointing INSIDE the repository root must NOT place
 	// sandbox scratch directories inside `realParent` or break Linux bwrap / Darwin Seatbelt,
 	// and Linux bwrap must supply writable XDG_CACHE_HOME / GOCACHE inside realTmp!
+	if runtime.GOOS == "windows" {
+		// Everything below runs a shell-script bwrap to inspect the sandbox's
+		// environment, which Windows cannot execute. The fail-closed and
+		// canary checks above have run; the rest is a Unix-only fixture.
+		t.Skip("the remaining checks run a shell-script bwrap")
+	}
 	inRepoTmp := filepath.Join(realParent, ".hostile-tmpdir")
 	if err := os.MkdirAll(inRepoTmp, 0o755); err != nil {
 		t.Fatal(err)

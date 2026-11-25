@@ -25,6 +25,7 @@ import (
 
 func TestRedirectInsideSubstitutionIsFound(t *testing.T) {
 	t.Setenv("HOME", "/home/agent")
+	t.Setenv("USERPROFILE", "/home/agent") // what os.UserHomeDir reads on Windows
 	tests := []struct {
 		command string
 		targets []string

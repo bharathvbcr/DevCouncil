@@ -2,6 +2,7 @@ package verify_test
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
@@ -31,7 +32,15 @@ func TestFailedCommandOutputCannotForgeAnUnrunCheck(t *testing.T) {
 	for _, phrase := range phrases {
 		t.Run(phrase, func(t *testing.T) {
 			t.Setenv("DC_CHECK_OUTPUT", phrase)
-			for _, command := range []string{`printf '%s\n' "$DC_CHECK_OUTPUT"; exit 1`, `printf '%s\n' "$DC_CHECK_OUTPUT" >&2; exit 1`} {
+			// The runner hands the line to the platform's shell, which is
+			// cmd.exe on Windows (see verifyShell), so each platform spells the
+			// same two commands its own way: print the phrase, on stdout or on
+			// stderr, then fail.
+			commands := []string{`printf '%s\n' "$DC_CHECK_OUTPUT"; exit 1`, `printf '%s\n' "$DC_CHECK_OUTPUT" >&2; exit 1`}
+			if runtime.GOOS == "windows" {
+				commands = []string{`echo %DC_CHECK_OUTPUT%& exit 1`, `echo %DC_CHECK_OUTPUT% 1>&2& exit 1`}
+			}
+			for _, command := range commands {
 				outcome := verify.DefaultRunCommand(context.Background(), t.TempDir())(command)
 				if outcome.ExitCode != 1 {
 					t.Fatalf("fixture did not fail: %+v", outcome)

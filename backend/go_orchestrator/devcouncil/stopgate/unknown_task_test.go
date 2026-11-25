@@ -16,6 +16,7 @@ import (
 // (ft-74d9ffb6).
 func TestUnknownTaskSkipReasonBytesAreUnchanged(t *testing.T) {
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}

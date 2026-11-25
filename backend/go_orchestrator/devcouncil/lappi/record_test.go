@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -175,7 +176,9 @@ func TestTheWriterAppendsWholeLinesWithPrivateModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
+	// Windows reports every writable file as 0666 whatever it was created with:
+	// it has no owner/group/other permission bits, so there is no mode to check.
+	if mode := info.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o600 {
 		t.Fatalf("file mode %o, want 600", mode)
 	}
 	for _, dir := range []string{filepath.Join(root, App), root} {
@@ -183,7 +186,8 @@ func TestTheWriterAppendsWholeLinesWithPrivateModes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if mode := info.Mode().Perm(); mode != 0o700 {
+		// The same holds for directories, which Windows reports as 0777.
+		if mode := info.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o700 {
 			t.Fatalf("%s mode %o, want 700", dir, mode)
 		}
 	}

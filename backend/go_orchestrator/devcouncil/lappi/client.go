@@ -235,7 +235,7 @@ func (c *Client) exchange(ctx context.Context, deadline time.Time, line []byte) 
 	dialer := net.Dialer{Deadline: deadline}
 	conn, err := dialer.DialContext(ctx, "unix", c.socket)
 	if err != nil {
-		return nil, classifyDial(ctx, err)
+		return nil, classifyDial(ctx, c.socket, err)
 	}
 	// The exchange is over whichever way it ended; a close error on a socket
 	// we only read from carries nothing the caller could act on.
@@ -291,11 +291,17 @@ func (c *Client) exchange(ctx context.Context, deadline time.Time, line []byte) 
 	}
 }
 
-func classifyDial(ctx context.Context, err error) string {
+func classifyDial(ctx context.Context, socket string, err error) string {
 	if ctx.Err() != nil || isTimeout(err) {
 		return UnavailableDeadline
 	}
 	if errors.Is(err, fs.ErrNotExist) {
+		return UnavailableSocketNotFound
+	}
+	// Windows answers a connect to a path that does not exist with
+	// WSAECONNREFUSED, not ENOENT, so the error alone cannot tell "no socket"
+	// from "nobody listening". The path can.
+	if _, statErr := os.Lstat(socket); errors.Is(statErr, fs.ErrNotExist) {
 		return UnavailableSocketNotFound
 	}
 	// ECONNREFUSED, and the rest of what a connect can say (EACCES, ENOTSOCK):

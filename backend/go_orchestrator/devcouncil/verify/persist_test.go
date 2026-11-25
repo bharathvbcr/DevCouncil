@@ -26,6 +26,7 @@ import (
 func TestPersistKeepsEveryGapField(t *testing.T) {
 	ctx := context.Background()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 
 	s := func(v string) *string { return &v }
 	line := 17

@@ -11,6 +11,7 @@ import (
 
 func TestExpandBindingsReadsWhatTheLineAndEnvironmentName(t *testing.T) {
 	t.Setenv("HOME", "/home/agent")
+	t.Setenv("USERPROFILE", "/home/agent") // what os.UserHomeDir reads on Windows
 	t.Setenv("TMPDIR", "/scratch")
 	for _, tc := range []struct {
 		line string
@@ -103,7 +104,10 @@ func TestTemporaryDirectoryWrites(t *testing.T) {
 	// is not refused for it, and a redirect into it is a write the file rung
 	// allows.
 	commands := CommandGate{Root: root, HardRules: true}
-	for _, command := range []string{"go build -o " + filepath.Join(scratch, "bin") + " ./...", "mkdir -p " + filepath.Join(scratch, "a", "b")} {
+	// Spelled with forward slashes: the command line is read the way a shell
+	// reads it, where a backslash is an escape, so a Windows path in its own
+	// spelling would be a different (relative) path, not the scratch directory.
+	for _, command := range []string{"go build -o " + filepath.ToSlash(filepath.Join(scratch, "bin")) + " ./...", "mkdir -p " + filepath.ToSlash(filepath.Join(scratch, "a", "b"))} {
 		if d := commands.EvaluateCommand(command, nil); d.Rule == RuleCommandOperandUnverifiable {
 			t.Errorf("%q refused as %s: %s", command, d.Rule, d.Reason)
 		}
