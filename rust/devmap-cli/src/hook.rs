@@ -6660,7 +6660,12 @@ mod tests {
                 );
             }
         }
-        assert_eq!(lane.builds_started(), 0, "a hostile cwd started a build");
+        assert_eq!(
+            lane.builds_started(),
+            0,
+            "a hostile cwd started a build: {:?}",
+            fs::read_to_string(&lane.args)
+        );
         for dir in [&plain, &repo, &newline] {
             assert!(!dir.join(".devcouncil").exists(), "{dir:?}: created state");
             assert!(!dir.join(".devmap").exists(), "{dir:?}: created state");
@@ -9843,9 +9848,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let marker = root.join("ran");
         let script = root.join("fake-devmap");
+        // The marker exists, empty, before it holds the arguments: the pause
+        // makes that window certain, so the wait below must wait for content.
         fs::write(
             &script,
-            format!("#!/bin/sh\necho \"$@\" > '{}'\n", marker.display()),
+            format!(
+                "#!/bin/sh\n: > '{m}'\nsleep 0.2\necho \"$@\" > '{m}'\n",
+                m = marker.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -9856,11 +9866,18 @@ mod tests {
         let held = coalesce_lock_dir(&repo, "session-report");
         assert!(try_acquire_lock_dir(&held).unwrap());
         detach_session_report(&script, &repo, Some("ending-session")).unwrap();
+        // Wait for what the script writes, not for the file: `> marker` creates
+        // it empty before `echo` fills it, and reading in that gap read "" (a
+        // failure about once in 15 parallel runs of hook:: on a loaded host).
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !marker.exists() && Instant::now() < deadline {
+        let mut ran = String::new();
+        while Instant::now() < deadline {
+            ran = fs::read_to_string(&marker).unwrap_or_default();
+            if ran.ends_with('\n') {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let ran = fs::read_to_string(&marker).unwrap_or_default();
         let _ = fs::remove_dir_all(&root);
         assert!(ran.contains("--session-id=ending-session"), "{ran:?}");
     }
