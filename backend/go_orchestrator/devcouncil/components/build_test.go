@@ -229,13 +229,18 @@ func TestInstallAtomicReplacesWholeAndLeavesNoTemporary(t *testing.T) {
 	defer held.Close()
 	if runtime.GOOS == "windows" {
 		// Windows refuses a rename over a file held open without
-		// FILE_SHARE_DELETE, which is how Go opens files. The replace must
-		// fail closed: the held copy untouched and no temporary left behind.
-		if err := installAtomic(src, dest); err == nil {
-			t.Fatal("replaced a file another handle holds open; Windows refuses that rename")
-		}
-		if got, _ := os.ReadFile(dest); string(got) != "old" {
-			t.Fatalf("a refused replace changed the held copy: %q", got)
+		// FILE_SHARE_DELETE, which is how Go opens files, so a replace may be
+		// refused here. Either outcome is acceptable, never a mix: replaced
+		// whole, or refused with the held copy untouched and no temporary
+		// left. (That a refusal means installing over an in-use binary fails
+		// on Windows is an open gap, not a property this test endorses.)
+		err := installAtomic(src, dest)
+		got, _ := os.ReadFile(dest)
+		switch {
+		case err == nil && string(got) == "new":
+		case err != nil && string(got) == "old":
+		default:
+			t.Fatalf("install over a held file: err %v, dest %q; want replaced whole or refused intact", err, got)
 		}
 		assertOnlyEntry(t, filepath.Dir(dest), "tool")
 		held.Close()
