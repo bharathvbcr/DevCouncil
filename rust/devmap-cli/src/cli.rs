@@ -51,7 +51,14 @@ fn non_empty(value: &Option<String>) -> Option<String> {
 /// parity check (`check-vendor-schema.mjs`) reads exactly that phrase and
 /// reports a build without it as unverifiable.
 ///
-/// `resolution reuse epoch N` follows the extraction schema so a parity check
+/// `stack lease format N` follows the extraction schema: it is
+/// `devmap_query::STACK_FORMAT_VERSION`, the on-disk format of a stacked
+/// worktree's lease, and a reader that only has the binary cannot otherwise
+/// tell which lease format it reads or writes. GitPulse's parity check reads
+/// `/stack lease format (\d+)/` and reports a build without it as
+/// unverifiable.
+///
+/// `resolution reuse epoch N` follows the lease format so a parity check
 /// can verify an installed binary's resolver epoch; every reader of this line
 /// matches a labelled, standalone number (or the first `schema`), so the new
 /// item sits before `build` without moving any of them.
@@ -68,11 +75,12 @@ pub(crate) fn version_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| {
         format!(
-            "{} (store schema {}, code graph schema {}, extract schema {}, resolution reuse epoch {}, build {})",
+            "{} (store schema {}, code graph schema {}, extract schema {}, stack lease format {}, resolution reuse epoch {}, build {})",
             env!("CARGO_PKG_VERSION"),
             devmap_store::CURRENT_SCHEMA_VERSION,
             devmap_query::CODE_GRAPH_SCHEMA_VERSION,
             devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
+            devmap_query::STACK_FORMAT_VERSION,
             devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH,
             env!("DEVMAP_BUILD_ID")
         )
