@@ -6519,17 +6519,21 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_edit_storm_costs_far_fewer_freshness_walks_than_drains() {
-        const EDITS: usize = 30;
+        // The storm runs until it has drained enough times to measure, not for
+        // a fixed number of edits: on a slow runner drains take longer, edits
+        // coalesce, and 30 edits once gave only 6 drains.
+        const MIN_DRAINS: u32 = 10;
+        const MAX_EDITS: usize = 300;
         let (daemon, task, root) =
             freshness_fixture("storm", Duration::from_millis(600), None, false).await;
         let store = Arc::clone(&daemon.store);
         let first = wait_for_drained_generation(&store).await;
-        for edit in 0..EDITS {
-            fs::write(
-                root.join("a.py"),
-                format!("def a():\n    return {}\n", edit + 1),
-            )
-            .unwrap();
+        let mut edits = 0;
+        while edits < MAX_EDITS
+            && store.latest_generation_id().unwrap().unwrap_or(first) - first < MIN_DRAINS
+        {
+            edits += 1;
+            fs::write(root.join("a.py"), format!("def a():\n    return {edits}\n")).unwrap();
             store
                 .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
                 .unwrap();
@@ -6555,12 +6559,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert!(
-            drains >= 10,
-            "the storm produced only {drains} drains, so it does not measure per-drain cost"
+            drains >= MIN_DRAINS,
+            "{edits} edits produced only {drains} drains, so it does not measure per-drain cost"
         );
         assert!(
             walks <= 3,
-            "{walks} freshness walks over {drains} drains from {EDITS} edits"
+            "{walks} freshness walks over {drains} drains from {edits} edits"
         );
         assert!(verified.is_ok(), "the settled tree never read fresh:true");
     }
