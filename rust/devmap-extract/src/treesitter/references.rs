@@ -160,7 +160,7 @@ pub(super) fn rust_macro_member_name(node: Node, lang: &str) -> bool {
     lang == "rust"
         && node.kind() == "identifier"
         && bounded_parent(node).is_some_and(|parent| parent.kind() == "token_tree")
-        && node.prev_sibling().is_some_and(|prev| prev.kind() == ".")
+        && crate::parent_index::prev_sibling_of(node).is_some_and(|prev| prev.kind() == ".")
 }
 
 /// Grammar keys with a language-specific arm in `extract_node`.

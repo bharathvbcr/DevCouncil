@@ -69,24 +69,32 @@ pub(crate) struct Args {
     /// `devmap manifest` stays a command of its own: writing the artifacts
     /// from a store somebody else built is a real request, and a caller
     /// that wants it should not have to run a build to get it.
-    #[arg(long)]
+    #[arg(long, group = "artifact_emit")]
     pub(crate) manifest: bool,
+    /// Also write `repo_map.json` from the generation this build leaves
+    /// current, without serializing or rewriting `code_graph.json`.
+    ///
+    /// Keeps the lightweight file/subsystem index current on incremental
+    /// builds without paying the cost of regenerating a multi-tens-of-MB
+    /// `code_graph.json` on every watcher tick.
+    #[arg(long, group = "artifact_emit", conflicts_with = "manifest")]
+    pub(crate) repo_map: bool,
     /// Unset, resolved against `path`'s state directory. See
     /// `devmap_extract::paths`.
-    #[arg(long, requires = "manifest")]
+    #[arg(long, requires = "artifact_emit")]
     pub(crate) output: Option<PathBuf>,
     /// Unset, resolved against `path`'s state directory.
     #[arg(long, requires = "manifest")]
     pub(crate) graph_output: Option<PathBuf>,
     /// Also write the marker-guarded agent guides. See `manifest --guides`.
-    #[arg(long, requires = "manifest")]
+    #[arg(long, requires = "artifact_emit")]
     pub(crate) guides: bool,
     /// With `--guides`: also append a DevMap block to a hand-written guide.
     /// See `manifest --adopt-guides`.
     #[arg(long, requires = "guides")]
     pub(crate) adopt_guides: bool,
     /// Replace a Python-schema or otherwise foreign repo map / code graph.
-    #[arg(long, requires = "manifest", default_value_t = false)]
+    #[arg(long, requires = "artifact_emit", default_value_t = false)]
     pub(crate) force: bool,
     /// Opt-in language-server edges for sites the syntax resolver left
     /// unresolved. Off unless passed. Servers on PATH (rust-analyzer,
@@ -192,6 +200,7 @@ impl Args {
             full: false,
             verify_rows: false,
             manifest: true,
+            repo_map: false,
             output: None,
             graph_output: None,
             guides: false,
@@ -252,6 +261,7 @@ fn run_build(
         full,
         verify_rows,
         manifest: write_manifest,
+        repo_map: write_repo_map,
         output,
         graph_output,
         guides,
@@ -308,7 +318,8 @@ fn run_build(
     // generation commits, and always writes consumer artifacts (`repo_map.json`
     // and `code_graph.json`) so a seeded worktree never lacks a manifest (`F2`).
     let mut staged_seed = seed.as_ref().and_then(|seed| seed.stage(cli, progress));
-    let write_manifest = &(*write_manifest || staged_seed.is_some());
+    let include_code_graph = *write_manifest || staged_seed.is_some();
+    let emit_artifacts = include_code_graph || *write_repo_map;
     // `build_ms` starts here, once the lock is held, so it means the same on
     // this path as on the daemon's: time spent building, not time spent
     // queued behind another writer (that is the `writer:wait` stage). It ends
@@ -667,14 +678,15 @@ fn run_build(
             // written — which is the entire saving: `manifest` used to
             // re-serialize a 22 MB code graph here to produce bytes
             // identical to the ones already on disk.
-            if *write_manifest {
+            if emit_artifacts {
                 progress.display.detail("checking consumer artifacts");
             }
             let manifest = build_manifest_payload(
                 cli,
                 progress,
                 &store,
-                *write_manifest,
+                emit_artifacts,
+                include_code_graph,
                 path,
                 &resolve_map_output(output, path),
                 &resolve_graph_output(graph_output, path),
@@ -1211,14 +1223,15 @@ fn run_build(
     } else {
         store
     };
-    if *write_manifest {
+    if emit_artifacts {
         progress.stage(5, "writing consumer artifacts");
     }
     let manifest = build_manifest_payload(
         cli,
         progress,
         &store,
-        *write_manifest,
+        emit_artifacts,
+        include_code_graph,
         path,
         &resolve_map_output(output, path),
         &resolve_graph_output(graph_output, path),
@@ -1551,6 +1564,7 @@ fn build_manifest_payload(
     progress: &crate::reporter::ProgressReporter,
     store: &Store,
     enabled: bool,
+    include_code_graph: bool,
     path: &std::path::Path,
     output: &std::path::Path,
     graph_output: &std::path::Path,
@@ -1571,6 +1585,7 @@ fn build_manifest_payload(
             output,
             graph_output,
             compact_graph_output: None,
+            include_code_graph,
             force,
             stamps,
             inventory: inventory.into(),

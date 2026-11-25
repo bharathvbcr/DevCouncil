@@ -93,6 +93,7 @@ macro_rules! outln {
 
 mod agent_install;
 mod agents;
+mod cache_archive;
 mod claude;
 mod cli;
 mod commands;

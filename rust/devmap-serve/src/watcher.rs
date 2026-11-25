@@ -772,8 +772,13 @@ pub fn start_file_watcher_observed<P: AsRef<Path>, F: Fn(Vec<String>) + Send + '
     let mut watcher = RecommendedWatcher::new(
         move |event| offer_watch_event(&tx, &overflow_writer, &offer_backlog, event),
         Config::default(),
-    )?;
-    watcher.watch(&root, RecursiveMode::Recursive)?;
+    )
+    .map_err(|error| {
+        explain_watch_error(error, "start a file watcher", &root, &read_watch_limits())
+    })?;
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|error| explain_watch_error(error, "watch", &root, &read_watch_limits()))?;
     if let Some(metadata) = git_metadata(&root)? {
         // Linked worktrees keep HEAD and shared refs/excludes outside the source
         // root. Watch only metadata surfaces, never shared object storage.
@@ -785,14 +790,18 @@ pub fn start_file_watcher_observed<P: AsRef<Path>, F: Fn(Vec<String>) + Send + '
             (metadata.common_dir.join("info"), true),
         ] {
             if !path.starts_with(&root) && path.exists() && watched.insert(path.clone()) {
-                watcher.watch(
-                    &path,
-                    if recursive {
-                        RecursiveMode::Recursive
-                    } else {
-                        RecursiveMode::NonRecursive
-                    },
-                )?;
+                watcher
+                    .watch(
+                        &path,
+                        if recursive {
+                            RecursiveMode::Recursive
+                        } else {
+                            RecursiveMode::NonRecursive
+                        },
+                    )
+                    .map_err(|error| {
+                        explain_watch_error(error, "watch", &path, &read_watch_limits())
+                    })?;
             }
         }
     }
@@ -815,6 +824,160 @@ pub fn start_file_watcher_observed<P: AsRef<Path>, F: Fn(Vec<String>) + Send + '
         stop: Some(stop_tx),
         thread: Some(thread),
     })
+}
+
+/// The kernel limits a file watcher runs into, read when one is refused.
+///
+/// Each is `None` where it cannot be read (any host other than Linux, or a
+/// sandbox without `/proc`). A missing value is printed as unknown, never as a
+/// number, so the error does not claim a limit nobody read.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct WatchLimits {
+    /// `fs.inotify.max_user_instances`: inotify instances per user. Every
+    /// running daemon's watcher holds one.
+    max_user_instances: Option<u64>,
+    /// `fs.inotify.max_user_watches`: watched directories per user, summed
+    /// over every daemon of that user.
+    max_user_watches: Option<u64>,
+    /// This process's soft open-file limit (`ulimit -n`).
+    open_files_soft: Option<u64>,
+}
+
+fn read_watch_limits() -> WatchLimits {
+    let number = |path: &str| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+    };
+    WatchLimits {
+        max_user_instances: number("/proc/sys/fs/inotify/max_user_instances"),
+        max_user_watches: number("/proc/sys/fs/inotify/max_user_watches"),
+        open_files_soft: std::fs::read_to_string("/proc/self/limits")
+            .ok()
+            .and_then(|limits| soft_open_files(&limits)),
+    }
+}
+
+/// The soft limit from the `Max open files` row of `/proc/self/limits`.
+fn soft_open_files(limits: &str) -> Option<u64> {
+    limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|soft| soft.parse().ok())
+}
+
+/// The error for a watcher the OS refused, naming the limit that most likely
+/// refused it and the current values of every limit involved.
+///
+/// notify reports an exhausted watch count (`ENOSPC` on adding a watch) as
+/// `MaxFilesWatch`; it reports an exhausted inotify instance count as the raw
+/// `EMFILE` from `inotify_init`, the same errno as running out of file
+/// descriptors. So an `EMFILE` names both causes. Before this, a daemon that hit
+/// either limit exited with only "Too many open files (os error 24)" or "OS
+/// file watch limit reached.", and 128 daemons on a stock Ubuntu runner died
+/// at startup with nothing in their logs naming a sysctl.
+fn explain_watch_error(
+    error: notify::Error,
+    action: &str,
+    path: &Path,
+    limits: &WatchLimits,
+) -> anyhow::Error {
+    const EMFILE: i32 = 24;
+    let cause = match &error.kind {
+        notify::ErrorKind::MaxFilesWatch => Some(
+            "the per-user inotify watch limit (fs.inotify.max_user_watches) is used up; \
+             every daemon of this user counts against it",
+        ),
+        notify::ErrorKind::Io(io) if io.raw_os_error() == Some(EMFILE) => Some(
+            "the per-user inotify instance limit (fs.inotify.max_user_instances, one per \
+             running devmap daemon) or this process's open-file limit is used up",
+        ),
+        _ => None,
+    };
+    let Some(cause) = cause else {
+        return anyhow::anyhow!("could not {action} {}: {error}", path.display());
+    };
+    let shown = |value: Option<u64>| value.map_or_else(|| "unknown".to_string(), |v| v.to_string());
+    anyhow::anyhow!(
+        "could not {action} {}: {error}. Likely cause: {cause}. Current limits: \
+         fs.inotify.max_user_instances={}, fs.inotify.max_user_watches={}, open files \
+         (soft)={}. On Linux, raise the inotify limits with \
+         `sudo sysctl -w fs.inotify.max_user_instances=1024` (or max_user_watches), and \
+         persist them in /etc/sysctl.d/",
+        path.display(),
+        shown(limits.max_user_instances),
+        shown(limits.max_user_watches),
+        shown(limits.open_files_soft),
+    )
+}
+
+#[cfg(test)]
+mod watch_limit_error_tests {
+    use super::*;
+
+    fn limits() -> WatchLimits {
+        WatchLimits {
+            max_user_instances: Some(128),
+            max_user_watches: Some(65_536),
+            open_files_soft: None,
+        }
+    }
+
+    #[test]
+    fn an_exhausted_instance_count_names_both_causes_and_the_live_limits() {
+        let error = notify::Error::io(std::io::Error::from_raw_os_error(24));
+        let text = explain_watch_error(error, "start a file watcher", Path::new("/r"), &limits())
+            .to_string();
+        assert!(
+            text.starts_with("could not start a file watcher /r: "),
+            "{text}"
+        );
+        assert!(
+            text.contains("fs.inotify.max_user_instances, one per"),
+            "{text}"
+        );
+        assert!(text.contains("open-file limit"), "{text}");
+        assert!(text.contains("fs.inotify.max_user_instances=128"), "{text}");
+        assert!(text.contains("fs.inotify.max_user_watches=65536"), "{text}");
+        // A limit nobody read is said to be unknown, not given a number.
+        assert!(text.contains("open files (soft)=unknown"), "{text}");
+    }
+
+    #[test]
+    fn an_exhausted_watch_count_names_the_watch_limit() {
+        let error = notify::Error::new(notify::ErrorKind::MaxFilesWatch);
+        let text = explain_watch_error(error, "watch", Path::new("/r"), &limits()).to_string();
+        assert!(
+            text.contains("watch limit (fs.inotify.max_user_watches) is used up"),
+            "{text}"
+        );
+        assert!(!text.contains("instance limit"), "{text}");
+    }
+
+    #[test]
+    fn any_other_refusal_is_reported_as_it_was() {
+        let error = notify::Error::io(std::io::Error::from_raw_os_error(2));
+        let text = explain_watch_error(error, "watch", Path::new("/r"), &limits()).to_string();
+        assert!(text.starts_with("could not watch /r: "), "{text}");
+        assert!(
+            !text.contains("sysctl"),
+            "only a limit refusal names a limit: {text}"
+        );
+    }
+
+    #[test]
+    fn the_soft_open_file_limit_is_read_from_proc_self_limits() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max cpu time              unlimited            unlimited            seconds   \n\
+                      Max open files            1024                 524288               files     \n";
+        assert_eq!(soft_open_files(limits), Some(1024));
+        assert_eq!(
+            soft_open_files("Max open files            unlimited  unlimited  files\n"),
+            None
+        );
+        assert_eq!(soft_open_files(""), None);
+    }
 }
 
 #[cfg(test)]
