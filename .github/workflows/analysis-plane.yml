@@ -167,8 +167,18 @@ jobs:
         working-directory: rust
         run: cargo build --locked -p devmap-cli --bin devmap
 
+      # A copy goes on PATH, not target/debug itself. testsupport's
+      # `cargo build -p devmap-cli --bin devmap` in other test packages, which
+      # run in parallel, re-does the uplift into target/debug even when it
+      # compiles nothing, unlinking the binary for a moment; a live contract
+      # test exec'ing it then failed with fork/exec ENOENT. A copy keeps the
+      # semantics a test of the installed binary expects (it resolves to itself
+      # on PATH), which a hashed test copy does not.
       - name: Put devmap on PATH
-        run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
+        run: |
+          mkdir -p "$RUNNER_TEMP/devmap-bin"
+          cp rust/target/debug/devmap "$RUNNER_TEMP/devmap-bin/devmap"
+          echo "$RUNNER_TEMP/devmap-bin" >> "$GITHUB_PATH"
 
       - name: Formatting
         working-directory: backend/go_orchestrator
@@ -332,9 +342,13 @@ jobs:
       - name: Build devmap
         working-directory: rust
         run: cargo build --locked -p devmap-cli --bin devmap
+      # A copy, not target/debug: see the Unix job's step of the same name.
       - name: Put devmap on PATH
         shell: bash
-        run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
+        run: |
+          mkdir -p "$RUNNER_TEMP/devmap-bin"
+          cp rust/target/debug/devmap.exe "$RUNNER_TEMP/devmap-bin/devmap.exe"
+          echo "$RUNNER_TEMP/devmap-bin" >> "$GITHUB_PATH"
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
       - name: Vet

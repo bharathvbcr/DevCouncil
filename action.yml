@@ -1,0 +1,563 @@
+name: DevCouncil PR Gate
+description: Deterministic, static pull-request verification gate (secret scan, anti-stub rigor, DevMap blast qualification).
+author: DevCouncil
+
+inputs:
+  mode:
+    description: "Gate mode: enforce, advisory, or off (never read from untrusted PR tree)"
+    required: false
+    default: "enforce"
+  repo:
+    description: "Repository directory to analyze (defaults to GITHUB_WORKSPACE; set to a separate head checkout dir when dogfooding from base)"
+    required: false
+    default: "${{ github.workspace }}"
+  version:
+    description: "Pinned DevCouncil release tag (e.g. v0.2.5) when downloading release binaries"
+    required: false
+    default: "v0.2.5"
+  sha256:
+    description: "Expected 64-hex SHA-256 checksum of the downloaded release archive (required when binary-dir is unset)"
+    required: false
+    default: ""
+  release-repo:
+    description: "GitHub repository hosting pinned DevCouncil release tarballs"
+    required: false
+    default: "bharathvbcr/DevCouncil"
+  binary-dir:
+    description: "Optional directory outside $GITHUB_WORKSPACE containing pre-built devcouncil, devmap, and dcverify (and optional dcredact) binaries"
+    required: false
+    default: ""
+  dcredact:
+    description: "Optional path outside $GITHUB_WORKSPACE to dcredact binary for egress scrubbing (uses pure-Go fallback scrubber when omitted)"
+    required: false
+    default: ""
+  coverage:
+    description: "Optional path to Go coverprofile (mode: set/count/atomic) or LCOV coverage file for diff coverage verification"
+    required: false
+    default: ""
+  base-sha:
+    description: "PR base commit SHA (40-hex; defaults to pull_request.base.sha)"
+    required: false
+    default: "${{ github.event.pull_request.base.sha }}"
+  head-sha:
+    description: "PR head commit SHA (40-hex; defaults to pull_request.head.sha, never GITHUB_SHA)"
+    required: false
+    default: "${{ github.event.pull_request.head.sha }}"
+  build-index:
+    description: "Whether to run `devmap build` before `devmap blast`"
+    required: false
+    default: "true"
+  timeout:
+    description: "Timeout for DevMap build and blast (Go duration, e.g. 5m)"
+    required: false
+    default: "5m"
+  post-comment:
+    description: "Post or update sticky PR comment on same-repo PRs (forks always skip write API calls; use workflow_run poster for forks)"
+    required: false
+    default: "true"
+  post-status:
+    description: "Post commit status context devcouncil/pr-gate on pull_request.head.sha for same-repo PRs"
+    required: false
+    default: "true"
+  upload-sarif:
+    description: "Upload SARIF 2.1.0 report to GitHub Code Scanning via github/codeql-action/upload-sarif (same-repo PRs only; fork PRs lack security-events: write)"
+    required: false
+    default: "false"
+  relay-url:
+    description: "Optional GitPulse Relay base URL (https://...) for private-repository OIDC authorization; public repos ALWAYS bypass the relay and run 100% free (note: self-hosted relay-url is advisory; hosted enforcement lives on the relay/GitHub App side)"
+    required: false
+    default: ""
+  relay-audience:
+    description: "Optional OIDC audience requested for relay-url (defaults to relay-url)"
+    required: false
+    default: ""
+  github-token:
+    description: "Token used for same-repo PR comment and commit status API calls"
+    required: false
+    default: "${{ github.token }}"
+
+outputs:
+  outcome:
+    description: "Gate outcome: success, failure, error, or skipped"
+    value: ${{ steps.gate.outputs.outcome }}
+  exit-code:
+    description: "Gate exit code: 0 (pass/skipped), 1 (failure), 2 (error/degraded), 64 (usage)"
+    value: ${{ steps.gate.outputs.exit_code }}
+  report-json:
+    description: "Path to devcouncil.pr_gate/v1 JSON report in RUNNER_TEMP"
+    value: ${{ steps.gate.outputs.report_json }}
+  report-markdown:
+    description: "Path to privacy-safe Markdown summary in RUNNER_TEMP"
+    value: ${{ steps.gate.outputs.report_markdown }}
+  report-sarif:
+    description: "Path to SARIF 2.1.0 report in RUNNER_TEMP"
+    value: ${{ steps.gate.outputs.report_sarif }}
+
+runs:
+  using: composite
+  steps:
+    - name: Authorize private repository via GitPulse Relay (OIDC)
+      if: ${{ inputs.mode != 'off' && inputs.relay-url != '' }}
+      shell: bash
+      env:
+        RELAY_URL: ${{ inputs.relay-url }}
+        RELAY_AUDIENCE: ${{ inputs.relay-audience }}
+        REPO_VISIBILITY: ${{ github.event.repository.visibility }}
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+      run: |
+        set -euo pipefail
+
+        # Note: in self-hosted workflows, passing relay-url is advisory (a private
+        # repo that omits relay-url runs the open-source static gate locally;
+        # paid entitlement enforcement lives on hosted GitPulse Relay / GitHub App
+        # features). Public repositories ALWAYS bypass the relay and run 100% free.
+        if [ "$REPO_VISIBILITY" = "public" ] || { [ -z "$REPO_VISIBILITY" ] && [ "$REPO_PRIVATE" = "false" ]; }; then
+          echo "::notice::DevCouncil PR Gate: public repository detected; bypassing relay authorization (free tier)."
+          exit 0
+        fi
+
+        BASE_URL="${RELAY_URL%/}"
+        if ! [[ "$BASE_URL" =~ ^https://[^[:space:]]+$ ]]; then
+          echo "::error::devcouncil pr-gate: relay-url must be a valid https:// URL"
+          exit 2
+        fi
+
+        AUDIENCE="${RELAY_AUDIENCE:-$BASE_URL}"
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::devcouncil pr-gate: OIDC token environment unavailable (add 'id-token: write' permission to authorize private repositories)"
+          exit 2
+        fi
+        case "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" in
+          *$'\n'*|*$'\r'*|*'"'*|*\\*)
+            echo "::error::devcouncil pr-gate: malformed ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+            exit 2
+            ;;
+        esac
+
+        ENCODED_AUD="$(jq -rn --arg a "$AUDIENCE" '$a | @uri')"
+        SEP="?"
+        if [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *"?"* ]]; then
+          SEP="&"
+        fi
+        OIDC_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}${SEP}audience=${ENCODED_AUD}"
+
+        CURL_CFG="$(mktemp "$RUNNER_TEMP/pr-gate-oidc-curl.XXXXXX")"
+        REQ_FILE="$(mktemp "$RUNNER_TEMP/pr-gate-oidc-req.XXXXXX")"
+        RESP_FILE="$(mktemp "$RUNNER_TEMP/pr-gate-oidc-resp.XXXXXX")"
+        chmod 600 "$CURL_CFG" "$REQ_FILE" "$RESP_FILE"
+        trap 'rm -f "$CURL_CFG" "$REQ_FILE" "$RESP_FILE"' EXIT
+
+        # Pass ACTIONS_ID_TOKEN_REQUEST_TOKEN via a mode-0600 curl --config file
+        # rather than on curl's command-line argv.
+        printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > "$CURL_CFG"
+        printf 'header = "Accept: application/json; api-version=2.0"\n' >> "$CURL_CFG"
+
+        OIDC_RESP="$(curl -fsSL --max-time 15 --proto '=https' --tlsv1.2 \
+          --config "$CURL_CFG" \
+          "$OIDC_URL")" || {
+          echo "::error::devcouncil pr-gate: failed to request GitHub Actions OIDC token"
+          exit 2
+        }
+        OIDC_TOKEN="$(printf '%s' "$OIDC_RESP" | jq -r '.value // ""')"
+        if [ -z "$OIDC_TOKEN" ]; then
+          echo "::error::devcouncil pr-gate: GitHub Actions OIDC response did not contain a token"
+          exit 2
+        fi
+
+        # Write token to a mode-0600 file rather than passing it in argv.
+        printf '%s' "$OIDC_TOKEN" | jq -Rs '{oidc_token: .}' > "$REQ_FILE"
+        unset OIDC_TOKEN OIDC_RESP
+
+        HTTP_CODE="$(curl -sS --max-time 15 --proto '=https' --tlsv1.2 \
+          -o "$RESP_FILE" \
+          -w '%{http_code}' \
+          -X POST \
+          -H "Content-Type: application/json" \
+          --data-binary "@${REQ_FILE}" \
+          "${BASE_URL}/v1/pr-gate/authorize")" || {
+          echo "::error::devcouncil pr-gate: relay authorization request failed (network error)"
+          exit 2
+        }
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          RAW_ERR="$(jq -r '.error // .code // "unauthorized"' "$RESP_FILE" 2>/dev/null || echo "unauthorized")"
+          # Sanitize untrusted relay error before emitting a workflow command
+          # (strip CR/LF, %, ::, and non-safe characters).
+          ERR_CODE="$(printf '%s' "$RAW_ERR" | tr '\r\n' '  ' | sed -e 's/%//g' -e 's/::/ /g' | tr -cd 'A-Za-z0-9._ -' | cut -c1-80)"
+          [ -n "$ERR_CODE" ] || ERR_CODE="unauthorized"
+          echo "::error::devcouncil pr-gate: private repository authorization denied by relay (HTTP ${HTTP_CODE}: ${ERR_CODE})"
+          exit 2
+        fi
+
+        ALLOWED="$(jq -r 'if (.allowed | type) == "boolean" then (.allowed | tostring) else "false" end' "$RESP_FILE" 2>/dev/null || echo "false")"
+        if [ "$ALLOWED" != "true" ]; then
+          echo "::error::devcouncil pr-gate: relay authorization response did not confirm allowed=true"
+          exit 2
+        fi
+
+    - name: Validate inputs and prepare binaries outside workspace
+      id: prep
+      shell: bash
+      env:
+        GATE_MODE: ${{ inputs.mode }}
+        REPO_DIR_IN: ${{ inputs.repo }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        BUILD_INDEX: ${{ inputs.build-index }}
+        TIMEOUT: ${{ inputs.timeout }}
+        BIN_DIR_IN: ${{ inputs.binary-dir }}
+        DCREDACT_IN: ${{ inputs.dcredact }}
+        COVERAGE_IN: ${{ inputs.coverage }}
+        UPLOAD_SARIF: ${{ inputs.upload-sarif }}
+        VERSION: ${{ inputs.version }}
+        EXPECTED_SHA256: ${{ inputs.sha256 }}
+        RELEASE_REPO: ${{ inputs.release-repo }}
+      run: |
+        set -euo pipefail
+
+        case "$GATE_MODE" in
+          enforce|advisory|off) ;;
+          *)
+            echo "::error::devcouncil pr-gate: invalid mode '$GATE_MODE' (expected enforce, advisory, or off)"
+            exit 64
+            ;;
+        esac
+
+        if [ "$GATE_MODE" != "off" ]; then
+          if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::devcouncil pr-gate: base-sha must be a 40-char lowercase hex SHA"
+            exit 64
+          fi
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::devcouncil pr-gate: head-sha must be a 40-char lowercase hex SHA"
+            exit 64
+          fi
+        fi
+
+        case "$BUILD_INDEX" in
+          true|false) ;;
+          *)
+            echo "::error::devcouncil pr-gate: build-index must be true or false"
+            exit 64
+            ;;
+        esac
+
+        case "$UPLOAD_SARIF" in
+          true|false) ;;
+          *)
+            echo "::error::devcouncil pr-gate: upload-sarif must be true or false"
+            exit 64
+            ;;
+        esac
+
+        resolve_real() {
+          if command -v realpath >/dev/null 2>&1; then
+            realpath "$1"
+          elif command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+          elif [ -d "$1" ]; then
+            (cd "$1" && pwd -P)
+          else
+            local dir base
+            dir="$(cd "$(dirname "$1")" && pwd -P)"
+            base="$(basename "$1")"
+            printf '%s/%s\n' "$dir" "$base"
+          fi
+        }
+
+        if [ -z "$REPO_DIR_IN" ] || [ ! -d "$REPO_DIR_IN" ]; then
+          echo "::error::devcouncil pr-gate: repo directory does not exist"
+          exit 64
+        fi
+        WORKSPACE_REAL="$(resolve_real "$GITHUB_WORKSPACE")"
+        REPO_REAL="$(resolve_real "$REPO_DIR_IN")"
+        OUT_DIR="$RUNNER_TEMP/devcouncil-pr-gate-out"
+        mkdir -p "$OUT_DIR"
+
+        ensure_outside_untrusted() {
+          local target="$1"
+          local resolved
+          resolved="$(resolve_real "$target")"
+          case "$resolved" in
+            "$WORKSPACE_REAL"|"$WORKSPACE_REAL"/*|"$REPO_REAL"|"$REPO_REAL"/*)
+              echo "::error::devcouncil pr-gate: binary path '$target' resolves inside GITHUB_WORKSPACE or repo under analysis"
+              exit 2
+              ;;
+          esac
+          printf '%s\n' "$resolved"
+        }
+
+        if [ -n "$BIN_DIR_IN" ]; then
+          if [ ! -d "$BIN_DIR_IN" ]; then
+            echo "::error::devcouncil pr-gate: binary-dir does not exist"
+            exit 2
+          fi
+          BIN_DIR="$(ensure_outside_untrusted "$BIN_DIR_IN")"
+        else
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::devcouncil pr-gate: version must be a pinned semver tag (e.g. v0.2.5)"
+            exit 64
+          fi
+          if ! [[ "$EXPECTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::devcouncil pr-gate: sha256 input (64-hex) is required when downloading release binaries"
+            exit 64
+          fi
+          if ! [[ "$RELEASE_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::devcouncil pr-gate: release-repo must be owner/repo"
+            exit 64
+          fi
+
+          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64) ARCH="amd64" ;;
+            arm64|aarch64) ARCH="arm64" ;;
+            *)
+              echo "::error::devcouncil pr-gate: unsupported architecture $ARCH"
+              exit 2
+              ;;
+          esac
+
+          BIN_DIR="$RUNNER_TEMP/devcouncil-pr-gate-bin"
+          rm -rf "$BIN_DIR"
+          mkdir -p "$BIN_DIR"
+          BIN_DIR="$(ensure_outside_untrusted "$BIN_DIR")"
+
+          ASSET="devcouncil_${VERSION}_${OS}_${ARCH}.tar.gz"
+          ARCHIVE="$RUNNER_TEMP/$ASSET"
+          URL="https://github.com/${RELEASE_REPO}/releases/download/${VERSION}/${ASSET}"
+
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$ARCHIVE" "$URL"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL_SHA256="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+          else
+            ACTUAL_SHA256="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          fi
+          ACTUAL_LOWER="$(printf '%s' "$ACTUAL_SHA256" | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_LOWER="$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')"
+          if [ "$ACTUAL_LOWER" != "$EXPECTED_LOWER" ]; then
+            echo "::error::devcouncil pr-gate: SHA-256 verification failed for downloaded archive"
+            rm -f "$ARCHIVE"
+            exit 2
+          fi
+
+          tar -xzf "$ARCHIVE" -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+        fi
+
+        # Verify each required executable exists and that symlinks cannot escape back into the workspace/repo.
+        for tool in devcouncil devmap dcverify; do
+          if [ ! -x "$BIN_DIR/$tool" ]; then
+            echo "::error::devcouncil pr-gate: required executable $tool not found in binary directory"
+            exit 2
+          fi
+          ensure_outside_untrusted "$BIN_DIR/$tool" >/dev/null
+        done
+
+        # Resolve optional dcredact binary (explicit input or bundled in BIN_DIR), always outside workspace/repo.
+        DCREDACT_BIN=""
+        if [ -n "$DCREDACT_IN" ]; then
+          if [ ! -x "$DCREDACT_IN" ]; then
+            echo "::error::devcouncil pr-gate: configured dcredact binary is not executable"
+            exit 2
+          fi
+          DCREDACT_BIN="$(ensure_outside_untrusted "$DCREDACT_IN")"
+        elif [ -x "$BIN_DIR/dcredact" ]; then
+          DCREDACT_BIN="$(ensure_outside_untrusted "$BIN_DIR/dcredact")"
+        fi
+
+        COVERAGE_PATH=""
+        if [ -n "$COVERAGE_IN" ]; then
+          if [ ! -f "$COVERAGE_IN" ]; then
+            echo "::error::devcouncil pr-gate: coverage profile does not exist"
+            exit 2
+          fi
+          COVERAGE_PATH="$(resolve_real "$COVERAGE_IN")"
+        fi
+
+        {
+          echo "bin_dir=$BIN_DIR"
+          echo "dcredact_bin=$DCREDACT_BIN"
+          echo "coverage_path=$COVERAGE_PATH"
+          echo "repo_dir=$REPO_REAL"
+          echo "out_dir=$OUT_DIR"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Run DevCouncil PR Gate
+      id: gate
+      shell: bash
+      env:
+        BIN_DIR: ${{ steps.prep.outputs.bin_dir }}
+        DCREDACT_BIN_PATH: ${{ steps.prep.outputs.dcredact_bin }}
+        COVERAGE_PATH: ${{ steps.prep.outputs.coverage_path }}
+        REPO_DIR: ${{ steps.prep.outputs.repo_dir }}
+        OUT_DIR: ${{ steps.prep.outputs.out_dir }}
+        GATE_MODE: ${{ inputs.mode }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        BUILD_INDEX: ${{ inputs.build-index }}
+        TIMEOUT: ${{ inputs.timeout }}
+        GOTOOLCHAIN: local
+      run: |
+        set -uo pipefail
+        # Never allow repo-controlled or ambient env vars to override pinned binaries or weaken fail-closed behavior.
+        unset MANVI_VERIFY_BINARY DEVMAP_BIN DCREDACT_BIN DEVCOUNCIL_ALLOW_NO_DCVERIFY
+
+        JSON_OUT="$OUT_DIR/pr-gate.json"
+        MD_OUT="$OUT_DIR/pr-gate.md"
+        SARIF_OUT="$OUT_DIR/pr-gate.sarif"
+
+        ARGS=(
+          pr-gate
+          --repo "$REPO_DIR"
+          --base "$BASE_SHA"
+          --head "$HEAD_SHA"
+          --mode "$GATE_MODE"
+          --devmap "$BIN_DIR/devmap"
+          --dcverify "$BIN_DIR/dcverify"
+          --build-index="$BUILD_INDEX"
+          --timeout "$TIMEOUT"
+          --format annotations
+          --json-out "$JSON_OUT"
+          --markdown-out "$MD_OUT"
+          --sarif-out "$SARIF_OUT"
+        )
+        if [ -n "$DCREDACT_BIN_PATH" ]; then
+          ARGS+=(--dcredact "$DCREDACT_BIN_PATH")
+        fi
+        if [ -n "$COVERAGE_PATH" ]; then
+          ARGS+=(--coverage "$COVERAGE_PATH")
+        fi
+
+        "$BIN_DIR/devcouncil" "${ARGS[@]}"
+        EXIT_CODE=$?
+
+        OUTCOME="error"
+        SHOULD_POST="false"
+        STATUS_STATE=""
+        STATUS_DESC=""
+        if [ -f "$JSON_OUT" ]; then
+          OUTCOME="$(jq -r '.outcome // "error"' "$JSON_OUT")"
+          SHOULD_POST="$(jq -r '.should_post // false' "$JSON_OUT")"
+          STATUS_STATE="$(jq -r '.status_state // ""' "$JSON_OUT")"
+          STATUS_DESC="$(jq -r '.status_description // ""' "$JSON_OUT")"
+        fi
+
+        HAS_SARIF="false"
+        if [ -f "$SARIF_OUT" ]; then
+          HAS_SARIF="true"
+        fi
+
+        # Write GitHub Job Summary for all PRs (including forks) unless mode=off skipped.
+        if [ "$OUTCOME" != "skipped" ] && [ -f "$MD_OUT" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          cat "$MD_OUT" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        {
+          echo "outcome=$OUTCOME"
+          echo "exit_code=$EXIT_CODE"
+          echo "should_post=$SHOULD_POST"
+          echo "status_state=$STATUS_STATE"
+          echo "has_sarif=$HAS_SARIF"
+          echo "report_json=$JSON_OUT"
+          echo "report_markdown=$MD_OUT"
+          echo "report_sarif=$SARIF_OUT"
+        } >> "$GITHUB_OUTPUT"
+
+        # Save status description to file to avoid multiline/env escaping issues.
+        printf '%s' "$STATUS_DESC" > "$OUT_DIR/status-desc.txt"
+
+    # Note: upload-sarif is same-repo PRs only (fork PRs lack security-events: write
+    # and GitHub Code Scanning rejects SARIF uploads from untrusted fork tokens).
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ !cancelled() && inputs.upload-sarif == 'true' && steps.gate.outputs.outcome != 'skipped' && steps.gate.outputs.has_sarif == 'true' }}
+      uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+      with:
+        sarif_file: ${{ steps.gate.outputs.report_sarif }}
+        category: devcouncil-pr-gate
+
+    - name: Post sticky PR comment and commit status (same-repo PRs only)
+      if: ${{ !cancelled() && steps.gate.outputs.should_post == 'true' && (inputs.post-comment == 'true' || inputs.post-status == 'true') }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REPO_ID: ${{ github.repository_id }}
+        PR_HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        POST_COMMENT: ${{ inputs.post-comment }}
+        POST_STATUS: ${{ inputs.post-status }}
+        STATUS_STATE: ${{ steps.gate.outputs.status_state }}
+        OUT_DIR: ${{ steps.prep.outputs.out_dir }}
+        MD_OUT: ${{ steps.gate.outputs.report_markdown }}
+      run: |
+        set -euo pipefail
+
+        # Fork PRs receive Job Summary + SARIF + exit code only; never attempt GitHub API writes.
+        if [ -z "$PR_HEAD_REPO_ID" ] || [ "$PR_HEAD_REPO_ID" != "$GITHUB_REPO_ID" ]; then
+          echo "::notice::DevCouncil PR Gate: fork pull request detected; skipping PR comment and commit status writes (Job Summary written)."
+          exit 0
+        fi
+
+        if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::DevCouncil PR Gate: refusing to post status without a valid 40-hex pull_request.head.sha"
+          exit 2
+        fi
+
+        if [ "$POST_STATUS" = "true" ]; then
+          case "$STATUS_STATE" in
+            success|failure|error) ;;
+            *)
+              echo "::error::DevCouncil PR Gate: refusing invalid commit status state '$STATUS_STATE'"
+              exit 2
+              ;;
+          esac
+          STATUS_DESC="$(cat "$OUT_DIR/status-desc.txt")"
+          # Post strictly on pull_request.head.sha (never GITHUB_SHA) under dedicated context devcouncil/pr-gate.
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$STATUS_STATE" \
+            -f context="devcouncil/pr-gate" \
+            -f description="$STATUS_DESC" >/dev/null
+        fi
+
+        if [ "$POST_COMMENT" = "true" ] && [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] && [ -f "$MD_OUT" ]; then
+          # Match sticky comment by BOTH hidden marker AND bot author so a PR author
+          # cannot plant the marker in their own comment to hijack updates.
+          EXISTING_ID="$(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq '.[] | select(.user.type == "Bot" and .user.login == "github-actions[bot]" and (.body | contains("<!-- devcouncil:pr-gate -->"))) | .id' \
+              | head -n 1
+          )"
+          if [ -n "$EXISTING_ID" ]; then
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" \
+              -F body=@"$MD_OUT" >/dev/null
+          else
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -F body=@"$MD_OUT" >/dev/null
+          fi
+        fi
+
+    - name: Enforce PR Gate exit code
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        GATE_EXIT_CODE: ${{ steps.gate.outputs.exit_code }}
+      run: |
+        set -euo pipefail
+        if ! [[ "$GATE_EXIT_CODE" =~ ^[0-9]+$ ]]; then
+          exit 2
+        fi
+        exit "$GATE_EXIT_CODE"

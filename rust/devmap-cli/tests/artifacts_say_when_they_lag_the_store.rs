@@ -186,3 +186,95 @@ fn a_manifest_build_times_each_phase_of_the_artifact_write() {
     assert_eq!(build["manifest"]["status"]["artifacts"]["current"], true);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn build_repo_map_refreshes_repo_map_without_rewriting_code_graph() {
+    let root = fixture("repo-map-only");
+    run(&root, &["build", ".", "--manifest", "--force"]);
+
+    let initial = json(&root, &["status", "--json"]);
+    let gen1 = initial["generation_id"].as_u64().unwrap();
+    let map_path = devmap_extract::paths::repo_map_path(&root);
+    let graph_path = devmap_extract::paths::code_graph_path(&root);
+    let graph_bytes_before = std::fs::read(&graph_path).unwrap();
+    let graph_meta_before = std::fs::metadata(&graph_path).unwrap();
+
+    // Edit one file and rebuild with `--repo-map`: repo_map advances, code_graph stays untouched.
+    std::fs::write(
+        root.join("src/m1.py"),
+        "def f1(value):\n    return value * 3\n\n\ndef extra(value):\n    return value + 10\n",
+    )
+    .unwrap();
+    let repo_map_build = json(&root, &["build", ".", "--repo-map", "--json"]);
+    assert_eq!(
+        repo_map_build["manifest"]["artifacts_unchanged"], false,
+        "{repo_map_build}"
+    );
+    assert!(
+        repo_map_build["manifest"]["graph_output"].is_null(),
+        "expected --repo-map to skip code_graph output: {repo_map_build}"
+    );
+    assert!(
+        repo_map_build["manifest"]["compact_graph_output"].is_null(),
+        "expected --repo-map to skip compact graph output: {repo_map_build}"
+    );
+
+    let after = json(&root, &["status", "--json"]);
+    let gen2 = after["generation_id"].as_u64().unwrap();
+    assert!(gen2 > gen1, "expected store to advance: {gen1} -> {gen2}");
+
+    // repo_map.json updated to gen2; code_graph.json was NOT rewritten.
+    let map_after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+    assert_eq!(map_after["freshness"]["generation_id"], gen2);
+    assert_eq!(std::fs::read(&graph_path).unwrap(), graph_bytes_before);
+    let graph_meta_after = std::fs::metadata(&graph_path).unwrap();
+    assert_eq!(
+        graph_meta_after.modified().unwrap(),
+        graph_meta_before.modified().unwrap(),
+        "code_graph.json mtime must not change under --repo-map"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            graph_meta_after.ino(),
+            graph_meta_before.ino(),
+            "code_graph.json inode must not change under --repo-map"
+        );
+    }
+
+    // Status fails closed on overall currency while reporting per-artifact generations.
+    let report = artifacts(&after);
+    assert_eq!(report["current"], false, "{report}");
+    assert_eq!(report["written_from_generation"], gen1, "{report}");
+    assert_eq!(report["store_generation"], gen2, "{report}");
+    assert_eq!(report["lag_generations"], gen2 - gen1, "{report}");
+    assert_eq!(report["output_generations"]["repo_map"], gen2, "{report}");
+    assert_eq!(report["output_generations"]["code_graph"], gen1, "{report}");
+    let reason = report["reason"].as_str().unwrap();
+    assert!(reason.contains("code_graph"), "{reason}");
+    assert!(reason.contains("repo_map is current"), "{reason}");
+
+    // A second `--repo-map` run with no source change skips rewriting repo_map.json.
+    let second = json(&root, &["build", ".", "--repo-map", "--json"]);
+    assert_eq!(second["manifest"]["artifacts_unchanged"], true, "{second}");
+
+    // Standalone `devmap manifest --repo-map-only` also skips when repo_map is already current.
+    let standalone = json(&root, &["manifest", ".", "--repo-map-only", "--json"]);
+    assert_eq!(standalone["artifacts_unchanged"], true, "{standalone}");
+    assert!(standalone["graph_output"].is_null(), "{standalone}");
+
+    // Full `--manifest` notices code_graph still lags and brings all artifacts current.
+    let full = json(&root, &["build", ".", "--manifest", "--json"]);
+    assert_eq!(full["manifest"]["artifacts_unchanged"], false, "{full}");
+    assert!(full["manifest"]["graph_output"].is_string(), "{full}");
+    let caught_up = json(&root, &["status", "--json"]);
+    let report = artifacts(&caught_up);
+    assert_eq!(report["current"], true, "{report}");
+    assert_eq!(report["lag_generations"], 0, "{report}");
+    assert_eq!(report["output_generations"]["repo_map"], gen2, "{report}");
+    assert_eq!(report["output_generations"]["code_graph"], gen2, "{report}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
