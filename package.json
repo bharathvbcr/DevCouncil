@@ -2,7 +2,7 @@
   "name": "devcouncil",
   "version": "0.2.5",
   "description": "Code intelligence and deterministic verification for AI coding agents: symbol-level code graph, blast radius, dead-code analysis, and MCP servers for Claude Code, Cursor, and Codex",
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/bharathvbcr/DevCouncil#readme",
   "repository": {
     "type": "git",
@@ -40,7 +40,10 @@
   "files": [
     "bin/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "NOTICE"
   ],
   "scripts": {
     "pack:check": "npm pack --dry-run",
