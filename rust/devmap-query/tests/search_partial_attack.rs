@@ -436,6 +436,9 @@ fn p3_overlapping_unsorted_ranges_name_the_region_once() {
 }
 
 /// A path with a newline and an ESC in it must not reach the sentence raw.
+/// Unix only: Windows cannot create a file name holding a control character
+/// (os error 123), and the fixture writes the file to disk.
+#[cfg(unix)]
 #[test]
 fn p3_control_characters_in_a_path_are_escaped() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";

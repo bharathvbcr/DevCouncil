@@ -15,6 +15,16 @@ use serde_json::{json, Value};
 
 const DEVMAP: &str = env!("CARGO_BIN_EXE_devmap");
 
+/// The registered server's executable, absolute on the host: `/opt/...` is
+/// rooted but not absolute on Windows, and the server is refused there.
+fn server_command() -> &'static str {
+    if cfg!(windows) {
+        r"C:\opt\devcouncil\bin\devcouncil"
+    } else {
+        "/opt/devcouncil/bin/devcouncil"
+    }
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "devmap-stdin-{tag}-{}-{}",
@@ -207,12 +217,7 @@ fn servers_on_stdin_are_registered_reported_and_checked() {
     // rewrites them. Creating it first keeps this test about the servers.
     std::fs::create_dir_all(root.join(".devcouncil")).unwrap();
     let root_arg = root.to_str().unwrap();
-    // Absolute on the host: `/opt/...` is rooted but not absolute on Windows.
-    let command = if cfg!(windows) {
-        r"C:\opt\devcouncil\bin\devcouncil"
-    } else {
-        "/opt/devcouncil/bin/devcouncil"
-    };
+    let command = server_command();
     let request = serde_json::to_vec(&json!({"servers": [{
         "name": "devcouncil",
         "command": command,
@@ -329,7 +334,7 @@ fn a_refused_document_stops_an_apply_before_it_writes_anything() {
 fn servers_request(root: &Path) -> Vec<u8> {
     serde_json::to_vec(&json!({"servers": [{
         "name": "devcouncil",
-        "command": "/opt/devcouncil/bin/devcouncil",
+        "command": server_command(),
         "args": ["mcp"],
         "env": {"DEVCOUNCIL_PROJECT_ROOT": root.to_str().unwrap()},
     }]}))

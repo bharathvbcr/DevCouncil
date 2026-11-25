@@ -67,7 +67,14 @@ fn files(root: &Path) -> BTreeSet<String> {
             if path.is_dir() {
                 walk(base, &path, into);
             } else {
-                into.insert(path.strip_prefix(base).unwrap().display().to_string());
+                // Forward slashes on every platform: callers match `.devmap/...`.
+                into.insert(
+                    path.strip_prefix(base)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                        .replace('\\', "/"),
+                );
             }
         }
     }

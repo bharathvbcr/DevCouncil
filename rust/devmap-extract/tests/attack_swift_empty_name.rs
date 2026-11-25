@@ -8,6 +8,14 @@
 //! expression yield the same facts, or the extractor abstains; a wrong edge is
 //! worse than an abstention; the refusal diagnostic is one line per file, is
 //! exact, and never leaks into another file.
+//!
+//! tree-sitter-swift 0.7.4 (was 0.7.3): `b as? T ?? X` parses correctly as
+//! `nil_coalescing_expression(value: as_expression, if_nil: X)`. The twin
+//! sweeps (1a, 1b, 1d, 1e) therefore refuse nothing; they still prove the bare
+//! spelling equals its parenthesised twin, and `Tally::finish` now requires a
+//! floor of Clean bare sites that matched their twin (the measured counts)
+//! instead of a refused site. The note-isolation tests (section 3) trigger the
+//! one refusal that is still live: a bare-cast member, `(b as! Foo.Bar)`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -46,12 +54,16 @@ fn refusal_notes(e: &Extraction) -> Vec<&str> {
         .collect()
 }
 
-fn refusal_note(n: usize) -> String {
-    format!("swift: refused {n} call(s) on an operator the grammar inserted with no spelling")
-}
-
 /// The one note the references walk raises for members the grammar read off a
-/// bare cast, which is a different note from the unspelled-operator one.
+/// bare cast. Under tree-sitter-swift 0.7.4 this is the only refusal note a
+/// Clean Swift file can carry: the unspelled-operator note (`swift: refused N
+/// call(s) on an operator the grammar inserted with no spelling`) is guarded in
+/// the source but no input reaches it, because `b as? T ?? X` now parses as a
+/// `nil_coalescing_expression`. The isolation tests below therefore trigger
+/// the note with a bare-cast member (`(b as! Foo.Bar)`), which still mis-parses
+/// as `navigation(as_expression "b as! Foo", Bar)`. (Only the parenthesised form
+/// does: a bare `let a = b as! Foo.Bar` followed by a newline parses correctly
+/// as a qualified type, while the same text at end of file does not.)
 fn member_note(n: usize) -> String {
     format!("swift: refused {n} member reference(s) the grammar read off a bare cast")
 }
@@ -175,6 +187,9 @@ struct Tally {
     bare_clean: usize,
     bare_partial: usize,
     refused_sites: usize,
+    /// Bare sites that were Clean, were compared table by table with their
+    /// twin, and matched it. The sweep's proof that it kept comparing.
+    matched: usize,
     failures: Vec<String>,
 }
 
@@ -211,26 +226,35 @@ impl Tally {
                     "{label} {bare:?} is Clean but differs from its twin {twin:?}: {}",
                     diffs.join("; ")
                 ));
+            } else {
+                self.matched += 1;
             }
         } else {
             self.bare_partial += 1;
         }
     }
 
-    fn finish(self) {
+    /// Fails on any recorded failure, and on a sweep that compared fewer than
+    /// `min_matched` Clean bare sites with their twin. Under tree-sitter-swift
+    /// 0.7.4 the bare cast-coalesce parses correctly, so nothing is refused and
+    /// the old "reached a refused site" guard cannot hold; the floor is the
+    /// measured count, so a sweep that silently stopped comparing fails.
+    fn finish(self, min_matched: usize) {
         assert!(
             self.failures.is_empty(),
-            "checked {} (bare Clean {}, bare Partial {}, refused {}); {} failure(s):\n{}",
+            "checked {} (bare Clean {}, bare Partial {}, refused {}, matched {}); {} failure(s):\n{}",
             self.checked,
             self.bare_clean,
             self.bare_partial,
             self.refused_sites,
+            self.matched,
             self.failures.len(),
             self.failures.join("\n")
         );
         assert!(
-            self.bare_clean > 0 && self.refused_sites > 0,
-            "the sweep never reached a Clean refused site (checked {}); it proves nothing",
+            self.matched >= min_matched,
+            "the sweep matched only {} of {} Clean bare sites with their twin (floor {min_matched}); it proves nothing",
+            self.matched,
             self.checked
         );
     }
@@ -300,7 +324,7 @@ fn every_plain_bare_cast_equals_its_twin_or_abstains() {
             }
         }
     }
-    tally.finish();
+    tally.finish(1920);
 }
 
 /// ATTACK 1b. `try?` / `try!` with a coalesce, plus nested `??`, multiple
@@ -347,7 +371,7 @@ fn try_nested_and_chained_spellings_equal_their_twins() {
     for (bare, twin) in pairs {
         tally.judge("variant", &format!("{bare}\n"), &format!("{twin}\n"));
     }
-    tally.finish();
+    tally.finish(10);
 }
 
 /// ATTACK 1c. A cast to a qualified type (`Foo.Bar`, `String.Type`) is read by
@@ -411,7 +435,7 @@ fn a_split_or_commented_bare_site_equals_its_twin() {
             }
         }
     }
-    tally.finish();
+    tally.finish(512);
 }
 
 /// ATTACK 1e. The bare site in every syntactic position the brief lists:
@@ -472,7 +496,7 @@ fn a_bare_site_in_any_context_equals_its_twin() {
             );
         }
     }
-    tally.finish();
+    tally.finish(90);
 }
 
 /// ATTACK 1f. After the coalesce, an implicit-member expression (`.foo()`,
@@ -539,47 +563,125 @@ fn an_implicit_member_after_the_coalesce_is_not_given_the_cast_as_receiver() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// ATTACK 1f, chains and the note. Swift's `as?` and `as!` bind looser than
-/// postfix `.` and `()`, so a member chain based on an unparenthesised cast is
-/// always a misparse, and every member of it is refused: `.foo().bar()` and
-/// `.foo.bar` publish no fact whose receiver is cast or coalesce text. The
-/// refusal is noted once per refused member, in its own wording (the
-/// unspelled-operator note is pinned and `??` is spelled here), and the operand
-/// of the cast is never one of them.
+/// ATTACK 1f, chains and the note, as of tree-sitter-swift 0.7.4. The grammar
+/// now parses `b as? Color ?? X` as `nil_coalescing_expression(value:
+/// as_expression, if_nil: X)`, so `X` is extracted exactly as it would be on its
+/// own: nothing is refused, no note is raised, and `X`'s members are published
+/// with their real receivers (`x.foo()` is `foo` on `x`, `Color.red` is `red` on
+/// `Color`, `.foo().bar()` is `bar` on `.foo()`; a bare leading-dot call such as
+/// `.foo()` publishes no call anywhere). Per probe: no note, no empty name, no
+/// receiver holding cast or operator text, the operand `b` stays, and the bare
+/// site publishes the same calls and references as its parenthesised twin
+/// `b as? Color ?? (X)`.
+///
+/// What is still live: a cast to a QUALIFIED type is read as a member access on
+/// the cast (`navigation(as_expression "b as? Foo", Bar)`), with or without a
+/// coalesce. Those probes keep their refusal expectation: one note counting
+/// every member, and no fact whose receiver is the cast.
 #[test]
 fn a_member_chain_off_a_bare_cast_is_refused_and_counted_per_member() {
     let mut failures = Vec::new();
-    for (source, members) in [
-        ("let a = b as? Color ?? .foo()\n", 1),
-        ("let a = b as! Color ?? .custom(1)\n", 1),
-        ("let a = b as? Color ?? .foo().bar()\n", 2),
-        ("let a = b as? Color ?? .foo.bar\n", 2),
-        ("let a = b as? Color ?? .some(x)\n", 1),
-        ("let a = b as? Color ?? .zero\n", 1),
-        // The grammar reads `Color ??` as an optional type here too, so the
-        // spelled `Color.red` is a member of the cast, not of `Color`.
-        ("let a = b as? Color ?? Color.red\n", 1),
-        // 1c: a qualified type read as a member of the cast.
-        ("let a = (b as? Foo.Bar)\n", 1),
-        ("let a = (b as? Foo.Bar.Baz)\n", 2),
-        ("func f() { _ = b as? Foo.Bar ?? nil }\n", 1),
+    // The right side after `b as? Color ?? `, and the facts it must publish.
+    for (cast, rhs) in [
+        ("as?", ".foo()"),
+        ("as!", ".custom(1)"),
+        ("as?", ".foo().bar()"),
+        ("as?", ".foo.bar"),
+        ("as?", ".some(x)"),
+        ("as?", ".zero"),
+        ("as?", "Color.red"),
+        ("as?", "x.foo()"),
+        ("as?", ".init()"),
     ] {
-        let e = ex("a.swift", source);
+        let source = format!("let a = b {cast} Color ?? {rhs}\n");
+        let twin = format!("let a = b {cast} Color ?? ({rhs})\n");
+        let (e, t) = (ex("a.swift", &source), ex("a.swift", &twin));
+        if !clean(&e) {
+            failures.push(format!("{source:?}: not Clean ({:?})", e.parse_outcome));
+        }
+        if !e.diagnostics.is_empty() {
+            failures.push(format!("{source:?}: notes {:?}", e.diagnostics));
+        }
         for call in &e.calls {
-            if call
-                .receiver_expr
-                .as_deref()
-                .is_some_and(|r| r.contains("as?") || r.contains("as!") || r.contains("??"))
-            {
+            if leaks(call.receiver_expr.as_deref()) {
                 failures.push(format!("{source:?}: call {call:?}"));
             }
         }
         for reference in &e.references {
-            if reference
-                .receiver_expr
-                .as_deref()
-                .is_some_and(|r| r.contains("as?") || r.contains("as!") || r.contains("??"))
-            {
+            if leaks(reference.receiver_expr.as_deref()) {
+                failures.push(format!("{source:?}: reference {reference:?}"));
+            }
+        }
+        if !e.references.iter().any(|r| r.name == "b") {
+            failures.push(format!("{source:?}: the operand `b` was refused"));
+        }
+        if empty_names(&e) != (0, 0) {
+            failures.push(format!("{source:?}: an empty name"));
+        }
+        let facts = |x: &Extraction| {
+            let mut calls: Vec<_> = x
+                .calls
+                .iter()
+                .map(|c| (c.callee_name.clone(), c.receiver_expr.clone()))
+                .collect();
+            let mut refs: Vec<_> = x
+                .references
+                .iter()
+                .map(|r| (r.name.clone(), r.receiver_expr.clone()))
+                .collect();
+            calls.sort();
+            refs.sort();
+            (calls, refs)
+        };
+        if facts(&e) != facts(&t) {
+            failures.push(format!(
+                "{source:?}: bare {:?} differs from twin {:?}",
+                facts(&e),
+                facts(&t)
+            ));
+        }
+    }
+    // Real members of the right side are published, not refused.
+    let e = ex("a.swift", "let a = b as? Color ?? x.foo()\n");
+    if !e
+        .calls
+        .iter()
+        .any(|c| c.callee_name == "foo" && c.receiver_expr.as_deref() == Some("x"))
+    {
+        failures.push(format!("`x.foo()` not published on `x`: {:?}", e.calls));
+    }
+    let e = ex("a.swift", "let a = b as? Color ?? .foo().bar()\n");
+    if !e
+        .calls
+        .iter()
+        .any(|c| c.callee_name == "bar" && c.receiver_expr.as_deref() == Some(".foo()"))
+    {
+        failures.push(format!("`.foo().bar()` lost `bar`: {:?}", e.calls));
+    }
+    let e = ex("a.swift", "let a = b as? Color ?? Color.red\n");
+    if !e
+        .references
+        .iter()
+        .any(|r| r.name == "red" && r.receiver_expr.as_deref() == Some("Color"))
+    {
+        failures.push(format!("`Color.red` lost `red`: {:?}", e.references));
+    }
+    // 1c, still live in 0.7.4: a qualified type read as a member of the cast.
+    for (source, members) in [
+        ("let a = (b as? Foo.Bar)\n", 1),
+        ("let a = (b as? Foo.Bar.Baz)\n", 2),
+        ("let a = b as? Foo.bar()\n", 1),
+        ("let a = (b as! Foo.Bar)\n", 1),
+        ("func f() { _ = b as? Foo.Bar ?? nil }\n", 1),
+    ] {
+        let e = ex("a.swift", source);
+        for call in &e.calls {
+            if leaks(call.receiver_expr.as_deref()) {
+                failures.push(format!("{source:?}: call {call:?}"));
+            }
+        }
+        for reference in &e.references {
+            if leaks(reference.receiver_expr.as_deref()) {
                 failures.push(format!("{source:?}: reference {reference:?}"));
             }
         }
@@ -599,19 +701,23 @@ fn a_member_chain_off_a_bare_cast_is_refused_and_counted_per_member() {
     }
     // Contexts and spellings the count is not pinned for: interpolation, a
     // closure, an argument, a `try?`/`await` wrapper, a call on the right, a
-    // generic qualifier. None may carry cast or coalesce text as a receiver.
-    for source in [
-        "let a = \"\\(b as? Color ?? .foo())\"\n",
-        "let a = items.map { $0 as? Color ?? .foo() }\n",
-        "let a = f(b as? Color ?? .foo())\n",
-        "let a = try? g(b) as? Color ?? .foo()\n",
-        "func f() async { let a = await g() as? Color ?? .foo() }\n",
-        "let a = b as? Color ?? x.foo()\n",
-        "let a = b as? Color ?? .init()\n",
-        "let a = (b as? Foo<T>.Bar)\n",
-        "let a = (b as? Foo.Bar?)\n",
-        "let a = b as? Color ??\n    .foo()\n",
-        "let a = b as? Color ?? /* c */ .foo()\n",
+    // generic qualifier. None may carry cast or coalesce text as a receiver;
+    // the coalesce ones raise no note at all.
+    for (source, coalesce) in [
+        ("let a = \"\\(b as? Color ?? .foo())\"\n", true),
+        ("let a = items.map { $0 as? Color ?? .foo() }\n", true),
+        ("let a = f(b as? Color ?? .foo())\n", true),
+        ("let a = try? g(b) as? Color ?? .foo()\n", true),
+        (
+            "func f() async { let a = await g() as? Color ?? .foo() }\n",
+            true,
+        ),
+        ("let a = b as? Color ?? x.foo()\n", true),
+        ("let a = b as? Color ?? .init()\n", true),
+        ("let a = (b as? Foo<T>.Bar)\n", false),
+        ("let a = (b as? Foo.Bar?)\n", false),
+        ("let a = b as? Color ??\n    .foo()\n", true),
+        ("let a = b as? Color ?? /* c */ .foo()\n", true),
     ] {
         let e = ex("a.swift", source);
         for call in &e.calls {
@@ -627,45 +733,67 @@ fn a_member_chain_off_a_bare_cast_is_refused_and_counted_per_member() {
         if empty_names(&e) != (0, 0) {
             failures.push(format!("{source:?}: an empty name"));
         }
+        if coalesce && !e.diagnostics.is_empty() {
+            failures.push(format!("{source:?}: notes {:?}", e.diagnostics));
+        }
+        if !coalesce && member_notes(&e).len() != 1 {
+            failures.push(format!("{source:?}: notes {:?}", e.diagnostics));
+        }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// ATTACK 1f, exactly once. The note is raised by the references walk, so a
-/// refused member whose name another rule would drop first (a local or a
-/// parameter of that name, a backticked keyword) must still reach the refusal
-/// and be counted. One file holds a plain member, a `let`-shadowed one, a
-/// parameter-shadowed one and a backticked one: the note counts all four, none
-/// is published, and the leading-dot member with no context is still refused
-/// by its own rule, silently and not counted.
+/// ATTACK 1f, exactly once, as of tree-sitter-swift 0.7.4. Two halves.
+///
+/// (1) The original source: a plain member, a `let`-shadowed one, a
+/// parameter-shadowed one and a backticked one, each as a leading-dot member
+/// after `b as? Color ??`. The grammar now parses these correctly, so nothing
+/// is refused and no note is raised; a bare leading-dot call publishes no call
+/// in any context, so none of the names is published either.
+///
+/// (2) The refusal rule that source used to exercise is still live for a
+/// qualified cast type, which the grammar reads as a member of the cast
+/// (`b as? Foo.plain`). A refused member must reach the refusal and be counted
+/// whether or not a local, a parameter or a backtick would hide its name: the
+/// note counts all four and none is published.
 #[test]
 fn a_refused_member_is_counted_whether_or_not_a_local_or_a_backtick_hides_its_name() {
+    let mut failures = Vec::new();
     let source = "func f(foo: Int) {\n    let bar = 1\n    let a = b as? Color ?? .plain()\n    let c = b as? Color ?? .bar()\n    let d = b as? Color ?? .foo()\n    let e = b as? Color ?? .`class`()\n    h(.minute)\n}\n";
     let e = ex("a.swift", source);
-    let mut failures = Vec::new();
-    if member_notes(&e) != [member_note(4).as_str()] {
+    if !e.diagnostics.is_empty() {
         failures.push(format!(
-            "notes {:?}, wanted {:?}",
-            member_notes(&e),
+            "leading-dot source raised notes {:?}",
+            e.diagnostics
+        ));
+    }
+    let source2 = "func f(foo: Int) {\n    let bar = 1\n    let a = (b as? Foo.plain)\n    let c = (b as? Foo.bar)\n    let d = (b as? Foo.foo)\n    let e = (b as? Foo.`class`)\n}\n";
+    let e2 = ex("a.swift", source2);
+    if member_notes(&e2) != [member_note(4).as_str()] {
+        failures.push(format!(
+            "qualified-cast notes {:?}, wanted {:?}",
+            member_notes(&e2),
             member_note(4)
         ));
     }
-    for name in ["plain", "bar", "foo", "class", "`class`", "minute"] {
-        if let Some(call) = e.calls.iter().find(|c| c.callee_name == name) {
-            failures.push(format!("published the call {call:?}"));
+    for (src, e) in [(source, &e), (source2, &e2)] {
+        for name in ["plain", "bar", "foo", "class", "`class`", "minute"] {
+            if let Some(call) = e.calls.iter().find(|c| c.callee_name == name) {
+                failures.push(format!("{src:?}: published the call {call:?}"));
+            }
+            if let Some(reference) = e.references.iter().find(|r| r.name == name) {
+                failures.push(format!("{src:?}: published the reference {reference:?}"));
+            }
         }
-        if let Some(reference) = e.references.iter().find(|r| r.name == name) {
-            failures.push(format!("published the reference {reference:?}"));
+        if empty_names(e) != (0, 0) {
+            failures.push(format!("{src:?}: an empty name"));
         }
-    }
-    if empty_names(&e) != (0, 0) {
-        failures.push("an empty name".to_string());
     }
     assert!(
         failures.is_empty(),
-        "{} ({:?})\n{}",
-        source,
+        "{:?} / {:?}\n{}",
         e.parse_outcome,
+        e2.parse_outcome,
         failures.join("\n")
     );
 }
@@ -729,7 +857,7 @@ fn a_parenthesised_call_after_the_coalesce_equals_its_twin() {
             tally.judge("paren-call", &bare, &twin);
         }
     }
-    tally.finish();
+    tally.finish(6);
 }
 
 /// ATTACK 1h. A call on the left of the cast: the 4-ancestor walk of
@@ -747,7 +875,7 @@ fn a_call_on_the_left_of_the_cast_binds_the_same_in_both_spellings() {
             tally.judge("call-lhs", &bare, &twin);
         }
     }
-    tally.finish();
+    tally.finish(10);
 }
 
 // ------------------------------------------- 2. does the gate drop a real call
@@ -866,13 +994,13 @@ fn the_gate_refuses_nothing_in_a_checked_in_swift_fixture() {
 
 /// One bare statement with its own name, so a file of `k` of them has `k` sites.
 fn site(i: usize) -> String {
-    format!("let v{i} = b{i} as? String ?? \"x\"\n")
+    format!("let v{i} = (b{i} as! Foo.Bar)\n")
 }
 
 /// The same site wrapped in its own function, which keeps a file of many of
 /// them Clean (three or more adjacent top-level statements do not).
 fn fsite(i: usize) -> String {
-    format!("func g{i}() {{ let v = b{i} as? String ?? \"x\" }}\n")
+    format!("func g{i}() {{ let v = (b{i} as! Foo.Bar) }}\n")
 }
 
 /// ATTACK 3a. The refusal counter is a thread-local, and `extract_all` runs
@@ -891,10 +1019,8 @@ fn the_refusal_count_is_per_file_under_rayon() {
                 let k = (i / 2) % 3;
                 let body = match k {
                     0 => format!("let top{i} = 1\n"),
-                    1 => format!("let v{i} = b as? String ?? \"x\"\n"),
-                    _ => format!(
-                        "let v{i} = b as? String ?? \"x\"\nlet w{i} = d as! String ?? \"y\"\n"
-                    ),
+                    1 => format!("let v{i} = (b as? Foo.Bar)\n"),
+                    _ => format!("let v{i} = (b as? Foo.Bar)\nlet w{i} = (d as! Foo.Baz)\n"),
                 };
                 sources.push((format!("f{i}.swift"), body, k));
             }
@@ -926,7 +1052,7 @@ fn the_refusal_count_is_per_file_under_rayon() {
             Vec::new()
         } else {
             swift_with_sites += 1;
-            vec![refusal_note(*expected)]
+            vec![member_note(*expected)]
         };
         if notes != want.iter().map(String::as_str).collect::<Vec<_>>() {
             failures.push(format!("{path}: notes {notes:?}, wanted {want:?}"));
@@ -978,68 +1104,83 @@ fn the_refusal_count_is_per_file_under_rayon() {
 /// that is not counted lies in an error range; the note never exceeds the
 /// sites; a Clean file counts every site; no name is empty. Test 3b pins the
 /// count against the sites alone.
+///
+/// Under tree-sitter-swift 0.7.4 newline-separated sites (now `(b as! Foo.Bar)`,
+/// the bare-cast member that is still refused) all stay Clean, so the
+/// sweep also lays the same sites on one line joined by ` ; `, which still makes
+/// the grammar recover with an `ERROR` range (Partial). That keeps the
+/// positional arm exercised: `partial > 0` is asserted below.
 #[test]
 fn adjacent_bare_statements_abstain_inside_their_error_ranges() {
     let mut failures = Vec::new();
     let mut partial = 0;
     for n in [2usize, 3, 4, 7, 25] {
-        for wrapped in [false, true] {
-            let head = if wrapped { "func f() {\n" } else { "" };
-            let tail = if wrapped { "}\n" } else { "" };
-            let mut source = String::from(head);
-            let mut spans = Vec::new();
-            for i in 0..n {
-                let text = site(i);
-                spans.push((source.len(), source.len() + text.len()));
-                source.push_str(&text);
-            }
-            source.push_str(tail);
-            let label = format!("{n} sites{}", if wrapped { " in a function" } else { "" });
-            let e = ex("a.swift", &source);
-            if empty_names(&e) != (0, 0) {
-                failures.push(format!("{label}: an empty name"));
-            }
-            let counted = match refusal_notes(&e).as_slice() {
-                [] => 0,
-                [one] => (1..=n)
-                    .find(|k| *one == refusal_note(*k))
-                    .unwrap_or(usize::MAX),
-                many => {
-                    failures.push(format!("{label}: {} note lines", many.len()));
+        for sep in ["\n", " ; "] {
+            for wrapped in [false, true] {
+                let head = if wrapped { "func f() {\n" } else { "" };
+                let tail = if wrapped { "}\n" } else { "" };
+                let mut source = String::from(head);
+                let mut spans = Vec::new();
+                for i in 0..n {
+                    let text = format!("{}{sep}", site(i).trim_end());
+                    spans.push((source.len(), source.len() + text.len()));
+                    source.push_str(&text);
+                }
+                if sep != "\n" {
+                    source.push('\n');
+                }
+                source.push_str(tail);
+                let label = format!(
+                    "{n} sites{}{}",
+                    if sep == "\n" { "" } else { " joined by ` ; `" },
+                    if wrapped { " in a function" } else { "" }
+                );
+                let e = ex("a.swift", &source);
+                if empty_names(&e) != (0, 0) {
+                    failures.push(format!("{label}: an empty name"));
+                }
+                let counted = match refusal_notes(&e).as_slice() {
+                    [] => 0,
+                    [one] => (1..=n)
+                        .find(|k| *one == member_note(*k))
+                        .unwrap_or(usize::MAX),
+                    many => {
+                        failures.push(format!("{label}: {} note lines", many.len()));
+                        continue;
+                    }
+                };
+                if counted > n {
+                    failures.push(format!("{label}: counted {counted} of {n}"));
                     continue;
                 }
-            };
-            if counted > n {
-                failures.push(format!("{label}: counted {counted} of {n}"));
-                continue;
-            }
-            match &e.parse_outcome {
-                ParseOutcome::Clean => {
-                    if counted != n {
-                        failures.push(format!("{label}: Clean but counted {counted}"));
+                match &e.parse_outcome {
+                    ParseOutcome::Clean => {
+                        if counted != n {
+                            failures.push(format!("{label}: Clean but counted {counted}"));
+                        }
                     }
-                }
-                ParseOutcome::Partial { error_ranges, .. } => {
-                    partial += 1;
-                    let in_error = spans
-                        .iter()
-                        .filter(|(start, end)| {
-                            error_ranges
-                                .iter()
-                                .any(|r| r.start_byte < *end && *start < r.end_byte)
-                        })
-                        .count();
-                    // Every site outside an error range was walked and counted,
-                    // so the sites that were not counted are inside one.
-                    if n - counted > in_error {
-                        failures.push(format!(
-                            "{label}: {} uncounted but only {in_error} inside an error range \
+                    ParseOutcome::Partial { error_ranges, .. } => {
+                        partial += 1;
+                        let in_error = spans
+                            .iter()
+                            .filter(|(start, end)| {
+                                error_ranges
+                                    .iter()
+                                    .any(|r| r.start_byte < *end && *start < r.end_byte)
+                            })
+                            .count();
+                        // Every site outside an error range was walked and counted,
+                        // so the sites that were not counted are inside one.
+                        if n - counted > in_error {
+                            failures.push(format!(
+                                "{label}: {} uncounted but only {in_error} inside an error range \
                              ({error_ranges:?})",
-                            n - counted
-                        ));
+                                n - counted
+                            ));
+                        }
                     }
+                    other => failures.push(format!("{label}: {other:?}")),
                 }
-                other => failures.push(format!("{label}: {other:?}")),
             }
         }
     }
@@ -1066,7 +1207,7 @@ fn the_refusal_count_never_exceeds_the_sites_and_is_exact_when_clean() {
             let counted = match notes.as_slice() {
                 [] => 0,
                 [one] => (1..=alone.max(n) + 1)
-                    .find(|k| *one == refusal_note(*k))
+                    .find(|k| *one == member_note(*k))
                     .unwrap_or(usize::MAX),
                 many => {
                     failures.push(format!("{n} {label} sites: {} note lines", many.len()));
@@ -1116,7 +1257,7 @@ fn a_budget_refusal_leaves_no_note_and_no_residue() {
                 // A real extraction: the note counts what its walk reached,
                 // so it is one line and never more than the sites there are.
                 let counted = (1..=400)
-                    .find(|k| notes == [refusal_note(*k).as_str()])
+                    .find(|k| notes == [member_note(*k).as_str()])
                     .unwrap_or(0);
                 if notes.len() > 1 || (notes.len() == 1 && counted == 0) {
                     failures.push(format!("budget {budget:?}: notes {notes:?}"));
@@ -1135,7 +1276,7 @@ fn a_budget_refusal_leaves_no_note_and_no_residue() {
         }
         // The next file on this thread starts from nothing.
         let next = ex("next.swift", &site(0));
-        if refusal_notes(&next) != [refusal_note(1).as_str()] {
+        if refusal_notes(&next) != [member_note(1).as_str()] {
             failures.push(format!(
                 "after budget {budget:?}: next file notes {:?}",
                 refusal_notes(&next)
@@ -1163,7 +1304,7 @@ fn a_refused_swift_file_does_not_taint_the_next_one() {
     let next = ex("next.swift", "func f() {}\n");
     assert!(next.diagnostics.is_empty(), "{:?}", next.diagnostics);
     let again = ex("again.swift", &site(1));
-    assert_eq!(refusal_notes(&again), [refusal_note(1).as_str()]);
+    assert_eq!(refusal_notes(&again), [member_note(1).as_str()]);
 }
 
 /// ATTACK 3e. Embedded hosts run an inner extraction under a nested
@@ -1174,7 +1315,7 @@ fn a_refused_swift_file_does_not_taint_the_next_one() {
 #[test]
 fn a_swift_script_in_a_template_host_leaks_nothing() {
     let mut failures = Vec::new();
-    let script = "<script lang=\"swift\">\nlet a = b as? String ?? \"x\"\n</script>\n";
+    let script = "<script lang=\"swift\">\nlet a = (b as! Foo.Bar)\n</script>\n";
     for (path, source) in [
         ("a.vue", format!("{script}<template><div/></template>\n")),
         ("a.svelte", format!("{script}<div/>\n")),
@@ -1189,7 +1330,7 @@ fn a_swift_script_in_a_template_host_leaks_nothing() {
             failures.push(format!("{path}: {:?}", refusal_notes(&e)));
         }
         let next = ex("next.swift", &site(0));
-        if refusal_notes(&next) != [refusal_note(1).as_str()] {
+        if refusal_notes(&next) != [member_note(1).as_str()] {
             failures.push(format!(
                 "after {path}: next Swift file notes {:?}",
                 refusal_notes(&next)
@@ -1208,9 +1349,9 @@ fn a_kotlin_recovery_between_two_swift_files_leaks_nothing() {
     let first = ex("a.swift", &site(0));
     let k = ex("k.kt", kotlin);
     let second = ex("b.swift", &(site(1) + &site(2)));
-    assert_eq!(refusal_notes(&first), [refusal_note(1).as_str()]);
+    assert_eq!(refusal_notes(&first), [member_note(1).as_str()]);
     assert!(refusal_notes(&k).is_empty(), "{:?}", k.diagnostics);
-    assert_eq!(refusal_notes(&second), [refusal_note(2).as_str()]);
+    assert_eq!(refusal_notes(&second), [member_note(2).as_str()]);
 }
 
 // -------------------------------------------------------- 5. cache, determinism
@@ -1261,7 +1402,7 @@ fn a_durable_payload_of_the_bare_site_equals_its_twins() {
 #[test]
 fn a_durable_reread_carries_no_refusal_note_by_design() {
     let fresh = ex("a.swift", &site(0));
-    assert_eq!(refusal_notes(&fresh), [refusal_note(1).as_str()]);
+    assert_eq!(refusal_notes(&fresh), [member_note(1).as_str()]);
     assert!(fresh.for_durable_store().diagnostics.is_empty());
 }
 

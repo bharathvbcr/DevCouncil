@@ -131,26 +131,33 @@ fn diff_mnemonicprefix_does_not_change_the_change_set() {
     assert_default(&read(&root));
 }
 
+/// Names git must report exactly. Windows cannot create a name holding a
+/// newline, tab or double quote (os error 123), so there the set shrinks to the
+/// names the filesystem can hold; the quoting paths those three exercise are
+/// covered on the Unix runners.
+fn odd_names() -> Vec<&'static str> {
+    let mut names = vec!["src/café.py", "src/ok.py"];
+    if cfg!(unix) {
+        names.extend(["src/nl\nname.py", "src/quo\"te.py"]);
+    }
+    names.sort();
+    names
+}
+
 #[test]
 fn newline_quote_and_non_ascii_names_all_appear_in_one_change_set() {
     let root = repo("odd");
     write(&root, "src/ok.py", "x = 1\n");
     commit(&root, "base");
-    write(&root, "src/nl\nname.py", "a = 1\n");
-    write(&root, "src/café.py", "b = 1\n");
-    write(&root, "src/quo\"te.py", "c = 1\n");
+    for name in odd_names() {
+        if name != "src/ok.py" {
+            write(&root, name, "a = 1\n");
+        }
+    }
     write(&root, "src/ok.py", "x = 2\n");
     commit(&root, "odd");
     let set = read(&root);
-    assert_eq!(
-        names(&set),
-        [
-            "src/café.py",
-            "src/nl\nname.py",
-            "src/ok.py",
-            "src/quo\"te.py"
-        ]
-    );
+    assert_eq!(names(&set), odd_names());
     for file in &set.files {
         assert!(
             !matches!(file.status, ChangeStatus::Unreadable { .. }),
@@ -161,16 +168,24 @@ fn newline_quote_and_non_ascii_names_all_appear_in_one_change_set() {
     }
 }
 
+/// A name git quotes in its output: a tab where the filesystem allows one, a
+/// non-ASCII name with a space where it does not (Windows rejects the tab).
+const QUOTED_NAME: &str = if cfg!(unix) {
+    "tab\tname.py"
+} else {
+    "sp ace é.py"
+};
+
 #[test]
 fn a_deleted_odd_name_and_an_empty_change_are_both_answered() {
     let root = repo("del");
-    write(&root, "tab\tname.py", "a = 1\n");
+    write(&root, QUOTED_NAME, "a = 1\n");
     write(&root, "keep.py", "k = 1\n");
     commit(&root, "base");
-    std::fs::remove_file(root.join("tab\tname.py")).expect("rm");
+    std::fs::remove_file(root.join(QUOTED_NAME)).expect("rm");
     commit(&root, "delete");
     let set = read(&root);
-    assert_eq!(names(&set), ["tab\tname.py"]);
+    assert_eq!(names(&set), [QUOTED_NAME]);
     assert_eq!(set.files[0].status, ChangeStatus::Deleted);
 
     git(

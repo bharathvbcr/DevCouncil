@@ -873,6 +873,15 @@ pub(super) fn member_access_receiver(node: Node, source: &str) -> Option<String>
         }
         let operand = crate::langcalls::swift::swift_call_operand(target);
         let text = receiver_identity(operand, source, 0);
+        // `.a.b`: under tree-sitter-swift 0.7.4 the leading dot is a prefix
+        // *around* the chain, so the target is `a` without it. The receiver
+        // keeps the dot, as the 0.7.3 shape `navigation(prefix(., a), b)` gave
+        // it: a dotless `a` would read as a value named `a` in scope.
+        let text = if !text.is_empty() && swift_leading_dot_prefix(target, source).is_some() {
+            format!(".{text}")
+        } else {
+            text
+        };
         return (!text.is_empty()).then_some(text);
     }
     // The member of a leading-dot expression (`.circle(1)`) names a member of

@@ -61,15 +61,18 @@ fn owners_of(root: &Path, path: &str) -> Vec<String> {
 fn pathspec_magic_names_are_read_as_literal_files() {
     let root = temp_root("magic");
     git_as(&root, "Ada", &["init", "-q", "--initial-branch=main"]);
-    let files = [
-        (":(glob)x", "Colon"),
+    // `:` and `*` cannot appear in a Windows file name (os error 123), so the
+    // three magic-spelled files exist only where the filesystem can hold them;
+    // the plain, dash-leading and non-ASCII names run everywhere.
+    let mut files = vec![
         ("x", "Plain"),
-        ("*.rs", "Star"),
         ("other.rs", "Other"),
-        (":!x", "Bang"),
         ("-dash", "Dash"),
         ("sp ace/ünï cødé.txt", "Uni"),
     ];
+    if cfg!(unix) {
+        files.extend([(":(glob)x", "Colon"), ("*.rs", "Star"), (":!x", "Bang")]);
+    }
     for (name, author) in files {
         let full = root.join(name);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -78,12 +81,15 @@ fn pathspec_magic_names_are_read_as_literal_files() {
         git_as(&root, author, &["commit", "-q", "-m", name]);
     }
 
-    // `:(glob)x` as magic would read x's history (Plain); literally it is Colon.
-    assert_eq!(owners_of(&root, ":(glob)x"), ["Colon"]);
-    // `*.rs` as a glob would also match other.rs (Other).
-    assert_eq!(owners_of(&root, "*.rs"), ["Star"]);
-    // `:!x` as magic is an exclude-only spec, which matches everything else.
-    assert_eq!(owners_of(&root, ":!x"), ["Bang"]);
+    #[cfg(unix)]
+    {
+        // `:(glob)x` as magic would read x's history (Plain); literally it is Colon.
+        assert_eq!(owners_of(&root, ":(glob)x"), ["Colon"]);
+        // `*.rs` as a glob would also match other.rs (Other).
+        assert_eq!(owners_of(&root, "*.rs"), ["Star"]);
+        // `:!x` as magic is an exclude-only spec, which matches everything else.
+        assert_eq!(owners_of(&root, ":!x"), ["Bang"]);
+    }
     assert_eq!(owners_of(&root, "-dash"), ["Dash"]);
     assert_eq!(owners_of(&root, "sp ace/ünï cødé.txt"), ["Uni"]);
 }
