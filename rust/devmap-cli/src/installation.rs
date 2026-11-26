@@ -1212,7 +1212,7 @@ fn outdated_post_tool_use_matcher(documents: &[PathBuf]) -> Option<String> {
     let mut outdated = Vec::new();
     let mut unchecked = Vec::new();
     for path in documents {
-        let text = match std::fs::read_to_string(path) {
+        let text = match crate::integrate::read_host_config(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {

@@ -2327,8 +2327,14 @@ pub fn write_codex_plugin_assets(
     let hooks = claude::codex_hooks_block(executable, &["hook".to_string()])?;
     let hooks_path = plugin_dir.join("hooks").join("hooks.json");
 
-    preflight_repo_write(&manifest_path)?;
-    preflight_repo_write(&hooks_path)?;
+    for target in [&manifest_path, &hooks_path] {
+        devmap_extract::safe_fs::preflight_write(target).with_context(|| {
+            format!(
+                "refusing to write through {}; move it aside to let DevMap write its own",
+                target.display()
+            )
+        })?;
+    }
     type Generated = fn(&Value) -> bool;
     let documents: [(&PathBuf, &Value, &str, Generated); 2] = [
         (
@@ -2882,8 +2888,14 @@ mod plugin_asset_tests {
     }
     #[test]
     fn hooks_written_for_a_bare_executable_name_are_devmaps() {
-        let hooks = claude::codex_hooks_block(Path::new("devmap"), &["hook".to_string()]).unwrap();
-        assert!(generated_hooks(&hooks), "{hooks}");
+        // New hook emission refuses relative/bare executables (a7452dcb);
+        // ownership recognition still identifies bare-name hooks written by
+        // earlier releases.
+        assert!(claude::codex_hooks_block(Path::new("devmap"), &["hook".to_string()]).is_err());
+        let bare = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": "devmap hook session-start"}]}]}});
+        assert!(is_devmap_hook_command("devmap hook session-start"));
+        assert!(generated_hooks(&bare), "{bare}");
         // The double-quoted bare form of an earlier release, with an event
         // Codex no longer gets (case L).
         let old = serde_json::json!({"hooks": {"PostToolUseFailure": [{"hooks": [

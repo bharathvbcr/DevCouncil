@@ -1350,21 +1350,6 @@ pub(crate) fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
     })
 }
 
-/// Absolute path for a hook `command`, even when PATH resolves to self.
-///
-/// MCP entries still use [`plugin_command`]'s bare-name rule; hooks must be
-/// absolute because Cursor/Codex do not expand a bare name the same way, and a
-/// bare `devmap` that clap-rejects exits 2 and blocks the agent.
-///
-/// [`plugin_command`] hands this the bare name whenever `devmap` on `PATH` is
-/// this binary (a CI runner with `target/debug` on `PATH`, a `cargo install`).
-/// A bare name is therefore looked up on `PATH` exactly as a shell would, and
-/// the file it finds is the answer. A name that cannot be resolved is an error:
-/// a hook command that is not absolute is never emitted.
-pub fn hook_executable(executable: &Path) -> anyhow::Result<PathBuf> {
-    resolve_hook_executable(executable, std::env::var_os("PATH").as_deref())
-}
-
 /// A fixture executable path that is absolute on the platform under test: a
 /// path with no drive letter is not absolute on Windows, and a hook executable
 /// that is not absolute is refused there, so a Unix-looking fixture would be
@@ -1380,6 +1365,7 @@ pub(crate) fn absolute_fixture(unix_path: &str) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn resolve_hook_executable(
     executable: &Path,
     path_var: Option<&std::ffi::OsStr>,
@@ -1415,6 +1401,7 @@ fn resolve_hook_executable(
 /// would try them: the name as given, then (Windows only, and only for a name
 /// with no extension) the name with each `PATHEXT` extension, so `devmap`
 /// finds `devmap.exe`. Unix probes the name as given and nothing else.
+#[cfg(test)]
 fn executable_names(executable: &Path) -> Vec<std::ffi::OsString> {
     #[cfg(windows)]
     {

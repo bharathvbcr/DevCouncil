@@ -9,8 +9,7 @@ use crate::installation::{
     binaries_skew_warning, build_identity_json, duplicate_mcp_registration_warning,
     host_command_defect_warning, inventory_devmap_binaries, mcp_registration_inventory,
     missing_binary_warning, plugin_cleanup_note, plugin_warning, post_tool_use_matcher_warning,
-    profile_hooks_warning,
-    stale_server_warning, stray_state_warning,
+    profile_hooks_warning, stale_server_warning, stray_state_warning,
 };
 use crate::output::emit_json;
 
