@@ -71,7 +71,10 @@ type IntegrateReport struct {
 	Hooks           []Asset  `json:"hooks"`
 	Servers         []Asset  `json:"servers"`
 	Notes           []string `json:"notes"`
-	CheckOK         bool     `json:"check_ok"`
+	// KeptForeign names files devmap left alone because it did not generate
+	// them: its own asset is not installed there, whatever Changed says.
+	KeptForeign []string `json:"kept_foreign"`
+	CheckOK     bool     `json:"check_ok"`
 }
 
 // RemovedDocument is one host document `devmap integrate --remove` examined.

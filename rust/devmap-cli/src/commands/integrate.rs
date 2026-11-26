@@ -49,6 +49,11 @@ pub(crate) struct Args {
     /// refresh only the block and need no flag.
     #[arg(long, conflicts_with = "remove")]
     pub(crate) adopt_guides: bool,
+    /// Replace a Codex `.codex-plugin/plugin.json` or `hooks/hooks.json` that
+    /// DevMap did not generate. The old file is first saved beside itself as
+    /// `<name>.devcouncil-backup-<id>`. Without it such a file is left alone.
+    #[arg(long, conflicts_with = "remove")]
+    pub(crate) force: bool,
 }
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
@@ -62,6 +67,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         remove,
         only_path,
         adopt_guides,
+        force,
     } = args;
     if *remove {
         return run_remove(
@@ -87,6 +93,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         } else {
             devmap_query::guides::HandWrittenGuides::Preserve
         },
+        *force,
     )
 }
 
@@ -156,6 +163,7 @@ fn run_integrate(
     binary: Option<&Path>,
     servers_stdin: bool,
     hand_written: devmap_query::guides::HandWrittenGuides,
+    force: bool,
 ) -> anyhow::Result<()> {
     // Read and validated before anything is written: a malformed request must
     // not leave DevMap's half applied and the caller's half missing.
@@ -180,6 +188,7 @@ fn run_integrate(
         dry_run,
         check,
         hand_written,
+        force,
     )?;
     // The warning `mcp_entry` prints on stderr, kept in the receipt's own
     // `notes` so a caller reading the JSON sees it too. It covers MCP entries
@@ -231,6 +240,7 @@ fn run_integrate(
                     "note": m.note,
                 })).collect::<Vec<_>>(),
                 "notes": report.notes,
+                "kept_foreign": report.kept.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dry_run": dry_run,
                 "check": check,
                 "check_ok": report.check_ok,
