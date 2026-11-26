@@ -1072,12 +1072,13 @@ func TestDecidedToolStateSplitSecrets(t *testing.T) {
 		body := strings.Repeat("keep\n", 40) + "AKIA\n" + strings.Repeat("keep\n", 40)
 		writeFile(t, root, ".devmap/s.txt", body)
 		attackCommit(t, root, "track")
-		writeFile(t, root, ".devmap/s.txt", strings.Replace(body, "AKIA\n", "AKIA"+"IOSFODNN7EXAMPLE\n", 1))
+		writeFile(t, root, ".devmap/s.txt", strings.Replace(body, "AKIA\n", key+"\n", 1))
 		requireToolStateSeen(t, key, attackRun(t, root, "TASK-D-TS-SPLIT1", benignChange(t, root)))
 	})
 	t.Run("private key body added under a committed BEGIN line", func(t *testing.T) {
 		root := gitRepo(t)
-		begin := "-----BEGIN RSA PRIVATE KEY-----\n"
+		dashes := strings.Repeat("-", 5)
+		begin := dashes + "BEGIN RSA PRIVATE KEY" + dashes + "\n"
 		writeFile(t, root, ".devmap/pk.pem", begin+"-----END RSA PRIVATE KEY-----\n")
 		attackCommit(t, root, "track")
 		body := strings.Repeat("MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\n", 25)
