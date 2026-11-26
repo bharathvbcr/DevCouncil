@@ -48,7 +48,13 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 	var all argWrites
 	for _, clause := range SplitCommandChain(line) {
 		words := shellWords(clause)
-		at := argumentCommandWord(words)
+		peel := peelCommand(words)
+		all.merge(literalWrites(peel.writes))
+		if peel.reparse != "" {
+			all.merge(argumentWriteTargetsInRoot(reparseLine(peel.reparse, peel.reparseRest), root))
+			continue
+		}
+		at := peel.at
 		if at < 0 {
 			continue
 		}
@@ -94,43 +100,11 @@ var shellReservedPrefixes = map[string]bool{
 // argumentCommandWord returns the index of the word sh would run in one
 // clause, or -1. Assignments and redirections before it are stepped over as in
 // reparsingCommandWord; so are reserved words and the wrappers of wrapperSpecs
-// together with their own options. See argumentCommandWordPeeled for the
-// wrapper option that cannot be stepped over.
+// together with their own options (peelCommand). A wrapper option the table
+// does not describe gives the guessed command word, never -1 for a clause that
+// runs something.
 func argumentCommandWord(words []shellWord) int {
-	at, _ := argumentCommandWordPeeled(words)
-	return at
-}
-
-// argumentCommandWordPeeled is argumentCommandWord that also reports the first
-// wrapper option wrapperSpecs does not describe (and -1 for the word): the
-// command behind it is unknowable, so a rung that refuses what it cannot read
-// must refuse it rather than skip the clause.
-func argumentCommandWordPeeled(words []shellWord) (at int, unknownOption string) {
-	for i := 0; i < len(words); i++ {
-		word := words[i]
-		if word.quotedHead {
-			return i, ""
-		}
-		if isAssignmentWord(word.text) || shellReservedPrefixes[word.text] {
-			continue
-		}
-		if operand, isRedirect := redirectionPrefix(word.text); isRedirect {
-			if operand {
-				i++
-			}
-			continue
-		}
-		if spec, ok := wrapperSpecs[wrapperName(word.text)]; ok {
-			next, unknown := peelWrapper(words, i, spec)
-			if next < 0 {
-				return -1, unknown
-			}
-			i = next - 1
-			continue
-		}
-		return i, ""
-	}
-	return -1, ""
+	return peelCommand(words).at
 }
 
 // sedWrites reads a sed argument list the way GNU sed does — options may

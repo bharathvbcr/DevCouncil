@@ -76,24 +76,34 @@ type wrapperSpec struct {
 	assigns bool
 	// noRun lists short options after which nothing is run (command -v).
 	noRun string
+	// The options below are spelled with their dashes ("-C", "--chdir") and
+	// must also be described by value/long. chdir options move where the
+	// wrapped command's relative paths resolve (refused like cd); writes
+	// options name a file the wrapper itself writes (time -o); edit options
+	// make the wrapper an editor of its operands (sudo -e is sudoedit);
+	// split options carry a command line the wrapper parses itself
+	// (env -S).
+	chdir, writes, edit, split []string
 }
 
 // wrapperSpecs is the option table of the wrappers argumentCommandWord peels.
 // Its keys are a subset of commandWrappers. A wrapper option missing here is
-// not guessed at: see peelWrapper.
+// not guessed at: see peelCommand.
 var wrapperSpecs = map[string]wrapperSpec{
 	"command": {flags: "p", noRun: "vV"},
 	"builtin": {},
 	"exec":    {value: "a", flags: "cl"},
 	"nohup":   {},
-	"time":    {value: "fo", flags: "pvalqV", long: map[string]bool{"format": true, "output": true, "portability": false, "append": false, "verbose": false, "quiet": false}},
-	"env": {value: "uCP", flags: "i0v", assigns: true, long: map[string]bool{
-		"ignore-environment": false, "null": false, "unset": true, "chdir": true, "debug": false}},
-	"sudo": {value: "ugCDhprRtTUc", flags: "EHnSbkKAPBvlLsi", assigns: true, long: map[string]bool{
-		"user": true, "group": true, "chdir": true, "preserve-env": false, "set-home": false, "non-interactive": false,
-		"stdin": false, "login": false, "shell": false, "background": false, "reset-timestamp": false,
-		"remove-timestamp": false, "askpass": false, "close-from": true, "host": true, "prompt": true, "role": true,
-		"type": true, "command-timeout": true, "other-user": true, "chroot": true, "login-class": true}},
+	"time": {value: "fo", flags: "pvalqV", writes: []string{"-o", "--output"},
+		long: map[string]bool{"format": true, "output": true, "portability": false, "append": false, "verbose": false, "quiet": false}},
+	"env": {value: "uCPS", flags: "i0v", assigns: true, chdir: []string{"-C", "--chdir"}, split: []string{"-S", "--split-string"},
+		long: map[string]bool{"ignore-environment": false, "null": false, "unset": true, "chdir": true, "debug": false, "split-string": true}},
+	"sudo": {value: "ugCDhprRtTUc", flags: "EHnSbkKAPBvlLsie", assigns: true, chdir: []string{"-D", "--chdir", "-R", "--chroot"},
+		edit: []string{"-e", "--edit"}, long: map[string]bool{
+			"user": true, "group": true, "chdir": true, "preserve-env": false, "set-home": false, "non-interactive": false,
+			"stdin": false, "login": false, "shell": false, "background": false, "reset-timestamp": false,
+			"remove-timestamp": false, "askpass": false, "close-from": true, "host": true, "prompt": true, "role": true,
+			"type": true, "command-timeout": true, "other-user": true, "chroot": true, "login-class": true, "edit": false}},
 	"doas":    {value: "uC", flags: "nsL"},
 	"nice":    {value: "n", digits: true, long: map[string]bool{"adjustment": true}},
 	"ionice":  {value: "cnpPu", flags: "ti", long: map[string]bool{"class": true, "classdata": true, "pid": true, "pgid": true, "uid": true, "ignore": false}},
@@ -102,14 +112,78 @@ var wrapperSpecs = map[string]wrapperSpec{
 	"setsid":  {flags: "cfwv", long: map[string]bool{"ctty": false, "fork": false, "wait": false, "verbose": false}},
 }
 
+// commandPeel is what stepping through a clause's wrappers found.
+type commandPeel struct {
+	// at is the index of the command word, or -1. With unknown set it is the
+	// best guess readerBehindWrapper-style: the first later word naming a
+	// program a rung knows (over-refusing is safe, skipping is not).
+	at int
+	// unknown is the first wrapper option wrapperSpecs does not describe.
+	unknown string
+	// chdir is a wrapper option that moves the working directory or root.
+	chdir string
+	// writes are files the wrappers themselves write (time -o FILE, sudo -e
+	// FILE).
+	writes []string
+	// reparse is a command line a wrapper parses itself (env -S 'cat .env'),
+	// with the words after it; the rungs judge it as a clause of its own.
+	reparse     string
+	reparseRest []shellWord
+}
+
+// reparseLine is the command line a wrapper that parses one itself runs: its
+// own text, then the words after it, each quoted as one word.
+func reparseLine(line string, rest []shellWord) string {
+	var b strings.Builder
+	b.WriteString(line)
+	for _, w := range rest {
+		b.WriteString(" '" + strings.ReplaceAll(w.text, "'", `'\''`) + "'")
+	}
+	return b.String()
+}
+
+func containsOption(set []string, key string) bool {
+	for _, k := range set {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
 // peelWrapper steps over the options of the wrapper at words[i] and returns
-// the index of the command it runs. at is -1 with unknown empty when nothing
-// runs (the line ends, or an option such as `command -v` says so); unknown
-// names the first option the spec does not describe, which leaves the wrapped
-// command unknowable: a caller must refuse it, never skip it.
-func peelWrapper(words []shellWord, i int, spec wrapperSpec) (at int, unknown string) {
+// the index of the command it runs, or -1 when nothing runs (the line ends, an
+// option such as `command -v` says so, or p.unknown / p.reparse / an edit says
+// the rest is not a command to peel to).
+func peelWrapper(words []shellWord, i int, spec wrapperSpec, p *commandPeel) int {
 	j := i + 1
 	operands := spec.operands
+	// note records what an option means; it returns false when the rest of
+	// the line is not a command to peel to.
+	note := func(key, value string, valueAt int) bool {
+		switch {
+		case containsOption(spec.chdir, key):
+			if p.chdir == "" {
+				p.chdir = key
+			}
+		case containsOption(spec.writes, key):
+			p.writes = append(p.writes, value)
+		case containsOption(spec.edit, key):
+			for k := j + 1; k < len(words); k++ {
+				if !strings.HasPrefix(words[k].text, "-") {
+					p.writes = append(p.writes, words[k].text)
+				}
+			}
+			return false
+		case containsOption(spec.split, key):
+			p.reparse = value
+			if valueAt+1 < len(words) {
+				p.reparseRest = words[valueAt+1:]
+			}
+			return false
+		}
+		return true
+	}
 	for ; j < len(words); j++ {
 		text := words[j].text
 		switch {
@@ -118,29 +192,50 @@ func peelWrapper(words []shellWord, i int, spec wrapperSpec) (at int, unknown st
 			goto afterOptions
 		case spec.assigns && isAssignmentWord(text):
 		case strings.HasPrefix(text, "--"):
-			name, _, attached := strings.Cut(text[2:], "=")
+			name, attached, hasValue := strings.Cut(text[2:], "=")
 			takes, known := spec.long[name]
 			if !known {
-				return -1, text
+				p.unknown = text
+				return -1
 			}
-			if takes && !attached {
+			valueAt := j
+			if takes && !hasValue {
 				j++
+				attached = ""
+				if j < len(words) {
+					attached = words[j].text
+				}
+				valueAt = j
+			}
+			if !note("--"+name, attached, valueAt) {
+				return -1
 			}
 		case strings.HasPrefix(text, "-") && text != "-":
 			cluster := text[1:]
 			for c := 0; c < len(cluster); c++ {
+				letter := cluster[c]
+				key := "-" + string(letter)
 				switch {
-				case strings.IndexByte(spec.noRun, cluster[c]) >= 0:
-					return -1, ""
-				case strings.IndexByte(spec.value, cluster[c]) >= 0:
-					if c == len(cluster)-1 {
+				case strings.IndexByte(spec.noRun, letter) >= 0:
+					return -1
+				case strings.IndexByte(spec.value, letter) >= 0:
+					value, valueAt := cluster[c+1:], j
+					if value == "" && j+1 < len(words) {
 						j++
+						value, valueAt = words[j].text, j
+					}
+					if !note(key, value, valueAt) {
+						return -1
 					}
 					c = len(cluster)
-				case strings.IndexByte(spec.flags, cluster[c]) >= 0:
-				case spec.digits && cluster[c] >= '0' && cluster[c] <= '9':
+				case strings.IndexByte(spec.flags, letter) >= 0:
+					if !note(key, "", j) {
+						return -1
+					}
+				case spec.digits && letter >= '0' && letter <= '9':
 				default:
-					return -1, text
+					p.unknown = text
+					return -1
 				}
 			}
 		case text == "-" && spec.assigns:
@@ -153,9 +248,63 @@ afterOptions:
 		j++
 	}
 	if j >= len(words) {
-		return -1, ""
+		return -1
 	}
-	return j, ""
+	return j
+}
+
+// peelCommand finds the command word of one clause: assignments,
+// redirections, reserved words and the wrappers of wrapperSpecs with their own
+// options are stepped over, and what the options mean is reported.
+func peelCommand(words []shellWord) commandPeel {
+	p := commandPeel{at: -1}
+	for i := 0; i < len(words); i++ {
+		word := words[i]
+		if word.quotedHead {
+			p.at = i
+			return p
+		}
+		if isAssignmentWord(word.text) || shellReservedPrefixes[word.text] {
+			continue
+		}
+		if operand, isRedirect := redirectionPrefix(word.text); isRedirect {
+			if operand {
+				i++
+			}
+			continue
+		}
+		if spec, ok := wrapperSpecs[wrapperName(word.text)]; ok {
+			next := peelWrapper(words, i, spec, &p)
+			if next < 0 {
+				if p.unknown != "" {
+					p.at = guessCommandWord(words, i+1)
+				}
+				return p
+			}
+			i = next - 1
+			continue
+		}
+		p.at = i
+		return p
+	}
+	return p
+}
+
+// guessCommandWord is the command word of a clause whose wrapper options
+// could not be read: the first word from `from` that names a program some rung
+// models. It can only over-refuse; skipping the clause would not.
+func guessCommandWord(words []shellWord, from int) int {
+	for j := from; j < len(words); j++ {
+		name := wrapperName(words[j].text)
+		if pathWritingCommands[name] || fileReaders[name] || readsOnlyCommands[name] || isGitWord(words[j].text) ||
+			name == "sort" || name == "uniq" {
+			return j
+		}
+		if _, ok := wrapperSpecs[name]; ok {
+			return j
+		}
+	}
+	return -1
 }
 
 // maxHarnessDepth bounds the recursion into quoted command lines.

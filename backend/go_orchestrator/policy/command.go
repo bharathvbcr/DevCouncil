@@ -461,7 +461,7 @@ func (g CommandGate) noteDirectoryChanges(f *clauseFindings, command, normalized
 	// on the ground that it "cannot write" — true of the cd itself, and beside
 	// the point, because it decides where every relative path *after* it
 	// writes. See RuleCommandDirectoryChange.
-	if cdSegmentRe.MatchString(normalized) {
+	if peel := peelCommand(shellWords(command)); cdSegmentRe.MatchString(normalized) || peel.chdir != "" {
 		f.noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"Changing the working directory is not allowed: every relative path in this command "+
 				"would then resolve somewhere other than where the gate judged it. Use paths "+
