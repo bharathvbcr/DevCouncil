@@ -1,7 +1,9 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{
+    emit_truncation, emit_unavailable, emit_walk_incomplete, open_for_read, WIDEN_BUDGET,
+};
 
 #[derive(clap::Args)]
 #[group(id = "Dead")]
@@ -17,13 +19,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json {
         store.emit_answer(cli, serde_json::to_value(&payload)?)?;
     } else {
-        emit_dead(&payload);
+        emit_dead(&payload, cli.verbose);
         store.warn_incomplete()?;
     }
     Ok(())
 }
 
-fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
+fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>, verbose: bool) {
     if let ResolutionAvailability::Unavailable { reason } = &resp.resolution {
         emit_unavailable(reason);
         return;
@@ -52,9 +54,17 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     if resp.items.is_empty() {
         outln!("(no dead-symbol candidates in budget)");
     }
-    emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+    emit_truncation(
+        resp.shown,
+        resp.hidden,
+        resp.total,
+        resp.truncated,
+        Some(WIDEN_BUDGET),
+    );
     if let Some(reason) = resp.walk_incomplete.as_ref() {
-        outln!("\nwalk incomplete: {reason}");
+        // The line this warning used to follow with a blank one.
+        outln!("");
+        emit_walk_incomplete(reason, verbose);
     }
     for line in excluded_lines(resp.excluded.as_ref()) {
         outln!("{line}");

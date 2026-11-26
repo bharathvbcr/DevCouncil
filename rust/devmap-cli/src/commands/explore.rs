@@ -3,6 +3,7 @@ use devmap_query::ResolutionAvailability;
 use crate::cli::Cli;
 use crate::output::{
     emit_blast_radius, emit_scope, emit_truncation, emit_unavailable, open_for_read,
+    WIDEN_LIMIT_OR_BUDGET,
 };
 
 #[derive(clap::Args)]
@@ -55,13 +56,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json {
         store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
-        emit_explore(&report);
+        emit_explore(&report, cli.verbose);
         store.warn_incomplete()?;
     }
     Ok(())
 }
 
-fn emit_explore(report: &devmap_query::ExploreReport) {
+fn emit_explore(report: &devmap_query::ExploreReport, verbose: bool) {
     if let ResolutionAvailability::Unavailable { reason } = &report.definitions.resolution {
         emit_unavailable(reason);
         return;
@@ -113,6 +114,7 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         report.definitions.hidden,
         report.definitions.total,
         report.definitions.truncated,
+        Some(WIDEN_LIMIT_OR_BUDGET),
     );
     outln!(
         "budget: {} total = {} definitions + {} per edge direction + {} blast radius",
@@ -121,5 +123,5 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         report.budget.edges_per_direction,
         report.budget.blast_radius
     );
-    emit_blast_radius(&report.blast_radius);
+    emit_blast_radius(&report.blast_radius, verbose);
 }

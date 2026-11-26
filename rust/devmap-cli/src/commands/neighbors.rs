@@ -48,9 +48,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         for entry in &answers {
             outln!("{}", entry.target);
             outln!("  callers:");
-            emit_edges(&entry.callers);
+            emit_edges(&entry.callers, cli.verbose);
             outln!("  callees:");
-            emit_edges(&entry.callees);
+            emit_edges(&entry.callees, cli.verbose);
         }
         store.warn_incomplete()?;
     }

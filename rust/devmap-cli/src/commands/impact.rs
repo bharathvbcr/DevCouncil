@@ -59,8 +59,8 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         if cli.json {
             store.emit_answer(cli, serde_json::to_value(&resp)?)?;
         } else {
-            emit_edges(&resp.edges);
-            emit_blast_radius(&resp.blast_radius);
+            emit_edges(&resp.edges, cli.verbose);
+            emit_blast_radius(&resp.blast_radius, cli.verbose);
             store.warn_incomplete()?;
         }
     } else {
@@ -73,7 +73,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         if cli.json {
             store.emit_answer(cli, serde_json::to_value(&resp)?)?;
         } else {
-            emit_edges(&resp);
+            emit_edges(&resp, cli.verbose);
             store.warn_incomplete()?;
         }
     }

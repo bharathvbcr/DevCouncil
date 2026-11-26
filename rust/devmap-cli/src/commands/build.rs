@@ -1364,7 +1364,11 @@ fn run_build(
                 || uninferred_receiver_calls > 0
                 || unresolved_member_calls > 0)
         {
-            summary.push(format!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers, {unresolved_member_calls} unresolved members (details: --verbose)"));
+            summary.extend(unresolved_summary(
+                unattributed_calls,
+                uninferred_receiver_calls,
+                unresolved_member_calls,
+            ));
         }
         progress.display.summary("Map ready", &summary);
         progress.display.report_loss();
@@ -2244,6 +2248,20 @@ fn affected_closure(
     Ok(Some(affected))
 }
 
+/// The summary rows for calls the resolver could not tie to a definition.
+fn unresolved_summary(unattributed: usize, uninferred: usize, members: usize) -> Vec<String> {
+    vec![
+        format!(
+            "  Unresolved: {unattributed} unattributed, {uninferred} uninferred receivers, {members} unresolved members (details: --verbose)"
+        ),
+        "    unattributed = a call to a bare name that no rule could bind although an indexed \
+         symbol shares its name (may be a real resolver miss); uninferred receivers = method \
+         calls whose receiver type was not inferred (a known limit, not a defect); unresolved \
+         members = calls on a typed receiver whose type declares no member of that name"
+            .to_string(),
+    ]
+}
+
 /// Render the resolution rate under the human build summary.
 ///
 /// Per language and sorted worst-first, because the corpus figure is not
@@ -2399,6 +2417,27 @@ mod tests {
         assert!(!binding.exists(), "a stale binding must not survive");
         assert!(check_reuse_binding(&dir, &store).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The build summary says what its three unresolved counts mean, in plain
+    /// words, and still carries every number and the `--verbose` pointer.
+    #[test]
+    fn the_unresolved_summary_explains_its_terms() {
+        let rows = unresolved_summary(1534, 10561, 7).join("\n");
+        for number in ["1534", "10561", "7"] {
+            assert!(rows.contains(number), "{rows}");
+        }
+        assert!(rows.contains("--verbose"), "{rows}");
+        assert!(
+            rows.contains("bare name") && rows.contains("shares its name"),
+            "unattributed is not explained: {rows}"
+        );
+        assert!(
+            rows.contains("receiver")
+                && rows.contains("not inferred")
+                && rows.contains("declares no member"),
+            "uninferred receivers is not explained: {rows}"
+        );
     }
 
     #[test]

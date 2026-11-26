@@ -1,7 +1,7 @@
 use devmap_query::ResolutionAvailability;
 
 use crate::cli::Cli;
-use crate::output::{emit_truncation, emit_unavailable, open_for_read};
+use crate::output::{emit_truncation, emit_unavailable, open_for_read, WIDEN_BUDGET};
 
 #[derive(clap::Args)]
 #[group(id = "Skeleton")]
@@ -71,5 +71,6 @@ fn emit_skeleton(report: &devmap_query::SkeletonReport) {
         report.total.saturating_sub(report.shown),
         report.total,
         report.truncated,
+        Some(WIDEN_BUDGET),
     );
 }

@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_truncation, open_for_read};
+use crate::output::{emit_truncation, open_for_read, WIDEN_BUDGET};
 
 #[derive(clap::Args)]
 #[group(id = "Preview")]
@@ -117,5 +117,6 @@ fn emit_preview(report: &devmap_query::PreviewReport) {
         report.broken_callers.hidden,
         report.broken_callers.total,
         report.broken_callers.truncated,
+        Some(WIDEN_BUDGET),
     );
 }
