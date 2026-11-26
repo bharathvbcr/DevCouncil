@@ -370,11 +370,24 @@ fn inspect_devmap_identity(path: &Path) -> BinaryIdentity {
     }
 }
 
+/// Map the build script's `DEVMAP_GIT_DIRTY` to the receipt's `dirty` flag and
+/// `dirty_state`. Only `"0"` is clean: `"unknown"` (git could not be read in
+/// time) and anything unexpected fail closed as possibly dirty.
+pub(crate) fn dirty_flag(raw: &str) -> (bool, &'static str) {
+    match raw {
+        "0" => (false, "clean"),
+        "1" => (true, "dirty"),
+        _ => (true, "unknown"),
+    }
+}
+
 pub(crate) fn build_identity_json() -> serde_json::Value {
+    let (dirty, dirty_state) = dirty_flag(env!("DEVMAP_GIT_DIRTY"));
     serde_json::json!({
         "id": env!("DEVMAP_BUILD_ID"),
         "git": env!("DEVMAP_GIT_HASH"),
-        "dirty": env!("DEVMAP_GIT_DIRTY") == "1",
+        "dirty": dirty,
+        "dirty_state": dirty_state,
         "time": env!("DEVMAP_BUILD_TIME"),
     })
 }
@@ -1651,5 +1664,14 @@ mod tests {
         let found =
             found.unwrap_or_else(|failure| panic!("no ps in {PROCESS_INVENTORY_PATH}: {failure}"));
         assert!(found.path().is_absolute(), "{}", found.path().display());
+    }
+
+    #[test]
+    fn dirty_flag_fails_closed_on_anything_but_clean() {
+        assert_eq!(dirty_flag("0"), (false, "clean"));
+        assert_eq!(dirty_flag("1"), (true, "dirty"));
+        assert_eq!(dirty_flag("unknown"), (true, "unknown"));
+        assert_eq!(dirty_flag(""), (true, "unknown"));
+        assert_eq!(dirty_flag("2"), (true, "unknown"));
     }
 }
