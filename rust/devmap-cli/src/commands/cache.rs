@@ -37,9 +37,27 @@ use crate::sha256::sha256_hex;
 
 /// Environment variable carrying the GitPulse Relay bearer token (never argv).
 pub const RELAY_TOKEN_ENV: &str = "GITPULSE_RELAY_TOKEN";
+/// Optional environment variable carrying the default GitPulse Relay base URL.
+pub const RELAY_URL_ENV: &str = "GITPULSE_RELAY_URL";
 /// Optional environment variable carrying a shared team HMAC-SHA256 signing key
 /// for verifying cache manifest provenance on unpack/pull (C8).
 pub const CACHE_SIGNING_KEY_ENV: &str = "DEVMAP_CACHE_SIGNING_KEY";
+
+/// Scope for remote relay cache bundles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheScope {
+    Account,
+    Space,
+}
+
+impl CacheScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Space => "space",
+        }
+    }
+}
 
 const MANIFEST_ENTRY_NAME: &str = "manifest.json";
 const DB_ENTRY_NAME: &str = "devmap.sqlite";
@@ -95,9 +113,13 @@ pub(crate) enum CacheAction {
     /// Pack and push the local cache bundle via GitPulse Relay presigned R2 URL.
     Push {
         /// GitPulse Relay base URL (https://..., or http://127.0.0.1:... for local tests).
+        /// Falls back to GITPULSE_RELAY_URL when omitted.
         #[arg(long)]
-        relay_url: String,
-        /// Optional Space ID for team-scoped cache sharing (defaults to account scope).
+        relay_url: Option<String>,
+        /// Cache scope: `account` or `space` (inferred from `--space-id` when omitted).
+        #[arg(long, value_enum)]
+        scope: Option<CacheScope>,
+        /// Optional Space ID for team-scoped cache sharing (required when `--scope space`).
         #[arg(long)]
         space_id: Option<String>,
         /// Optional explicit 64-hex repository hash.
@@ -110,12 +132,17 @@ pub(crate) enum CacheAction {
     /// Pull, verify SHA-256, and atomically unpack a cache bundle via GitPulse Relay.
     Pull {
         /// GitPulse Relay base URL (https://..., or http://127.0.0.1:... for local tests).
+        /// Falls back to GITPULSE_RELAY_URL when omitted.
         #[arg(long)]
-        relay_url: String,
-        /// Optional Space ID for team-scoped cache sharing (defaults to account scope).
+        relay_url: Option<String>,
+        /// Cache scope: `account` or `space` (inferred from `--space-id` when omitted).
+        #[arg(long, value_enum)]
+        scope: Option<CacheScope>,
+        /// Optional Space ID for team-scoped cache sharing (required when `--scope space`).
         #[arg(long)]
         space_id: Option<String>,
         /// Expected 64-hex SHA-256 digest of the remote cache archive.
+        /// When omitted, resolves the latest digest automatically via the relay.
         #[arg(long)]
         digest: Option<String>,
         /// Optional explicit 64-hex repository hash.
@@ -376,6 +403,7 @@ impl PresignRequest {
 struct PresignResponse {
     url: String,
     method: Option<String>,
+    key: Option<String>,
     headers: BTreeMap<String, String>,
     digest: Option<String>,
     sha256: Option<String>,
@@ -397,6 +425,12 @@ impl PresignResponse {
             .get("method")
             .and_then(|x| x.as_str())
             .map(str::to_string);
+        let key = obj
+            .get("key")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let mut headers = BTreeMap::new();
         if let Some(hmap) = obj.get("headers").and_then(|x| x.as_object()) {
             for (k, val) in hmap {
@@ -416,9 +450,137 @@ impl PresignResponse {
         Ok(Self {
             url,
             method,
+            key,
             headers,
             digest,
             sha256,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PublishLatestRequest {
+    scope: String,
+    space_id: Option<String>,
+    repo_hash: String,
+    schema_version: i32,
+    digest: String,
+    head_sha: String,
+    bytes: u64,
+    key: String,
+}
+
+impl PublishLatestRequest {
+    fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "scope".into(),
+            serde_json::Value::String(self.scope.clone()),
+        );
+        if let Some(sid) = &self.space_id {
+            map.insert("space_id".into(), serde_json::Value::String(sid.clone()));
+        }
+        map.insert(
+            "repo_hash".into(),
+            serde_json::Value::String(self.repo_hash.clone()),
+        );
+        map.insert(
+            "schema_version".into(),
+            serde_json::Value::Number(self.schema_version.into()),
+        );
+        map.insert(
+            "digest".into(),
+            serde_json::Value::String(self.digest.clone()),
+        );
+        map.insert(
+            "head_sha".into(),
+            serde_json::Value::String(self.head_sha.clone()),
+        );
+        map.insert("bytes".into(), serde_json::Value::Number(self.bytes.into()));
+        map.insert("key".into(), serde_json::Value::String(self.key.clone()));
+        Ok(serde_json::to_vec(&serde_json::Value::Object(map))?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LatestPointerResponse {
+    scope: String,
+    space_id: Option<String>,
+    repo_hash: String,
+    schema_version: i32,
+    digest: String,
+    head_sha: String,
+    bytes: u64,
+    key: String,
+    updated_at: String,
+}
+
+impl LatestPointerResponse {
+    fn from_json_slice(bytes: &[u8]) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_slice(bytes)
+            .context("invalid JSON response from relay latest endpoint")?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow!("latest cache response must be a JSON object"))?;
+        let scope = obj
+            .get("scope")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("latest cache response missing scope"))?
+            .trim()
+            .to_string();
+        let space_id = obj
+            .get("space_id")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let raw_repo_hash = obj
+            .get("repo_hash")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("latest cache response missing repo_hash"))?;
+        let repo_hash = validate_hex64(raw_repo_hash, "relay latest repo_hash")?;
+        let schema_version = obj
+            .get("schema_version")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| anyhow!("latest cache response missing integer schema_version"))?
+            as i32;
+        let raw_digest = obj
+            .get("digest")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("latest cache response missing digest"))?;
+        let digest = validate_hex64(raw_digest, "relay latest digest")?;
+        let head_sha = obj
+            .get("head_sha")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let bytes = obj
+            .get("bytes")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| anyhow!("latest cache response missing integer bytes"))?;
+        let key = obj
+            .get("key")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let updated_at = obj
+            .get("updated_at")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Ok(Self {
+            scope,
+            space_id,
+            repo_hash,
+            schema_version,
+            digest,
+            head_sha,
+            bytes,
+            key,
+            updated_at,
         })
     }
 }
@@ -586,16 +748,19 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
         }
         CacheAction::Push {
             relay_url,
+            scope,
             space_id,
             repo_hash,
             include_literals,
         } => {
             let token = read_relay_token()?;
+            let resolved_relay_url = resolve_relay_url(relay_url.as_deref())?;
             let repo_root_hash = resolve_repo_hash(&root, repo_hash.as_deref())?;
             let report = push_cache_opts(
                 &root,
                 &db_path,
-                relay_url,
+                &resolved_relay_url,
+                *scope,
                 space_id.as_deref(),
                 &repo_root_hash,
                 &token,
@@ -608,8 +773,11 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                 "repo_root_hash": report.repo_root_hash,
                 "schema_version": report.schema_version,
                 "digest": report.digest,
+                "head_sha": report.head_sha,
                 "bytes": report.bytes,
                 "entries": report.entries,
+                "key": report.key,
+                "updated_at": report.updated_at,
                 "literals_stripped": !include_literals,
             });
             if cli.json {
@@ -626,6 +794,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
         }
         CacheAction::Pull {
             relay_url,
+            scope,
             space_id,
             digest,
             repo_hash,
@@ -633,11 +802,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
             require_git_head,
         } => {
             let token = read_relay_token()?;
+            let resolved_relay_url = resolve_relay_url(relay_url.as_deref())?;
             let repo_root_hash = resolve_repo_hash(&root, repo_hash.as_deref())?;
             let manifest_and_digest = pull_cache_opts(
                 &root,
                 &db_path,
-                relay_url,
+                &resolved_relay_url,
+                *scope,
                 space_id.as_deref(),
                 digest.as_deref(),
                 &repo_root_hash,
@@ -756,6 +927,88 @@ fn read_relay_token() -> Result<String> {
     validate_relay_token(&token)
 }
 
+fn resolve_relay_url(explicit: Option<&str>) -> Result<String> {
+    if let Some(raw) = explicit {
+        return validate_relay_base_url(raw, "--relay-url");
+    }
+    let from_env = std::env::var(RELAY_URL_ENV).map_err(|_| {
+        anyhow!(
+            "--relay-url <URL> (or {RELAY_URL_ENV} environment variable) is required for remote cache push/pull"
+        )
+    })?;
+    validate_relay_base_url(&from_env, RELAY_URL_ENV)
+}
+
+fn resolve_scope_and_space_id(
+    scope: Option<CacheScope>,
+    space_id: Option<&str>,
+) -> Result<(CacheScope, Option<String>)> {
+    let cleaned_space = match space_id {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            ensure!(!trimmed.is_empty(), "--space-id must not be empty");
+            ensure!(
+                !trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f),
+                "--space-id contains invalid control characters"
+            );
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+    match (scope, cleaned_space) {
+        (None, None) | (Some(CacheScope::Account), None) => Ok((CacheScope::Account, None)),
+        (None, Some(sid)) | (Some(CacheScope::Space), Some(sid)) => {
+            Ok((CacheScope::Space, Some(sid)))
+        }
+        (Some(CacheScope::Account), Some(_)) => {
+            bail!("--space-id cannot be combined with --scope account")
+        }
+        (Some(CacheScope::Space), None) => {
+            bail!("--space-id is required when --scope space")
+        }
+    }
+}
+
+fn normalize_head_sha(raw: &str) -> String {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        trimmed
+    } else {
+        String::new()
+    }
+}
+
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        let is_unreserved =
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if is_unreserved {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn redact_url_for_display(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    if let Some(scheme_end) = without_query.find("://") {
+        let after_scheme = &without_query[scheme_end + 3..];
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at_pos) = authority.rfind('@') {
+            return format!(
+                "{}://<redacted>@{}",
+                &without_query[..scheme_end],
+                &after_scheme[at_pos + 1..]
+            );
+        }
+    }
+    without_query.to_string()
+}
+
 fn is_strict_loopback_authority(authority: &str) -> bool {
     if authority.is_empty() || authority.contains('@') {
         return false;
@@ -780,7 +1033,7 @@ fn is_strict_loopback_authority(authority: &str) -> bool {
 }
 
 fn validate_url_with_policy(raw: &str, label: &str, allow_loopback_http: bool) -> Result<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
+    let trimmed = raw.trim();
     ensure!(!trimmed.is_empty(), "{label} must not be empty");
     ensure!(
         !trimmed.bytes().any(|b| b <= 0x20
@@ -805,8 +1058,14 @@ fn validate_url_with_policy(raw: &str, label: &str, allow_loopback_http: bool) -
     bail!("{label} must start with https://")
 }
 
+fn validate_relay_base_url(raw: &str, label: &str) -> Result<String> {
+    let validated = validate_url_with_policy(raw, label, true)?;
+    Ok(validated.trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
 fn validate_relay_or_presign_url(raw: &str, label: &str) -> Result<String> {
-    validate_url_with_policy(raw, label, true)
+    validate_relay_base_url(raw, label)
 }
 
 fn is_forbidden_relay_header(name: &str) -> bool {
@@ -1316,11 +1575,15 @@ pub struct PushReport {
     pub repo_root_hash: String,
     pub schema_version: i32,
     pub digest: String,
+    pub head_sha: String,
     pub bytes: usize,
     pub entries: usize,
+    pub key: String,
+    pub updated_at: String,
 }
 
-/// Pack, request a presigned upload URL from GitPulse Relay, and upload bytes.
+/// Pack, request a presigned upload URL from GitPulse Relay, upload bytes, and
+/// publish the latest pointer.
 /// Test-only shorthand; the `cache push` command calls [`push_cache_opts`].
 #[cfg(test)]
 pub fn push_cache(
@@ -1335,6 +1598,7 @@ pub fn push_cache(
         root,
         db_path,
         relay_url,
+        None,
         space_id,
         repo_root_hash,
         bearer_token,
@@ -1342,29 +1606,30 @@ pub fn push_cache(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn push_cache_opts(
     root: &Path,
     db_path: &Path,
     relay_url: &str,
+    scope: Option<CacheScope>,
     space_id: Option<&str>,
     repo_root_hash: &str,
     bearer_token: &str,
     include_literals: bool,
 ) -> Result<PushReport> {
     let token = validate_relay_token(bearer_token)?;
-    let base = validate_relay_or_presign_url(relay_url, "--relay-url")?;
+    let base = validate_relay_base_url(relay_url, "--relay-url")?;
     let relay_is_loopback = base.starts_with("http://");
+    let repo_root_hash = validate_hex64(repo_root_hash, "repo_root_hash")?;
+    let (resolved_scope, resolved_space_id) = resolve_scope_and_space_id(scope, space_id)?;
+    let scope_str = resolved_scope.as_str().to_string();
+
     let (archive_bytes, manifest, archive_sha256) =
-        pack_store_to_bytes_opts(root, db_path, repo_root_hash, include_literals)?;
-    let scope = if space_id.is_some() {
-        "space".to_string()
-    } else {
-        "account".to_string()
-    };
+        pack_store_to_bytes_opts(root, db_path, &repo_root_hash, include_literals)?;
     let req = PresignRequest {
-        scope: scope.clone(),
-        space_id: space_id.map(str::to_string),
-        repo_hash: repo_root_hash.to_string(),
+        scope: scope_str.clone(),
+        space_id: resolved_space_id.clone(),
+        repo_hash: repo_root_hash.clone(),
         schema_version: manifest.schema_version,
         digest: Some(archive_sha256.clone()),
         action: "upload".to_string(),
@@ -1402,28 +1667,49 @@ pub fn push_cache_opts(
         sanitize_error_snippet(&resp_body)
     );
 
+    let head_sha = normalize_head_sha(&manifest.git_head);
+    let latest_req = PublishLatestRequest {
+        scope: scope_str.clone(),
+        space_id: resolved_space_id.clone(),
+        repo_hash: repo_root_hash.clone(),
+        schema_version: manifest.schema_version,
+        digest: archive_sha256.clone(),
+        head_sha: head_sha.clone(),
+        bytes: archive_bytes.len() as u64,
+        key: presign.key.unwrap_or_default(),
+    };
+    let latest_url = format!("{base}/v1/devmap-cache/latest");
+    let published = publish_latest(&latest_url, &token, &latest_req)?;
+
     let _ = write_local_cache_state(
         root,
         &LocalCacheState {
             last_digest: archive_sha256.clone(),
             schema_version: manifest.schema_version,
-            repo_root_hash: repo_root_hash.to_string(),
+            repo_root_hash: repo_root_hash.clone(),
         },
     );
 
     Ok(PushReport {
-        scope,
-        space_id: space_id.map(str::to_string),
-        repo_root_hash: repo_root_hash.to_string(),
+        scope: scope_str,
+        space_id: resolved_space_id,
+        repo_root_hash,
         schema_version: manifest.schema_version,
         digest: archive_sha256,
+        head_sha: if published.head_sha.is_empty() {
+            head_sha
+        } else {
+            published.head_sha
+        },
         bytes: archive_bytes.len(),
         entries: manifest.entries.len(),
+        key: published.key,
+        updated_at: published.updated_at,
     })
 }
 
-/// Request a presigned download URL from GitPulse Relay, download, verify
-/// SHA-256, and atomically unpack into `db_path`.
+/// Resolve latest digest (when omitted), request a presigned download URL from
+/// GitPulse Relay, download, verify SHA-256, and atomically unpack into `db_path`.
 /// Test-only shorthand; the `cache pull` command calls [`pull_cache_opts`].
 #[cfg(test)]
 pub fn pull_cache(
@@ -1439,6 +1725,7 @@ pub fn pull_cache(
         root,
         db_path,
         relay_url,
+        None,
         space_id,
         expected_digest,
         repo_root_hash,
@@ -1456,6 +1743,7 @@ pub fn pull_cache_opts(
     root: &Path,
     db_path: &Path,
     relay_url: &str,
+    scope: Option<CacheScope>,
     space_id: Option<&str>,
     expected_digest: Option<&str>,
     repo_root_hash: &str,
@@ -1463,30 +1751,30 @@ pub fn pull_cache_opts(
     unpack_opts: &UnpackOptions,
 ) -> Result<(CacheManifest, String)> {
     let token = validate_relay_token(bearer_token)?;
-    let base = validate_relay_or_presign_url(relay_url, "--relay-url")?;
+    let base = validate_relay_base_url(relay_url, "--relay-url")?;
     let relay_is_loopback = base.starts_with("http://");
+    let repo_root_hash = validate_hex64(repo_root_hash, "repo_root_hash")?;
+    let (resolved_scope, resolved_space_id) = resolve_scope_and_space_id(scope, space_id)?;
+    let scope_str = resolved_scope.as_str().to_string();
+
     let requested_digest = match expected_digest {
         Some(d) => validate_hex64(d, "--digest")?,
-        None => read_local_cache_state(root)
-            .filter(|s| {
-                s.schema_version == CURRENT_SCHEMA_VERSION && s.repo_root_hash == repo_root_hash
-            })
-            .map(|s| s.last_digest)
-            .ok_or_else(|| {
-                anyhow!(
-                    "--digest <64-hex> is required for `devmap cache pull` when no prior pushed digest is recorded locally"
-                )
-            })?,
-    };
-    let scope = if space_id.is_some() {
-        "space".to_string()
-    } else {
-        "account".to_string()
+        None => {
+            let latest = fetch_latest(
+                &base,
+                &token,
+                resolved_scope,
+                resolved_space_id.as_deref(),
+                &repo_root_hash,
+                CURRENT_SCHEMA_VERSION,
+            )?;
+            latest.digest
+        }
     };
     let req = PresignRequest {
-        scope,
-        space_id: space_id.map(str::to_string),
-        repo_hash: repo_root_hash.to_string(),
+        scope: scope_str,
+        space_id: resolved_space_id,
+        repo_hash: repo_root_hash.clone(),
         schema_version: CURRENT_SCHEMA_VERSION,
         digest: Some(requested_digest.clone()),
         action: "download".to_string(),
@@ -1541,7 +1829,7 @@ pub fn pull_cache_opts(
         &LocalCacheState {
             last_digest: actual_digest.clone(),
             schema_version: manifest.schema_version,
-            repo_root_hash: repo_root_hash.to_string(),
+            repo_root_hash,
         },
     );
     Ok((manifest, actual_digest))
@@ -1590,17 +1878,197 @@ fn request_presign(url: &str, bearer_token: &str, req: &PresignRequest) -> Resul
     PresignResponse::from_json_slice(&resp_bytes)
 }
 
-fn sanitize_error_snippet(bytes: &[u8]) -> String {
-    let raw = String::from_utf8_lossy(bytes);
-    let mut out = String::new();
-    for ch in raw.chars().take(160) {
-        if ch.is_control() {
-            out.push(' ');
-        } else {
-            out.push(ch);
+fn publish_latest(
+    url: &str,
+    bearer_token: &str,
+    req: &PublishLatestRequest,
+) -> Result<LatestPointerResponse> {
+    let body = req.to_json_bytes()?;
+    let mut headers = BTreeMap::new();
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    headers.insert("Accept".to_string(), "application/json".to_string());
+    let (status, resp_bytes) = http_request(
+        "PUT",
+        url,
+        &headers,
+        Some(bearer_token),
+        Some(&body),
+        1024 * 1024,
+    )?;
+    ensure!(
+        (200..300).contains(&status),
+        "relay latest publish failed with HTTP {status}: {}",
+        sanitize_error_snippet(&resp_bytes)
+    );
+    let published = LatestPointerResponse::from_json_slice(&resp_bytes)?;
+    ensure!(
+        published.digest == req.digest,
+        "relay latest publish response digest ({}) does not match uploaded digest ({})",
+        published.digest,
+        req.digest
+    );
+    ensure!(
+        published.repo_hash == req.repo_hash,
+        "relay latest publish response repo_hash ({}) does not match requested repo_hash ({})",
+        published.repo_hash,
+        req.repo_hash
+    );
+    ensure!(
+        published.schema_version == req.schema_version,
+        "relay latest publish response schema_version ({}) does not match uploaded schema_version ({})",
+        published.schema_version,
+        req.schema_version
+    );
+    Ok(published)
+}
+
+fn fetch_latest(
+    base_url: &str,
+    bearer_token: &str,
+    scope: CacheScope,
+    space_id: Option<&str>,
+    repo_root_hash: &str,
+    schema_version: i32,
+) -> Result<LatestPointerResponse> {
+    let scope_str = scope.as_str();
+    let mut query = format!(
+        "scope={}&repo_hash={}&schema_version={}",
+        percent_encode_query(scope_str),
+        percent_encode_query(repo_root_hash),
+        schema_version,
+    );
+    if let Some(sid) = space_id {
+        query.push_str("&space_id=");
+        query.push_str(&percent_encode_query(sid));
+    }
+    let url = format!("{base_url}/v1/devmap-cache/latest?{query}");
+    let mut headers = BTreeMap::new();
+    headers.insert("Accept".to_string(), "application/json".to_string());
+    let (status, resp_bytes) =
+        http_request("GET", &url, &headers, Some(bearer_token), None, 1024 * 1024)?;
+    if status == 404 {
+        bail!(
+            "no remote devmap cache found on relay for scope={scope_str} repo_hash={repo_root_hash} schema_version={schema_version} (HTTP 404): {}",
+            sanitize_error_snippet(&resp_bytes)
+        );
+    }
+    ensure!(
+        (200..300).contains(&status),
+        "relay latest lookup failed with HTTP {status}: {}",
+        sanitize_error_snippet(&resp_bytes)
+    );
+    let latest = LatestPointerResponse::from_json_slice(&resp_bytes)?;
+    ensure!(
+        latest.scope == scope_str,
+        "relay latest response scope ({:?}) does not match requested scope ({scope_str:?})",
+        latest.scope
+    );
+    match scope {
+        CacheScope::Space => {
+            ensure!(
+                latest.space_id.as_deref() == space_id,
+                "relay latest response space_id ({:?}) does not match requested space_id ({:?})",
+                latest.space_id,
+                space_id
+            );
+        }
+        CacheScope::Account => {
+            ensure!(
+                latest.space_id.is_none(),
+                "relay latest response returned unexpected space_id for account scope"
+            );
         }
     }
-    out.trim().to_string()
+    ensure!(
+        latest.repo_hash == repo_root_hash,
+        "relay latest response repo_hash ({}) does not match requested repo_hash ({repo_root_hash})",
+        latest.repo_hash
+    );
+    ensure!(
+        latest.schema_version == schema_version,
+        "relay latest response schema_version ({}) does not match local schema_version ({schema_version})",
+        latest.schema_version
+    );
+    ensure!(
+        latest.bytes > 0 && latest.bytes <= MAX_ARCHIVE_BYTES as u64,
+        "relay latest response bytes ({}) out of allowed range (1..={MAX_ARCHIVE_BYTES})",
+        latest.bytes
+    );
+    Ok(latest)
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let matched = rest.len() >= 7
+            && rest.as_bytes()[..7].eq_ignore_ascii_case(b"bearer ")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
+        if matched {
+            out.push_str("Bearer <redacted>");
+            i += 7;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && !matches!(bytes[i], b'"' | b'\'' | b',' | b'}' | b')' | b'>')
+            {
+                i += 1;
+            }
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_url_query_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_pos) = rest
+        .find("http://")
+        .into_iter()
+        .chain(rest.find("https://"))
+        .min()
+    {
+        out.push_str(&rest[..scheme_pos]);
+        let url_start = &rest[scheme_pos..];
+        let url_end = url_start
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '>' | ')' | ']' | '}' | ',')
+            })
+            .unwrap_or(url_start.len());
+        let token = &url_start[..url_end];
+        if let Some(q_pos) = token.find('?') {
+            out.push_str(&redact_url_for_display(&token[..q_pos]));
+            out.push_str("?<redacted>");
+        } else {
+            out.push_str(&redact_url_for_display(token));
+        }
+        rest = &url_start[url_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn sanitize_error_snippet(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let redacted = redact_bearer_tokens(&redact_url_query_strings(&cleaned));
+    redacted
+        .chars()
+        .take(160)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1620,7 +2088,10 @@ fn http_request(
     } else if url.starts_with("https://") {
         https_curl_request(method, url, headers, bearer_token, body, max_response_bytes)
     } else {
-        bail!("unsupported URL scheme in {url:?}")
+        bail!(
+            "unsupported URL scheme in {:?}",
+            redact_url_for_display(url)
+        )
     }
 }
 
@@ -1649,11 +2120,11 @@ fn http_loopback_request(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
-    let payload = body.unwrap_or(&[]);
-    let mut req = format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        payload.len()
-    );
+    let mut req =
+        format!("{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    if let Some(payload) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+    }
     if let Some(tok) = bearer_token {
         req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
     }
@@ -1669,8 +2140,10 @@ fn http_loopback_request(
     }
     req.push_str("\r\n");
     stream.write_all(req.as_bytes())?;
-    if !payload.is_empty() {
-        stream.write_all(payload)?;
+    if let Some(payload) = body {
+        if !payload.is_empty() {
+            stream.write_all(payload)?;
+        }
     }
     stream.flush()?;
 
@@ -1797,7 +2270,6 @@ fn build_hardened_curl_args(
     cfg_path: &Path,
     resp_path: &Path,
     body_path: Option<&Path>,
-    url: &str,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         // C6: `-q` MUST be the very first argument so ~/.curlrc is never read.
@@ -1829,7 +2301,6 @@ fn build_hardened_curl_args(
         args.push("--data-binary".into());
         args.push(format!("@{}", bp.display()).into());
     }
-    args.push(url.into());
     args
 }
 
@@ -1857,7 +2328,7 @@ fn create_private_temp_dir() -> Result<PathBuf> {
 
 /// HTTPS transport via `curl` with `-q` (no ~/.curlrc), `--globoff`,
 /// `--max-redirs 0`, `--proto =https`, trusted absolute curl path, and
-/// credentials passed strictly in a mode-0600 `--config` file (never in argv).
+/// URL + credentials passed strictly in a mode-0600 `--config` file (never in argv).
 fn https_curl_request(
     method: &str,
     url: &str,
@@ -1866,6 +2337,11 @@ fn https_curl_request(
     body: Option<&[u8]>,
     max_response_bytes: usize,
 ) -> Result<(u16, Vec<u8>)> {
+    ensure!(
+        !url.bytes()
+            .any(|b| b <= 0x20 || b == 0x7f || b == b'"' || b == b'\\'),
+        "unsafe character in HTTPS URL"
+    );
     let curl_bin = resolve_trusted_curl_binary()?;
     let tmp_dir = create_private_temp_dir()?;
     let _cleanup = DirCleanupGuard(tmp_dir.clone());
@@ -1874,7 +2350,7 @@ fn https_curl_request(
     let resp_path = tmp_dir.join("resp.bin");
     let body_path = tmp_dir.join("req.bin");
 
-    let mut cfg_contents = String::new();
+    let mut cfg_contents = format!("url = \"{url}\"\n");
     if let Some(tok) = bearer_token {
         let safe_tok = validate_relay_token(tok)?;
         cfg_contents.push_str(&format!("header = \"Authorization: Bearer {safe_tok}\"\n"));
@@ -1902,14 +2378,8 @@ fn https_curl_request(
         None
     };
 
-    let args = build_hardened_curl_args(
-        method,
-        max_response_bytes,
-        &cfg_path,
-        &resp_path,
-        body_arg,
-        url,
-    );
+    let args =
+        build_hardened_curl_args(method, max_response_bytes, &cfg_path, &resp_path, body_arg);
     let output = std::process::Command::new(&curl_bin)
         .args(&args)
         .output()
@@ -2145,8 +2615,8 @@ mod tests {
         let server_base = base_url.clone();
 
         let handle = std::thread::spawn(move || {
-            // Serve 6 sequential requests: push(presign+PUT), pull(presign+GET), tampered pull(presign+GET)
-            for _ in 0..6 {
+            // Serve 7 sequential requests: push(presign+PUT r2+PUT latest), pull(presign+GET), tampered pull(presign+GET)
+            for _ in 0..7 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 8192];
@@ -2196,10 +2666,18 @@ mod tests {
                         let req: serde_json::Value = serde_json::from_slice(body).unwrap();
                         let action = req["action"].as_str().unwrap();
                         let digest = req["digest"].as_str().unwrap_or("latest");
+                        let repo_hash = req["repo_hash"].as_str().unwrap();
+                        let schema_version = req["schema_version"].as_i64().unwrap();
+                        let space_id = req["space_id"].as_str().unwrap_or("");
+                        let key = format!(
+                            "devmap-cache/spaces/{space_id}/{repo_hash}/v{schema_version}/{digest}.tar.gz"
+                        );
                         let obj_url = format!("{server_base}/r2/{digest}");
                         let resp = serde_json::json!({
                             "url": obj_url,
                             "method": if action == "upload" { "PUT" } else { "GET" },
+                            "key": key,
+                            "expires_at": "2026-11-25T23:05:00Z",
                             "digest": digest,
                             "headers": {
                                 "X-Amz-Checksum-Sha256": "dGVzdC1jaGVja3N1bS1iNjQ=",
@@ -2208,6 +2686,24 @@ mod tests {
                             },
                         });
                         (200, serde_json::to_vec(&resp).unwrap())
+                    }
+                } else if method == "PUT" && path == "/v1/devmap-cache/latest" {
+                    let has_auth = hdr
+                        .split("\r\n")
+                        .any(|l| l.eq_ignore_ascii_case("Authorization: Bearer secret-relay-tok"));
+                    if !has_auth {
+                        (401, br#"{"error":"unauthorized"}"#.to_vec())
+                    } else {
+                        let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+                        let mut resp = req.as_object().unwrap().clone();
+                        resp.insert(
+                            "updated_at".into(),
+                            serde_json::json!("2026-11-25T23:00:00Z"),
+                        );
+                        (
+                            200,
+                            serde_json::to_vec(&serde_json::Value::Object(resp)).unwrap(),
+                        )
                     }
                 } else if method == "PUT" && path.starts_with("/r2/") {
                     let key = path.trim_start_matches("/r2/").to_string();
@@ -2261,6 +2757,8 @@ mod tests {
         .unwrap();
         assert_eq!(pushed.scope, "space");
         assert_eq!(pushed.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(pushed.key.starts_with("devmap-cache/spaces/space-123/"));
+        assert_eq!(pushed.updated_at, "2026-11-25T23:00:00Z");
 
         let (pulled_manifest, pulled_digest) = pull_cache(
             &dst_repo,
@@ -2303,6 +2801,417 @@ mod tests {
     }
 
     #[test]
+    fn relay_push_latest_and_pull_without_digest_roundtrip() {
+        let (src_repo, src_db) = build_indexed_repo("relay-rt-src");
+        let dst_space_repo = scratch_dir("relay-rt-dst-space");
+        let dst_space_db = devmap_extract::paths::store_path(&dst_space_repo);
+        let dst_acct_repo = scratch_dir("relay-rt-dst-acct");
+        let dst_acct_db = devmap_extract::paths::store_path(&dst_acct_repo);
+        let dst_miss_repo = scratch_dir("relay-rt-dst-miss");
+        let dst_miss_db = devmap_extract::paths::store_path(&dst_miss_repo);
+        let dst_bad_repo = scratch_dir("relay-rt-dst-bad");
+        let dst_bad_db = devmap_extract::paths::store_path(&dst_bad_repo);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let blobs: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let latest_map: Arc<Mutex<BTreeMap<String, serde_json::Value>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let corrupt_latest_repo = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_blobs = Arc::clone(&blobs);
+        let server_latest = Arc::clone(&latest_map);
+        let server_corrupt = Arc::clone(&corrupt_latest_repo);
+        let server_base = base_url.clone();
+
+        // 14 requests total:
+        //  1-3: space push (POST /presign, PUT /r2, PUT /latest)
+        //  4-6: space pull without digest (GET /latest, POST /presign, GET /r2)
+        //  7-9: account push (POST /presign, PUT /r2, PUT /latest)
+        // 10-12: account pull without digest (GET /latest, POST /presign, GET /r2)
+        //   13: missing repo pull (GET /latest -> 404)
+        //   14: tampered repo_hash in GET /latest -> fails closed before presign
+        let handle = std::thread::spawn(move || {
+            const ALLOWED_LATEST_KEYS: &[&str] = &[
+                "scope",
+                "space_id",
+                "repo_hash",
+                "schema_version",
+                "digest",
+                "head_sha",
+                "bytes",
+                "key",
+            ];
+            for _ in 0..14 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos);
+                            let hdr = std::str::from_utf8(&raw[..pos]).unwrap();
+                            for line in hdr.split("\r\n") {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(pos) = header_end {
+                        if raw.len() >= pos + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let pos = header_end.unwrap();
+                let hdr = std::str::from_utf8(&raw[..pos]).unwrap();
+                let body = &raw[pos + 4..pos + 4 + content_len];
+                let first_line = hdr.split("\r\n").next().unwrap();
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap();
+                let full_target = parts.next().unwrap();
+                let (path, query_str) = match full_target.split_once('?') {
+                    Some((p, q)) => (p, q),
+                    None => (full_target, ""),
+                };
+                let has_auth = hdr
+                    .split("\r\n")
+                    .any(|l| l.eq_ignore_ascii_case("Authorization: Bearer waylode-tok-42"));
+
+                let (status, resp_body) = if method == "POST" && path == "/v1/devmap-cache/presign"
+                {
+                    if !has_auth {
+                        (401, br#"{"error":"unauthorized"}"#.to_vec())
+                    } else {
+                        let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+                        let scope = req["scope"].as_str().unwrap();
+                        let repo_hash = req["repo_hash"].as_str().unwrap();
+                        let schema_version = req["schema_version"].as_i64().unwrap();
+                        let digest = req["digest"].as_str().unwrap();
+                        let action = req["action"].as_str().unwrap();
+                        let key = if scope == "space" {
+                            let sid = req["space_id"].as_str().unwrap();
+                            format!(
+                                "devmap-cache/spaces/{sid}/{repo_hash}/v{schema_version}/{digest}.tar.gz"
+                            )
+                        } else {
+                            assert!(
+                                req.get("space_id").is_none(),
+                                "account presign must omit space_id: {req}"
+                            );
+                            format!(
+                                "devmap-cache/accounts/7/{repo_hash}/v{schema_version}/{digest}.tar.gz"
+                            )
+                        };
+                        let obj_url = format!(
+                            "{server_base}/r2/{digest}?X-Amz-Signature=supersecret&X-Amz-Expires=300"
+                        );
+                        let resp = serde_json::json!({
+                            "url": obj_url,
+                            "method": if action == "upload" { "PUT" } else { "GET" },
+                            "key": key,
+                            "expires_at": "2026-11-25T23:05:00Z",
+                            "headers": {
+                                "X-Amz-Checksum-Sha256": "Y2hlY2tzdW0=",
+                                "X-Amz-Content-Sha256": digest,
+                            },
+                        });
+                        (200, serde_json::to_vec(&resp).unwrap())
+                    }
+                } else if method == "PUT" && path == "/v1/devmap-cache/latest" {
+                    if !has_auth {
+                        (401, br#"{"error":"unauthorized"}"#.to_vec())
+                    } else {
+                        let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+                        let obj = req.as_object().unwrap();
+                        // Enforce relay strict JSON (no unknown keys).
+                        for k in obj.keys() {
+                            assert!(
+                                ALLOWED_LATEST_KEYS.contains(&k.as_str()),
+                                "unexpected key {k:?} in PUT /v1/devmap-cache/latest"
+                            );
+                        }
+                        let scope = obj["scope"].as_str().unwrap();
+                        let space_id = obj.get("space_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let repo_hash = obj["repo_hash"].as_str().unwrap();
+                        let schema_version = obj["schema_version"].as_i64().unwrap();
+                        let digest = obj["digest"].as_str().unwrap();
+                        let head_sha = obj["head_sha"].as_str().unwrap();
+                        let bytes = obj["bytes"].as_u64().unwrap();
+                        let key = obj["key"].as_str().unwrap();
+                        assert!(bytes > 0);
+                        assert!(
+                            head_sha.is_empty()
+                                || (head_sha.len() == 40
+                                    && head_sha.bytes().all(|b| b.is_ascii_hexdigit())),
+                            "invalid head_sha {head_sha:?}"
+                        );
+                        let expected_key = if scope == "space" {
+                            format!(
+                                "devmap-cache/spaces/{space_id}/{repo_hash}/v{schema_version}/{digest}.tar.gz"
+                            )
+                        } else {
+                            assert!(
+                                obj.get("space_id").is_none(),
+                                "account PUT /latest must omit space_id"
+                            );
+                            format!(
+                                "devmap-cache/accounts/7/{repo_hash}/v{schema_version}/{digest}.tar.gz"
+                            )
+                        };
+                        assert_eq!(key, expected_key);
+
+                        let record = serde_json::json!({
+                            "scope": scope,
+                            "space_id": space_id,
+                            "repo_hash": repo_hash,
+                            "schema_version": schema_version,
+                            "digest": digest,
+                            "head_sha": head_sha,
+                            "bytes": bytes,
+                            "key": key,
+                            "updated_at": "2026-11-25T23:01:02Z",
+                        });
+                        let lookup = format!("{scope}|{space_id}|{repo_hash}|{schema_version}");
+                        server_latest.lock().unwrap().insert(lookup, record.clone());
+                        (200, serde_json::to_vec(&record).unwrap())
+                    }
+                } else if method == "GET" && path == "/v1/devmap-cache/latest" {
+                    if !has_auth {
+                        (401, br#"{"error":"unauthorized"}"#.to_vec())
+                    } else {
+                        let mut qmap = BTreeMap::new();
+                        for pair in query_str.split('&').filter(|s| !s.is_empty()) {
+                            if let Some((k, v)) = pair.split_once('=') {
+                                qmap.insert(k.to_string(), v.to_string());
+                            }
+                        }
+                        let scope = qmap.get("scope").map(String::as_str).unwrap_or("");
+                        let space_id = qmap.get("space_id").map(String::as_str).unwrap_or("");
+                        if scope == "account" {
+                            assert!(
+                                !qmap.contains_key("space_id"),
+                                "account GET /latest must omit space_id query param"
+                            );
+                        }
+                        let repo_hash = qmap.get("repo_hash").map(String::as_str).unwrap_or("");
+                        let schema_version =
+                            qmap.get("schema_version").map(String::as_str).unwrap_or("");
+                        let lookup = format!("{scope}|{space_id}|{repo_hash}|{schema_version}");
+                        if let Some(mut rec) = server_latest.lock().unwrap().get(&lookup).cloned() {
+                            if server_corrupt.load(Ordering::SeqCst) {
+                                rec["repo_hash"] = serde_json::json!("f".repeat(64));
+                            }
+                            (200, serde_json::to_vec(&rec).unwrap())
+                        } else {
+                            (
+                                404,
+                                br#"{"error":"not_found","message":"no latest cache pointer"}"#
+                                    .to_vec(),
+                            )
+                        }
+                    }
+                } else if method == "PUT" && path.starts_with("/r2/") {
+                    let leaked_auth = hdr
+                        .split("\r\n")
+                        .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+                    let has_checksum = hdr
+                        .split("\r\n")
+                        .any(|l| l.eq_ignore_ascii_case("X-Amz-Checksum-Sha256: Y2hlY2tzdW0="));
+                    assert!(
+                        !leaked_auth,
+                        "must never send bearer token to presigned PUT"
+                    );
+                    assert!(has_checksum, "must forward signed headers on presigned PUT");
+                    assert!(
+                        query_str.contains("X-Amz-Signature=supersecret"),
+                        "presigned query string must be preserved verbatim"
+                    );
+                    let key = path.trim_start_matches("/r2/").to_string();
+                    server_blobs.lock().unwrap().insert(key, body.to_vec());
+                    (200, b"ok".to_vec())
+                } else if method == "GET" && path.starts_with("/r2/") {
+                    let leaked_auth = hdr
+                        .split("\r\n")
+                        .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+                    assert!(
+                        !leaked_auth,
+                        "must never send bearer token to presigned GET"
+                    );
+                    let key = path.trim_start_matches("/r2/").to_string();
+                    let data = server_blobs.lock().unwrap().get(&key).cloned().unwrap();
+                    (200, data)
+                } else {
+                    (404, b"not found".to_vec())
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(&resp_body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let repo_hash = resolve_repo_hash(&src_repo, None).unwrap();
+
+        // 1. Space scope push -> PUT /latest -> pull WITHOUT --digest into brand-new checkout.
+        let space_push = push_cache_opts(
+            &src_repo,
+            &src_db,
+            &base_url,
+            Some(CacheScope::Space),
+            Some("sp_team_42"),
+            &repo_hash,
+            "waylode-tok-42",
+            false,
+        )
+        .unwrap();
+        assert_eq!(space_push.scope, "space");
+        assert_eq!(space_push.space_id.as_deref(), Some("sp_team_42"));
+        assert_eq!(
+            space_push.key,
+            format!(
+                "devmap-cache/spaces/sp_team_42/{repo_hash}/v{}/{}.tar.gz",
+                CURRENT_SCHEMA_VERSION, space_push.digest
+            )
+        );
+        assert_eq!(space_push.updated_at, "2026-11-25T23:01:02Z");
+
+        let (pulled_space_manifest, pulled_space_digest) = pull_cache_opts(
+            &dst_space_repo,
+            &dst_space_db,
+            &base_url,
+            Some(CacheScope::Space),
+            Some("sp_team_42"),
+            None,
+            &repo_hash,
+            "waylode-tok-42",
+            &UnpackOptions {
+                expected_repo_hash: Some(repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(pulled_space_digest, space_push.digest);
+        assert_eq!(pulled_space_manifest.schema_version, CURRENT_SCHEMA_VERSION);
+        let reopened_space = Store::open_existing(&dst_space_db).unwrap().unwrap();
+        let space_hits = devmap_query::StoreQueryEngine::new(&reopened_space)
+            .search(devmap_query::Request {
+                query: "cache_roundtrip_fn".to_string(),
+                token_budget: 2000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .unwrap();
+        assert!(space_hits
+            .items
+            .iter()
+            .any(|h| h.symbol_name.contains("cache_roundtrip_fn")));
+
+        // 2. Account scope push -> PUT /latest -> pull WITHOUT --digest into brand-new checkout.
+        let acct_push = push_cache_opts(
+            &src_repo,
+            &src_db,
+            &base_url,
+            Some(CacheScope::Account),
+            None,
+            &repo_hash,
+            "waylode-tok-42",
+            false,
+        )
+        .unwrap();
+        assert_eq!(acct_push.scope, "account");
+        assert_eq!(acct_push.space_id, None);
+        assert!(acct_push.key.starts_with("devmap-cache/accounts/7/"));
+
+        let (_, pulled_acct_digest) = pull_cache_opts(
+            &dst_acct_repo,
+            &dst_acct_db,
+            &base_url,
+            Some(CacheScope::Account),
+            None,
+            None,
+            &repo_hash,
+            "waylode-tok-42",
+            &UnpackOptions {
+                expected_repo_hash: Some(repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(pulled_acct_digest, acct_push.digest);
+        assert!(dst_acct_db.is_file());
+
+        // 3. 404 on GET /latest fails closed without touching destination DB.
+        let missing_repo_hash = "0".repeat(64);
+        let err = pull_cache_opts(
+            &dst_miss_repo,
+            &dst_miss_db,
+            &base_url,
+            Some(CacheScope::Account),
+            None,
+            None,
+            &missing_repo_hash,
+            "waylode-tok-42",
+            &UnpackOptions {
+                expected_repo_hash: Some(missing_repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
+        assert!(!dst_miss_db.exists());
+
+        // 4. Mismatched repo_hash in GET /latest response fails closed before presign.
+        corrupt_latest_repo.store(true, Ordering::SeqCst);
+        let err = pull_cache_opts(
+            &dst_bad_repo,
+            &dst_bad_db,
+            &base_url,
+            Some(CacheScope::Account),
+            None,
+            None,
+            &repo_hash,
+            "waylode-tok-42",
+            &UnpackOptions {
+                expected_repo_hash: Some(repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("repo_hash"), "{err}");
+        assert!(!dst_bad_db.exists());
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&src_repo);
+        let _ = std::fs::remove_dir_all(&dst_space_repo);
+        let _ = std::fs::remove_dir_all(&dst_acct_repo);
+        let _ = std::fs::remove_dir_all(&dst_miss_repo);
+        let _ = std::fs::remove_dir_all(&dst_bad_repo);
+    }
+
+    #[test]
     fn non_loopback_http_relay_url_and_ssrf_presign_url_are_rejected() {
         let err =
             validate_relay_or_presign_url("http://relay.example.com", "--relay-url").unwrap_err();
@@ -2325,20 +3234,60 @@ mod tests {
         assert!(validate_relay_token("good-token_123").is_ok());
         assert!(validate_relay_token("bad\"token").is_err());
         assert!(validate_relay_token("bad\\token").is_err());
-        // C6: `-q` is the very first curl argument and `--globoff` + `--max-redirs 0` are present
-        let args = build_hardened_curl_args(
-            "PUT",
-            1024,
-            Path::new("/tmp/c"),
-            Path::new("/tmp/r"),
-            None,
-            "https://r2.example.com/obj",
-        );
+        // C6: `-q` is the very first curl argument, `--globoff` + `--max-redirs 0` are present,
+        // and neither presigned URLs nor bearer tokens appear in curl argv.
+        let args =
+            build_hardened_curl_args("PUT", 1024, Path::new("/tmp/c"), Path::new("/tmp/r"), None);
         assert_eq!(args[0], "-q");
         assert!(args.iter().any(|a| a == "--globoff"));
         assert!(args.iter().any(|a| a == "--max-redirs"));
+        assert!(args
+            .iter()
+            .all(|a| !a.to_string_lossy().contains("https://")));
         assert!(is_forbidden_relay_header("Host"));
         assert!(is_forbidden_relay_header("Authorization"));
+    }
+
+    #[test]
+    fn scope_validation_and_secret_redaction_invariants() {
+        assert_eq!(
+            resolve_scope_and_space_id(None, None).unwrap(),
+            (CacheScope::Account, None)
+        );
+        assert_eq!(
+            resolve_scope_and_space_id(None, Some("sp_1")).unwrap(),
+            (CacheScope::Space, Some("sp_1".to_string()))
+        );
+        assert_eq!(
+            resolve_scope_and_space_id(Some(CacheScope::Account), None).unwrap(),
+            (CacheScope::Account, None)
+        );
+        assert_eq!(
+            resolve_scope_and_space_id(Some(CacheScope::Space), Some("sp_1")).unwrap(),
+            (CacheScope::Space, Some("sp_1".to_string()))
+        );
+        assert!(resolve_scope_and_space_id(Some(CacheScope::Space), None).is_err());
+        assert!(resolve_scope_and_space_id(Some(CacheScope::Account), Some("sp_1")).is_err());
+        assert!(resolve_scope_and_space_id(Some(CacheScope::Space), Some("   ")).is_err());
+
+        assert_eq!(normalize_head_sha(&"A".repeat(40)), "a".repeat(40));
+        assert_eq!(normalize_head_sha("not-a-sha"), "");
+        assert_eq!(percent_encode_query("sp_1/a b&c"), "sp_1%2Fa%20b%26c");
+
+        // Never echo bearer tokens or presigned URL query strings in error snippets.
+        let leaky = b"curl: failed for https://r2.example.com/k.tar.gz?X-Amz-Signature=TOPSECRET123&X-Amz-Credential=abc with Authorization: Bearer MY_BEARER_SECRET_99";
+        let sanitized = sanitize_error_snippet(leaky);
+        assert!(!sanitized.contains("TOPSECRET123"), "{sanitized}");
+        assert!(!sanitized.contains("MY_BEARER_SECRET_99"), "{sanitized}");
+        assert!(
+            sanitized.contains("https://r2.example.com/k.tar.gz?<redacted>"),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains("Bearer <redacted>"), "{sanitized}");
+        assert_eq!(
+            redact_url_for_display("https://user:pass@r2.example.com/k.tar.gz?X-Amz-Signature=xyz"),
+            "https://<redacted>@r2.example.com/k.tar.gz"
+        );
     }
 
     #[test]
