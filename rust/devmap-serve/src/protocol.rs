@@ -2474,6 +2474,19 @@ impl Drop for UnixIpcServer {
     }
 }
 
+/// Whether `name` is in the local named-pipe namespace (`\\.\pipe\<name>`,
+/// matched without regard to case, as Windows does). A pipe server can only be
+/// created there; any other spelling, such as a socket-file path, is refused
+/// by `CreateNamedPipeW` with an error that does not say why.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_named_pipe_name(name: &str) -> bool {
+    const PREFIX: &str = r"\\.\pipe\";
+    name.len() > PREFIX.len()
+        && name
+            .get(..PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+}
+
 /// `on_listening` is called once, the moment the first pipe instance exists and
 /// a client could connect — the named-pipe counterpart of `UnixIpcServer::bind`
 /// returning. It is a callback rather than a return value because this function
@@ -2487,6 +2500,15 @@ pub async fn run_named_pipe(
 ) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    // A Unix-shaped `--socket C:\..\x.sock` reaches here as-is. Windows would
+    // refuse it with a bare os error 123 after the daemon has already logged
+    // that it started, which names neither the flag nor the spelling it needs.
+    anyhow::ensure!(
+        is_named_pipe_name(name),
+        "{name} is not a named-pipe name: on Windows the daemon listens on a named pipe, \
+         so the endpoint (`--socket`) must be spelled \\\\.\\pipe\\<name>; omit it to use \
+         the repository's default pipe"
+    );
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(name)?;
@@ -4694,6 +4716,23 @@ mod tests {
 #[cfg(test)]
 mod hardening_limit_tests {
     use super::*;
+
+    /// `run_named_pipe` refuses, by name, an endpoint that is not a pipe: a
+    /// socket-file path handed to `--socket` on Windows used to die with a bare
+    /// os error 123 after the daemon had logged that it started.
+    #[test]
+    fn only_the_local_pipe_namespace_is_a_named_pipe_name() {
+        assert!(is_named_pipe_name(r"\\.\pipe\devmap-0123456789abcdef"));
+        assert!(is_named_pipe_name(r"\\.\PIPE\dm-serve-1"));
+        assert!(!is_named_pipe_name(r"\\.\pipe\"), "a prefix with no name");
+        assert!(!is_named_pipe_name(
+            r"C:\Users\x\AppData\Local\Temp\dm-serve-1.sock"
+        ));
+        assert!(!is_named_pipe_name("/tmp/devmap-ig-1.sock"));
+        assert!(!is_named_pipe_name(r"\\?\C:\Temp\pipe\x"));
+        assert!(!is_named_pipe_name(r"\\.\pip"));
+        assert!(!is_named_pipe_name(""));
+    }
 
     /// The fan-out cap and probe window are contracts, not vibes: both were
     /// introduced because an unbounded value had a concrete failure mode

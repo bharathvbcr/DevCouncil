@@ -528,7 +528,7 @@ with an absolute repository path."
         // next call. Taken after, it would vouch for a file the connection
         // never opened.
         let identity = match std::fs::metadata(store_path) {
-            Ok(metadata) if metadata.is_file() => StoreFileIdentity::of(&metadata),
+            Ok(metadata) if metadata.is_file() => StoreFileIdentity::of(&metadata, store_path),
             _ => return Err(explain_absence(store_path)),
         };
         let stamp_before = DamageStamp::of(&key);
@@ -655,7 +655,7 @@ with an absolute repository path."
         let identity = std::fs::metadata(store_path)
             .ok()
             .filter(std::fs::Metadata::is_file)
-            .map(|metadata| StoreFileIdentity::of(&metadata))
+            .map(|metadata| StoreFileIdentity::of(&metadata, store_path))
             .ok_or_else(|| OpenFailure {
                 message: explain_absence(store_path),
                 corrupt: false,
@@ -5334,6 +5334,8 @@ mod damage_recovery_tests {
             !Arc::ptr_eq(&before, &after),
             "the connection that saw damage must not be served again"
         );
+        // Windows cannot delete a store file while a connection holds it open.
+        drop((before, after, slot));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5351,6 +5353,8 @@ mod damage_recovery_tests {
 
         let named = slot.reopen(&a).expect("reopens a by path");
         assert_eq!(named.path(), Some(a.as_path()));
+        // Windows cannot delete a store file while a connection holds it open.
+        drop((resolved, named, slot));
         std::fs::remove_dir_all(root_a).unwrap();
         std::fs::remove_dir_all(root_b).unwrap();
     }

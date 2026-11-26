@@ -296,7 +296,61 @@ func installAtomic(src, dest string) error {
 	if err != nil {
 		return err
 	}
-	return safefile.WriteAtomic(dest, data, 0o755)
+	write := func() error { return safefile.WriteAtomic(dest, data, 0o755) }
+	if runtime.GOOS != "windows" {
+		return write()
+	}
+	sweepAside(dest)
+	if err := write(); err != nil {
+		return replaceAside(dest, err, write)
+	}
+	return nil
+}
+
+// asideMarker names a binary moved out of the way so its replacement could
+// land: dest + asideMarker + a timestamp.
+const asideMarker = ".devcouncil-old-"
+
+// replaceAside retries a replace Windows refused because dest is in use.
+// Windows will not rename over a running program, but it will rename the
+// running program itself, so the old copy moves aside and the new one takes
+// its name; the process already running keeps its image. A copy still in use
+// cannot be deleted yet and is left for sweepAside on a later install. If the
+// second write fails too, the old copy goes back where it was.
+//
+// Only a regular file is moved: a directory or link at dest is not a binary
+// this install put there, and relocating it would hide someone's data.
+func replaceAside(dest string, refused error, write func() error) error {
+	if info, err := os.Lstat(dest); err != nil || !info.Mode().IsRegular() {
+		return refused
+	}
+	aside := dest + asideMarker + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := os.Rename(dest, aside); err != nil {
+		return fmt.Errorf("%w; moving the in-use copy aside also failed: %v", refused, err)
+	}
+	if err := write(); err != nil {
+		if rerr := os.Rename(aside, dest); rerr != nil {
+			return fmt.Errorf("%w; and the previous copy could not be restored from %s: %v", err, aside, rerr)
+		}
+		return err
+	}
+	_ = os.Remove(aside)
+	return nil
+}
+
+// sweepAside removes copies replaceAside moved aside next to dest that nothing
+// holds any longer. One still running stays; the next install tries again.
+func sweepAside(dest string) {
+	entries, err := os.ReadDir(filepath.Dir(dest))
+	if err != nil {
+		return
+	}
+	prefix := filepath.Base(dest) + asideMarker
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			_ = os.Remove(filepath.Join(filepath.Dir(dest), e.Name()))
+		}
+	}
 }
 
 // resolutionNotes says, for each installed binary, whether PATH finds the

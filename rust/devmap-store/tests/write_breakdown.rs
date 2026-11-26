@@ -366,6 +366,9 @@ fn literal_tree(revision: usize, modules: usize) -> Vec<(String, String)> {
 /// Largest share of a write the unnamed remainder may take.
 const OTHER_SHARE_LIMIT: f64 = 0.25;
 
+/// One trial's shape, its `other` fraction, and every named span's seconds.
+type Trial<'a> = (&'a str, f64, Vec<(&'static str, f64)>);
+
 /// The three regions that used to hide in `other` have names, and with them
 /// `other` is a minor remainder rather than half the write.
 ///
@@ -374,66 +377,92 @@ const OTHER_SHARE_LIMIT: f64 = 0.25;
 /// 0.68 s (the literal carry). Asserted on both shapes, with the named spans
 /// required to be non-zero so a span that silently stopped charging cannot
 /// pass by leaving its time in the residual.
+///
+/// The residual is a ratio of wall-clock spans over a write of about 0.1 s, so
+/// one sample of it carries the runner's scheduling noise: a windows-latest run
+/// measured the cold `other` at 16.0% and the next run of the same commit was
+/// under 15%. The bound is therefore held by the best of `TRIALS` writes, each
+/// to a fresh store. That does not loosen what it guards: a region hiding in
+/// `other` (the 30–55% this test was written against) is in every trial, so
+/// the best of them still fails. Every trial must charge every named span.
+///
+/// The bound is `OTHER_SHARE_LIMIT`, 25%. The regression this guards is
+/// `other` at 55% of the write (1.63 s of 2.96 s). The bound was 15%, a local
+/// measurement; ubuntu CI's debug build measured the cold write's `other` at
+/// 15.1% twice (18 ms of a 121 ms write, where fixed per-write costs that no
+/// span names weigh more), so 15% sat on that runner's steady value, not above
+/// it, and a steady value is not noise that more trials remove. 25% clears it
+/// and still fails the 55% shape by a wide margin.
 #[test]
 fn the_regions_that_hid_in_other_are_named_and_other_is_a_remainder() {
-    let dir = tmp_dir("write-breakdown-named-regions");
-    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    const TRIALS: usize = 3;
+    let mut fractions: Vec<Trial> = Vec::new();
+    for trial in 0..TRIALS {
+        let dir = tmp_dir(&format!("write-breakdown-named-regions-{trial}"));
+        let store = Store::open(dir.join("devmap.sqlite")).unwrap();
 
-    let first = literal_tree(0, 400);
-    let (extractions, resolution, analysis) = pipeline(&as_refs(&first));
-    let (_gen, cold) = store
-        .save_generation_timed(
-            &extractions,
-            &resolution,
-            &analysis,
-            GenerationWriteOpts::default(),
-            "unknown",
-        )
-        .unwrap();
+        let first = literal_tree(0, 400);
+        let (extractions, resolution, analysis) = pipeline(&as_refs(&first));
+        let (_gen, cold) = store
+            .save_generation_timed(
+                &extractions,
+                &resolution,
+                &analysis,
+                GenerationWriteOpts::default(),
+                "unknown",
+            )
+            .unwrap();
 
-    let second = literal_tree(1, 400);
-    let (extractions, resolution, analysis) = pipeline(&as_refs(&second));
-    let opts = GenerationWriteOpts {
-        affected_paths: vec!["lit_0.py".to_string()],
-        ..Default::default()
-    };
-    let (_gen, incremental) = store
-        .save_generation_timed(&extractions, &resolution, &analysis, opts, "unknown")
-        .unwrap();
-
-    for (shape, breakdown, must_charge) in [
-        ("cold", &cold, &["serialize", "payloads", "literals"][..]),
-        ("incremental", &incremental, &["literals"][..]),
-    ] {
-        let total: f64 = breakdown.parts().iter().map(|(_, secs)| secs).sum();
-        let part = |wanted: &str| {
-            breakdown
-                .parts()
-                .into_iter()
-                .find(|(label, _)| *label == wanted)
-                .map(|(_, secs)| secs)
-                .unwrap_or_else(|| panic!("{shape}: no span named {wanted}"))
+        let second = literal_tree(1, 400);
+        let (extractions, resolution, analysis) = pipeline(&as_refs(&second));
+        let opts = GenerationWriteOpts {
+            affected_paths: vec!["lit_0.py".to_string()],
+            ..Default::default()
         };
-        for wanted in must_charge {
-            assert!(
-                part(wanted) > 0.0,
-                "{shape}: `{wanted}` charged nothing: {:?}",
-                breakdown.parts()
-            );
+        let (_gen, incremental) = store
+            .save_generation_timed(&extractions, &resolution, &analysis, opts, "unknown")
+            .unwrap();
+
+        for (shape, breakdown, must_charge) in [
+            ("cold", &cold, &["serialize", "payloads", "literals"][..]),
+            ("incremental", &incremental, &["literals"][..]),
+        ] {
+            let parts = breakdown.parts();
+            let total: f64 = parts.iter().map(|(_, secs)| secs).sum();
+            let part = |wanted: &str| {
+                parts
+                    .iter()
+                    .find(|(label, _)| *label == wanted)
+                    .map(|(_, secs)| *secs)
+                    .unwrap_or_else(|| panic!("{shape}: no span named {wanted}"))
+            };
+            for wanted in must_charge {
+                assert!(
+                    part(wanted) > 0.0,
+                    "{shape} (trial {trial}): `{wanted}` charged nothing: {parts:?}"
+                );
+            }
+            fractions.push((shape, part("other") / total, parts.clone()));
         }
-        // The regression this guards is `other` at 55% of the write (1.63 s of
-        // 2.96 s). The bound was 15%, a local measurement; ubuntu CI's debug
-        // build measured the cold write's `other` at 15.1% twice (18 ms of a
-        // 121 ms write, where fixed per-write costs that no span names weigh
-        // more), so 15% sat on that runner's steady value, not above it. 25%
-        // clears it and still fails the 55% shape by a wide margin.
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    for shape in ["cold", "incremental"] {
+        let trials: Vec<_> = fractions.iter().filter(|(of, _, _)| *of == shape).collect();
+        let best = trials
+            .iter()
+            .map(|(_, fraction, _)| *fraction)
+            .fold(f64::INFINITY, f64::min);
         assert!(
-            part("other") < total * OTHER_SHARE_LIMIT,
-            "{shape}: `other` is {:.1}% of the write, not under {:.0}%: {:?}",
-            100.0 * part("other") / total,
+            best < OTHER_SHARE_LIMIT,
+            "{shape}: `other` is at least {:.1}% of the write in all {TRIALS} trials, not under {:.0}%: {:?}",
+            100.0 * best,
             100.0 * OTHER_SHARE_LIMIT,
-            breakdown.parts()
+            trials
+                .iter()
+                .map(|(_, fraction, parts)| (format!("{:.1}%", 100.0 * fraction), parts))
+                .collect::<Vec<_>>()
         );
     }
-    let _ = fs::remove_dir_all(&dir);
 }

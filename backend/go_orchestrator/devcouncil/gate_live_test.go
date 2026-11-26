@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -44,6 +45,7 @@ func TestALiveHostFollowsTheGateConfigAndFailsClosedWhenItCannotRead(t *testing.
 		t.Fatal(err)
 	}
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +71,9 @@ func TestALiveHostFollowsTheGateConfigAndFailsClosedWhenItCannotRead(t *testing.
 
 	if os.Geteuid() == 0 {
 		t.Skip("root reads chmod-000 files")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no mode bit that makes a file unreadable to its owner; os.Chmod(0) leaves it readable")
 	}
 	if err := os.Chmod(cfg, 0); err != nil {
 		t.Fatal(err)

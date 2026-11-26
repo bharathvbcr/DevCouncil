@@ -262,6 +262,19 @@ type diagnosticWriter struct{ s *Session }
 
 func (w diagnosticWriter) Write(p []byte) (int, error) {
 	w.s.diagnosticsTotal.Add(1)
+	if len(p) > 4096 {
+		w.s.lost.Add(1)
+	}
+	// A flood past the kept notes and a full queue is counted and dropped
+	// without building its text: a stalled terminal must not make every
+	// further diagnostic pay for a copy nobody will read.
+	w.s.diagnosticsMu.Lock()
+	keep := len(w.s.diagnostics) < 64
+	w.s.diagnosticsMu.Unlock()
+	if !keep && len(w.s.events) == cap(w.s.events) {
+		w.s.lost.Add(1)
+		return len(p), nil
+	}
 	end := min(len(p), 4096)
 	if end < len(p) {
 		for end > 0 && !utf8.RuneStart(p[end]) {
@@ -271,7 +284,6 @@ func (w diagnosticWriter) Write(p []byte) (int, error) {
 	text := string(p[:end])
 	if len(p) > 4096 {
 		text += " [diagnostic truncated]"
-		w.s.lost.Add(1)
 	}
 
 	w.s.diagnosticsMu.Lock()

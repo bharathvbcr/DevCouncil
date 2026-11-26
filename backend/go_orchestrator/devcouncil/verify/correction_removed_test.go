@@ -69,6 +69,7 @@ func TestMCPResultOmitsCorrectionPathAndBlockedVerifyWritesNoCorrectionManifest(
 
 	dbPath := filepath.Join(root, ".devcouncil", "state.sqlite")
 	client := store.New(testsupport.DCStore(t), dbPath)
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}

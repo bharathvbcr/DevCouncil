@@ -115,7 +115,9 @@ func TestWriteAtomicConcurrentWritersAlwaysLeaveAWholeFile(t *testing.T) {
 				return
 			default:
 			}
-			got, err := os.ReadFile(path)
+			// ReadFile, the read for a file WriteAtomic replaces: on Windows
+			// a plain open is refused while a rename lands.
+			got, err := ReadFile(path)
 			if err != nil || len(got) != 9 {
 				select {
 				case bad <- fmt.Sprintf("read %q err=%v", got, err):

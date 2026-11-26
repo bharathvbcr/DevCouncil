@@ -611,7 +611,7 @@ fn serve_until_ready_or_exit(cwd: &Path, db: &Path, socket: &Path) -> Served {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             };
         }
-        if socket.exists() {
+        if endpoint_is_live(socket) {
             child.kill().expect("kill the serve this test started");
             let _ = child.wait();
             return Served::Ready;
@@ -623,8 +623,31 @@ fn serve_until_ready_or_exit(cwd: &Path, db: &Path, socket: &Path) -> Served {
     panic!("devmap serve neither bound its socket nor exited");
 }
 
+/// The endpoint handed to `devmap serve --socket`. On Unix it is a socket file;
+/// Windows serves a named pipe, and a drive path is not a legal pipe name there
+/// (`run_named_pipe` refuses it), so the endpoint is spelled `\\.\pipe\..`.
 fn short_socket(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("dm-{label}-{}.sock", std::process::id()))
+    if cfg!(windows) {
+        PathBuf::from(format!(r"\\.\pipe\dm-{label}-{}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("dm-{label}-{}.sock", std::process::id()))
+    }
+}
+
+/// The serve's endpoint accepts a client. A Unix socket file exists from the
+/// moment it is bound and listening. A named pipe is not a file a stat can
+/// see, so on Windows readiness is the connect a client would make: opening
+/// the pipe succeeds only once the server's first instance exists.
+fn endpoint_is_live(socket: &Path) -> bool {
+    if cfg!(windows) {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(socket)
+            .is_ok()
+    } else {
+        socket.exists()
+    }
 }
 
 /// `devmap serve` opens the store for writing: it migrates and heals before the

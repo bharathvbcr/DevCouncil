@@ -293,9 +293,9 @@ pub struct Daemon {
     /// `None` when that path was not a regular file then. There is nothing to
     /// compare, so [`Self::vanished_reason`] checks absence only.
     ///
-    /// Unix only. [`StoreFileIdentity`] has no stable file id elsewhere, and
-    /// its size-and-mtime stand-in changes on every write. Using that to
-    /// retire would exit a daemon for writing its own store.
+    /// Unix only. Off Unix [`StoreFileIdentity`] also carries the size and
+    /// mtime, which change on every write. Using that to retire would exit a
+    /// daemon for writing its own store.
     #[cfg(unix)]
     opened_store: Option<StoreFileIdentity>,
     /// Bytes per second of disk writes the drain loop paces itself to. See
@@ -615,7 +615,7 @@ impl Daemon {
             self.opened_store = std::fs::metadata(&store_path)
                 .ok()
                 .filter(|metadata| metadata.is_file())
-                .map(|metadata| StoreFileIdentity::of(&metadata));
+                .map(|metadata| StoreFileIdentity::of(&metadata, &store_path));
         }
         self.store_path = Some(store_path);
         self
@@ -826,7 +826,7 @@ impl Daemon {
             Ok(metadata) if metadata.is_file() => {
                 #[cfg(unix)]
                 if let Some(opened) = self.opened_store {
-                    let current = StoreFileIdentity::of(&metadata);
+                    let current = StoreFileIdentity::of(&metadata, path);
                     if opened != current {
                         return Some(format!(
                             "store {path:?} was replaced by a different file \

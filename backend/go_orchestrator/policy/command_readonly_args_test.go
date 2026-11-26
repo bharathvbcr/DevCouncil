@@ -202,6 +202,7 @@ func TestReadOnlyGitArgumentsRungIsInertForOtherCommands(t *testing.T) {
 
 func TestPytestOutputOptionsAreWrites(t *testing.T) {
 	t.Setenv("HOME", "/home/agent")
+	t.Setenv("USERPROFILE", "/home/agent") // what os.UserHomeDir reads on Windows
 	for _, tc := range []struct {
 		command string
 		want    []string

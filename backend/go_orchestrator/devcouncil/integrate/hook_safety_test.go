@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,7 +160,9 @@ func TestHookCleanupPreservesPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	// Windows reports every writable file as 0666 whatever it was set to: it
+	// has no owner/group/other permission bits, so there is no mode to compare.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("permissions widened to %o", info.Mode().Perm())
 	}
 }
@@ -376,7 +379,13 @@ func TestHookCleanupOpenCodeAbsoluteRegistration(t *testing.T) {
 		plugin := filepath.Join(root, openCodeHookPlugin)
 		ref := plugin
 		if fileURI {
-			ref = (&url.URL{Scheme: "file", Path: filepath.ToSlash(plugin)}).String()
+			// A file URI's path always begins with a slash, so a Windows drive
+			// path is file:///C:/..., never file://C:/... (which names a host).
+			uriPath := filepath.ToSlash(plugin)
+			if !strings.HasPrefix(uriPath, "/") {
+				uriPath = "/" + uriPath
+			}
+			ref = (&url.URL{Scheme: "file", Path: uriPath}).String()
 		}
 		raw, err := json.Marshal(map[string]any{"plugin": []string{ref, "keep"}})
 		if err != nil {

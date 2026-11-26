@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/repomap"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // Every other test in this package drives a fake, which is right: what needs
@@ -38,6 +40,12 @@ func devmapBinary(t *testing.T) string {
 	p, err := exec.LookPath("devmap")
 	if err != nil {
 		t.Skip("devmap is not on PATH; the live contract with the producer is unverified in this run")
+	}
+	if runtime.GOOS == "windows" {
+		// PATH names the cargo output (CI puts target/debug on it). Running it
+		// in place would stop every other package's `cargo build` from
+		// replacing it, which Windows refuses while the image is running.
+		return testsupport.StableCopy(t, p)
 	}
 	return p
 }

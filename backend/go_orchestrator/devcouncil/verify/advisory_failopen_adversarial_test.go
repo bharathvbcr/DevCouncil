@@ -335,6 +335,7 @@ func TestAdversarialNonBlockingUnprovenGaps(t *testing.T) {
 func TestAdversarialDegradedReasonsSynthesisAndPersistence(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "adv_state.sqlite")
 	client := store.New(testsupport.DCStore(t), db)
+	t.Cleanup(client.Close)
 
 	preExistingReasons := []string{
 		"scanner did not run: path with spaces/unicode caf\u00e9",

@@ -23,9 +23,7 @@ func subcommandLog(t *testing.T, statusReply string) (*Client, func() []string) 
 		"  *) echo '{\"items\":[{\"source_file\":\"a.go\",\"target_file\":\"b.go\"}],\"hidden\":0}';;\n" +
 		"esac\n"
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	calls := func() []string {
 		raw, err := os.ReadFile(log)
 		if err != nil {
@@ -138,9 +136,7 @@ func TestFailedStatusIsNotMemoised(t *testing.T) {
 		"case \" $* \" in *\" --help \"*) printf '      --graph-output <PATH>\\n'; exit 0;; esac\n" +
 		"if [ -f " + flag + " ]; then echo '" + scopeHealthyStatus + "'; else echo boom >&2; exit 3; fi\n"
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	c := New(path, dir)
 	ctx := WithCall(context.Background())
 	if _, err := c.Status(ctx); err == nil {

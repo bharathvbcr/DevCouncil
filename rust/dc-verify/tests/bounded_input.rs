@@ -157,6 +157,8 @@ fn adv_coverage_one_past_the_cap_does_not_echo_the_tail() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Unix only: `/dev/zero` does not exist on Windows, so the read never starts.
+#[cfg(unix)]
 #[test]
 fn adv_coverage_dev_zero_stops_at_the_cap() {
     // The device itself. A coverage path that is a symlink is refused and

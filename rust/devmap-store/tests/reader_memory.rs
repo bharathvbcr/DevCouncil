@@ -23,6 +23,8 @@ fn a_plain_read_only_open_keeps_the_64_mib_cache_and_no_mapping() {
     let file = store_file("default");
     let store = Store::open_read_only(&file).expect("read-only open");
     assert_eq!(store.memory_settings().unwrap(), ReaderMemory::CURRENT);
+    // Windows cannot delete a file a connection still holds open.
+    drop(store);
     std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 }
 
@@ -36,6 +38,8 @@ fn open_read_only_with_applies_the_asked_for_cache_and_mapping() {
     };
     let store = Store::open_read_only_with(&file, small).expect("read-only open");
     assert_eq!(store.memory_settings().unwrap(), small);
+    // A shadowed binding is not dropped: release the first connection now.
+    drop(store);
 
     let mapped = ReaderMemory {
         cache_kib: 16_384,
@@ -44,5 +48,7 @@ fn open_read_only_with_applies_the_asked_for_cache_and_mapping() {
     };
     let store = Store::open_read_only_with(&file, mapped).expect("read-only open");
     assert_eq!(store.memory_settings().unwrap(), mapped);
+    // Windows cannot delete a file a connection still holds open.
+    drop(store);
     std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 }

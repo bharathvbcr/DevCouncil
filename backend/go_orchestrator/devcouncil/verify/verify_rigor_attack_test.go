@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -170,6 +171,7 @@ func TestAttackLegitUntrackedNamesAreCollected(t *testing.T) {
 	}
 	for i, name := range names {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			testsupport.RequireFileNameHere(t, name)
 			root := gitRepo(t)
 			writeFile(t, root, name, "INNOCENT-CONTENT\n")
 			_, diff, _, err := verify.CollectGitState(context.Background(), root)
@@ -441,6 +443,9 @@ func TestAttackUntrackedSecretInNestedSubmoduleIsScanned(t *testing.T) {
 // A git that answers `version` and then never returns must not hold the
 // verification past the caller's deadline.
 func TestAttackHangingGitHonoursTheCallersDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the planted git is a shell script")
+	}
 	realGit := testsupport.Tool(t, "git")
 	bin := t.TempDir()
 	script := "#!/bin/sh\nif [ \"$1\" = \"version\" ] || [ \"$1\" = \"--version\" ]; then exec " + realGit + " \"$@\"; fi\nexec sleep 25\n"
@@ -545,6 +550,7 @@ func TestAttackTrackedHostileNamesWithSecretAreScanned(t *testing.T) {
 	names := []string{"odd\nname.txt", "tab\tname.txt", `back\slash.txt`, "-leading.txt", "q\"uote.txt", "éé.txt", "sp ace/b/in b/x.txt"}
 	for i, name := range names {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			testsupport.RequireFileNameHere(t, name)
 			root := gitRepo(t)
 			writeFile(t, root, name, "one\n")
 			attackCommit(t, root, "add")

@@ -298,7 +298,7 @@ fn an_agent_whose_tool_list_excludes_devmap_is_named() {
     assert!(
         paths["agent_tools_warning"]
             .as_str()
-            .is_some_and(|w| w.contains(&user.display().to_string())),
+            .is_some_and(|w| names_path(w, &user)),
         "{paths}"
     );
     let _ = fs::remove_dir_all(&home);
@@ -378,13 +378,10 @@ fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
     let payload = doctor_with_home(&home, &cwd);
     let warning = payload["agent_tools_warning"].as_str().unwrap_or("");
     assert!(
-        !warning.contains(&researcher.display().to_string()),
+        !names_path(warning, &researcher),
         "the printed opt-out did not clear it: {opt_out} -> {payload}"
     );
-    assert!(
-        warning.contains(&gitpulse_only.display().to_string()),
-        "{payload}"
-    );
+    assert!(names_path(warning, &gitpulse_only), "{payload}");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cwd);
 }

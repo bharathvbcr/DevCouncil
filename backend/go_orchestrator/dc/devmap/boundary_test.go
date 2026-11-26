@@ -28,9 +28,7 @@ func recording(t *testing.T, replies map[string]string) (*Client, string) {
 	}
 	script += "esac; done\necho '{}'\n"
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	return New(path, dir), argv
 }
 
@@ -151,9 +149,7 @@ func TestAFloodOfOutputIsBoundedRatherThanBuffered(t *testing.T) {
 	// Emits far more than the limit set below, and would not stop on its own.
 	script := "#!/bin/sh\nwhile :; do printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'; done\n"
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	c := New(path, dir)
 	c.maxOutput = 64 << 10
 
@@ -184,9 +180,7 @@ func TestStderrIsBoundedAndSaysThatItWas(t *testing.T) {
 	script := clapHelp("#!/bin/sh\ni=0\nwhile [ $i -lt 4000 ]; do echo \"noise line $i\" >&2; i=$((i+1)); done\n" +
 		"echo '{\"files_indexed\":1,\"symbols\":1,\"edges\":1}'\n")
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	c := New(path, dir)
 	c.maxStderr = 4 << 10
 

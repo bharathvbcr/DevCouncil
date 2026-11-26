@@ -12,6 +12,17 @@ import (
 	"testing"
 )
 
+// toolFile is the file name of the program these tests plant, which they look
+// up by the bare name "tool-under-test". Windows resolves a bare name only to a
+// file with an executable extension (exec.LookPath tries each PATHEXT entry),
+// so the planted file is tool-under-test.exe there and the lookup is unchanged.
+var toolFile = func() string {
+	if runtime.GOOS == "windows" {
+		return "tool-under-test.exe"
+	}
+	return "tool-under-test"
+}()
+
 func writeExecutable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -27,7 +38,7 @@ func writeExecutable(t *testing.T, path string) {
 func TestLookPathOutsideRefusesRepositoryLocalCandidate(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
-	writeExecutable(t, filepath.Join(root, "target", "release", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "target", "release", toolFile))
 	t.Setenv("PATH", filepath.Join(root, "target", "release"))
 
 	got, err := LookPathOutside("tool-under-test", root)
@@ -42,12 +53,12 @@ func TestLookPathOutsideRefusesSymlinkIntoRepository(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
 	bin := filepath.Join(base, "bin")
-	writeExecutable(t, filepath.Join(root, "target", "release", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "target", "release", toolFile))
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(root, "target", "release", "tool-under-test"),
-		filepath.Join(bin, "tool-under-test")); err != nil {
+	if err := os.Symlink(filepath.Join(root, "target", "release", toolFile),
+		filepath.Join(bin, toolFile)); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
@@ -62,7 +73,7 @@ func TestLookPathOutsideRefusesSymlinkIntoRepository(t *testing.T) {
 func TestLookPathOutsideRefusesUncanonicalRootSpelling(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
 	t.Setenv("PATH", filepath.Join(root, "bin"))
 
 	spelled := filepath.Join(root, "sub", "..")
@@ -82,7 +93,7 @@ func TestLookPathOutsideAcceptsInstallationOutsideRepository(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	installed := filepath.Join(base, "usr", "bin", "tool-under-test")
+	installed := filepath.Join(base, "usr", "bin", toolFile)
 	writeExecutable(t, installed)
 	t.Setenv("PATH", filepath.Dir(installed))
 
@@ -126,13 +137,14 @@ func componentFixture(t *testing.T) (root, home string) {
 	}
 	t.Setenv("PATH", filepath.Join(base, "empty"))
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // what os.UserHomeDir reads on Windows
 	return root, home
 }
 
 // ~/.local/bin is searched when PATH has no candidate at all.
 func TestResolveComponentFallsBackToLocalBin(t *testing.T) {
 	root, home := componentFixture(t)
-	installed := filepath.Join(home, ".local", "bin", "tool-under-test")
+	installed := filepath.Join(home, ".local", "bin", toolFile)
 	writeExecutable(t, installed)
 
 	got, err := ResolveComponent("tool-under-test", root, Override{})
@@ -152,8 +164,8 @@ func TestResolveComponentFallsBackToLocalBin(t *testing.T) {
 // would hide that something in the repository is on PATH.
 func TestResolveComponentDoesNotFallPastARefusal(t *testing.T) {
 	root, home := componentFixture(t)
-	writeExecutable(t, filepath.Join(home, ".local", "bin", "tool-under-test"))
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(home, ".local", "bin", toolFile))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
 	t.Setenv("PATH", filepath.Join(root, "bin"))
 
 	got, err := ResolveComponent("tool-under-test", root, Override{})
@@ -166,7 +178,7 @@ func TestResolveComponentDoesNotFallPastARefusal(t *testing.T) {
 // repository does not make its ~/.local/bin a trusted installation.
 func TestResolveComponentRefusesLocalBinInsideRoot(t *testing.T) {
 	_, home := componentFixture(t)
-	writeExecutable(t, filepath.Join(home, ".local", "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(home, ".local", "bin", toolFile))
 
 	got, err := ResolveComponent("tool-under-test", home, Override{})
 	if !errors.Is(err, ErrRepositoryLocal) {
@@ -177,7 +189,14 @@ func TestResolveComponentRefusesLocalBinInsideRoot(t *testing.T) {
 // A file that is not executable is not a program, on either rung.
 func TestResolveComponentRefusesNonExecutableLocalBin(t *testing.T) {
 	root, home := componentFixture(t)
-	path := filepath.Join(home, ".local", "bin", "tool-under-test")
+	// Windows has no execute bit: a file is a program by its extension, so
+	// tool-under-test.exe is one whatever it holds. The same refusal there is
+	// for a file whose name carries no executable extension.
+	name := toolFile
+	if runtime.GOOS == "windows" {
+		name = "tool-under-test"
+	}
+	path := filepath.Join(home, ".local", "bin", name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +224,7 @@ func TestResolveComponentNotFoundIsErrNotFound(t *testing.T) {
 // setting it is an operator's act, not something the repository arranges.
 func TestResolveComponentOverrideIsUsed(t *testing.T) {
 	root, _ := componentFixture(t)
-	inside := filepath.Join(root, "bin", "tool-under-test")
+	inside := filepath.Join(root, "bin", toolFile)
 	writeExecutable(t, inside)
 
 	got, err := ResolveComponent("tool-under-test", root, Override{Path: inside, Source: "TOOL_BIN"})
@@ -218,7 +237,7 @@ func TestResolveComponentOverrideIsUsed(t *testing.T) {
 // replaced by a search, and the refusal names where it came from.
 func TestResolveComponentOverrideIsRefusedNotReplaced(t *testing.T) {
 	root, home := componentFixture(t)
-	writeExecutable(t, filepath.Join(home, ".local", "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(home, ".local", "bin", toolFile))
 	for _, path := range []string{filepath.Join(root, "missing"), root} {
 		got, err := ResolveComponent("tool-under-test", root, Override{Path: path, Source: "TOOL_BIN"})
 		if err == nil {
@@ -243,8 +262,8 @@ func TestEnvOverrideTreatsBlankAsUnset(t *testing.T) {
 // does not fall through to ~/.local/bin.
 func TestResolveComponentRefusesRelativePATHEntry(t *testing.T) {
 	root, home := componentFixture(t)
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
-	writeExecutable(t, filepath.Join(home, ".local", "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
+	writeExecutable(t, filepath.Join(home, ".local", "bin", toolFile))
 	t.Setenv("PATH", "bin")
 	t.Chdir(root)
 
@@ -264,12 +283,12 @@ func TestResolveComponentRefusesRelativePATHEntry(t *testing.T) {
 func TestResolveComponentOverrideIsMadeAbsolute(t *testing.T) {
 	root, _ := componentFixture(t)
 	cwd := t.TempDir()
-	checked := filepath.Join(cwd, "bin", "tool-under-test")
+	checked := filepath.Join(cwd, "bin", toolFile)
 	writeExecutable(t, checked)
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
 	t.Chdir(cwd)
 
-	got, err := ResolveComponent("tool-under-test", root, Override{Path: "bin/tool-under-test", Source: "TOOL_BIN"})
+	got, err := ResolveComponent("tool-under-test", root, Override{Path: "bin/" + toolFile, Source: "TOOL_BIN"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +329,7 @@ func sameDirOrSkip(t *testing.T, dir, alias string) {
 func TestLookPathOutsideRefusesCaseVariantOfRoot(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "Repo")
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
 	for _, alias := range []string{"REPO", "repo"} {
 		sameDirOrSkip(t, root, filepath.Join(base, alias))
 		t.Setenv("PATH", filepath.Join(base, alias, "bin"))
@@ -326,7 +345,7 @@ func TestLookPathOutsideRefusesCaseVariantOfRoot(t *testing.T) {
 func TestLookPathOutsideRefusesNormalizationVariantOfRoot(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "café")
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
 	alias := filepath.Join(base, "café")
 	sameDirOrSkip(t, root, alias)
 	t.Setenv("PATH", filepath.Join(alias, "bin"))
@@ -342,7 +361,7 @@ func TestLookPathOutsideRefusesNormalizationVariantOfRoot(t *testing.T) {
 func TestLookPathOutsideRefusesCaseVariantOfRootArgument(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "Repo")
-	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(root, "bin", toolFile))
 	alias := filepath.Join(base, "rEPO")
 	sameDirOrSkip(t, root, alias)
 	t.Setenv("PATH", filepath.Join(root, "bin"))
@@ -356,7 +375,7 @@ func TestLookPathOutsideRefusesCaseVariantOfRootArgument(t *testing.T) {
 // The ~/.local/bin rung is held to the same identity check.
 func TestResolveComponentRefusesLocalBinUnderCaseVariantRoot(t *testing.T) {
 	_, home := componentFixture(t)
-	writeExecutable(t, filepath.Join(home, ".local", "bin", "tool-under-test"))
+	writeExecutable(t, filepath.Join(home, ".local", "bin", toolFile))
 	alias := filepath.Join(filepath.Dir(home), strings.ToUpper(filepath.Base(home)))
 	sameDirOrSkip(t, home, alias)
 
@@ -370,7 +389,7 @@ func TestResolveComponentRefusesLocalBinUnderCaseVariantRoot(t *testing.T) {
 // caller's own command reports the missing root.
 func TestLookPathOutsideTreatsMissingRootAsContainingNothing(t *testing.T) {
 	base := t.TempDir()
-	installed := filepath.Join(base, "usr", "bin", "tool-under-test")
+	installed := filepath.Join(base, "usr", "bin", toolFile)
 	writeExecutable(t, installed)
 	t.Setenv("PATH", filepath.Dir(installed))
 
@@ -400,8 +419,8 @@ func TestLookPathOutsideRefusesAChainThroughTheRepository(t *testing.T) {
 	root := filepath.Join(base, "repo")
 	installed := filepath.Join(base, "usr", "bin", "real-tool")
 	writeExecutable(t, installed)
-	symlinkOrSkip(t, installed, filepath.Join(root, "links", "tool-under-test"))
-	symlinkOrSkip(t, filepath.Join(root, "links", "tool-under-test"), filepath.Join(base, "bin", "tool-under-test"))
+	symlinkOrSkip(t, installed, filepath.Join(root, "links", toolFile))
+	symlinkOrSkip(t, filepath.Join(root, "links", toolFile), filepath.Join(base, "bin", toolFile))
 	t.Setenv("PATH", filepath.Join(base, "bin"))
 
 	got, err := LookPathOutside("tool-under-test", root)
@@ -418,9 +437,9 @@ func TestLookPathOutsideFollowsAChainOutsideTheRepository(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	installed := filepath.Join(base, "Cellar", "tool", "1.0", "bin", "tool-under-test")
+	installed := filepath.Join(base, "Cellar", "tool", "1.0", "bin", toolFile)
 	writeExecutable(t, installed)
-	symlinkOrSkip(t, "../Cellar/tool/1.0/bin/tool-under-test", filepath.Join(base, "bin", "tool-under-test"))
+	symlinkOrSkip(t, "../Cellar/tool/1.0/bin/tool-under-test", filepath.Join(base, "bin", toolFile))
 	t.Setenv("PATH", filepath.Join(base, "bin"))
 
 	got, err := LookPathOutside("tool-under-test", root)
@@ -443,7 +462,7 @@ func TestLookPathOutsideBoundsALinkLoop(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a := filepath.Join(base, "bin", "tool-under-test")
+	a := filepath.Join(base, "bin", toolFile)
 	b := filepath.Join(base, "loop", "b")
 	symlinkOrSkip(t, b, a)
 	symlinkOrSkip(t, a, b)
@@ -469,8 +488,8 @@ func TestLookPathOutsideAgainstGeneratedLayouts(t *testing.T) {
 		base := t.TempDir()
 		root := filepath.Join(base, "Repo")
 		outside := filepath.Join(base, "outside")
-		writeExecutable(t, filepath.Join(outside, "real", "tool-under-test"))
-		writeExecutable(t, filepath.Join(root, "build", "tool-under-test"))
+		writeExecutable(t, filepath.Join(outside, "real", toolFile))
+		writeExecutable(t, filepath.Join(root, "build", toolFile))
 		folds := false
 		if a, err := os.Stat(root); err == nil {
 			if b, err := os.Stat(filepath.Join(base, "REPO")); err == nil && os.SameFile(a, b) {
@@ -490,7 +509,7 @@ func TestLookPathOutsideAgainstGeneratedLayouts(t *testing.T) {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			link := filepath.Join(dir, "tool-under-test")
+			link := filepath.Join(dir, toolFile)
 			switch kind := rng.IntN(7); kind {
 			case 0: // nothing here
 				entries = append(entries, entry{dir: dir})
@@ -498,14 +517,14 @@ func TestLookPathOutsideAgainstGeneratedLayouts(t *testing.T) {
 				writeExecutable(t, link)
 				entries = append(entries, entry{dir: dir, executable: true})
 			case 2: // a link to the outside program
-				symlinkOrSkip(t, filepath.Join(outside, "real", "tool-under-test"), link)
+				symlinkOrSkip(t, filepath.Join(outside, "real", toolFile), link)
 				entries = append(entries, entry{dir: dir, executable: true})
 			case 3: // a link to the repository's build output
-				symlinkOrSkip(t, filepath.Join(root, "build", "tool-under-test"), link)
+				symlinkOrSkip(t, filepath.Join(root, "build", toolFile), link)
 				entries = append(entries, entry{dir: dir, executable: true, inside: true})
 			case 4: // a link to a repository link that points outside
-				repoLink := filepath.Join(root, fmt.Sprintf("l%d", j), "tool-under-test")
-				symlinkOrSkip(t, filepath.Join(outside, "real", "tool-under-test"), repoLink)
+				repoLink := filepath.Join(root, fmt.Sprintf("l%d", j), toolFile)
+				symlinkOrSkip(t, filepath.Join(outside, "real", toolFile), repoLink)
 				symlinkOrSkip(t, repoLink, link)
 				entries = append(entries, entry{dir: dir, executable: true, inside: true})
 			case 5: // the repository's directory itself, spelled as built or folded
@@ -573,7 +592,7 @@ func repositoryWithSubdirectory(t *testing.T, marker string, markerIsFile bool) 
 	} else if err := os.Mkdir(filepath.Join(top, marker), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	planted = filepath.Join(top, "tools", "bin", "tool-under-test")
+	planted = filepath.Join(top, "tools", "bin", toolFile)
 	writeExecutable(t, planted)
 	return top, sub, planted
 }
@@ -642,10 +661,11 @@ func homeWithDotfilesRepository(t *testing.T) (home, installed string) {
 			t.Fatal(err)
 		}
 	}
-	installed = filepath.Join(home, ".local", "bin", "tool-under-test")
+	installed = filepath.Join(home, ".local", "bin", toolFile)
 	writeExecutable(t, installed)
 	t.Setenv("PATH", filepath.Join(base, "empty"))
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // what os.UserHomeDir reads on Windows
 	return home, installed
 }
 
@@ -684,7 +704,7 @@ func TestResolveComponentBoundaryStopsAtTheNearestGit(t *testing.T) {
 // subdirectory of it.
 func TestLookPathOutsideAcceptsInstallationOutsideFromASubdirectory(t *testing.T) {
 	top, sub, _ := repositoryWithSubdirectory(t, ".git", false)
-	installed := filepath.Join(filepath.Dir(top), "usr", "bin", "tool-under-test")
+	installed := filepath.Join(filepath.Dir(top), "usr", "bin", toolFile)
 	writeExecutable(t, installed)
 	t.Setenv("PATH", filepath.Dir(installed))
 	t.Chdir(sub)

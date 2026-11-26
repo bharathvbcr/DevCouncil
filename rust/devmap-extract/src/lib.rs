@@ -53,6 +53,8 @@ pub mod agent_text;
 // needs to find the store and the artifacts without linking a single grammar.
 mod git_metadata;
 pub mod paths;
+#[cfg(windows)]
+pub mod process;
 pub mod progress;
 pub mod safe_fs;
 pub mod secret;

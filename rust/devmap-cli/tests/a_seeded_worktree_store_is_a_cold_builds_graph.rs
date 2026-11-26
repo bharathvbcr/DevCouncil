@@ -127,6 +127,11 @@ fn git(dir: &Path, args: &[&str]) {
             "core.hooksPath=",
             "-c",
             "init.templateDir=",
+            // Git for Windows checks a worktree out with CRLF under its
+            // default autocrlf=true, so the lane's bytes would differ from the
+            // donor's and the seed would see a diverged tree it was not given.
+            "-c",
+            "core.autocrlf=false",
         ])
         .args(args)
         .current_dir(dir)

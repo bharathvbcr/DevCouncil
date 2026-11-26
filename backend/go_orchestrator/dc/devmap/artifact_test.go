@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -65,9 +66,7 @@ fi
 echo '{}'
 `
 	bin := filepath.Join(t.TempDir(), "devmap")
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, bin, script)
 	return New(bin, root)
 }
 
@@ -79,9 +78,7 @@ func refusingFake(t *testing.T, root string) *Client {
 		"  manifest) echo 'Error: something else went wrong' >&2; exit 1;;\n" +
 		"esac; done\necho '{}'\n"
 	bin := filepath.Join(t.TempDir(), "devmap")
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, bin, script)
 	return New(bin, root)
 }
 
@@ -481,6 +478,9 @@ func TestConcurrentPreservesNeverLoseACopy(t *testing.T) {
 func TestAdoptIsAllOrNothing(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root; the unreadable-graph half of this check cannot be set up")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no mode bit that makes a file unreadable to its owner; os.Chmod(0o000) leaves it readable")
 	}
 	_, mapPath, graphPath := artifactPaths(t)
 	write(t, mapPath, pythonRepoMap)

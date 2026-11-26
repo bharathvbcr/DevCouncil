@@ -484,23 +484,31 @@ pub fn read_log(db_path: &Path, file_name: &str) -> std::io::Result<Ledger<Map<S
 
 /// Rotate within the checked session directory. Only a missing log is a no-op.
 pub fn rotate_live(db_path: &Path, stamp: &str) -> std::io::Result<bool> {
-    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    use devmap_extract::safe_fs::{through_a_racing_rename, Access, Creation, PinnedDir};
     let directory = match PinnedDir::open(&sessions_dir(db_path), false) {
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    match directory.open_file(
-        std::ffi::OsStr::new("live.jsonl"),
-        Access::Read,
-        Creation::Never,
-    ) {
+    // Both checks open a name a concurrent report may be renaming this
+    // instant. On Windows an open that meets a rename in flight is refused
+    // (os error 32), which overlapping SessionEnd reports turned into a failed
+    // report; it is waited out, and a log a racer claimed reads as NotFound.
+    match through_a_racing_rename(|| {
+        directory.open_file(
+            std::ffi::OsStr::new("live.jsonl"),
+            Access::Read,
+            Creation::Never,
+        )
+    }) {
         Ok(file) => file.require_owned()?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     }
     let name = format!("{stamp}.jsonl");
-    match directory.open_file(std::ffi::OsStr::new(&name), Access::Read, Creation::Never) {
+    match through_a_racing_rename(|| {
+        directory.open_file(std::ffi::OsStr::new(&name), Access::Read, Creation::Never)
+    }) {
         Ok(file) => file.require_owned()?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"math"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,13 +82,7 @@ case "$*" in
 esac
 `
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// #nosec G302 -- this test fixture must be executable and is private to its temp directory.
-	if err := os.Chmod(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	c := New(path, dir)
 	_, err := c.Advanced(context.Background(), AdvancedQuery{Kind: QueryImpact, Query: "Router", Depth: 1, Budget: 1})
 	if err == nil || !strings.Contains(err.Error(), "changed during") {

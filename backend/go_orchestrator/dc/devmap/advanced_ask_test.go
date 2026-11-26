@@ -25,13 +25,7 @@ func recordingDevmap(t *testing.T, status, ask string) (*Client, string) {
 		"  *\" ask \"*) cat <<'EOF'\n" + ask + "\nEOF\n;;\n" +
 		"esac\n"
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// #nosec G302 -- this test fixture must be executable and is private to its temp directory.
-	if err := os.Chmod(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	return New(path, dir), argsLog
 }
 

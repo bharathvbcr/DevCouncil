@@ -948,16 +948,27 @@ fn edit_last_module(root: &std::path::Path) {
 }
 
 fn reuse_dir(root: &std::path::Path) -> std::path::PathBuf {
-    devmap_extract::paths::state_dir(root).join(format!(
-        "resolution-reuse-{}",
-        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
-    ))
+    devmap_extract::paths::state_dir(root)
+        .join(devmap_resolve::resolver::resolution_reuse_dir_name())
+}
+
+/// A reuse blob's JSON, decoded from its zstd frame by the store's codec.
+fn read_blob(path: &std::path::Path) -> serde_json::Value {
+    let frame = std::fs::read(path).unwrap();
+    let json = devmap_store::inflate_json_frame(&frame, &path.display().to_string()).unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+/// Write `value` as a reuse blob, in the frame a build writes.
+fn write_blob(path: &std::path::Path, value: &serde_json::Value) {
+    let frame = devmap_store::compress_json_frame(&value.to_string()).unwrap();
+    std::fs::write(path, frame).unwrap();
 }
 
 fn blob_for(root: &std::path::Path, file_path: &str) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
     let hex = format!("{:x}", Sha256::digest(file_path.as_bytes()));
-    let path = reuse_dir(root).join(format!("{hex}.json"));
+    let path = reuse_dir(root).join(format!("{hex}.json.zst"));
     assert!(
         path.is_file(),
         "expected reuse blob for {file_path} at {}; dir was {:?}",
@@ -1049,6 +1060,72 @@ fn a_missing_reuse_blob_resolves_that_file_and_keeps_the_rest() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The cache was 168 MB of plain JSON for this repository's 1,297 files, more
+/// than the graph store. Each blob is now that JSON in a checksummed zstd frame,
+/// in a directory named for the encoding as well as the epoch, and a build
+/// removes the plain-JSON directory an older binary left.
+///
+/// The plain-JSON directory must go, not sit beside the new one: an older
+/// binary building again would rebind it to its own generation, and the two
+/// encodings can never share one `generation.json`.
+#[test]
+fn the_reuse_cache_is_written_as_checksummed_frames_and_the_plain_json_one_is_removed() {
+    let root = scratch("frames");
+    write_independent_tree(&root);
+    let legacy = devmap_extract::paths::state_dir(&root).join(format!(
+        "resolution-reuse-{}",
+        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+    ));
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("generation.json"), b"{\"generation_id\":1}").unwrap();
+    build_text(&root);
+
+    assert!(
+        !legacy.exists(),
+        "the plain-JSON directory {} is removed",
+        legacy.display()
+    );
+    let mut blobs = 0;
+    for entry in std::fs::read_dir(reuse_dir(&root)).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        if name == "budget.json" || name == "generation.json" {
+            continue;
+        }
+        assert!(
+            name.ends_with(".json.zst"),
+            "{name}: every blob is a zstd frame"
+        );
+        let frame = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &frame[..4],
+            &[0x28, 0xB5, 0x2F, 0xFD],
+            "{name} starts with the zstd magic number"
+        );
+        // Frame header descriptor bit 2: the content checksum is present.
+        assert_ne!(frame[4] & 0b100, 0, "{name} carries a content checksum");
+        let value = read_blob(&path);
+        assert!(
+            value["content_hash"].is_u64(),
+            "{name} decodes to a resolution"
+        );
+        blobs += 1;
+    }
+    assert_eq!(blobs, 21, "one blob per resolved file");
+
+    // A frame that is intact but holds broken JSON is a miss, like a damaged frame.
+    let broken = devmap_store::compress_json_frame("{").unwrap();
+    std::fs::write(blob_for(&root, "src/mod_1.py"), broken).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 2 of 21 files") && edited.contains("src/mod_1.py is a miss"),
+        "a frame of broken JSON is resolved instead of reused; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_corrupt_reuse_blob_is_a_miss_and_the_graph_matches_cold() {
     let root = scratch("corrupt-blob");
@@ -1075,10 +1152,9 @@ fn a_tampered_reuse_hash_resolves_that_file() {
     write_independent_tree(&root);
     build_text(&root);
     let blob = blob_for(&root, "src/mod_2.py");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
+    let mut value = read_blob(&blob);
     value["content_hash"] = serde_json::json!(1);
-    std::fs::write(&blob, serde_json::to_vec(&value).unwrap()).unwrap();
+    write_blob(&blob, &value);
     edit_last_module(&root);
     let edited = build_text(&root);
     assert!(
@@ -1108,14 +1184,13 @@ fn a_reuse_blob_written_under_other_rules_is_reused_today() {
     write_independent_tree(&root);
     build_text(&root);
     let blob = blob_for(&root, "src/mod_2.py");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
+    let mut value = read_blob(&blob);
     let edge = value["edges"]
         .as_array_mut()
         .and_then(|edges| edges.iter_mut().find(|edge| edge["edge_kind"] == "Calls"))
         .expect("mod_2 holds a call edge");
     edge["target_symbol"] = serde_json::json!("src/mod_2.py::decided_by_older_rules");
-    std::fs::write(&blob, serde_json::to_vec(&value).unwrap()).unwrap();
+    write_blob(&blob, &value);
     edit_last_module(&root);
     let edited = build_text(&root);
     assert!(
@@ -1274,11 +1349,10 @@ fn plant_blobs_of_another_epoch(
             std::fs::copy(entry.path(), planted.join(&name)).unwrap();
             continue;
         }
-        let mut blob: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+        let mut blob = read_blob(&entry.path());
         hidden += blob["edges"].as_array().unwrap().len();
         blob["edges"] = serde_json::json!([]);
-        std::fs::write(planted.join(&name), serde_json::to_vec(&blob).unwrap()).unwrap();
+        write_blob(&planted.join(&name), &blob);
     }
     (planted, hidden)
 }
