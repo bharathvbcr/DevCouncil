@@ -67,6 +67,7 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 			args = append(args, words[k])
 		}
 		cw := commandWrites(words, at, args, 0)
+		cw.unjudgeable = unjudgeableTargets(args, cw)
 		if root != "" && isGitWord(words[at].text) {
 			if gitRoot, _, escaped := resolveGitClauseWorktree(words, at, root); !escaped && gitRoot != "" && !sameWorktreePath(gitRoot, root) {
 				// Another session's worktree: git may read it and record into
@@ -81,6 +82,45 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 		all.merge(cw)
 	}
 	return all
+}
+
+// unjudgeableTargets returns the operand words (or the value of an `of=` /
+// `--opt=` word) that a command writes through and whose expansion can steer
+// the path (escapingPathWord). A word is one the command writes through when a
+// target it was judged to write is that word, or is built from it (the
+// DIR/basename of cp, the backup name of sed -i), so a source that is only read
+// is not refused here.
+func unjudgeableTargets(args []shellWord, cw argWrites) []string {
+	if len(cw.targets) == 0 && len(cw.deletes) == 0 {
+		return nil
+	}
+	builtFrom := func(candidate string) bool {
+		dir := strings.TrimRight(candidate, "/") + "/"
+		for _, set := range [][]string{cw.targets, cw.deletes} {
+			for _, t := range set {
+				if t == candidate || strings.HasPrefix(t, candidate) || strings.HasPrefix(t, dir) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	var out []string
+	for _, a := range args {
+		candidates := []string{a.text}
+		if _, value, ok := strings.Cut(a.text, "="); ok {
+			candidates = append(candidates, value)
+		}
+		for _, c := range candidates {
+			w := a
+			w.text = c
+			if c != "" && escapingPathWord(w, false) && builtFrom(c) {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // argumentWrappers run the command named by the following words. Stepped over

@@ -1109,39 +1109,6 @@ func NormalizeRepoPath(root, raw string) (string, bool) {
 	return rel, false
 }
 
-// expansionBeforeDotDot reports a path in which a component the shell expands
-// ($…, `…`, {…}, a leading ~) is followed by a ".." component, or is itself
-// spelled with one. filepath.Clean treats the expansion as a directory name and
-// lets the ".." cancel it, but the shell expands an unset $zz to nothing and
-// ${zz:-..} to "..", so the real path is a different one: `src/$zz/../Makefile`
-// opens ./Makefile and `src/$a/$b/$c/../../../x` opens a file above the root,
-// while the gate judged src/../Makefile cleaned to an in-root path that is
-// never what was opened. The gate cannot know the expansion's value, so it
-// never resolves such a path lexically: settlePath reports it as not settled,
-// which every caller already treats as uncontained and refuses as a hard rule
-// (path.outside_root for a write, so no host posture softens it). A path whose
-// variables the line bound was rewritten before it got here and is unaffected.
-func expansionBeforeDotDot(raw string) bool {
-	expanded := false
-	for i, comp := range strings.Split(raw, "/") {
-		if expanded && strings.Trim(comp, "}\"'") == ".." {
-			return true
-		}
-		if strings.ContainsAny(comp, "$`{") || (i == 0 && strings.HasPrefix(strings.TrimLeft(comp, "\"'"), "~")) {
-			// A default that spells the escape (${zz:-..}, {..,x}) is the
-			// expansion carrying it; a ".." elsewhere in the word (main..$b, a
-			// JSON string) is just text.
-			for _, lead := range []string{"-..", "=..", "+..", "?..", ",..", "{.."} {
-				if strings.Contains(comp, lead) {
-					return true
-				}
-			}
-			expanded = true
-		}
-	}
-	return false
-}
-
 // settlePath applies the two normalisations to a fixed point, and reports
 // whether it reached one.
 //
@@ -1159,9 +1126,6 @@ func expansionBeforeDotDot(raw string) bool {
 // is quick — and exhausting it is reported rather than swallowed, because the
 // caller must fail closed on a path that will not settle.
 func settlePath(raw string) (string, bool) {
-	if expansionBeforeDotDot(raw) {
-		return "", false
-	}
 	cleaned := raw
 	for i := 0; i < 16; i++ {
 		next := filepath.ToSlash(filepath.Clean(cleanInput(cleaned)))

@@ -240,9 +240,12 @@ func readOnlyArgumentViolation(clause, root string) string {
 				}
 			}
 		default:
-			if computedOperand(w) && !computedOptionValue("git", sub, words, idx) {
+			// A bare reference before ".." only counts where it can be a path:
+			// after "--", or with a slash (HEAD:src/$d/../x); $a..$b is a range.
+			if (computedOperand(w) || (escapingPathWord(w, true) && (endOfOptions || strings.Contains(text, "/")))) &&
+				!computedOptionValue("git", sub, words, idx) {
 				return fmt.Sprintf("`git %s %s` is refused: the operand holds an expansion the gate cannot "+
-					"resolve to a value (a parameter operator, a special parameter or a brace expansion), "+
+					"resolve to a value (a parameter operator, a special parameter, a brace expansion, or an expansion beside a parent-directory component), "+
 					"so the path or revision it names was not judged. Spell the operand out.", sub, text)
 			}
 			if reason := readOnlyOperandViolation(text, effectiveRoot); reason != "" {
