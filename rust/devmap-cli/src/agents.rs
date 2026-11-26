@@ -352,9 +352,7 @@ mod tests {
         // tools, is not DevMap.
         assert!(gap("tools: Read, mcp__plugin_waylode_waylode\n").is_some());
         assert!(gap("tools: mcp__plugin_waylode_waylode__waylode_insights\n").is_some());
-        assert!(
-            gap("tools: Read\ndisallowedTools: Bash, mcp__plugin_waylode_waylode\n").is_some()
-        );
+        assert!(gap("tools: Read\ndisallowedTools: Bash, mcp__plugin_waylode_waylode\n").is_some());
         assert!(!remedy_entries().contains("waylode"));
     }
 

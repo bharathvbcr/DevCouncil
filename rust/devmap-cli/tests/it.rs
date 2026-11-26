@@ -21,6 +21,7 @@ mod a_call_blind_file_names_its_hole;
 mod a_damaged_store_is_reported_and_refused;
 mod a_dead_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod a_held_delta_writer_lock_holds_off_sync_delta;
+#[cfg(unix)]
 mod a_host_command_never_resolves_from_the_working_directory;
 mod a_legacy_base_store_pointer_is_refused_by_name;
 mod a_manifest_rewrite_keeps_unchanged_blocks;
@@ -48,7 +49,9 @@ mod ast_reports_its_own_totals;
 mod attack_ah_damaged_store;
 mod attack_build_cancel;
 mod attack_dsr_quarantine_ownership;
+#[cfg(unix)]
 mod attack_host_command_resolution;
+#[cfg(unix)]
 mod attack_host_command_resolution_breaks;
 mod attack_rb_resolution_budget;
 mod binary_digests_are_memoised;

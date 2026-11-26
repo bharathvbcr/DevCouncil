@@ -150,15 +150,21 @@ pub fn checkout_dir(name: &str) -> String {
 /// one. A fixture that names none of those prefixes passes through unchanged.
 pub fn real_checkouts(input: &str) -> String {
     let root = checkout_root();
-    let mut out = input.to_owned();
+    // The root can itself start with a fixture prefix (on Linux it is
+    // `/tmp/dc-store-fixture-checkouts`, under `/tmp`), so every path already
+    // under it is held aside while the prefixes are rewritten: none is
+    // rewritten twice into a directory nobody created.
+    const HELD: &str = "\u{0}checkout-root\u{0}";
+    let mut out = input.replace(root, HELD);
     for name in ["checkout", "worktrees", "moved", "clone", "tmp"] {
         for lead in ["\"", "local:"] {
-            out = out.replace(&format!("{lead}/{name}"), &format!("{lead}{root}/{name}"));
+            out = out.replace(&format!("{lead}/{name}"), &format!("{lead}{HELD}/{name}"));
         }
     }
     for lead in ["\"", "local:"] {
-        out = out.replace(&format!("{lead}C:/tmp"), &format!("{lead}{root}/tmp"));
+        out = out.replace(&format!("{lead}C:/tmp"), &format!("{lead}{HELD}/tmp"));
     }
+    let out = out.replace(HELD, root);
     let mut rest = out.as_str();
     while let Some(at) = rest.find(root) {
         rest = &rest[at..];

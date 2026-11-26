@@ -38,6 +38,28 @@ fn fixture_input(input: &str) -> String {
     support::real_checkouts(input)
 }
 
+/// A path already under the checkout root is left as it is. On Linux the root
+/// is `/tmp/dc-store-fixture-checkouts`, which starts with the `/tmp` fixture
+/// prefix, and a second rewrite named a directory that was never created.
+#[test]
+fn a_path_already_under_the_checkout_root_is_not_rewritten_again() {
+    let root = support::checkout_root();
+    let raw = format!(r#"{{"git_dir":"{root}/checkout/again/.git","cwd":"/tmp/again"}}"#);
+    let got = fixture_input(&raw);
+    assert!(
+        got.contains(&format!(r#""git_dir":"{root}/checkout/again/.git""#)),
+        "{got}"
+    );
+    assert!(
+        got.contains(&format!(r#""cwd":"{root}/tmp/again""#)),
+        "{got}"
+    );
+    assert!(
+        std::path::Path::new(&format!("{root}/checkout/again/.git")).is_dir(),
+        "{got}"
+    );
+}
+
 #[test]
 fn a_fixture_checkout_is_rewritten_to_a_real_directory() {
     let raw = r#"{"cwd":"/worktrees/a","git_dir":"/checkout/.git","identity_key":"local:/moved/.git","effective_configuration":"{\"cwd\":\"/checkout\"}"}"#;
