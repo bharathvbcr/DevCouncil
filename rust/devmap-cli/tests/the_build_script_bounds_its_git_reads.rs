@@ -102,7 +102,10 @@ fn a_git_that_answers_gives_clean_and_dirty() {
 
 #[test]
 fn output_larger_than_a_pipe_buffer_is_read_in_full() {
-    let (dir, script) = fake_git("big", "yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 1000000");
+    let (dir, script) = fake_git(
+        "big",
+        "yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 1000000",
+    );
     let (out, _) = run(&script, &["status"], Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.expect("answered").len() >= 999_000);

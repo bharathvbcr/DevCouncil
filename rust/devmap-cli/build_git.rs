@@ -27,12 +27,7 @@ pub const GIT_BOUND: Duration = Duration::from_secs(10);
 /// `None` means the answer is unknown: git could not be started, exited
 /// non-zero, printed non-UTF-8, or did not finish within `bound` (the child is
 /// then killed and reaped).
-pub fn bounded_git(
-    program: &OsStr,
-    repo: &Path,
-    args: &[&str],
-    bound: Duration,
-) -> Option<String> {
+pub fn bounded_git(program: &OsStr, repo: &Path, args: &[&str], bound: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(["-c", "core.fsmonitor=false", "--no-optional-locks", "-C"])
         .arg(repo)
@@ -80,7 +75,9 @@ pub fn bounded_git(
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(250));
     let bytes = receiver.recv_timeout(remaining).ok()?.ok()?;
-    String::from_utf8(bytes).ok().map(|text| text.trim().to_string())
+    String::from_utf8(bytes)
+        .ok()
+        .map(|text| text.trim().to_string())
 }
 
 /// Whether the working tree has uncommitted changes: `Some(dirty)`, or `None`

@@ -37,10 +37,7 @@ fn main() {
     let build_time = unix_utc();
 
     println!("cargo:rustc-env=DEVMAP_GIT_HASH={git_hash}");
-    println!(
-        "cargo:rustc-env=DEVMAP_GIT_DIRTY={}",
-        dirty_env(dirty)
-    );
+    println!("cargo:rustc-env=DEVMAP_GIT_DIRTY={}", dirty_env(dirty));
     println!("cargo:rustc-env=DEVMAP_BUILD_TIME={build_time}");
     println!("cargo:rustc-env=DEVMAP_BUILD_ID={build_id}");
 }

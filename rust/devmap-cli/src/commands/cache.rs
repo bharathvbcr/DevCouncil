@@ -981,8 +981,8 @@ fn normalize_head_sha(raw: &str) -> String {
 fn percent_encode_query(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
-        let is_unreserved = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        let is_unreserved =
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         if is_unreserved {
             out.push(byte as char);
         } else {
@@ -1944,14 +1944,8 @@ fn fetch_latest(
     let url = format!("{base_url}/v1/devmap-cache/latest?{query}");
     let mut headers = BTreeMap::new();
     headers.insert("Accept".to_string(), "application/json".to_string());
-    let (status, resp_bytes) = http_request(
-        "GET",
-        &url,
-        &headers,
-        Some(bearer_token),
-        None,
-        1024 * 1024,
-    )?;
+    let (status, resp_bytes) =
+        http_request("GET", &url, &headers, Some(bearer_token), None, 1024 * 1024)?;
     if status == 404 {
         bail!(
             "no remote devmap cache found on relay for scope={scope_str} repo_hash={repo_root_hash} schema_version={schema_version} (HTTP 404): {}",
@@ -2036,7 +2030,11 @@ fn redact_bearer_tokens(text: &str) -> String {
 fn redact_url_query_strings(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(scheme_pos) = rest.find("http://").into_iter().chain(rest.find("https://")).min()
+    while let Some(scheme_pos) = rest
+        .find("http://")
+        .into_iter()
+        .chain(rest.find("https://"))
+        .min()
     {
         out.push_str(&rest[..scheme_pos]);
         let url_start = &rest[scheme_pos..];
@@ -2065,7 +2063,12 @@ fn sanitize_error_snippet(bytes: &[u8]) -> String {
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
     let redacted = redact_bearer_tokens(&redact_url_query_strings(&cleaned));
-    redacted.chars().take(160).collect::<String>().trim().to_string()
+    redacted
+        .chars()
+        .take(160)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,9 +2120,8 @@ fn http_loopback_request(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
-    let mut req = format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n"
-    );
+    let mut req =
+        format!("{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
     if let Some(payload) = body {
         req.push_str(&format!("Content-Length: {}\r\n", payload.len()));
     }
@@ -2376,13 +2378,8 @@ fn https_curl_request(
         None
     };
 
-    let args = build_hardened_curl_args(
-        method,
-        max_response_bytes,
-        &cfg_path,
-        &resp_path,
-        body_arg,
-    );
+    let args =
+        build_hardened_curl_args(method, max_response_bytes, &cfg_path, &resp_path, body_arg);
     let output = std::process::Command::new(&curl_bin)
         .args(&args)
         .output()
@@ -2703,7 +2700,10 @@ mod tests {
                             "updated_at".into(),
                             serde_json::json!("2026-11-25T23:00:00Z"),
                         );
-                        (200, serde_json::to_vec(&serde_json::Value::Object(resp)).unwrap())
+                        (
+                            200,
+                            serde_json::to_vec(&serde_json::Value::Object(resp)).unwrap(),
+                        )
                     }
                 } else if method == "PUT" && path.starts_with("/r2/") {
                     let key = path.trim_start_matches("/r2/").to_string();
@@ -3032,7 +3032,10 @@ mod tests {
                     let has_checksum = hdr
                         .split("\r\n")
                         .any(|l| l.eq_ignore_ascii_case("X-Amz-Checksum-Sha256: Y2hlY2tzdW0="));
-                    assert!(!leaked_auth, "must never send bearer token to presigned PUT");
+                    assert!(
+                        !leaked_auth,
+                        "must never send bearer token to presigned PUT"
+                    );
                     assert!(has_checksum, "must forward signed headers on presigned PUT");
                     assert!(
                         query_str.contains("X-Amz-Signature=supersecret"),
@@ -3045,7 +3048,10 @@ mod tests {
                     let leaked_auth = hdr
                         .split("\r\n")
                         .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
-                    assert!(!leaked_auth, "must never send bearer token to presigned GET");
+                    assert!(
+                        !leaked_auth,
+                        "must never send bearer token to presigned GET"
+                    );
                     let key = path.trim_start_matches("/r2/").to_string();
                     let data = server_blobs.lock().unwrap().get(&key).cloned().unwrap();
                     (200, data)
@@ -3230,17 +3236,14 @@ mod tests {
         assert!(validate_relay_token("bad\\token").is_err());
         // C6: `-q` is the very first curl argument, `--globoff` + `--max-redirs 0` are present,
         // and neither presigned URLs nor bearer tokens appear in curl argv.
-        let args = build_hardened_curl_args(
-            "PUT",
-            1024,
-            Path::new("/tmp/c"),
-            Path::new("/tmp/r"),
-            None,
-        );
+        let args =
+            build_hardened_curl_args("PUT", 1024, Path::new("/tmp/c"), Path::new("/tmp/r"), None);
         assert_eq!(args[0], "-q");
         assert!(args.iter().any(|a| a == "--globoff"));
         assert!(args.iter().any(|a| a == "--max-redirs"));
-        assert!(args.iter().all(|a| !a.to_string_lossy().contains("https://")));
+        assert!(args
+            .iter()
+            .all(|a| !a.to_string_lossy().contains("https://")));
         assert!(is_forbidden_relay_header("Host"));
         assert!(is_forbidden_relay_header("Authorization"));
     }
@@ -3276,7 +3279,10 @@ mod tests {
         let sanitized = sanitize_error_snippet(leaky);
         assert!(!sanitized.contains("TOPSECRET123"), "{sanitized}");
         assert!(!sanitized.contains("MY_BEARER_SECRET_99"), "{sanitized}");
-        assert!(sanitized.contains("https://r2.example.com/k.tar.gz?<redacted>"), "{sanitized}");
+        assert!(
+            sanitized.contains("https://r2.example.com/k.tar.gz?<redacted>"),
+            "{sanitized}"
+        );
         assert!(sanitized.contains("Bearer <redacted>"), "{sanitized}");
         assert_eq!(
             redact_url_for_display("https://user:pass@r2.example.com/k.tar.gz?X-Amz-Signature=xyz"),
