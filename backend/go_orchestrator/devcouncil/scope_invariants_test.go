@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 )
@@ -91,9 +90,6 @@ func TestGateAndVerifyAgreeThatReadOnlyWinsOverlap(t *testing.T) {
 			if len(gaps) != 1 || gaps[0].GapType != "oracle_tampering" {
 				t.Errorf("%+v: verify gaps %+v, want one oracle_tampering", planned, gaps)
 			}
-			if devcouncil.MatchesPlannedPath("src/a.go", []string{"src/a.go"}) != true {
-				t.Fatal("delegate broken")
-			}
 		}
 	}
 }
@@ -125,8 +121,8 @@ func TestBackslashChangedPathIsReadTheSameByGateAndVerify(t *testing.T) {
 	task := &dc.Task{ID: "T", PlannedFiles: planned}
 	d := policy.FileGate{Root: root, HardRules: true}.EvaluateFileChange("src\\a.go", task, dc.OpModify, false)
 	gaps := verify.DetectOrphanDiffGapsIn(root, "T", planned, []string{"src\\a.go"}, nil)
-	if d.Blocked() || policy.WouldBlockVerification(d, task) || len(gaps) != 0 {
-		t.Errorf("gate blocked=%v would_block=%v verify gaps=%+v; want all three to read src\\a.go as src/a.go", d.Blocked(), policy.WouldBlockVerification(d, task), gaps)
+	if d.Blocked() || policy.WouldBlockVerificationIn(root, d, task) || len(gaps) != 0 {
+		t.Errorf("gate blocked=%v would_block=%v verify gaps=%+v; want all three to read src\\a.go as src/a.go", d.Blocked(), policy.WouldBlockVerificationIn(root, d, task), gaps)
 	}
 	other := verify.DetectOrphanDiffGapsIn(root, "T", planned, []string{"src\\b.go"}, nil)
 	if len(other) != 1 || !other[0].Blocking {

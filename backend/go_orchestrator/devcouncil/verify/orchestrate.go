@@ -191,9 +191,12 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	if g := DetectNoWorkGap(taskID, planned, workPresent); g != nil {
 		gaps = append(gaps, *g)
 	}
-	gaps = append(gaps, DetectPlannedFileGapsIn(in.Root, taskID, planned, in.ChangedFiles)...)
-	gaps = append(gaps, DetectOrphanDiffGapsIn(in.Root, taskID, planned, in.ChangedFiles, in.AddedFiles)...)
-	gaps = append(gaps, DetectDependencyRiskGapsIn(in.Root, taskID, planned, in.ChangedFiles)...)
+	// One judge for the three scope detectors: each changed path is asked of the
+	// filesystem once for the whole run, not once per detector.
+	judge := policy.NewScopeJudge(in.Root)
+	gaps = append(gaps, DetectPlannedFileGapsWith(judge, taskID, planned, in.ChangedFiles)...)
+	gaps = append(gaps, DetectOrphanDiffGapsWith(judge, taskID, planned, in.ChangedFiles, in.AddedFiles)...)
+	gaps = append(gaps, DetectDependencyRiskGapsWith(judge, taskID, planned, in.ChangedFiles)...)
 	if in.GitErr != nil {
 		gaps = append(gaps, gitStateGap(taskID, in.GitErr))
 	}
