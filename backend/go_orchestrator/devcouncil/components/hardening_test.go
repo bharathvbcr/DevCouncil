@@ -291,7 +291,7 @@ func (f *failingRunner) Run(name string, args []string, dir string, env []string
 	if f.failSubstr != "" && strings.Contains(joined, f.failSubstr) {
 		return os.ErrPermission
 	}
-	return nil
+	return writeGoBuildOutput(name, args)
 }
 
 func TestCorruptReceiptIsNeverOverwrittenByDisableEnableOrInstall(t *testing.T) {

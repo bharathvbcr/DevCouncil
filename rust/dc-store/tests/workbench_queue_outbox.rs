@@ -10,6 +10,10 @@ use std::sync::{
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
+/// An absolute directory on every platform: the store refuses a relative or
+/// drive-less `cwd`/`git_dir`, and `/tmp/...` has no drive on Windows.
+const GIT_ROOT: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -44,10 +48,10 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     let time = clock.clone();
     s.set_clock(move || time.load(Ordering::SeqCst));
     for (id, path) in [
-        ("repo-a", "/tmp/git-a/.git"),
-        ("repo-b", "/tmp/git-b/.git"),
-        ("repo-c", "/tmp/git-c/.git"),
-        ("repo-z", "/tmp/git-z/.git"),
+        ("repo-a", format!("{GIT_ROOT}/git-a/.git")),
+        ("repo-b", format!("{GIT_ROOT}/git-b/.git")),
+        ("repo-c", format!("{GIT_ROOT}/git-c/.git")),
+        ("repo-z", format!("{GIT_ROOT}/git-z/.git")),
     ] {
         call(
             &s,
@@ -108,7 +112,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q-bad-1","request_id":"qb1","expected_revision":0,"title":"Too small","concurrency_limit":1,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}}]}}"#
+            r#"{{"id":"q-bad-1","request_id":"qb1","expected_revision":0,"title":"Too small","concurrency_limit":1,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}}]}}"#
         ),
         "invalid_input",
     );
@@ -116,7 +120,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q-bad-5","request_id":"qb5","expected_revision":0,"title":"Too big","concurrency_limit":5,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}}]}}"#
+            r#"{{"id":"q-bad-5","request_id":"qb5","expected_revision":0,"title":"Too big","concurrency_limit":5,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}}]}}"#
         ),
         "invalid_input",
     );
@@ -127,9 +131,9 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         "queue.enqueue",
         &format!(
             r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Cross-repo release","concurrency_limit":2,"members":[
-                {{"member_id":"m-z","repository_id":"repo-z","git_dir":"/tmp/git-z/.git","base_oid":"{OID_A}","task_id":"t-a","depends_on":["m-a"]}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}},
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_C}"}}
+                {{"member_id":"m-z","repository_id":"repo-z","git_dir":"{GIT_ROOT}/git-z/.git","base_oid":"{OID_A}","task_id":"t-a","depends_on":["m-a"]}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}},
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_C}"}}
             ]}}"#
         ),
     );
@@ -146,7 +150,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-b-ext","request_id":"rbext","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-b","git_dir":"/tmp/git-b/.git","git_common_dir":"/tmp/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main"}}"#
+            r#"{{"id":"run-b-ext","request_id":"rbext","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-b","git_dir":"{GIT_ROOT}/git-b/.git","git_common_dir":"{GIT_ROOT}/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main"}}"#
         ),
     );
     refuse(
@@ -202,7 +206,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-steal","request_id":"rsteal","expected_revision":0,"task_id":"t-a","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-a","git_dir":"/tmp/git-a/.git","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_C}","head_ref":"refs/heads/main"}}"#
+            r#"{{"id":"run-steal","request_id":"rsteal","expected_revision":0,"task_id":"t-a","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-a","git_dir":"{GIT_ROOT}/git-a/.git","git_common_dir":"{GIT_ROOT}/git-a/.git","head_oid":"{OID_C}","head_ref":"refs/heads/main"}}"#
         ),
         "checkout_busy",
     );
@@ -295,8 +299,8 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         "queue.enqueue",
         &format!(
             r#"{{"id":"q-timeout","request_id":"qt-enq","expected_revision":0,"title":"Timeout test","members":[
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}"}}
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}"}}
             ]}}"#
         ),
     );
@@ -329,8 +333,8 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         "queue.enqueue",
         &format!(
             r#"{{"id":"q-dep","request_id":"qd-enq","expected_revision":0,"title":"Dep propagation","members":[
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","depends_on":["m-a"]}}
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","depends_on":["m-a"]}}
             ]}}"#
         ),
     );
@@ -356,9 +360,9 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         "queue.enqueue",
         &format!(
             r#"{{"id":"q-cap","request_id":"qc-enq","expected_revision":0,"title":"Cap 2","concurrency_limit":2,"members":[
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}"}},
-                {{"member_id":"m-c","repository_id":"repo-c","git_dir":"/tmp/git-c/.git","base_oid":"{OID_C}"}}
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}"}},
+                {{"member_id":"m-c","repository_id":"repo-c","git_dir":"{GIT_ROOT}/git-c/.git","base_oid":"{OID_C}"}}
             ]}}"#
         ),
     );
@@ -423,7 +427,7 @@ fn task_blocks_and_parent_dependencies_gate_launch_and_reject_cycles() {
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-blocked","request_id":"rb1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-a","git_dir":"/tmp/git-a/.git","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main"}}"#
+            r#"{{"id":"run-blocked","request_id":"rb1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-a","git_dir":"{GIT_ROOT}/git-a/.git","git_common_dir":"{GIT_ROOT}/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main"}}"#
         ),
         "task_blocked",
     );
@@ -454,7 +458,7 @@ fn task_blocks_and_parent_dependencies_gate_launch_and_reject_cycles() {
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-sub","request_id":"rsub1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-a","git_dir":"/tmp/git-a/.git","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main","require_subtasks_done":true}}"#
+            r#"{{"id":"run-sub","request_id":"rsub1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-a","git_dir":"{GIT_ROOT}/git-a/.git","git_common_dir":"{GIT_ROOT}/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main","require_subtasks_done":true}}"#
         ),
         "subtasks_incomplete",
     );
@@ -468,7 +472,9 @@ fn github_sync_and_confirmed_durable_outbox_survive_restart_and_reconcile() {
     store
         .workbench_request(
             "repositories.put",
-            r#"{"id":"repo-a","request_id":"ra","expected_revision":0,"name":"repo-a","identity_key":"local:/tmp/git-a/.git"}"#,
+            &format!(
+                r#"{{"id":"repo-a","request_id":"ra","expected_revision":0,"name":"repo-a","identity_key":"local:{GIT_ROOT}/git-a/.git"}}"#
+            ),
         )
         .unwrap();
     store
@@ -672,7 +678,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
 
     let remote_b = |id: &str, req: &str, extra: &str| {
         format!(
-            r#"{{"id":"{id}","request_id":"{req}","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-b","git_dir":"/tmp/git-b/.git","git_common_dir":"/tmp/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main","skip_checkout_occupancy":true{extra}}}"#
+            r#"{{"id":"{id}","request_id":"{req}","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-b","git_dir":"{GIT_ROOT}/git-b/.git","git_common_dir":"{GIT_ROOT}/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main","skip_checkout_occupancy":true{extra}}}"#
         )
     };
 
@@ -682,7 +688,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Q1","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+            r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Q1","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
         ),
     );
     let acq1 = call(
@@ -721,7 +727,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q2","request_id":"q2-enq","expected_revision":0,"title":"Q2","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+            r#"{{"id":"q2","request_id":"q2-enq","expected_revision":0,"title":"Q2","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
         ),
     );
     let acq2 = call(
@@ -753,7 +759,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q3","request_id":"q3-enq","expected_revision":0,"title":"Q3","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+            r#"{{"id":"q3","request_id":"q3-enq","expected_revision":0,"title":"Q3","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
         ),
     );
     let acq3 = call(

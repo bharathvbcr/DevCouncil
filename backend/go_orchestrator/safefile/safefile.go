@@ -220,7 +220,7 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 // a no-op in production and is assigned only from tests in this package.
 var (
 	afterRootedOpen = func(attempt int) {}
-	renameFile      = os.Rename
+	renameFile      = replaceFile
 	syncFile        = func(f *os.File) error { return f.Sync() }
 	syncDir         = syncDirectory
 )

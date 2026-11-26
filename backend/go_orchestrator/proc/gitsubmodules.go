@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 const (
@@ -302,7 +304,7 @@ func pathJoinSlash(parent, name string) string {
 // is false for a gitlink that is not checked out.
 func (s *GitSession) submoduleDir(path string) (string, bool, error) {
 	native := filepath.FromSlash(path)
-	if path == "" || filepath.IsAbs(native) || filepath.Clean(native) != native || native == ".." ||
+	if path == "" || filepath.IsAbs(native) || safefile.RootedOffRoot(native) || filepath.Clean(native) != native || native == ".." ||
 		strings.HasPrefix(native, ".."+string(filepath.Separator)) {
 		return "", false, fmt.Errorf("the index names a submodule at %q, which is not a plain path inside %s", path, s.root)
 	}

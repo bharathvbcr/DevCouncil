@@ -55,6 +55,7 @@ func TestAdvisoryDoesNotVerifyAnUnprovenCriterion(t *testing.T) {
 func TestPersistStoresTheAdvisoryDegradedReason(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.sqlite")
 	client := store.New(testsupport.DCStore(t), db)
+	t.Cleanup(client.Close)
 	gaps := []Gap{{
 		ID: "GAP-TEST", Severity: "high", GapType: "test_failed",
 		TaskID: "TASK-DEGRADE", Description: "boom", Blocking: true,

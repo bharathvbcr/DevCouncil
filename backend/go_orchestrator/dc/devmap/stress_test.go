@@ -23,9 +23,7 @@ func binary(t *testing.T, script string) *Client {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(clapHelp(script)), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, clapHelp(script))
 	c := New(path, dir)
 	c.Timeout = 5 * time.Second
 	return c

@@ -116,6 +116,7 @@ func TestArgumentWriteTargets(t *testing.T) {
 		{"echo 'tee f'", nil, false},
 	}
 	t.Setenv("HOME", "/home/agent")
+	t.Setenv("USERPROFILE", "/home/agent") // what os.UserHomeDir reads on Windows
 	for _, tc := range tests {
 		targets, opaque, err := RedirectTargets(tc.input)
 		if err != nil {

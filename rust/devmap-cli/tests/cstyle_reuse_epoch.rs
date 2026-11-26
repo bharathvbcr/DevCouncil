@@ -179,10 +179,7 @@ fn stage_store(label: &str, older_extractor: bool) -> std::path::PathBuf {
     // The blob.
     let state = devmap_extract::paths::state_dir(&root);
     let legacy = state.join("resolution-reuse-1");
-    let current = state.join(format!(
-        "resolution-reuse-{}",
-        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
-    ));
+    let current = state.join(devmap_resolve::resolver::resolution_reuse_dir_name());
     if current != legacy {
         std::fs::rename(&current, &legacy).unwrap();
     }
@@ -201,11 +198,19 @@ fn stage_store(label: &str, older_extractor: bool) -> std::path::PathBuf {
     ))
     .unwrap();
     use sha2::{Digest, Sha256};
-    let blob = legacy.join(format!("{:x}.json", Sha256::digest(b"java/Cls.java")));
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
+    let hex = format!("{:x}", Sha256::digest(b"java/Cls.java"));
+    let framed = legacy.join(format!("{hex}.json.zst"));
+    let json = devmap_store::inflate_json_frame(&std::fs::read(&framed).unwrap(), "java/Cls.java")
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
     value["edges"].as_array_mut().unwrap().push(stale);
-    std::fs::write(&blob, serde_json::to_vec(&value).unwrap()).unwrap();
+    // What the pre-split build left: its blobs were plain JSON.
+    std::fs::remove_file(&framed).unwrap();
+    std::fs::write(
+        legacy.join(format!("{hex}.json")),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
 
     // The committed generation. `generation_edges` is a view over the
     // time-versioned `edge_rows`; an open row is one with no `valid_to`.

@@ -7,6 +7,16 @@
 //! `references.rs` only, whatever the member's spelling (shadowed, backticked,
 //! reserved), whatever the context the walk reaches it through; the moved arm
 //! must never refuse a member a later rule correctly handled.
+//!
+//! tree-sitter-swift 0.7.4: `b as? T ?? X` parses as
+//! `nil_coalescing_expression(value: as_expression, if_nil: X)`, so the
+//! cast-coalesce probes below (`COUNTED`, `COUNTED_MORE`, `CONTEXTS`) refuse
+//! nothing and raise no note; `X` is extracted as it would be on its own, and
+//! must equal the same source with the cast parenthesised (`(b as? T) ?? X`).
+//! What is still refused is a cast to a QUALIFIED type, which the grammar reads
+//! as a member of the cast (`(b as? Foo.Bar)` is `navigation(as_expression
+//! "b as? Foo", Bar)`); the note-isolation and metamorphic checks use that
+//! trigger.
 
 use std::time::Duration;
 
@@ -99,86 +109,194 @@ fn has_ref(e: &Extraction, name: &str) -> bool {
     e.references.iter().any(|r| r.name == name)
 }
 
+/// The same source with every simple `X as? T ?? ` (operand a plain identifier,
+/// type a plain or bracketed name) written `(X as? T) ?? `. Swift gives `as`
+/// higher precedence than `??`, so this is the same expression; it is the
+/// "parenthesised twin" the cast-coalesce probes must equal. Returns the twin
+/// and how many casts it wrapped.
+fn parenthesised_twin(source: &str) -> (String, usize) {
+    let is_operand = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let is_type = |c: char| c.is_alphanumeric() || c == '_' || c == '[' || c == ']';
+    let mut out = String::new();
+    let mut wrapped = 0;
+    let mut rest = source;
+    while let Some(ch) = rest.chars().next() {
+        let cast = [" as? ", " as! "].into_iter().find(|c| rest.starts_with(c));
+        if let Some(cast) = cast {
+            let operand_len = out.chars().rev().take_while(|c| is_operand(*c)).count();
+            let after = &rest[cast.len()..];
+            let ty_len = after.chars().take_while(|c| is_type(*c)).count();
+            if operand_len > 0 && ty_len > 0 && after[ty_len..].starts_with(" ?? ") {
+                let operand: String = out
+                    .chars()
+                    .skip(out.chars().count() - operand_len)
+                    .collect();
+                out.truncate(out.len() - operand.len());
+                out.push('(');
+                out.push_str(&operand);
+                out.push_str(cast);
+                out.push_str(&after[..ty_len]);
+                out.push(')');
+                rest = &after[ty_len..];
+                wrapped += 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    (out, wrapped)
+}
+
+/// The calls and references a resolver reads, receivers compared without
+/// parentheses (a twin differs from its bare spelling only by the parentheses
+/// around the cast, which a receiver's source text carries) and without
+/// `assigned_to` (a separate, ignored follow-up: ft-c0b8696f).
+fn facts(e: &Extraction) -> (Vec<String>, Vec<String>) {
+    let bare = |r: &Option<String>| {
+        r.as_deref()
+            .map_or("-".to_string(), |r| r.replace(['(', ')', ' '], ""))
+    };
+    let mut calls: Vec<String> = e
+        .calls
+        .iter()
+        .map(|c| {
+            format!(
+                "{}|{}|{}",
+                c.caller_symbol.as_deref().unwrap_or(""),
+                c.callee_name,
+                bare(&c.receiver_expr)
+            )
+        })
+        .collect();
+    let mut refs: Vec<String> = e
+        .references
+        .iter()
+        .map(|r| {
+            format!(
+                "{:?}|{}|{}|{}",
+                r.kind,
+                r.name,
+                bare(&r.receiver_expr),
+                r.enclosing_symbol.as_deref().unwrap_or("-")
+            )
+        })
+        .collect();
+    calls.sort();
+    refs.sort();
+    (calls, refs)
+}
+
+/// The 0.7.4 contract for one cast-coalesce probe: it stays Clean, raises no
+/// note, publishes no empty name and no cast text as a receiver, and equals its
+/// parenthesised twin. Returns whether a twin cast was made.
+fn judge_cast_coalesce(source: &str, failures: &mut Vec<String>) -> bool {
+    let e = ex("a.swift", source);
+    if !e.diagnostics.is_empty() {
+        failures.push(format!(
+            "{source:?}: nothing is refused, yet {}",
+            describe(&e)
+        ));
+    }
+    for leak in leaks(&e) {
+        failures.push(format!("{source:?}: leaked {leak}"));
+    }
+    if e.calls.iter().any(|c| c.callee_name.trim().is_empty())
+        || e.references.iter().any(|r| r.name.trim().is_empty())
+    {
+        failures.push(format!("{source:?}: an empty name"));
+    }
+    let (twin, wrapped) = parenthesised_twin(source);
+    if wrapped > 0 {
+        let t = ex("a.swift", &twin);
+        if facts(&e) != facts(&t) {
+            failures.push(format!(
+                "{source:?}: differs from its twin {twin:?}\n   bare {:?}\n   twin {:?}",
+                facts(&e),
+                facts(&t)
+            ));
+        }
+    }
+    wrapped > 0
+}
+
 // ---------------------------------------------------------------- ATTACK 1/2
 
-/// (source, member nodes the lane must refuse and note). Counts are by
-/// construction: each `X as? T ?? .m` / `(X as? T).` misparse is one refused
-/// member; a parenthesised cast, a real receiver and a leading-dot member of a
-/// contextual type are not.
-const COUNTED: &[(&str, usize)] = &[
+/// Cast-coalesce shapes the lane used to refuse and count (one note per refused
+/// member). Under tree-sitter-swift 0.7.4 none of them is refused: each is
+/// judged by `judge_cast_coalesce` (no note, no leak, equal to its twin).
+const COUNTED: &[&str] = &[
     // a bare-cast member that is also an argument label
-    ("func f() {\n    _ = b as? T ?? .foo(foo: 1)\n}\n", 1),
-    ("func f() {\n    _ = b as? T ?? .foo(foo: foo)\n}\n", 1),
-    ("func f(foo: Int) {\n    _ = b as? T ?? .foo(foo: foo)\n}\n", 1),
-    ("func f() {\n    _ = b as? T ?? .foo(foo: 1, bar: 2)\n}\n", 1),
+    "func f() {\n    _ = b as? T ?? .foo(foo: 1)\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo(foo: foo)\n}\n",
+    "func f(foo: Int) {\n    _ = b as? T ?? .foo(foo: foo)\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo(foo: 1, bar: 2)\n}\n",
     // a leading-dot member in argument position beside a bare cast
-    ("func f() {\n    h(b as? T ?? .minute)\n}\n", 1),
-    ("func f() {\n    h(.minute, b as? T ?? .minute)\n}\n", 1),
-    ("func f() {\n    h(b as? T ?? .minute, .minute)\n}\n", 1),
-    ("func f() {\n    h(a: .minute, b: b as? T ?? .minute)\n}\n", 1),
-    ("func f() {\n    h(.minute(1), b as? T ?? .minute(2))\n}\n", 1),
-    ("func f() -> Shape {\n    .circle(1)\n}\nfunc g() {\n    _ = b as? T ?? .circle(2)\n}\n", 1),
-    ("func f() -> Shape {\n    return b as? T ?? .circle(2)\n}\n", 1),
-    ("var v: Shape = b as? T ?? .circle(2)\n", 1),
-    ("var v: Shape = .circle(1)\nvar w = b as? T ?? .circle(2)\n", 1),
+    "func f() {\n    h(b as? T ?? .minute)\n}\n",
+    "func f() {\n    h(.minute, b as? T ?? .minute)\n}\n",
+    "func f() {\n    h(b as? T ?? .minute, .minute)\n}\n",
+    "func f() {\n    h(a: .minute, b: b as? T ?? .minute)\n}\n",
+    "func f() {\n    h(.minute(1), b as? T ?? .minute(2))\n}\n",
+    "func f() -> Shape {\n    .circle(1)\n}\nfunc g() {\n    _ = b as? T ?? .circle(2)\n}\n",
+    "func f() -> Shape {\n    return b as? T ?? .circle(2)\n}\n",
+    "var v: Shape = b as? T ?? .circle(2)\n",
+    "var v: Shape = .circle(1)\nvar w = b as? T ?? .circle(2)\n",
     // nested and repeated casts
-    // The grammar hangs `.y` off the OUTER bare cast too (`T ?? (...)` is the
-    // cast's right-hand text), so both members are refused: two, not one.
-    ("func f() {\n    _ = (b as? T ?? (c as? U ?? .x()).y())\n}\n", 2),
-    ("func f() {\n    _ = b as? T ?? (c as? U ?? .x()).y()\n}\n", 2),
-    ("func f() {\n    _ = (c as? U ?? .x()).y()\n}\n", 1),
-    ("func f() {\n    _ = (b as? (c as? T).U)\n}\n", 0),
-    ("func f() {\n    _ = (b as? T).u ?? (c as? V).w\n}\n", 0),
+    // 0.7.3 hung `.y` off the OUTER bare cast too; 0.7.4 publishes `y` on the
+    // parenthesised `(c as? U ?? .x())`.
+    "func f() {\n    _ = (b as? T ?? (c as? U ?? .x()).y())\n}\n",
+    "func f() {\n    _ = b as? T ?? (c as? U ?? .x()).y()\n}\n",
+    "func f() {\n    _ = (c as? U ?? .x()).y()\n}\n",
+    "func f() {\n    _ = (b as? (c as? T).U)\n}\n",
+    "func f() {\n    _ = (b as? T).u ?? (c as? V).w\n}\n",
     // two bare casts in one expression, each with its own member
-    ("func f() {\n    _ = [b as? T ?? .x(), c as? U ?? .y()]\n}\n", 2),
-    ("func f() {\n    g(b as? T ?? .x(), c as? U ?? .y())\n}\n", 2),
-    ("func f() {\n    _ = (b as? T ?? .x(), c as? U ?? .y())\n}\n", 2),
-    ("func f() {\n    let a = b as? T ?? .x()\n    let c = d as? U ?? .y()\n}\n", 2),
-    ("func f() {\n    _ = b as? T ?? .x() + c as? U ?? .y()\n}\n", 2),
+    "func f() {\n    _ = [b as? T ?? .x(), c as? U ?? .y()]\n}\n",
+    "func f() {\n    g(b as? T ?? .x(), c as? U ?? .y())\n}\n",
+    "func f() {\n    _ = (b as? T ?? .x(), c as? U ?? .y())\n}\n",
+    "func f() {\n    let a = b as? T ?? .x()\n    let c = d as? U ?? .y()\n}\n",
+    "func f() {\n    _ = b as? T ?? .x() + c as? U ?? .y()\n}\n",
     // the same member name used twice on different casts
-    ("func f() {\n    _ = [b as? T ?? .foo(), c as? U ?? .foo()]\n}\n", 2),
-    ("func f() {\n    let foo = 1\n    _ = [b as? T ?? .foo(), c as? U ?? .foo()]\n}\n", 2),
+    "func f() {\n    _ = [b as? T ?? .foo(), c as? U ?? .foo()]\n}\n",
+    "func f() {\n    let foo = 1\n    _ = [b as? T ?? .foo(), c as? U ?? .foo()]\n}\n",
     // a chain longer than one hop: each member of the chain is its own node
-    ("func f() {\n    _ = b as? T ?? .a().b().c()\n}\n", 3),
-    ("func f() {\n    _ = b as? T ?? .a.b.c\n}\n", 3),
-    ("func f() {\n    let a = 1\n    _ = b as? T ?? .a.b.c\n}\n", 3),
-    ("func f() {\n    let b = 1\n    _ = x as? T ?? .a.b.c\n}\n", 3),
+    "func f() {\n    _ = b as? T ?? .a().b().c()\n}\n",
+    "func f() {\n    _ = b as? T ?? .a.b.c\n}\n",
+    "func f() {\n    let a = 1\n    _ = b as? T ?? .a.b.c\n}\n",
+    "func f() {\n    let b = 1\n    _ = x as? T ?? .a.b.c\n}\n",
     // a member that is both a call callee and read as a value
-    ("func f() {\n    _ = b as? T ?? .foo(.foo)\n}\n", 1),
-    ("func f() {\n    _ = b as? T ?? .foo(c as? U ?? .foo())\n}\n", 2),
-    ("func f() {\n    _ = b as? T ?? .foo({ $0 as? U ?? .foo() })\n}\n", 2),
-    ("func f() {\n    _ = b as? T ?? .foo { $0 as? U ?? .foo() }\n}\n", 2),
+    "func f() {\n    _ = b as? T ?? .foo(.foo)\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo(c as? U ?? .foo())\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo({ $0 as? U ?? .foo() })\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo { $0 as? U ?? .foo() }\n}\n",
     // subscript off the cast member: the member is a read, not a call
-    ("func f() {\n    _ = b as? T ?? .foo[0]\n}\n", 1),
-    ("func f() {\n    _ = b as? T ?? .foo[0].bar()\n}\n", 2),
+    "func f() {\n    _ = b as? T ?? .foo[0]\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo[0].bar()\n}\n",
     // trailing closures
-    ("func f() {\n    _ = b as? T ?? .foo { }\n}\n", 1),
-    ("func f() {\n    _ = b as? T ?? .foo { } .bar { }\n}\n", 2),
+    "func f() {\n    _ = b as? T ?? .foo { }\n}\n",
+    "func f() {\n    _ = b as? T ?? .foo { } .bar { }\n}\n",
     // macro expansion: the argument of a freestanding macro is an expression
-    ("func f() {\n    _ = #stringify(b as? T ?? .foo())\n}\n", 1),
-    ("func f() {\n    #warning(\"x\")\n    _ = #stringify(b as? T ?? .foo(), c as? U ?? .foo())\n}\n", 2),
+    "func f() {\n    _ = #stringify(b as? T ?? .foo())\n}\n",
+    "func f() {\n    #warning(\"x\")\n    _ = #stringify(b as? T ?? .foo(), c as? U ?? .foo())\n}\n",
     // an optional-chained member after a bare cast member
-    ("func f() {\n    _ = b as? T ?? .a?.b()\n}\n", 2),
+    "func f() {\n    _ = b as? T ?? .a?.b()\n}\n",
 ];
 
-/// ATTACK 1/2. The count is exact for every spelled shape, and no cast text
-/// leaks as a receiver.
+/// ATTACK 1/2, rewritten for tree-sitter-swift 0.7.4. Every cast-coalesce shape
+/// in `COUNTED` is parsed correctly: no note, no cast text as a receiver, and
+/// the facts equal its parenthesised twin. The sweep must have made a twin for
+/// most of the table, or it compared nothing.
 #[test]
 fn every_refused_member_is_one_note_in_the_shapes_the_move_could_disturb() {
     let mut failures = Vec::new();
-    for (source, want) in COUNTED {
-        let e = ex("a.swift", source);
-        let got = note_count(&e);
-        if got != *want {
-            failures.push(format!(
-                "{source:?}: want {want} got {got}: {}",
-                describe(&e)
-            ));
-        }
-        for leak in leaks(&e) {
-            failures.push(format!("{source:?}: leaked {leak}"));
-        }
-    }
+    let twinned = COUNTED
+        .iter()
+        .filter(|source| judge_cast_coalesce(source, &mut failures))
+        .count();
+    assert!(
+        twinned >= COUNTED.len() - 5,
+        "only {twinned} of {} probes had a cast to parenthesise",
+        COUNTED.len()
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -285,48 +403,90 @@ fn expr(member: &str) -> String {
     format!("b as? T ?? .{member}()")
 }
 
+/// The live refusal trigger: a cast to a qualified type, which the grammar reads
+/// as a member of the cast (`navigation(as_expression "b as? Foo", member)`).
+fn live_expr(member: &str) -> String {
+    format!("(b as? Foo.{member})")
+}
+
+/// Contexts where 0.7.4 parses `(b as? Foo.member)` correctly as a qualified type
+/// (a prefix `!` or `&` operand), so nothing is refused there: the count is the
+/// same for every spelling (zero), but not the number of slots.
+const LIVE_PARSES_CORRECTLY: &[&str] = &[
+    "func f() {\n    _ = !{E}\n}\n",
+    "func f() {\n    _ = &{E}\n}\n",
+];
+
+/// Spellings that stay a plain member name after `Foo.` (the others, such as
+/// `init`, `self`, `Type`, `is` and `as`, are keywords or metatypes there and
+/// parse differently, so they cannot be a refused member).
+fn plain_member(member: &str) -> bool {
+    !matches!(member, "init" | "self" | "Type" | "is" | "as" | "$0x")
+}
+
 /// ATTACK 2. Metamorphic: the note count of a source must not depend on how its
-/// member is spelled or what binds that spelling, because the arm now runs
-/// before every spelling rule. A context holding exactly one `{E}` refuses
-/// exactly one member for every spelling (the raw identifier is a separate
-/// Partial case).
+/// member is spelled or what binds that spelling, because the arm runs before
+/// every spelling rule.
+///
+/// tree-sitter-swift 0.7.4, two halves. (1) The cast-coalesce shape `b as? T ??
+/// .{member}()` in every context is parsed correctly for every spelling: no
+/// note, no leak, and the count (zero) equals the plain-name baseline. (2) The
+/// live trigger `(b as? Foo.{member})` (a context holding exactly one `{E}`
+/// refuses exactly one member) is noted once per slot for every plain
+/// spelling, equal to the plain-name baseline `zzqq`.
 #[test]
 fn the_note_count_is_independent_of_the_member_spelling_in_every_context() {
     let mut failures = Vec::new();
     let mut seen = 0;
+    let mut live_seen = 0;
     for ctx in CONTEXTS {
         let slots = ctx.matches("{E}").count();
-        for member in SPELLINGS {
-            let source = ctx
-                .replace("{E_OTHER}", "1")
+        let fill = |e: &str| {
+            ctx.replace("{E_OTHER}", "1")
                 .replace("{E_NONE}", "1")
-                .replace("{E}", &expr(member));
+                .replace("{E}", e)
+        };
+        for member in SPELLINGS {
+            let source = fill(&expr(member));
             let e = ex("a.swift", &source);
             seen += 1;
-            // A source the grammar could not read has nothing to count.
-            if !matches!(e.parse_outcome, ParseOutcome::Clean) && ctx.contains("broken") {
-                continue;
-            }
-            let got = note_count(&e);
-            let base = ex(
-                "a.swift",
-                &ctx.replace("{E_OTHER}", "1")
-                    .replace("{E_NONE}", "1")
-                    .replace("{E}", &expr("zzqq")),
-            );
-            let want = note_count(&base);
-            if got != want || (want != slots && !ctx.contains("broken")) {
+            if note_count(&e) != 0 || !e.diagnostics.is_empty() {
                 failures.push(format!(
-                    "member {member:?} in {ctx:?}: got {got}, plain-name baseline {want}, slots {slots}\n   {}",
+                    "member {member:?} in {ctx:?}: nothing is refused, yet {}",
                     describe(&e)
                 ));
             }
             for leak in leaks(&e) {
                 failures.push(format!("member {member:?} in {ctx:?}: leaked {leak}"));
             }
+            if !plain_member(member) {
+                continue;
+            }
+            let source = fill(&live_expr(member));
+            let e = ex("a.swift", &source);
+            live_seen += 1;
+            // A source the grammar could not read has nothing to count.
+            if !matches!(e.parse_outcome, ParseOutcome::Clean) && ctx.contains("broken") {
+                continue;
+            }
+            let got = note_count(&e);
+            let want = note_count(&ex("a.swift", &fill(&live_expr("zzqq"))));
+            let exempt = LIVE_PARSES_CORRECTLY.contains(ctx);
+            if got != want
+                || (exempt && want != 0)
+                || (!exempt && want != slots && !ctx.contains("broken"))
+            {
+                failures.push(format!(
+                    "live member {member:?} in {ctx:?}: got {got}, plain-name baseline {want}, slots {slots}\n   {}",
+                    describe(&e)
+                ));
+            }
+            for leak in leaks(&e) {
+                failures.push(format!("live member {member:?} in {ctx:?}: leaked {leak}"));
+            }
         }
     }
-    assert!(seen > 1000);
+    assert!(seen > 1000 && live_seen > 1000, "{seen} / {live_seen}");
     assert!(
         failures.is_empty(),
         "{} failure(s):\n{}",
@@ -465,10 +625,13 @@ fn real_members_beside_a_refused_member_survive_the_moved_arm() {
 // ------------------------------------------------------------------ ATTACK 2b
 
 /// ATTACK 2. The count is per file under `extract_all`, and does not carry from
-/// a file with notes into a file with none, across many threads.
+/// a file with notes into a file with none, across many threads. The noted file
+/// is triggered by the bare-cast member that tree-sitter-swift 0.7.4 still
+/// mis-parses (`(b as? Foo.foo)`, with a local `foo` hiding the name); the
+/// cast-coalesce shape it used before is parsed correctly and refuses nothing.
 #[test]
 fn the_note_does_not_leak_between_files_under_rayon() {
-    let noted = "func f() {\n    let foo = 1\n    _ = b as? T ?? .foo()\n    _ = foo\n}\n";
+    let noted = "func f() {\n    let foo = 1\n    _ = (b as? Foo.foo)\n    _ = foo\n}\n";
     let quiet = "func g() { _ = (b as? T)?.foo() }\n";
     let paths: Vec<String> = (0..200).map(|i| format!("f{i}.swift")).collect();
     let files: Vec<FileRef> = paths
@@ -606,53 +769,47 @@ fn harness_time_file() {
 // ------------------------------------------------------------ ATTACK 2 (more)
 
 /// More contexts and nesting that might make the walk visit one member twice or
-/// reach one through a path the arm does not see.
-const COUNTED_MORE: &[(&str, usize)] = &[
-    (
-        "let s = \"\\(b as? T ?? .foo(\"x \\(c as? U ?? .bar())\"))\"\n",
-        2,
-    ),
-    (
-        "let s = \"\"\"\n  \\(b as? T ?? .foo())\n  \\(c as? U ?? .bar())\n  \"\"\"\n",
-        2,
-    ),
-    ("func f() async {\n    async let x = b as? T ?? .foo()\n    _ = await x\n}\n", 1),
-    ("func f() {\n    repeat { } while (b as? T ?? .foo()) == nil\n}\n", 1),
-    ("func f() {\n    outer: for v in xs { _ = b as? T ?? .foo(); continue outer }\n}\n", 1),
-    ("class C {\n    static let shared = b as? T ?? .foo()\n}\n", 1),
-    ("class C {\n    #if DEBUG\n    var v = b as? T ?? .foo()\n    #endif\n}\n", 1),
-    ("struct S {\n    let x = b as? T ?? .foo()\n    let y = c as? U ?? .foo()\n}\n", 2),
-    ("enum E {\n    case a(Int = 0)\n    static var d = b as? T ?? .foo()\n}\n", 1),
-    ("typealias A = Int\nfunc f() { _ = b as? T ?? .foo() }\n", 1),
-    ("func f() {\n    let g = { { { b as? T ?? .foo() }() }() }()\n}\n", 1),
-    ("func f() {\n    g { h { i { _ = b as? T ?? .foo() } } }\n}\n", 1),
-    ("func f() {\n    let a = [1].map { x in b as? T ?? .foo() }.filter { y in c as? U ?? .foo() }\n}\n", 2),
-    ("func f() {\n    let a = xs.map { $0 as? T ?? .foo() }\n}\n", 1),
-    ("func f() {\n    let a = xs.map { ($0 as? T)?.foo() ?? .bar() }\n}\n", 0),
-    ("func f() {\n    let a = b as? T ?? .foo() as? U ?? .bar()\n}\n", 2),
-    ("func f() {\n    let a = (b as? T ?? .foo()) as? U ?? .bar()\n}\n", 2),
-    ("func f() {\n    let a = b as? T ?? (.foo())\n}\n", 0),
-    ("func f() {\n    let a = b as? T ?? (x.foo())\n}\n", 0),
-    ("func f() {\n    let a: T = b as? T ?? T.foo()\n}\n", 1),
-    ("func f() {\n    let a: [T] = b as? [T] ?? [].foo()\n}\n", 1),
+/// reach one through a path the arm does not see. Cast-coalesce probes: see
+/// `COUNTED` for what 0.7.4 does with them.
+const COUNTED_MORE: &[&str] = &[
+    "let s = \"\\(b as? T ?? .foo(\"x \\(c as? U ?? .bar())\"))\"\n",
+    "let s = \"\"\"\n  \\(b as? T ?? .foo())\n  \\(c as? U ?? .bar())\n  \"\"\"\n",
+    "func f() async {\n    async let x = b as? T ?? .foo()\n    _ = await x\n}\n",
+    "func f() {\n    repeat { } while (b as? T ?? .foo()) == nil\n}\n",
+    "func f() {\n    outer: for v in xs { _ = b as? T ?? .foo(); continue outer }\n}\n",
+    "class C {\n    static let shared = b as? T ?? .foo()\n}\n",
+    "class C {\n    #if DEBUG\n    var v = b as? T ?? .foo()\n    #endif\n}\n",
+    "struct S {\n    let x = b as? T ?? .foo()\n    let y = c as? U ?? .foo()\n}\n",
+    "enum E {\n    case a(Int = 0)\n    static var d = b as? T ?? .foo()\n}\n",
+    "typealias A = Int\nfunc f() { _ = b as? T ?? .foo() }\n",
+    "func f() {\n    let g = { { { b as? T ?? .foo() }() }() }()\n}\n",
+    "func f() {\n    g { h { i { _ = b as? T ?? .foo() } } }\n}\n",
+    "func f() {\n    let a = [1].map { x in b as? T ?? .foo() }.filter { y in c as? U ?? .foo() }\n}\n",
+    "func f() {\n    let a = xs.map { $0 as? T ?? .foo() }\n}\n",
+    "func f() {\n    let a = xs.map { ($0 as? T)?.foo() ?? .bar() }\n}\n",
+    "func f() {\n    let a = b as? T ?? .foo() as? U ?? .bar()\n}\n",
+    "func f() {\n    let a = (b as? T ?? .foo()) as? U ?? .bar()\n}\n",
+    "func f() {\n    let a = b as? T ?? (.foo())\n}\n",
+    "func f() {\n    let a = b as? T ?? (x.foo())\n}\n",
+    "func f() {\n    let a: T = b as? T ?? T.foo()\n}\n",
+    "func f() {\n    let a: [T] = b as? [T] ?? [].foo()\n}\n",
 ];
 
+/// Rewritten for tree-sitter-swift 0.7.4, like the table above: nested,
+/// interpolated and unusual contexts hold cast-coalesce probes that used to be
+/// refused and are now parsed correctly (no note, no leak, equal to the twin).
 #[test]
 fn every_refused_member_is_one_note_in_nested_and_unusual_contexts() {
     let mut failures = Vec::new();
-    for (source, want) in COUNTED_MORE {
-        let e = ex("a.swift", source);
-        let got = note_count(&e);
-        if got != *want {
-            failures.push(format!(
-                "{source:?}: want {want} got {got}: {}",
-                describe(&e)
-            ));
-        }
-        for leak in leaks(&e) {
-            failures.push(format!("{source:?}: leaked {leak}"));
-        }
-    }
+    let twinned = COUNTED_MORE
+        .iter()
+        .filter(|source| judge_cast_coalesce(source, &mut failures))
+        .count();
+    assert!(
+        twinned >= COUNTED_MORE.len() - 6,
+        "only {twinned} of {} probes had a cast to parenthesise",
+        COUNTED_MORE.len()
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

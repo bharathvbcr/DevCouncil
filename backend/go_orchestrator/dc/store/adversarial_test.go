@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // TestColdStartContentionYieldsNoLockErrors covers the case its neighbour below
@@ -54,6 +56,7 @@ func TestColdStartContentionYieldsNoLockErrors(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				c := New(bin, db)
+				defer c.Close()
 				c.Timeout = 30 * time.Second
 				<-start
 				// An acquire needs its task to exist (a task is a workbench
@@ -114,10 +117,12 @@ func TestConcurrentAcquireElectsExactlyOneHolder(t *testing.T) {
 	// refuses to bring a store into existence, because a health check that
 	// creates the database it was asked about cannot tell a mistyped path from
 	// a real store.
-	if _, err := New(bin, db).ActiveLeases(context.Background()); err != nil {
+	prep := New(bin, db)
+	t.Cleanup(prep.Close)
+	if _, err := prep.ActiveLeases(context.Background()); err != nil {
 		t.Fatalf("prepare store: %v", err)
 	}
-	seedTask(t, New(bin, db), "TASK-RACE")
+	seedTask(t, prep, "TASK-RACE")
 
 	const racers = 24
 	var wg sync.WaitGroup
@@ -130,6 +135,7 @@ func TestConcurrentAcquireElectsExactlyOneHolder(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			c := New(bin, db)
+			defer c.Close()
 			c.Timeout = 30 * time.Second
 			<-start
 			lease, err := c.Acquire(context.Background(), AcquireRequest{
@@ -187,6 +193,7 @@ func TestUnreachableStoreNeverReportsAValidLease(t *testing.T) {
 	}
 
 	write := func(name, body string) string {
+		testsupport.RequireShellFakes(t)
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -271,6 +278,7 @@ func TestUnreachableStoreNeverReportsAValidLease(t *testing.T) {
 // report no code, both of which are at least errors; renew was the one that
 // turned an unreadable reply into a plausible answer.
 func TestAJSONNullIsNotAnAnswer(t *testing.T) {
+	testsupport.RequireShellFakes(t)
 	dir := t.TempDir()
 	nul := filepath.Join(dir, "null.sh")
 	if err := os.WriteFile(nul, []byte("#!/bin/sh\necho null\n"), 0o755); err != nil {

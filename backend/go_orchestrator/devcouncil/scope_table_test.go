@@ -93,6 +93,7 @@ func TestScopeSurfacesAgreeOnTheSharedFixtureTable(t *testing.T) {
 	git("commit", "-q", "-m", "seed")
 
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +200,7 @@ func TestDeleteOfAModifyPlannedPathIsAnOperationRefusalNotAScopeOne(t *testing.T
 func TestDotSlashForbiddenEntryDeniesAnAbsentPath(t *testing.T) {
 	root := t.TempDir()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(t.Context()); err != nil {
 		t.Fatal(err)
 	}

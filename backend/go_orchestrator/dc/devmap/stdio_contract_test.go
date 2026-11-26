@@ -119,7 +119,8 @@ func TestStdioHarnessNeverReachesSeatConfig(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", seat)
 	home := t.TempDir()
 	root := fixtureRepo(t)
-	servers := []byte(`{"servers":[{"name":"contract-probe","command":"/opt/probe/bin/probe","args":["mcp"]}]}`)
+	servers := []byte(`{"servers":[{"name":"contract-probe","command":"` +
+		testsupport.AbsoluteFixturePath("/opt/probe/bin/probe") + `","args":["mcp"]}]}`)
 
 	doc := devmapStdout(t, bin, home, servers,
 		"--json", "integrate", "claude", "--project-root", root, "--servers-stdin")
@@ -130,14 +131,16 @@ func TestStdioHarnessNeverReachesSeatConfig(t *testing.T) {
 		t.Fatalf("the apply wrote no integrate report (check_ok missing, got %v): %v", ok, doc)
 	}
 	// IntegrateReport names the documents it touched under "path" in each of
-	// these arrays (protocols/devmap/stdio.v1.json, integrate_report).
+	// these arrays (protocols/devmap/stdio.v1.json, integrate_report). DevMap
+	// reports them canonical, which on Windows is the verbatim `\\?\C:\...`
+	// spelling, so they are read through PlainPath as every reader must.
 	var paths []string
 	for _, key := range []string{"global_mcp", "project_mcp", "hooks", "servers", "guides"} {
 		entries, _ := doc[key].([]any)
 		for _, entry := range entries {
 			if obj, ok := entry.(map[string]any); ok {
 				if path, ok := obj["path"].(string); ok && path != "" {
-					paths = append(paths, path)
+					paths = append(paths, PlainPath(path))
 				}
 			}
 		}
@@ -192,7 +195,8 @@ func TestTheLiveStdioContractReplay(t *testing.T) {
 	contract := loadContract(t)
 	home := t.TempDir()
 	root := fixtureRepo(t)
-	servers := []byte(`{"servers":[{"name":"contract-probe","command":"/opt/probe/bin/probe","args":["mcp"]}]}`)
+	servers := []byte(`{"servers":[{"name":"contract-probe","command":"` +
+		testsupport.AbsoluteFixturePath("/opt/probe/bin/probe") + `","args":["mcp"]}]}`)
 
 	check := func(name string, doc map[string]any) {
 		t.Helper()

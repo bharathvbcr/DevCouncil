@@ -26,6 +26,7 @@ func plantTaskWithLinks(t *testing.T, reqs, acs string) (*Client, string) {
 	bin := testsupport.DCStore(t)
 	db := filepath.Join(t.TempDir(), "state.sqlite")
 	c := New(bin, db)
+	t.Cleanup(c.Close)
 
 	testsupport.SeedTask(t, db, testsupport.TaskSeed{
 		ID: "TASK-1", Title: "planted",
@@ -178,6 +179,7 @@ func TestAnUnlinkedTaskReportsNoRequirementsRatherThanFailing(t *testing.T) {
 	bin := testsupport.DCStore(t)
 	db := filepath.Join(t.TempDir(), "state.sqlite")
 	c := New(bin, db)
+	t.Cleanup(c.Close)
 	testsupport.SeedTask(t, db, testsupport.TaskSeed{ID: "TASK-1", Title: "planted"})
 
 	task, err := c.Task(context.Background(), "TASK-1")

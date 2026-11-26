@@ -353,18 +353,53 @@ func ResolveOutside(explicit, root string) (string, error) {
 	return found, err
 }
 
+// PlainPath returns a path DevMap reported in the spelling the rest of Go uses.
+//
+// DevMap canonicalises every path it reports, and on Windows the canonical form
+// of a drive path is the verbatim one: `\\?\C:\work\x` for `C:\work\x`, and
+// `\\?\UNC\host\share\x` for `\\host\share\x`. Go joins and compares paths as
+// plain text, so a verbatim path never equals the plain spelling of the same
+// file, and filepath.Join(root, `\\?\C:\work\x`) is a path that does not exist.
+// This is the one place devmap's spelling is converted; every reader of a
+// reported path goes through it. Verbatim forms that name no drive or share
+// (`\\?\Volume{...}`) are returned unchanged, because stripping their prefix
+// would name a different file. Off Windows no path has the prefix, so the
+// result is the input.
+func PlainPath(p string) string {
+	const verbatim, verbatimUNC = `\\?\`, `\\?\UNC\`
+	switch {
+	case strings.HasPrefix(p, verbatimUNC) && len(p) > len(verbatimUNC):
+		return `\\` + p[len(verbatimUNC):]
+	case strings.HasPrefix(p, verbatim) && len(p) >= len(verbatim)+2 &&
+		p[len(verbatim)+1] == ':' && isDriveLetter(p[len(verbatim)]):
+		return p[len(verbatim):]
+	}
+	return p
+}
+
+func isDriveLetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+
 // RelativeTo names a path DevMap reported relative to root when it lies
 // inside it, whichever spelling of root it used: DevMap canonicalises, so on
 // macOS `/var/…` arrives as `/private/var/…`. A path outside — a user-level
 // config — is returned unchanged.
 func RelativeTo(root, p string) string {
+	p = PlainPath(p)
 	roots := []string{root}
 	if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
 		roots = append(roots, resolved)
 	}
 	for _, base := range roots {
-		if rel, err := filepath.Rel(base, p); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
-			return filepath.ToSlash(rel)
+		// Judged in slash form: filepath.Rel answers `..\x` on Windows, which a
+		// "../" prefix check never matched, so a path outside the first root
+		// tried (the 8.3 spelling of a temp dir, say) came back as
+		// ../../runneradmin/... instead of being tried against the next.
+		rel, err := filepath.Rel(base, p)
+		if err != nil {
+			continue
+		}
+		if rel = filepath.ToSlash(rel); rel != ".." && !strings.HasPrefix(rel, "../") {
+			return rel
 		}
 	}
 	return p

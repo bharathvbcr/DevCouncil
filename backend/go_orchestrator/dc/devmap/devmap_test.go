@@ -3,7 +3,6 @@ package devmap
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,9 +61,7 @@ func fakeSaying(t *testing.T, replies, said map[string]string, artifacts ...stri
 	}
 	script += "esac; done\necho '{}'\n"
 	path := filepath.Join(dir, "devmap")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	return New(path, dir)
 }
 

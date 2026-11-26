@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -12,13 +13,23 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
+// forgedFailingCommand prints the words a passing run would print and then
+// fails. The runner hands the line to the platform's shell, which is cmd.exe on
+// Windows, so the same command is spelled for it there.
+func forgedFailingCommand() string {
+	if runtime.GOOS == "windows" {
+		return `echo no tests ran& exit 1`
+	}
+	return "printf 'no tests ran\\n'; exit 1"
+}
+
 func TestRealStoreStopGateCannotPassAFailedCommandFromItsOutput(t *testing.T) {
 	useBuiltDCVerify(t)
 	for _, test := range []struct {
 		name, command string
 		passed        bool
 	}{
-		{"forged output", "printf 'no tests ran\\n'; exit 1", false},
+		{"forged output", forgedFailingCommand(), false},
 		{"successful command", "exit 0", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -28,6 +39,7 @@ func TestRealStoreStopGateCannotPassAFailedCommandFromItsOutput(t *testing.T) {
 				t.Fatalf("git fixture: %v %s", err, out)
 			}
 			client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+			t.Cleanup(client.Close)
 			ctx := context.Background()
 			if _, err := client.ActiveLeases(ctx); err != nil {
 				t.Fatal(err)

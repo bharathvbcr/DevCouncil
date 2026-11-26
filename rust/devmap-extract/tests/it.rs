@@ -182,6 +182,8 @@ mod svelte_template_text;
 #[cfg(feature = "parse")]
 mod swift_close_attack;
 #[cfg(feature = "parse")]
+mod swift_leading_dot_chains;
+#[cfg(feature = "parse")]
 mod swift_properties;
 #[cfg(feature = "parse")]
 mod swift_properties_attack;
@@ -192,6 +194,8 @@ mod swift_recall_r5_attack;
 #[cfg(feature = "parse")]
 mod swift_scope_terminates;
 mod swift_targets_collect;
+#[cfg(feature = "parse")]
+mod swift_trailing_closure_operand;
 #[cfg(feature = "parse")]
 mod test_phase2_hardening;
 mod the_bounded_runner_under_hostile_children;

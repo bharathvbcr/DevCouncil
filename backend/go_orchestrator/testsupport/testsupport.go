@@ -332,6 +332,36 @@ func Devmap(t testing.TB) string {
 	return cargoBin(t, "devmap-cli", "devmap")
 }
 
+// StableCopy returns a content-addressed copy of the executable at path, for a
+// test that was handed a binary by PATH or an environment variable rather than
+// built one through cargoBin.
+//
+// Such a path is often the cargo output itself (CI puts target/debug on PATH).
+// Executing it holds it open, and Windows will not let cargo replace a running
+// image, so a test that runs it makes every concurrent `cargo build` in another
+// package fail its uplift (see upliftBlockedByRunningImage). The copy lives in
+// the OS temp directory, named after its own hash, and is not removed: another
+// test process may be about to run it.
+//
+// It is not under a testBinDir directory. That name marks cargoBin's hashed
+// builds, and devmap refuses to register an MCP command at any path that
+// crosses it (`refuse_hashed_test_binary`), so a stable copy there failed every
+// test that drives `devmap integrate` on Windows, the one platform that copies:
+// "refusing to register an MCP command at ...\devcouncil-testbin\...".
+func StableCopy(t testing.TB, path string) string {
+	t.Helper()
+	data, err := readStableArtifact(path)
+	if err != nil {
+		t.Fatalf("copying %s: %v", path, err)
+	}
+	binary := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	copied, err := publishInto(filepath.Join(os.TempDir(), "devcouncil-stable"), binary, data)
+	if err != nil {
+		t.Fatalf("copying %s: %v", path, err)
+	}
+	return copied
+}
+
 // cargoBin builds one binary and returns the path to a stable copy of it.
 //
 // The copy is the point. `cargo build` does not leave its output alone: every
@@ -453,21 +483,45 @@ func buildAndPublish(stop time.Time, boundBy, crates, crate, binary string) (str
 	defer unlock()
 
 	started := time.Now()
-	cmd := exec.CommandContext(ctx, "cargo", "build", "-p", crate, "--bin", binary)
-	proc.ConfigureGroup(cmd)
-	cmd.Dir = crates
-	log := &proc.CappedBuffer{Limit: cargoLogLimit}
-	cmd.Stdout, cmd.Stderr = log, log
-	cmd.WaitDelay = 5 * time.Second
-	// The method value, not cmd.Run(): that call is what the process-wide
-	// bound test forbids, because Start only becomes cancellable after the
-	// fork. The wrapper exists to close ran once that call returns.
-	run := cmd.Run
-	ran := make(chan struct{})
-	runErr, timedOut := proc.RunBounded(ctx, func() error {
-		defer close(ran)
-		return run()
-	})
+	var (
+		cmd      *exec.Cmd
+		log      *proc.CappedBuffer
+		ran      chan struct{}
+		runErr   error
+		timedOut bool
+	)
+	for {
+		cmd = exec.CommandContext(ctx, "cargo", "build", "-p", crate, "--bin", binary)
+		proc.ConfigureGroup(cmd)
+		cmd.Dir = crates
+		log = &proc.CappedBuffer{Limit: cargoLogLimit}
+		cmd.Stdout, cmd.Stderr = log, log
+		cmd.WaitDelay = 5 * time.Second
+		// The method value, not cmd.Run(): that call is what the process-wide
+		// bound test forbids, because Start only becomes cancellable after the
+		// fork. The wrapper exists to close ran once that call returns.
+		run := cmd.Run
+		ran = make(chan struct{})
+		runErr, timedOut = proc.RunBounded(ctx, func() error {
+			defer close(ran)
+			return run()
+		})
+		if timedOut || runErr == nil || !upliftBlockedByRunningImage(runErr, log.Bytes()) {
+			break
+		}
+		// Another package's test is running the binary cargo is trying to
+		// replace; it exits on its own, so wait for it rather than fail. ctx
+		// bounds the wait, and a build that is still blocked at the deadline
+		// is reported as overrun, the same as any other slow build.
+		select {
+		case <-ctx.Done():
+		case <-time.After(upliftRetryDelay):
+		}
+		if ctx.Err() != nil {
+			timedOut = true
+			break
+		}
+	}
 	if timedOut {
 		err := fmt.Errorf("%w: `cargo build -p %s --bin %s` in %s was stopped after %s, the bound set by %s.%s",
 			errOverran, crate, binary, crates, time.Since(started).Round(time.Second), boundBy, cargoWaitHint(crate, binary))
@@ -488,12 +542,37 @@ func buildAndPublish(stop time.Time, boundBy, crates, crate, binary string) (str
 		return "", log.Bytes(), runErr
 	}
 
-	data, err := readStableArtifact(filepath.Join(target, "debug", executableName(binary)))
+	data, err := readStableArtifact(filepath.Join(target, "debug", ExecutableName(binary)))
 	if err != nil {
 		return "", log.Bytes(), err
 	}
 	path, err := publishArtifact(target, binary, data)
 	return path, log.Bytes(), err
+}
+
+// upliftRetryDelay is how long cargoBin waits before building again after cargo
+// could not replace a binary that was running.
+const upliftRetryDelay = 2 * time.Second
+
+// upliftBlockedByRunningImage reports whether a failed `cargo build` failed only
+// because it could not replace its own output while a process was running it.
+//
+// Every build re-does cargo's uplift into target/debug, unlinking the existing
+// binary first (see cargoBin). Unix lets that succeed under a running process.
+// Windows does not: deleting a running image is refused with "Access is denied
+// (os error 5)", cargo exits 101, and the test that wanted the binary fails with
+// "cannot build" although nothing is wrong with the build. The image is running
+// because some other package's test resolved the same file from PATH (CI puts
+// target/debug there) and execs it directly, and those processes are short
+// lived, so waiting and building again is correct. Any other failure, or this
+// one with no uplift line in the log, is a real build failure and is not retried.
+func upliftBlockedByRunningImage(err error, log []byte) bool {
+	if err == nil {
+		return false
+	}
+	text := string(log)
+	return strings.Contains(text, "failed to remove file") &&
+		(strings.Contains(text, "os error 5") || strings.Contains(text, "Access is denied"))
 }
 
 // cargoWaitHint says where the time of a build that overran may have gone.
@@ -616,9 +695,14 @@ func readStableArtifact(path string) ([]byte, error) {
 // An entry that already exists is left alone: its name is its content, so it
 // cannot differ from what we would write.
 func publishArtifact(target, binary string, data []byte) (string, error) {
+	return publishInto(filepath.Join(target, testBinDir), binary, data)
+}
+
+// publishInto is publishArtifact under parent itself, with no testBinDir.
+func publishInto(parent, binary string, data []byte) (string, error) {
 	sum := sha256.Sum256(data)
-	dir := filepath.Join(target, testBinDir, binary+"-"+hex.EncodeToString(sum[:])[:16])
-	path := filepath.Join(dir, executableName(binary))
+	dir := filepath.Join(parent, binary+"-"+hex.EncodeToString(sum[:])[:16])
+	path := filepath.Join(dir, ExecutableName(binary))
 	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(data)) {
 		return path, nil
 	}
@@ -655,11 +739,12 @@ func publishArtifact(target, binary string, data []byte) (string, error) {
 	return path, nil
 }
 
-// executableName is the file name cargo gives a binary target on this
-// platform: the bare name, plus ".exe" on Windows. Looking for the bare name
-// there finds nothing, so every build was reported as unreadable after fifty
-// attempts although cargo had finished.
-func executableName(binary string) string {
+// ExecutableName is the file name a program has on this platform: the bare
+// name, plus ".exe" on Windows. Looking for the bare name there finds nothing,
+// so every cargo build was reported as unreadable after fifty attempts
+// although cargo had finished, and a test that plants a stand-in under the
+// bare name plants something Windows never runs.
+func ExecutableName(binary string) string {
 	if runtime.GOOS == "windows" {
 		return binary + ".exe"
 	}

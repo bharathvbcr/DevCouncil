@@ -197,7 +197,9 @@ func SetVerificationMode(path, mode string) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(path)
+	// safefile.ReadFile: another SetVerificationMode may be renaming over the
+	// file, which Windows refuses an open for until it is done.
+	data, err := safefile.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err

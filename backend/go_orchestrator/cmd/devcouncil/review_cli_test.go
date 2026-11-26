@@ -6,9 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
@@ -80,6 +82,14 @@ func reviewKey(t *testing.T) string {
 	code, out := cli(t, "review", "keygen", "--key-id", "test", "--out", keyPath)
 	if code != 0 {
 		t.Fatalf("keygen: %d %s", code, out)
+	}
+	if runtime.GOOS == "windows" {
+		// Windows has no mode bits to assert; what matters is that keygen's
+		// owner-only DACL passes the check the loader enforces.
+		if _, _, err := dc.LoadSigningKey(keyPath); err != nil {
+			t.Fatalf("keygen's key file was refused: %v", err)
+		}
+		return keyPath
 	}
 	info, err := os.Stat(keyPath)
 	if err != nil {

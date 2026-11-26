@@ -205,8 +205,10 @@ type SigningKey struct {
 
 // LoadSigningKey reads a private signing key from a file the agent cannot
 // reach. The caller is responsible for keeping that path outside the
-// repository; this refuses a key file that is group- or world-readable, the
-// way an ssh client refuses a loose private key.
+// repository; this refuses a key file that others can read, the way an ssh
+// client refuses a loose private key: on Unix a mode other than 0600, on
+// Windows a DACL that grants anyone but the owner (SYSTEM and Administrators
+// aside) access.
 func LoadSigningKey(path string) (string, ed25519.PrivateKey, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -215,8 +217,8 @@ func LoadSigningKey(path string) (string, ed25519.PrivateKey, error) {
 	if info.Size() > maxSignersFile {
 		return "", nil, fmt.Errorf("%s is larger than %d bytes", path, maxSignersFile)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return "", nil, fmt.Errorf("%s is readable by group or others (%o); a signing key must be 0600", path, info.Mode().Perm())
+	if err := checkKeyFileAccess(path, info); err != nil {
+		return "", nil, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

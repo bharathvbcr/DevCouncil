@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -342,6 +343,9 @@ func TestGitsContentTransformsCannotHideAnEdit(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
+			if name == "exec bit with core.fileMode off" && runtime.GOOS == "windows" {
+				t.Skip("Windows has no execute bit, so the chmod changes nothing and there is no edit to hide")
+			}
 			r := newSubjectRepo(t)
 			c.setup(r)
 			r.run("add", ".")

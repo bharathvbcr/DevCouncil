@@ -40,6 +40,7 @@ func runCLICtx(t *testing.T, ctx context.Context, client *store.Client, taskID, 
 func emptyStore(t *testing.T) *store.Client {
 	t.Helper()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}

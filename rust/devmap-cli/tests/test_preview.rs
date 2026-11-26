@@ -46,17 +46,22 @@ def report(rows):
     return compute(rows, 1.5)
 ";
 
+/// The fixture's files as the store keys them: repository-relative and
+/// `/`-separated, the spelling `devmap build` records (`repo_relative_key`)
+/// and the one `preview` resolves against the generation's root.
+///
+/// The fixture used to key them by their absolute OS path. The resolver splits
+/// paths on `/`, so on Windows `C:\..\lib.py` had no basename, `from lib
+/// import compute` bound to nothing, and the caller tests found no callers.
+const LIB_KEY: &str = "lib.py";
+const CALLER_KEY: &str = "caller.py";
+
 /// Build a store over a two-file fixture written into `dir`.
 fn fixture(dir: &Path) -> Store {
-    std::fs::write(dir.join("lib.py"), LIB).unwrap();
-    std::fs::write(dir.join("caller.py"), CALLER).unwrap();
-    let lib_path = dir.join("lib.py").to_string_lossy().into_owned();
-    let caller_path = dir.join("caller.py").to_string_lossy().into_owned();
+    std::fs::write(dir.join(LIB_KEY), LIB).unwrap();
+    std::fs::write(dir.join(CALLER_KEY), CALLER).unwrap();
 
-    let extractions = vec![
-        extract_file(&lib_path, LIB),
-        extract_file(&caller_path, CALLER),
-    ];
+    let extractions = vec![extract_file(LIB_KEY, LIB), extract_file(CALLER_KEY, CALLER)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions).unwrap();
@@ -85,12 +90,11 @@ fn fixture(dir: &Path) -> Store {
 fn removing_a_function_names_the_callers_it_would_break() {
     let dir = scratch("removing_a_function_names_the_callers_it_would_break");
     let store = fixture(dir.as_path());
-    let lib_path = dir.as_path().join("lib.py").to_string_lossy().into_owned();
 
     // Drop `compute` entirely.
     let edited = "def helper(value):\n    return value * 2\n";
     let report = StoreQueryEngine::new(&store)
-        .preview(&lib_path, edited, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
+        .preview(LIB_KEY, edited, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
         .unwrap();
 
     assert!(report.delta_available);
@@ -123,12 +127,11 @@ fn removing_a_function_names_the_callers_it_would_break() {
 fn a_buffer_that_does_not_parse_reports_no_delta_at_all() {
     let dir = scratch("a_buffer_that_does_not_parse_reports_no_delta_at_all");
     let store = fixture(dir.as_path());
-    let lib_path = dir.as_path().join("lib.py").to_string_lossy().into_owned();
 
     // Rust source at a .py path: the Python grammar cannot make sense of it.
     let garbage = "fn main() -> Result<(), Box<dyn Error>> { let x = vec![1,2,3]; Ok(()) }\n";
     let report = StoreQueryEngine::new(&store)
-        .preview(&lib_path, garbage, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
+        .preview(LIB_KEY, garbage, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
         .unwrap();
 
     if report.parse_status == "failed" {
@@ -155,13 +158,12 @@ fn a_buffer_that_does_not_parse_reports_no_delta_at_all() {
 fn a_body_change_is_not_reported_as_breaking_callers() {
     let dir = scratch("a_body_change_is_not_reported_as_breaking_callers");
     let store = fixture(dir.as_path());
-    let lib_path = dir.as_path().join("lib.py").to_string_lossy().into_owned();
 
     // Same declaration, different body.
     let edited = LIB.replace("total -= row.penalty", "total -= row.penalty * 2");
     assert_ne!(edited, LIB, "fixture edit did not apply");
     let report = StoreQueryEngine::new(&store)
-        .preview(&lib_path, &edited, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
+        .preview(LIB_KEY, &edited, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
         .unwrap();
 
     assert!(report
@@ -178,7 +180,6 @@ fn a_body_change_is_not_reported_as_breaking_callers() {
 fn a_declaration_change_outranks_the_body_change_it_implies() {
     let dir = scratch("a_declaration_change_outranks_the_body_change_it_implies");
     let store = fixture(dir.as_path());
-    let lib_path = dir.as_path().join("lib.py").to_string_lossy().into_owned();
 
     let edited = LIB.replace(
         "def compute(rows, rate):",
@@ -186,7 +187,7 @@ fn a_declaration_change_outranks_the_body_change_it_implies() {
     );
     assert_ne!(edited, LIB, "fixture edit did not apply");
     let report = StoreQueryEngine::new(&store)
-        .preview(&lib_path, &edited, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
+        .preview(LIB_KEY, &edited, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
         .unwrap();
 
     let compute = report
@@ -209,10 +210,9 @@ fn a_declaration_change_outranks_the_body_change_it_implies() {
 fn an_unchanged_buffer_reports_nothing() {
     let dir = scratch("an_unchanged_buffer_reports_nothing");
     let store = fixture(dir.as_path());
-    let lib_path = dir.as_path().join("lib.py").to_string_lossy().into_owned();
 
     let report = StoreQueryEngine::new(&store)
-        .preview(&lib_path, LIB, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
+        .preview(LIB_KEY, LIB, 2000, PREVIEW_CALLER_MIN_CONFIDENCE)
         .unwrap();
     assert!(
         report.symbols.is_empty(),
@@ -226,13 +226,13 @@ fn an_unchanged_buffer_reports_nothing() {
 fn preview_writes_nothing() {
     let dir = scratch("preview_writes_nothing");
     let store = fixture(dir.as_path());
-    let lib_path = dir.as_path().join("lib.py").to_string_lossy().into_owned();
+    let lib_path = dir.as_path().join(LIB_KEY);
     let before = std::fs::read_to_string(&lib_path).unwrap();
     let generation_before = store.latest_generation_id().unwrap();
 
     StoreQueryEngine::new(&store)
         .preview(
-            &lib_path,
+            LIB_KEY,
             "def nothing():\n    pass\n",
             2000,
             PREVIEW_CALLER_MIN_CONFIDENCE,

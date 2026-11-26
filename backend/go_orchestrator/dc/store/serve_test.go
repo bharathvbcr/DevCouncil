@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // framedReply renders one reply the way a serving store writes it.
@@ -24,6 +26,7 @@ func framedReply(status, body string) string {
 // unmangled — which is the point of several of the cases below.
 func fakeStore(t *testing.T, stdout string, preamble ...string) string {
 	t.Helper()
+	testsupport.RequireShellFakes(t)
 	dir := t.TempDir()
 	payload := filepath.Join(dir, "reply.bin")
 	if err := os.WriteFile(payload, []byte(stdout), 0o600); err != nil {

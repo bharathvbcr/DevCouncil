@@ -214,14 +214,15 @@ fn an_emitted_hook_does_not_name_a_path_that_exists_on_one_machine() {
     let root = fixture("binary-flag");
     assert_built(&build(&root, None));
 
+    // Absolute on the host: a drive-less `/usr/...` is refused on Windows, and
+    // forward slashes survive the JSON the command prints unescaped.
+    let binary = if cfg!(windows) {
+        "C:/usr/local/bin/devmap"
+    } else {
+        "/usr/local/bin/devmap"
+    };
     let output = Command::new(devmap())
-        .args([
-            "--json",
-            "claude",
-            "hooks",
-            "--binary",
-            "/usr/local/bin/devmap",
-        ])
+        .args(["--json", "claude", "hooks", "--binary", binary])
         .current_dir(&root)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -231,7 +232,7 @@ fn an_emitted_hook_does_not_name_a_path_that_exists_on_one_machine() {
 
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
-        text.contains("/usr/local/bin/devmap"),
+        text.contains(binary),
         "--binary must be what the emitted handlers name: {text}"
     );
     assert!(

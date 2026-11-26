@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use devmap_extract::collect_project_manifests;
 use devmap_resolve::resolver::{
-    ResolutionBudgetUsage, ResolveReuse, ReuseBudgetReceipt, ReusedFileResolution,
-    RESOLUTION_REUSE_EPOCH,
+    resolution_reuse_dir_name, ResolutionBudgetUsage, ResolveReuse, ReuseBudgetReceipt,
+    ReusedFileResolution,
 };
 use devmap_resolve::{LimitPolicy, ResolutionLimits, Resolver, UnresolvedClass};
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
@@ -1099,16 +1099,22 @@ fn run_build(
     // The generation is committed. A cache write that fails must not fail it:
     // the next edit resolves every file the cache cannot prove, which is the
     // same graph. The diagnostic carries the error text.
-    if let Err(error) = persist_resolution_reuse(
-        path,
-        &store,
-        gen_id,
-        &extractions,
-        &produced,
-        full_resolve,
-        &limits,
-        usage,
-    ) {
+    //
+    // Timed as its own sub-phase. It writes one JSON blob per resolved file,
+    // 168 MB for this repository's 1,297 files, and as an untimed span it
+    // showed up only as 0.9-1.0 s that "persisting" took beyond its parts.
+    if let Err(error) = progress.timed("persist:reuse_cache", || {
+        persist_resolution_reuse(
+            path,
+            &store,
+            gen_id,
+            &extractions,
+            &produced,
+            full_resolve,
+            &limits,
+            usage,
+        )
+    }) {
         progress.display.diagnostic(format_args!(
             "resolution reuse: the generation was committed but the reuse cache was not updated: {error}"
         ));
@@ -1609,12 +1615,18 @@ struct LoadedReuse {
 }
 
 fn reuse_dir(repo: &std::path::Path) -> std::path::PathBuf {
-    devmap_extract::paths::state_dir(repo)
-        .join(format!("resolution-reuse-{RESOLUTION_REUSE_EPOCH}"))
+    devmap_extract::paths::state_dir(repo).join(resolution_reuse_dir_name())
 }
 
 fn reuse_blob_stem(file_path: &str) -> String {
     crate::sha256::sha256_hex(file_path.as_bytes())
+}
+
+/// A reuse blob's file name: its JSON in a checksummed zstd frame.
+const REUSE_BLOB_SUFFIX: &str = ".json.zst";
+
+fn reuse_blob_path(dir: &std::path::Path, file_path: &str) -> std::path::PathBuf {
+    dir.join(format!("{}{REUSE_BLOB_SUFFIX}", reuse_blob_stem(file_path)))
 }
 
 fn limits_match(receipt: &ReuseBudgetReceipt, limits: &ResolutionLimits) -> bool {
@@ -1832,7 +1844,7 @@ fn read_reuse_blob(
     file_path: &str,
     content_hash: u64,
 ) -> Result<ReusedFileResolution, String> {
-    let path = dir.join(format!("{}.json", reuse_blob_stem(file_path)));
+    let path = reuse_blob_path(dir, file_path);
     let meta = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     if !meta.is_file() {
         return Err(format!("{} is not a file", path.display()));
@@ -1854,8 +1866,20 @@ fn read_reuse_blob(
             REUSE_BLOB_MAX_BYTES
         ));
     }
+    // The frame declares its size and the codec refuses one over its own cap
+    // before allocating; the reuse cap is the tighter bound, checked on what
+    // the frame actually held.
+    let json = devmap_store::inflate_json_frame(&bytes, &path.display().to_string())?;
+    if json.len() as u64 > REUSE_BLOB_MAX_BYTES {
+        return Err(format!(
+            "{} decompresses to {} bytes, over the {} byte cap",
+            path.display(),
+            json.len(),
+            REUSE_BLOB_MAX_BYTES
+        ));
+    }
     let parsed: ReusedFileResolution =
-        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        serde_json::from_str(&json).map_err(|error| format!("{}: {error}", path.display()))?;
     if parsed.content_hash != content_hash {
         return Err(format!(
             "{} content hash {:x} does not match the file {:x}",
@@ -1956,17 +1980,20 @@ fn write_reuse_blob(
     file_path: &str,
     file: &ReusedFileResolution,
 ) -> Result<(), String> {
-    let bytes = serde_json::to_vec(file)
+    let json = serde_json::to_string(file)
         .map_err(|error| format!("{file_path}: could not encode the resolution: {error}"))?;
-    if bytes.len() as u64 > REUSE_BLOB_MAX_BYTES {
+    // The cap is on the JSON, the size a reader will allocate, not the frame.
+    if json.len() as u64 > REUSE_BLOB_MAX_BYTES {
         return Err(format!(
             "{file_path}: encoded resolution is {} bytes, over the {} byte cap",
-            bytes.len(),
+            json.len(),
             REUSE_BLOB_MAX_BYTES
         ));
     }
-    let dest = dir.join(format!("{}.json", reuse_blob_stem(file_path)));
-    write_atomic(&dest, &bytes).map_err(|error| format!("{file_path}: {error}"))
+    let frame = devmap_store::compress_json_frame(&json)
+        .map_err(|error| format!("{file_path}: could not compress the resolution: {error}"))?;
+    write_atomic(&reuse_blob_path(dir, file_path), &frame)
+        .map_err(|error| format!("{file_path}: {error}"))
 }
 
 /// Write `bytes` to `dest` by renaming a sibling temp file over it.
@@ -2025,7 +2052,7 @@ fn prune_reuse_blobs(
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(stem) = name.strip_suffix(".json") else {
+        let Some(stem) = name.strip_suffix(REUSE_BLOB_SUFFIX) else {
             continue;
         };
         if stem.len() == 64
@@ -2040,7 +2067,9 @@ fn prune_reuse_blobs(
 
 fn remove_old_reuse_epochs(repo: &std::path::Path) -> std::io::Result<()> {
     let state = devmap_extract::paths::state_dir(repo);
-    let current = format!("resolution-reuse-{RESOLUTION_REUSE_EPOCH}");
+    // Every other `resolution-reuse-*` directory goes: another epoch's, and
+    // another encoding's (the plain-JSON `resolution-reuse-<epoch>` included).
+    let current = resolution_reuse_dir_name();
     let entries = match std::fs::read_dir(&state) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
