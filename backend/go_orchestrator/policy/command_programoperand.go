@@ -194,6 +194,14 @@ var offLineOptions = map[string]string{
 	"fgrep": "",
 }
 
+// programOpensFiles are the tools whose program can itself open a file: sed's
+// `r`, `R`, `w` and `e` commands, awk's `getline <` and redirections. Every
+// program word of theirs, the first operand and each -e value, is judged as a
+// literal path, which is how main refused `sed 'r ./.env.local' README.md`.
+// A name the program builds at run time cannot be judged from the text, here
+// or on main.
+var programOpensFiles = map[string]bool{"sed": true, "awk": true}
+
 // programOperandsOf finds the program words of the command at words[at] — the
 // first operand, or the values of -e/--regexp — for the tools in programTools
 // and `git grep`. Every other word stays an operand to judge, option values
@@ -256,6 +264,9 @@ func programOperandsOf(command string, words []shellWord, at int) programOperand
 			return false
 		}
 		out.exempt[index[argAt]] = true
+		if programOpensFiles[command] {
+			out.literal[index[argAt]] = true
+		}
 		return true
 	}
 

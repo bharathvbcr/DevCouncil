@@ -210,6 +210,14 @@ func TestSecretReadProgramOperandPermutationsAndUnknownOptions(t *testing.T) {
 		// The same holds for a bare credential name searched as a regex: main
 		// refused it too, and GREP_OPTIONS='-e x' would make it the file read.
 		`grep .env .gitignore`,
+		// A sed or awk program can open a file itself, so its words are still
+		// judged as literal paths.
+		`sed 'r ./.env.local' README.md`,
+		`sed '1R ./.env.local' README.md`,
+		`sed '1e cat ./.env.local' README.md`,
+		`sed -e 'r ./.env.local' README.md`,
+		`sed --expression='r ./.env.local' README.md`,
+		`awk 'BEGIN{while((getline l<"./.env.local")>0)print l}'`,
 	} {
 		d := gate.EvaluateCommand(command, nil)
 		if d.Action != Deny || d.Severity != Hard || d.Rule != RuleCommandSecretRead {
