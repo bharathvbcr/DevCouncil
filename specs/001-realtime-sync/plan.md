@@ -1,8 +1,10 @@
 # Implementation Plan: 001 - Realtime Sync
 
+> **Status (2026-11-26)**: Core Go spec/workflow orchestration in `backend/go_orchestrator/devcouncil/spec/` and `workflow/` and SQLite state persistence in `.devcouncil/state.sqlite` are implemented. Live cross-worktree event streaming to Waylode (formerly GitPulse) remains the target integration layer described below.
+
 ## 1. Technical Context
 - **Primary Languages**: Go (orchestration and CLI dispatch) and Rust (high-performance event broker and state store)
-- **Target Subsystems**: `backend/go_orchestrator/devcouncil/spec/`, `GitPulse/src-tauri/src/engine/`
+- **Target Subsystems**: `backend/go_orchestrator/devcouncil/spec/`, Waylode desktop engine (`../GitPulse/src-tauri/src/engine/`, formerly `GitPulse`)
 - **Concurrency & Storage**: SQLite WAL persistence in `.devcouncil/state.sqlite` and Unix domain sockets for event streaming.
 
 ## 2. Constitution Check & Complexity Tracking
@@ -12,7 +14,7 @@
 | **Article II: CLI Consumer** | PASSED | CLI commands support human-readable and deterministic `--json` envelopes |
 | **Article III: Test-First** | PASSED | Integration tests written alongside contracts before implementation |
 | **Article IV: Fail-Closed** | PASSED | Verification gates abort if socket or runner is unconfigured |
-| **Article V: Single Source** | PASSED | Reuses existing `dc-store` and `GitPulse` event streams without duplication |
+| **Article V: Single Source** | PASSED | Reuses existing `dc-store` and Waylode (formerly GitPulse) event streams without duplication |
 | **Article VI: Allocator Symmetry**| PASSED | Cross-language boundaries governed by Gusset zero-panic firewalls |
 | **Article VII: Simplicity Limit** | PASSED | Introduces 0 new external dependencies; adds 2 modular internal packages |
 | **Article VIII: Anti-Abstraction**| PASSED | Concrete implementations tailored specifically to agent worktree syncing |

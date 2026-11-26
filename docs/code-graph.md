@@ -116,7 +116,7 @@ symbol graph (`devmap html`), which is linked from its footer. Over HTTP
 `/map_preview.html` and `/code_graph.html`; see
 [HOST_INTEGRATION](devmap/HOST_INTEGRATION.md).
 
-Both pages draw with the renderer GitPulse's Map section uses: a deterministic
+Both pages draw with the renderer Waylode's (formerly GitPulse's) Map section uses: a deterministic
 layout (communities packed side by side, hubs near the centre, no simulation
 that keeps moving) and an opt-in **Globe** layout for the file and symbol
 graphs. Light or dark follows the system setting, and the page respects
@@ -141,7 +141,7 @@ The Navigator is an area tree with a filter and the standard tree keys (arrows,
 Home, End, Enter). Selecting an area opens its detail: language mix, entry
 points, critical files, a tests sample, clickable neighbours, handoffs and role
 files, with **Show on map** to find its dot. The pages are read-only: where
-GitPulse opens a file in its editor, a file here is a **Copy path** button. A
+Waylode opens a file in its editor, a file here is a **Copy path** button. A
 neighbour that is not a drawn subsystem is shown greyed and does not link. "Not
 computed for this map" means the map was built without that evidence, which
 differs from "none". The tests list is a capped sample and the payload carries no

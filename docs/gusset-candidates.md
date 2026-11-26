@@ -55,7 +55,7 @@ walk dominates the Go profile. On the questions themselves, the engine costs
 2.1–2.5× fnmatch.
 
 The earlier figures ("about 20 µs per crossing, 63 µs against Go's 23 µs per
-write decision") came from the sequential `BenchmarkDecision` this replaces.
+write decision") came from the sequential BenchmarkDecision benchmark this replaces.
 It had one synthetic path, ran each side in turn and took no minimum. The
 crossing is about 1.5 µs, not 20.
 
@@ -92,7 +92,7 @@ Back to back, a decision's questions then took 4.3 µs against fnmatch's
 14.5 µs, 0.30×. Production does not ask back to back, though. A gate decides
 once per agent tool call, after the process has been idle, and every such
 call has to wake gusset's worker and completion reader. Both spin for only
-50 µs (`WORKER_SPIN`, `ticketReaderSpin`) and then park.
+50 µs (constants WORKER_SPIN and ticketReaderSpin) and then park.
 `BenchmarkIsolatedDecisionAB` (`policy/engine_oracle_test.go`) measures that shape:
 the whole write decision, a sleep before each sample, 300 decisions a side.
 `BenchmarkIsolatedBatchAB` on the prototype branch measures the questions
@@ -127,19 +127,19 @@ case gusset says not to take.
   back to fnmatch, because a fallback would compare fnmatch with itself. A
   question past its 30 s bound is an error, and an error is a decision no Go
   decision equals (`TestOracleNeverAnswersWithFnmatch`).
-- **gusset-check.** devcouncil, Manvi and GitPulse still link the umbrella
+- **gusset-check.** devcouncil, Manvi and Waylode (formerly GitPulse) still link the umbrella
   archive, and `gusset-check` still proves it loads, matches and contains a
   panic (I2).
 
-Removed with this decision: `gussetfn.Matcher` (with its `DefaultTimeout`
-fallback and `Fallbacks` counter), devcouncil's `policyMatcher`, Manvi's
-`gussetcheck.Matcher` and `gussetcheck.Ready`, and `serve`'s `requireGusset`.
+Removed with this decision: `gussetfn.Matcher` (with its removed DefaultTimeout
+fallback and `Fallbacks` counter), devcouncil's removed policyMatcher, Manvi's
+`gussetcheck.Matcher` and `gussetcheck.Ready`, and `serve`'s removed requireGusset flag.
 The last of these refused every policy check with `E_INTERNAL` when the engine
 failed its check. The rule IDs `path.engine_unavailable` and
 `command.engine_unavailable` stay in the verdict contract. A gate given a
 matcher that fails, as the oracle can, still denies under them.
 
-Hosts keep linking the archive. devcouncil, Manvi, GitPulse and Jarvis keep
+Hosts keep linking the archive. devcouncil, Manvi, Waylode and Jarvis keep
 `gusset-check`, by the owner's decision on 2026-10-08, so the oracle and the
 check stay exercised against the archive each host ships. A failed opcode
 registration is now refused at open, never left to the wrong decoder:

@@ -324,7 +324,7 @@ So K is **resolver-only**. R1.7(b) stands in for the missing `[[test]]`/`[[examp
   - `explore` reports "callers 0 of 0" for `bare_name_has_other_evidence` and `names_a_non_local_import`, though `resolve_all.rs:1563` and `candidates.rs:245` call them. This is recorded as gap `rust-vis-note-zero-callers`.
   - DevMap has no rung-order query, so the rung order in §4 was read from `resolve_all.rs`.
   - `rust_mod_declarers` is not on main at all: it exists only at `b1a22348:rust/devmap-resolve/src/resolver.rs:372`. DevMap's "outside index" answer for it was therefore correct.
-- **GitPulse.** `gitpulse_insights`: 8 worktrees, 0 collisions, 1 live session. Its codeintel facet reports main's store `is_fresh=false` ("stored extraction payload is obsolete"). That is the 97/98 reader mismatch the owner must resolve. No store was rebuilt.
+- **Waylode (formerly GitPulse).** `gitpulse_insights`: 8 worktrees, 0 collisions, 1 live session. Its codeintel facet reports main's store `is_fresh=false` ("stored extraction payload is obsolete"). That is the 97/98 reader mismatch the owner must resolve. No store was rebuilt.
 - **Read with `git show` only, without checking anything out:** `b1a22348` (lane), `f34f66fb` (attack), `docs/swift-lookup-rules` (format model). Cards: ft-1b21e9b6 revision 2 and ft-fff6fb52 revision 1.
 
 ## 12. Where rustc or the code contradicts the rulings or the card text

@@ -532,7 +532,7 @@ the edge and adding the variant where `p` declares or star-imports `q`, which mu
   `.../src/<set>/<lang>/` path prefix. A path heuristic; acceptable, or require a Gradle
   parse of `project(":x")` dependencies (a new fact)?
 - **Q6 Schema timing.** V1 and V2 force extract-v98 and the cross-app sweep
-  (`check:schema-parity`, GitPulse vendor, Manvi/Jarvis pins). Land the resolver model
+  (`check:schema-parity`, Waylode (formerly GitPulse) vendor, Manvi/Jarvis pins). Land the resolver model
   first against v97 (Scala on the stem allowance, C# partial probe stays ignored), then
   v98 as its own approved step? I recommend yes.
 - **Q7 Default-import table ownership.** The table (Kotlin/Java/Scala default imports,

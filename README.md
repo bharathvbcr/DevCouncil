@@ -109,12 +109,16 @@ its own:
 
 `bash scripts/install.sh` from a clone builds and installs the whole set; the
 [quickstart](docs/quickstart.md) covers presets and Windows. How the modules fit
-together, and which apps (Manvi, GitPulse) consume which, is in the
+together, and which apps (Manvi, Waylode) consume which, is in the
 [architecture](docs/architecture.md). The task loop that ties the host, store and
 verifier together is in the [task workflow](docs/workflow.md) and the
-[MCP loop](docs/hero-loop.md). [GitPulse](https://gitpulse.vbcr.dev/),
+[MCP loop](docs/hero-loop.md). [Waylode](https://gitpulse.vbcr.dev/) (formerly GitPulse),
 a desktop command centre for parallel coding agents, uses DevMap for its
 collision radar.
+
+## Philosophy
+
+DevCouncil is built around deterministic truth and modular engines before the edit: query impact first, keep uncertainty explicit (`truncated`, `walk_incomplete`, per-row `confidence`), never launder a degraded or overridden check into a clean pass, and keep every component usable on its own without a cloud key, turn loop, or GUI. Every local DevCouncil engine (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `dcredact`, `devcouncil pr-gate`, local `devmap federate`) and public OSS PR Gate is free and open source (`MIT OR Apache-2.0`) with zero sign-in (`Waylode Primary`); optional hosted infrastructure (`Waylode Labs` over `gitpulse-relay`) covers only private-repo hosted PR gates, remote R2 `devmap cache` storage, and cross-repo org federation. Read [DevCouncil's engineering philosophy](docs/PHILOSOPHY.md) and the cross-repo [stack boundaries](specs/003-stack-boundaries-and-non-overlap/spec.md).
 
 ## Documentation
 
@@ -131,7 +135,7 @@ collision radar.
 
 ## License
 
-Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option. See [LICENSE](LICENSE), [NOTICE](NOTICE), and [CONTRIBUTING.md](CONTRIBUTING.md). The Python CLI, its release lineage and its historical
+Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option, with Developer Certificate of Origin 1.1 (`Signed-off-by:` required; see [DCO.txt](DCO.txt)). See [LICENSE](LICENSE), [NOTICE](NOTICE), and [CONTRIBUTING.md](CONTRIBUTING.md). The Python CLI, its release lineage and its historical
 workflow certifications are retired; current native source and installed
 binary identities must be checked separately.
 

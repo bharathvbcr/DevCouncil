@@ -132,7 +132,7 @@ iterations. The high-water mark after edits was 100,131 (100,110 seed events plu
 committed edits); the benchmark's revision counter includes any extra invocation of that
 sub-benchmark. Workspace list and search are
 slower at 100,000 tasks than at 10,000 tasks with the same number of mutations. The same
-figures are in Manvi `docs/WORKBENCH.md`.
+figures are in Manvi's "docs/WORKBENCH.md" (in the Manvi repo).
 
 ## Scale behaviour (hx/w4-store-scale)
 

@@ -9,7 +9,7 @@ availability; it does not certify every platform, editor session or release.
 
 | Surface | Implementation | Practical boundary |
 |---|---|---|
-| Code intelligence | Rust `devc-map` (`dc-map` / `devmap`) pipeline, CLI, 21-tool MCP, watcher, `doc-drift`, `lean-tcb`, 11-tier resolution ladder (`rung`), Blake3 CAS AST store (`cas`), per-worktree delta overlay (`overlay`), and `devmap-store::csr` zero-copy `mmap` CSR storage | Static evidence (schema 100; source identity folds byte length); store schema 29 (reader floor 29); resolution budgets; damaged store refusal; queries can be capped |
+| Code intelligence | Rust `devc-map` (`dc-map` / `devmap`) pipeline, CLI, 21-tool MCP, watcher, `doc-drift`, `lean-tcb`, `cache` (relay pack/unpack/push/pull), `seed --stacked` (`stack_lease.json`), 11-tier resolution ladder (`rung`), Blake3 CAS AST store (`cas`), per-worktree delta overlay (`overlay`), and `devmap-store::csr` zero-copy `mmap` CSR storage | Static evidence (extraction schema 102; source identity folds byte length); store schema 29 (reader floor 29); resolution budgets; damaged store refusal; FIFO-safe matcher config read & Codex plugin preflight; queries can be capped |
 | Go host | `devc` / `devcouncil` / `dev` CLI (`spec`, `workflow`, `search`, `task`, `verify`, `review`, `integrate`, `skills`) and eight-tool task MCP | Task tooling, 7-layer specification lifecycle, resumable DAG workflows, unified search routing, integration, skills and verification; no autonomous model loop |
 | Task state | Rust `devc-store` (`dc-store` / `dcstore`) | Cooperating-client leases (schema 11, partial unique index `ux_task_leases_active`), workbench tasks & cross-repo queue/sync/outbox (`workbench_schema` 17), constitution gates (`constitution_gates`), and durable records |
 | Verification | Go task checks, secondary judge model verification (`verify/secondary_model.go`), plus Rust `devc-verify` (`dc-verify` / `dcverify`, `dcjsoncheck`) rigor and `dc-evidence` acceptance evaluator | Deep scans (untracked, submodules), opaque stubs, anti-reward-hacking gates (`runner_hijack`, `lean_tcb`, `unattested_test_run`, `oracle_tampering`), prompt-input write protection, CDATA prompt-injection sanitization, no diff/panic secret echo |
@@ -22,7 +22,7 @@ availability; it does not certify every platform, editor session or release.
 Native source versions are declared independently: currently 0.2.5 in the
 Rust workspace (`rust/Cargo.toml`), the Go host
 (`backend/go_orchestrator/devcouncil/version/version.go`) and the npm launcher
-(`package.json`). These are source
+(`package.json`). Repository contributions are dual-licensed under `MIT OR Apache-2.0` with DCO 1.1 (`LICENSE`, `DCO.txt`). These are source
 values, not proof of publication. Inspect `devmap --version`,
 `devcouncil --version` and `devmap paths --json` for installed identity.
 Old Python 0.4.x release notes belong to a different runtime lineage.
@@ -39,7 +39,7 @@ Old Python 0.4.x release notes belong to a different runtime lineage.
 | Provider routing, advisor setup, debate roles | Configure in the consuming harness |
 | DevCouncil lifecycle write/stop hooks | Retired no-op compatibility and cleanup controls |
 | Old MCP file-write, shell, scope-update and rollback tools | Absent from the eight-tool Go host |
-| Python SCA and GitHub Checks writers (`GAP-P7-SCA-LOST`, `GAP-P7-GITHUB-LOST`) | DevCouncil builds neither in Go. GitPulse Insights Health (`src-tauri/src/analyzer/deps.rs`) runs local dependency audits on open, and GitPulse (`src-tauri/src/workbench/verify_status.rs`, `src/lib/components/TaskVerification.svelte`) posts Manvi's task verdict as the `devcouncil/verify` commit status and optional PR comment via `gh api` (opt-in per repository, desktop action only; no Checks API run without a GitHub App) |
+| Python SCA and GitHub Checks writers (`GAP-P7-SCA-LOST`, `GAP-P7-GITHUB-LOST`) | DevCouncil builds neither in Go. Waylode Insights Health (formerly GitPulse Insights, `src-tauri/src/analyzer/deps.rs`) runs local dependency audits on open, and Waylode (`src-tauri/src/workbench/verify_status.rs`, `src/lib/components/TaskVerification.svelte`) posts Manvi's task verdict as the `devcouncil/verify` commit status and optional PR comment via `gh api` (opt-in per repository, desktop action only; no Checks API run without a GitHub App) |
 
 ## Evidence and open work
 

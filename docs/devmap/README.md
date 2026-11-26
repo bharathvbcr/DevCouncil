@@ -37,7 +37,7 @@ devmap affected src/api.py   # the tests a change here reaches
 devmap dead                  # confident vs unconfirmed dead candidates (not one flat list)
 ```
 
-![DevMap interactive dependency map and symbol graph in GitPulse](../assets/DevMap.png)
+![DevMap interactive dependency map and symbol graph in Waylode (formerly GitPulse)](../assets/DevMap.png)
 
 ```mermaid
 flowchart TD
@@ -232,7 +232,7 @@ corpora; clean on both index-staleness probes, including the revert-to-original
 case that GitNexus fails.
 
 **DevMap negatives:** CodeGraph has lower edit latency on **every** corpus —
-DevMap takes 1.08× its time on the smallest and 3.61× on GitPulse — and a
+DevMap takes 1.08× its time on the smallest and 3.61× on Waylode (measured as GitPulse in the 2026-09-14 run) — and a
 smaller store (1.6–2.0× smaller; Graphify 2.8–4.7× smaller). Graphify used less
 memory than DevMap on the largest corpus (1,458 MB vs 1,725 MB). DevMap reports
 **106,217 unexplained call-attribution sites** on this corpus. Against v0.2.1,
@@ -293,7 +293,7 @@ From a checkout of this tree:
 cargo install --path rust/devmap-cli --locked --force
 ```
 
-That puts `devmap` on `PATH` via `~/.cargo/bin` (what GUI apps such as GitPulse
+That puts `devmap` on `PATH` via `~/.cargo/bin` (what GUI apps such as Waylode
 search when they lack a shell profile). `--locked` keeps the tree's
 `Cargo.lock`; `--force` refreshes an earlier install. Requires a Rust toolchain.
 
@@ -346,6 +346,11 @@ serial retry of budget-refused files is covered too, so a long retry no longer
 needs a second kill. A build cancelled during extraction commits no generation.
 
 State lives in `.devmap/` by default. See **Where state lives** below.
+Linked worktrees can also use stacked delta indexing (`devmap seed --stacked`,
+writing `stack_lease.json` + `delta.sqlite` over a shared immutable `base.sqlite`;
+`devmap paths --json` reports `stack_lease_path` and `stacked_exists`). Remote
+store/CSR bundles can be packed, verified, or pushed/pulled via Waylode Relay
+with `devmap cache pack|unpack|status|push|pull`.
 
 For a fresh checkout or linked worktree, run `devmap paths --json` to find
 the resolved database and `repo_map` paths, then `devmap status --json` to
@@ -480,7 +485,7 @@ devmap build . --json --progress always --verbose > /tmp/devmap-report.json 2> /
 ```
 
 These are caller-selected output files; the CLI does not keep an automatic log
-history. GitPulse's **Code → Map → Copy DevMap logs** combines its captured CLI
+history. Waylode's **Code → Map → Copy DevMap logs** combines its captured CLI
 diagnostics with the panel state and its existing rotating logs.
 
 ### Ask
@@ -716,7 +721,7 @@ devmap map-html .                      # subsystems, coloured by language
 `repo_map.json`, colouring each node by its dominant language in GitHub
 Linguist's own palette and carrying the coverage the map does *not* have —
 subsystems are a selected set, not a partition. Both use the shared code-map
-renderer (below), so they look and behave like GitPulse's Map section.
+renderer (below), so they look and behave like Waylode's Map section.
 
 `map-html` reads the resolved state directory's `repo_map.json` and writes
 `map.html` beside it, honoring `.devmap/`, legacy `.devcouncil/`, and
@@ -746,12 +751,12 @@ numbers ride in `--json`.
 ### The shared code-map package
 
 Both pages are one TypeScript package, `rust/devmap-query/assets/code-map/`,
-which DevCouncil owns and GitPulse vendors (its `scripts/vendor-crates.mjs`
+which DevCouncil owns and Waylode (formerly GitPulse) vendors (its `scripts/vendor-crates.mjs`
 copies `src`, `build.rs` and `assets`, so the same files appear under
 `src-tauri/vendored/devmap-query/assets/code-map/`). The modules under `src/`
 (layout, filtering, trace, globe, area tree, canvas renderer) take no DOM and no
 Bun API, use extensionless relative imports, and take their theme and language
-palette as injected values, so GitPulse imports them as they are. `src/page/` is
+palette as injected values, so Waylode imports them as they are. `src/page/` is
 the DOM shell (vanilla TypeScript, no framework) and is the only part that
 touches `document`.
 
@@ -765,7 +770,7 @@ touches `document`.
   `.bun-version`. CI runs it, installing Bun with `oven-sh/setup-bun` pinned to a
   commit; `npm run ci:local` runs it too.
 - **Tests.** `npm run test:code-map` runs `bun test` over `tests/`.
-- **Types.** Bun does not type-check. The gate is GitPulse's `svelte-check` /
+- **Types.** Bun does not type-check. The gate is Waylode's `svelte-check` /
   `tsc` over its vendored copy. The test files import `bun:test`, so a consumer's
   tsconfig should include `assets/code-map/src` and not `assets/code-map/tests`
   (or map `bun:test` to its own runner, as the tests use only `describe`, `it`
@@ -1008,9 +1013,9 @@ on `Bash`):
   `PostToolUseFailure`; its `PostToolUse` for Bash also runs after a non-zero
   exit, so a failed shell write is still refreshed. Codex also re-trusts hooks
   by hash (`/hooks`) after a reinstall.
-- Cursor documents `postToolUseFailure` (matcher `Shell`) and fires
+- Cursor documents "postToolUseFailure" (matcher `Shell`) and fires
   `postToolUse` after a successful execution. Whether a non-zero exit counts as
-  one is undocumented, so no `postToolUseFailure` entry is installed and a
+  one is undocumented, so no "postToolUseFailure" entry is installed and a
   failed shell write may not be refreshed under Cursor.
 
 The `PreToolUse` context (the index directive or a file's signature list)
@@ -1207,8 +1212,10 @@ cargo clippy --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store 
 
 ## License
 
-Apache-2.0, per the `LICENSE` at the repository root. `Cargo.toml`, the plugin
-manifest and that file all say so, and a test fails if they stop agreeing.
+Dual-licensed under `MIT OR Apache-2.0`, per `LICENSE`, `LICENSE-MIT`, and
+`LICENSE-APACHE` at the repository root, with Developer Certificate of Origin 1.1
+(`DCO.txt`). `Cargo.toml`, the plugin manifest, and `LICENSE` agree, and CI
+checks that they match.
 
 ## Repository hygiene policy
 

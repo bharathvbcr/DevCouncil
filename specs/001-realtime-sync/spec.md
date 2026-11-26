@@ -1,5 +1,7 @@
 # Feature: 001 - Realtime Sync
 
+> **Status (2026-11-26)**: Spec/workflow orchestration (`backend/go_orchestrator/devcouncil/spec/` and `workflow/`) and `.devcouncil/state.sqlite` WAL persistence are implemented; sub-50ms cross-worktree delta broadcast to Waylode (formerly GitPulse) remains a planned integration target.
+
 ## 1. Problem Statement & Motivation
 State synchronization across distributed edge nodes and agent worktrees requires low-latency, causal broadcast with deterministic conflict resolution. Without a unified spec-driven sync protocol, disparate clients experience desynchronization and unresolvable merge conflicts during multi-agent editing.
 

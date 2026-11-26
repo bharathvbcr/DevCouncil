@@ -93,7 +93,7 @@ led on all four repositories at both stages. It answered definition lookups
 **~10× faster** and caller lookups **~3.7× faster**, on a quarter of the memory.
 
 **CodeGraph wins the edit loop, on every corpus.** DevMap takes 1.08× its time
-on the smallest repository and **3.61×** on GitPulse. The cause is known and
+on the smallest repository and **3.61×** on Waylode (measured as GitPulse in the 2026-09-14 run). The cause is known and
 measured: roughly 59% of a DevMap incremental build is whole-tree work that does
 not shrink with the change set, because resolution deliberately covers the whole
 tree so liveness and community detection mean the same thing on both paths. If

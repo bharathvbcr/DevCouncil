@@ -78,18 +78,18 @@ any working directory. There is no `go install` route (the host links the
 Gusset engine through cgo), and the npm package is only a launcher for a host
 you built.
 After installing from a checkout, the installer checks the schema consumers.
-DevCouncil owns the devmap store, dc-store and workbench schemas, and GitPulse,
+DevCouncil owns the devmap store, dc-store and workbench schemas, and Waylode (formerly GitPulse),
 Manvi and Jarvis each read them through binaries or pins that can fall behind.
-The installer finds a GitPulse checkout (`--gitpulse DIR`, then
-`$DEVCOUNCIL_GITPULSE_ROOT`, then `../GitPulse`) and runs its
+The installer finds a Waylode checkout (`--waylode` / `--gitpulse DIR`, then
+`$DEVCOUNCIL_WAYLODE_ROOT` / `$DEVCOUNCIL_GITPULSE_ROOT`, then `../Waylode` / `../GitPulse`) and runs its
 `scripts/check-schema-parity.mjs --json` with node, pointed at this checkout.
 The run is bounded at two minutes with output capped at 1 MiB. It prints
 every reader's verdict (`match`, `stale`, `unverifiable` or `absent`) and lists
 each stale or unverifiable reader under `FOLLOW-UP` with its remedy:
 
-- GitPulse's `gitpulse-mcp`: `bun run mcp:install`.
-- GitPulse.app: rebuild and reinstall the app.
-- GitPulse's vendored crates: re-vendor.
+- Waylode's `gitpulse-mcp` (legacy server binary name): `bun run mcp:install`.
+- Waylode.app (or GitPulse.app): rebuild and reinstall the app.
+- Waylode's vendored crates: re-vendor.
 - `devmap` or `dcstore` on PATH: reinstall, or fix PATH shadowing.
 - Manvi's or Jarvis's pin: bump the pin. That is a commit in that repository,
   so report the delta and ask first.
@@ -97,7 +97,7 @@ each stale or unverifiable reader under `FOLLOW-UP` with its remedy:
 The install's exit status does not change: an owner does not refuse to install
 because a consumer lags. `--strict-consumers` makes a stale or unverifiable
 reader fail the install, and so does a check that could not run. It refuses
-`--dry-run`. If GitPulse or node is missing, or the check fails, times out or
+`--dry-run`. If Waylode or node is missing, or the check fails, times out or
 prints something unreadable, the installer prints
 `schema consumers: NOT CHECKED — <why>`, never a pass. With `--json`, the
 receipt carries the same report as `consumers`.
@@ -185,11 +185,11 @@ dcgrep health
 ```
 
 Task verification needs a task in this repository's task store. A board card
-(a GitPulse `ft-...` id) is not a task in this store: `devcouncil verify ft-...`
+(a Waylode / GitPulse `ft-...` id) is not a task in this store: `devcouncil verify ft-...`
 finds nothing and reports `not_run` (`task_not_found`) rather than a verdict. A
 card's verification is the board's own gate: `waylode_complete_task` (still accepted
 as `gitpulse_complete_task`) with status
-done lands the card in `review`, and the GitPulse app's verification driver then
+done lands the card in `review`, and the Waylode app's verification driver then
 runs Manvi `work.verify.task` and moves it to `done` on a pass. Report a `not_run` as not run, never as
 verified or passed. A task is a
 workbench item: create one with `devcouncil task create` (installing or mapping

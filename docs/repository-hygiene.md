@@ -20,7 +20,7 @@ custom or mixed guides are preserved. Refresh managed guides through the
 existing Rust CLI artifact flow with `--guides`; do not overwrite a custom
 `AGENTS.md` merely to distribute these rules.
 
-GitPulse embeds this module through its existing vendored `devmap-query` crate.
+Waylode (formerly GitPulse) embeds this module through its existing vendored `devmap-query` crate.
 Its provider module delegates to this owner. The host retains settings, consent,
 Git index/ignore checks, complete bounded snapshots, active task/process/open-file
 checks, policy gates, cancellation, journaling and filesystem mutation. The host
@@ -29,7 +29,7 @@ the policy without importing Tauri or launching a cleanup worker.
 
 Updating a compiled-in consumer requires re-vendoring and rebuilding that
 consumer. Updating the DevCouncil CLI alone does not change an installed
-GitPulse application. There is no independently running DevCouncil cleaner and
+Waylode application. There is no independently running DevCouncil cleaner and
 these changes do not install or enable schedules.
 
 ## Before removing a git worktree

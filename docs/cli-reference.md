@@ -266,7 +266,7 @@ Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work,
 - `dcverify` is discovered on `PATH`, excluding any candidate inside the repository under analysis (`proc.LookPathOutside`); `MANVI_VERIFY_BINARY` overrides discovery. It remains a separately installed component (`devcouncil install --only=dcverify`).
 - `--mode`: `off` (default when unset) skips quality verification and reports `status: "skipped"`, `passed: false`, and `verification_skipped: true`; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair. Skipped tasks increment `completed_without_verification`, not `verified_tasks`. Completion and verification remain separate outcomes.
-- `not_run`: A verify that judged nothing says so. An id this store does not hold (a GitPulse board card id is not a task here), a missing store, or a store read error ends with exit 1, `ok: false`, `processed_tasks: 0` and a top-level `not_run` object, `{"reason": "task_not_found" | "store_unavailable" | "store_error", "task_id": ...}`; `error` keeps its text. Nothing is written to the store, and none of `verified_tasks`, `blocked_tasks`, `degraded_tasks` or `completed_without_verification` counts it. `not_run` is absent on any run that judged a task. When a multi-task run judges some tasks and then cannot read a later one, the earned verdicts stay in `tasks[]` and the unread task is its own entry with `status: "not_run"` and a `not_run` object; the run is `ok: false`. Report a not-run as not run, never as passed. Human mode prints one stderr line, `verify: NOT RUN (<reason>): ...`, with control characters escaped.
+- `not_run`: A verify that judged nothing says so. An id this store does not hold (a Waylode / GitPulse board card id is not a task here), a missing store, or a store read error ends with exit 1, `ok: false`, `processed_tasks: 0` and a top-level `not_run` object, `{"reason": "task_not_found" | "store_unavailable" | "store_error", "task_id": ...}`; `error` keeps its text. Nothing is written to the store, and none of `verified_tasks`, `blocked_tasks`, `degraded_tasks` or `completed_without_verification` counts it. `not_run` is absent on any run that judged a task. When a multi-task run judges some tasks and then cannot read a later one, the earned verdicts stay in `tasks[]` and the unread task is its own entry with `status: "not_run"` and a `not_run` object; the run is `ok: false`. Report a not-run as not run, never as passed. Human mode prints one stderr line, `verify: NOT RUN (<reason>): ...`, with control characters escaped.
 - Acceptance criteria: each criterion the task claims is dispatched on its requirement's `verification_method` (`devcouncil/verify/criteria.go`). `unit_test`, `integration_test` and `static_check` are discharged when the task's verification commands all ran and passed, and are then also reported as a non-blocking `coarse_acceptance_proof`; otherwise they are `acceptance_criteria_unproven`. `manual` has no executor and is a hard-safety `unsupported_verification_method` gap (blocking when `required`, in advisory mode too). `llm_review` is discharged only by a recorded independent review of exactly the content under verification (see [Independent reviews](#independent-reviews-llm_review)); with none, or with one that cannot vouch for this content, it is a blocking `llm_review_unproven` gap whose evidence says why, and a discharging review's open major or contested findings are reported as a non-blocking `llm_review_findings` gap. Passing commands never discharge it. A criterion no linked requirement defines, or requirements the store could not return, also block.
 - `--sandbox`: Only `local` exists: verification commands run on the host (`/bin/sh -c` in the project root), and the report's `sandbox` field is always `local` because that is where they ran. Any other value (`docker`, `nix`, anything) is refused with exit 2 before a store is opened or a command runs (TASK-P7-2). MCP `devcouncil_verify_task` takes no sandbox argument and refuses one with `code: invalid_argument`.
 
@@ -343,7 +343,8 @@ High-performance multi-language code graph and symbol analysis engine (extract â
 ```bash
 # Build & Lifecycle
 devmap build --manifest     # Generate repo_map.json and code_graph.json
-devmap seed                 # Seed or stack a linked worktree's index from a registered checkout
+devmap seed [--stacked] [--sync-delta]   # Seed or stack a linked worktree's index (`stack_lease.json` + `delta.sqlite`)
+devmap cache pack|unpack|status|push|pull  # Deterministic store/CSR archive & relay transport (`GITPULSE_RELAY_URL` / `GITPULSE_RELAY_TOKEN`)
 devmap build --full         # Cold rebuild: re-parse every source, ignore the extraction cache
 devmap build --verify-rows  # Incremental extraction, but re-derive every stored edge's validity
 devmap build --manifest --force  # Also replace a foreign repo map / code graph (`--force` requires `--manifest`)
@@ -361,8 +362,8 @@ devmap serve                # Watcher + IPC (not `build --watch`)
 devmap status [--json]      # Generation, readiness, resolution caps, search_index_damaged probe
 devmap --version            # Prints version, store schema, code graph schema, extract schema, build hash
 devmap version              # Subcommand equivalent of --version
-devmap doctor               # No `--fix`
-devmap paths [--json]
+devmap doctor               # No `--fix`; FIFO-safe config checks and Codex plugin preflight
+devmap paths [--json]       # Emits resolved root, db_path, stack_lease_path, stacked_exists, binary diagnostics
 devmap freshness            # Working-tree head/inventory/content digests (--expect-* checks staleness)
 devmap history
 devmap snapshots

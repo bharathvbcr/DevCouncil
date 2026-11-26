@@ -77,9 +77,9 @@ Pick the boundary by where the two run, then by how much work each call does.
 
 | Situation | Use |
 | --- | --- |
-| Go service hosting a Rust engine **in-process**, calls doing ~hundreds of µs or more, concurrency above `GOMAXPROCS` | **gusset** (`github.com/bharathvbcr/gusset`): panic firewall, bounded pool, deadlines, poisoned handles, ABI verification. Follow its `docs/adoption.md`. |
-| In-process call doing **under ~10 µs** of work | Not gusset — its fixed per-call cost is the workload. Write it in Go, or use raw cgo. Check gusset's `docs/choosing.md` table before deciding. |
-| Separately versioned binaries / processes | A documented process contract (JSON on stdio, as DevCouncil's components and MANVI use). gusset is **not** an IPC transport; `gusset-ipc` for GPU driver-fault isolation is planned, not shipped — confirm its status in `docs/ipc.md` before relying on it. |
+| Go service hosting a Rust engine **in-process**, calls doing ~hundreds of µs or more, concurrency above `GOMAXPROCS` | **gusset** (`github.com/bharathvbcr/gusset`): panic firewall, bounded pool, deadlines, poisoned handles, ABI verification. Follow gusset's adoption guide ("docs/adoption.md" in the gusset repo). |
+| In-process call doing **under ~10 µs** of work | Not gusset — its fixed per-call cost is the workload. Write it in Go, or use raw cgo. Check gusset's choosing table ("docs/choosing.md" in the gusset repo) before deciding. |
+| Separately versioned binaries / processes | A documented process contract (JSON on stdio, as DevCouncil's components and MANVI use). gusset is **not** an IPC transport; `gusset-ipc` for GPU driver-fault isolation is planned, not shipped — confirm its status in gusset's IPC doc ("docs/ipc.md" in the gusset repo) before relying on it. |
 
 Never let a Rust panic, an unbounded thread count, or an unverified struct
 layout cross the boundary by hand-rolling cgo where gusset's contract applies.
@@ -111,7 +111,7 @@ HLSL).
 | Need | Tool |
 | --- | --- |
 | Where a symbol lives, callers, blast radius, dead code, affected tests | **DevMap** (`devmap_*` MCP tools or the `devmap` CLI). GitNexus is retired; do not install or consult it. |
-| What else is live in this repo: worktrees, agent sessions, contended files | **GitPulse Insights** (`waylode_insights`, `waylode_collision_risk`; the old `gitpulse_*` names are still accepted) |
+| What else is live in this repo: worktrees, agent sessions, contended files | **Waylode Insights** (`waylode_insights`, `waylode_collision_risk`; the legacy `gitpulse_*` names are still accepted) |
 | Go hosting a Rust engine | **gusset** |
 | GEMM / NN kernels on Apple silicon | **tessl** (Rust, Metal 4; C ABI in `src/capi.rs`) |
 | An embeddable agent harness | **MANVI** (Go + Rust, zero-cgo, component contract over stdio) |

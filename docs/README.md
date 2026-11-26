@@ -14,7 +14,8 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 | Find symbols, callers, impact and candidate tests, or read the repository map page | [Code graph guide](code-graph.md) |
 | Search text, regex, symbols or AST structure through one router | [Ranked search](lexical-search.md) and `devcouncil search` in [CLI reference](cli-reference.md) |
 | Choose a binary, library or host boundary | [Architecture](architecture.md); what runs in-process on Gusset: [Gusset candidates](gusset-candidates.md) |
-| Scaffold 7-layer specs, run DAG workflows, or use tasks, leases and verification | [Task workflow](workflow.md) and [MCP task loop](hero-loop.md) |
+| Understand DevCouncil's design principles and deliberate refusals | [Engineering philosophy](PHILOSOPHY.md) |
+| Scaffold 7-layer specs, run DAG workflows, or use tasks, leases and verification | [Specifications index](../specs/README.md), [Task workflow](workflow.md) and [MCP task loop](hero-loop.md) |
 | Look up commands and flags | [CLI reference](cli-reference.md) |
 | Understand limitations and retired commands | [Project status](project-status.md) |
 

@@ -1,7 +1,9 @@
 # Feature: 002 - Zero-Copy Agentic Worktrees & DevMap Hardening
 
+> **Status (2026-11-26)**: Implemented across `DevCouncil` (`rust/devmap-*`, `backend/go_orchestrator/devcouncil/verify/sparse_subject.go`, `devmap seed [--stacked]`, `StackedStore`, `stack_lease.json`, `CURRENT_SCHEMA_VERSION = 29`), Waylode (formerly `GitPulse`), and `Manvi`.
+
 ## 1. Problem Statement & Motivation
-Multi-agent development creates short-lived Git worktrees across repositories (`DevCouncil`, `GitPulse`, `Manvi`), but provisioning and querying those lanes suffers from 17 verified failure modes (`F1`–`F17`): split-brain `base_store_ref.json` overlays invisible to `devmap`, MCP routing leaks/refusals across linked worktrees, regex fallback AST poisoning of anchor CAS stores, `8.03 MiB` SQLite overflow page rewrites during `rebind_staged`, `~272 MiB` `VACUUM INTO` penalties on live WALs, missed nested Cargo `target/` workspaces, sparse-checkout verification refusals, proc-macro `CARGO_MANIFEST_DIR` thrash/hazards, and `68–90 MiB` private source extent inflation on `git worktree add`.
+Multi-agent development creates short-lived Git worktrees across repositories (`DevCouncil`, `Waylode` (formerly `GitPulse`), `Manvi`), but provisioning and querying those lanes suffers from 17 verified failure modes (`F1`–`F17`): split-brain `base_store_ref.json` overlays invisible to `devmap`, MCP routing leaks/refusals across linked worktrees, regex fallback AST poisoning of anchor CAS stores, `8.03 MiB` SQLite overflow page rewrites during `rebind_staged`, `~272 MiB` `VACUUM INTO` penalties on live WALs, missed nested Cargo `target/` workspaces, sparse-checkout verification refusals, proc-macro `CARGO_MANIFEST_DIR` thrash/hazards, and `68–90 MiB` private source extent inflation on `git worktree add`.
 
 ## 2. User Stories & Acceptance Scenarios
 
@@ -40,7 +42,7 @@ So that anchor stores are never poisoned by regex ASTs, read paths never mutate 
   - **Then** base facts for synced `FileId`s are masked via `WorktreeOverlay` `RoaringBitmap` bitsets and merged with `delta.sqlite` symbols/edges while leaving `delta.sqlite`, `stack_lease.json`, and `base.sqlite` byte-for-byte untouched.
 
 ### US3: Nested Hybrid Build Cache & Zero-Copy Source Materialization (Priority: P2)
-As a worktree orchestrator (`GitPulse` and `Manvi`),
+As a worktree orchestrator (`Waylode` and `Manvi`),
 I want new agent worktrees to CoW-clone clean tracked sources and nested Cargo/`dist` caches with `mtime`-preserving `OUT_DIR` path rewriting and safe proc-macro caching,
 So that lane creation finishes in `~150ms` with near-zero private APFS block allocation and warm Cargo builds.
 
@@ -67,15 +69,15 @@ So that sparse monorepo lanes pass strict safety gates and subagents can isolate
 - **Scenario 2: Parallel Multi-Lane Subagent Execution**
   - **Given** two concurrent `Manvi` runs targeting distinct worktrees of the same repository
   - **When** both enter `managed.go` checkout gates and spawn `workspace: "worktree"` subagents
-  - **Then** neither blocks with `ErrHarnessBusy` and each subagent receives a seeded isolated worktree.
+  - **Then** neither blocks with ErrHarnessBusy and each subagent receives a seeded isolated worktree.
 
 ## 3. Success Metrics & Testability Criteria
 - **SC-001**: `devmap seed` rebinds `seeded_repo_root` in `<15ms` writing `<=32 KiB` (zero `generations` overflow page rewrites).
 - **SC-002**: `hook_conformance` (`briefs_agree_with_status_across_many_worktrees_under_concurrency` and `an_unindexed_worktree_is_told_how_to_index_itself_on_session_start_only`) passes 20/20 consecutive runs with zero flakes.
-- **SC-003**: `Manvi` `devmap status --json` reports `discovery_refused.total == 0` while `TestCratePinsMatchDevCouncil` passes.
+- **SC-003**: `Manvi` `devmap status --json` reports `discovery_refused.total == 0` while Manvi's TestCratePinsMatchDevCouncil check passes.
 - **SC-004**: Forged `.git` gitlink files pointing at another repo's `.git` are 100% rejected by `same_registered_repo`, `mcp::open_for_call`, and `devmap seed`.
-- **SC-005**: `GitPulse/scripts/check-schema-parity.mjs` and `check-vendor-schema.mjs` pass at `CURRENT_SCHEMA_VERSION = 29`.
-- **SC-006**: Zero regressions across existing Rust and Go test suites in `DevCouncil`, `GitPulse`, and `Manvi`.
+- **SC-005**: Waylode's `../GitPulse/scripts/check-schema-parity.mjs` and `../GitPulse/scripts/check-vendor-schema.mjs` pass at `CURRENT_SCHEMA_VERSION = 29`.
+- **SC-006**: Zero regressions across existing Rust and Go test suites in `DevCouncil`, `Waylode`, and `Manvi`.
 
 ## 4. Edge Cases & Exclusions
 - **Edge Case**: Pre-existing schema-29 SQLite stores opened read-only (`?mode=ro`) before `seed_rebind` DDL runs must dynamically fall back to `generations.repo_root` without `no such table` errors.

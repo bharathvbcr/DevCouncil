@@ -242,7 +242,7 @@ The test files are the acceptance tests. A row resumes only when every listed te
 ## 8. Corpus-diff discipline for Swift lanes
 
 1. **Run before review, not after** (ruling 55 owner note).
-   - Script: the lead's corpus-diff script. It is session-local and not committed, so the lane brief supplies it. The `REPOS` default is **15 repos**: ChronosFlow, Meridian, Graft, Vani, Curio, M5Blade, GitPulse, Strait, Blitztree, gusset, ojas, scholarlm, DevCouncil, AppLock, DevType.
+   - Script: the lead's corpus-diff script. It is session-local and not committed, so the lane brief supplies it. The `REPOS` default is **15 repos**: ChronosFlow, Meridian, Graft, Vani, Curio, M5Blade, Waylode (`GitPulse` checkout), Strait, Blitztree, gusset, ojas, scholarlm, DevCouncil, AppLock, DevType.
    - Each repo is a `git archive HEAD` snapshot built cold with `build --full` and a fresh `--db`.
    - Set `C=` to a lane-private directory whenever another run may be live, because `$C/out` is shared.
    - The baseline is `bench/tgt-main782`: `BASE=main782 LAND=<lane> SUMMARY=<lane> C=… bash run5.sh`.

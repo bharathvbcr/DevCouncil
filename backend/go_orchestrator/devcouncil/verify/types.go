@@ -198,10 +198,10 @@ type GateState struct {
 }
 
 // GateConfigInvalid is the gap type for a gate config that could not be read.
-const GateConfigInvalid = "gate_config_invalid"
+const GateConfigInvalid = dc.GateConfigInvalid
 
 // VerifyEnvConfigInvalid is the gap type for an unreadable verify.env_allow.
-const VerifyEnvConfigInvalid = "verify_env_config_invalid"
+const VerifyEnvConfigInvalid = dc.VerifyEnvConfigInvalid
 
 // Input is everything orchestration needs from the outside world.
 type Input struct {

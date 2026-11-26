@@ -1,9 +1,6 @@
 # extract-v98: the extractor-output bundle
 
-Status: IMPLEMENTED AND MERGED on local `main` (landings 1–3, commits `37b9f9f5` through
-`4aeda9d6`). `EXTRACTION_SCHEMA_VERSION` is `"98"` (`rust/devmap-extract/src/cache.rs:814`).
-Local `main` carries the complete extract-v98 bundle, including side tables, Kotlin loss recovery,
-Swift residue typing, and SQL DDL recovery. Push to origin is held for the v98 consumer sweep.
+Status: IMPLEMENTED AND MERGED (superseded by `EXTRACTION_SCHEMA_VERSION = "102"` in `rust/devmap-extract/src/cache.rs`). At the time of this design note (commits `37b9f9f5` through `4aeda9d6`), `EXTRACTION_SCHEMA_VERSION` was `"98"`. Subsequent landings bumped the extraction schema to `"102"` (Svelte 5 template/expression fixes, TS/Rust 2024/Shell syntax repairs, JS/TS factory-returned object methods and return shapes). Below is the v98 bundle design record.
 
 Labels: **[V]** verified by reading code or running a command this session; **[I]** inferred;
 **[U]** unverified, to be settled by the first implementation step named beside it.
@@ -12,12 +9,12 @@ Inputs read: `docs/devmap/design/jvm-scope-import-model.md` (all ruling sections
 declaration facts", V1-V14), `BUILD_REPORT.md` ("Waiting on extract-v98"), every `#[ignore]` that
 cites extract-v98 or "schema frozen at 97", and `rust/testdata/accuracy/known_failing.tsv`.
 
-Where the evidence lives. The 45 JVM acceptance probes are **not on main**. They are on the
-unmerged, paused branch `lane/jvm-scope-model` @ `a247f398` [V: `git grep` on that ref], in
-`rust/devmap-resolve/src/resolver/jvm_names_attack.rs` and `jvm_names_attack2.rs`. Every
+Where the evidence lives. The 45 JVM acceptance probes described in this historical note were on
+the unmerged, paused branch `lane/jvm-scope-model` @ `a247f398` [V: `git grep` on that ref], in
+jvm_names_attack.rs and jvm_names_attack2.rs under `rust/devmap-resolve/src/resolver/`. Every
 `file:line` below for those two files, and for `attack_resolver_bundle3/5.rs`,
-`kotlin_receivers_and_packages.rs`, `overload_self_edges.rs`, is on that ref. Everything else is on
-main. GitPulse card bodies could not be read (`gitpulse_get_task` returned not_found for
+`kotlin_receivers_and_packages.rs`, `overload_self_edges.rs`, was on that ref. Everything else was on
+main. Waylode (formerly GitPulse) card bodies could not be read (`gitpulse_get_task` returned not_found for
 ft-80c5d100), so card text is taken from BUILD_REPORT.md and the `#[ignore]` strings.
 
 ## 0. Ground rules this design relies on
@@ -73,8 +70,8 @@ struct JvmDeclFact {
 
 | # | Fact | Langs | Emit at | Model field | Unblocks | Cards |
 |---|------|-------|---------|-------------|----------|-------|
-| 1 | **V1 Scala package scopes**: `package a.b`, chained `package a` / `package b` => `a.b`, block forms | Scala | New `jvmfacts.rs::scala_scopes`, called from `entry.rs:925` region. Today `jvm_package_name` (`treesitter/rust_use.rs:896`) accepts only `package_header`/`package_declaration` and `entry.rs:925` gates on `kotlin\|java`, so Scala gets nothing [V]. Scala nodes `package_clause` (header and block) [U: confirm node names with a tree dump] | `Extraction.package_scopes`; header form also fills `Extraction.jvm_package` | `r4_scala_repo_import_same_name_binds` (`attack_resolver_bundle5.rs:275`), `j8` guard stays on stem allow-list `importpath.rs:54` until it lands; kg Scala stem rows | ft-2c800986 |
-| 2 | **V2 C# namespace per type**: `namespace N { }` and file-scoped `namespace N;` | C# | `jvmfacts.rs::csharp_scopes`; nodes `namespace_declaration` (already a `Module` symbol via `generic_symbol_kind`, `lang_helpers.rs:1415` [V]) and `file_scoped_namespace_declaration` (file-scoped extends to EOF) [U] | `Extraction.package_scopes` (same struct as V1: one field for both languages) | `ov_csharp_partial_classes_across_files_sibling_call_not_self` (`attack_resolver_bundle3.rs:299`) | ft-2c800986 |
+| 1 | **V1 Scala package scopes**: `package a.b`, chained `package a` / `package b` => `a.b`, block forms | Scala | New `jvmfacts.rs` Scala scope extractor, called from `entry.rs:925` region. Today `jvm_package_name` (`treesitter/rust_use.rs:896`) accepts only `package_header`/`package_declaration` and `entry.rs:925` gates on `kotlin\|java`, so Scala gets nothing [V]. Scala nodes `package_clause` (header and block) [U: confirm node names with a tree dump] | `Extraction.package_scopes`; header form also fills `Extraction.jvm_package` | `r4_scala_repo_import_same_name_binds` (`attack_resolver_bundle5.rs:275`), `j8` guard stays on stem allow-list `importpath.rs:54` until it lands; kg Scala stem rows | ft-2c800986 |
+| 2 | **V2 C# namespace per type**: `namespace N { }` and file-scoped `namespace N;` | C# | `jvmfacts.rs` C# scope extractor; nodes `namespace_declaration` (already a `Module` symbol via `generic_symbol_kind`, `lang_helpers.rs:1415` [V]) and `file_scoped_namespace_declaration` (file-scoped extends to EOF) [U] | `Extraction.package_scopes` (same struct as V1: one field for both languages) | `ov_csharp_partial_classes_across_files_sibling_call_not_self` (`attack_resolver_bundle3.rs:299`) | ft-2c800986 |
 | 3 | **V3 type-parameter names** on classes, callables, typealiases | Kotlin, Java | `jvmfacts.rs`; Kotlin `type_parameters` child of `class_declaration`/`function_declaration`/`type_alias`; Java `type_parameters` of `class_declaration`/`method_declaration`/`interface_declaration`/`constructor_declaration` [U] | `JvmDeclFact.type_params` | 15 probes in `jvm_names_attack.rs`: `a02`:80, `a02b`:89, `a02c`:99; `jvm_names_attack2.rs`: `t01`:66, `t01j`:80, `t05`:108, `t06`:119, `t07`:130, `t08`:141, `t08b`:154, `t09`:167, `t10`:179, `t11`:192, `t12`:202, `d02`:910. Plus `kg.Z5` (`known_failing.tsv:13`, `kotlin_written_types.rs`) | ft-2c800986, ft-87b28bb6 |
 | 4 | **V4 import kind flags** `{static, wildcard, member}` so the resolver stops parsing `raw_import` | Kotlin, Java, Scala | `langimports/` per-language `extract_import` (`langimports/mod.rs:109` registry, java/kotlin modules) | `ExtractedImport.kind` (new field, 15 literal sites [V: rg -c]; use `Default` and `..` at sites) | None (hardening). Replaces the source-text Java `import static` parser added at commit 2 | ft-2c800986 |
 | 5 | **V5 Kotlin typealias target** | Kotlin | `langdecl/kotlin.rs`: add `type_alias` arm. Verified none exists today: no symbol, only `Name` refs [V: Phase 0 note, BUILD_REPORT.md "Q2"] | `JvmDeclFact{kind: TypeAlias, alias_target}`. Not a symbol (no id churn) | `j10_kotlin_import_of_package_declared_only_by_other_file_binds_stem` (`attack_resolver_bundle5.rs:155`); `t08` (`jvm_names_attack2.rs:141`) shares V3 | ft-2c800986 |
@@ -99,7 +96,7 @@ struct JvmDeclFact {
 | # | Fact | Langs | Emit at | Model field | Unblocks | Cards |
 |---|------|-------|---------|-------------|----------|-------|
 | 21 | **getattr outer-call record**. `getattr(o, 'cmd_' + n)()` parses as a `call` whose callee is itself a `call`; no extractor code mentions `getattr` [V: `rg getattr rust/devmap-extract/src` finds nothing]. Fact: the dispatch site, its receiver expression, and the literal prefix of the name argument if any | Python | `treesitter/calls.rs` (`is_call_node` at `:111`): new `pyfacts.rs::dynamic_dispatch`. A side table, not an `ExtractedCall` field (that struct has about 25 literal sites [V], and a fake callee name would pollute the resolver) | `Extraction.dynamic_dispatch: Vec<DynamicDispatch{caller_symbol, start_byte, kind: Getattr, receiver: Option<String>, name_prefix: Option<String>, name_is_literal: bool}>` | `py_getattr_module` (`rust/devmap-analyze/tests/attack_script_probe.rs:89`, today a passing guard through the file claim), `p_hasattr_dispatch` (`attack_script_probe2.rs:121`). Narrowing the Python script callable exemption (`liveness.rs:75-88`) is the follow-up the fact enables | ft-1d03bb95 (part 1) |
-| 22 | **Python scope-binding facts**: for each (scope, name), how many times and by what construct the name is bound (import, assign, augmented, `for`, `with ... as`, walrus, comprehension, `except as`, `def`, `class`, parameter, `del`, `global`/`nonlocal`, match capture, annotation-only), plus whether any binding is conditional (under `if`/`try`/`TYPE_CHECKING`) and byte extents. One fact serves the alias-rebind family: a resolver can bind a function-local alias only when it has a sole unconditional binding. A bind was tried in resolver code and reverted as unsound (BUILD_REPORT lane D round 1) | Python | Export the walk that `python_read_file_facts` (`treesitter/bindings.rs:301`) already performs: one walk per scope, each name recorded as `(name, at, is_rebinding)`, with `python_bound_names`/`python_pattern_captures` (`:117,:153`) doing the target reading. `pyfacts.rs::scope_bindings` calls that walk rather than writing a third binder. [I: lane brief tally] about 11 of the 22 probes are satisfied by the fact as specified and 4 need more than the specified fields, so read each assertion before claiming it | `Extraction.py_bindings: Vec<ScopeBinding{scope: Option<String>, name, kinds: u16, sites: u32, conditional: bool, first_byte, last_byte}>` | `py.AR1` (`known_failing.tsv:15`, `edges.tsv:132`). **[I] mapping, read each assertion before claiming:** ft-572bb69d group `python_field_super_attack.rs:848`, `..attack3.rs:273,280,289`, `..attack4.rs:469`, `..attack5.rs:228,239,524,570,578,584,590`, `python_residue_attack.rs:200`. **Not ignores**: `python_receiver_residue.rs:373` (py.Z6e), `:507` (py.Z4) and `:540` are comment-only pins of honest misses [V: `rg ignore` on that file is empty; the comments say the extractor records no attribute-read initializer, no return-statement or tuple-element facts, and no decorator-to-function link], so one scope-binding fact does not unblock them and they leave this row; match captures (ft-c0afdfef) `py_receiver_residue_attack2.rs:559,565,571,577,583`. Comment-only (not ignored) markers: `attack_resolver_bundle.rs:508`, `attack_resolver_bundle4.rs:130,235` | ft-1d03bb95, ft-f0af68af, ft-572bb69d, ft-c0afdfef, ft-c666ba7c |
+| 22 | **Python scope-binding facts**: for each (scope, name), how many times and by what construct the name is bound (import, assign, augmented, `for`, `with ... as`, walrus, comprehension, `except as`, `def`, `class`, parameter, `del`, `global`/`nonlocal`, match capture, annotation-only), plus whether any binding is conditional (under `if`/`try`/`TYPE_CHECKING`) and byte extents. One fact serves the alias-rebind family: a resolver can bind a function-local alias only when it has a sole unconditional binding. A bind was tried in resolver code and reverted as unsound (BUILD_REPORT lane D round 1) | Python | Export the walk that `python_read_file_facts` (`treesitter/bindings.rs:301`) already performs: one walk per scope, each name recorded as `(name, at, is_rebinding)`, with `python_bound_names`/`python_pattern_captures` (`:117,:153`) doing the target reading. `pyfacts.rs` scope-bindings collector calls that walk rather than writing a third binder. [I: lane brief tally] about 11 of the 22 probes are satisfied by the fact as specified and 4 need more than the specified fields, so read each assertion before claiming it | `Extraction.py_bindings: Vec<ScopeBinding{scope: Option<String>, name, kinds: u16, sites: u32, conditional: bool, first_byte, last_byte}>` | `py.AR1` (`known_failing.tsv:15`, `edges.tsv:132`). **[I] mapping, read each assertion before claiming:** ft-572bb69d group `python_field_super_attack.rs:848`, `..attack3.rs:273,280,289`, `..attack4.rs:469`, `..attack5.rs:228,239,524,570,578,584,590`, `python_residue_attack.rs:200`. **Not ignores**: `python_receiver_residue.rs:373` (py.Z6e), `:507` (py.Z4) and `:540` are comment-only pins of honest misses [V: `rg ignore` on that file is empty; the comments say the extractor records no attribute-read initializer, no return-statement or tuple-element facts, and no decorator-to-function link], so one scope-binding fact does not unblock them and they leave this row; match captures (ft-c0afdfef) `py_receiver_residue_attack2.rs:559,565,571,577,583`. Comment-only (not ignored) markers: `attack_resolver_bundle.rs:508`, `attack_resolver_bundle4.rs:130,235` | ft-1d03bb95, ft-f0af68af, ft-572bb69d, ft-c0afdfef, ft-c666ba7c |
 | 23 | **TS namespace `scope_locals`**. `is_symbol_binding` (`scope_locals.rs:125`) has no `internal_module` arm (its parent-kind list is `:156-174`), so the namespace's own name is filed as a file-scope local and `name_is_shadowed_by_local` drops every non-call file-scope read of it. The symbol is emitted at `extract_node.rs:535` [V] | TS, TSX, JS | `scope_locals.rs::is_symbol_binding`: add `"internal_module"` (and `"module"` for the `module X {}` keyword form) to the list, with the `name` field test. The `name` may be a `nested_identifier` for `A.B.C` [U: handle it] | none (corrects `scope_locals` and the references that survive) | `a_namespace_read_at_file_scope_is_not_confidently_dead` (`rust/devmap-analyze/tests/ts_namespace_module_scope_read.rs:41`) and its siblings pin the *interim cap*; they must be **inverted** (namespace read at file scope is live at full confidence) and the cap `NAMESPACE_READ_UNEXTRACTED` (`liveness.rs:1362`, used `:1678`) deleted in the same change. `attack_script_probe3.rs:34` control | ft-260158ce |
 | 24 | **tsconfig `parent_dir` backslash**: `tsconfig.rs:181` is `rsplit_once('/')` only. The resolver twin (`resolver/candidates.rs:349`) was fixed and has a test (`resolver/tests.rs:15`) [V] | TS | `rust/devmap-extract/src/tsconfig.rs:181` | none. Output changes only for inputs containing `\` | New test needed (no ignored one exists): a `tsconfig` whose `extends`/`baseUrl` is written with `\`. Boundary hardening, but output-changing, so it rides the bump | ft-a43bfbc6 |
 | 25 | **Swift extract residue, receiver typing** (ft-80c5d100): the closure parameter `$0`, `v!`, `first`, subscripts, `Set.contains` and similar do not get a receiver type. The typing lives in `swiftscope.rs`, reached from `scope_locals.rs:509` `crate::swiftscope::bindings` [V] | Swift | `swiftscope.rs` (3291 lines): element-type propagation through `compactMap`, `map`, `contains`, `first`, subscripts, `!`, generic `where` constraints, contextual `.init`/`.shared` | none (more `LocalBinding.declared_type`) | 10 ignores citing ft-80c5d100 in `rust/devmap-resolve/tests/swift_properties_attack.rs`: `:236`, `:246`, `:471`, and macro rows `:813`, `:818`, `:821`, `:823`, `:824`, `:825`, `:855` | ft-80c5d100 |
@@ -242,8 +239,8 @@ means every installed consumer reports the new number. This bundle changes **dev
 
 | Consumer | Action | Done when |
 |---|---|---|
-| GitPulse (vendors `devmap-extract`, `scripts/vendor-crates.mjs:143`) | `node scripts/vendor-crates.mjs`, `bun run check:vendor-schema`, commit; `bun run mcp:install && bun run mcp:doctor` (all three verdicts OK); `bun run tauri build`, reinstall GitPulse.app | `bun run check:schema-parity` passes with no stale row |
-| Manvi (links DevCouncil crates live, pins in `scripts/module-pins.txt`) | bump the DevCouncil pin to the v98 merge commit; `manvi doctor` | doctor reports devmap-extract 98 |
+| Waylode (formerly GitPulse; vendors `devmap-extract`, `scripts/vendor-crates.mjs:143`) | `node scripts/vendor-crates.mjs`, `bun run check:vendor-schema`, commit; `bun run mcp:install && bun run mcp:doctor` (all three verdicts OK); `bun run tauri build`, reinstall Waylode (GitPulse.app) | `bun run check:schema-parity` passes with no stale row |
+| Manvi (links DevCouncil crates live, pins in Manvi's "scripts/module-pins.txt") | bump the DevCouncil pin to the v98 merge commit; `manvi doctor` | doctor reports devmap-extract 98 |
 | Jarvis (pins in `upstream.lock.json` and `go.mod`; gusset must agree in all three places) | bump the DevCouncil pin; `dev check-pins` and doctor | pins agree, doctor OK |
 | Installed `devmap` | rebuild and reinstall; `devmap --version`; `devmap build --full` so warm stores pick up v98 | version line shows the v98 build |
 
@@ -259,8 +256,8 @@ values in the BUILD_REPORT handover (`1ae3bc15`) disagree with `Manvi/scripts/mo
 1. **Commit 0, scaffold (one owner, small, lands first).** Add all new model structs and empty
    `Extraction` fields (updating every `Extraction` literal), the version bump, the `a_v97` test and
    pin updates, and **pre-wire the dispatch seams** so lanes touch only leaf files:
-   `jvmfacts::collect`, `pyfacts::collect` (both return empty), `langdecl::return_type_of` and
-   `langdecl::symbol_extras` (return `None`), the `langdecl/java.rs` registry arm (delegates to
+   `jvmfacts::collect`, `pyfacts::collect` (both return empty), the proposed return-type and
+   symbol-extras helpers (return `None`), the `langdecl/java.rs` registry arm (delegates to
    `generic`). No behaviour change; the corpus edge set must be byte-identical to main except the
    version stamp.
 2. **Phase E, two parallel lanes** (section 3), each rebased on commit 0.
@@ -321,7 +318,7 @@ Files (all under `rust/devmap-extract/src/` unless noted):
 - `tsconfig.rs` (row 24)
 - tests: `rust/devmap-resolve/tests/swift_*`, `python_*`, `py_receiver_residue_attack2.rs`,
   `rust/devmap-analyze/tests/attack_script_probe*.rs`, `python_script_entry_liveness.rs`,
-  `rust/devmap-cli` bindings, new `rust/devmap-extract/tests/tsconfig_backslash.rs`
+  `rust/devmap-cli` bindings, new tsconfig backslash test (proposed `tsconfig_backslash.rs` under `rust/devmap-extract/tests/`)
 
 **Corpus diff gate B**, same 12 repos: zero lost true edges and zero lost symbols; any added Swift
 property type must not remove a true edge; for `py_bindings`, **no resolver behaviour changes in
@@ -346,7 +343,7 @@ Risks:
    Node count, build time and dead-code rows all move. Mitigation: the dead-row gate in A; if rows
    explode, ship V7 with the properties non-exported-exempt tagged first and tighten later.
 2. **Id churn** from rows 17, 18 and the property-versus-callable collision (Q2). Joins keyed by id
-   in consumers (GitPulse ledger, Manvi) will see renames. Mitigated by renaming only collision
+   in consumers (Waylode ledger, Manvi) will see renames. Mitigated by renaming only collision
    groups, but consumers must be told in the sweep report.
 3. **Recovery can hallucinate** (rows 13, 15, 16). A re-parse that emits a symbol that is not there is
    worse than a drop. Gate: repaired ranges are recorded in `recovered_decl_ranges` and unrecovered ones in `decl_gaps`, the loss detector is a tree
@@ -389,7 +386,7 @@ Open questions (each needs a ruling or a measurement):
 - **Q7** Should rows 22, 25, 26, 27, 28 (Python and Swift, from ignores citing "schema frozen at 97"
   but not named in the V1-V14 doc) ride this bump? They need one bump anyway (the freeze is global),
   and a second bump costs another consumer sweep. Recommendation: yes, lane B.
-- **Q8** `ImportKind` (row 4) is optional hardening with no probe. Keep or cut? It adds a field on a
+- **Q8** The proposed import-kind enum (row 4) is optional hardening with no probe. Keep or cut? It adds a field on a
   15-site struct. Recommendation: cut unless Phase R shows the text parser failing.
 - **[U] first-step verifications** before any lane starts: ~~dump Kotlin tree-sitter shapes for rows 15
   and 16~~ (row 15 done: `annotated_expression` chain around an `infix_expression`, or an `assignment`

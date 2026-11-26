@@ -10,7 +10,7 @@ Cards: `ft-6bcae99cd8aea8538b677a3660c18cbe` (task_id
 
 `devmap build` used to move a damaged store aside (`<name>.corrupt-<unix
 seconds>`, with its `-wal` and `-shm`) and build again from source. The mover
-(`Store::quarantine_damaged`, its naming logic, `Store::quick_check`, the
+(the removed Store::quarantine_damaged helper, its naming logic, `Store::quick_check`, the
 `SQLITE_CORRUPT` retry in `build`, and the `store_recovery` key of the build
 JSON) was deleted, not disabled. It is in the history of this branch at
 `0f254876` (and the attack round that broke it is `attack/dsr` @ `8da36922`).

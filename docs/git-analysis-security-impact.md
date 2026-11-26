@@ -81,6 +81,6 @@ secrets or quotas, or changes what a gate allows an agent to write.
   absent). The diff reads run nothing inside it either way.
 - Windows: the guards are applied there too, but the planted-program tests are
   shell scripts and run only on unix.
-- Copies outside this repository — Manvi's `crates/dc-proc` and GitPulse's
+- Copies outside this repository — Manvi's `crates/dc-proc` and Waylode's (formerly GitPulse's)
   vendored `dc-proc`/`dc-regress`/`devmap-extract` — keep the old behaviour
   until they are updated.

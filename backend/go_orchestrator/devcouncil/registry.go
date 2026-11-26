@@ -18,32 +18,10 @@ import (
 )
 
 // ToolBehaviour is (readOnly, destructive, idempotent, openWorld).
-type ToolBehaviour struct {
-	ReadOnly    bool
-	Destructive bool
-	Idempotent  bool
-	OpenWorld   bool
-}
+type ToolBehaviour = dc.SharedToolBehaviour
 
 // ToolSpec is one advertised MCP tool.
-type ToolSpec struct {
-	Name        string
-	Description string
-	InputSchema json.RawMessage
-	Behaviour   ToolBehaviour
-}
-
-// Annotations maps behaviour into the MCP ToolAnnotations shape.
-func (b ToolBehaviour) Annotations() map[string]any {
-	return map[string]any{
-		"readOnlyHint":    b.ReadOnly,
-		"destructiveHint": b.Destructive,
-		"idempotentHint":  b.Idempotent,
-		"openWorldHint":   b.OpenWorld,
-	}
-}
-
-var ro = ToolBehaviour{ReadOnly: true, Destructive: false, Idempotent: true, OpenWorld: false}
+type ToolSpec = dc.SharedToolSpec
 
 // Registry is the Phase-4 MCP tool surface. It does not import Manvi packages.
 type Registry struct {
@@ -95,66 +73,12 @@ func (r *Registry) Specs() []ToolSpec { return toolSpecs() }
 // this list in both directions. Callers that can reach this function have no
 // such excuse.
 func ServedToolNames() []string {
-	specs := toolSpecs()
-	names := make([]string, len(specs))
-	for i, spec := range specs {
-		names[i] = spec.Name
-	}
-	return names
+	return dc.SharedToolNames()
 }
 
-// toolSpecs is the one literal list of advertised tools.
+// toolSpecs returns the canonical advertised shared devcouncil_* tools from dc.
 func toolSpecs() []ToolSpec {
-	return []ToolSpec{
-		{
-			Name:        "devcouncil_get_diff",
-			Description: "Return the working-tree (or staged) git diff, optionally scoped to a task's planned files or explicit paths.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"staged":{"type":"boolean"}},"additionalProperties":false}`),
-			Behaviour:   ro,
-		},
-		{
-			Name:        "devcouncil_checkout_task",
-			Description: "Acquire a lease on a task and return its scope, lease token, and allowed next tools.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"client_id":{"type":"string"},"agent":{"type":"string"},"force":{"type":"boolean","description":"Take the task even if another client holds its lease, revoking that lease. The reply names the revoked owner as revoked_lease_owner. Reserved for human intervention."}},"required":["task_id","client_id"],"additionalProperties":false}`),
-			Behaviour:   ToolBehaviour{ReadOnly: false, Destructive: false, Idempotent: false, OpenWorld: false},
-		},
-		{
-			Name:        "devcouncil_renew_lease",
-			Description: "Extend an active lease before its TTL expires.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"lease_token":{"type":"string"}},"required":["task_id","lease_token"],"additionalProperties":false}`),
-			Behaviour:   ToolBehaviour{ReadOnly: false, Destructive: false, Idempotent: false, OpenWorld: false},
-		},
-		{
-			Name:        "devcouncil_release_task",
-			Description: "Release a held lease so another agent can check the task out.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"lease_token":{"type":"string"}},"required":["task_id","lease_token"],"additionalProperties":false}`),
-			Behaviour:   ToolBehaviour{ReadOnly: false, Destructive: false, Idempotent: true, OpenWorld: false},
-		},
-		{
-			Name:        "devcouncil_next_task",
-			Description: "Find the next ready, unheld task. Does not acquire a lease.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"client_id":{"type":"string"}},"additionalProperties":false}`),
-			Behaviour:   ro,
-		},
-		{
-			Name:        "devcouncil_verify_task",
-			Description: "Verify a leased task. Requires a valid lease_token. Verifies the task's diff against its scope and acceptance criteria and returns the verdict: status, blocking gaps, and typed next actions to repair them. The result shape is pinned by committed golden envelopes captured from the retired Python implementation.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"lease_token":{"type":"string"}},"required":["task_id","lease_token"],"additionalProperties":false}`),
-			Behaviour:   ToolBehaviour{ReadOnly: false, Destructive: false, Idempotent: true, OpenWorld: true},
-		},
-		{
-			Name:        "devcouncil_get_gaps",
-			Description: "Return verification gaps for a task from the latest persisted verification run.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}`),
-			Behaviour:   ro,
-		},
-		{
-			Name:        "devcouncil_policy_check_write",
-			Description: "Ask whether a write to a path would be allowed under the current gate posture. Pass task_id to judge it against that task's planned scope; without one the answer stops at task.absent after the secret, restricted and outside-root rules. operation is create, modify (the default) or delete.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"path":{"type":"string"},"task_id":{"type":"string"},"operation":{"type":"string","enum":["create","modify","delete"]}},"required":["path"],"additionalProperties":false}`),
-			Behaviour:   ro,
-		},
-	}
+	return dc.SharedToolSpecs()
 }
 
 // Call dispatches one tool by name.
@@ -500,8 +424,6 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		"decision":                 d,
 	}
 }
-
-func rawSchema(s string) json.RawMessage { return json.RawMessage(s) }
 
 // argumentHints says, for an argument callers send expecting it to work, why
 // it is refused rather than merely that it is.

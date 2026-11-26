@@ -24,7 +24,7 @@ suggests tests to run; it does not record a test result.
 ## Testing Go packages that link Gusset from a linked worktree
 
 `cmd/devcouncil` and `gussetfn` link a sibling Gusset checkout and
-`libgusset.a`; from `.gitpulse/worktrees/<lane>` the `go.mod` replace
+`libgusset.a`; from a Waylode / GitPulse worktree lane (`.gitpulse/worktrees/<lane>`) the `go.mod` replace
 (`../../../gusset`) and the archive path do not resolve ("[setup failed]").
 Run those tests through the lane wrapper, which writes a `go.work` in the
 worktree's private git dir (nothing in the tree changes) and points the linker
@@ -116,6 +116,7 @@ see [architecture](architecture.md) and [project status](project-status.md).
 
 ## Before you push, and before you tag
 
+All commits must carry a DCO 1.1 `Signed-off-by:` trailer (`git commit -s`; see [`CONTRIBUTING.md`](../CONTRIBUTING.md) and [`DCO.txt`](../DCO.txt)).
 Nothing enforces a gate on `git push`, so the gate is a rule: run
 `npm run ci:local` from the repository root before pushing to `main`. It runs the
 script tests, the release-identity gates, the workflow lint, the npm package

@@ -40,7 +40,7 @@ uses every edge.
 ## How hosts consume the modules
 
 - **Manvi** wraps the components: it drives the agent loop, provider routing, policy ladder, and TUI, and reaches each binary over JSON on stdio. A host that wants a harness embeds Manvi rather than reimplementing it.
-- **GitPulse** uses both for their respective jobs: Manvi (`manvi serve`) for policy, workbench, and agent hosting; selected DevCouncil crates and the `devmap` CLI for in-process code intelligence. It does not have to take every module.
+- **Waylode** (formerly GitPulse) uses both for their respective jobs: Manvi (`manvi serve`) for policy, workbench, and agent hosting; selected DevCouncil crates and the `devmap` CLI for in-process code intelligence. It does not have to take every module.
 - **Other apps** pick the same way — `devmap` alone, `dcverify` alone, the Go host MCP, or the full set. Updating one module does not require shipping the rest.
 
 ### Host integration and skill installation: one owner
@@ -87,7 +87,7 @@ Antigravity agent installation; the Go host delegates.**
 
 Before this, both languages carried a host list, a per-host document table and
 an installer for the same receipt, kept in step by Go tests that parsed the
-Rust source. The decision removes the second copies instead of pinning them. Manvi owns its agent loop and provider orchestration. GitPulse
+Rust source. The decision removes the second copies instead of pinning them. Manvi owns its agent loop and provider orchestration. Waylode
 composes Manvi with selected DevCouncil components; those consumers have their
 own versions and qualification requirements.
 
@@ -132,9 +132,11 @@ flowchart TD
 ## Code graph pipeline
 
 1. `devmap-extract` discovers files and extracts definitions, imports, calls and
-   language-specific evidence (extraction schema 100; a file's `content_hash` is FNV-1a 64
+   language-specific evidence (extraction schema 102; a file's `content_hash` is FNV-1a 64
    with its byte length folded in, `source_identity`), including bounded Lean 4
-   declarations (`devmap lean-tcb`) and per-file symbol/call/reference caps
+   declarations (`devmap lean-tcb`), Svelte 5 template/expression parsing,
+   syntax repairs for TypeScript/Rust 2024/Shell, JS/TS factory-returned object
+   methods/shapes, and per-file symbol/call/reference caps
    (`MAX_FILE_SYMBOLS`, `MAX_FILE_CALLS`, `MAX_FILE_REFERENCES`). Handles Java records, compact
    constructors, enum constants, Kotlin expression-recovery, Svelte template text
    `&`/`>` repair, and CommonJS exports. Parsing and discovery gaps remain visible.
@@ -157,11 +159,13 @@ flowchart TD
    (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`,
    `FastBitSet`, and `sqlite_v30` pragmas) for sub-100 ns hop traversal;
    `devmap-query` reads and composes results with the 11-tier symbol resolution
-   ladder (`rung.rs`), Blake3 content-addressed AST storage (`cas.rs`), ephemeral
-   per-worktree delta overlays with roaring bitmaps and tombstones (`overlay.rs`),
+   ladder (`rung.rs`), Blake3 content-addressed AST storage (`cas.rs`), stacked
+   worktree delta overlays (`StackedStore`, `stack_lease.json` + `delta.sqlite`
+   over immutable `0444` bases) with roaring bitmaps and tombstones (`overlay.rs`),
    bounded unresolved-namesake site lists (`sites_omitted`), and file-hit prefix reads.
-5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP (21 tools) and
-   integration surfaces.
+5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP (21 tools),
+   remote store/CSR cache relay (`devmap cache`), Codex plugin preflight &
+   FIFO-safe host config checks, and integration surfaces.
 
 Supported parsing is not complete semantic coverage. Read
 [code graph interpretation](code-graph.md) before making completeness claims.

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DevCouncilModuleSurfaceManifest",
+  "schema_version": "1.0.0",
+  "owner_repo": "DevCouncil",
+  "updated_at": "2026-11-26",
+  "schema_constants": {
+    "devmap_store_schema": 29,
+    "devmap_min_reader_schema": 29,
+    "devmap_extraction_schema": "102",
+    "dc_store_schema": 11,
+    "dc_store_workbench_schema": 17,
+    "devmap_mcp_tool_count": 21,
+    "devcouncil_shared_mcp_tool_count": 8
+  },
+  "rust_crates": [
+    { "name": "devmap-extract", "path": "rust/devmap-extract", "role": "AST extraction & tsconfig/workspace detection", "vendored_by_waylode": true },
+    { "name": "devmap-resolve", "path": "rust/devmap-resolve", "role": "Cross-file symbol, import & call resolution", "vendored_by_waylode": true },
+    { "name": "devmap-analyze", "path": "rust/devmap-analyze", "role": "Dead code, PDG, clones & resolution analytics", "vendored_by_waylode": true },
+    { "name": "devmap-store", "path": "rust/devmap-store", "role": "SQLite store (v29), CSR, seeding & stacked bases", "vendored_by_waylode": true },
+    { "name": "devmap-query", "path": "rust/devmap-query", "role": "StackedStore, doc-drift, hygiene, semantic search", "vendored_by_waylode": true },
+    { "name": "devmap-serve", "path": "rust/devmap-serve", "role": "21-tool MCP server & live daemon watcher", "vendored_by_waylode": false },
+    { "name": "devmap-cli", "path": "rust/devmap-cli", "role": "devmap CLI, integrate, hook, cache, skill installer", "vendored_by_waylode": false },
+    { "name": "dc-store", "path": "rust/dc-store", "role": "Task, lease, scope & workbench SQLite store + dcstore CLI", "vendored_by_waylode": true },
+    { "name": "dc-verify", "path": "rust/dc-verify", "role": "AST stub/skip detection, coverage & rigor CLI (dcverify)", "vendored_by_waylode": false },
+    { "name": "dc-evidence", "path": "rust/dc-evidence", "role": "Strict JSON & TCB evidence checks", "vendored_by_waylode": true },
+    { "name": "dc-grep", "path": "rust/dc-grep", "role": "Lexical & git search engine (dcgrep)", "vendored_by_waylode": false },
+    { "name": "dc-redact", "path": "rust/dc-redact", "role": "Secret & token redaction library + CLI (dcredact)", "vendored_by_waylode": true },
+    { "name": "dc-glob", "path": "rust/dc-glob", "role": "Secret & protected path glob matcher", "vendored_by_waylode": true },
+    { "name": "dc-proc", "path": "rust/dc-proc", "role": "Process group isolation, deadlines & daemon reaping", "vendored_by_waylode": true },
+    { "name": "dc-regress", "path": "rust/dc-regress", "role": "Regression corpus harness", "vendored_by_waylode": true },
+    { "name": "dc-regress-store", "path": "rust/dc-regress-store", "role": "Regression baseline SQLite persistence", "vendored_by_waylode": true },
+    { "name": "gusset-engine", "path": "rust/gusset-engine", "role": "In-process C-ABI bridge crate", "vendored_by_waylode": false }
+  ],
+  "go_packages": [
+    { "package": "policy", "path": "backend/go_orchestrator/policy", "role": "Canonical write, secret, and command-operand policy evaluation" },
+    { "package": "gate", "path": "backend/go_orchestrator/gate", "role": "Fail-closed runtime gate evaluation and mode control" },
+    { "package": "grants", "path": "backend/go_orchestrator/grants", "role": "Scoped runtime permission grant persistence" },
+    { "package": "dc/store", "path": "backend/go_orchestrator/dc/store", "role": "Go client wrapper over dcstore" },
+    { "package": "dc/devmap", "path": "backend/go_orchestrator/dc/devmap", "role": "Warm stdio devmap mcp client" },
+    { "package": "devcouncil/spec", "path": "backend/go_orchestrator/devcouncil/spec", "role": "7-layer spec parser, validator, task export & quickstart" },
+    { "package": "devcouncil/workflow", "path": "backend/go_orchestrator/devcouncil/workflow", "role": "Resumable YAML DAG workflow engine" },
+    { "package": "devcouncil/verify", "path": "backend/go_orchestrator/devcouncil/verify", "role": "Verification orchestrator & sparse-cone checkout verifier" },
+    { "package": "devcouncil/integrate", "path": "backend/go_orchestrator/devcouncil/integrate", "role": "Thin delegating adapter to devmap integrate" },
+    { "package": "devcouncil", "path": "backend/go_orchestrator/devcouncil/registry.go", "role": "8-tool shared devcouncil_* MCP registry & server" }
+  ],
+  "explicit_non_goals": [
+    "No LLM turn loop, model provider registry, or terminal TUI (owned by Manvi)",
+    "No desktop GUI, git worktree manager, APFS CoW cache cloner, or PTY host (owned by Waylode)"
+  ]
+}

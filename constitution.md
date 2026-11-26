@@ -15,7 +15,7 @@ Implementation files must never be created before contract, integration, or unit
 All gates, verifiers, and subprocess executions must fail closed. If a verification tool, binary, or dependency is missing, unconfigured, or timed out, the gate refuses the operation. A skipped gate is a failed gate.
 
 ### Article V: Single Source of Truth & Zero Duplication
-Never create parallel or redundant implementations. Code intelligence belongs in DevMap; lease state in `dc-store`; worktrees in GitPulse; verification in `dc-verify`. Extend existing modules at the canonical seam.
+Never create parallel or redundant implementations. Code intelligence belongs in DevMap; lease state in `dc-store`; worktrees in Waylode (formerly GitPulse); verification in `dc-verify`. Extend existing modules at the canonical seam.
 
 ### Article VI: Strict Memory & Allocator Symmetry
 In cross-language boundaries (Go <-> Rust), memory must be released only by the allocator that allocated it. All in-process boundaries must run behind Gusset zero-panic firewalls and bounded worker stacks.

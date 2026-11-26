@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
@@ -371,10 +372,10 @@ func gapFromSubstance(taskID string, s dcverify.Substance) (Gap, bool) {
 func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 	gaps := make([]Gap, 0, len(findings))
 	for _, f := range findings {
-		gapType, severity, fix := "", "", ""
+		gapType := dc.GapTypeForRigorGate(f.Gate)
+		severity, fix := "", ""
 		switch f.Gate {
 		case dcverify.GateSecretScan:
-			gapType = "security_risk"
 			// Critical regardless of anything else in the run: a credential in
 			// a commit is compromised even after it is deleted, because the
 			// object stays in the repository's history.
@@ -382,7 +383,6 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 			fix = "Remove the credential from the diff and rotate it; it is compromised " +
 				"the moment this lands, and deleting the line later does not undo that."
 		case dcverify.GateStubDetection:
-			gapType = "stub_detected"
 			severity = "high"
 			fix = "Replace the placeholder with a real implementation before marking the task done."
 			if !f.Blocking() {
@@ -396,24 +396,16 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 			// A stub an `allow-stub: <reason>` marker declared intentional.
 			// Recorded rather than dropped, carrying the reason in the
 			// description, so a reviewer can see what was waved through.
-			gapType = "stub_declared"
 			severity = "low"
 			fix = "Review the declared stub and its reason; replace it before the work is called done."
-		case dcverify.GateAssertFreeTest:
-			gapType = "assert_free_test"
+		case dcverify.GateAssertFreeTest, dcverify.GateSkippedTest:
 			severity = "medium"
-			fix = "Make the added test assert on the behaviour it is named for, or call a helper that does."
-		case dcverify.GateSkippedTest:
-			gapType = "skipped_test"
-			severity = "medium"
-			fix = "Remove the unconditional skip, or make the skip conditional on what the test needs."
+			fix = dc.RigorActionText(f.Gate, f.Path, f.Line, "")
 		case dcverify.GateRunnerHijack:
-			gapType = "runner_hijack"
 			severity = "critical"
 			fix = "Remove the test-runner bypass (os._exit, os.Exit(0), TestMain omitting m.Run(), " +
 				"exitstatus = 0, or test-frame stack inspection) so the real test harness executes every assertion."
 		case dcverify.GateLeanTCB:
-			gapType = "lean_tcb"
 			severity = "critical"
 			fix = "Discharge the Lean 4 proof obligation inside the kernel without sorry, admit, " +
 				"native_decide, axiom, opaque, unsafe, @[extern], @[implemented_by], or @[csimp]."
@@ -422,7 +414,6 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 			// cannot map, so this cannot be a finding silently dropped. The
 			// branch exists so that a gate added there without a gap type here
 			// fails visibly instead of vanishing.
-			gapType = "rigor_check_unavailable"
 			severity = "high"
 			fix = "A rigor gate reported a finding this host has no gap type for; " +
 				"map " + f.Gate + " in verify/rigor.go."

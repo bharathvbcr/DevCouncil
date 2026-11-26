@@ -156,8 +156,8 @@ Reports decisive accuracy (passed/blocked), overall calibration including `incom
 verdicts, and infra-error exclusions per run.
 
 The local-monitor probe (`local_monitor_probe.py`) was removed under ft-bc87301a:
-it drove the retired Python `devcouncil` package (`OllamaProvider`,
-`AcceptanceTestCompiler`), which no longer exists in this tree, so it could not
+it drove the retired Python `devcouncil` package (including the removed
+OllamaProvider and AcceptanceTestCompiler classes), which no longer exists in this tree, so it could not
 run. Its recorded runs, `results/local_monitor_*.{json,md}`, stay and are still
 plotted; `git log -- benchmarks/local_monitor_probe.py` has the source.
 
@@ -285,7 +285,7 @@ The [v0.2.2 report](results/competition/20260914-v0.2.2/REPORT.md) is the
 current competitor comparison and the first to carry both halves in one run:
 the four-repository indexing/memory/store matrix **and** the correctness-and-query
 campaign (definitions, callers, edit visibility, index staleness, query latency,
-coverage inventories). It measures DevPrism, DevCouncil, GitPulse and scholarlm
+coverage inventories). It measures DevPrism, DevCouncil, Waylode (measured as GitPulse in the 2026-09-14 run) and scholarlm
 — 595 to 4,335 files — against CodeGraph, codebase-memory-mcp, Graphify,
 GitNexus, Gortex and a ripgrep text baseline. All 180 matrix measurements
 succeeded.
@@ -359,7 +359,7 @@ performance for the other tools.
 
 ## Code-intelligence performance
 
-Python code-intel ratchets (`tests/performance`, `scripts/codeintel-benchmark.py`)
+Python code-intel ratchets (the removed `tests/performance` suite and scripts/codeintel-benchmark.py)
 are retired. The mapping engine's required gate is `rust/verify.sh`
 (determinism, peak RSS, growth plateau, incremental-vs-cold soak).
 

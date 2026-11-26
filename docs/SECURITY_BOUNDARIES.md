@@ -226,7 +226,25 @@ callers whose path
 components come from repository content validate ancestors themselves or hold a
 root. The DevMap CLI bounds every host config it inspects at 1 MiB and requires
 a regular file, and publishes the Codex `config.toml` through the same atomic
-`safe_fs` writer as its JSON siblings.
+`safe_fs` writer as its JSON siblings. In `devmap-cli`, `installation.rs` reads
+`PostToolUse` host settings via `integrate::read_host_config` so `doctor` never blocks
+on a symlink to a FIFO, and `write_codex_plugin_assets` runs `preflight_write`
+to refuse symlinks before emitting Codex plugin assets.
+
+### `secret_read` program-operand evaluation and relay tokens
+
+The Go policy gate's `command.secret_read` rule (`policy/command_programoperand.go`,
+`policy/command_secretread.go`) exempts a search/filter tool's program operand
+(`grep -o 'gh:.*'`, `jq .env`) from wildcard-expanded file checks only when the
+tool's option table recognizes every option in the clause, the word is not
+shell-expanded, and the tool is not `sed` or `awk` (whose program scripts can
+open files via `r`/`R`/`w`/`e` or `getline <`, so `sed` and `awk` program operands
+are judged as literal paths without wildcard expansion). For `rg` (without
+`--no-config`) and the `grep` family, the first operand is also judged as a
+literal path without wildcard expansion so `GREP_OPTIONS` / `RIPGREP_CONFIG_PATH`
+cannot slip a literal credential file through. In `devmap cache push|pull`,
+`GITPULSE_RELAY_TOKEN` is read exclusively from the environment (never argv)
+and passed to `curl` via a mode-0600 temporary `--config` file deleted on drop.
 
 These checks protect against hostile repository paths and files. They are not
 an operating-system sandbox against a privileged actor or another process
@@ -305,7 +323,7 @@ memory, for the life of the session; earlier bytes are counted and discarded.
 The tail is never written to a log, a store or the terminal as the child wrote
 it. It reaches an operator by one path: `LspDidNotRun::NonZeroExit`, where
 `lsp::surface_stderr` passes it through `dc_redact::redact_secrets` (the same
-table dc-verify's secret gate and GitPulse's ledger use), drops the first line
+table dc-verify's secret gate and Waylode's — formerly GitPulse's — ledger use), drops the first line
 when bytes were dropped (a line cut mid-token matches no credential shape),
 and replaces control characters. That redacted text is what the build readout
 prints after `last stderr (redacted):` and what `build --json` carries at

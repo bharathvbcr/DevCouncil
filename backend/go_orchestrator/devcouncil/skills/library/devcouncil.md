@@ -9,7 +9,7 @@ triggers:
 
 # DevCouncil Integration for Claude Code
 
-This repository uses **DevCouncil** as a **component and module layer** for coding agents — leases, verification, and code intelligence — not as a required end-to-end application. **Manvi** wraps those components into a harness. Host apps such as GitPulse select Manvi and DevCouncil modules independently. Evidence — not model confidence — decides when work is done.
+This repository uses **DevCouncil** as a **component and module layer** for coding agents — leases, verification, and code intelligence — not as a required end-to-end application. **Manvi** wraps those components into a harness. Host apps such as **Waylode** (formerly GitPulse) select Manvi and DevCouncil modules independently. Evidence — not model confidence — decides when work is done.
 
 Check `gates.mode` before assuming verification is mandatory: `enforce` blocks,
 `advisory` records non-safety findings without blocking, and `off` skips quality
@@ -74,11 +74,11 @@ const [gate, gaps, tests] = await Promise.all([
   j($`dev tool call devcouncil_get_gaps --args ${JSON.stringify({ task_id: task })} --project-root ${root} 2>/dev/null`),
   j($`devmap affected ${files} --json --root ${root} 2>/dev/null`),
 ]);
-({ mode: gate.verification_mode, gapsExit: gaps.exit, blocking: gaps.gaps?.filter((g) => g.blocking),
+({ mode: gate.verification_mode, gaps_exit: gaps.exit, blocking: gaps.gaps?.filter((g) => g.blocking),
    tests: tests.tests?.items?.map((t) => t.path) })
 ```
 
-A non-zero `gapsExit` or a `raw` field means the call did not answer: never read it as "no gaps".
+A non-zero `gaps_exit` or a `raw` field means the call did not answer: never read it as "no gaps".
 
 **When MCP is unreliable.** `dev tool call <name> --args '<json>'` runs the same
 tool, from the same registry, with the same arguments, and prints the text an MCP

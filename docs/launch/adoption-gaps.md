@@ -7,12 +7,12 @@ review, and the cards filed from them. Every claim carries a label:
 - **vendor**: from the competitor's own site.
 - **inferred**: reasoning, not yet checked.
 
-The GitPulse half of this plan, including the cloud conflict-warning work, is in GitPulse's
-`docs/launch/ADOPTION_GAPS.md`.
+The Waylode (formerly GitPulse) half of this plan, including the cloud conflict-warning work, is in Waylode's
+"docs/launch/ADOPTION_GAPS.md" (in the GitPulse/Waylode repo).
 
 ## Why two small devtools got into YC
 
-| | Graphify Labs (YC S26) | Herdr (YC F26) | DevCouncil | GitPulse |
+| | Graphify Labs (YC S26) | Herdr (YC F26) | DevCouncil | Waylode (formerly GitPulse) |
 |---|---|---|---|---|
 | Stars | ~150k (vendor) | ~25k, $6M seed (vendor) | 4 (verified) | 18 (verified) |
 | Install | `uv tool install graphifyy`, then `/graphify .` | brew / curl | clone + Rust + Go 1.27.4 + `../gusset` (verified) | ad-hoc-signed DMG plus `xattr` (verified) |
@@ -83,7 +83,7 @@ Marketing improvements from the same pass, in order. The cards above carry them.
 6. Post "Show HN: DevMap, a local code graph that tells your agent what an edit will break", then
    r/ClaudeAI, r/rust and the MCP directories.
 7. Collect three named before/after stories before the post.
-8. For GitPulse: "Herdr runs your agents. GitPulse knows what they're changing."
+8. For Waylode: "Herdr runs your agents. Waylode knows what they're changing."
 
 ## Release checklist for the installers (owner steps, not done)
 

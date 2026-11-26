@@ -144,13 +144,13 @@ not capped: one path string and one hash per indexed file, about 0.4 MB at 3,320
 files (estimated, not measured; an estimated 10 to 15 MB at 100,000 files), and
 it lives as long as the `Store`, so a writable daemon holds it for the life of
 the daemon. Callers of `latest_generation_payload_is_current` and
-`edge_confidence_mismatches` outside this crate (GitPulse's vendored copy,
+`edge_confidence_mismatches` outside this crate (Waylode's — formerly GitPulse's — vendored copy,
 Manvi's linked one) get the same memo: a repeat within a minute returns the held
 answer unless a write moved a key.
 
 ## Re-timing at the tip (`51af7891`, after the hardening)
 
-Measured 2026-11-10/11, `mcp_ab_bench` with a fresh copy of the current GitPulse
+Measured 2026-11-10/11, `mcp_ab_bench` with a fresh copy of the current Waylode (then GitPulse)
 store (same size, 389,332,992 bytes; not the same snapshot as above), base
 `c2348467` against the tip, n = 21 (23 rounds, 2 discarded), one untimed warm-up
 per arm, `--evict-wait-secs 1` (the idle-window rows of these runs mean nothing

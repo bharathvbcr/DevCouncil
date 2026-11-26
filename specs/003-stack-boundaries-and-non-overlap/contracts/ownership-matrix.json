@@ -1,0 +1,625 @@
+{
+  "schema_version": "1.0.0",
+  "updated_at": "2026-11-26",
+  "canonical_repos": [
+    "DevCouncil",
+    "Manvi",
+    "Waylode"
+  ],
+  "legacy_repo_directory_aliases": {
+    "Waylode": "GitPulse"
+  },
+  "editions": {
+    "primary": {
+      "name": "Waylode Primary",
+      "license": "MIT OR Apache-2.0",
+      "requires_sign_in": false,
+      "paywalled": false,
+      "byok_always_free": true,
+      "devcouncil_local_scope": [
+        "devmap (21 MCP tools, Schema 29, extract 102, integrate, local federate, local cache pack/unpack/status)",
+        "dcstore (SCHEMA_VERSION 11, WORKBENCH_SCHEMA 17)",
+        "dcverify, dcgrep, dcredact, dc-glob, dc-proc, gusset-engine",
+        "Go policy/gate/grants, devcouncil CLI, 8 shared devcouncil_* tools, devcouncil pr-gate CLI & public OSS PR Gate"
+      ]
+    },
+    "labs": {
+      "name": "Waylode Labs",
+      "repository": "GitPulse-labs / gitpulse-relay",
+      "license": "FCL-1.0-MIT",
+      "requires_sign_in": true,
+      "device_auth": "Ed25519",
+      "tier_ids": ["free", "pro", "team", "enterprise"],
+      "tier_names": {
+        "free": "Free Relay Inbox (receiving shares)",
+        "pro": "Labs Geek",
+        "team": "Labs Geek Squad",
+        "enterprise": "Enterprise"
+      },
+      "e2ee_review_gated_features": ["device_sync", "secrets_vault", "team_killswitch", "markdev-sync"],
+      "devcouncil_hosted_extensions": [
+        "Hosted DevCouncil PR Gate on private repositories (Labs Geek: 3-5 repos; Geek Squad/Enterprise: unlimited)",
+        "Remote R2 devmap cache hosting (devmap cache push|pull via gitpulse-relay)",
+        "Cross-repo org devmap federation over Space infrastructure"
+      ]
+    }
+  },
+  "capabilities": [
+    {
+      "id": "code_intelligence_devmap",
+      "title": "Code Graph, Resolution, Impact, Affected Tests & Doc Drift (DevMap)",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:rust/devmap-extract/src/cache.rs (EXTRACTION_SCHEMA_VERSION = \"102\")",
+        "DevCouncil:rust/devmap-store/src/schema.rs (CURRENT_SCHEMA_VERSION = 29)",
+        "DevCouncil:rust/devmap-store/src/delta.rs (extraction_schema_version in delta_meta)",
+        "DevCouncil:rust/devmap-query/src/stacked.rs",
+        "DevCouncil:rust/devmap-serve/src/mcp.rs (TOOLS / TOOL_NAMES, 21 tools)",
+        "DevCouncil:rust/devmap-cli/src/commands/"
+      ],
+      "adapters": [
+        {
+          "repo": "Waylode",
+          "role": "read_only_subset",
+          "seams": [
+            "Waylode:src-tauri/vendored/devmap-{extract,resolve,analyze,store,query}",
+            "Waylode:src-tauri/src/mcp/devmap_parity.rs (11-tool subset of TOOL_NAMES)"
+          ],
+          "notes": "Does not vendor devmap-serve; dispatches 11 read-side devmap_* tools through in-process codeintel StackedStore."
+        },
+        {
+          "repo": "Manvi",
+          "role": "stdio_wrapper",
+          "seams": [
+            "DevCouncil:backend/go_orchestrator/dc/devmap/warm.go",
+            "Manvi:manvi/serve/devmap.go",
+            "Manvi:manvi/devcouncil/navigate.go (3 agent-facing graph tools)"
+          ],
+          "notes": "Connects to devmap mcp over stdio and exposes simplified devcouncil_graph_query, devcouncil_code_dead, and devcouncil_graph_context wrappers."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Waylode must not vendor devmap-serve or resurrect regex AST fallback / base_store_ref.json overlays.",
+        "Manvi must not implement its own tree-sitter index or SQLite code-graph store."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "Waylode:bun run check:schema-parity",
+        "Waylode:bun run check:vendor-schema",
+        "DevCouncil:cargo test --manifest-path rust/Cargo.toml -p devmap-cli"
+      ]
+    },
+    {
+      "id": "verification_and_evidence",
+      "title": "Deterministic Task Verification, AST Stub/Skip Gates & Evidence",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:rust/dc-verify/",
+        "DevCouncil:rust/dc-evidence/",
+        "DevCouncil:backend/go_orchestrator/dc/verify_actions.go (RigorActionText, GapTypeForRigorGate, CategoryForGapType, KnownGapTypes)",
+        "DevCouncil:backend/go_orchestrator/devcouncil/verify/orchestrate.go",
+        "DevCouncil:backend/go_orchestrator/devcouncil/verify/sparse_subject.go",
+        "DevCouncil:backend/go_orchestrator/devcouncil/registry.go (devcouncil_verify_task)"
+      ],
+      "adapters": [
+        {
+          "repo": "Manvi",
+          "role": "host_enforcer",
+          "seams": [
+            "Manvi:manvi/serve/verify.go (work.verify.task host-plane job runner)",
+            "Manvi:manvi/devcouncil/rigor.go (delegates rigor wording & categories to dc.RigorActionText / dc.CategoryForGapType)"
+          ],
+          "notes": "Host-plane orchestration wrapper claiming async verification runs and surfacing verdict status to IDE/desktop callers. OV-VERIFY-01 closed via dc/verify_actions.go without importing dc/dcverify."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Manvi and Waylode must not invent divergent AST stub detectors, coverage normalizers, or verification verdict shapes."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "DevCouncil:go -C backend/go_orchestrator test ./devcouncil/verify/...",
+        "DevCouncil:cargo test --manifest-path rust/Cargo.toml -p dc-verify -p dc-evidence"
+      ]
+    },
+    {
+      "id": "task_lease_and_workbench_state",
+      "title": "Task State, Lease Exclusivity, Scope Envelopes & Workbench SQLite Schema",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:rust/dc-store/src/lib.rs (SCHEMA_VERSION = 11)",
+        "DevCouncil:rust/dc-store/src/workbench/mod.rs (WORKBENCH_SCHEMA = 17)",
+        "DevCouncil:rust/dc-store/src/bin/dcstore.rs",
+        "DevCouncil:backend/go_orchestrator/dc/store/"
+      ],
+      "adapters": [
+        {
+          "repo": "Manvi",
+          "role": "schema_consumer",
+          "seams": [
+            "Manvi:manvi/serve/ (work.* workbench RPCs)",
+            "Manvi:manvi/devcouncil/tools.go"
+          ],
+          "notes": "Acts as workbench host client over dc/store."
+        },
+        {
+          "repo": "Waylode",
+          "role": "desktop_bridge",
+          "seams": [
+            "Waylode:src-tauri/vendored/dc-store",
+            "Waylode:src-tauri/src/tasks/file_tasks.rs (Markdown brief reader only)"
+          ],
+          "notes": "Displays board tasks and verification status; Markdown briefs are explicitly not a store."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Manvi and Waylode must not alter dc-store DDL or add parallel SQLite task/lease databases."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "DevCouncil:cargo test --manifest-path rust/Cargo.toml -p dc-store",
+        "Waylode:bun run check:schema-parity"
+      ]
+    },
+    {
+      "id": "policy_decisions_gates_grants",
+      "title": "Write/Command Policy Decisions, Gate Config & Grants Semantics",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:backend/go_orchestrator/policy/ (including command_programoperand.go)",
+        "DevCouncil:backend/go_orchestrator/gate/gate.go",
+        "DevCouncil:backend/go_orchestrator/grants/",
+        "DevCouncil:backend/go_orchestrator/devcouncil/gatescfg/",
+        "DevCouncil:rust/dc-glob/",
+        "DevCouncil:rust/dc-redact/"
+      ],
+      "adapters": [
+        {
+          "repo": "Manvi",
+          "role": "host_enforcer",
+          "seams": [
+            "Manvi:manvi/serve/policy.go (PostureDevCouncil and host-scope posture)"
+          ],
+          "notes": "Runtime enforcement of DevCouncil policy/gate/grants plus memguard and sandbox guards."
+        },
+        {
+          "repo": "Waylode",
+          "role": "desktop_bridge",
+          "seams": [
+            "Waylode:src-tauri/src/harness/mod.rs (guard_command, judge_command)"
+          ],
+          "notes": "Routes IDE/hook command and write checks to manvi serve and surfaces the 8-status verdict ladder."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Manvi must not redefine secret/protected path rules outside DevCouncil policy; Waylode must not invent a second command-gate ladder."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "DevCouncil:go -C backend/go_orchestrator test ./policy/... ./gate/... ./grants/...",
+        "Manvi:go -C manvi test ./serve/... ./internal/contract/...",
+        "Waylode:bun run vitest run scripts/verdict-contract.test.ts"
+      ]
+    },
+    {
+      "id": "shared_devcouncil_mcp_tools",
+      "title": "Shared devcouncil_* Task & Policy Tool Surface (8 Tools)",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:backend/go_orchestrator/dc/toolspecs.go (SharedToolSpecs, SharedToolNames, SharedToolSpecByName: 8 tools)",
+        "DevCouncil:backend/go_orchestrator/devcouncil/registry.go (toolSpecs / ServedToolNames: 8 tools)",
+        "DevCouncil:backend/go_orchestrator/devcouncil/mcp/",
+        "DevCouncil:backend/go_orchestrator/devcouncil/allowed_next_tools_test.go"
+      ],
+      "adapters": [
+        {
+          "repo": "Manvi",
+          "role": "host_enforcer",
+          "seams": [
+            "Manvi:manvi/devcouncil/tools.go (sharedTool delegates to dc.SharedToolSpecByName)",
+            "Manvi:manvi/devcouncil/policy_tools.go (devcouncil_policy_check_write operation create|modify|delete)"
+          ],
+          "notes": "Combines the 8 shared task/policy tools (validated against dc.SharedToolSpecByName with session-bound client_id/lease_token omitted) with Manvi's harness-only execution, artifact, search, and subagent tools."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Manvi must not diverge argument schemas, error codes, or allowed_next_tools lists for the 8 DevCouncil task/policy tools; Waylode must not register devcouncil_* task tools."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "DevCouncil:go -C backend/go_orchestrator test ./devcouncil/...",
+        "Manvi:go -C manvi test ./devcouncil -run TestDocumentedToolCountMatchesRegistry"
+      ]
+    },
+    {
+      "id": "agent_runtime_turn_loop_and_serve",
+      "title": "Agent Turn Loop, Local/Cloud Model Providers, Subagents, TUI & manvi serve",
+      "canonical_owner": "Manvi",
+      "owner_seams": [
+        "Manvi:manvi/cmd/manvi/turnloop.go",
+        "Manvi:manvi/cmd/manvi/subagent.go",
+        "Manvi:manvi/agent/",
+        "Manvi:manvi/agents/",
+        "Manvi:manvi/devcouncil/debate.go",
+        "Manvi:manvi/serve/"
+      ],
+      "adapters": [
+        {
+          "repo": "Waylode",
+          "role": "desktop_bridge",
+          "seams": [
+            "Waylode:src/lib/components/ManviConnection.svelte"
+          ],
+          "notes": "Connects desktop ADE to manvi serve over NDJSON."
+        }
+      ],
+      "forbidden_overlaps": [
+        "DevCouncil must not host an LLM turn loop, provider router, or TUI.",
+        "Waylode must not implement an autonomous multi-turn LLM execution loop outside Manvi."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "Manvi:go -C manvi test ./agent/... ./agents/... ./serve/..."
+      ]
+    },
+    {
+      "id": "desktop_ade_git_worktrees_pty_load",
+      "title": "Desktop ADE, Git Client, Worktree Lifecycle, Collision Radar, PTY Daemon & Load Governor",
+      "canonical_owner": "Waylode",
+      "owner_seams": [
+        "Waylode:src-tauri/src/engine/worktree.rs",
+        "Waylode:src-tauri/src/engine/cow_clone.rs",
+        "Waylode:src-tauri/src/insights/entity_collision.rs",
+        "Waylode:src-tauri/src/insights/live_sessions.rs",
+        "Waylode:src-tauri/src/sysload/",
+        "Waylode:src-tauri/src/bin/waylode-mcp.rs",
+        "Waylode:src-tauri/src/bin/waylode-ptyd.rs"
+      ],
+      "adapters": [
+        {
+          "repo": "DevCouncil",
+          "role": "schema_consumer",
+          "seams": [
+            "DevCouncil:rust/devmap-store/src/seed.rs",
+            "DevCouncil:rust/devmap-query/src/stacked.rs",
+            "DevCouncil:rust/dc-store/src/lib.rs (worktree_path/worktree_id lease columns)"
+          ],
+          "notes": "DevCouncil owns DevMap database seeding/stacking and task-lease binding only; Waylode owns git worktree creation, CoW caches, process reaping, collision detection, and UI."
+        }
+      ],
+      "forbidden_overlaps": [
+        "DevCouncil and Manvi must not reimplement desktop worktree managers, APFS CoW cloner trees, or PTY multiplexers."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "Waylode:cargo test --manifest-path src-tauri/Cargo.toml --lib"
+      ]
+    },
+    {
+      "id": "host_integration_and_wiring",
+      "title": "Coding CLI / Editor Host Config Table, MCP Registration & .agents/ Materialization",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:rust/devmap-cli/src/integrate.rs",
+        "DevCouncil:rust/devmap-cli/src/skills.rs",
+        "DevCouncil:rust/devmap-cli/src/agent_install.rs",
+        "DevCouncil:backend/go_orchestrator/devcouncil/integrate/integrate.go (delegating adapter)"
+      ],
+      "adapters": [
+        {
+          "repo": "Waylode",
+          "role": "desktop_bridge",
+          "seams": [
+            "Waylode:src-tauri/src/devmap/integrate.rs (IntegrationHost, HostCliStatus, probe_host_clis_with)",
+            "Waylode:src-tauri/src/agent_connect.rs (user-global CLI connect using devmap::probe_host_clis_with)",
+            "Waylode:src-tauri/src/workbench/agy_plugin.rs",
+            "Waylode:src-tauri/src/workbench/claude_hook.rs",
+            "Waylode:src/lib/components/AgentConnectPanel.svelte"
+          ],
+          "notes": "Target architecture keeps Waylode as Connect UI driving devmap integrate. Shared host-CLI preflight/status is unified via devmap::probe_host_clis_with (GAP-HOST-01 closed); user-global agent_connect.rs registration awaits devmap integrate --servers-only --scope user."
+        }
+      ],
+      "forbidden_overlaps": [
+        "No repo outside devmap integrate should maintain a parallel hardcoded host-path and MCP-file writer table."
+      ],
+      "current_overlaps": [
+        {
+          "id": "OV-INTEGRATE-01",
+          "repo": "Waylode",
+          "seam": "Waylode:src-tauri/src/agent_connect.rs retains user-global CLI registration (claude mcp add --scope user, codex mcp add) while sharing host-CLI preflight/status via devmap::probe_host_clis_with; full delegation awaits devmap integrate --servers-only --scope user",
+          "status": "open",
+          "closure_task": "T-008"
+        }
+      ],
+      "parity_checks": [
+        "DevCouncil:cargo test --manifest-path rust/Cargo.toml -p devmap-cli --test it -- integrate",
+        "DevCouncil:go -C backend/go_orchestrator test ./devcouncil/integrate/...",
+        "Waylode:cargo test --manifest-path src-tauri/Cargo.toml --lib agent_connect_tests"
+      ]
+    },
+    {
+      "id": "agent_skills_packaging",
+      "title": "Agent Skills Authorship & Product-Scoped Distribution",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:rust/devmap-cli/skills/ (5 devmap skills)",
+        "DevCouncil:backend/go_orchestrator/devcouncil/skills/library/ (18 devcouncil skills)",
+        "DevCouncil:scripts/sync-agent-defs.mjs"
+      ],
+      "adapters": [
+        {
+          "repo": "Waylode",
+          "role": "desktop_bridge",
+          "seams": [
+            "Waylode:plugins/waylode/skills/"
+          ],
+          "notes": "Each product ships skills only for its own binary/MCP surface."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Product repos must not silently vendor stale copies of sibling products' SKILL.md files."
+      ],
+      "current_overlaps": [
+        {
+          "id": "OV-SKILLS-01",
+          "repo": "Waylode",
+          "seam": "Waylode:plugins/waylode/skills/ cleanly ships 9 Waylode-only skills and Waylode:.agents/skills/ holds 23 dogfooding skills; automated CI guard & installer separation tracked in T-009",
+          "status": "partial",
+          "closure_task": "T-009"
+        }
+      ],
+      "parity_checks": [
+        "DevCouncil:node scripts/sync-agent-defs.mjs --check",
+        "DevCouncil:cargo test --manifest-path rust/Cargo.toml -p devmap-cli --test it -- shipped_skills"
+      ]
+    },
+    {
+      "id": "lifecycle_hooks_and_lease_wrapper",
+      "title": "Code-Graph Hooks vs Host Session/Build-Lease Hooks",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:rust/devmap-cli/src/hook.rs (devmap hook)",
+        "DevCouncil:backend/go_orchestrator/cmd/devcouncil/hook.go (devcouncil hook)"
+      ],
+      "adapters": [
+        {
+          "repo": "Waylode",
+          "role": "desktop_bridge",
+          "seams": [
+            "Waylode:src-tauri/src/hooks/mod.rs",
+            "Waylode:src-tauri/src/hooks/lease_wrapper.rs (waylode-hook / gitpulse-hook)"
+          ],
+          "notes": "Waylode hooks govern desktop alert intake, Claude/Codex session tracking, and cargo/go build lease wrapping."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Waylode hooks must not run separate DevMap indexing logic outside devmap seed/build.",
+        "DevCouncil hooks must not mutate Waylode desktop UI state or build-lease symlinks."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "DevCouncil:cargo test --manifest-path rust/Cargo.toml -p devmap-cli --test it -- hook",
+        "DevCouncil:go -C backend/go_orchestrator test ./cmd/devcouncil -run TestHook"
+      ]
+    },
+    {
+      "id": "wire_contracts_and_schema_parity",
+      "title": "Authoritative JSON Schemas, Verdict Cases, Checksums & Cross-Repo Parity",
+      "canonical_owner": "DevCouncil",
+      "owner_seams": [
+        "DevCouncil:backend/contracts/CHECKSUMS",
+        "DevCouncil:backend/contracts/event.schema.json",
+        "DevCouncil:backend/contracts/verdict.schema.json",
+        "DevCouncil:backend/contracts/verdict.cases.json",
+        "DevCouncil:backend/contracts/lease.schema.md"
+      ],
+      "adapters": [
+        {
+          "repo": "Manvi",
+          "role": "schema_consumer",
+          "seams": [
+            "Manvi:contracts/ (mirrored read-only + serve.ops.schema.json)",
+            "Manvi:manvi/internal/contract/"
+          ],
+          "notes": "Validates mirrored contracts and crate pins on every CI run."
+        },
+        {
+          "repo": "Waylode",
+          "role": "schema_consumer",
+          "seams": [
+            "Waylode:contracts/ (mirrored read-only)",
+            "Waylode:scripts/check-schema-parity.mjs",
+            "Waylode:scripts/vendor-crates.mjs"
+          ],
+          "notes": "Enforces crate/tool/schema parity against DevCouncil."
+        }
+      ],
+      "forbidden_overlaps": [
+        "Manvi and Waylode must never edit shared event/lease/verdict contracts independently of DevCouncil:backend/contracts/."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "Manvi:GOMAXPROCS=4 go -C manvi test ./internal/contract/...",
+        "Waylode:bun run check:schema-parity",
+        "Waylode:bun run vitest run scripts/check-schema-parity.test.ts scripts/verdict-contract.test.ts"
+      ]
+    },
+    {
+      "id": "hosted_labs_relay_extensions",
+      "title": "Waylode Primary (Free OSS Local + BYOK) vs. Waylode Labs (Hosted Relay Extensions)",
+      "canonical_owner": "Waylode Labs",
+      "owner_seams": [
+        "Waylode Labs:gitpulse-relay (private repo, FCL-1.0-MIT)",
+        "Waylode:specs/003-primary-and-labs-editions/contracts/edition-boundary.schema.json (public wire tier definitions: free, pro, team, enterprise)"
+      ],
+      "adapters": [
+        {
+          "repo": "DevCouncil",
+          "role": "schema_consumer",
+          "seams": [
+            "DevCouncil:rust/devmap-cli/src/commands/cache.rs (devmap cache push|pull via GITPULSE_RELAY_TOKEN/GITPULSE_RELAY_URL)",
+            "DevCouncil:backend/go_orchestrator/cmd/devcouncil/prgate.go (local devcouncil pr-gate CLI)",
+            "DevCouncil:rust/devmap-cli/src/commands/federate.rs (local devmap federate status|impact)"
+          ],
+          "notes": "DevCouncil local CLIs and public OSS PR Gate stay 100% free (MIT OR Apache-2.0, requires_sign_in: false) with zero billing or account logic; hosted private-repo PR Gate, R2 cache hosting, and org federation live in Waylode Labs."
+        },
+        {
+          "repo": "Manvi",
+          "role": "host_enforcer",
+          "seams": [
+            "Manvi:manvi/serve/policy.go (org-signed policy_bundles enforced externally via host posture)"
+          ],
+          "notes": "Manvi local core has zero billing/paywall logic; Waylode Labs layers remote relay approvals, Space AI spend rollups, and Enterprise policy_bundles outside Manvi."
+        }
+      ],
+      "forbidden_overlaps": [
+        "DevCouncil and Manvi must never add account sign-in, license checks, or billing logic to local open-source binaries.",
+        "Waylode Labs must never gate local IDE/CLI workflows, local devmap/dcverify/pr-gate execution, public OSS PR gates, or BYOK compute behind paid tiers."
+      ],
+      "current_overlaps": [],
+      "parity_checks": [
+        "DevCouncil:python3 -m json.tool specs/003-stack-boundaries-and-non-overlap/contracts/ownership-matrix.json > /dev/null",
+        "DevCouncil:devcouncil spec validate 003-stack-boundaries-and-non-overlap --strict --project-root /Users/bharath/Code/devtools/DevCouncil"
+      ]
+    }
+  ],
+  "landing_order": [
+    "DevCouncil",
+    "Manvi",
+    "Waylode Primary",
+    "Waylode Labs"
+  ],
+  "work_lanes": [
+    {
+      "lane_id": "lane-a-devcouncil",
+      "name": "Lane A — DevCouncil (Engines, Schemas & Contracts)",
+      "repo": "DevCouncil",
+      "edition": "primary",
+      "landing_order": 1,
+      "owned_paths": [
+        "rust/",
+        "backend/go_orchestrator/",
+        "backend/contracts/",
+        "specs/",
+        "docs/",
+        "scripts/",
+        "constitution.md",
+        "dist-workspace.toml",
+        "package.json"
+      ],
+      "forbidden_paths": [
+        "Manvi:*",
+        "Waylode:*",
+        "Waylode Labs:*"
+      ],
+      "handoff_upstream": [],
+      "required_checks": [
+        "cargo test --manifest-path rust/Cargo.toml -p devmap-cli --test it -- shipped_skills",
+        "go -C backend/go_orchestrator test ./policy/... ./gate/... ./devcouncil/...",
+        "node scripts/check-stack-boundaries.mjs",
+        "node scripts/sync-agent-defs.mjs --check",
+        "devcouncil spec validate 003-stack-boundaries-and-non-overlap --strict --project-root ."
+      ]
+    },
+    {
+      "lane_id": "lane-b-manvi",
+      "name": "Lane B — Manvi (Agent Harness, Policy Enforcement & manvi serve)",
+      "repo": "Manvi",
+      "edition": "primary",
+      "landing_order": 2,
+      "owned_paths": [
+        "manvi/",
+        "native/",
+        "contracts/",
+        "specs/",
+        "docs/",
+        "scripts/"
+      ],
+      "forbidden_paths": [
+        "DevCouncil:rust/",
+        "DevCouncil:backend/go_orchestrator/",
+        "DevCouncil:backend/contracts/",
+        "Waylode:*"
+      ],
+      "handoff_upstream": [
+        "DevCouncil:backend/contracts/",
+        "DevCouncil:backend/go_orchestrator/{policy,gate,grants,dc,devcouncil}/",
+        "DevCouncil:rust/dc-*"
+      ],
+      "required_checks": [
+        "GOMAXPROCS=4 go -C manvi test ./internal/contract/...",
+        "go -C manvi test ./devcouncil -run TestDocumentedToolCountMatchesRegistry -count=1",
+        "devcouncil spec validate 001-agent-harness-and-serve-plane --strict --project-root .",
+        "devcouncil spec validate 002-policy-enforcement-and-hardening --strict --project-root ."
+      ]
+    },
+    {
+      "lane_id": "lane-c-waylode-primary",
+      "name": "Lane C — Waylode Primary (Public ADE, Git, Worktrees, PTY, Load Governor)",
+      "repo": "Waylode",
+      "edition": "primary",
+      "landing_order": 3,
+      "owned_paths": [
+        "src/",
+        "src-tauri/src/",
+        "src-tauri/crates/",
+        "src-tauri/vendored/",
+        "plugins/",
+        "contracts/",
+        "specs/",
+        "docs/",
+        "wiki/",
+        "scripts/"
+      ],
+      "forbidden_paths": [
+        "src-tauri/vendored/devmap-serve/",
+        "DevCouncil:rust/",
+        "DevCouncil:backend/go_orchestrator/",
+        "Manvi:manvi/",
+        "Waylode Labs:labs/",
+        "Waylode Labs:src-tauri/src/features/registry.rs"
+      ],
+      "handoff_upstream": [
+        "DevCouncil:backend/contracts/",
+        "DevCouncil:rust/devmap-{extract,resolve,analyze,store,query}/",
+        "DevCouncil:rust/dc-{store,evidence,glob,proc,redact,regress,regress-store}/",
+        "Manvi:contracts/serve.ops.schema.json"
+      ],
+      "required_checks": [
+        "node scripts/check-schema-parity.mjs",
+        "bun run vitest run scripts/brand-rename-contract.test.ts scripts/architecture-docs-contract.test.ts scripts/verdict-contract.test.ts scripts/check-schema-parity.test.ts",
+        "devcouncil spec validate 001-local-first-ade-and-worktrees --strict --project-root .",
+        "devcouncil spec validate 002-host-integration-and-cross-repo-seams --strict --project-root .",
+        "devcouncil spec validate 003-primary-and-labs-editions --strict --project-root ."
+      ]
+    },
+    {
+      "lane_id": "lane-d-waylode-labs",
+      "name": "Lane D — Waylode Labs (Private Relay, E2EE Sync, Billing, Spaces, Hosted PR Gate)",
+      "repo": "Waylode Labs",
+      "edition": "labs",
+      "landing_order": 4,
+      "owned_paths": [
+        "src-tauri/src/features/",
+        "src-tauri/src/labs/",
+        "src/lib/account/",
+        "gitpulse-relay/"
+      ],
+      "forbidden_paths": [
+        "DevCouncil:*",
+        "Manvi:*",
+        "Waylode:src-tauri/vendored/",
+        "Waylode:specs/001-local-first-ade-and-worktrees/"
+      ],
+      "handoff_upstream": [
+        "Waylode:specs/003-primary-and-labs-editions/contracts/edition-boundary.schema.json",
+        "DevCouncil:specs/003-stack-boundaries-and-non-overlap/contracts/ownership-matrix.json",
+        "DevCouncil:rust/devmap-cli/src/commands/cache.rs",
+        "Manvi:manvi/serve/policy.go"
+      ],
+      "required_checks": [
+        "cargo test --manifest-path src-tauri/Cargo.toml --lib features",
+        "node scripts/check-stack-boundaries.mjs --lanes"
+      ]
+    }
+  ]
+}

@@ -1754,6 +1754,7 @@ pub struct StackedStore {
     /// creates or migrates it: a missing delta reads as an empty one.
     delta: Option<DeltaStore>,
     delta_writable: bool,
+    delta_extraction_schema_version: Option<String>,
     overlay: WorktreeOverlay,
     /// The base edge index merged with the delta's edges, built on first use and
     /// dropped whenever the overlay is rebuilt. Unused while the delta is empty.
@@ -1829,7 +1830,7 @@ impl StackedStore {
             // fresh one.
             delta.limit_wait(deadline.saturating_duration_since(Instant::now()))?;
         }
-        let overlay =
+        let (overlay, delta_extraction_schema_version) =
             build_overlay_from_delta(&wt_root_str, lease.generation_id, &base, delta.as_ref())?;
 
         Ok(Self {
@@ -1840,6 +1841,7 @@ impl StackedStore {
             base,
             delta,
             delta_writable: false,
+            delta_extraction_schema_version,
             overlay,
             merged_edges: Mutex::new(None),
         })
@@ -2304,6 +2306,11 @@ impl StackedStore {
     /// tombstone for a path that is gone, or the hash of the bytes on disk.
     /// Identity by content, not by path: a second edit of a synced path differs.
     fn delta_covers(&self, rel_path: &str) -> bool {
+        if self.delta_extraction_schema_version.as_deref()
+            != Some(devmap_extract::cache::EXTRACTION_SCHEMA_VERSION)
+        {
+            return false;
+        }
         let path = Path::new(rel_path);
         let full = self.worktree_root.join(rel_path);
         if self.overlay.is_file_tombstoned(path) {
@@ -3200,12 +3207,14 @@ impl StackedStore {
 
     fn reload_overlay(&mut self) -> Result<()> {
         let wt_str = self.worktree_root.to_string_lossy().into_owned();
-        self.overlay = build_overlay_from_delta(
+        let (overlay, delta_extraction_schema_version) = build_overlay_from_delta(
             &wt_str,
             self.lease.generation_id,
             &self.base,
             self.delta.as_ref(),
         )?;
+        self.overlay = overlay;
+        self.delta_extraction_schema_version = delta_extraction_schema_version;
         // The merged edge index was built from the overlay just replaced.
         *self
             .merged_edges
@@ -3674,11 +3683,12 @@ fn build_overlay_from_delta(
     generation_id: u32,
     base: &Store,
     delta: Option<&DeltaStore>,
-) -> Result<WorktreeOverlay> {
+) -> Result<(WorktreeOverlay, Option<String>)> {
     let snap = match delta {
         Some(delta) => delta.load_snapshot()?,
         None => Default::default(),
     };
+    let extraction_schema_version = snap.extraction_schema_version.clone();
     let mut overlay = WorktreeOverlay::new(worktree_id.to_string(), u64::from(generation_id));
     overlay.dirty_nodes = RoaringBitmap::new();
 
@@ -3719,7 +3729,7 @@ fn build_overlay_from_delta(
         });
     }
 
-    Ok(overlay)
+    Ok((overlay, extraction_schema_version))
 }
 
 fn extract_delta_edges(rel_path: &str, extraction: &Extraction) -> Vec<DeltaEdgeRecord> {
@@ -9326,6 +9336,106 @@ mod tests {
             open_lane_base_store(&lease.base_sqlite_path()).is_err(),
             "a stat-identity tamper must still be refused by open_lane_base_store"
         );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn delta_covers_requires_matching_extraction_schema_version() {
+        let root = temp_repo_dir("delta-covers-extract-ver");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        let rel = "src/limits.rs";
+        fs::write(
+            lane.join(rel),
+            "pub const MAX_BATCH: usize = 128;\npub fn within_cap(v: usize) -> bool { v < MAX_BATCH }\n",
+        )
+        .unwrap();
+
+        // 1. Syncing writes extraction_schema_version == EXTRACTION_SCHEMA_VERSION -> delta_covers is true.
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        stacked.sync_worktree().unwrap();
+        drop(stacked);
+        let stacked = StackedStore::open(&lane).unwrap();
+        assert!(
+            stacked.delta_covers(rel),
+            "delta_covers must be true when extraction_schema_version matches"
+        );
+        assert!(
+            !stacked.unsynced_paths().unwrap().contains(rel),
+            "synced file with matching extraction version must not be reported unsynced"
+        );
+        drop(stacked);
+
+        // 2. Mismatched extraction_schema_version -> delta_covers is false.
+        let delta_path = stack_delta_path(&lane);
+        {
+            let conn = rusqlite::Connection::open(&delta_path).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO delta_meta (key, value) VALUES ('extraction_schema_version', '0')",
+                [],
+            )
+            .unwrap();
+        }
+        let stacked = StackedStore::open(&lane).unwrap();
+        assert!(
+            !stacked.delta_covers(rel),
+            "delta_covers must be false when extraction_schema_version mismatches"
+        );
+        assert!(
+            stacked.unsynced_paths().unwrap().contains(rel),
+            "mismatched extraction version must mark the file unsynced"
+        );
+        drop(stacked);
+
+        // 3. Missing delta_meta row -> delta_covers is false.
+        {
+            let conn = rusqlite::Connection::open(&delta_path).unwrap();
+            conn.execute(
+                "DELETE FROM delta_meta WHERE key = 'extraction_schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        let stacked = StackedStore::open(&lane).unwrap();
+        assert!(
+            !stacked.delta_covers(rel),
+            "delta_covers must be false when extraction_schema_version row is missing"
+        );
+        drop(stacked);
+
+        // 4. Pre-existing read-only delta.sqlite without delta_meta table -> opens cleanly without
+        //    `no such table` and delta_covers returns false.
+        {
+            let conn = rusqlite::Connection::open(&delta_path).unwrap();
+            conn.execute_batch("DROP TABLE delta_meta;").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let state_dir = delta_path.parent().unwrap();
+            fs::set_permissions(&delta_path, fs::Permissions::from_mode(0o444)).unwrap();
+            fs::set_permissions(state_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let stacked = StackedStore::open(&lane).expect(
+            "pre-existing read-only delta.sqlite without delta_meta must open without no-such-table error",
+        );
+        assert!(
+            !stacked.delta_covers(rel),
+            "delta_covers must be false when delta_meta table is absent"
+        );
+        drop(stacked);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let state_dir = delta_path.parent().unwrap();
+            fs::set_permissions(state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&delta_path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
         let _ = remove_readonly_tree(&root);
     }
 }

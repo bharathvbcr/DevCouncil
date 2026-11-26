@@ -52,10 +52,17 @@ CREATE TABLE IF NOT EXISTS delta_edges (
 
 CREATE INDEX IF NOT EXISTS idx_delta_edges_source ON delta_edges(source_symbol);
 CREATE INDEX IF NOT EXISTS idx_delta_edges_target ON delta_edges(target_symbol);
+
+CREATE TABLE IF NOT EXISTS delta_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
-/// The tables [`DELTA_SCHEMA_DDL`] creates; a read-only open counts them.
+/// The core tables [`DELTA_SCHEMA_DDL`] creates; a read-only open counts them
+/// so pre-existing `delta.sqlite` files without `delta_meta` still open.
 const DELTA_TABLE_COUNT: i64 = 3;
+const EXTRACTION_SCHEMA_VERSION_KEY: &str = "extraction_schema_version";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaFileRecord {
@@ -92,6 +99,7 @@ pub struct DeltaSnapshot {
     pub files: Vec<DeltaFileRecord>,
     pub symbols: Vec<DeltaSymbolRecord>,
     pub edges: Vec<DeltaEdgeRecord>,
+    pub extraction_schema_version: Option<String>,
 }
 
 /// A read or write of the stacked delta store failed with `SQLITE_CORRUPT`.
@@ -226,6 +234,28 @@ impl DeltaStore {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .and_then(|tx| {
                 tx.execute_batch(DELTA_SCHEMA_DDL)?;
+                let has_meta: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM delta_meta WHERE key = ?1",
+                        params![EXTRACTION_SCHEMA_VERSION_KEY],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if has_meta.is_none() {
+                    let has_rows: bool =
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM delta_files)", [], |row| {
+                            row.get(0)
+                        })?;
+                    if !has_rows {
+                        tx.execute(
+                            "INSERT OR REPLACE INTO delta_meta (key, value) VALUES (?1, ?2)",
+                            params![
+                                EXTRACTION_SCHEMA_VERSION_KEY,
+                                devmap_extract::cache::EXTRACTION_SCHEMA_VERSION
+                            ],
+                        )?;
+                    }
+                }
                 tx.commit()
             });
         schema.with_context(|| format!("cannot initialize delta schema at {}", path.display()))?;
@@ -400,6 +430,18 @@ impl DeltaStore {
         main.saturating_add(wal)
     }
 
+    pub fn extraction_schema_version(&self) -> Result<Option<String>> {
+        tag_damage(&self.path, self.extraction_schema_version_untagged())
+    }
+
+    fn extraction_schema_version_untagged(&self) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("delta store mutex poisoned"))?;
+        read_extraction_schema_version(&conn)
+    }
+
     pub fn dirty_file_count(&self) -> Result<usize> {
         tag_damage(&self.path, self.dirty_file_count_untagged())
     }
@@ -505,6 +547,17 @@ impl DeltaStore {
                 ],
             )?;
         }
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS delta_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO delta_meta (key, value) VALUES (?1, ?2)",
+            params![
+                EXTRACTION_SCHEMA_VERSION_KEY,
+                devmap_extract::cache::EXTRACTION_SCHEMA_VERSION
+            ],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -639,12 +692,33 @@ impl DeltaStore {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
 
+        let extraction_schema_version = read_extraction_schema_version(&conn)?;
+
         Ok(DeltaSnapshot {
             files,
             symbols,
             edges,
+            extraction_schema_version,
         })
     }
+}
+
+fn read_extraction_schema_version(conn: &Connection) -> Result<Option<String>> {
+    let has_meta: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'delta_meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_meta == 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT value FROM delta_meta WHERE key = ?1",
+        params![EXTRACTION_SCHEMA_VERSION_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1135,6 +1209,83 @@ mod tests {
         held.execute_batch("COMMIT;").unwrap();
         drop(held);
         DeltaStore::open(&path).expect("once nothing holds it, it converts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_delta_persists_extraction_schema_version() {
+        let dir = temp_dir("meta-fresh");
+        let path = dir.join("delta.sqlite");
+        {
+            let writer = DeltaStore::open(&path).unwrap();
+            assert_eq!(
+                writer.extraction_schema_version().unwrap().as_deref(),
+                Some(devmap_extract::cache::EXTRACTION_SCHEMA_VERSION)
+            );
+        }
+        let reader = DeltaStore::open_read_only(&path)
+            .unwrap()
+            .expect("created delta exists");
+        assert_eq!(
+            reader.extraction_schema_version().unwrap().as_deref(),
+            Some(devmap_extract::cache::EXTRACTION_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            reader
+                .load_snapshot()
+                .unwrap()
+                .extraction_schema_version
+                .as_deref(),
+            Some(devmap_extract::cache::EXTRACTION_SCHEMA_VERSION)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_readonly_delta_without_meta_table_never_fails_with_no_such_table() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("meta-preexisting-ro");
+        let path = dir.join("delta.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE delta_files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, \
+                 tombstoned INTEGER NOT NULL CHECK (tombstoned IN (0, 1)), extraction_json TEXT, \
+                 updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE delta_symbols (path TEXT NOT NULL, qualified_name TEXT NOT NULL, \
+                 name TEXT NOT NULL, kind TEXT NOT NULL, span_start INTEGER NOT NULL, \
+                 span_end INTEGER NOT NULL, is_exported INTEGER NOT NULL CHECK (is_exported IN (0, 1)), \
+                 content_hash INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (path, qualified_name));
+                 CREATE TABLE delta_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, \
+                 source_symbol TEXT NOT NULL, target_symbol TEXT NOT NULL, edge_kind TEXT NOT NULL, \
+                 confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100));
+                 INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms) \
+                 VALUES ('src/a.rs', 'h1', 1, NULL, 1);",
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let opened = DeltaStore::open_read_only(&path);
+        let res = opened.map(|opt| {
+            opt.map(|s| {
+                let ver = s.extraction_schema_version().unwrap();
+                let snap = s.load_snapshot().unwrap();
+                (ver, snap.extraction_schema_version, snap.files.len())
+            })
+        });
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (ver, snap_ver, file_count) = res
+            .expect("pre-existing read-only delta must open without error")
+            .expect("delta exists");
+        assert_eq!(ver, None);
+        assert_eq!(snap_ver, None);
+        assert_eq!(file_count, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
