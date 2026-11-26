@@ -8,6 +8,20 @@ pub(super) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Pasted terminal dumps. Matches the terminal output window.
 pub(super) const MAX_LOGS_BYTES: usize = 256 * 1024;
 
+/// Characters that end a line in a brief. Header fields must not hold them.
+pub(super) const LINE_BREAKS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+
+/// Refuse a line break in a single-line field. The message names the field
+/// and never echoes the value, so a rejection cannot carry a forged heading.
+pub(super) fn reject_line_break(key: &str, value: &str) -> Result<()> {
+    if value.contains(LINE_BREAKS) {
+        return Err(Error::invalid(format!(
+            "{key} must not contain a line break"
+        )));
+    }
+    Ok(())
+}
+
 /// SQLite's bundled JSON parser supplies validation and encoding. Inputs never
 /// become SQL: field paths are program constants and values are bound parameters.
 pub(super) struct Input<'a> {
@@ -91,6 +105,42 @@ impl<'a> Input<'a> {
             }
             _ => Err(Error::invalid(format!("{key} must be a string"))),
         }
+    }
+
+    /// `text` for a field the brief renders on one line. A CR, LF, U+2028 or
+    /// U+2029 would start another line and could forge a heading, so it is
+    /// rejected rather than escaped. Body fields keep using `text`.
+    pub fn header_text(&self, key: &str, max: usize) -> Result<Option<String>> {
+        let value = self.text(key, max)?;
+        if let Some(value) = &value {
+            reject_line_break(key, value)?;
+        }
+        Ok(value)
+    }
+
+    pub fn header_required_text(&self, key: &str, max: usize) -> Result<String> {
+        let value = self
+            .header_text(key, max)?
+            .ok_or_else(|| Error::invalid(format!("{key} is required")))?;
+        if value.trim().is_empty() {
+            return Err(Error::invalid(format!("{key} must not be blank")));
+        }
+        Ok(value)
+    }
+
+    /// `strings` for entries the brief joins onto one line.
+    pub fn header_strings(
+        &self,
+        key: &str,
+        max_count: usize,
+        max_bytes: usize,
+        required: bool,
+    ) -> Result<Vec<String>> {
+        let values = self.strings(key, max_count, max_bytes, required)?;
+        for value in &values {
+            reject_line_break(key, value)?;
+        }
+        Ok(values)
     }
 
     pub fn required_text(&self, key: &str, max: usize) -> Result<String> {

@@ -106,7 +106,7 @@ pub(super) fn complete(input: &Input<'_>, prior: &Input<'_>) -> Result<String> {
                         conn: input.conn,
                         raw: &entry,
                     };
-                    let title = split.required_text("title", 1200)?;
+                    let title = split.header_required_text("title", 1200)?;
                     if title.chars().count() > 300 {
                         return Err(Error::invalid("split title exceeds 300 characters"));
                     }

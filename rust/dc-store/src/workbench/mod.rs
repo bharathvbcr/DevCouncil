@@ -1403,7 +1403,7 @@ fn put_workspace(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result
         "pinned",
         "repository_ids",
     ])?;
-    let name = input.required_text("name", 300)?;
+    let name = input.header_required_text("name", 300)?;
     let description = input.text("description", 16_384)?.unwrap_or_default();
     let icon = input.text("icon", 64)?.unwrap_or_default();
     let color = input.text("color", 64)?.unwrap_or_default();
@@ -1434,7 +1434,7 @@ fn put_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
         "identity_key",
         "remote_url",
     ])?;
-    let name = input.required_text("name", 300)?;
+    let name = input.header_required_text("name", 300)?;
     let identity = input.required_text("identity_key", 4096)?;
     let remote = input.text("remote_url", 4096)?;
     let old: Option<String> = input
@@ -1484,7 +1484,7 @@ fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Re
         "absorb_id",
     ])?;
     let identity = input.required_text("identity_key", 4096)?;
-    let name = input.text("name", 300)?;
+    let name = input.header_text("name", 300)?;
     if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
         return Err(Error::invalid("name must not be blank"));
     }
@@ -1614,28 +1614,35 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
     }
     enhancements::locks(input, "locked_fields")?;
     input.text("logs", input::MAX_LOGS_BYTES)?;
-    let title = input.required_text("title", 1200)?;
+    let title = input.header_required_text("title", 1200)?;
     if title.chars().count() > 300 {
         return Err(Error::invalid("title exceeds 300 characters"));
     }
     let description = input.text("description", 65_536)?.unwrap_or_default();
-    let kind = input.text("kind", 64)?.unwrap_or_else(|| "feature".into());
+    let kind = input
+        .header_text("kind", 64)?
+        .unwrap_or_else(|| "feature".into());
     if kind.trim().is_empty() {
         return Err(Error::invalid("kind must not be blank"));
     }
-    let status = task_status(input.text("status", 32)?.as_deref().unwrap_or("backlog"))?;
+    let status = task_status(
+        input
+            .header_text("status", 32)?
+            .as_deref()
+            .unwrap_or("backlog"),
+    )?;
     let priority = input.integer("priority", Some(1), 3)?;
     let position = input.integer("position", Some(0), MAX_INTEGER)?;
-    let severity = input.text("severity", 32)?;
+    let severity = input.header_text("severity", 32)?;
     if severity
         .as_deref()
         .is_some_and(|v| !["low", "medium", "high", "critical"].contains(&v))
     {
         return Err(Error::invalid("unknown severity"));
     }
-    let owner = input.text("owner", 300)?;
+    let owner = input.header_text("owner", 300)?;
     input.integer("due_at", Some(0), MAX_INTEGER)?;
-    input.strings("labels", 64, 128, false)?;
+    input.header_strings("labels", 64, 128, false)?;
     input.strings("acceptance_criteria", 128, 4096, false)?;
     let ids = repository_ids(input, true)?;
     let primary = input.id("primary_repository_id")?;

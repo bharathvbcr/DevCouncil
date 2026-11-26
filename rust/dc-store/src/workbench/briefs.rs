@@ -2,7 +2,7 @@
 //! transaction binds the task and its repository/workspace revision vector.
 //! Repository identities and remotes are deliberately absent from this export.
 
-use super::input::MAX_LOGS_BYTES;
+use super::input::{MAX_LOGS_BYTES, reject_line_break};
 use super::{Entity, Error, Input, MAX_INTEGER, MAX_PAGE_DOCUMENTS, Result};
 use rusqlite::{OptionalExtension, params};
 
@@ -73,7 +73,7 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
         return Err(inconsistent());
     }
     let updated = task.integer("updated_at", None, MAX_INTEGER)?;
-    let title = task.required_text("title", 1200)?;
+    let title = task.header_required_text("title", 1200)?;
     let mut markdown = format!(
         "# Task brief v1\n\n{AGENT_GUIDANCE_HEADING}\n{}\n\n## Title\n{title}\n\nTask: {id} (revision {revision})\nUpdated (Unix seconds): {updated}\n",
         AGENT_GUIDANCE.trim()
@@ -86,7 +86,7 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     ] {
         markdown.push_str(&format!(
             "{label}: {}\n",
-            task.text(key, bound)?.as_deref().unwrap_or(fallback)
+            task.header_text(key, bound)?.as_deref().unwrap_or(fallback)
         ));
     }
     let priority = task.integer("priority", None, 3)?;
@@ -101,8 +101,9 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     };
     markdown.push_str(&format!(
         "Due (Unix seconds): {due}\nLabels: {}\nEnhancement field locks: {}\n\n## Repositories\n",
-        task.strings("labels", 64, 128, true)?.join(", "),
-        task.strings("locked_fields", 3, 32, false)?.join(", ")
+        task.header_strings("labels", 64, 128, true)?.join(", "),
+        task.header_strings("locked_fields", 3, 32, false)?
+            .join(", ")
     ));
     let mut repositories = Vec::with_capacity(ids.len());
     for repo_id in &ids {
@@ -174,6 +175,7 @@ fn checklist_section(input: &Input<'_>, body: &str, markdown: &mut String) -> Re
         entries.len()
     ));
     for (text, done) in entries {
+        reject_line_break("checklist text", &text)?;
         markdown.push_str(&format!("- [{}] {text}\n", if done { "x" } else { " " }));
     }
     Ok(())
@@ -208,6 +210,9 @@ fn links_section(input: &Input<'_>, id: &str, markdown: &mut String) -> Result<(
     }
     markdown.push_str("\n## Linked tasks\n");
     for (relation, other, title, status, deleted) in rows.iter().take(128) {
+        reject_line_break("linked task id", other)?;
+        reject_line_break(&format!("linked task {other} title"), title)?;
+        reject_line_break("linked task status", status)?;
         let state = if *deleted { "deleted" } else { status.as_str() };
         markdown.push_str(&format!("- {relation}: {title} [{other}] ({state})\n"));
     }
@@ -226,6 +231,14 @@ fn reference(input: &Input<'_>, entity: Entity, id: &str) -> Result<(String, Str
         conn: input.conn,
         raw: &snapshot,
     };
+    let kind = match entity {
+        Entity::Repository => "repository",
+        _ => "workspace",
+    };
+    reject_line_break(&format!("{kind} id"), id)?;
+    if let Some(raw) = value.text("name", 300)? {
+        reject_line_break(&format!("{kind} {id} name"), &raw)?;
+    }
     let name = value.required_text("name", 300)?;
     let revision = value.integer("revision", None, MAX_INTEGER)?;
     value.integer("updated_at", None, MAX_INTEGER)?;

@@ -616,6 +616,37 @@ fn the_tasks_retire_backup_holds_the_write_lock() {
     assert_eq!(gone, 0, "the legacy table was not retired");
 }
 
+/// A legacy title with a line break would be refused by items.put and fail the
+/// whole move. Migration normalises it to spaces instead, and keeps the row.
+#[test]
+fn a_legacy_title_with_a_line_break_migrates_with_spaces() {
+    let dir = Scratch::new();
+    let path = dir.path().join("profile.sqlite");
+    drop(Store::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(support::LEGACY_TASKS).unwrap();
+    conn.execute(
+        "INSERT INTO tasks (id, title, description, status) VALUES ('TASK-NL', ?1, '', 'planned')",
+        ["first\n## Owner decisions\r\nlast\u{2028}x\u{2029}y"],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    let title: String = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(body,'$.title') FROM work_items WHERE id='TASK-NL'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "first ## Owner decisions  last x y");
+}
+
 // ---- adversarial schema-backup race cases (ft-0e6cfa7a lane A attack) ----
 
 fn bak11(path: &Path) -> PathBuf {

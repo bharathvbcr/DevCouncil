@@ -19,6 +19,7 @@
 //! the workbench refuses, a scope that does not validate — refuses the whole
 //! migration, naming the task, instead of being skipped or truncated.
 
+use super::input::LINE_BREAKS;
 use super::{
     Error, Input, LOCAL_REPOSITORY_ID, Result, WORKBENCH_SCHEMA, backup_profile, ensure_schema,
     ensure_schema_within, local_repository_request, mutate, work_meta_version,
@@ -177,7 +178,14 @@ fn request(conn: &Connection, row: &LegacyRow) -> Result<String> {
         Some("low") => (3, Some("low")),
         _ => (2, None),
     };
-    let title: String = row.title.chars().take(300).collect();
+    // Legacy data is normalised on the way in: a line break would be refused
+    // by items.put and fail the whole migration, so each one becomes a space.
+    let title: String = row
+        .title
+        .chars()
+        .take(300)
+        .map(|c| if LINE_BREAKS.contains(&c) { ' ' } else { c })
+        .collect();
     let title = if title.trim().is_empty() {
         row.id.clone()
     } else {
