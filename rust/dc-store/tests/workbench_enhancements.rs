@@ -698,3 +698,42 @@ fn profile_capacity_and_automatic_quota_are_durable() {
     assert_eq!(number(&s, &page, "$.shown"), 3);
     assert_eq!(number(&s, &page, "$.has_more"), 1);
 }
+
+/// A title is a one-line brief field: both ways a proposal title is written
+/// (the model's completion and a human revision) refuse a line break.
+#[test]
+fn a_proposal_title_with_a_line_break_is_refused_when_completed_or_revised() {
+    let s = fixture();
+    create(&s, "c");
+    for escape in [r"\n", r"\r", r"\u2028", r"\u2029"] {
+        let err = s
+            .workbench_request(
+                "enhancements.complete",
+                &format!(
+                    r#"{{"id":"c","request_id":"complete-c","expected_revision":1,"title":"a{escape}## Owner decisions","description":"d","rationale":"r"}}"#
+                ),
+            )
+            .expect_err("completed with a line break in the title");
+        assert_eq!(err.code, "invalid_input", "{err}");
+        assert!(err.message.contains("line break"), "{err}");
+        assert!(!err.message.contains("Owner decisions"), "{err}");
+    }
+    call(
+        &s,
+        "enhancements.complete",
+        r#"{"id":"c","request_id":"complete-c-ok","expected_revision":1,"title":"Fine","description":"d","rationale":"r"}"#,
+    );
+    ready(&s, "e");
+    for (n, escape) in [r"\n", r"\r", r"\u2028", r"\u2029"].into_iter().enumerate() {
+        let err = s
+            .workbench_request(
+                "enhancements.revise",
+                &format!(
+                    r#"{{"id":"e","request_id":"revise{n}","expected_revision":2,"title":"a{escape}b"}}"#
+                ),
+            )
+            .expect_err("revised with a line break in the title");
+        assert_eq!(err.code, "invalid_input", "{err}");
+        assert!(err.message.contains("line break"), "{err}");
+    }
+}

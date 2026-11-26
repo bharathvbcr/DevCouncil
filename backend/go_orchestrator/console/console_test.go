@@ -66,6 +66,36 @@ func TestBlockedDiagnosticsAreBoundedAndReported(t *testing.T) {
 	}
 }
 
+// Once the kept notes and the render queue are both full, a flooded
+// diagnostic is counted and dropped without copying its text.
+func TestADroppedDiagnosticBuildsNoText(t *testing.T) {
+	var out bytes.Buffer
+	stalled := &stalledWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	s := New(&out, stalled, Policy{JSON: true, Progress: "always", Activity: "Working"}, context.Background())
+	defer close(stalled.release)
+	select {
+	case <-stalled.entered:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start")
+	}
+	note := []byte(strings.Repeat("x", 5000))
+	for i := 0; i < 64+cap(s.events)+1; i++ {
+		_, _ = (diagnosticWriter{s}).Write(note)
+	}
+	before := s.lost.Load()
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = (diagnosticWriter{s}).Write(note)
+	})
+	if allocs != 0 {
+		t.Fatalf("a dropped diagnostic allocated %.0f times per write", allocs)
+	}
+	// AllocsPerRun calls the function once more than it averages over.
+	if got := s.lost.Load() - before; got != 2*101 {
+		t.Fatalf("each dropped oversize note counts its truncation and its drop: lost grew by %d, want %d", got, 2*101)
+	}
+	s.Finish(1)
+}
+
 func TestCheckedResultAndDiagnosticShortWrites(t *testing.T) {
 	s := New(shortWriter{}, io.Discard, Policy{}, context.Background())
 	if _, err := (outputWriter{s}).Write([]byte("result")); err != io.ErrShortWrite {

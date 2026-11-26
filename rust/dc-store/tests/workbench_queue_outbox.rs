@@ -10,6 +10,12 @@ use std::sync::{
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
+mod support;
+
+/// An absolute directory on every platform: the store refuses a relative or
+/// drive-less `cwd`/`git_dir`, and `/tmp/...` has no drive on Windows.
+const GIT_ROOT: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -44,10 +50,10 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     let time = clock.clone();
     s.set_clock(move || time.load(Ordering::SeqCst));
     for (id, path) in [
-        ("repo-a", "/tmp/git-a/.git"),
-        ("repo-b", "/tmp/git-b/.git"),
-        ("repo-c", "/tmp/git-c/.git"),
-        ("repo-z", "/tmp/git-z/.git"),
+        ("repo-a", format!("{GIT_ROOT}/git-a/.git")),
+        ("repo-b", format!("{GIT_ROOT}/git-b/.git")),
+        ("repo-c", format!("{GIT_ROOT}/git-c/.git")),
+        ("repo-z", format!("{GIT_ROOT}/git-z/.git")),
     ] {
         call(
             &s,
@@ -61,12 +67,12 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
 }
 
 fn call(s: &Store, method: &str, input: &str) -> String {
-    s.workbench_request(method, input)
+    s.workbench_request(method, &support::real_checkouts(input))
         .unwrap_or_else(|e| panic!("{method} {input}: {e}"))
 }
 
 fn refuse(s: &Store, method: &str, input: &str, code: &str) -> String {
-    match s.workbench_request(method, input) {
+    match s.workbench_request(method, &support::real_checkouts(input)) {
         Ok(ok) => panic!("expected {method} {input} to fail ({code}), got {ok}"),
         Err(e) => {
             assert_eq!(e.code, code, "{method} {input}: {}", e.message);
@@ -108,7 +114,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q-bad-1","request_id":"qb1","expected_revision":0,"title":"Too small","concurrency_limit":1,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}}]}}"#
+            r#"{{"id":"q-bad-1","request_id":"qb1","expected_revision":0,"title":"Too small","concurrency_limit":1,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}}]}}"#
         ),
         "invalid_input",
     );
@@ -116,7 +122,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q-bad-5","request_id":"qb5","expected_revision":0,"title":"Too big","concurrency_limit":5,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}}]}}"#
+            r#"{{"id":"q-bad-5","request_id":"qb5","expected_revision":0,"title":"Too big","concurrency_limit":5,"members":[{{"member_id":"m1","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}}]}}"#
         ),
         "invalid_input",
     );
@@ -127,9 +133,9 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         "queue.enqueue",
         &format!(
             r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Cross-repo release","concurrency_limit":2,"members":[
-                {{"member_id":"m-z","repository_id":"repo-z","git_dir":"/tmp/git-z/.git","base_oid":"{OID_A}","task_id":"t-a","depends_on":["m-a"]}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}},
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_C}"}}
+                {{"member_id":"m-z","repository_id":"repo-z","git_dir":"{GIT_ROOT}/git-z/.git","base_oid":"{OID_A}","task_id":"t-a","depends_on":["m-a"]}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}},
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_C}"}}
             ]}}"#
         ),
     );
@@ -146,7 +152,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-b-ext","request_id":"rbext","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-b","git_dir":"/tmp/git-b/.git","git_common_dir":"/tmp/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main"}}"#
+            r#"{{"id":"run-b-ext","request_id":"rbext","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-b","git_dir":"{GIT_ROOT}/git-b/.git","git_common_dir":"{GIT_ROOT}/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main"}}"#
         ),
     );
     refuse(
@@ -202,7 +208,7 @@ fn cross_repo_queue_acquires_leases_in_canonical_repo_order_all_or_none_and_veri
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-steal","request_id":"rsteal","expected_revision":0,"task_id":"t-a","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-a","git_dir":"/tmp/git-a/.git","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_C}","head_ref":"refs/heads/main"}}"#
+            r#"{{"id":"run-steal","request_id":"rsteal","expected_revision":0,"task_id":"t-a","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-a","git_dir":"{GIT_ROOT}/git-a/.git","git_common_dir":"{GIT_ROOT}/git-a/.git","head_oid":"{OID_C}","head_ref":"refs/heads/main"}}"#
         ),
         "checkout_busy",
     );
@@ -295,8 +301,8 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         "queue.enqueue",
         &format!(
             r#"{{"id":"q-timeout","request_id":"qt-enq","expected_revision":0,"title":"Timeout test","members":[
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}"}}
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}"}}
             ]}}"#
         ),
     );
@@ -329,8 +335,8 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         "queue.enqueue",
         &format!(
             r#"{{"id":"q-dep","request_id":"qd-enq","expected_revision":0,"title":"Dep propagation","members":[
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","depends_on":["m-a"]}}
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","depends_on":["m-a"]}}
             ]}}"#
         ),
     );
@@ -356,9 +362,9 @@ fn cross_repo_queue_enforces_active_and_elapsed_timeouts_and_failure_blocks_depe
         "queue.enqueue",
         &format!(
             r#"{{"id":"q-cap","request_id":"qc-enq","expected_revision":0,"title":"Cap 2","concurrency_limit":2,"members":[
-                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"/tmp/git-a/.git","base_oid":"{OID_A}"}},
-                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}"}},
-                {{"member_id":"m-c","repository_id":"repo-c","git_dir":"/tmp/git-c/.git","base_oid":"{OID_C}"}}
+                {{"member_id":"m-a","repository_id":"repo-a","git_dir":"{GIT_ROOT}/git-a/.git","base_oid":"{OID_A}"}},
+                {{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}"}},
+                {{"member_id":"m-c","repository_id":"repo-c","git_dir":"{GIT_ROOT}/git-c/.git","base_oid":"{OID_C}"}}
             ]}}"#
         ),
     );
@@ -423,7 +429,7 @@ fn task_blocks_and_parent_dependencies_gate_launch_and_reject_cycles() {
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-blocked","request_id":"rb1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-a","git_dir":"/tmp/git-a/.git","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main"}}"#
+            r#"{{"id":"run-blocked","request_id":"rb1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-a","git_dir":"{GIT_ROOT}/git-a/.git","git_common_dir":"{GIT_ROOT}/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main"}}"#
         ),
         "task_blocked",
     );
@@ -454,7 +460,7 @@ fn task_blocks_and_parent_dependencies_gate_launch_and_reject_cycles() {
         &s,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run-sub","request_id":"rsub1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-a","git_dir":"/tmp/git-a/.git","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main","require_subtasks_done":true}}"#
+            r#"{{"id":"run-sub","request_id":"rsub1","expected_revision":0,"task_id":"downstream","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-a","git_dir":"{GIT_ROOT}/git-a/.git","git_common_dir":"{GIT_ROOT}/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main","require_subtasks_done":true}}"#
         ),
         "subtasks_incomplete",
     );
@@ -468,7 +474,9 @@ fn github_sync_and_confirmed_durable_outbox_survive_restart_and_reconcile() {
     store
         .workbench_request(
             "repositories.put",
-            r#"{"id":"repo-a","request_id":"ra","expected_revision":0,"name":"repo-a","identity_key":"local:/tmp/git-a/.git"}"#,
+            &format!(
+                r#"{{"id":"repo-a","request_id":"ra","expected_revision":0,"name":"repo-a","identity_key":"local:{GIT_ROOT}/git-a/.git"}}"#
+            ),
         )
         .unwrap();
     store
@@ -672,7 +680,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
 
     let remote_b = |id: &str, req: &str, extra: &str| {
         format!(
-            r#"{{"id":"{id}","request_id":"{req}","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/tmp/git-b","git_dir":"/tmp/git-b/.git","git_common_dir":"/tmp/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main","skip_checkout_occupancy":true{extra}}}"#
+            r#"{{"id":"{id}","request_id":"{req}","expected_revision":0,"task_id":"t-b","source_revision":1,"repository_id":"repo-b","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"{GIT_ROOT}/git-b","git_dir":"{GIT_ROOT}/git-b/.git","git_common_dir":"{GIT_ROOT}/git-b/.git","head_oid":"{OID_B}","head_ref":"refs/heads/main","skip_checkout_occupancy":true{extra}}}"#
         )
     };
 
@@ -682,7 +690,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Q1","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+            r#"{{"id":"q1","request_id":"q1-enq","expected_revision":0,"title":"Q1","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
         ),
     );
     let acq1 = call(
@@ -721,7 +729,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q2","request_id":"q2-enq","expected_revision":0,"title":"Q2","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+            r#"{{"id":"q2","request_id":"q2-enq","expected_revision":0,"title":"Q2","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
         ),
     );
     let acq2 = call(
@@ -753,7 +761,7 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         &s,
         "queue.enqueue",
         &format!(
-            r#"{{"id":"q3","request_id":"q3-enq","expected_revision":0,"title":"Q3","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"/tmp/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
+            r#"{{"id":"q3","request_id":"q3-enq","expected_revision":0,"title":"Q3","members":[{{"member_id":"m-b","repository_id":"repo-b","git_dir":"{GIT_ROOT}/git-b/.git","base_oid":"{OID_B}","task_id":"t-b"}}]}}"#
         ),
     );
     let acq3 = call(
@@ -794,4 +802,141 @@ fn skip_checkout_occupancy_never_blocks_queue_acquire_but_still_obeys_queue_leas
         json::<i64>(&s, &leased, "$.item.skip_checkout_occupancy"),
         1
     );
+}
+
+fn member(id: &str, repo: &str, git_dir: &str) -> String {
+    format!(
+        r#"{{"member_id":"{id}","repository_id":"{repo}","git_dir":"{git_dir}","base_oid":"{OID_A}"}}"#
+    )
+}
+
+/// Removes the fixture checkout `name` (created by `real_checkouts`) so the
+/// path a stored member names no longer resolves.
+fn delete_checkout(name: &str) {
+    std::fs::remove_dir_all(format!("{}/checkout/{name}", support::checkout_root())).unwrap();
+}
+
+#[test]
+fn a_member_whose_directory_was_deleted_does_not_break_finishing_another_member() {
+    let (s, _) = fixture();
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-stale","request_id":"qs-enq","expected_revision":0,"title":"Stale","concurrency_limit":2,"members":[{},{},{}]}}"#,
+            member("m-a", "repo-a", "/checkout/stale-a/.git"),
+            member("m-c", "repo-c", "/checkout/stale-c/.git"),
+            member("m-z", "repo-z", "/checkout/stale-z/.git"),
+        ),
+    );
+    delete_checkout("stale-z");
+    let acquired = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q-stale","request_id":"qs-acq","expected_revision":1}"#,
+    );
+    assert_eq!(
+        json::<String>(&s, &acquired, "$.item.members[0].state"),
+        "leased"
+    );
+    let passed = call(
+        &s,
+        "queue.member.update",
+        r#"{"id":"q-stale","request_id":"qs-pass","expected_revision":2,"member_id":"m-a","state":"passed"}"#,
+    );
+    assert_eq!(
+        json::<String>(&s, &passed, "$.item.members[2].state"),
+        "leased"
+    );
+}
+
+#[test]
+fn a_member_whose_directory_was_deleted_does_not_fail_acquire_for_another_member() {
+    let (s, _) = fixture();
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-acq","request_id":"qa-enq","expected_revision":0,"title":"Stale acquire","members":[{},{}]}}"#,
+            member("m-a", "repo-a", "/checkout/acq-a/.git"),
+            member("m-b", "repo-b", "/checkout/acq-b/.git"),
+        ),
+    );
+    delete_checkout("acq-b");
+    let acquired = call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q-acq","request_id":"qa-acq","expected_revision":1}"#,
+    );
+    assert_eq!(
+        json::<String>(&s, &acquired, "$.item.members[0].state"),
+        "leased"
+    );
+    assert_eq!(
+        json::<String>(&s, &acquired, "$.item.members[1].state"),
+        "leased"
+    );
+}
+
+#[test]
+fn a_member_enqueued_with_a_respelled_git_dir_is_stored_resolved() {
+    let (s, _) = fixture();
+    let enqueued = call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-resolved","request_id":"qr-enq","expected_revision":0,"title":"Resolved","members":[{}]}}"#,
+            member("m-a", "repo-a", "/checkout/resolved/x/../.git/"),
+        ),
+    );
+    let expected = std::fs::canonicalize(format!(
+        "{}/checkout/resolved/.git",
+        support::checkout_root()
+    ))
+    .unwrap();
+    assert_eq!(
+        json::<String>(&s, &enqueued, "$.item.members[0].git_dir"),
+        expected.to_str().unwrap()
+    );
+}
+
+#[test]
+fn a_leased_member_stored_in_the_old_spelling_still_passes_a_claimed_prepare() {
+    let (s, _) = fixture();
+    put_task(&s, "t-a", 0, "repo-a", r#","status":"ready""#);
+    call(
+        &s,
+        "queue.enqueue",
+        &format!(
+            r#"{{"id":"q-old","request_id":"qo-enq","expected_revision":0,"title":"Old spelling","members":[{}]}}"#,
+            member("m-a", "repo-a", "/checkout/old/.git")
+                .replace("\"base_oid\"", "\"task_id\":\"t-a\",\"base_oid\""),
+        ),
+    );
+    call(
+        &s,
+        "queue.acquire",
+        r#"{"id":"q-old","request_id":"qo-acq","expected_revision":1}"#,
+    );
+    // A member enqueued before checkout paths were resolved holds the host's
+    // spelling, whatever it was.
+    let git = format!("{}/checkout/old/.git", support::checkout_root());
+    let legacy = format!("{}/checkout/old/x/../.git/", support::checkout_root());
+    std::fs::create_dir_all(format!("{}/checkout/old/x", support::checkout_root())).unwrap();
+    let changed = s
+        .connection()
+        .execute(
+            "UPDATE work_queue_members SET git_dir=?1 WHERE queue_id='q-old'",
+            [&legacy],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let prepared = call(
+        &s,
+        "runs.prepare",
+        &format!(
+            r#"{{"id":"run-old","request_id":"ro-prep","expected_revision":0,"task_id":"t-a","source_revision":1,"repository_id":"repo-a","repository_revision":1,"provider":"codex","permission_mode":"edit","cwd":"/checkout/old","git_dir":"{git}","git_common_dir":"/tmp/git-a/.git","head_oid":"{OID_A}","head_ref":"refs/heads/main","queue_id":"q-old","member_id":"m-a"}}"#
+        ),
+    );
+    assert_eq!(json::<String>(&s, &prepared, "$.item.id"), "run-old");
 }

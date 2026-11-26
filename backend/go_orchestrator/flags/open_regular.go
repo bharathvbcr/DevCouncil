@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // NonRegularConfigError is a config path that is not a regular file.
@@ -75,6 +77,19 @@ func init() {
 // link whose target is a pipe is not opened. A FIFO, directory, socket, or
 // other non-regular file is refused before Open.
 func OpenRegular(path string) (*os.File, error) {
+	// A config some writer replaces with safefile.WriteAtomic is refused on
+	// Windows for the moment the rename takes; that is a wait, not an
+	// unreadable config (gatescfg.Load read it as one and failed closed).
+	var f *os.File
+	err := safefile.RetryTransient(func() error {
+		var openErr error
+		f, openErr = openRegularOnce(path)
+		return openErr
+	})
+	return f, err
+}
+
+func openRegularOnce(path string) (*os.File, error) {
 	if kind, refuse := classifyBeforeOpen(path); refuse {
 		return nil, &NonRegularConfigError{Path: path, Kind: kind}
 	}

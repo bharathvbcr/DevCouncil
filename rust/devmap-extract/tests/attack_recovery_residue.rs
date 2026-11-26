@@ -873,67 +873,132 @@ fn the_member_note_is_exact_per_file_under_rayon() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// ATTACK 1, characterization (HOLD). A REAL member after `as? T ??` is refused
-/// with the cast's own members: `c.foo()` is `foo` on `c`, a receiver the site
-/// spells, but the grammar reads `T ??` as an optional type and hangs `c.foo`
-/// off the cast. The lane refuses it (main published it with the receiver
-/// `b as? T ??`, which no resolver rung binds), so no edge moves; what is lost
-/// is the evidence that `foo` is called. Pinned so a change either way is seen.
+/// ATTACK 1, characterization, rewritten for tree-sitter-swift 0.7.4. A REAL
+/// member after `as? T ??` used to be refused with the cast's own members,
+/// because 0.7.3 read `T ??` as an optional type and hung `c.foo` off the cast.
+/// 0.7.4 parses `nil_coalescing_expression(value: as_expression, if_nil: X)`, so
+/// `c.foo()` is extracted as it would be on its own: `foo` on `c`, `foo` on
+/// `c.d`, `make` on `Color`, the reference `red` on `Color`. No note is raised
+/// (nothing is refused), no receiver holds cast or operator text, and the bare
+/// site publishes the same calls and references as its twin `b as? T ?? (X)`.
 #[test]
 fn a_real_member_after_the_coalesce_is_refused_and_noted_not_misbound() {
-    for (source, member) in [
-        ("let a = b as? T ?? c.foo()\n", "foo"),
-        ("let a = b as? T ?? c.d.foo()\n", "foo"),
-        ("let a = b as? T ?? Color.make()\n", "make"),
-        ("let a = b as? T ?? Color.red\n", "red"),
+    let facts = |e: &Extraction| {
+        let mut calls: Vec<_> = e
+            .calls
+            .iter()
+            .map(|c| (c.callee_name.clone(), c.receiver_expr.clone()))
+            .collect();
+        let mut refs: Vec<_> = e
+            .references
+            .iter()
+            .map(|r| (r.name.clone(), r.receiver_expr.clone()))
+            .collect();
+        calls.sort();
+        refs.sort();
+        (calls, refs)
+    };
+    for (rhs, member, receiver, is_call) in [
+        ("c.foo()", "foo", "c", true),
+        ("c.d.foo()", "foo", "c.d", true),
+        ("Color.make()", "make", "Color", true),
+        ("Color.red", "red", "Color", false),
     ] {
-        let e = ex("a.swift", source);
-        assert!(
-            !has_call(&e, member) && !has_ref(&e, member),
-            "{source:?}: `{member}` was published after all: {:?} {:?}",
-            e.calls,
+        let source = format!("let a = b as? T ?? {rhs}\n");
+        let twin = format!("let a = b as? T ?? ({rhs})\n");
+        let (e, t) = (ex("a.swift", &source), ex("a.swift", &twin));
+        let published = if is_call {
+            e.calls
+                .iter()
+                .any(|c| c.callee_name == member && c.receiver_expr.as_deref() == Some(receiver))
+        } else {
             e.references
+                .iter()
+                .any(|r| r.name == member && r.receiver_expr.as_deref() == Some(receiver))
+        };
+        assert!(
+            published,
+            "{source:?}: `{member}` on `{receiver}` was not published: {:?} {:?}",
+            e.calls, e.references
         );
         assert!(leaks(&e).is_empty(), "{source:?}: {:?}", leaks(&e));
-        assert!(!member_notes(&e).is_empty(), "{source:?}: refused unnoted");
+        assert!(
+            e.diagnostics.is_empty(),
+            "{source:?}: nothing is refused, yet {:?}",
+            e.diagnostics
+        );
+        assert_eq!(facts(&e), facts(&t), "{source:?} differs from its twin");
     }
 }
 
-/// ATTACK 3. A refused call is a noted refusal even when the references walk
-/// drops the member's name for another reason first: the note is raised only
-/// by that walk's last arm, so a call refused in `swift_navigation_call` whose
-/// name a local binding or a reserved spelling hides would vanish unrecorded.
+/// ATTACK 3, rewritten for tree-sitter-swift 0.7.4. A refused call is a noted
+/// refusal even when the references walk drops the member's name for another
+/// reason first (a local or parameter binding of that name, a reserved or
+/// backticked spelling): the note is raised only by that walk's last arm.
+///
+/// (1) `SHADOW` holds the cast-coalesce shapes that used to be refused. 0.7.4
+/// parses them correctly, so per probe: no note, no cast text as a receiver, and
+/// a leading-dot member publishes no call (`x.foo()` is the real call `foo` on
+/// `x`). The one probe that also holds a live bare-cast member (`(b as?
+/// Foo.Bar)` in `g`) carries exactly that one note. The raw-identifier probe
+/// (SE-0451) is Clean in 0.7.4 too, with nothing refused.
+///
+/// (2) The refusal rule is still live for a qualified cast type (`(b as?
+/// Foo.foo)` reads as `navigation(as_expression "b as? Foo", foo)`), so the
+/// same hiding spellings are replayed there and each must be noted once.
 #[test]
 fn a_refused_call_is_noted_even_when_its_name_is_hidden_by_another_rule() {
     let mut failures = Vec::new();
-    let mut raw_exempt = 0;
+    let mut raw_seen = 0;
+    let mut live_in_shadow = 0;
     for source in SHADOW {
         let e = ex("a.swift", source);
         for leak in leaks(&e) {
             failures.push(format!("{source:?}: leaked {leak}"));
         }
-        // Either the refusal is noted, or (raw identifier only) the grammar put
-        // the member site inside an error region and there was nothing to refuse.
-        let site = source.find("?? .").map(|at| at + "?? ".len());
-        let in_error_range = match (&e.parse_outcome, site) {
-            (ParseOutcome::Partial { error_ranges, .. }, Some(site)) => error_ranges
-                .iter()
-                .any(|r| r.start_byte <= site && site < r.end_byte),
-            _ => false,
-        };
-        let raw = source.contains(RAW_IDENTIFIER);
-        // The error-range exemption is taken by the raw identifier alone, so a
-        // regression on a valid probe cannot hide behind it.
-        if raw {
-            raw_exempt += 1;
-            if !(member_notes(&e).is_empty() && in_error_range) {
+        let live = source.contains("(b as? Foo.Bar)");
+        let want = usize::from(live);
+        live_in_shadow += want;
+        if member_notes(&e).len() != want
+            || (want == 1 && member_notes(&e) != [member_note(1).as_str()])
+        {
+            failures.push(format!(
+                "{source:?}: notes {:?}, wanted {want} member note(s) ({:?})",
+                e.diagnostics, e.parse_outcome
+            ));
+        }
+        if source.contains("?? .foo(") && has_call(&e, "foo") {
+            failures.push(format!("{source:?}: published a leading-dot call `foo`"));
+        }
+        if source.contains(RAW_IDENTIFIER) {
+            raw_seen += 1;
+            if !clean(&e) || !e.diagnostics.is_empty() {
                 failures.push(format!(
-                    "{source:?}: the raw identifier was expected to be a Partial file with its \
-                     site in an error range and no note ({:?})",
-                    e.parse_outcome
+                    "{source:?}: the raw identifier is Clean with no note in 0.7.4 ({:?}, {:?})",
+                    e.parse_outcome, e.diagnostics
                 ));
             }
-        } else if member_notes(&e).is_empty() {
+        }
+    }
+    assert_eq!(raw_seen, 1, "exactly one probe is the raw identifier");
+    assert_eq!(live_in_shadow, 1, "exactly one probe holds a live member");
+    for source in [
+        "func f() {\n    let foo = 1\n    _ = (b as? Foo.foo)\n    _ = foo\n}\n",
+        "func f(foo: Int) {\n    _ = (b as? Foo.foo)\n}\n",
+        "func f(_ foo: Int) {\n    _ = (b as? Foo.foo)\n}\n",
+        "func f() {\n    if let foo = x { _ = (b as? Foo.foo) }\n}\n",
+        "func f() {\n    for foo in xs { _ = (b as? Foo.foo) }\n}\n",
+        "func f() {\n    let g = { (foo: Int) in (b as? Foo.foo) }\n}\n",
+        "func foo() {}\nfunc f() {\n    _ = (b as? Foo.foo)\n}\n",
+        "struct S {\n    var foo = 1\n    func f() { _ = (b as? Foo.foo) }\n}\n",
+        "func f() {\n    _ = (b as? Foo.`class`)\n}\n",
+        "func f() {\n    _ = (b as? Foo._foo)\n}\n",
+    ] {
+        let e = ex("a.swift", source);
+        for leak in leaks(&e) {
+            failures.push(format!("{source:?}: leaked {leak}"));
+        }
+        if member_notes(&e) != [member_note(1).as_str()] {
             failures.push(format!(
                 "{source:?}: refused unnoted (calls {:?}, diag {:?}, {:?})",
                 e.calls
@@ -945,7 +1010,6 @@ fn a_refused_call_is_noted_even_when_its_name_is_hidden_by_another_rule() {
             ));
         }
     }
-    assert_eq!(raw_exempt, 1, "exactly one probe is the raw identifier");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

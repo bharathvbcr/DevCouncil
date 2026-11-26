@@ -76,6 +76,7 @@ func plantTask(t *testing.T, client *store.Client, id, plannedFile string) {
 func newStore(t *testing.T) *store.Client {
 	t.Helper()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	// Forces schema creation, the way the sibling store tests do.
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)

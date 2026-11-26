@@ -414,6 +414,7 @@ func TestAdvHostilePathsDoNotMisattribute(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			testsupport.RequireFileNameHere(t, tc.rel)
 			root := gitRepo(t)
 			body := []byte("let aws_key = \"" + key + "\";\n")
 			full := filepath.Join(root, tc.rel)

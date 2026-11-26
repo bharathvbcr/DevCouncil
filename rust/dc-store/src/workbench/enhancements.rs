@@ -1,6 +1,7 @@
 //! Durable advisory changes. Only explicit acceptance can change a task.
 //! Provider execution lives above this store; pending work has a bounded lease.
 
+use super::input::reject_line_break;
 use super::{
     Affected, Entity, Error, Input, MAX_INTEGER, Result, automation, collect_page, page,
     page_response, record_change, refine,
@@ -262,6 +263,9 @@ fn revise(input: &Input<'_>, prior: &Input<'_>) -> Result<String> {
         let value = input
             .text(field, bound)?
             .ok_or_else(|| Error::invalid("edited fields must be strings"))?;
+        if field == "title" {
+            reject_line_break(field, &value)?;
+        }
         if !requested.iter().any(|f| f == field) {
             return Err(Error::invalid(
                 "only requested suggestion fields may be edited",
@@ -492,6 +496,9 @@ fn complete(input: &Input<'_>, prior: &Input<'_>, now: i64) -> Result<String> {
         let value = input.text(field, bound)?;
         if requested.iter().any(|f| f == field) {
             let value = value.ok_or_else(|| Error::invalid(format!("missing proposed {field}")))?;
+            if field == "title" {
+                reject_line_break(field, &value)?;
+            }
             if field == "title" && (value.trim().is_empty() || value.chars().count() > 300) {
                 return Err(Error::invalid(
                     "proposed title must be nonblank and at most 300 characters",

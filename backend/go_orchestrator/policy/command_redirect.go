@@ -91,7 +91,12 @@ func RedirectWrites(command string) (RedirectSet, error) {
 func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 	var found redirectFindings
 	memo := scanMemo{}
-	for i, reading := range expandBindings(command) {
+	readings, truncated := expandBindings(command)
+	if truncated {
+		// Readings past the caps were never scanned: fail closed.
+		return RedirectSet{Opaque: true}, nil
+	}
+	for i, reading := range readings {
 		one, err := redirectTargetsMemo(reading, root, 0, memo)
 		if err != nil {
 			return RedirectSet{}, err

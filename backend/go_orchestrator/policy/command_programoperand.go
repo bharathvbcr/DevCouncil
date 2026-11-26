@@ -172,18 +172,51 @@ type programOperands struct {
 	// (`-f.env`, `-g.env*`), other than the program's own. The operand loop
 	// passes over option words, so these are judged separately.
 	attached []string
+	// literal are exempt words that are still judged as a path, only without
+	// wildcard expansion. They are first operands of a tool that can take
+	// options from somewhere other than the command line (rg's config file,
+	// GREP_OPTIONS), so the gate cannot know the word is the program: a
+	// config line `-e TOKEN` turns `rg .env.local` into a read of .env.local.
+	// A regex is never expanded against the tree, which is what refused
+	// `grep -o 'gh:.*'`, but a word that spells a credential path is.
+	literal map[int]bool
 }
+
+// offLineOptions are the tools that read options from outside the command
+// line, and the option that turns that off (`""` when nothing does). rg reads
+// the file named by RIPGREP_CONFIG_PATH unless --no-config is given; BSD grep
+// prepends GREP_OPTIONS. Where the variable comes from (an assignment, an
+// export, the profile) is not visible to the gate, so it is not looked for.
+var offLineOptions = map[string]string{
+	"rg":    "--no-config",
+	"grep":  "",
+	"egrep": "",
+	"fgrep": "",
+}
+
+// programOpensFiles are the tools whose program can itself open a file: sed's
+// `r`, `R`, `w` and `e` commands, awk's `getline <` and redirections. Every
+// program word of theirs, the first operand and each -e value, is judged as a
+// literal path, which is how main refused `sed 'r ./.env.local' README.md`.
+// A name the program builds at run time cannot be judged from the text, here
+// or on main.
+var programOpensFiles = map[string]bool{"sed": true, "awk": true}
 
 // programOperandsOf finds the program words of the command at words[at] — the
 // first operand, or the values of -e/--regexp — for the tools in programTools
 // and `git grep`. Every other word stays an operand to judge, option values
 // included, so `rg x -g '.env*'` and `grep -f .env x` are still reads.
 //
-// It fails closed: an option the tool's table does not know may take the next
-// word as its value, so no word from there on is exempted, and the clause is
-// judged as it was before programs were told apart from files.
+// It fails closed:
+//   - An option the tool's table does not know, anywhere in the clause, exempts
+//     nothing. It may take a value, and GNU tools permute arguments and accept
+//     abbreviations, so `grep .env.local --reg TOKEN` makes .env.local a file.
+//   - A word the shell rewrites (an unquoted `.*` or `.env*`) is never
+//     exempt: the shell expands it into file names before the tool runs.
+//   - For a tool in offLineOptions, the first operand is exempt from wildcard
+//     expansion only, and still judged as a literal path (see literal).
 func programOperandsOf(command string, words []shellWord, at int) programOperands {
-	out := programOperands{exempt: map[int]bool{}}
+	out := programOperands{exempt: map[int]bool{}, literal: map[int]bool{}}
 	if at < 0 {
 		return out
 	}
@@ -218,13 +251,23 @@ func programOperandsOf(command string, words []shellWord, at int) programOperand
 	}
 	p := parseOptArgsArity(args, tool.shortValue, tool.longArity)
 
-	// The first option the table does not know ends what can be exempted.
+	// An option the table does not know, anywhere, exempts nothing.
 	limit := len(args)
 	for _, o := range p.seen {
 		if !tool.knows(o) {
-			limit = o.at
+			limit = 0
 			break
 		}
+	}
+	exempt := func(argAt int) bool {
+		if argAt < 0 || argAt >= limit || args[argAt].expands {
+			return false
+		}
+		out.exempt[index[argAt]] = true
+		if programOpensFiles[command] {
+			out.literal[index[argAt]] = true
+		}
+		return true
 	}
 
 	program := func(o optOccurrence) bool { return containsString(tool.programOpts, o.name) }
@@ -241,12 +284,14 @@ func programOperandsOf(command string, words []shellWord, at int) programOperand
 		if program(o) || containsString(tool.programFileOpts, o.name) {
 			given = true
 		}
-		if program(o) && o.valueAt >= 0 && o.valueAt < limit {
-			out.exempt[index[o.valueAt]] = true
+		if program(o) {
+			exempt(o.valueAt)
 		}
 	}
-	if !given && len(p.operandAt) > 0 && p.operandAt[0] < limit {
-		out.exempt[index[p.operandAt[0]]] = true
+	if !given && len(p.operandAt) > 0 && exempt(p.operandAt[0]) {
+		if off, reads := offLineOptions[command]; reads && (off == "" || !p.has(off)) {
+			out.literal[index[p.operandAt[0]]] = true
+		}
 	}
 	return out
 }

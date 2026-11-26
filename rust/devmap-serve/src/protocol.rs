@@ -1550,6 +1550,15 @@ fn analysis_budget(cancel: &devmap_query::Cancel) -> dc_regress::Budget {
     dc_regress::Budget::default().with_cancel(move || cancel.is_cancelled())
 }
 
+/// The bound a `routes` or `api-impact` source scan runs under: the scan's
+/// default caps, ended early by the request's cancel.
+fn route_scan_budget(cancel: &devmap_query::Cancel) -> devmap_query::api_routes::ScanBudget {
+    devmap_query::api_routes::ScanBudget {
+        cancel: cancel.clone(),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn dispatch(
     store: &Store,
     request: IpcRequest,
@@ -1900,12 +1909,15 @@ pub(crate) fn dispatch_with_stacked(
         }
         IpcCommand::Routes { filter, budget } => {
             let root = route_scan_root(store)?;
-            let graph = devmap_query::graph_core_for_store(store)?;
-            let mut mapped = devmap_query::api_routes::route_map(
-                &root,
-                &graph,
-                &devmap_query::api_routes::ScanBudget::default(),
-            );
+            let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
+            let mut mapped =
+                devmap_query::api_routes::route_map(&root, &graph, &route_scan_budget(cancel));
+            // A scan the caller abandoned says so in `scan.cancelled`, but the
+            // dispatcher's contract is the engine arms': a cancelled request
+            // answers with `QueryCancelled`, never a value that could be read
+            // as a finished route map. A cancel that arrives after a complete
+            // scan returns `QueryCancelled` too, on purpose: the caller is gone.
+            cancel.check()?;
             if let Some(filter) = filter.as_deref() {
                 devmap_query::api_routes::retain_matching_routes(&mut mapped, filter);
             }
@@ -1914,17 +1926,22 @@ pub(crate) fn dispatch_with_stacked(
         }
         IpcCommand::ApiImpact { route } => {
             let root = route_scan_root(store)?;
-            let graph = devmap_query::graph_core_for_store(store)?;
-            Ok(devmap_query::api_routes::api_impact(
+            let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
+            let impact = devmap_query::api_routes::api_impact(
                 &root,
                 &graph,
-                &devmap_query::api_routes::ScanBudget::default(),
+                &route_scan_budget(cancel),
                 &route,
-            ))
+            );
+            cancel.check()?;
+            Ok(impact)
         }
         IpcCommand::Cypher { query, limit } => {
-            let graph = devmap_query::graph_core_for_store(store)?;
+            let graph = devmap_query::graph_core_for_store_cancellable(store, cancel)?;
             let result = devmap_query::cypher::run(&graph, &query, limit);
+            // `cypher::run` does not observe cancel, so this check changes what
+            // is returned, not the work done; the row ceiling bounds that work.
+            cancel.check()?;
             // A refusal is an error, exactly as the CLI exits non-zero on one:
             // "your query was not run" must not arrive looking like "your query
             // matched nothing".
@@ -2457,6 +2474,19 @@ impl Drop for UnixIpcServer {
     }
 }
 
+/// Whether `name` is in the local named-pipe namespace (`\\.\pipe\<name>`,
+/// matched without regard to case, as Windows does). A pipe server can only be
+/// created there; any other spelling, such as a socket-file path, is refused
+/// by `CreateNamedPipeW` with an error that does not say why.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_named_pipe_name(name: &str) -> bool {
+    const PREFIX: &str = r"\\.\pipe\";
+    name.len() > PREFIX.len()
+        && name
+            .get(..PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+}
+
 /// `on_listening` is called once, the moment the first pipe instance exists and
 /// a client could connect — the named-pipe counterpart of `UnixIpcServer::bind`
 /// returning. It is a callback rather than a return value because this function
@@ -2470,6 +2500,15 @@ pub async fn run_named_pipe(
 ) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    // A Unix-shaped `--socket C:\..\x.sock` reaches here as-is. Windows would
+    // refuse it with a bare os error 123 after the daemon has already logged
+    // that it started, which names neither the flag nor the spelling it needs.
+    anyhow::ensure!(
+        is_named_pipe_name(name),
+        "{name} is not a named-pipe name: on Windows the daemon listens on a named pipe, \
+         so the endpoint (`--socket`) must be spelled \\\\.\\pipe\\<name>; omit it to use \
+         the repository's default pipe"
+    );
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(name)?;
@@ -2518,6 +2557,35 @@ pub async fn run_named_pipe(
 
 #[cfg(test)]
 mod tests {
+    /// The route scan runs under the request's cancel and keeps the scan's own
+    /// caps: a budget that dropped the cancel (`ScanBudget::default()`) would
+    /// walk files for a client that has gone.
+    #[test]
+    fn the_route_scan_budget_carries_the_cancel_and_keeps_the_default_caps() {
+        let root = std::env::temp_dir().join(format!("devmap-route-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        let graph = json!({"nodes": [{"path": "a.ts"}]});
+
+        let cancel = devmap_query::Cancel::new();
+        let live =
+            devmap_query::api_routes::route_map(&root, &graph, &super::route_scan_budget(&cancel));
+        assert_eq!(live["scan"]["cancelled"], json!(false), "{live:#}");
+        assert_eq!(live["scan"]["files_read"], json!(1), "{live:#}");
+
+        cancel.cancel();
+        let budget = super::route_scan_budget(&cancel);
+        let defaults = devmap_query::api_routes::ScanBudget::default();
+        assert_eq!(budget.max_files, defaults.max_files);
+        assert_eq!(budget.max_file_bytes, defaults.max_file_bytes);
+        assert_eq!(budget.max_sites, defaults.max_sites);
+        let cut = devmap_query::api_routes::route_map(&root, &graph, &budget);
+        assert_eq!(cut["scan"]["cancelled"], json!(true), "{cut:#}");
+        assert_eq!(cut["scan"]["files_read"], json!(0), "{cut:#}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A peer dribbling one byte at a time must be cut by an *overall* request
     /// deadline, not just the per-read timeout.
     ///
@@ -4648,6 +4716,23 @@ mod tests {
 #[cfg(test)]
 mod hardening_limit_tests {
     use super::*;
+
+    /// `run_named_pipe` refuses, by name, an endpoint that is not a pipe: a
+    /// socket-file path handed to `--socket` on Windows used to die with a bare
+    /// os error 123 after the daemon had logged that it started.
+    #[test]
+    fn only_the_local_pipe_namespace_is_a_named_pipe_name() {
+        assert!(is_named_pipe_name(r"\\.\pipe\devmap-0123456789abcdef"));
+        assert!(is_named_pipe_name(r"\\.\PIPE\dm-serve-1"));
+        assert!(!is_named_pipe_name(r"\\.\pipe\"), "a prefix with no name");
+        assert!(!is_named_pipe_name(
+            r"C:\Users\x\AppData\Local\Temp\dm-serve-1.sock"
+        ));
+        assert!(!is_named_pipe_name("/tmp/devmap-ig-1.sock"));
+        assert!(!is_named_pipe_name(r"\\?\C:\Temp\pipe\x"));
+        assert!(!is_named_pipe_name(r"\\.\pip"));
+        assert!(!is_named_pipe_name(""));
+    }
 
     /// The fan-out cap and probe window are contracts, not vibes: both were
     /// introduced because an unbounded value had a concrete failure mode

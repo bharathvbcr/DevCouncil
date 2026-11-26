@@ -37,6 +37,12 @@ flowchart TD
 The diagram describes implemented interfaces, not a claim that every consumer
 uses every edge.
 
+## How hosts consume the modules
+
+- **Manvi** wraps the components: it drives the agent loop, provider routing, policy ladder, and TUI, and reaches each binary over JSON on stdio. A host that wants a harness embeds Manvi rather than reimplementing it.
+- **GitPulse** uses both for their respective jobs: Manvi (`manvi serve`) for policy, workbench, and agent hosting; selected DevCouncil crates and the `devmap` CLI for in-process code intelligence. It does not have to take every module.
+- **Other apps** pick the same way — `devmap` alone, `dcverify` alone, the Go host MCP, or the full set. Updating one module does not require shipping the rest.
+
 ### Host integration and skill installation: one owner
 
 **Decision (2026-10-08, owner): `devmap integrate`, `devmap skills install`,

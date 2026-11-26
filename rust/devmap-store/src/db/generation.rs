@@ -10,6 +10,7 @@ use crate::schema::BUILD_HISTORY_RETENTION;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Result};
+#[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -19,7 +20,9 @@ thread_local! {
     /// pins how many one `status` takes.
     #[cfg(test)]
     static STATUS_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
+    #[cfg(test)]
     static FRESHNESS_INTERLEAVE: Cell<Option<fn(&Store)>> = const { Cell::new(None) };
+    #[cfg(test)]
     static FRESHNESS_INTERLEAVE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -27,11 +30,9 @@ thread_local! {
 /// queue and before it clones the verdict cache. Production never sets it.
 /// A hook that calls `query_source_freshness` again does not re-enter itself.
 ///
-/// Callers live in this crate's tests. A non-test build of the crate (as a
-/// dependency of `devmap-query`) therefore sees an unused function; that is
-/// the seam, not a dead production path.
-#[doc(hidden)]
-#[allow(dead_code)]
+/// Compiled only under `cfg(test)`: every caller is in this crate's own unit
+/// tests (checked with `rg -uu` across `rust/`), so no feature exports it.
+#[cfg(test)]
 pub fn set_source_freshness_interleave(hook: Option<fn(&Store)>) {
     FRESHNESS_INTERLEAVE.with(|slot| slot.set(hook));
 }
@@ -1514,6 +1515,7 @@ impl Store {
         // Test seam. Production leaves the hook unset. It runs after the
         // queue read has dropped the connection and before the cache is
         // cloned, which is the window an enqueue can commit into.
+        #[cfg(test)]
         if let Some(hook) = FRESHNESS_INTERLEAVE.with(|slot| slot.get()) {
             let entered = FRESHNESS_INTERLEAVE_ACTIVE.with(|active| {
                 if active.get() {

@@ -18,7 +18,12 @@ func TestResolveStateDirPrecedence(t *testing.T) {
 		}
 		return func(p string) bool { return set[p] }
 	}
-	abs := filepath.FromSlash("/elsewhere/state")
+	// Rooted is not absolute on Windows ("\elsewhere\state" has no drive and
+	// would be joined onto the root), so the absolute home gets its drive.
+	abs, err := filepath.Abs(filepath.FromSlash("/elsewhere/state"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name  string
 		home  string

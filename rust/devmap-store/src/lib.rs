@@ -11,6 +11,8 @@ pub(crate) mod payload_codec;
 pub mod schema;
 pub mod seed;
 
+pub use payload_codec::{compress_json_frame, inflate_json_frame};
+
 pub use delta::{
     DeltaBusy, DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore,
     DeltaSymbolRecord, DEFAULT_READ_WAIT,
@@ -33,8 +35,8 @@ pub use db::{
     QuerySourceFreshness, ReaderMemory, ResolverStamp, SearchNarrowing, SearchPage,
     SourceTreeDelta, Store, StoreStatus, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
     UnresolvedSiteRow, UnresolvedSitesByName, UnsupportedSchema, VacuumAction, VacuumOutcome,
-    WalCheckpointMode, WalCheckpointResult, WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
-    RESOLVER_NEWER_REASON, UNAVAILABLE_HEAD,
+    WalCheckpointMode, WalCheckpointResult, WriteBreakdown, WriterLock, WriterLockWait,
+    MAX_PENDING_ATTEMPTS, RESOLVER_NEWER_REASON, UNAVAILABLE_HEAD,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

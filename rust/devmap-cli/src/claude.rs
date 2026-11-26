@@ -559,14 +559,16 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                     }
                 }
                 if let Some(command) = handler.get("command").and_then(Value::as_str) {
-                    let trimmed = command.trim();
-                    // A bare name with no path separator is the Cursor failure mode.
-                    if !trimmed.contains('/') && !trimmed.contains('\\') && !trimmed.contains(' ') {
+                    // A bare or relative executable is the Cursor failure mode, and
+                    // a repository file named `devmap` the worse one.
+                    if let Some(why) = command_word_defect(command) {
+                        let trimmed = command.trim();
                         out.push(Diagnostic::error(
                             at,
                             format!(
-                                "hook `command` {trimmed:?} is a bare name; Cursor/Codex need an \
-                                 absolute-path shell-form command ('/path/to/devmap' hook <event>)"
+                                "hook `command` {trimmed:?} starts with an executable that {why}; \
+                                 Cursor/Codex need an absolute-path shell-form command \
+                                 ('/path/to/devmap' hook <event>)"
                             ),
                         ));
                     }
@@ -1348,21 +1350,6 @@ pub(crate) fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
     })
 }
 
-/// Absolute path for a hook `command`, even when PATH resolves to self.
-///
-/// MCP entries still use [`plugin_command`]'s bare-name rule; hooks must be
-/// absolute because Cursor/Codex do not expand a bare name the same way, and a
-/// bare `devmap` that clap-rejects exits 2 and blocks the agent.
-///
-/// [`plugin_command`] hands this the bare name whenever `devmap` on `PATH` is
-/// this binary (a CI runner with `target/debug` on `PATH`, a `cargo install`).
-/// A bare name is therefore looked up on `PATH` exactly as a shell would, and
-/// the file it finds is the answer. A name that cannot be resolved is an error:
-/// a hook command that is not absolute is never emitted.
-pub fn hook_executable(executable: &Path) -> anyhow::Result<PathBuf> {
-    resolve_hook_executable(executable, std::env::var_os("PATH").as_deref())
-}
-
 /// A fixture executable path that is absolute on the platform under test: a
 /// path with no drive letter is not absolute on Windows, and a hook executable
 /// that is not absolute is refused there, so a Unix-looking fixture would be
@@ -1378,6 +1365,7 @@ pub(crate) fn absolute_fixture(unix_path: &str) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn resolve_hook_executable(
     executable: &Path,
     path_var: Option<&std::ffi::OsStr>,
@@ -1413,6 +1401,7 @@ fn resolve_hook_executable(
 /// would try them: the name as given, then (Windows only, and only for a name
 /// with no extension) the name with each `PATHEXT` extension, so `devmap`
 /// finds `devmap.exe`. Unix probes the name as given and nothing else.
+#[cfg(test)]
 fn executable_names(executable: &Path) -> Vec<std::ffi::OsString> {
     #[cfg(windows)]
     {
@@ -1450,6 +1439,125 @@ fn executable_names_with(
     names
 }
 
+/// The executable path a writer may put in a hook or MCP `command`: absolute,
+/// or an error. A relative path is never resolved against the working
+/// directory here, because that is how a file named `devmap` in a repository
+/// root became the command every session ran.
+pub fn absolute_executable(executable: &Path) -> anyhow::Result<PathBuf> {
+    if executable.is_absolute() {
+        return Ok(executable.to_path_buf());
+    }
+    anyhow::bail!(
+        "refusing to register the relative executable {}: a host would resolve it against \
+         whatever directory it runs in. Resolve it with `reachable_command` first",
+        executable.display()
+    )
+}
+
+/// The leading executable word of a shell-form hook command: the single- or
+/// double-quoted path, else the first whitespace-delimited word.
+pub(crate) fn command_executable_word(command: &str) -> &str {
+    let trimmed = command.trim();
+    for quote in ['\'', '"'] {
+        if let Some(rest) = trimmed.strip_prefix(quote) {
+            return rest.split(quote).next().unwrap_or("");
+        }
+    }
+    trimmed.split_whitespace().next().unwrap_or("")
+}
+
+/// How one command word fares as an executable a host will run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordVerdict {
+    /// Absolute (or expanding to the user's home) and outside the repository.
+    Fine,
+    /// Neither absolute nor an expansion: resolved against the host's cwd or PATH.
+    Relative,
+    /// Led by a `$VAR` other than `$HOME`, or `~user`: the environment decides.
+    Expanded,
+    /// Resolves inside the repository, which can replace it.
+    Inside,
+}
+
+impl WordVerdict {
+    pub(crate) fn defect(self) -> Option<&'static str> {
+        match self {
+            Self::Fine => None,
+            Self::Relative => {
+                Some("is relative, so the host resolves it against whatever directory it runs in")
+            }
+            Self::Expanded => Some(
+                "is expanded by the host from its environment, which a repository can influence",
+            ),
+            Self::Inside => Some("is inside the repository, which can replace it"),
+        }
+    }
+}
+
+/// `~`, `$HOME` or `${HOME}` alone or followed by `/…`: the rest of the word.
+fn home_relative(word: &str) -> Option<&str> {
+    for prefix in ["~", "${HOME}", "$HOME"] {
+        if let Some(rest) = word.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return Some(rest);
+            }
+        }
+    }
+    None
+}
+
+/// The one predicate for "is this command word acceptable", shared by the hook
+/// validators and `doctor`: absolute and outside `repo` is fine; a leading `~`
+/// or `$HOME` expanding to `home` is judged as that path; any other `$VAR`-led
+/// or `~user` word, and any relative word, is a defect. An error means the word
+/// could not be judged, which a caller must never read as fine.
+pub(crate) fn judge_command_word(
+    word: &str,
+    home: Option<&Path>,
+    repo: Option<&Path>,
+) -> anyhow::Result<WordVerdict> {
+    let resolved = if let Some(rest) = home_relative(word) {
+        let home =
+            home.ok_or_else(|| anyhow::anyhow!("HOME is unset, so {word:?} cannot be expanded"))?;
+        home.join(rest.trim_start_matches('/'))
+    } else if word.starts_with('$') || word.starts_with('~') {
+        return Ok(WordVerdict::Expanded);
+    } else if !Path::new(word).is_absolute() {
+        return Ok(WordVerdict::Relative);
+    } else {
+        PathBuf::from(word)
+    };
+    if let Some(repo) = repo {
+        if !resolved.is_dir() && crate::hook::executable_is_inside_repository(&resolved, repo)? {
+            return Ok(WordVerdict::Inside);
+        }
+    }
+    Ok(WordVerdict::Fine)
+}
+
+/// Why the leading executable word of a hook command string is not acceptable,
+/// judged with `$HOME` from the environment and no repository. `None` when it is.
+pub(crate) fn command_word_defect(command: &str) -> Option<String> {
+    let word = command_executable_word(command);
+    if word.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match judge_command_word(word, home.as_deref(), None) {
+        Ok(verdict) => verdict.defect().map(str::to_string),
+        Err(error) => Some(format!("could not be judged: {error}")),
+    }
+}
+
+/// The repository the working directory is in: its git worktree top, unless
+/// that is `$HOME` itself (a home directory is not the repository a hook
+/// command could be planted in). `None` outside any repository.
+pub fn cwd_repository() -> anyhow::Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let home = std::env::var_os("HOME").and_then(|home| PathBuf::from(home).canonicalize().ok());
+    Ok(devmap_extract::git_worktree_root(&cwd).filter(|top| Some(top) != home.as_ref()))
+}
+
 /// Subcommands this binary's parser actually registers.
 ///
 /// The equivalent of asking the parser rather than trusting the table: a
@@ -1464,63 +1572,84 @@ pub fn known_subcommands<C: clap::CommandFactory>() -> Vec<String> {
     })
 }
 
-/// The command string to write into an emitted hook or MCP entry.
-///
-/// `std::env::current_exe()` is an absolute path into whatever tree the running
-/// binary came from — for a local build, `…/rust/target/release/devmap`.
-/// Baked into a bundle, that path is wrong in two ordinary situations: a bundle
-/// committed to the repository names a path that exists on one machine, and a
-/// bundle emitted from a build tree keeps pointing at a stale binary after
-/// `cargo install` puts a current one on `PATH`.
-///
-/// So the bare name `devmap` is emitted when `devmap` on `PATH` *is* this
-/// binary, and the absolute path otherwise. The test is by resolved path rather
-/// than by name: a *different* `devmap` earlier on `PATH` is precisely the case
-/// where the absolute path is the honest answer, because emitting the bare name
-/// would silently hand the hook to some other build.
-///
-/// `explicit` wins over both, for a packager who knows the install location
-/// before anything is installed there.
-pub fn plugin_command(executable: &Path, explicit: Option<&Path>) -> PathBuf {
-    if let Some(path) = explicit {
-        return path.to_path_buf();
+/// `path` with its deepest existing ancestor canonicalized and the missing
+/// tail re-appended. A tail with `..` or no file name is refused.
+fn canonical_with_missing_tail(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut tail = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match current.canonicalize() {
+            Ok(mut resolved) => {
+                resolved.extend(tail.iter().rev());
+                return Ok(resolved);
+            }
+            Err(_) => {
+                let Some(name) = current.file_name().map(std::ffi::OsStr::to_os_string) else {
+                    anyhow::bail!(
+                        "refusing to register {}: cannot resolve where it would land",
+                        path.display()
+                    );
+                };
+                tail.push(name);
+                current.pop();
+            }
+        }
     }
-    let path_var = std::env::var_os("PATH");
-    if resolves_to_self(PLUGIN_NAME, executable, path_var.as_deref()) {
-        return PathBuf::from(PLUGIN_NAME);
-    }
-    executable.to_path_buf()
 }
 
-/// True when looking `name` up on `path_var` finds `executable` itself.
+/// What command line reaches this binary: the one owner every writer shares.
 ///
-/// Compares canonicalized paths, so a `PATH` entry that is a symlink to the
-/// binary — which is what `cargo install` and every package manager produce —
-/// counts as the same file rather than as a different one.
-fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::OsStr>) -> bool {
-    let Some(path_var) = path_var else {
-        return false;
-    };
-    let Ok(target) = executable.canonicalize() else {
-        return false;
-    };
-    for dir in std::env::split_paths(path_var) {
-        // An empty `PATH` entry means the working directory on some shells.
-        // Resolving a hook command against wherever the agent happens to be
-        // running is not a behaviour worth reproducing.
-        if dir.as_os_str().is_empty() {
-            continue;
+/// Always an absolute, canonical path that is not inside the repository at
+/// `root` (nor reached through a link inside it), as
+/// [`crate::hook::canonical_hook_executable`] proves for the hooks themselves.
+/// A bare `devmap` is never returned, even when `devmap` on `PATH` is this
+/// binary: the bare name is resolved by the *host*, against its own `PATH` and
+/// working directory, and an executable `devmap` in a repository root would
+/// win there. `explicit` (`--binary`) replaces the running binary and goes
+/// through the same check.
+pub fn reachable_command(
+    executable: &Path,
+    explicit: Option<&Path>,
+    root: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    // A packager names the install location before anything is installed there
+    // (`--binary /usr/local/bin/devmap`). Such a path cannot be canonicalized,
+    // so it is judged by where it is: absolute, and not under the repository.
+    if let Some(path) = explicit {
+        let missing = std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if missing && path.is_absolute() {
+            // Judged where it will land: the deepest existing ancestor is
+            // resolved through its links and the missing tail re-appended, so
+            // `out/link/devmap` with `out/link -> repo/bin` is the repository's.
+            let landing = canonical_with_missing_tail(path)?;
+            if let Some(root) = root.filter(|root| {
+                crate::hook::executable_is_inside_repository(&landing, root).unwrap_or(true)
+            }) {
+                anyhow::bail!(
+                    "refusing to register the devmap command: {} lands inside the repository at {} ({})",
+                    path.display(),
+                    root.display(),
+                    landing.display()
+                );
+            }
+            return Ok(landing);
         }
-        let candidate = dir.join(name);
-        let Ok(resolved) = candidate.canonicalize() else {
-            continue;
-        };
-        // The first hit on PATH decides, exactly as execution would. Continuing
-        // past it would let a *later* entry that happens to be this binary
-        // authorize emitting a bare name that resolves to the earlier one.
-        return resolved == target;
     }
-    false
+    let chosen = explicit.unwrap_or(executable);
+    match root {
+        Some(root) => {
+            crate::hook::canonical_hook_executable(chosen, root, "register the devmap command")
+        }
+        // Not in any repository: nothing can supply a file by that name, so
+        // only the absolute, canonical form is required.
+        None => chosen.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "cannot resolve the devmap executable {}: {error}",
+                chosen.display()
+            )
+        }),
+    }
 }
 
 /// One shell-form hook command: `'<abs>' hook <event>`.
@@ -1590,7 +1719,7 @@ fn hooks_block_without(
             subcommands.join(", ")
         );
     }
-    let exe = hook_executable(executable)?;
+    let exe = absolute_executable(executable)?;
     let exe_text = utf8_path("the devmap executable path", &exe)?;
 
     // Groups are keyed by (event, matcher): two handlers that fire on the same
@@ -1770,7 +1899,10 @@ pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
 /// `postToolUse` entry, matcher `Shell` (Cursor's name for the terminal tool),
 /// is the shell-write refresh; `afterFileEdit` never fires for a shell write.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
-    let exe = utf8_path("the devmap executable path", &hook_executable(executable)?)?;
+    let exe = utf8_path(
+        "the devmap executable path",
+        &absolute_executable(executable)?,
+    )?;
     let session_start = hook_shell_command(&exe, "session-start")?;
     let after_file_edit = hook_shell_command(&exe, "post-tool-use")?;
     let shell_write = after_file_edit.clone();
@@ -1872,17 +2004,106 @@ pub(crate) fn path_is_hashed_test_binary(path: &Path) -> bool {
     })
 }
 
-/// Refuse to put a hashed test binary into an MCP command.
+/// Why `path` is a cargo build product inside a linked worktree, if it is.
+///
+/// A path with a `target` component followed by a profile directory and then
+/// the binary (`target/<profile>/devmap`, `target/<triple>/<profile>/devmap`) is
+/// build output whatever the profile is called. Every `target` component is
+/// tried, and the ancestors above it are asked whether any is a linked worktree
+/// that git itself registered, through `devmap_extract::paths::main_checkout_of`:
+/// that excludes submodules and any folder that merely looks like a worktree.
+/// A lane's checkout is removed when it lands, and the binary goes with it, so
+/// the host that stored the path fails `posix_spawn` with ENOENT. The primary
+/// checkout's own `target/` is not matched: it outlives any lane. A deleted
+/// worktree cannot be confirmed, so it is not named.
+pub(crate) fn worktree_build_output_warning(path: &Path) -> Option<String> {
+    worktree_build_output_warning_at(path).or_else(|| {
+        let resolved = path.canonicalize().ok()?;
+        worktree_build_output_warning_at(&resolved)
+    })
+}
+
+/// `worktree_build_output_warning` for one spelling of the path.
+///
+/// A bare-repository common dir is not recognised as a main checkout by
+/// `main_checkout_of`, so a worktree of a bare repo is not named.
+fn worktree_build_output_warning_at(path: &Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    let is_target = |c: &std::path::Component<'_>| matches!(c, std::path::Component::Normal(name) if *name == "target");
+    for (index, _) in components.iter().enumerate().filter(|(_, c)| is_target(c)) {
+        // `target`, a profile directory, and the file itself.
+        if components.len() < index + 3 {
+            continue;
+        }
+        let above: PathBuf = components[..index].iter().collect();
+        for dir in above.ancestors() {
+            if let Some(main) = devmap_extract::paths::main_checkout_of(dir) {
+                return Some(format!(
+                    "the MCP command {} is build output inside the linked worktree {} \
+                     (main checkout {}); the entry will break when that worktree is \
+                     removed. Register an installed devmap, or pass --binary.",
+                    path.display(),
+                    dir.display(),
+                    main.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The `notes` line for a receipt: the warning, but only when an MCP entry
+/// naming `executable` is registered after the run. Otherwise nothing will
+/// break. This covers MCP entries only: the hook and plugin writers also embed
+/// the binary path and are not checked (card ft-502e29ba).
+pub(crate) fn mcp_receipt_note(executable: &Path, registered: bool) -> Option<String> {
+    if registered {
+        worktree_build_output_warning(executable)
+    } else {
+        None
+    }
+}
+
+/// True the first time `path` is seen in this process. A poisoned lock still
+/// holds a valid list, so it is recovered rather than dropping the warning.
+fn first_sighting(path: &Path) -> bool {
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.iter().any(|p| p == path) {
+        return false;
+    }
+    seen.push(path.to_path_buf());
+    true
+}
+
+/// Print `worktree_build_output_warning` once per path per process.
+///
+/// Stderr only: `mcp --print-config` keeps stdout to the JSON a host consumes.
+fn warn_on_worktree_build_output(executable: &Path) {
+    if let Some(message) = worktree_build_output_warning(executable) {
+        if first_sighting(executable) {
+            eprintln!("warning: {message}");
+        }
+    }
+}
+
+/// Refuse to put a hashed test binary into an MCP command; warn on a linked
+/// worktree's build output.
 ///
 /// A symlink is followed. The lexical path of a deleted worktree does not
 /// exist, so a failed canonicalize is not treated as safe: the path components
 /// are checked either way. A missing ordinary path stays allowed, which is
-/// what the config writers' unit tests hand in.
+/// what the config writers' unit tests hand in. Build output in a linked
+/// worktree is only warned about: `CARGO_BIN_EXE_devmap` is that path whenever
+/// the integration tests run in a lane.
 pub(crate) fn refuse_hashed_test_binary(executable: &Path) -> anyhow::Result<()> {
     let canonical = executable.canonicalize().ok();
     let lexical = path_is_hashed_test_binary(executable);
     let via_link = canonical.as_deref().is_some_and(path_is_hashed_test_binary);
     if !lexical && !via_link {
+        warn_on_worktree_build_output(executable);
         return Ok(());
     }
     let shown = if via_link {
@@ -1918,7 +2139,10 @@ pub fn mcp_entry(
     // Always the absolute path this binary validated. Emitting a bare `devmap`
     // silently hands the host whichever build wins on PATH; two installs with
     // different schemas is the skew doctor reports.
-    let command = utf8_path("the devmap executable path", executable)?;
+    let command = utf8_path(
+        "the devmap executable path",
+        &absolute_executable(executable)?,
+    )?;
     Ok(match http {
         Some(address) => json!({
             "type": "http",
@@ -1956,7 +2180,10 @@ pub fn mcp_entry_with_root(
     if http.is_some() {
         return mcp_entry(executable, None, http);
     }
-    let command = utf8_path("the devmap executable path", executable)?;
+    let command = utf8_path(
+        "the devmap executable path",
+        &absolute_executable(executable)?,
+    )?;
     Ok(json!({
         "type": "stdio",
         "command": command,
@@ -2515,10 +2742,10 @@ mod tests {
         let os = |value: &str| Some(std::ffi::OsString::from(value));
         assert_eq!(config_dir_from(home, None), home.join(".claude"));
         assert_eq!(config_dir_from(home, os("")), home.join(".claude"));
-        assert_eq!(
-            config_dir_from(home, os("/seat/one")),
-            PathBuf::from("/seat/one")
-        );
+        // A drive-less `/seat/one` is not absolute on Windows and gains the
+        // current drive, so the fixture is absolute on every platform.
+        let seat = absolute_fixture("/seat/one");
+        assert_eq!(config_dir_from(home, os(seat.to_str().unwrap())), seat);
         let relative = config_dir_from(home, os("seat"));
         assert!(relative.is_absolute(), "{relative:?}");
         assert!(relative.ends_with("seat"), "{relative:?}");
@@ -2530,9 +2757,10 @@ mod tests {
         let os = |value: &str| Some(std::ffi::OsString::from(value));
         assert_eq!(global_config_from(home, None), home.join(".claude.json"));
         assert_eq!(global_config_from(home, os("")), home.join(".claude.json"));
+        let seat = absolute_fixture("/seat/one");
         assert_eq!(
-            global_config_from(home, os("/seat/one")),
-            PathBuf::from("/seat/one/.claude.json")
+            global_config_from(home, os(seat.to_str().unwrap())),
+            seat.join(".claude.json")
         );
     }
 
@@ -3519,6 +3747,181 @@ mod tests {
         }
     }
 
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-wt-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let canonical = dir.canonicalize().expect("canonical scratch dir");
+        // Windows canonicalizes to a verbatim `\\?\C:\...` path, which git
+        // refuses as a worktree or submodule location; the drive form names
+        // the same directory.
+        match canonical
+            .to_str()
+            .and_then(|text| text.strip_prefix(r"\\?\"))
+        {
+            Some(rest) => PathBuf::from(rest),
+            None => canonical,
+        }
+    }
+
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("repo dir");
+        git_in(dir, &["init", "-q"]);
+        git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Build output in a worktree git registered warns and is still accepted:
+    /// `CARGO_BIN_EXE_devmap` is exactly that path when the suite runs in a lane.
+    #[test]
+    fn a_registered_linked_worktrees_build_output_warns_and_is_accepted() {
+        let root = scratch_dir("lane");
+        let main = root.join("main");
+        init_repo(&main);
+        let lane = root.join("lane");
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                lane.to_str().expect("utf8"),
+                "-b",
+                "lane",
+            ],
+        );
+        let primary_bin = main.join("rust/target/debug/devmap");
+        let cases = [
+            lane.join("rust/target/debug/devmap"),
+            lane.join("rust/target/aarch64-apple-darwin/release/devmap"),
+            lane.join("rust/target/custom-profile/devmap"),
+            lane.join("target/x/target/ci/devmap"),
+        ];
+        let warned: Vec<_> = cases
+            .iter()
+            .map(|p| (p.clone(), worktree_build_output_warning(p)))
+            .collect();
+        let accepted: Vec<_> = cases.iter().map(|p| mcp_entry(p, None, None)).collect();
+        let primary = worktree_build_output_warning(&primary_bin);
+        let note_direct = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), true);
+        let note_unregistered = mcp_receipt_note(&lane.join("rust/target/debug/devmap"), false);
+        // A path no writer above has used, so the set has not seen it yet.
+        let unseen = lane.join("rust/target/debug/unseen-devmap");
+        let first = first_sighting(&unseen);
+        let second = first_sighting(&unseen);
+        let source_file = worktree_build_output_warning(&lane.join("rust/src/target"));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, warning) in warned {
+            let warning = warning.unwrap_or_else(|| panic!("{} was not flagged", path.display()));
+            assert!(warning.contains("removed"), "{warning}");
+            assert!(warning.contains("--binary"), "{warning}");
+            assert!(warning.contains(&*path.to_string_lossy()), "{warning}");
+        }
+        for entry in accepted {
+            entry.expect("a warning is not a refusal");
+        }
+        assert!(first && !second, "stderr warns once per path");
+        assert!(note_direct.is_some(), "receipt note missing");
+        assert!(
+            note_unregistered.is_none(),
+            "nothing registered, nothing will break"
+        );
+        assert!(
+            primary.is_none(),
+            "the main checkout outlives any lane: {primary:?}"
+        );
+        assert!(
+            source_file.is_none(),
+            "a file named target is not build output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_a_lanes_build_output_warns_and_notes() {
+        let root = scratch_dir("link");
+        let main = root.join("main");
+        init_repo(&main);
+        let lane = root.join("lane");
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                lane.to_str().expect("utf8"),
+                "-b",
+                "lane",
+            ],
+        );
+        let binary = lane.join("rust/target/debug/devmap");
+        std::fs::create_dir_all(binary.parent().expect("parent")).expect("lane target");
+        std::fs::write(&binary, b"x").expect("lane binary");
+        let link = root.join("devmap");
+        std::os::unix::fs::symlink(&binary, &link).expect("symlink");
+        let warning = worktree_build_output_warning(&link);
+        let note = mcp_receipt_note(&link, true);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(warning.is_some(), "a symlink into a lane was not flagged");
+        assert!(
+            note.is_some(),
+            "the receipt note is missing for the symlink"
+        );
+    }
+
+    #[test]
+    fn a_submodules_target_and_a_plain_worktrees_folder_are_not_flagged() {
+        let root = scratch_dir("neg");
+        let sub_src = root.join("sub-src");
+        init_repo(&sub_src);
+        let main = root.join("main");
+        init_repo(&main);
+        git_in(
+            &main,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                sub_src.to_str().expect("utf8"),
+                "vendor/sub",
+            ],
+        );
+        let submodule_bin = main.join("vendor/sub/target/debug/devmap");
+        let outside_git = root.join("not-a-repo/worktrees/lane/rust/target/debug/devmap");
+        let flagged = [
+            worktree_build_output_warning(&submodule_bin),
+            worktree_build_output_warning(&outside_git),
+        ];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(flagged, [None, None]);
+    }
+
     /// The ENOENT from 2026-10-29 was this path: a hashed copy under
     /// `target/devcouncil-testbin` inside a worktree that was later deleted.
     /// Registering it is the failure. A checkout's own `target/debug` or
@@ -3591,5 +3994,56 @@ mod tests {
             linked.to_string().contains("devcouncil-testbin"),
             "{linked}"
         );
+    }
+
+    #[test]
+    fn a_relative_executable_is_never_registered() {
+        for relative in ["devmap", "./devmap", "bin/devmap"] {
+            let path = Path::new(relative);
+            assert!(absolute_executable(path).is_err(), "{relative}");
+            assert!(
+                hooks_block(path, &["hook".to_string()]).is_err(),
+                "{relative}"
+            );
+            assert!(cursor_hooks_document(path).is_err(), "{relative}");
+            assert!(mcp_entry(path, None, None).is_err(), "{relative}");
+            assert!(
+                mcp_entry_with_root(path, Path::new("/repo"), None).is_err(),
+                "{relative}"
+            );
+        }
+        assert_eq!(
+            absolute_executable(Path::new("/usr/local/bin/devmap")).unwrap(),
+            Path::new("/usr/local/bin/devmap")
+        );
+    }
+
+    #[test]
+    fn one_predicate_judges_command_words() {
+        let home = Path::new("/home/u");
+        let verdict = |word: &str| judge_command_word(word, Some(home), None).unwrap();
+        for relative in ["devmap", "./devmap", "bin/devmap", "../x/devmap"] {
+            assert_eq!(verdict(relative), WordVerdict::Relative, "{relative}");
+        }
+        for expanded in [
+            "$CLAUDE_PROJECT_DIR/bin/devmap",
+            "${CLAUDE_PROJECT_DIR}/devmap",
+            "$HOMEX/devmap",
+            "~other/bin/devmap",
+        ] {
+            assert_eq!(verdict(expanded), WordVerdict::Expanded, "{expanded}");
+        }
+        for fine in [
+            "/usr/bin/devmap",
+            "~/.local/bin/devmap",
+            "$HOME/.local/bin/devmap",
+            "${HOME}/.local/bin/devmap",
+        ] {
+            assert_eq!(verdict(fine), WordVerdict::Fine, "{fine}");
+        }
+        assert!(judge_command_word("~/devmap", None, None).is_err());
+        assert!(command_word_defect("'$CLAUDE_PROJECT_DIR'/devmap hook x").is_some());
+        assert!(command_word_defect("'/usr/bin/devmap' hook x").is_none());
+        assert!(command_word_defect("devmap hook x").is_some());
     }
 }

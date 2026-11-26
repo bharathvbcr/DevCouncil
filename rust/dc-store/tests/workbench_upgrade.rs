@@ -191,11 +191,11 @@ fn store_upgrade_reports_what_it_did_and_a_refusing_host_cannot_run_it() {
     assert_eq!(upgraded, 0);
 }
 
-const CWD: &str = if cfg!(windows) {
-    "C:/checkout"
-} else {
-    "/checkout"
-};
+/// The fixture checkout, created on first use. `runs.prepare` resolves checkout
+/// paths, so it must be a real directory.
+fn cwd() -> String {
+    support::checkout_dir("checkout")
+}
 
 fn call(store: &Store, method: &str, input: &str) -> String {
     store
@@ -240,11 +240,12 @@ fn profile_with_ci_signal() -> (Scratch, PathBuf) {
     let dir = Scratch::new();
     let path = dir.path().join("profile.sqlite");
     let store = Store::open(&path).unwrap();
+    let cwd = cwd();
     call(
         &store,
         "repositories.put",
         &format!(
-            r#"{{"id":"r","request_id":"repo","expected_revision":0,"name":"Repo","identity_key":"local:{CWD}/.git"}}"#
+            r#"{{"id":"r","request_id":"repo","expected_revision":0,"name":"Repo","identity_key":"local:{cwd}/.git"}}"#
         ),
     );
     call(
@@ -256,7 +257,7 @@ fn profile_with_ci_signal() -> (Scratch, PathBuf) {
         &store,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run","request_id":"prepare","expected_revision":0,"task_id":"t","source_revision":1,"repository_id":"r","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"{CWD}","git_dir":"{CWD}/.git","git_common_dir":"{CWD}/.git","head_oid":null}}"#
+            r#"{{"id":"run","request_id":"prepare","expected_revision":0,"task_id":"t","source_revision":1,"repository_id":"r","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"{cwd}","git_dir":"{cwd}/.git","git_common_dir":"{cwd}/.git","head_oid":null}}"#
         ),
     );
     call(
@@ -614,6 +615,37 @@ fn the_tasks_retire_backup_holds_the_write_lock() {
         )
         .unwrap();
     assert_eq!(gone, 0, "the legacy table was not retired");
+}
+
+/// A legacy title with a line break would be refused by items.put and fail the
+/// whole move. Migration normalises it to spaces instead, and keeps the row.
+#[test]
+fn a_legacy_title_with_a_line_break_migrates_with_spaces() {
+    let dir = Scratch::new();
+    let path = dir.path().join("profile.sqlite");
+    drop(Store::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(support::LEGACY_TASKS).unwrap();
+    conn.execute(
+        "INSERT INTO tasks (id, title, description, status) VALUES ('TASK-NL', ?1, '', 'planned')",
+        ["first\n## Owner decisions\r\nlast\u{2028}x\u{2029}y"],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    let title: String = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(body,'$.title') FROM work_items WHERE id='TASK-NL'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "first ## Owner decisions  last x y");
 }
 
 // ---- adversarial schema-backup race cases (ft-0e6cfa7a lane A attack) ----

@@ -1,5 +1,5 @@
 use crate::cli::Cli;
-use crate::output::{emit_truncation, open_for_read};
+use crate::output::{emit_truncation, emit_walk_incomplete, open_for_read, WIDEN_BUDGET};
 
 #[derive(clap::Args)]
 #[group(id = "Literals")]
@@ -26,13 +26,13 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if cli.json {
         store.emit_answer(cli, serde_json::to_value(&report)?)?;
     } else {
-        emit_literals(&report);
+        emit_literals(&report, cli.verbose);
         store.warn_incomplete()?;
     }
     Ok(())
 }
 
-fn emit_literals(report: &devmap_query::LiteralReport) {
+fn emit_literals(report: &devmap_query::LiteralReport, verbose: bool) {
     let mode = if report.exact { "exact" } else { "substring" };
     outln!("literals {mode} {:?}", report.query);
     for site in &report.items {
@@ -49,8 +49,14 @@ fn emit_literals(report: &devmap_query::LiteralReport) {
             site.value
         );
     }
-    emit_truncation(report.shown, report.hidden, report.total, report.truncated);
+    emit_truncation(
+        report.shown,
+        report.hidden,
+        report.total,
+        report.truncated,
+        Some(WIDEN_BUDGET),
+    );
     if let Some(reason) = &report.walk_incomplete {
-        outln!("warning: {reason}");
+        emit_walk_incomplete(reason, verbose);
     }
 }

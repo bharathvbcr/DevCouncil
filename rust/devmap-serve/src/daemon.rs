@@ -71,7 +71,7 @@ async fn release_ipc_endpoint<T>(task: &mut AbortTaskOnDrop<T>) {
 /// listener registered only while a `select!` branch is being polled can miss
 /// the signal that arrives between iterations, and `recv` on these is
 /// cancel-safe, so losing the race to another branch costs nothing.
-struct ShutdownSignals {
+pub struct ShutdownSignals {
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -85,8 +85,14 @@ struct ShutdownSignals {
 }
 
 impl ShutdownSignals {
+    /// Subscribe to the stop signals. Synchronous, so a caller that installs
+    /// before any await point has them registered before its first yield; a
+    /// signal that arrives afterwards waits in the stream until it is read,
+    /// whoever reads it. Hand the streams on with
+    /// [`Daemon::with_shutdown_signals`] rather than dropping them: a fresh
+    /// subscription does not see a signal that came before it.
     #[cfg(unix)]
-    fn install() -> anyhow::Result<Self> {
+    pub fn install() -> anyhow::Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(Self {
             terminate: signal(SignalKind::terminate())?,
@@ -95,7 +101,7 @@ impl ShutdownSignals {
     }
 
     #[cfg(windows)]
-    fn install() -> anyhow::Result<Self> {
+    pub fn install() -> anyhow::Result<Self> {
         Ok(Self {
             ctrl_c: tokio::signal::windows::ctrl_c()?,
             ctrl_break: tokio::signal::windows::ctrl_break()?,
@@ -105,7 +111,7 @@ impl ShutdownSignals {
 
     /// Resolves with the name of whichever signal arrived.
     #[cfg(unix)]
-    async fn recv(&mut self) -> &'static str {
+    pub async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.terminate.recv() => "SIGTERM",
             _ = self.interrupt.recv() => "SIGINT",
@@ -113,7 +119,7 @@ impl ShutdownSignals {
     }
 
     #[cfg(windows)]
-    async fn recv(&mut self) -> &'static str {
+    pub async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.ctrl_c.recv() => "CTRL_C",
             _ = self.ctrl_break.recv() => "CTRL_BREAK",
@@ -258,6 +264,9 @@ pub struct Daemon {
     /// Tripped by [`Daemon::request_shutdown`], and by SIGTERM/SIGINT, to end
     /// [`Daemon::run_loop`] through its orderly-release path.
     shutdown: Arc<tokio::sync::Notify>,
+    /// Stop-signal streams installed by the caller before the store was opened,
+    /// taken by [`Daemon::run_loop`] in place of subscribing afresh.
+    preinstalled_signals: Arc<std::sync::Mutex<Option<ShutdownSignals>>>,
     /// The flag the blocking drain's extraction reads. Tripped wherever
     /// `shutdown` is (a `Notify` cannot be polled from a blocking thread), so
     /// a shutdown mid-retry returns at the next file instead of after the
@@ -284,9 +293,9 @@ pub struct Daemon {
     /// `None` when that path was not a regular file then. There is nothing to
     /// compare, so [`Self::vanished_reason`] checks absence only.
     ///
-    /// Unix only. [`StoreFileIdentity`] has no stable file id elsewhere, and
-    /// its size-and-mtime stand-in changes on every write. Using that to
-    /// retire would exit a daemon for writing its own store.
+    /// Unix only. Off Unix [`StoreFileIdentity`] also carries the size and
+    /// mtime, which change on every write. Using that to retire would exit a
+    /// daemon for writing its own store.
     #[cfg(unix)]
     opened_store: Option<StoreFileIdentity>,
     /// Bytes per second of disk writes the drain loop paces itself to. See
@@ -520,6 +529,7 @@ impl Daemon {
             ipc_path,
             max_idle: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            preinstalled_signals: Arc::new(std::sync::Mutex::new(None)),
             build_cancel: devmap_query::Cancel::new(),
             // `channel`, not `Sender::new`: the workspace declares tokio 1.38
             // as its floor and this half of the API is older than either, so
@@ -580,6 +590,17 @@ impl Daemon {
             .map(|counters| counters.logical_bytes)
     }
 
+    /// Use stop-signal streams the caller installed earlier, so a SIGTERM or
+    /// SIGINT that arrived during startup (store creation, migration) stops
+    /// the daemon as soon as its loop runs instead of being lost.
+    pub fn with_shutdown_signals(self, signals: ShutdownSignals) -> Self {
+        *self
+            .preinstalled_signals
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(signals);
+        self
+    }
+
     /// Tell the daemon which file its store lives in, so it can notice the file
     /// being deleted or replaced out from under it.
     ///
@@ -594,7 +615,7 @@ impl Daemon {
             self.opened_store = std::fs::metadata(&store_path)
                 .ok()
                 .filter(|metadata| metadata.is_file())
-                .map(|metadata| StoreFileIdentity::of(&metadata));
+                .map(|metadata| StoreFileIdentity::of(&metadata, &store_path));
         }
         self.store_path = Some(store_path);
         self
@@ -805,7 +826,7 @@ impl Daemon {
             Ok(metadata) if metadata.is_file() => {
                 #[cfg(unix)]
                 if let Some(opened) = self.opened_store {
-                    let current = StoreFileIdentity::of(&metadata);
+                    let current = StoreFileIdentity::of(&metadata, path);
                     if opened != current {
                         return Some(format!(
                             "store {path:?} was replaced by a different file \
@@ -1874,7 +1895,15 @@ impl Daemon {
         // failure, which is fatal, happens while there is still no socket on
         // disk to strand. A daemon that cannot install them is a daemon whose
         // socket a `kill` would leave behind.
-        let mut signals = ShutdownSignals::install()?;
+        let preinstalled = self
+            .preinstalled_signals
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        let mut signals = match preinstalled {
+            Some(signals) => signals,
+            None => ShutdownSignals::install()?,
+        };
 
         let store = Arc::clone(&self.store);
         let root = self.root.clone();

@@ -49,6 +49,11 @@ pub(crate) struct Args {
     /// refresh only the block and need no flag.
     #[arg(long, conflicts_with = "remove")]
     pub(crate) adopt_guides: bool,
+    /// Replace a Codex `.codex-plugin/plugin.json` or `hooks/hooks.json` that
+    /// DevMap did not generate. The old file is first saved beside itself as
+    /// `<name>.devcouncil-backup-<id>`. Without it such a file is left alone.
+    #[arg(long, conflicts_with = "remove")]
+    pub(crate) force: bool,
 }
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
@@ -62,6 +67,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         remove,
         only_path,
         adopt_guides,
+        force,
     } = args;
     if *remove {
         return run_remove(
@@ -87,6 +93,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         } else {
             devmap_query::guides::HandWrittenGuides::Preserve
         },
+        *force,
     )
 }
 
@@ -156,6 +163,7 @@ fn run_integrate(
     binary: Option<&Path>,
     servers_stdin: bool,
     hand_written: devmap_query::guides::HandWrittenGuides,
+    force: bool,
 ) -> anyhow::Result<()> {
     // Read and validated before anything is written: a malformed request must
     // not leave DevMap's half applied and the caller's half missing.
@@ -165,10 +173,14 @@ fn run_integrate(
     } else {
         Vec::new()
     };
-    let executable = claude::plugin_command(&std::env::current_exe()?, binary);
+    // Absolute, canonical and outside the repository being configured: a
+    // `devmap` file in that repository must never become the command a host
+    // runs in every session.
+    let executable =
+        claude::reachable_command(&std::env::current_exe()?, binary, Some(project_root))?;
     let db = cli.db();
     let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
-    let report = integrate::integrate(
+    let mut report = integrate::integrate(
         host,
         project_root,
         &executable,
@@ -180,7 +192,22 @@ fn run_integrate(
         dry_run,
         check,
         hand_written,
+        force,
     )?;
+    // The warning `mcp_entry` prints on stderr, kept in the receipt's own
+    // `notes` so a caller reading the JSON sees it too. It covers MCP entries
+    // only. It is keyed on the documents as they stand after this run, not on
+    // `changed`: an entry that was already current still breaks, and a removal
+    // (`retire_beside_plugin`) leaves nothing to break.
+    let names_executable = |outcome: &integrate::McpMergeOutcome, project_scope: bool| {
+        integrate::registered_devmap_command(host, &outcome.path, project_scope)
+            .is_some_and(|command| command_names_executable(&command, &executable))
+    };
+    let registered = report.global_mcp.iter().any(|o| names_executable(o, false))
+        || report.project_mcp.iter().any(|o| names_executable(o, true));
+    if let Some(warning) = claude::mcp_receipt_note(&executable, registered) {
+        report.notes.push(warning);
+    }
     if cli.json {
         emit_json(
             cli,
@@ -217,6 +244,7 @@ fn run_integrate(
                     "note": m.note,
                 })).collect::<Vec<_>>(),
                 "notes": report.notes,
+                "kept_foreign": report.kept.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dry_run": dry_run,
                 "check": check,
                 "check_ok": report.check_ok,
@@ -267,6 +295,21 @@ fn run_integrate(
         anyhow::bail!("integrate --check: assets differ from the expected installation");
     }
     Ok(())
+}
+
+/// True when a registered `command` is `executable`, as written or resolved.
+///
+/// Only an absolute command is resolved: a bare `devmap` is looked up on
+/// `PATH` by the host, never against this process's working directory.
+fn command_names_executable(command: &str, executable: &Path) -> bool {
+    let command = Path::new(command);
+    command == executable
+        || (command.is_absolute()
+            && executable.is_absolute()
+            && matches!(
+                (command.canonicalize(), executable.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            ))
 }
 
 /// Map context for integrate: prefer an on-disk repo map, else an empty shell

@@ -80,6 +80,11 @@ func unverifiableOperand(clause, root string, mt matching) string {
 				continue
 			}
 		}
+		if computedOperand(words[i]) {
+			return fmt.Sprintf("`%s` is handed an operand (`%s`) holding an expansion the gate cannot resolve "+
+				"to a value (a parameter operator, a special parameter, a brace expansion or ANSI-C quoting), so "+
+				"the path it names was not judged and the gate cannot tell a read from a write. Spell the operand out.", name, text)
+		}
 		candidates := []string{text}
 		if strings.HasPrefix(text, "-") {
 			candidates = nil

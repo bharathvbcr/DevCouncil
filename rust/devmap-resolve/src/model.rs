@@ -1,3 +1,4 @@
+use devmap_extract::agent_text::is_agent_unsafe;
 use devmap_extract::model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1073,31 +1074,78 @@ impl ResolutionBudgetGap {
     /// The most bytes the whole sample keeps.
     pub const SAMPLE_BYTES: usize = 1024;
 
-    /// The first [`Self::SAMPLE`] of `names`, in order, each cut to
-    /// [`Self::NAME_BYTES`] on a character boundary with `…` marking the cut,
-    /// stopping before the sample would pass [`Self::SAMPLE_BYTES`]. Fewer
-    /// names than that is reported as such by [`Self::describe`]'s "sample of
-    /// N", so a sample cut short says so.
+    /// The first [`Self::SAMPLE`] of `names`, in order, each cut on a character
+    /// boundary with `…` marking the cut, stopping before the sample would pass
+    /// [`Self::SAMPLE_BYTES`]. Both caps are charged against the *escaped* length
+    /// ([`Self::quote_name`]), the form [`Self::describe`] writes: a name made of
+    /// control characters or `;` grows up to six times when escaped, and a cap
+    /// on the raw text would let the sentence outgrow it. Fewer names than that
+    /// is reported as such by [`Self::describe`]'s "sample of N", so a sample cut
+    /// short says so.
     fn bounded_sample<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
         let mut sample = Vec::new();
         let mut bytes = 0usize;
         for name in names.into_iter().take(Self::SAMPLE) {
-            let quoted = if name.len() > Self::NAME_BYTES {
-                let mut end = Self::NAME_BYTES;
-                while !name.is_char_boundary(end) {
-                    end -= 1;
+            let mut kept = String::new();
+            let mut escaped_len = 0usize;
+            let mut cut = false;
+            for ch in name.chars() {
+                let width = Self::escaped(ch).len();
+                if escaped_len + width > Self::NAME_BYTES {
+                    cut = true;
+                    break;
                 }
-                format!("{}…", &name[..end])
-            } else {
-                name.clone()
-            };
-            if bytes + quoted.len() > Self::SAMPLE_BYTES {
+                escaped_len += width;
+                kept.push(ch);
+            }
+            if cut {
+                kept.push('…');
+            }
+            // The quotes, and the `…` (three bytes) when the name was cut.
+            let charged = escaped_len + 2 + if cut { '…'.len_utf8() } else { 0 };
+            if bytes + charged > Self::SAMPLE_BYTES {
                 break;
             }
-            bytes += quoted.len();
-            sample.push(quoted);
+            bytes += charged;
+            sample.push(kept);
         }
         sample
+    }
+
+    /// One character of a quoted name: `"`, `\`, `;` and every character
+    /// [`devmap_extract::agent_text::is_agent_unsafe`] escapes are written as
+    /// `\u{..}`-style escapes; letters, combining marks and the rest pass
+    /// unchanged.
+    fn escaped(ch: char) -> String {
+        if ch == ';' {
+            "\\u{3b}".to_string()
+        } else if matches!(ch, '"' | '\\') || is_agent_unsafe(ch) {
+            ch.escape_default().to_string()
+        } else {
+            ch.to_string()
+        }
+    }
+
+    /// `name` as one double-quoted token for [`Self::describe`].
+    ///
+    /// A name is whatever the tree declares, and the sentence it lands in is
+    /// joined to the next note by `"; "`, the next note opening with a count
+    /// (`<N> call site(s)`). The guarantee is narrow: **no clause boundary
+    /// (`"; "`) and so no clause start can occur inside a name**, because `;` is
+    /// always escaped, and the quote and backslash are escaped so the token's
+    /// end cannot be forged. Digits and the words `call site(s)` can still
+    /// appear inside the quotes; a consumer must split on `"; "` (or skip quoted
+    /// tokens) before it looks for a count. The set of escaped characters
+    /// beyond those three is the workspace's one agent-visible set,
+    /// [`devmap_extract::agent_text::is_agent_unsafe`].
+    fn quote_name(name: &str) -> String {
+        let mut quoted = String::with_capacity(name.len() + 2);
+        quoted.push('"');
+        for ch in name.chars() {
+            quoted.push_str(&Self::escaped(ch));
+        }
+        quoted.push('"');
+        quoted
     }
 
     /// One sentence that says what was capped and by how much.
@@ -1140,7 +1188,11 @@ impl ResolutionBudgetGap {
             self.sites,
             self.sample_names.len(),
             Self::NAME_BYTES,
-            self.sample_names.join(", "),
+            self.sample_names
+                .iter()
+                .map(|name| Self::quote_name(name))
+                .collect::<Vec<_>>()
+                .join(", "),
             tail
         )
     }
@@ -1253,5 +1305,73 @@ impl ResolutionResult {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod budget_gap_quote_tests {
+    use super::ResolutionBudgetGap;
+    use devmap_extract::agent_text::RTL_LETTER_FIXTURES;
+
+    fn gap(names: Vec<String>) -> ResolutionBudgetGap {
+        ResolutionBudgetGap {
+            limit: "ambiguity evidence bytes".to_string(),
+            names_truncated: names.len(),
+            candidates_dropped: 1,
+            names_skipped: 0,
+            sites: 1,
+            names_total: names.len(),
+            sample_names: names,
+        }
+    }
+
+    #[test]
+    fn letters_and_combining_marks_pass_through_quote_name_unchanged() {
+        let mut names: Vec<&str> = RTL_LETTER_FIXTURES.to_vec();
+        names.push("नमस्ते");
+        for name in names {
+            assert_eq!(
+                ResolutionBudgetGap::quote_name(name),
+                format!("\"{name}\""),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_quote_backslash_semicolon_and_agent_unsafe_characters_are_escaped() {
+        assert_eq!(
+            ResolutionBudgetGap::quote_name("a;b\"c\\d\u{1b}\u{202e}"),
+            "\"a\\u{3b}b\\\"c\\\\d\\u{1b}\\u{202e}\""
+        );
+    }
+
+    /// Names of controls and `;` grow six-fold when escaped; the caps are
+    /// charged against the escaped text, so the sentence still obeys them.
+    #[test]
+    fn the_caps_are_charged_against_the_escaped_length() {
+        for filler in ['\u{1}', ';', '\u{202e}'] {
+            let names: Vec<String> = (0..12)
+                .map(|i| format!("n{i:02}{}", filler.to_string().repeat(300)))
+                .collect();
+            let sample = ResolutionBudgetGap::bounded_sample(names.iter());
+            assert!(!sample.is_empty());
+            let mut total = 0;
+            for name in &sample {
+                let escaped = ResolutionBudgetGap::quote_name(name.trim_end_matches('…'));
+                assert!(
+                    escaped.len() - 2 <= ResolutionBudgetGap::NAME_BYTES,
+                    "{} escaped bytes",
+                    escaped.len() - 2
+                );
+                total += ResolutionBudgetGap::quote_name(name).len();
+            }
+            assert!(
+                total <= ResolutionBudgetGap::SAMPLE_BYTES + 3 * sample.len(),
+                "{total} escaped bytes"
+            );
+            let described = gap(sample).describe();
+            assert!(described.len() < 4096, "{} bytes", described.len());
+        }
     }
 }

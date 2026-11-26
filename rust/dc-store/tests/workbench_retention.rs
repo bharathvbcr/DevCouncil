@@ -4,6 +4,8 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
+mod support;
+
 fn call(s: &Store, method: &str, raw: &str) -> String {
     s.workbench_request(method, raw)
         .unwrap_or_else(|e| panic!("{method}: {e}"))
@@ -23,11 +25,7 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     let clock = Arc::new(AtomicI64::new(1000));
     let c = clock.clone();
     s.set_clock(move || c.load(Ordering::SeqCst));
-    let root = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let root = support::checkout_dir("checkout");
     call(
         &s,
         "repositories.put",

@@ -24,6 +24,7 @@ import (
 // the client to one process per command (`dcstore --db <path> <command> ...`).
 func storeThatCannotRecordRuns(t *testing.T) *store.Client {
 	t.Helper()
+	testsupport.RequireShellFakes(t)
 	real := testsupport.DCStore(t)
 	dir := t.TempDir()
 	wrapper := filepath.Join(dir, "dcstore")
@@ -35,6 +36,7 @@ func storeThatCannotRecordRuns(t *testing.T) *store.Client {
 		t.Fatal(err)
 	}
 	client := store.New(wrapper, filepath.Join(dir, "state.sqlite"))
+	t.Cleanup(client.Close)
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatalf("the wrapper must pass ordinary commands through: %v", err)
 	}

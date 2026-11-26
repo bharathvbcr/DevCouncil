@@ -93,7 +93,7 @@ fn checklist(input: &Input<'_>) -> Result<Option<String>> {
             raw: &entry,
         };
         item.fields(&["text", "done"])?;
-        item.required_text("text", MAX_CHECKLIST_TEXT)?;
+        item.header_required_text("text", MAX_CHECKLIST_TEXT)?;
         if !matches!(item.kind("done")?.as_deref(), Some("true" | "false")) {
             return Err(Error::invalid("each checklist entry needs a boolean done"));
         }

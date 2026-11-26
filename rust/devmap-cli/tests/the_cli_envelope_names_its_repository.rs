@@ -310,11 +310,13 @@ fn whole_store_read_commands_name_their_repository_like_their_mcp_tools() {
 /// and MCP must report the same strings (JSON-escaped, not mangled).
 #[test]
 fn hostile_root_names_are_reported_exactly_as_the_mcp_envelope_reports_them() {
-    for dir in [
-        "a b c",
-        "q\"uote",
-        "r\u{e9}p\u{f6}-\u{65e5}\u{672c}-\u{1f600}",
-    ] {
+    // A double quote cannot appear in a Windows directory name (os error 123),
+    // so that spelling runs on the Unix runners only.
+    let mut dirs = vec!["a b c", "r\u{e9}p\u{f6}-\u{65e5}\u{672c}-\u{1f600}"];
+    if cfg!(unix) {
+        dirs.push("q\"uote");
+    }
+    for dir in dirs {
         let root = named_corpus(dir);
         let from_cli = cli(&root, &["--json", "search", "helper"]);
         let from_mcp = mcp(&root, "devmap_search", json!({"query": "helper"}));

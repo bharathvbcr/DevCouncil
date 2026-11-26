@@ -21,6 +21,34 @@ Use the resolved map for navigation, then inspect actual source. Check query
 freshness, coverage gaps, confidence and truncation. An affected-test list
 suggests tests to run; it does not record a test result.
 
+## Testing Go packages that link Gusset from a linked worktree
+
+`cmd/devcouncil` and `gussetfn` link a sibling Gusset checkout and
+`libgusset.a`; from `.gitpulse/worktrees/<lane>` the `go.mod` replace
+(`../../../gusset`) and the archive path do not resolve ("[setup failed]").
+Run those tests through the lane wrapper, which writes a `go.work` in the
+worktree's private git dir (nothing in the tree changes) and points the linker
+at the main checkout's archive. In the main checkout it is a no-op.
+
+```bash
+node scripts/lane-env.mjs -- go -C backend/go_orchestrator test ./cmd/devcouncil/... -count=1
+node scripts/lane-env.mjs --help
+```
+
+It links an archive only when its input stamp (written beside it by
+`ci:local`'s "gusset engine" step and `rust/gusset-engine/cgo-env.sh`) equals
+the lane's engine inputs exactly: the lane's own archive first, then main's.
+An unstamped, stale or dirty-built archive, or uncommitted engine inputs in the
+lane, fail closed and name the build command; commit engine changes, then
+rebuild. A `CGO_LDFLAGS` `-L` to another `libgusset.a` is refused. For a lane
+editing the engine, `--engine-dir <dir>` links `<dir>/libgusset.a` unchecked,
+with a warning. A lane cannot build its own archive unless a gusset checkout is
+reachable at `../../../gusset` from the lane (the engine's Cargo path
+dependency), so in practice a lane uses main's stamped archive or
+`--engine-dir`. The sibling gusset must be at the setup-gusset pin. The two
+linker "search path ... not found" warnings are harmless. Do not hand-roll a
+`-modfile`.
+
 ## Connect the chosen host
 
 Preview and apply standalone code-navigation integration:

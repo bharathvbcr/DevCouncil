@@ -13,7 +13,6 @@
  * Without a flag the output and exit codes are what they always were.
  */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -23,14 +22,15 @@ import {
   devmapAvailable,
   expectedRowLabels,
   goModToolchain,
-  gussetPin,
-  gussetPinVerdict,
+  engineCflags,
+  gussetPinCheck,
   localTagState,
   nestedGateProblem,
   parseArgs,
   runSteps,
   tagVerdict,
 } from "./ci-local-checks.mjs";
+import { stampedBuild } from "./gusset-engine-stamp.mjs";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
@@ -127,10 +127,7 @@ function execChecked(ctx, command, args, opts) {
  * @param {string} sibling
  */
 function requireGussetAtPin(sibling) {
-  const actionPath = path.join(REPO_ROOT, ".github", "actions", "setup-gusset", "action.yml");
-  const pin = existsSync(actionPath) ? gussetPin(readFileSync(actionPath, "utf8")) : undefined;
-  const head = spawnSync("git", ["-C", sibling, "rev-parse", "HEAD"], { encoding: "utf8", shell: false });
-  const verdict = gussetPinVerdict(pin, head.status === 0 ? head.stdout.trim() : "");
+  const verdict = gussetPinCheck(REPO_ROOT, sibling);
   if (!verdict.ok) {
     throw fail(1, verdict.message);
   }
@@ -154,37 +151,35 @@ function ensureGussetEngine(ctx) {
     throw fail(
       2,
       `Go replace expects a Gusset checkout at ${path.dirname(siblingMod)}. ` +
-        "CI checks out https://github.com/bharathvbcr/gusset in .github/actions/setup-gusset.",
+        "CI checks out https://github.com/bharathvbcr/gusset in .github/actions/setup-gusset. " +
+        "From a linked worktree (.gitpulse/worktrees/<lane>) run the gate through " +
+        "`node scripts/lane-env.mjs -- <command>` (see its --help) instead.",
       { cannotRun: true },
     );
   }
   requireGussetAtPin(path.dirname(siblingMod));
-  exec(ctx, "cargo", [
-    "build",
-    "--release",
-    "--locked",
-    "--manifest-path",
-    "rust/gusset-engine/Cargo.toml",
-    // Where gussetfn's #cgo -L and the hash below look, whatever
-    // CARGO_TARGET_DIR says.
-    "--target-dir",
-    "rust/gusset-engine/target",
-  ]);
   const archive = path.join(REPO_ROOT, "rust", "gusset-engine", "target", "release", "libgusset.a");
+  // The previous stamp goes before the build and a new one is written only if the
+  // inputs did not change under it: lane-env reuses an archive only on a matching
+  // stamp. A stamp problem warns; it never changes this step's verdict.
+  stampedBuild(REPO_ROOT, path.dirname(siblingMod), path.dirname(archive), () => {
+    exec(ctx, "cargo", [
+      "build",
+      "--release",
+      "--locked",
+      "--manifest-path",
+      "rust/gusset-engine/Cargo.toml",
+      // Where gussetfn's #cgo -L and the hash below look, whatever
+      // CARGO_TARGET_DIR says.
+      "--target-dir",
+      "rust/gusset-engine/target",
+    ]);
+  });
   if (!existsSync(archive)) {
     throw fail(1, `${archive} is missing after cargo build`);
   }
-  // Key Go's caches on the archive, as rust/gusset-engine/cgo-env.sh does:
-  // Go hashes cgo flags, not the libraries they link, so a rebuilt archive
-  // is otherwise not relinked and a cached "ok" is replayed against the old one.
-  const sum = createHash("sha256").update(readFileSync(archive)).digest("hex").slice(0, 32);
-  // `go env` reports the process env, a `go env -w` setting, or Go's default.
-  const goEnv = spawnSync("go", ["env", "CGO_CFLAGS"], { env: ctx.env, encoding: "utf8", shell: false });
-  const current = goEnv.status === 0 ? goEnv.stdout.trim() : (ctx.env.CGO_CFLAGS || "-O2 -g");
-  const base = current
-    .replace(/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=\S*/g, "")
-    .trim();
-  return { env: { CGO_CFLAGS: `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}` } };
+  // Go hashes cgo flags, not the libraries they link: key the caches on the archive.
+  return { env: { CGO_CFLAGS: engineCflags(archive, ctx.env) } };
 }
 
 /**

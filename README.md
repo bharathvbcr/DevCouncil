@@ -2,259 +2,134 @@
   <img src="docs/assets/logo.png" alt="DevCouncil Logo" width="128" height="128" />
 </p>
 
-# DevCouncil
+# DevMap, by DevCouncil
 
-Code intelligence and verification components for AI development.
+**Tell your coding agent what an edit will break before it makes it.**
+
+DevMap is a local, symbol-level code graph for Claude Code, Cursor, Codex and
+other agents. It answers "who calls this?", "what does this change reach?",
+"which tests should I run?" and "what is dead?" in under a second, from the
+command line or over MCP. No model key, no account, no cloud: the index lives
+in a `.devmap/` directory in your repository (add it to `.gitignore`).
 
 [![Website](https://img.shields.io/badge/website-devcouncil.vbcr.dev-10B981?style=flat&logo=safari&logoColor=white)](https://devcouncil.vbcr.dev/)
 [![CI](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/bharathvbcr/DevCouncil)](https://github.com/bharathvbcr/DevCouncil/releases)
 [![npm version](https://img.shields.io/npm/v/devcouncil)](https://www.npmjs.com/package/devcouncil)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 
-<p align="center">
-  <a href="https://devcouncil.vbcr.dev/"><strong>Explore the Interactive Architecture &amp; Code Graph Showcase (devcouncil.vbcr.dev) &rarr;</strong></a>
-</p>
+![DevMap interactive dependency map and symbol graph](docs/assets/DevMap.png)
 
-> **"DevCouncil should not merely generate code. It should make AI-generated work prove that it satisfied the original intent."**  
-> *Evidence, not model confidence, is the final authority.*
+## Install
 
-DevCouncil is **components and modules** for AI-assisted software development. It ships independently installable binaries and libraries — code intelligence (`devc-map` / `dc-map` / `devmap`), task and lease state (`devc-store` / `dc-store` / `dcstore`), deterministic verification (`devc-verify` / `dc-verify` / `dcverify`), ignore-aware search (`devc-grep` / `dc-grep` / `dcgrep`), and a Go host (`devc` / `devcouncil` / `dev`) — so a harness or an app can take only the pieces it needs and update them one at a time.
-
-See [repository input and verification boundaries](docs/SECURITY_BOUNDARIES.md)
-for executable selection, filesystem protections, resource limits, and the
-difference between unavailable evidence and a passing check.
-
-**Manvi wraps these components** into a coding-agent harness (turn loop, providers, policy, TUI, `manvi serve`). **GitPulse** uses Manvi for policy, workbench, and agent hosting, and DevCouncil components for code intelligence and related analysis. DevCouncil does not replace coding agents; it sits beside Claude Code, Codex, Cursor, and others as selectable modules.
-
-![DevMap interactive dependency map and symbol graph in GitPulse](docs/assets/DevMap.png)
-
----
-
-## Architecture & Components
-
-DevCouncil's core runtime is a set of standalone, compiled native modules. Each binary is useful on its own, sits on `PATH`, and can be spawned or linked by a host that wants that one job:
-
-| Binary / Crate | Language | Role & Ownership |
-|--------|----------|------------------|
-| `devc` (`devcouncil` / `dev`) | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), 7-layer specification lifecycle (`spec`), declarative DAG workflows (`workflow`), unified code search (`search`), task verification (`verify`), and devmap forwarding (`map`, `devmap`, `graph`, `ast`). |
-| `devc-map` (`dc-map` / `devmap`) | **Rust** | Unified code intelligence & graph engine: Language-aware tree-sitter extraction (schema 100) plus Lean 4 reader (`devmap lean-tcb`), 11-tier symbol resolution ladder, Blake3 content-addressed AST store with per-worktree delta overlays, zero-copy `mmap` Compressed Sparse Row (CSR) graph storage (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`, `FastBitSet`, `sqlite_v30`), blast-radius calculation, dead-code analysis, doc-drift auditing, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`, 21 read-only tools). |
-| `devc-store` (`dc-store` / `dcstore`) | **Rust** | State & lease store: SQLite-backed task repository (`dc-store` schema 11), workbench tasks & cross-repo queue/sync/outbox (`workbench_schema` 17), ratified constitution gates (`constitution_gates`), mutual-exclusion leases (`ux_task_leases_active`) for concurrent agent building, evidence records, and gap tracking. |
-| `devc-verify` (`dc-verify` / `dcverify`, `dcjsoncheck`) | **Rust** | Deterministic verification & evidence checking: Unified-diff parsing, planned file scope classification, anti-laziness/stub/test-rigor AST gates, `runner_hijack` and `lean_tcb` hard-safety checks, independent acceptance verification (`dc-evidence` via `dcverify evidence-check`), diff–coverage evaluation, and typed `next_actions` repair signals. |
-| `devc-grep` (`dc-grep` / `dcgrep`) | **Rust** | Code search: Ripgrep-powered ignore-aware search engine (`search`, `files`, `index`, BM25/learned `rank`, `health`) with optional trigram indexing (`tgrep-core`). |
-| `devc-redact` (`dc-redact-cli` / `dcredact`) | **Rust** | Credential redaction over the `dcgrep` JSON-on-stdio contract (`redact`, `health`): `redact_secrets` from the dependency-free `dc-redact` crate, with an explicit `redaction_ran` field and bounded, fail-closed requests. |
-| `dc-proc` & `dc-redact` | **Rust** | Shared subprocess isolation (`cli` JSON-stdio contract helpers, `lean_kernel` runner, hard deadlines, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation, `spawn_session` 4 KiB stderr tail) and vendor/OAuth secret redaction (`dc-redact`). |
-
-```mermaid
-flowchart TD
-    subgraph Consumers["AI Agents & Host Harnesses"]
-        Agent["Coding Agents (Cursor / Claude / Codex / Antigravity / Warp)"]
-        Manvi["Manvi (Agent Loop & Policy Harness)"]
-        GitPulse["GitPulse (Workbench & Git Host)"]
-    end
-
-    subgraph Orchestration["Go Host Layer"]
-        DevCouncil["devcouncil / dev (Go Host CLI & Stdio MCP)"]
-    end
-
-    subgraph NativeModules["Native Rust Engines"]
-        DevMap["devmap (Code Intelligence & AST Graph)"]
-        DCStore["dcstore (Task & Lease SQLite Store)"]
-        DCVerify["dcverify (Rigor, Stubs & Diff Verification)"]
-        DCGrep["dcgrep (Ignore-Aware Ripgrep Engine)"]
-    end
-
-    subgraph Storage["Persistent State"]
-        GraphDB[(".devmap/codeintel/devmap.sqlite (Code Graph)")]
-        TaskDB[(".devcouncil/state.sqlite (Tasks & Leases)")]
-    end
-
-    Agent -->|"Code Navigation MCP (21 tools)"| DevMap
-    Agent -->|"Task & Policy MCP"| DevCouncil
-    Manvi -->|"Stdio JSON IPC"| DevCouncil
-    Manvi -->|"Stdio JSON IPC"| DevMap
-    GitPulse -->|"In-process / CLI"| DevMap
-    GitPulse -->|"Workbench state"| DCStore
-
-    DevCouncil -->|"Forward map/graph/ast"| DevMap
-    DevCouncil -->|"Task lease coordination"| DCStore
-    DevCouncil -->|"Rigor gate execution"| DCVerify
-
-    DevMap --> GraphDB
-    DCStore --> TaskDB
-```
-
-### How hosts consume the modules
-
-- **Manvi** wraps the components: it drives the agent loop, provider routing, policy ladder, and TUI, and reaches each binary over JSON on stdio. A host that wants a harness embeds Manvi rather than reimplementing it.
-- **GitPulse** uses both for their respective jobs: Manvi (`manvi serve`) for policy, workbench, and agent hosting; selected DevCouncil crates and the `devmap` CLI for in-process code intelligence. It does not have to take every module.
-- **Other apps** pick the same way — `devmap` alone, `dcverify` alone, the Go host MCP, or the full set. Updating one module does not require shipping the rest.
-
-> [!NOTE]
-> DevCouncil is built entirely as native compiled Go and Rust binaries; legacy Python orchestration has been retired (see [docs/PHASE7_LONG_TAIL.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/PHASE7_LONG_TAIL.md)).
-
----
-
-## Benchmarks: DevMap vs Graphify, Gortex, GitNexus, CodeGraph, and codebase-memory-mcp
-
-Six code-graph tools plus a ripgrep text baseline, measured on **four
-repositories** (595 to 4,335 files, mixing Rust, Go, TypeScript, Python and
-Swift) on one Apple M5 Pro. Every timing is a minimum or median from a
-reproducible run with the raw evidence committed beside it — not a marketing
-estimate. Head-to-head breakdown:
-**[DevMap vs GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp](docs/devmap/comparison.md)**.
-Full method, caveats, and raw output:
-**[benchmark report](benchmarks/results/competition/20260914-v0.2.2/REPORT.md)**.
-
-**DevMap 0.2.2 was fastest on most of what was measured:** cold indexing and
-unchanged refresh on **all four repositories** against the four tools timed as
-standalone CLIs (CodeGraph, codebase-memory-mcp, GitNexus, Graphify; Gortex is a
-resident daemon and is not comparable on those two stages), the lowest median in
-**all six symbol-query cells**, and **5/5** source-inspected caller pairs —
-matched only by codebase-memory-mcp. It did not win the one-file-changed
-refresh: CodeGraph did, on all four.
-
-Detailed table on the 1,098-file DevCouncil corpus, where the correctness and
-query campaign also ran:
-
-| Tool | Cold index | Unchanged refresh | Single-file edit | Definition lookup | Peak RSS | Caller pairs found |
-|---|---:|---:|---:|---:|---:|---:|
-| **DevMap 0.2.2** | **2.012 s** | **0.089 s** | 0.816 s | **9.7 ms** | **678 MiB** | **5/5** |
-| CodeGraph 1.6.0 | 3.294 s | 0.235 s | **0.512 s** | 101–106 ms | 2430 MiB | 3/5 |
-| codebase-memory-mcp 0.10.8 | 9.357 s | 5.726 s | 8.894 s | ~3.94 s | — | **5/5** |
-| Graphify 0.9.59 | 14.989 s | 5.080 s | 4.883 s | 557–572 ms | 3417 MiB | 3/5 |
-| GitNexus 1.6.9 | 33.689 s | 0.699 s | 31.841 s | 792–808 ms | 3355 MiB | 3/5 |
-| Gortex 0.64.3 | 16.5 s to query-ready | — | — | 92–104 ms | — | 4/5 |
-
-**Where DevMap won.** Fastest cold index on all four corpora (**1.6–21×** the
-time of the four CLI tools) and fastest unchanged refresh on all four
-(**2.2–107×**).
-Lowest median in all six query cells — definition lookups at 9.7 ms, **~10×
-faster than CodeGraph** and **~82× faster than GitNexus**. Lowest sampled peak
-memory on three of four corpora. All five source-inspected caller pairs, and a
-clean result on both index-staleness probes.
-
-**Where DevMap lost.** CodeGraph re-indexes a single edited file faster **on
-every corpus** — DevMap takes 1.08× its time on the smallest and **3.61×** on
-GitPulse. That is the one stage where a competitor is consistently ahead.
-DevMap's store is 1.6–2.0× CodeGraph's and 2.8–4.7× Graphify's, and Graphify
-used **less memory than DevMap on the largest repository** (1,458 MB vs
-1,725 MB). Against v0.2.1, unchanged refresh regressed ~12% on the smallest
-corpus.
-
-**What these numbers are not.** Four repositories, one machine, three-to-five
-repetitions, three symbols, and five inspected caller pairs. They do not
-establish general graph accuracy, persistent-MCP latency, or coding-agent task
-success. Tool output scopes differ, so equal latency is not equal analysis.
-DevMap itself reports 106,217 unexplained call-attribution sites on this corpus.
-The report states every limit explicitly and keeps the failures in — including
-GitNexus serving a deleted symbol through two ordinary refreshes until a forced
-rebuild.
-
----
-
-## Get started
-
-Build just DevMap from source, then map a project:
+macOS and Linux:
 
 ```bash
-git clone https://github.com/bharathvbcr/DevCouncil.git
-cd DevCouncil
-bash scripts/install.sh --only=devmap
-export PATH="$HOME/.local/bin:$PATH"
-
-cd /path/to/your/project
-devmap build --manifest --guides
-devmap paths --json
-devmap status --json
-devmap explore MyFunction --json
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.sh | sh
 ```
 
-Git, Rust/Cargo and Go are required: `scripts/install.sh` builds the Go host
-into a temporary directory and runs `devcouncil install` with your arguments,
-and that command is the installer (`--help` lists presets and flags). Omit
-`--only=devmap` for the Go host and full analysis suite. The host needs the
-toolchain declared in [`go.mod`](backend/go_orchestrator/go.mod), currently Go
-1.27.4, and a sibling checkout of [Gusset](https://github.com/bharathvbcr/gusset)
-at `../gusset`, at the revision pinned in
-[`.github/actions/setup-gusset/action.yml`](.github/actions/setup-gusset/action.yml)
-(`npm run ci:local` and `rust/verify.sh` fail on any other revision). Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag vX.Y.Z --locked devmap-cli`, with `vX.Y.Z` a [release tag](https://github.com/bharathvbcr/DevCouncil/releases) (the default branch is whatever was merged last),
-installs DevMap alone. The host installs only from a checkout: run from outside one, `devcouncil install` (which includes the host by default) exits 2 and names `git clone https://github.com/bharathvbcr/DevCouncil.git` plus `devcouncil install --src <dir>`; there is no `go install` route, and the npm package is a launcher for a host you built, not a source of one. On Windows use `.\scripts\install.ps1 -Components devmap`,
-or omit `-Components` for the suite.
+Windows (PowerShell):
 
-After a checkout install, the installer asks the apps that read DevCouncil's
-schemas (GitPulse, Manvi, Jarvis) whether they carry this checkout's numbers.
-It does this by running GitPulse's `scripts/check-schema-parity.mjs` with node,
-from `--gitpulse DIR`, `$DEVCOUNCIL_GITPULSE_ROOT` or a sibling `../GitPulse`.
-Each stale or unverifiable reader is printed under `FOLLOW-UP` with its
-remedy, and the install still succeeds. Pass `--strict-consumers` to fail it
-instead, including when the check could not run. Without GitPulse or node, the
-report says `schema consumers: NOT CHECKED` and why.
-The npm package is a lightweight launcher for native binaries, not a bundled
-runtime. [Complete installation guide](docs/quickstart.md).
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.ps1 | iex"
+```
 
-Use the paths returned by `devmap paths`: new repositories default to `.devmap`,
-existing `.devcouncil` layouts remain supported, and explicit configuration can
-override either. `--guides` requests managed workspace guides separately from
-the map export. Check freshness, coverage gaps and result truncation before
-using graph answers as evidence. If first-time guide creation leaves status
-stale, run `devmap build --manifest` once more to index the new guides.
+The installers put one self-contained `devmap` binary in `~/.local/bin`. You
+can also download the archive for your platform (macOS arm64 and x86_64,
+Linux x86_64, Windows x64) from
+[Releases](https://github.com/bharathvbcr/DevCouncil/releases) and check it
+against its `.sha256`. To build from source instead, see the
+[quickstart](docs/quickstart.md).
 
-## Connect an agent
+## Sixty seconds with DevMap
 
 ```bash
-devmap integrate cursor --dry-run
-devmap integrate cursor
-devmap integrate cursor --check
+cd your-project
+devmap build --manifest          # index the repository
+devmap search config             # find real symbol names to ask about
+devmap explore parse_config      # definition, source, callers, callees
+devmap impact parse_config       # everything that reaches it, transitively
+devmap affected parse_config     # test files reached through its callers
+devmap dead                      # dead-code candidates, each with a confidence
 ```
 
-Substitute `claude`, `codex`, `antigravity`, `opencode` or `warp` for `cursor`.
-Integration can update user-level MCP settings as well as project assets.
-Inspect the receipt and complete host reload/trust steps. For task tooling,
-add the Go-host integration described in
-[coding CLI integration](docs/coding-cli-integration.md).
-
-## Verification is opt-in
-
-For an existing task in an initialized `.devcouncil/state.sqlite`:
+Replace `parse_config` with a name `search` printed. Then give your agent the
+same answers:
 
 ```bash
-devcouncil verify TASK-001 --mode enforce --json
+devmap integrate claude --dry-run   # list the repo files and global MCP entries it would write
+devmap integrate claude             # or cursor, codex, antigravity, opencode, warp
 ```
 
-```mermaid
-flowchart LR
-    A["Acquire Task Lease<br/>(devcouncil_checkout_task)"] --> B["Implement Changes<br/>(Within Planned Scope)"]
-    B --> C["Verify Task<br/>(devcouncil verify / dcverify)"]
-    C --> D{"Rigor Gates<br/>& Scope Clean?"}
-    D -->|"Gaps Found"| E["Self-Repair<br/>(Typed next_actions)"]
-    E --> B
-    D -->|"All Gates Passed"| F["Release Task Lease<br/>(devcouncil_release_task)"]
-```
+## What your agent can ask
 
-Read gate mode, skipped reasons and coverage metadata. The Go host invokes
-`dcverify` for rigor checks; changed-line coverage requires a profile supplied
-through `--coverage PATH`. The default gate mode is `off`. Task leases and MCP
-policy results coordinate participating clients; retired lifecycle hooks do
-not intercept arbitrary shell commands or editor writes. The sandbox selector
-does not implement Docker/Nix isolation. See the
-[task loop contract](docs/hero-loop.md).
+| Question | Command | MCP tool |
+|---|---|---|
+| Where is this defined, and what surrounds it? | `devmap explore NAME` | `devmap_explore` |
+| What breaks if I change it? | `devmap impact NAME` | `devmap_impact` |
+| What would this unsaved edit break? | `devmap preview --file F --content -` | `devmap_preview` |
+| Which tests should I run? | `devmap affected NAME` | `devmap_affected_tests` |
+| What did my last commits reach? | `devmap blast --since REV` | `devmap_blast` |
+| Which commit could have caused this bug? | `devmap suspects SYMPTOM --since REV` | `devmap_suspects` |
+| Where is the code for a behaviour I can't name? | `devmap ask "QUESTION"` | `devmap_ask_evidence` |
+| What can I safely delete? | `devmap dead` | `devmap_dead_symbols` |
+
+Every answer says what it left out. `truncated`, `walk_incomplete` and
+per-row `confidence` separate "nothing calls this" from "the index could not
+tell". Treat dead-code rows as candidates to check, not a delete list.
+
+## Why DevMap
+
+- **It answers before the edit.** `preview` diffs an unsaved buffer against the
+  index and names the calls a removal would break. `affected` picks the tests
+  to run.
+- **It is fast.** In our benchmark across four repositories (595 to 4,335
+  files), DevMap 0.2.2 had the fastest cold index and unchanged refresh of the five
+  standalone tools timed, and the lowest median on every symbol query.
+  CodeGraph re-indexed a single edited file faster on every corpus. Method,
+  raw output and every loss:
+  [DevMap vs GitNexus, CodeGraph, Graphify, Gortex and codebase-memory-mcp](docs/devmap/comparison.md).
+- **It stays local.** One native binary and a SQLite store per repository. No
+  account, no API key, no model in the loop.
+
+## The rest of DevCouncil
+
+DevMap is the engine most people want. DevCouncil is the full set of modules it
+belongs to. Each one is a separate binary you can install, run and update on
+its own:
+
+| Module | What it does | Install |
+|---|---|---|
+| `devmap` | Code graph: callers, impact, affected tests, dead code, MCP server | Prebuilt (above) |
+| `devcouncil` (`dev`) | Go host: task MCP server, task leases, agent integration, specs and DAG workflows, `verify` orchestration, unified `search` | From source |
+| `dcstore` | SQLite task and workbench store: tasks, leases, evidence records, gaps | From source |
+| `dcverify` | Deterministic checks on an agent's diff: planned scope, stubs, test rigor, changed-line coverage | From source |
+| `dcgrep` | Ignore-aware text search with optional trigram index and BM25 ranking | From source |
+| `dcredact` | Credential redaction over a JSON-on-stdio contract, failing closed | From source |
+
+`bash scripts/install.sh` from a clone builds and installs the whole set; the
+[quickstart](docs/quickstart.md) covers presets and Windows. How the modules fit
+together, and which apps (Manvi, GitPulse) consume which, is in the
+[architecture](docs/architecture.md). The task loop that ties the host, store and
+verifier together is in the [task workflow](docs/workflow.md) and the
+[MCP loop](docs/hero-loop.md). [GitPulse](https://gitpulse.vbcr.dev/),
+a desktop command centre for parallel coding agents, uses DevMap for its
+collision radar.
 
 ## Documentation
 
-Start at the **[documentation index](docs/README.md)**.
-
 | Topic | Guide |
 |---|---|
-| Installation and first query | [Quickstart](docs/quickstart.md) |
-| Components and state ownership | [Architecture](docs/architecture.md) |
+| Install, build from source, first query | [Quickstart](docs/quickstart.md) |
+| Editor and agent setup | [Integration](docs/coding-cli-integration.md) |
 | Symbols, impact and evidence limits | [Code graph](docs/code-graph.md) |
-| Editor setup and hooks | [Integration](docs/coding-cli-integration.md) |
 | Commands and flags | [CLI reference](docs/cli-reference.md) |
-| Task workflow | [Workflow](docs/workflow.md) and [MCP loop](docs/hero-loop.md) |
-| Implementation and migration limits | [Project status](docs/project-status.md) |
-| Native development | [Rust workspace](rust/README.md) |
+| Components and state ownership | [Architecture](docs/architecture.md) |
+| Task workflow and verification | [Workflow](docs/workflow.md) and [MCP loop](docs/hero-loop.md) |
+| Security boundaries | [Repository input and verification boundaries](docs/SECURITY_BOUNDARIES.md) |
+| Everything else | [Documentation index](docs/README.md) |
 
-## License & Acknowledgements
+## License
 
 Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option. See [LICENSE](LICENSE), [NOTICE](NOTICE), and [CONTRIBUTING.md](CONTRIBUTING.md). The Python CLI, its release lineage and its historical
 workflow certifications are retired; current native source and installed

@@ -75,7 +75,9 @@ func TestGitSiblingWorktreeAllowedAndJudgedAgainstSibling(t *testing.T) {
 	allowed := []string{
 		"git -C ../wt-b status",
 		"git -C../wt-b diff --stat",
-		fmt.Sprintf("git -C %s log -n 5", wtB),
+		// Slashes, as in every other line here: a command line is read the way
+		// a shell reads it, where a backslash is an escape, not a separator.
+		fmt.Sprintf("git -C %s log -n 5", filepath.ToSlash(wtB)),
 		"git -c color.ui=false -C ../wt-b status --short",
 		"git -C . status",
 		"git -C ../wt-b diff -- README.md",

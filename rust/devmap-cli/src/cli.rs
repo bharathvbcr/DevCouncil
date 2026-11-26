@@ -142,7 +142,8 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, global = true, default_value_t = ProgressMode::Auto)]
     pub(crate) progress: ProgressMode,
 
-    /// Include build phase timings, reclaim details and resolution breakdowns.
+    /// Include build phase timings, reclaim details and resolution breakdowns,
+    /// and print the full walk_incomplete detail instead of its one-line form.
     #[arg(long, short, global = true)]
     pub(crate) verbose: bool,
 
@@ -1046,6 +1047,38 @@ impl Commands {
     /// installs is the right one. Everything else is a one-shot command.
     pub(crate) fn serves(&self) -> bool {
         matches!(self, Commands::Serve(_) | Commands::Mcp(_))
+    }
+
+    /// The command tag of the MCP tool this command is the twin of, for the
+    /// commands an agent uses to *ask the index*. `None` for everything a hook
+    /// or host runs on its own behalf (status, paths, hook, build, doctor,
+    /// serve, mcp, gap-record, session-report, integrate, ...): those must
+    /// never stand in for the agent having queried, so they are not listed by
+    /// default. Adding a query command means adding it here.
+    pub(crate) fn query_tag(&self) -> Option<&'static str> {
+        Some(match self {
+            Commands::Search(_) => "search",
+            Commands::Ask(args) if args.evidence => "ask_evidence",
+            Commands::Ask(_) => "ask",
+            Commands::Deps(_) => "deps",
+            Commands::Impact(_) => "impact",
+            Commands::Neighbors(_) => "neighbors",
+            Commands::Trace(_) => "trace",
+            Commands::Dead(_) => "dead",
+            Commands::Skeleton(_) => "skeleton",
+            Commands::Suspects(_) => "suspects",
+            Commands::Blast(_) => "blast",
+            Commands::Explore(_) => "explore",
+            Commands::Literals(_) => "literals",
+            Commands::DocDrift(_) => "doc_drift",
+            Commands::Affected(_) => "affected",
+            Commands::Preview(_) => "preview",
+            Commands::Clones(_) => "clones",
+            Commands::Cypher(_) => "cypher",
+            Commands::Routes(_) => "routes",
+            Commands::ApiImpact(_) => "api_impact",
+            _ => return None,
+        })
     }
 }
 

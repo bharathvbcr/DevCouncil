@@ -79,10 +79,13 @@ fn a_seat_profile_with_the_mcp_server_and_no_hooks_is_warned_about() {
     let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
     let text = warning(&payload).expect("the seat profile has the server and no hooks");
     assert!(text.contains(profile.to_str().unwrap()), "{text}");
+    // `to_string()` is JSON text, where a Windows path's backslashes are
+    // escaped; compare in that spelling (a no-op on Unix paths).
+    let registered = serde_json::to_string(profile.join(".claude.json").to_str().unwrap()).unwrap();
     assert!(
         payload["mcp_registrations"]
             .to_string()
-            .contains(profile.join(".claude.json").to_str().unwrap()),
+            .contains(registered.trim_matches('"')),
         "the registration listed is the profile's own: {}",
         payload["mcp_registrations"]
     );
@@ -100,8 +103,8 @@ fn hooks_in_any_scope_the_profile_loads_clear_the_warning() {
         register_mcp(&profile.join(".claude.json"));
         let target = match place {
             "profile" => profile.join("settings.json"),
-            "project" => cwd.join(".claude/settings.json"),
-            _ => cwd.join(".claude/settings.local.json"),
+            "project" => cwd.join(".claude").join("settings.json"),
+            _ => cwd.join(".claude").join("settings.local.json"),
         };
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, hooks).unwrap();
@@ -269,8 +272,8 @@ fn an_install_whose_matcher_lacks_bash_is_outdated_not_broken() {
         let profile = home.join("profile");
         let target = match place {
             "profile" => profile.join("settings.json"),
-            "project" => cwd.join(".claude/settings.json"),
-            _ => cwd.join(".claude/settings.local.json"),
+            "project" => cwd.join(".claude").join("settings.json"),
+            _ => cwd.join(".claude").join("settings.local.json"),
         };
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, LEGACY_HOOKS).unwrap();

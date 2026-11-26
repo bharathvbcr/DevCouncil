@@ -97,12 +97,29 @@ fn page_size(bytes: &[u8]) -> usize {
     }
 }
 
+/// Damage `len` bytes at `from` in place, the way a bad sector or a stray
+/// writer damages a store: same file, same length, same modification time.
+///
+/// The time is put back because it is part of the slot's file identity off
+/// Unix (`StoreFileIdentity`: file id, length and mtime there, device and inode
+/// on Unix). With the write's new mtime the slot saw another file on Windows and
+/// reopened it afresh, so these tests never reached the cached-handle paths
+/// they exist for. It is set through the writing handle, which stops NTFS from
+/// stamping the write's own time when the handle closes.
 fn overwrite(db: &Path, from: usize, len: usize) {
     use std::io::{Seek, SeekFrom, Write};
     let mut file = std::fs::OpenOptions::new().write(true).open(db).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
     file.seek(SeekFrom::Start(from as u64)).unwrap();
     file.write_all(&vec![0xFF; len]).unwrap();
     file.sync_all().unwrap();
+    file.set_modified(modified).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(
+        std::fs::metadata(db).unwrap().modified().unwrap(),
+        modified,
+        "damage in place must keep the file's identity"
+    );
 }
 
 /// Overwrite every page after the first with 0xFF, in place. Returns the
@@ -219,6 +236,8 @@ async fn a_damaged_store_file_is_reported_by_name_with_the_next_step_and_not_cac
         json!(false),
         "a repaired file is answered from, not refused from a cached failure: {healed}"
     );
+    // Windows cannot delete a store file while a connection holds it open.
+    drop(slot);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -273,6 +292,8 @@ async fn damage_met_only_in_the_full_text_index_refuses_search_and_nothing_else(
     restore_in_place(&db, &original);
     let healed = call(&slot, "devmap_search", json!({"query": "helper"})).await;
     assert_eq!(healed["result"]["isError"], json!(false), "{healed}");
+    // Windows cannot delete a store file while a connection holds it open.
+    drop((slot, cached));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -317,6 +338,8 @@ async fn a_store_first_opened_with_a_damaged_full_text_index_answers_everything_
     restore_in_place(&db, &original);
     let healed = call(&slot, "devmap_search", json!({"query": "helper"})).await;
     assert_eq!(healed["result"]["isError"], json!(false), "{healed}");
+    // Windows cannot delete a store file while a connection holds it open.
+    drop((slot, held));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -349,6 +372,8 @@ async fn damage_in_the_literal_sites_is_file_damage_and_not_index_damage() {
         text.contains("devmap doctor") && text.contains("devmap build"),
         "the whole-file remedy: {text}"
     );
+    // Windows cannot delete a store file while a connection holds it open.
+    drop(slot);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -387,6 +412,8 @@ async fn damage_is_remembered_only_for_the_file_state_the_attempt_started_from()
     slot.remember_damage(&db, DamageKind::File, stamp, "the page that was bad");
     let refused = error_text(&call(&slot, "devmap_status", json!({})).await);
     assert!(refused.contains("the page that was bad"), "{refused}");
+    // Windows cannot delete a store file while a connection holds it open.
+    drop(slot);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -421,6 +448,8 @@ async fn a_second_failure_keeps_the_first_and_a_remembered_refusal_keeps_the_cau
         remembered.contains("clears when the file changes, or after 30 seconds"),
         "{remembered}"
     );
+    // Windows cannot delete a store file while a connection holds it open.
+    drop(slot);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -453,6 +482,8 @@ async fn a_damaged_store_replaced_by_rename_is_read_again_at_once() {
     std::fs::rename(&healthy_copy, &db).unwrap();
     let healed = call(&slot, "devmap_status", json!({})).await;
     assert_eq!(healed["result"]["isError"], json!(false), "{healed}");
+    // Windows cannot delete a store file while a connection holds it open.
+    drop(slot);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -475,5 +506,7 @@ async fn a_caller_owned_store_that_reports_corrupt_is_reported_and_kept() {
     // Kept, not evicted: the whole file at the path was not swapped in.
     let again = error_text(&call(&slot, "devmap_status", json!({})).await);
     assert!(again.contains("handed"), "{again}");
+    // Windows cannot delete a store file while a connection holds it open.
+    drop(slot);
     std::fs::remove_dir_all(root).unwrap();
 }

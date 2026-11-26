@@ -25,6 +25,14 @@ func TestTheDecisionLogIsFlatAfterAMillionWrites(t *testing.T) {
 	if testing.Short() {
 		t.Skip("a million evaluations")
 	}
+	if runtime.GOOS == "windows" {
+		// What is measured is the decision log's bound, which is platform
+		// independent and runs on every Unix leg. Each evaluation walks its
+		// path with lstat (~50µs here, 90% of the time in syscalls), and
+		// Windows lstat is over 12x slower: a million did not finish inside
+		// the 10-minute package timeout, on main as well.
+		t.Skip("a million evaluations take over 10 minutes of lstat on Windows")
+	}
 	const warm, total = 100_000, 1_000_000
 	g := newGate(t, nil)
 	task := testTask()

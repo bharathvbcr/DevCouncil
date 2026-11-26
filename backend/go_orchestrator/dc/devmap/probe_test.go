@@ -7,15 +7,27 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
+
+// writeFakeBinary writes a shell script as an executable at path. It is the one
+// place this package's tests create a stand-in devmap, so the Windows skip
+// (a script cannot be executed there) is stated once; see
+// testsupport.RequireShellFakes.
+func writeFakeBinary(t *testing.T, path, script string) {
+	t.Helper()
+	testsupport.RequireShellFakes(t)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // writeBinary writes an executable script and returns its path.
 func writeBinary(t *testing.T, dir, name, script string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBinary(t, path, script)
 	return path
 }
 

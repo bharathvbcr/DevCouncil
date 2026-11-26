@@ -609,10 +609,13 @@ fn the_flipped_files_extract_the_same_tables_as_their_clean_twins() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The diagnostic the Swift gate leaves when it refuses an operator the grammar
-/// inserted with no spelling, for `n` sites.
-fn refusal_note(n: usize) -> String {
-    format!("swift: refused {n} call(s) on an operator the grammar inserted with no spelling")
+/// The diagnostic the Swift walk leaves when it refuses members the grammar read
+/// off a bare cast, for `n` members. Under tree-sitter-swift 0.7.4 this is the
+/// only refusal note a Clean file can carry: the unspelled-operator note is
+/// guarded in the source but unreachable, because `b as? T ?? X` now parses as
+/// a `nil_coalescing_expression`.
+fn member_note(n: usize) -> String {
+    format!("swift: refused {n} member reference(s) the grammar read off a bare cast")
 }
 
 fn refusal_notes(e: &Extraction) -> Vec<&str> {
@@ -636,66 +639,59 @@ fn empty_names(e: &Extraction) -> (usize, usize) {
     )
 }
 
-/// BREAK (MEDIUM, a phantom fact), fixed. tree-sitter-swift reads `x as? String
-/// ?? "d"` as `String??` followed by a hidden, zero-width `custom_operator`
-/// that recovery inserted. Nothing in the tree is an error or missing node, so
-/// the file stays `Clean` (the hidden-error arm is Kotlin-only by design) and
-/// the Swift walk used to publish a `Call` and a `Call` reference named `""`
-/// that the parenthesised spelling of the same expression does not carry. The
-/// gate in `extract_swift_call` now refuses a call with no spelling: the file
-/// stays Clean, the empty pair is gone, the bare spelling's tables equal its
-/// twin's, and the refusal is counted in one diagnostic so it is not silent.
+/// BREAK (MEDIUM, a phantom fact), fixed, and since 0.7.4 fixed by the grammar.
+/// tree-sitter-swift 0.7.3 read `x as? String ?? "d"` as `String??` followed by
+/// a hidden, zero-width `custom_operator`, which published a `Call` and a `Call`
+/// reference named `""`; the extractor gate refused them and counted the refusal.
+/// tree-sitter-swift 0.7.4 parses the shape correctly as
+/// `nil_coalescing_expression(value: as_expression, if_nil: X)`, so there is
+/// nothing to refuse: the file is Clean, no empty-name fact exists, NO refusal
+/// note is raised (a note here would be a phantom), and the bare spelling's
+/// tables equal its parenthesised twin's.
 #[test]
 fn a_swift_nil_coalesced_string_cast_publishes_no_call_with_an_empty_name() {
-    // (label, bare spelling, parenthesised twin, refused sites on the bare one)
-    let cases: &[(&str, &str, &str, usize)] = &[
+    // (label, bare spelling, parenthesised twin)
+    let cases: &[(&str, &str, &str)] = &[
         (
             "a as?",
             "let a = b as? String ?? \"x\"\n",
             "let a = (b as? String) ?? \"x\"\n",
-            1,
         ),
         (
             "c as!",
             "let a = b as! String ?? \"x\"\n",
             "let a = (b as! String) ?? \"x\"\n",
-            1,
         ),
         (
             "g three lines",
             "let a = b\n    as? String\n    ?? \"x\"\n",
             "let a = (b\n    as? String)\n    ?? \"x\"\n",
-            1,
         ),
         (
             "h closure",
             "let a = items.map { $0 as? String ?? \"x\" }\n",
             "let a = items.map { ($0 as? String) ?? \"x\" }\n",
-            1,
         ),
         (
             "i return",
             "func f(r: [String: Any]) -> String {\n    return r[\"e\"] as? String ?? \"x\"\n}\n",
             "func f(r: [String: Any]) -> String {\n    return (r[\"e\"] as? String) ?? \"x\"\n}\n",
-            1,
         ),
-        // Regression guards: already equal to the twin on main, nothing refused.
+        // Regression guards: already equal to the twin on main.
         (
             "d try?",
             "let a = try? g() ?? \"x\"\n",
             "let a = (try? g()) ?? \"x\"\n",
-            0,
         ),
         (
             "f array cast",
             "let a = b as? [String] ?? []\n",
             "let a = (b as? [String]) ?? []\n",
-            0,
         ),
     ];
     let mut failures = Vec::new();
     let outcome_of = label;
-    for (label, bare, paren, refused) in cases {
+    for (label, bare, paren) in cases {
         let (e, twin_e) = (ex("a.swift", bare), ex("a.swift", paren));
         let (calls, refs) = empty_names(&e);
         if calls != 0 || refs != 0 {
@@ -712,21 +708,9 @@ fn a_swift_nil_coalesced_string_cast_publishes_no_call_with_an_empty_name() {
         if !clean(&twin_e) {
             failures.push(format!("{label} {paren:?}: the twin is not Clean"));
         }
-        let want: Vec<String> = if *refused == 0 {
-            Vec::new()
-        } else {
-            vec![refusal_note(*refused)]
-        };
-        let got: Vec<&str> = refusal_notes(&e);
-        if got != want.iter().map(String::as_str).collect::<Vec<_>>() {
+        if !e.diagnostics.is_empty() {
             failures.push(format!(
-                "{label} {bare:?}: refusal diagnostics {got:?}, wanted {want:?} in {:?}",
-                e.diagnostics
-            ));
-        }
-        if *refused == 0 && !e.diagnostics.is_empty() {
-            failures.push(format!(
-                "{label} {bare:?}: a guard case carries diagnostics {:?}",
+                "{label} {bare:?}: nothing is refused, yet it carries diagnostics {:?}",
                 e.diagnostics
             ));
         }
@@ -761,16 +745,21 @@ fn a_swift_partial_nil_coalesce_shape_publishes_no_empty_name() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Two bare sites in one file are one diagnostic line carrying N=2, and the
+/// Two refused sites in one file are one diagnostic line carrying N=2, and the
 /// note belongs to that file alone: the next extraction on the same thread
 /// starts with none, and a Clean file without such a site has none.
+///
+/// Under tree-sitter-swift 0.7.4 `b as? String ?? "x"` is no longer refused, so
+/// the trigger is the bare-cast member that still mis-parses: `(b as? Foo.Bar)`
+/// reads as `navigation(as_expression "b as? Foo", Bar)`, and the walk refuses
+/// the member with the `off a bare cast` note.
 #[test]
 fn the_swift_refusal_note_is_one_line_per_file_and_does_not_leak() {
-    let two = "let a = b as? String ?? \"x\"\nlet c = d as! String ?? \"y\"\n";
+    let two = "let a = (b as? Foo.Bar)\nlet c = (d as! Foo.Baz)\n";
     let first = ex("a.swift", two);
     assert_eq!(
         refusal_notes(&first),
-        vec![refusal_note(2).as_str()],
+        vec![member_note(2).as_str()],
         "diagnostics: {:?}",
         first.diagnostics
     );

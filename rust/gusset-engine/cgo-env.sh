@@ -57,7 +57,19 @@ if [[ "$here" == *" "* ]]; then
   echo "cgo-env.sh: $here contains a space, which cgo cannot link from" >&2
   exit 1
 fi
+stamp_js="$here/../../scripts/gusset-engine-stamp.mjs"
+gusset_dir="$here/../../../gusset"
+# With --target cargo writes under target/<triple>/release, and the host
+# archive in target/release is for a different machine: link only the one
+# built for this target.
+libdir="$here/target${target:+/$target}/release"
+archive="$libdir/libgusset.a"
+before=""
 if [[ "$build" -eq 1 ]]; then
+  # Delete the previous stamp first: whatever happens next, an archive is never
+  # left next to a stamp for other inputs. Record the inputs the build starts from.
+  rm -f "$libdir/libgusset.stamp.json"
+  before="$(node "$stamp_js" begin "$libdir" "$gusset_dir")" || before=""
   # --target-dir pins the output where gussetfn's #cgo -L and the hash below
   # look. Without it an inherited CARGO_TARGET_DIR (two lanes on one
   # checkout) sent the fresh archive elsewhere and this script keyed Go on
@@ -65,14 +77,16 @@ if [[ "$build" -eq 1 ]]; then
   cargo build --release --locked --manifest-path "$here/Cargo.toml" --target-dir "$here/target" \
     ${target:+--target "$target"} >&2
 fi
-# With --target cargo writes under target/<triple>/release, and the host
-# archive in target/release is for a different machine: link only the one
-# built for this target.
-libdir="$here/target${target:+/$target}/release"
-archive="$libdir/libgusset.a"
 if [[ ! -f "$archive" ]]; then
   echo "cgo-env.sh: $archive is missing" >&2
   exit 1
+fi
+if [[ "$build" -eq 1 ]]; then
+  # The stamp (for scripts/lane-env.mjs) is written only if the inputs are
+  # unchanged by the build. Not fatal: the archive is fine, it is just unstamped.
+  if [[ -z "$before" ]] || ! printf '%s' "$before" | node "$stamp_js" write "$libdir" "$gusset_dir" >&2; then
+    echo "cgo-env.sh: no engine stamp was written; lane-env.mjs will refuse this archive as unstamped" >&2
+  fi
 fi
 if command -v sha256sum >/dev/null 2>&1; then
   sum="$(sha256sum "$archive" | cut -c1-32)"

@@ -30,6 +30,7 @@ import (
 func TestGetGapsReportsAGapsOptionalFields(t *testing.T) {
 	ctx := context.Background()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 
 	req, ac, method := "REQ-1", "AC-1.1", "integration_test"
 	file, line, cmd := "src/a.py", 9, "pytest tests/test_a.py"
@@ -133,6 +134,7 @@ func TestGetGapsReportsAGapsOptionalFields(t *testing.T) {
 func TestGetGapsReportsRecurrenceTruncated(t *testing.T) {
 	ctx := context.Background()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
+	t.Cleanup(client.Close)
 	reg := devcouncil.NewRegistry(t.TempDir(), client, nil)
 
 	callGaps := func() (avail, trunc, gapsTrunc bool) {

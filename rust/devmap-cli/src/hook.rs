@@ -1351,7 +1351,7 @@ const PRE_TOOL_SKELETON_CONTEXT_CAP: usize = 3500;
 const PROMPT_NUDGE: &str = "DevMap has recorded no query from this session. Before grepping or \
      reading files to find code, ask the index: devmap_search / devmap_explore for where a \
      symbol lives, devmap_ask_evidence for a behaviour you cannot name, devmap_impact before \
-     changing one.";
+     changing one (CLI: `devmap search|explore|ask --evidence|impact ... --json`).";
 
 /// Most prompt nudges one session receives, whatever else is true.
 ///
@@ -3275,7 +3275,7 @@ fn lock_dir_is_stale(lock_dir: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        !windows_process_is_running(pid as u32)
+        !devmap_extract::process::windows_is_running(pid as u32)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -3313,37 +3313,6 @@ fn stop_standard_handles_from_being_inherited() {
                 SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
             }
         }
-    }
-}
-
-/// Whether `pid` names a running process. It was not asked at all on Windows:
-/// every lock read as live until [`LOCK_MAX_AGE`], so a build that died without
-/// removing its lock stopped that repository's rebuilds for half an hour.
-#[cfg(windows)]
-fn windows_process_is_running(pid: u32) -> bool {
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
-    const ERROR_ACCESS_DENIED: u32 = 5;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
-        fn GetExitCodeProcess(process: *mut std::ffi::c_void, code: *mut u32) -> i32;
-        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-    // SAFETY: plain Win32 calls on a handle this function opens and closes.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            // A process this user may not query still exists; anything else
-            // (invalid parameter) is no process with that pid.
-            return GetLastError() == ERROR_ACCESS_DENIED;
-        }
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(handle, &mut code) != 0;
-        CloseHandle(handle);
-        // Unknown is held, like every other unknown owner here.
-        !ok || code == STILL_ACTIVE
     }
 }
 
@@ -3409,7 +3378,8 @@ pub(crate) fn shell_quote_hook_executable(text: &str) -> anyhow::Result<String> 
 const INSIDE_REPO_REMEDY: &str = "Remedy: install devmap outside the repository \
      (`bash scripts/install.sh --only=devmap` from a checkout, or `cargo install --git \
      https://github.com/bharathvbcr/DevCouncil.git --tag <release tag> --locked devmap-cli`) \
-     and point the hooks at that binary";
+     (`cargo install --path rust/devmap-cli --locked` from a checkout also installs outside it) \
+     and point the hooks at that binary, or pass `--binary <path outside the repository>`";
 
 /// The agent-visible line for a refused hook executable: the refusal message
 /// (which already names the executable, the repository top and the remedy),
@@ -3743,6 +3713,25 @@ pub(crate) fn canonical_hook_executable(
     action: &str,
 ) -> anyhow::Result<PathBuf> {
     check_hook_executable_containment(executable, root, None, action)
+}
+
+/// True when `executable` (resolved through links as far as it exists) lies in
+/// the repository at `root`, by the same boundaries
+/// [`canonical_hook_executable`] enforces. A path that does not exist yet is
+/// judged lexically; a `root` that cannot be resolved is an error, never "no".
+pub(crate) fn executable_is_inside_repository(
+    executable: &Path,
+    root: &Path,
+) -> anyhow::Result<bool> {
+    let boundaries = collect_containment_boundaries(root, None, "inspect")?;
+    let lexical = normalize_lexical(&absolute_non_canonical(executable));
+    let resolved = canonicalize_existing(executable).ok();
+    Ok(boundaries.iter().any(|boundary| {
+        boundary.contains_path(&lexical)
+            || resolved
+                .as_deref()
+                .is_some_and(|path| boundary.contains_path(path))
+    }))
 }
 
 pub(crate) fn canonical_hook_executable_with_seed(
@@ -9506,6 +9495,9 @@ mod tests {
             let out = std::process::Command::new("git")
                 .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
                 .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+                // Git for Windows checks a worktree out with CRLF under its
+                // default autocrlf=true, which would make the lane look edited.
+                .args(["-c", "core.autocrlf=false"])
                 .args(args)
                 .current_dir(cwd)
                 .output()

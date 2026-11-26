@@ -27,7 +27,7 @@ func TestWorkbenchPersistsThroughHostRestartAndReusesOneChild(t *testing.T) {
 	call("repositories.put", `{"request_id":"r","id":"r1","expected_revision":0,"name":"Manvi","identity_key":"local:r1"}`)
 	first := idleChild(t, c)
 	call("workspaces.put", `{"request_id":"w","id":"ws","expected_revision":0,"name":"Devtools","repository_ids":["r1"]}`)
-	input := `{"request_id":"t","id":"t1","expected_revision":0,"title":"Preserve \"quoted\" errors\nand 日本語","description":"Detailed brief","repository_ids":["r1"],"primary_repository_id":"r1"}`
+	input := `{"request_id":"t","id":"t1","expected_revision":0,"title":"Preserve \"quoted\" errors and 日本語","description":"Detailed brief\nwith line break","repository_ids":["r1"],"primary_repository_id":"r1"}`
 	receipt := call("items.put", input)
 	if replay := call("items.put", input); !bytes.Equal(receipt, replay) {
 		t.Fatal("retry lost original receipt")

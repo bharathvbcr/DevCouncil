@@ -32,7 +32,7 @@ func TestDotSlashPlanEntryIsOneEntryOnEveryReader(t *testing.T) {
 			if d := decide(t, g, "src/b.go", task, dc.OpModify); d.Blocked() {
 				t.Errorf("write to planned src/b.go refused: %+v", d)
 			}
-			if !PlansPath(task, "src/a.go") || !PlansPath(task, "./src/a.go") {
+			if !PlansPathIn("", task, "src/a.go") || !PlansPathIn("", task, "./src/a.go") {
 				t.Error("PlansPath must answer true for planned ./src/a.go")
 			}
 			if !MatchesPlannedPath("src/a.go", files) || !MatchesPlannedPath("./src/a.go", files) {
@@ -44,10 +44,10 @@ func TestDotSlashPlanEntryIsOneEntryOnEveryReader(t *testing.T) {
 
 func TestPlansPathReadsGlobEntries(t *testing.T) {
 	task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("docs/*.md")}}
-	if !PlansPath(task, "docs/x.md") {
+	if !PlansPathIn("", task, "docs/x.md") {
 		t.Error("a glob entry plans the paths it matches, as verification's orphan check reads it")
 	}
-	if PlansPath(task, "src/x.md") {
+	if PlansPathIn("", task, "src/x.md") {
 		t.Error("a glob entry must not plan a path it does not match")
 	}
 }
@@ -157,5 +157,29 @@ func TestForbiddenEntriesAreNormalisedByTheGate(t *testing.T) {
 	task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("*")}, ForbiddenChanges: []string{"./secret/*"}}
 	if d := decide(t, mapless(t), "secret/x", task, dc.OpModify); d.Rule != RuleForbiddenChange {
 		t.Errorf("rule=%s, want %s", d.Rule, RuleForbiddenChange)
+	}
+}
+
+// ft-84b49733 item 3 through the gate: a prohibition spelled with "//" or "/./"
+// denies the path it names, instead of silently matching nothing.
+func TestForbiddenEntriesWithDoubledSeparatorsStillDeny(t *testing.T) {
+	for _, entry := range []string{".//secret/x", "secret//x", "./secret/./x", ".//secret/*"} {
+		task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("*")}, ForbiddenChanges: []string{entry}}
+		if d := decide(t, mapless(t), "secret/x", task, dc.OpModify); d.Rule != RuleForbiddenChange {
+			t.Errorf("forbidden %q: rule=%s, want %s", entry, d.Rule, RuleForbiddenChange)
+		}
+	}
+}
+
+// The same normalisation reads a planned entry "src//a.go" as src/a.go. That is
+// the one place the collapse widens what an entry matches, so it is pinned: the
+// entry names the file the filesystem opens for that spelling.
+func TestPlannedEntryWithDoubledSeparatorNamesTheSameFile(t *testing.T) {
+	task := &dc.Task{ID: "TASK-1", PlannedFiles: []dc.PlannedFile{modify("src//a.go")}}
+	if d := decide(t, mapless(t), "src/a.go", task, dc.OpModify); d.Blocked() {
+		t.Errorf("src//a.go no longer plans src/a.go: %s/%q", d.Action, d.Rule)
+	}
+	if editable, _ := PlannedScope("src/b.go", task.PlannedFiles); editable {
+		t.Error("src//a.go plans src/b.go")
 	}
 }

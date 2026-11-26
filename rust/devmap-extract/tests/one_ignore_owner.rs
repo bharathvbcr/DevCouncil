@@ -135,6 +135,191 @@ fn the_watcher_and_the_walk_exclude_the_same_paths() {
     agree(&root, "b.ts", false, "no repository: .gitignore is git's");
 }
 
+/// Every `.ts` file under `root`, found by reading the filesystem and
+/// consulting nothing that ignores: the population both verdicts are asked
+/// about. `.git` and `.jj` are skipped only because they hold no sources.
+fn every_ts_file(root: &Path) -> Vec<String> {
+    fn visit(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_dir() {
+                if name != ".git" && name != ".jj" {
+                    visit(root, &path, out);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "ts") {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// For every file in the tree, in both directions: the watcher excludes it
+/// exactly when the cold walk does not yield it. Returns the excluded set so a
+/// caller can pin the verdicts it expects (a comparison that passes because
+/// both sides exclude everything would otherwise pass).
+fn watcher_equals_walk(root: &Path, case: &str) -> BTreeSet<String> {
+    let walked = walked(root);
+    let mut excluded = BTreeSet::new();
+    for candidate in every_ts_file(root) {
+        let watcher_excluded = is_gitignored(root, &root.join(&candidate), false)
+            .unwrap_or_else(|error| panic!("{case}: verdict for {candidate} failed: {error}"));
+        assert_eq!(
+            watcher_excluded,
+            !walked.contains(&candidate),
+            "{case}: the watcher says excluded={watcher_excluded} for {candidate}; the cold walk \
+             yields it={} — two answers to one question",
+            walked.contains(&candidate)
+        );
+        if watcher_excluded {
+            excluded.insert(candidate);
+        }
+    }
+    excluded
+}
+
+/// A `.git` file that points at a git directory, as a submodule or a linked
+/// worktree has.
+fn write_git_pointer(root: &Path, relative: &str, target: &str) {
+    write(root, relative, &format!("gitdir: {target}\n"));
+}
+
+/// The version-control boundary is one rule written in the `ignore` crate and
+/// read by the walk; the watcher must read it the same way inside a nested
+/// clone, a submodule, a nested `.jj` and across a `.git` pointer that points
+/// nowhere. The parent's `.gitignore` and `info/exclude` stop at the nested
+/// repository; its own do not; `.ignore` crosses every boundary.
+#[test]
+fn the_watcher_and_the_walk_agree_across_nested_repositories() {
+    let root = scratch("nested-boundaries", true);
+    write(&root, ".gitignore", "*.gen.ts\nparent_only.ts\n");
+    write(&root, ".git/info/exclude", "root_exclude.ts\n");
+    write(&root, ".ignore", "everywhere.ts\n");
+    for name in [
+        "top.gen.ts",
+        "parent_only.ts",
+        "root_exclude.ts",
+        "everywhere.ts",
+        "keep.ts",
+    ] {
+        write(&root, name, "export const v = 1;\n");
+    }
+
+    // (b) a nested clone with its own .gitignore and info/exclude.
+    write(&root, "clone/.git/info/exclude", "clone_exclude.ts\n");
+    write(&root, "clone/.gitignore", "clone_only.ts\n");
+    for name in [
+        "x.gen.ts",
+        "parent_only.ts",
+        "root_exclude.ts",
+        "everywhere.ts",
+        "clone_only.ts",
+        "clone_exclude.ts",
+        "keep.ts",
+        "sub/x.gen.ts",
+        "sub/clone_only.ts",
+    ] {
+        write(&root, &format!("clone/{name}"), "export const v = 1;\n");
+    }
+
+    // (a) a submodule: a .git pointer to a real git directory outside it.
+    write(&root, ".git/modules/sub/info/exclude", "sub_exclude.ts\n");
+    write_git_pointer(&root, "vendor/sub/.git", "../../.git/modules/sub");
+    write(&root, "vendor/sub/.gitignore", "sub_only.ts\n");
+    for name in [
+        "x.gen.ts",
+        "parent_only.ts",
+        "sub_only.ts",
+        "sub_exclude.ts",
+        "keep.ts",
+    ] {
+        write(
+            &root,
+            &format!("vendor/sub/{name}"),
+            "export const v = 1;\n",
+        );
+    }
+
+    // (c) a nested .jj: a boundary for .gitignore, with no .git beside it.
+    write(&root, "jj/.jj/repo/placeholder", "");
+    write(&root, "jj/.gitignore", "jj_only.ts\n");
+    for name in [
+        "x.gen.ts",
+        "parent_only.ts",
+        "jj_only.ts",
+        "everywhere.ts",
+        "keep.ts",
+    ] {
+        write(&root, &format!("jj/{name}"), "export const v = 1;\n");
+    }
+
+    // (d) a .git pointer that does not resolve.
+    write_git_pointer(&root, "broken/.git", "/nonexistent/devmap/gitdir");
+    write(&root, "broken/.gitignore", "broken_only.ts\n");
+    for name in ["x.gen.ts", "parent_only.ts", "broken_only.ts", "keep.ts"] {
+        write(&root, &format!("broken/{name}"), "export const v = 1;\n");
+    }
+
+    let excluded = watcher_equals_walk(&root, "nested repositories");
+    for expected in [
+        "top.gen.ts",
+        "parent_only.ts",
+        "root_exclude.ts",
+        "everywhere.ts",
+        "clone/everywhere.ts",
+        "clone/clone_only.ts",
+        "clone/sub/clone_only.ts",
+        "vendor/sub/sub_only.ts",
+        "jj/jj_only.ts",
+        "jj/everywhere.ts",
+        "broken/broken_only.ts",
+    ] {
+        assert!(
+            excluded.contains(expected),
+            "{expected} is excluded: {excluded:?}"
+        );
+    }
+    for admitted in [
+        "keep.ts",
+        "clone/x.gen.ts",
+        "clone/parent_only.ts",
+        "clone/root_exclude.ts",
+        "vendor/sub/x.gen.ts",
+        "vendor/sub/parent_only.ts",
+        "jj/x.gen.ts",
+        "jj/parent_only.ts",
+        "broken/x.gen.ts",
+        "broken/parent_only.ts",
+    ] {
+        assert!(
+            !excluded.contains(admitted),
+            "{admitted} is admitted: {excluded:?}"
+        );
+    }
+}
+
+/// A `.git` pointer that does not resolve, at the walk's own root, must not
+/// fail every verdict: the walk reads no exclude file from it and walks on.
+#[test]
+fn an_unresolvable_git_pointer_at_the_root_does_not_fail_the_verdict() {
+    let root = scratch("broken-root-pointer", false);
+    write_git_pointer(&root, ".git", "/nonexistent/devmap/gitdir");
+    write(&root, ".gitignore", "dropped.ts\n");
+    write(&root, "dropped.ts", "export const v = 1;\n");
+    write(&root, "kept.ts", "export const v = 1;\n");
+    let excluded = watcher_equals_walk(&root, "broken pointer at the root");
+    assert_eq!(excluded, BTreeSet::from(["dropped.ts".to_string()]));
+}
+
 /// Every rule file the walk reads is one the watcher stamps, so an edit to it
 /// invalidates the verdicts it backed — `.ignore` included.
 #[test]

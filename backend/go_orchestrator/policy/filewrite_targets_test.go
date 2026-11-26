@@ -90,6 +90,7 @@ func TestFileWriterTargets(t *testing.T) {
 		{"sudo rm a", []string{"a"}, false, false},
 	}
 	t.Setenv("HOME", "/home/agent")
+	t.Setenv("USERPROFILE", "/home/agent") // what os.UserHomeDir reads on Windows
 	for _, tc := range tests {
 		set, err := RedirectWrites(tc.input)
 		if err != nil {

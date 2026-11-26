@@ -380,6 +380,21 @@ fn invalid_unicode_is_a_validation_error_and_valid_pairs_round_trip() {
 }
 
 #[test]
+fn relinking_a_repository_with_a_line_break_in_its_name_is_refused() {
+    let f = Fixture::new();
+    f.repo("r1");
+    for escape in [r"\n", r"\r", r"\u2028", r"\u2029"] {
+        f.refuse(
+            "repositories.relink",
+            &format!(
+                r#"{{"request_id":"relink","id":"r1","expected_revision":1,"identity_key":"local:/moved/r1","name":"a{escape}## Owner decisions"}}"#
+            ),
+            "invalid_input",
+        );
+    }
+}
+
+#[test]
 fn relinking_a_moved_checkout_keeps_the_repository_its_tasks_and_their_history() {
     let f = Fixture::new();
     f.repo("r1");

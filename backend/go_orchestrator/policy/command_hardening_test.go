@@ -246,6 +246,7 @@ func TestRedirectTargetsExtraction(t *testing.T) {
 		{"echo `echo hi > .env", nil, false, true},
 	}
 	t.Setenv("HOME", "/home/agent")
+	t.Setenv("USERPROFILE", "/home/agent") // what os.UserHomeDir reads on Windows
 	for _, tc := range tests {
 		targets, opaque, err := RedirectTargets(tc.input)
 		if tc.wantErr {

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 func runArgs(argv ...string) (int, string, string) {
@@ -143,7 +145,8 @@ func TestTagAtHeadNeverRunsAGitInsideTheRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := "#!/bin/sh\n: > '" + marker + "'\necho 0123456789abcdef0123456789abcdef01234567\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	// git.exe on Windows: a planted file Windows would not run tests nothing.
+	if err := os.WriteFile(filepath.Join(bin, testsupport.ExecutableName("git")), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
