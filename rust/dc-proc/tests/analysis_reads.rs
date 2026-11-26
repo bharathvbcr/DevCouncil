@@ -5,10 +5,13 @@
 #![cfg(unix)]
 
 use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dc_proc::{Bounds, Captured, Failure, GitVersion, git_version, git_with_program, run_bounded};
@@ -84,8 +87,35 @@ fn repo(dir: &Path) {
     setup(dir, &["commit", "-qm", "base"]);
 }
 
+/// Pins the network environment of a git the test runs, so no ambient proxy
+/// can divert a fetch away from the loopback server (which would let a
+/// guard-less run pass without ever reaching the credential helper), no
+/// askpass program stands in for the planted one, and no operator git config
+/// (a global `protocol.http.allow = never` would refuse the fetch before the
+/// helper runs and let a guard-less run pass) is read.
+fn pin_network_env(command: &mut Command) {
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    ] {
+        command.env_remove(var);
+    }
+    command
+        .env("no_proxy", "127.0.0.1")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
 fn read(program: &OsStr, root: &Path, args: &[&str]) -> Result<Captured, Failure> {
     let mut command = git_with_program(program, root, args)?;
+    pin_network_env(&mut command);
     run_bounded(
         &mut command,
         Bounds {
@@ -154,11 +184,93 @@ fn a_submodule_filter_does_not_run_when_the_superproject_is_read() {
     }
 }
 
-/// A blobless clone whose remote only `core.sshCommand` can reach, with
-/// `core.sshCommand` and `credential.helper` planted, and an index naming
-/// files the working tree lacks — so `diff` needs blobs the clone never
-/// fetched.
-fn partial_clone(base: &Path) -> (PathBuf, PathBuf) {
+/// How the planted remote is reached. Only the transport decides which
+/// planted program a lazy fetch would run: ssh consults `core.sshCommand` and
+/// never a credential helper; an http remote that answers 401 consults
+/// `credential.helper`.
+#[derive(Clone, Copy)]
+enum Transport {
+    Ssh,
+    Http(SocketAddr),
+}
+
+/// A loopback-only HTTP server that answers every request 401 with a Basic
+/// challenge, which is what makes git ask its credential helper. It counts
+/// requests so a test can say the remote was never contacted, and it stops
+/// and joins its thread when dropped.
+struct Challenge {
+    addr: SocketAddr,
+    hits: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Challenge {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (hits, stop) = (hits.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut conn, _)) => {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                            // An accepted socket can inherit the listener's
+                            // non-blocking mode.
+                            let _ = conn.set_nonblocking(false);
+                            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut request = Vec::new();
+                            let mut chunk = [0u8; 1024];
+                            while !request.windows(4).any(|w| w == b"\r\n\r\n")
+                                && request.len() < 1 << 16
+                            {
+                                match conn.read(&mut chunk) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                                }
+                            }
+                            let _ = conn.write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\n\
+                                  WWW-Authenticate: Basic realm=\"planted\"\r\n\
+                                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+        Challenge {
+            addr,
+            hits,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Challenge {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A blobless clone whose remote only `transport` can reach, with the
+/// program that transport consults planted as a marker script, and an index
+/// naming files the working tree lacks — so `diff` needs blobs the clone
+/// never fetched.
+fn partial_clone(base: &Path, transport: Transport) -> (PathBuf, PathBuf) {
     let src = base.join("src");
     repo(&src);
     std::fs::write(src.join("a.txt"), "one\ntwo\n").unwrap();
@@ -180,37 +292,70 @@ fn partial_clone(base: &Path) -> (PathBuf, PathBuf) {
     let marker = base.join("ran");
     let planted = marker_script(&base.join("bin"), &marker, 1);
     let planted = planted.to_str().unwrap();
-    setup(
-        &root,
-        &[
-            "config",
-            "remote.origin.url",
-            "ssh://example.invalid/repo.git",
-        ],
-    );
-    setup(&root, &["config", "core.sshCommand", planted]);
-    setup(&root, &["config", "credential.helper", planted]);
+    match transport {
+        Transport::Ssh => {
+            setup(
+                &root,
+                &[
+                    "config",
+                    "remote.origin.url",
+                    "ssh://example.invalid/repo.git",
+                ],
+            );
+            setup(&root, &["config", "core.sshCommand", planted]);
+        }
+        Transport::Http(addr) => {
+            setup(
+                &root,
+                &[
+                    "config",
+                    "remote.origin.url",
+                    &format!("http://{addr}/repo.git"),
+                ],
+            );
+            setup(&root, &["config", "credential.helper", planted]);
+        }
+    }
     (root, marker)
 }
 
-#[test]
-fn a_partial_clone_read_fails_rather_than_fetching() {
+/// An unguarded read fetches through `transport` and so runs its planted
+/// program (the fixture is wrong otherwise); the guarded reads then run
+/// nothing, fetch nothing and fail.
+fn partial_clone_read_fails_rather_than_fetching(
+    transport: Transport,
+    contacted: &dyn Fn() -> usize,
+    reaches_server: bool,
+) {
     let base = Scratch::new("partial");
-    let (root, marker) = partial_clone(&base.0);
+    let (root, marker) = partial_clone(&base.0, transport);
 
-    // The fixture is only evidence if an unguarded read fetches.
-    let _ = Command::new("git")
+    let mut unguarded = Command::new("git");
+    unguarded
         .arg("-C")
         .arg(&root)
         .args(["diff", "HEAD"])
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output();
+        .stdin(Stdio::null());
+    pin_network_env(&mut unguarded);
+    let _ = run_bounded(
+        &mut unguarded,
+        Bounds {
+            deadline: Duration::from_secs(20),
+            stdout_cap: 1 << 20,
+            stderr_cap: 1 << 16,
+        },
+    );
     assert!(
         marker.exists(),
-        "the fixture is wrong: an unguarded diff did not try to fetch"
+        "the fixture is wrong: an unguarded diff did not run the planted program"
+    );
+    assert!(
+        !reaches_server || contacted() > 0,
+        "the fixture is wrong: an unguarded diff never reached the loopback server"
     );
     std::fs::remove_file(&marker).unwrap();
+    let contacted_before = contacted();
 
     let git = dc_proc::resolve_outside(
         OsStr::new("git"),
@@ -233,6 +378,11 @@ fn a_partial_clone_read_fails_rather_than_fetching() {
     ] {
         let result = read(OsStr::new("git"), &root, args);
         assert_not_run(&marker, &format!("git {args:?}"));
+        assert_eq!(
+            contacted(),
+            contacted_before,
+            "git {args:?} contacted the remote"
+        );
         match result {
             Ok(captured) => assert!(
                 !captured.status.success(),
@@ -242,6 +392,23 @@ fn a_partial_clone_read_fails_rather_than_fetching() {
             Err(failure) => panic!("git {args:?} did not run: {failure}"),
         }
     }
+}
+
+#[test]
+fn a_partial_clone_read_fails_rather_than_fetching() {
+    partial_clone_read_fails_rather_than_fetching(Transport::Ssh, &|| 0, false);
+}
+
+/// The credential helper is consulted only by a transport that is
+/// challenged, so this is the case that can fail if a lazy fetch runs it.
+#[test]
+fn a_partial_clone_read_never_runs_the_credential_helper() {
+    let server = Challenge::start();
+    partial_clone_read_fails_rather_than_fetching(
+        Transport::Http(server.addr),
+        &|| server.hits(),
+        true,
+    );
 }
 
 /// A git standing in for the real one that reports `version` and otherwise
