@@ -721,6 +721,9 @@ func xargsWrites(args []shellWord, depth int) argWrites {
 	if peel.unknown != "" {
 		w.unjudged = "`xargs` runs a wrapper with an option (`" + peel.unknown + "`) the gate cannot step over"
 	}
+	if peel.computed != "" && w.unjudged == "" {
+		w.unjudged = "`xargs` runs a wrapper whose command the shell computes (`" + peel.computed + "`)"
+	}
 	if at < 0 {
 		return w
 	}
@@ -785,6 +788,9 @@ func findWrites(args []shellWord, depth int) argWrites {
 			w.merge(literalWrites(peel.writes))
 			if peel.unknown != "" && w.unjudged == "" {
 				w.unjudged = "`find -exec` runs a wrapper with an option (`" + peel.unknown + "`) the gate cannot step over"
+			}
+			if peel.computed != "" && w.unjudged == "" {
+				w.unjudged = "`find -exec` runs a wrapper whose command the shell computes (`" + peel.computed + "`)"
 			}
 			at := peel.at
 			if at < 0 {

@@ -77,7 +77,18 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 			"so that command's operands were not judged. Spell the command without the wrapper, or use an option "+
 			"the gate knows.", peel.unknown)
 	}
+	if peel.computed != "" {
+		commandAt = -1
+		unknownReason = fmt.Sprintf("a wrapper runs a command the shell computes (`%s`), so which program runs, and "+
+			"which of the later words it reads, cannot be told. Spell the command out.", peel.computed)
+	}
 	at, judgedFrom := readerBehindWrapper(words, commandAt)
+	if at < 0 && peel.computed != "" {
+		// No word names the program. Every word after the computed one may be
+		// what it reads, so each is judged as a reader's operand: a spelled
+		// credential stays the hard refusal rather than the unverifiable one.
+		at, judgedFrom = peel.computedAt, peel.computedAt
+	}
 	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""

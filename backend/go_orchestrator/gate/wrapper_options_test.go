@@ -55,6 +55,10 @@ func TestWrapperOptionsReachOperandRungs(t *testing.T) {
 		{"xargs env --frobnicate rm -rf .git", protected}, {"find . -exec env --frobnicate rm -rf .git \\;", protected},
 		{"env --frobnicate rm -rf .git", protected}, {"env -S \"cat .env\"", secret}, {"env -S \"rm -rf .git\"", protected},
 		{"sudo -e .env", secret}, {"sudo --edit .git/config", protected},
+		// R5: a command the shell computes behind a wrapper (a glob, an expansion)
+		// leaves which program runs unknown; the words after it are still judged.
+		{"timeout * .env", secret}, {"nice $X .env", secret}, {"sudo $X .env", secret}, {"nice \"$@\" .env", secret},
+		{"nice .e*", rules(policy.RuleCommandSubstitution, policy.RuleCommandOperandUnverifiable)},
 		// an unknown option with nothing spelled behind it still refuses, as unverifiable.
 		{"env --frobnicate cat README.md", rules(policy.RuleCommandOperandUnverifiable)},
 		{"sudo --frobnicate ls", rules(policy.RuleCommandOperandUnverifiable)},

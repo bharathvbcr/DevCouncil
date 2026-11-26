@@ -120,6 +120,13 @@ type commandPeel struct {
 	at int
 	// unknown is the first wrapper option wrapperSpecs does not describe.
 	unknown string
+	// computed is the word a wrapper runs when the shell computes it
+	// (`nice *`, `timeout 5 "$@"`, `env $X .env`): which program runs, and so
+	// which later words it reads or writes, cannot be told. at is then guessed
+	// as it is for unknown.
+	computed string
+	// computedAt is the index of computed.
+	computedAt int
 	// chdir is a wrapper option that moves the working directory or root.
 	chdir string
 	// writes are files the wrappers themselves write (time -o FILE, sudo -e
@@ -245,6 +252,12 @@ func peelWrapper(words []shellWord, i int, spec wrapperSpec, p *commandPeel) int
 	}
 afterOptions:
 	for ; operands > 0 && j < len(words); operands-- {
+		// An operand the shell computes (`timeout * …`) may be several
+		// words, so the command after it cannot be found.
+		if words[j].expands {
+			p.computed, p.computedAt = words[j].text, j
+			return -1
+		}
 		j++
 	}
 	if j >= len(words) {
@@ -258,6 +271,7 @@ afterOptions:
 // options are stepped over, and what the options mean is reported.
 func peelCommand(words []shellWord) commandPeel {
 	p := commandPeel{at: -1}
+	wrapped := false
 	for i := 0; i < len(words); i++ {
 		word := words[i]
 		if word.quotedHead {
@@ -276,13 +290,19 @@ func peelCommand(words []shellWord) commandPeel {
 		if spec, ok := wrapperSpecs[wrapperName(word.text)]; ok {
 			next := peelWrapper(words, i, spec, &p)
 			if next < 0 {
-				if p.unknown != "" {
+				if p.unknown != "" || p.computed != "" {
 					p.at = guessCommandWord(words, i+1)
 				}
 				return p
 			}
 			i = next - 1
+			wrapped = true
 			continue
+		}
+		if wrapped && word.expands {
+			p.computed, p.computedAt = word.text, i
+			p.at = guessCommandWord(words, i+1)
+			return p
 		}
 		p.at = i
 		return p

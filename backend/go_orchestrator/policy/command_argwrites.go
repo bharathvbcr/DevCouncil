@@ -50,6 +50,9 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 		words := shellWords(clause)
 		peel := peelCommand(words)
 		all.merge(literalWrites(peel.writes))
+		if peel.computed != "" && all.unjudged == "" {
+			all.unjudged = "a wrapper runs a command the shell computes (`" + peel.computed + "`), so what it writes cannot be told"
+		}
 		if peel.reparse != "" {
 			all.merge(argumentWriteTargetsInRoot(reparseLine(peel.reparse, peel.reparseRest), root))
 			continue
