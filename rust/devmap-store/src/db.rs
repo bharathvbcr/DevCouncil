@@ -77,9 +77,8 @@ pub(crate) fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
-    /// Set only by tests. Production leaves it `None`, and the read then does
-    /// nothing here.
     static GENERATION_READ_PAUSE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
@@ -87,15 +86,21 @@ thread_local! {
 /// that reads that generation.
 ///
 /// `#[cfg(test)]` items are not compiled into the library that `tests/*.rs`
-/// and `devmap-query`'s tests link, so this is `pub` and hidden rather than
-/// test-gated. A test sets it to commit a prune from a second connection at
-/// that one point. The hook is thread-local and runs on the reading thread.
-/// Nothing in production sets it; the cost is one thread-local read per call.
+/// and `devmap-query`'s tests link, so the seam is compiled under the
+/// `test-hooks` cargo feature as well (this crate's own unit tests get it from
+/// `cfg(test)`). A build without either has neither this function nor the
+/// thread-local read in the production snapshot path, and a hook that panics
+/// cannot poison a release `Store`. A test sets it to commit a prune from a
+/// second connection at that one point. The hook is thread-local and runs on
+/// the reading thread. Dev-dependents enable the feature in their
+/// `[dev-dependencies]`; resolver 3 keeps it out of non-test builds.
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub fn set_generation_read_pause(hook: Option<fn()>) {
     GENERATION_READ_PAUSE.with(|slot| slot.set(hook));
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 fn fire_generation_read_pause() {
     GENERATION_READ_PAUSE.with(|slot| {
         if let Some(hook) = slot.get() {
@@ -103,6 +108,10 @@ fn fire_generation_read_pause() {
         }
     });
 }
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+#[inline(always)]
+fn fire_generation_read_pause() {}
 
 /// What a reader is told about a damaged full-text index, and what to do.
 ///
@@ -1137,6 +1146,23 @@ struct CachedSourceFreshness {
 pub struct WriterLock {
     file: Option<devmap_extract::safe_fs::SafeFile>,
     path: Option<std::path::PathBuf>,
+}
+
+/// What a writer-lock wait looks like to the caller watching it: the lock file,
+/// how long the wait has run and the bound it will end at.
+#[derive(Debug, Clone, Copy)]
+pub struct WriterLockWait<'a> {
+    pub lock_path: &'a Path,
+    pub waited: std::time::Duration,
+    pub bound: std::time::Duration,
+}
+
+impl WriterLockWait<'_> {
+    /// The pid the holder recorded, or `"unknown"`. Reads the lock file, so a
+    /// watcher that reports on every poll should ask only when it reports.
+    pub fn holder_pid(&self) -> String {
+        Store::writer_lock_holder(self.lock_path)
+    }
 }
 
 impl WriterLock {

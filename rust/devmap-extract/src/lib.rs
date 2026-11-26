@@ -44,6 +44,11 @@ pub mod lean;
 /// walks a parse tree is behind `parse`.
 pub mod markup;
 pub mod model;
+
+/// Which characters are escaped wherever outside text is shown to an agent or
+/// a terminal. Ungated, and shared by the resolver and the query layer.
+pub mod agent_text;
+
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.
 mod git_metadata;

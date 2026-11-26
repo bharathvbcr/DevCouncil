@@ -7414,14 +7414,60 @@ mod tests {
         (root, wt, lane, store)
     }
 
+    /// The `devmap` binary of the build that produced this test executable.
+    ///
+    /// A unit test gets no `CARGO_BIN_EXE_*`, and the workspace `target/` is
+    /// only where a build lands when nothing redirects it (`CARGO_TARGET_DIR`,
+    /// `--target-dir`, `build.target-dir`, a `--target` triple). The test
+    /// executable lives under the active `<target>/<profile>/` (in `deps/`, or
+    /// `build/<pkg>/<hash>/out/` under cargo's newer layout), so the nearest
+    /// ancestor directory that holds a `devmap` file is the binary of the same
+    /// build, wherever the target directory was pointed.
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_devmap_bin_in(test_exe: &Path) -> Result<PathBuf, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let is_executable = |bin: &Path| {
+            fs::metadata(bin).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        };
+        let mut found = None;
+        for dir in test_exe.ancestors().skip(1) {
+            let bin = dir.join("devmap");
+            if is_executable(&bin) {
+                found = Some(bin);
+                break;
+            }
+            // The profile directory (`target/debug`) holds `deps` or `build`;
+            // nothing above it belongs to this build.
+            if dir.join("deps").is_dir() || dir.join("build").is_dir() {
+                break;
+            }
+        }
+        found.ok_or_else(|| {
+            format!(
+                "no devmap binary in any directory above the test executable {}",
+                test_exe.display()
+            )
+        })
+    }
+
+    /// The binary for a test that spawns it. A missing binary means the gate
+    /// could not run, which is neither a pass nor evidence the code is wrong, so
+    /// it stops with a message that says exactly that and how to cover it.
+    #[cfg(all(feature = "parse", unix))]
+    fn a3_require_devmap_bin() -> PathBuf {
+        let exe = std::env::current_exe().expect("the test executable path is readable");
+        a3_devmap_bin_in(&exe).unwrap_or_else(|why| {
+            panic!(
+                "NOT COVERED (the gate could not run; this is not a code failure): {why}. \
+                 Build it into the same target directory first: \
+                 `cargo build -p devmap-cli` with the same CARGO_TARGET_DIR / --target-dir"
+            )
+        })
+    }
+
     #[cfg(all(feature = "parse", unix))]
     fn a3_run_sync_delta(wt: &Path) -> (Option<i32>, String) {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/devmap");
-        assert!(
-            bin.is_file(),
-            "build the devmap binary first: {}",
-            bin.display()
-        );
+        let bin = a3_require_devmap_bin();
         let out = Command::new(&bin)
             .arg("--root")
             .arg(wt)
@@ -7436,6 +7482,40 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             ),
         )
+    }
+
+    /// The locator follows the test executable's own target directory (not the
+    /// workspace `rust/target`) and reports a missing binary as such.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a3_devmap_bin_is_found_beside_the_test_executable_in_any_target_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_repo_dir("a3-bin-locator");
+        let deps = root.join("custom-target/debug/deps");
+        let new_layout = root.join("custom-target/debug/build/devmap-query/0b2c/out");
+        fs::create_dir_all(&deps).unwrap();
+        fs::create_dir_all(&new_layout).unwrap();
+        let exe = deps.join("devmap_query-0123abcd");
+        let exe_new = new_layout.join("devmap_query-0123abcd");
+        let err = a3_devmap_bin_in(&exe).expect_err("no binary yet");
+        assert!(err.contains("no devmap binary"), "{err}");
+        // Above the profile directory belongs to no build of this target.
+        let above = root.join("custom-target/devmap");
+        fs::write(&above, b"").unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            a3_devmap_bin_in(&exe).is_err(),
+            "a file above the profile dir"
+        );
+        // A file that is not executable is not the binary.
+        let want = root.join("custom-target/debug/devmap");
+        fs::write(&want, b"").unwrap();
+        fs::set_permissions(&want, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(a3_devmap_bin_in(&exe).is_err(), "a non-executable file");
+        fs::set_permissions(&want, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(a3_devmap_bin_in(&exe).unwrap(), want);
+        assert_eq!(a3_devmap_bin_in(&exe_new).unwrap(), want);
+        let _ = remove_readonly_tree(&root);
     }
 
     /// The recovery a read prints for "a store beside a stale lease" must
@@ -7520,8 +7600,7 @@ mod tests {
     fn a3_sync_delta_racing_a_reader_never_refuses_or_serves_a_torn_delta() {
         let (root, _anchor, lane) = a3_lane("a3-race");
         let wt = lane.canonicalize().unwrap();
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/devmap");
-        assert!(bin.is_file(), "build the devmap binary first");
+        let bin = a3_require_devmap_bin();
         for i in 0..4 {
             fs::write(
                 wt.join(format!("src/extra{i}.go")),

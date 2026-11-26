@@ -67,15 +67,21 @@ func (h *liveHost) request(method, params string) int {
 	return h.nextID
 }
 
+// frameHasID reports whether the frame's own top-level id is id, by decoding
+// it. Matching the id as text would let id 2 match 20-29.
+func frameHasID(frame string, id int) bool {
+	var r struct {
+		ID json.RawMessage `json:"id"`
+	}
+	return json.Unmarshal([]byte(frame), &r) == nil && string(r.ID) == strconv.Itoa(id)
+}
+
 // replyFor waits for the response with the given id.
 func (h *liveHost) replyFor(id int, within time.Duration) (string, bool) {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		for _, l := range h.out.lines() {
-			var r struct {
-				ID json.RawMessage `json:"id"`
-			}
-			if json.Unmarshal([]byte(l), &r) == nil && string(r.ID) == strconv.Itoa(id) {
+			if frameHasID(l, id) {
 				return l, true
 			}
 		}
@@ -207,7 +213,7 @@ func TestADuplicateInFlightIDIsRefusedAndTheOriginalSurvives(t *testing.T) {
 	var refusal string
 	for time.Now().Before(deadline) && refusal == "" {
 		for _, l := range h.out.lines() {
-			if strings.Contains(l, fmt.Sprintf(`"id":%d`, verifyID)) && strings.Contains(l, "-32600") {
+			if frameHasID(l, verifyID) && strings.Contains(l, "-32600") {
 				refusal = l
 			}
 		}

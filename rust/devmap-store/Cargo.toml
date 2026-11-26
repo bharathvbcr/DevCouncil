@@ -36,6 +36,16 @@ default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse"]
+# Compiles `db::set_generation_read_pause`, the seam that lets a test commit a
+# prune between a generation check and its read. Off in every build that is not
+# a test: dependents enable it under `[dev-dependencies]`, which resolver 3
+# keeps out of release and `cargo build` graphs.
+test-hooks = []
+
+[dev-dependencies]
+# This crate's integration tests (`tests/*.rs`) link the library without
+# `cfg(test)`, so they get the pause seam through the feature.
+devmap-store = { path = ".", default-features = false, features = ["test-hooks"] }
 
 [[test]]
 name = "retention_churn"

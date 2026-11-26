@@ -755,6 +755,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A reader polling while a writer creates the delta must see no delta or
+    /// a complete one on every poll: never a refusal. Fresh paths, many rounds.
+    #[test]
+    fn a_reader_beside_the_first_creation_of_a_delta_is_never_refused() {
+        let dir = temp_dir("first-create");
+        let mut refusals: Vec<String> = Vec::new();
+        let mut refused_rounds = 0usize;
+        for round in 0..300 {
+            let path = dir.join(format!("delta-{round}.sqlite"));
+            let barrier = std::sync::Barrier::new(2);
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let before = refusals.len();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    DeltaStore::open(&path).expect("the writer creates the delta");
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                });
+                barrier.wait();
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    match DeltaStore::open_read_only(&path) {
+                        Ok(Some(store)) => {
+                            if let Err(err) = store.load_snapshot() {
+                                refusals.push(format!("{err:#}"));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => refusals.push(format!("{err:#}")),
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+            });
+            refused_rounds += usize::from(refusals.len() > before);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            refusals.is_empty(),
+            "{refused_rounds} of 300 creations refused a polling reader ({} refusals); first: {:?}",
+            refusals.len(),
+            refusals.first()
+        );
+    }
+
     /// The schema a writer creates is whole: a fresh delta reads as a store.
     #[test]
     fn a_freshly_created_delta_reads_as_an_empty_store() {
