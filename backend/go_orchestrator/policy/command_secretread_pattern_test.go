@@ -46,7 +46,6 @@ func TestSecretReadDoesNotJudgeAProgramOperandAsAPath(t *testing.T) {
 		`grep -e '.*' README.md`,
 		`grep --regexp='.*' README.md`,
 		`grep -e foo -e '.*' README.md`,
-		`grep .env .gitignore`,
 		`egrep '.*' README.md`,
 		`fgrep '.*' README.md`,
 		`rg -n 'a:.*' src`,
@@ -189,6 +188,28 @@ func TestSecretReadProgramOperandPermutationsAndUnknownOptions(t *testing.T) {
 		`grep -Q .env.local README.md`,
 		`git grep API_KEY -- .env.local`,
 		`git grep -e x HEAD -- .env.local`,
+		// An option the table does not know, anywhere, exempts nothing: GNU
+		// grep and sed permute arguments and take abbreviations, so --reg is
+		// --regexp and .env.local is a file.
+		`grep .env.local --reg TOKEN`,
+		`grep .env.local --regex=TOKEN`,
+		`sed .env.local --expr p`,
+		// A word the shell expands is file names, not a program.
+		`grep .* README.md`,
+		`grep .env* README.md`,
+		`grep -e .env* README.md`,
+		// rg's config file and GREP_OPTIONS can supply the pattern, so a first
+		// operand that spells a credential path may be read as one.
+		`rg .env.local`,
+		`rg -- .env.local`,
+		`RIPGREP_CONFIG_PATH=/tmp/c rg .env.local`,
+		`export RIPGREP_CONFIG_PATH=/tmp/c; rg .env.local`,
+		`GREP_OPTIONS='-e TOKEN' grep .env.local`,
+		`env GREP_OPTIONS=-eX grep .env.local`,
+		`grep .env.local`,
+		// The same holds for a bare credential name searched as a regex: main
+		// refused it too, and GREP_OPTIONS='-e x' would make it the file read.
+		`grep .env .gitignore`,
 	} {
 		d := gate.EvaluateCommand(command, nil)
 		if d.Action != Deny || d.Severity != Hard || d.Rule != RuleCommandSecretRead {
@@ -200,6 +221,12 @@ func TestSecretReadProgramOperandPermutationsAndUnknownOptions(t *testing.T) {
 		`git grep -n 'a:.*'`,
 		`git grep -n 'a:.*' -- src`,
 		`git -C . grep -e '.*' -- src`,
+		// With --no-config rg reads no options from elsewhere, so its first
+		// operand is the pattern.
+		`rg --no-config .env.local src`,
+		// Judged literally, a quoted regex is not a path.
+		`rg -n 'a:.*' src`,
+		`grep -o 'gh:.*' notes.txt`,
 	} {
 		if d := allowAll.EvaluateCommand(command, nil); d.Rule == RuleCommandSecretRead {
 			t.Errorf("%q was refused as a secret read: %s", command, d.Reason)
