@@ -260,7 +260,25 @@ fn relative_gitfile_pointers_and_submodule_excludes_share_the_same_owner() {
     let resolved = devmap_extract::git_metadata(&root).unwrap().unwrap();
     assert_eq!(resolved.git_dir, metadata.canonicalize().unwrap());
     assert_eq!(resolved.common_dir, resolved.git_dir);
-    assert!(is_gitignored(&root, &root.join("hidden.py"), false).unwrap());
+    // The metadata resolver (`git_metadata`) follows the relative pointer, but
+    // the question here is what the *cold walk* indexes, and the `ignore` crate
+    // opens a relative `gitdir:` against the process rather than the worktree
+    // and reads `info/exclude` only behind a `commondir` file. So the walk
+    // yields `hidden.py`, and the watcher must say the same: a verdict that
+    // excluded it would drop what the next `devmap build` re-adds, forever.
+    // (Making the walk honour such an exclude is a change to what it indexes,
+    // and so to extraction identity.)
+    let (sources, _) = collect_sources_with_report(&root).unwrap();
+    let walk_yields = sources.iter().any(|(path, _)| path == "hidden.py");
+    assert_eq!(
+        is_gitignored(&root, &root.join("hidden.py"), false).unwrap(),
+        !walk_yields,
+        "the watcher and the cold walk must agree on a file behind a relative gitdir pointer"
+    );
+    assert!(
+        walk_yields,
+        "characterization: the cold walk does not read an exclude behind a relative gitdir pointer"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
