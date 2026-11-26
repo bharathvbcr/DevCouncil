@@ -3640,7 +3640,17 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir.canonicalize().expect("canonical scratch dir")
+        let canonical = dir.canonicalize().expect("canonical scratch dir");
+        // Windows canonicalizes to a verbatim `\\?\C:\...` path, which git
+        // refuses as a worktree or submodule location; the drive form names
+        // the same directory.
+        match canonical
+            .to_str()
+            .and_then(|text| text.strip_prefix(r"\\?\"))
+        {
+            Some(rest) => PathBuf::from(rest),
+            None => canonical,
+        }
     }
 
     fn init_repo(dir: &Path) {
