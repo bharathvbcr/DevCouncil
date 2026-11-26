@@ -48,7 +48,13 @@ pub(crate) async fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         // Before the store is touched: this must create no file and open
         // no database, so it can be run against a repository that has
         // never been indexed — which is when a user configures a host.
-        let executable = std::env::current_exe()?;
+        // The same resolution plugin and integrate use: an in-repository build
+        // is refused here too rather than printed as a config to paste.
+        let executable = claude::reachable_command(
+            &std::env::current_exe()?,
+            None,
+            claude::cwd_repository()?.as_deref(),
+        )?;
         // One owner for "how do I reach this server": the plugin bundle
         // calls the same builder, so a host configured from one cannot
         // point at a different server than a host configured from the

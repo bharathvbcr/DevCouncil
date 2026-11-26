@@ -305,6 +305,379 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
     out
 }
 
+/// One existing host entry that launches `devmap`: where it lives, the host to
+/// re-integrate, and every word it passes (command, then args; or the
+/// shell-split words of a hook command string).
+struct HostEntry {
+    at: String,
+    rewrite: &'static str,
+    /// A hook handler in a file `devmap integrate` does not own the commands
+    /// of, as opposed to a server registration it rewrites.
+    hook: bool,
+    words: Vec<String>,
+}
+
+/// What a diagnostic could and could not read of the host documents.
+#[derive(Default)]
+struct HostEntries {
+    entries: Vec<HostEntry>,
+    /// Documents that exist but could not be read or parsed. Not clean, not a
+    /// defect: unknown.
+    unchecked: Vec<String>,
+}
+
+impl HostEntries {
+    /// `Some(text)` for a document that exists; a missing one is not an entry.
+    fn read(&mut self, path: &Path) -> Option<String> {
+        match integrate::read_host_config(path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                self.unchecked
+                    .push(format!("could not check {}: {error}", path.display()));
+                None
+            }
+        }
+    }
+
+    fn read_json(&mut self, path: &Path) -> Option<serde_json::Value> {
+        let text = self.read(path)?;
+        match serde_json::from_str(&text) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.unchecked.push(format!(
+                    "could not check {}: not strict JSON ({error}); a BOM or comments hide its entries from this check",
+                    path.display()
+                ));
+                None
+            }
+        }
+    }
+}
+
+/// Every `devmap` launch an existing host entry makes: MCP documents, Codex's
+/// `config.toml`, and the hook handlers in Cursor's `hooks.json` and Claude
+/// Code's settings files.
+fn host_devmap_entries(home: Option<&Path>, cwd: &Path) -> HostEntries {
+    let mut found = HostEntries::default();
+    for site in host_mcp_config_sites(home, cwd) {
+        let Some(host) = site.host else { continue };
+        let Some(value) = found.read_json(&site.path) else {
+            continue;
+        };
+        let Some(entry) = value.pointer("/mcpServers/devmap") else {
+            continue;
+        };
+        let mut words: Vec<String> = entry
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        words.extend(
+            entry
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
+        let rewrite = match host {
+            McpHost::Cursor => "cursor",
+            McpHost::ClaudeCode => "claude",
+        };
+        found.entries.push(HostEntry {
+            at: site.path.display().to_string(),
+            rewrite,
+            hook: false,
+            words,
+        });
+    }
+    if let Some(home) = home {
+        let codex = home.join(".codex").join("config.toml");
+        if let Some(text) = found.read(&codex) {
+            match text.parse::<toml::Table>() {
+                Ok(table) => {
+                    if let Some(entry) = table
+                        .get("mcp_servers")
+                        .and_then(|servers| servers.get(claude::MCP_SERVER_NAME))
+                    {
+                        let mut words: Vec<String> = entry
+                            .get("command")
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_string)
+                            .into_iter()
+                            .collect();
+                        words.extend(
+                            entry
+                                .get("args")
+                                .and_then(toml::Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(toml::Value::as_str)
+                                .map(str::to_string),
+                        );
+                        found.entries.push(HostEntry {
+                            at: codex.display().to_string(),
+                            rewrite: "codex",
+                            hook: false,
+                            words,
+                        });
+                    }
+                }
+                Err(error) => found.unchecked.push(format!(
+                    "could not check {}: not valid TOML ({error})",
+                    codex.display()
+                )),
+            }
+        }
+    }
+    let mut hook_files: Vec<(PathBuf, &'static str)> =
+        vec![(cwd.join(".cursor").join("hooks.json"), "cursor")];
+    for name in ["settings.json", "settings.local.json"] {
+        hook_files.push((cwd.join(".claude").join(name), "claude"));
+    }
+    if let Some(home) = home {
+        hook_files.push((home.join(".cursor").join("hooks.json"), "cursor"));
+        hook_files.push((
+            claude::claude_config_dir(home).join("settings.json"),
+            "claude",
+        ));
+    }
+    for (path, rewrite) in hook_files {
+        let Some(value) = found.read_json(&path) else {
+            continue;
+        };
+        let mut commands = Vec::new();
+        collect_hook_commands(
+            value.get("hooks").unwrap_or(&serde_json::Value::Null),
+            &mut commands,
+        );
+        for command in commands {
+            found.entries.push(HostEntry {
+                at: path.display().to_string(),
+                rewrite,
+                hook: true,
+                words: shell_words(&command),
+            });
+        }
+    }
+    found
+}
+
+fn collect_hook_commands(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                match (key.as_str(), child.as_str()) {
+                    ("command", Some(command)) => out.push(command.to_string()),
+                    _ => collect_hook_commands(child, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_hook_commands(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Split a shell command string into words the way a POSIX shell would for
+/// quoting: single quotes are literal, double quotes allow backslash escapes,
+/// a backslash outside quotes escapes the next character, and unquoted `;|&()`
+/// and whitespace separate words. Expansion is not performed: `$VAR` stays
+/// text, which is what lets the caller see it.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    current.push(q);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                if !matches!(next, '"' | '\\' | '$' | '`') {
+                                    current.push('\\');
+                                }
+                                current.push(next);
+                            }
+                        }
+                        other => current.push(other),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            c if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`') => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            other => {
+                in_word = true;
+                current.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
+/// The file name of `word` names devmap: `devmap`, or `devmap` with an
+/// executable extension (`.exe`, `.cmd`, `.bat`, `.ps1`, any case).
+fn word_references_devmap(word: &str) -> bool {
+    Path::new(word).file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name == claude::PLUGIN_NAME
+            || ["exe", "cmd", "bat", "ps1"]
+                .iter()
+                .any(|ext| name.strip_prefix("devmap.") == Some(ext))
+    })
+}
+
+/// A `-c`-family flag cluster: `-c`, `-lc`, `-ic`, `-ec`, …
+fn is_command_flag(word: &str) -> bool {
+    word.strip_prefix('-').is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('c')
+    })
+}
+
+/// The pieces of a word a shell would run separately: split at command
+/// substitution and grouping characters, so `\`./devmap\`` and `$(./devmap` show
+/// the path they run.
+fn word_pieces(word: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(word).chain(
+        word.split(|c: char| matches!(c, '`' | '(' | ')' | ';' | '|' | '&') || c.is_whitespace())
+            .filter(move |piece| !piece.is_empty() && *piece != word),
+    )
+}
+
+/// Every word an entry can run, with the words of any `sh -c`-family payload
+/// expanded recursively (bounded).
+fn expand_launch_words(words: &[String], depth: u8) -> Vec<String> {
+    let mut out = words.to_vec();
+    if depth >= 4 {
+        return out;
+    }
+    for (i, word) in words.iter().enumerate() {
+        let shell = Path::new(word).file_name().is_some_and(|name| {
+            matches!(name.to_str(), Some("sh" | "bash" | "zsh" | "dash" | "ksh"))
+        });
+        if !shell {
+            continue;
+        }
+        if let Some(flag) = words[i + 1..].iter().position(|w| is_command_flag(w)) {
+            if let Some(payload) = words.get(i + 1 + flag + 1) {
+                out.extend(expand_launch_words(&shell_words(payload), depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// The exact edit that fixes a flagged entry. A server registration is
+/// rewritten by `devmap integrate`; a hook handler is not, so it is named.
+fn remedy(entry: &HostEntry, word: &str) -> String {
+    if !entry.hook {
+        return format!(
+            "rewrite it with `devmap integrate {}` from an installed devmap",
+            entry.rewrite
+        );
+    }
+    let canonical = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .map(|exe| exe.display().to_string())
+        .unwrap_or_else(|_| "the absolute path of an installed devmap".to_string());
+    format!(
+        "edit {} and replace {word:?} with \"{canonical}\"",
+        entry.at
+    )
+}
+
+/// Existing host entries that run a relative, environment-expanded or
+/// in-repository `devmap`, and the documents this check could not read.
+///
+/// Configs written by earlier binaries resolved `devmap` against the working
+/// directory, so a repository file named `devmap` could be the command a host
+/// ran in every session. Every word of every entry is judged by
+/// [`claude::judge_command_word`], so a launcher (`env`, `sh -c`, `bash -lc`,
+/// a command substitution, a `cd … &&` prefix) does not hide it. A document
+/// that cannot be parsed, or a word that cannot be judged, is reported as
+/// "could not check", never as clean.
+pub(crate) fn host_command_defect_warning(cwd: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // The tree doctor was asked about is the repository: its git top, or itself
+    // when it has none; never the home directory.
+    let home_canonical = home.as_deref().and_then(|home| home.canonicalize().ok());
+    let repo = cwd
+        .canonicalize()
+        .ok()
+        .map(|root| devmap_extract::git_worktree_root(&root).unwrap_or(root))
+        .filter(|top| Some(top) != home_canonical.as_ref());
+    command_defects(
+        &host_devmap_entries(home.as_deref(), cwd),
+        home.as_deref(),
+        repo.as_deref(),
+    )
+}
+
+fn command_defects(
+    found: &HostEntries,
+    home: Option<&Path>,
+    repo: Option<&Path>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for entry in &found.entries {
+        for word in expand_launch_words(&entry.words, 0) {
+            for piece in word_pieces(&word) {
+                if !word_references_devmap(piece) {
+                    continue;
+                }
+                match claude::judge_command_word(piece, home, repo) {
+                    Ok(verdict) => {
+                        if let Some(why) = verdict.defect() {
+                            parts.push(format!(
+                                "{}: {piece:?} {why}; {}",
+                                entry.at,
+                                remedy(entry, piece)
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        parts.push(format!("could not check {}: {piece:?}: {error}", entry.at))
+                    }
+                }
+            }
+        }
+    }
+    parts.extend(found.unchecked.iter().cloned());
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 fn resolve_devmap_command(command: &str) -> PathBuf {
     let path = PathBuf::from(command);
     if command.contains('/') || command.contains('\\') {
@@ -331,7 +704,7 @@ fn resolve_on_path(command: &str) -> Option<PathBuf> {
 }
 
 fn read_devmap_command_from_mcp_config(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = integrate::read_host_config(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let servers = value.get("mcpServers")?.as_object()?;
     let entry = servers.get("devmap")?;
@@ -474,7 +847,7 @@ pub(crate) fn missing_binary_warning(binaries: &[serde_json::Value]) -> Option<S
 }
 
 fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = integrate::read_host_config(path) else {
         return false;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -499,7 +872,7 @@ fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
 }
 
 fn mcp_entry_is_pinned(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = integrate::read_host_config(path) else {
         return false;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -711,7 +1084,7 @@ pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
     let config_dir = claude::claude_config_dir(&home);
     let global = claude::claude_global_config(&home);
     let read_json = |path: &Path| -> Result<Option<serde_json::Value>, String> {
-        match std::fs::read_to_string(path) {
+        match integrate::read_host_config(path) {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
                 .map_err(|error| format!("{} is not JSON: {error}", path.display())),
@@ -1055,7 +1428,7 @@ fn plugin_health(home: &Path) -> PluginHealth {
                 dir.display()
             )),
         }
-        if let Ok(text) = std::fs::read_to_string(&hooks) {
+        if let Ok(text) = integrate::read_host_config(&hooks) {
             if text.contains("\"args\"") || text.contains("\"async\"") {
                 issues.push(format!(
                     "{}: hooks still use args/async; regenerate with `devmap claude plugin` \
@@ -1086,15 +1459,12 @@ fn plugin_health(home: &Path) -> PluginHealth {
                                 if let Some(command) =
                                     handler.get("command").and_then(serde_json::Value::as_str)
                                 {
-                                    let trimmed = command.trim();
-                                    if !trimmed.contains('/')
-                                        && !trimmed.contains('\\')
-                                        && !trimmed.contains(' ')
-                                    {
+                                    if let Some(why) = claude::command_word_defect(command) {
                                         issues.push(format!(
-                                            "{}: bare-name hook command {trimmed:?}; use an \
-                                             absolute shell-form path",
-                                            hooks.display()
+                                            "{}: hook command {:?} starts with an executable that \
+                                             {why}; use an absolute shell-form path",
+                                            hooks.display(),
+                                            command.trim()
                                         ));
                                     }
                                 }
@@ -1108,7 +1478,7 @@ fn plugin_health(home: &Path) -> PluginHealth {
 
     // Codex trust records naming a missing hooks.json.
     let codex_config = home.join(".codex").join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(&codex_config) {
+    if let Ok(text) = integrate::read_host_config(&codex_config) {
         if let Ok(table) = text.parse::<toml::Table>() {
             if let Some(trust) = table.get("hooks").and_then(|v| v.get("trust")) {
                 if let Some(map) = trust.as_table() {
@@ -1673,5 +2043,42 @@ mod tests {
         assert_eq!(dirty_flag("unknown"), (true, "unknown"));
         assert_eq!(dirty_flag(""), (true, "unknown"));
         assert_eq!(dirty_flag("2"), (true, "unknown"));
+    }
+
+    #[test]
+    fn an_unjudgeable_word_is_could_not_check_never_clean() {
+        let found = HostEntries {
+            entries: vec![HostEntry {
+                at: "cfg".to_string(),
+                rewrite: "cursor",
+                hook: false,
+                words: vec!["/usr/bin/devmap".to_string(), "mcp".to_string()],
+            }],
+            unchecked: Vec::new(),
+        };
+        // The repository cannot be resolved, so the word cannot be judged.
+        let warning = command_defects(
+            &found,
+            None,
+            Some(Path::new("/nonexistent/repo/for/doctor")),
+        )
+        .expect("an evaluation error must be reported");
+        assert!(warning.contains("could not check cfg"), "{warning}");
+        // Judged against no repository, the same entry is fine.
+        assert_eq!(command_defects(&found, None, None), None);
+    }
+
+    #[test]
+    fn shell_words_and_pieces_show_substitution_and_cluster_payloads() {
+        assert_eq!(
+            shell_words("\"$P\"/devmap hook x"),
+            ["$P/devmap", "hook", "x"]
+        );
+        let words = expand_launch_words(&shell_words("bash -lc './devmap hook x'"), 0);
+        assert!(words.iter().any(|w| w == "./devmap"), "{words:?}");
+        let pieces: Vec<&str> = word_pieces("$(./devmap").collect();
+        assert!(pieces.contains(&"./devmap"), "{pieces:?}");
+        assert!(word_references_devmap("DEVMAP.PS1") && word_references_devmap("./devmap.cmd"));
+        assert!(!word_references_devmap("devmapper") && !word_references_devmap("devmap.txt"));
     }
 }

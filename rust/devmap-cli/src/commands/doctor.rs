@@ -7,8 +7,9 @@ use crate::agents;
 use crate::cli::Cli;
 use crate::installation::{
     binaries_skew_warning, build_identity_json, duplicate_mcp_registration_warning,
-    inventory_devmap_binaries, mcp_registration_inventory, missing_binary_warning,
-    plugin_cleanup_note, plugin_warning, post_tool_use_matcher_warning, profile_hooks_warning,
+    host_command_defect_warning, inventory_devmap_binaries, mcp_registration_inventory,
+    missing_binary_warning, plugin_cleanup_note, plugin_warning, post_tool_use_matcher_warning,
+    profile_hooks_warning,
     stale_server_warning, stray_state_warning,
 };
 use crate::output::emit_json;
@@ -57,6 +58,9 @@ fn doctor_report(
         "binaries": binaries,
         "binary_skew_warning": skew,
         "missing_binary_warning": missing_binary_warning(&binaries),
+        "host_command_defect_warning": host_command_defect_warning(
+            &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+        ),
         "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
         "stray_state_warning": stray_state_warning(),
         "skills_receipt_warning": skills_receipt_warning(root),

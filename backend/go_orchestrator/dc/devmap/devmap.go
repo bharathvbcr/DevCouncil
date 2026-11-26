@@ -1221,6 +1221,13 @@ func (o invocation) failure(command string) error {
 
 // invoke runs one bounded `devmap --json …`, with stdin when given.
 func (c *Client) invoke(ctx context.Context, timeout time.Duration, stdin []byte, args ...string) (invocation, error) {
+	return c.invokeIn(ctx, c.Root, timeout, stdin, args...)
+}
+
+// invokeIn is invoke with the working directory named. Queries run in the
+// repository they ask about; the commands that write host configuration run
+// elsewhere (see install).
+func (c *Client) invokeIn(ctx context.Context, dir string, timeout time.Duration, stdin []byte, args ...string) (invocation, error) {
 	if c.Binary == "" {
 		return invocation{}, errors.New("no devmap binary configured")
 	}
@@ -1237,7 +1244,7 @@ func (c *Client) invoke(ctx context.Context, timeout time.Duration, stdin []byte
 	cmd := exec.CommandContext(ctx, c.Binary, full...)
 	// See proc.ConfigureGroup: the deadline must reach the whole group.
 	proc.ConfigureGroup(cmd)
-	cmd.Dir = c.Root
+	cmd.Dir = dir
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
