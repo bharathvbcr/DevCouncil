@@ -149,7 +149,15 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		if command == "git" {
 			reads = gitContentSubcommands[gitSub]
 		}
-		if !reads || program.exempt[i] {
+		if !reads {
+			continue
+		}
+		if program.exempt[i] {
+			if program.literal[i] {
+				if reason := secretOperandReasonLiteral(text, operandRoot); reason != "" {
+					return fmt.Sprintf("`%s` names %s", command, reason), false
+				}
+			}
 			continue
 		}
 		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
@@ -251,6 +259,18 @@ func gitSubcommand(words []shellWord) string {
 // secretOperandReason judges one operand, and each piece of a `rev:path` around
 // the colon. It returns the clause for the refusal, or "".
 func secretOperandReason(operand, root string) string {
+	return secretOperandReasonMode(operand, root, true)
+}
+
+// secretOperandReasonLiteral is secretOperandReason without wildcard
+// expansion: the operand is judged as the path it spells. It is for a word
+// that is a program unless options from outside the command line say
+// otherwise, where `.*` is a regex but `.env.local` may be a file.
+func secretOperandReasonLiteral(operand, root string) string {
+	return secretOperandReasonMode(operand, root, false)
+}
+
+func secretOperandReasonMode(operand, root string, expandGlobs bool) string {
 	candidates := []string{operand}
 	if strings.Contains(operand, ":") {
 		candidates = append(candidates, strings.Split(operand, ":")...)
@@ -277,7 +297,7 @@ func secretOperandReason(operand, root string) string {
 					"devcouncil_read_file.", candidate)
 			}
 		}
-		if root != "" && strings.ContainsAny(candidate, "*?[") {
+		if expandGlobs && root != "" && strings.ContainsAny(candidate, "*?[") {
 			if matched := globMatchesSecret(root, candidate); matched != "" {
 				return fmt.Sprintf("a wildcard (`%s`) that matches a path holding credentials (`%s`), "+
 					"whose contents would enter the model's context.", candidate, matched)
