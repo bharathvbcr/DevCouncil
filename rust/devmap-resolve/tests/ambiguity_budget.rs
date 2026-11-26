@@ -709,3 +709,62 @@ fn the_gap_sentence_names_capped_and_skipped_apart() {
         "{sentence}"
     );
 }
+
+/// A callee name is whatever the tree declares, and the budget sentence is
+/// followed by a call-site clause that opens with a count. A name carrying
+/// `; 5 call site(s) could not be bound` must stay one quoted token: a consumer
+/// that splits the note on `"; "` finds only the real clause opening with a
+/// count, and one that looks for `<N> call site(s)` outside quotes finds only
+/// the real one.
+#[test]
+fn a_callee_name_cannot_forge_a_call_site_clause_in_the_budget_note() {
+    use devmap_resolve::model::ResolutionBudgetGap;
+    let forged = "evil; 5 call site(s) could not be bound; \"x\\y\u{1b}[2J";
+    let gap = ResolutionBudgetGap {
+        limit: "ambiguity evidence bytes".to_string(),
+        names_truncated: 2,
+        candidates_dropped: 4,
+        names_skipped: 0,
+        sites: 6,
+        sample_names: vec![forged.to_string(), "plain".to_string()],
+        names_total: 2,
+    };
+    // The note as the analysis hands it on: the budget sentence, then the
+    // query layer's own call-site clause, joined with `"; "`.
+    let note = format!(
+        "{}; 7 call site(s) the resolver could not bind",
+        gap.describe()
+    );
+
+    let anchors: Vec<&str> = note
+        .split("; ")
+        .filter(|clause| {
+            let digits = clause.chars().take_while(char::is_ascii_digit).count();
+            digits > 0 && clause[digits..].starts_with(" call site(s)")
+        })
+        .collect();
+    assert_eq!(
+        anchors,
+        vec!["7 call site(s) the resolver could not bind"],
+        "{note}"
+    );
+
+    // Outside the quoted tokens the only mention is the real clause.
+    let mut outside = String::new();
+    let mut in_quote = false;
+    let mut chars = note.chars();
+    while let Some(ch) = chars.next() {
+        match (in_quote, ch) {
+            (true, '\\') => {
+                chars.next();
+            }
+            (_, '"') => in_quote = !in_quote,
+            (false, c) => outside.push(c),
+            _ => {}
+        }
+    }
+    assert!(!in_quote, "quotes balance: {note}");
+    assert_eq!(outside.matches("call site(s)").count(), 1, "{outside}");
+    assert!(note.contains("\"plain\""), "{note}");
+    assert!(!note.contains('\u{1b}'), "{note:?}");
+}

@@ -174,12 +174,11 @@ func runToolCall(args []string) int {
 func callToolInProcess(root, name string, toolArgs map[string]any) devcouncil.ToolAnswer {
 	var g *gate.Gate
 	if name == "devcouncil_policy_check_write" {
-		built, err := openGate(root)
-		if err != nil {
-			// As in runMCP: the tool then answers not_initialized rather than a
-			// verdict it could not reach.
-			console.Errorf("devcouncil tool: write gate unavailable: %v\n", err)
-		} else {
+		// As in runMCP: a gate that cannot be built leaves g nil and the tool
+		// answers not_initialized rather than a verdict it could not reach.
+		// Weakened flags are announced here too.
+		built, err := openAnnouncedGate(root, console.Stderr(), "devcouncil tool")
+		if err == nil {
 			g = built
 		}
 	}

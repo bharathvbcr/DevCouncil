@@ -92,6 +92,33 @@ fn an_orphan_beside_a_new_store_is_swept_and_the_lock_is_released() {
     drop(Store::lock_writer_at(&db, Duration::from_millis(200)).expect("lock released"));
 }
 
+/// A wait on a held lock is shown to its watcher while it runs, names the
+/// holder, and ends when the watcher says so, long before the bound.
+#[test]
+fn a_watched_wait_reports_the_holder_and_ends_when_the_watcher_breaks_it() {
+    let dir = scratch("watched");
+    let db = dir.join("devmap.sqlite");
+    let _held = Store::lock_writer_at(&db, Duration::from_secs(5)).unwrap();
+    let mut polls = 0u32;
+    let mut holder = String::new();
+    let started = std::time::Instant::now();
+    let error = Store::lock_writer_at_watched(&db, Duration::from_secs(60), &mut |wait| {
+        polls += 1;
+        assert_eq!(wait.bound, Duration::from_secs(60));
+        holder = wait.holder_pid();
+        if polls >= 3 {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+    .expect_err("a broken wait is a refusal");
+    assert!(error.to_string().contains("was cancelled"), "{error:#}");
+    assert_eq!(polls, 3);
+    assert_eq!(holder, std::process::id().to_string());
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
 /// A store created while a seed holds the lock, with no orphan beside it, must
 /// also wait: otherwise the seed's final placement replaces the empty store the
 /// open made, and the open's connection is left on a deleted file.

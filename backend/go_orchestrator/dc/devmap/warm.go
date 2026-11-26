@@ -117,6 +117,7 @@ func (c *Client) Close() error {
 	if c == nil || c.warmShared {
 		return nil
 	}
+	c.closeProbe()
 	c.warmMu.Lock()
 	sess := c.warm
 	c.warm = nil
