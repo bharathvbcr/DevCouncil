@@ -6,11 +6,13 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
-const CWD: &str = if cfg!(windows) {
-    "C:/checkout"
-} else {
-    "/checkout"
-};
+mod support;
+
+/// The fixture checkout, created on first use. `runs.prepare` resolves checkout
+/// paths, so it must be a real directory.
+fn cwd() -> String {
+    support::checkout_dir("checkout")
+}
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn call(s: &Store, method: &str, input: &str) -> String {
@@ -42,11 +44,12 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     let clock = Arc::new(AtomicI64::new(1000));
     let time = clock.clone();
     s.set_clock(move || time.load(Ordering::SeqCst));
+    let cwd = cwd();
     call(
         &s,
         "repositories.put",
         &format!(
-            r#"{{"id":"r","request_id":"repo","expected_revision":0,"name":"Repo","identity_key":"local:{CWD}/.git"}}"#
+            r#"{{"id":"r","request_id":"repo","expected_revision":0,"name":"Repo","identity_key":"local:{cwd}/.git"}}"#
         ),
     );
     for task in ["t", "u"] {
@@ -61,7 +64,7 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     (s, clock)
 }
 fn prepare(s: &Store, run: &str, task: &str) {
-    let cwd = CWD;
+    let cwd = cwd();
     call(
         s,
         "runs.prepare",

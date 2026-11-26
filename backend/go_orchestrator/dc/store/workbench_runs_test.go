@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -30,6 +31,10 @@ func TestWorkbenchLaunchClaimRemainsConsumedAfterHostRestart(t *testing.T) {
 	}
 	root := filepath.Join(t.TempDir(), "checkout with spaces")
 	common := filepath.Join(root, ".git")
+	// runs.prepare resolves the checkout paths and refuses one that is not a directory.
+	if err := os.MkdirAll(common, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	call("repositories.put", fmt.Sprintf(`{"id":"repo","request_id":"repo","expected_revision":0,"name":"Manvi","identity_key":%s}`, quote("local:"+common)))
 	call("items.put", `{"id":"task","request_id":"task","expected_revision":0,"title":"Keep E42","description":"Exact source must survive restart","repository_ids":["repo"],"primary_repository_id":"repo"}`)
 	prepare := fmt.Sprintf(`{"id":"run","request_id":"prepare","expected_revision":0,"task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"inspect","cwd":%s,"git_dir":%s,"git_common_dir":%s,"head_oid":null}`, quote(root), quote(common), quote(common))

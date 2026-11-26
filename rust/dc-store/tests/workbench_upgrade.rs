@@ -191,11 +191,11 @@ fn store_upgrade_reports_what_it_did_and_a_refusing_host_cannot_run_it() {
     assert_eq!(upgraded, 0);
 }
 
-const CWD: &str = if cfg!(windows) {
-    "C:/checkout"
-} else {
-    "/checkout"
-};
+/// The fixture checkout, created on first use. `runs.prepare` resolves checkout
+/// paths, so it must be a real directory.
+fn cwd() -> String {
+    support::checkout_dir("checkout")
+}
 
 fn call(store: &Store, method: &str, input: &str) -> String {
     store
@@ -240,11 +240,12 @@ fn profile_with_ci_signal() -> (Scratch, PathBuf) {
     let dir = Scratch::new();
     let path = dir.path().join("profile.sqlite");
     let store = Store::open(&path).unwrap();
+    let cwd = cwd();
     call(
         &store,
         "repositories.put",
         &format!(
-            r#"{{"id":"r","request_id":"repo","expected_revision":0,"name":"Repo","identity_key":"local:{CWD}/.git"}}"#
+            r#"{{"id":"r","request_id":"repo","expected_revision":0,"name":"Repo","identity_key":"local:{cwd}/.git"}}"#
         ),
     );
     call(
@@ -256,7 +257,7 @@ fn profile_with_ci_signal() -> (Scratch, PathBuf) {
         &store,
         "runs.prepare",
         &format!(
-            r#"{{"id":"run","request_id":"prepare","expected_revision":0,"task_id":"t","source_revision":1,"repository_id":"r","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"{CWD}","git_dir":"{CWD}/.git","git_common_dir":"{CWD}/.git","head_oid":null}}"#
+            r#"{{"id":"run","request_id":"prepare","expected_revision":0,"task_id":"t","source_revision":1,"repository_id":"r","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"{cwd}","git_dir":"{cwd}/.git","git_common_dir":"{cwd}/.git","head_oid":null}}"#
         ),
     );
     call(

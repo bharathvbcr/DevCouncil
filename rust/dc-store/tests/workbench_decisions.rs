@@ -4,6 +4,8 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
+mod support;
+
 fn call(s: &Store, method: &str, raw: &str) -> String {
     s.workbench_request(method, raw)
         .unwrap_or_else(|e| panic!("{method}: {e}"))
@@ -23,11 +25,7 @@ fn fixture() -> (Store, Arc<AtomicI64>) {
     let clock = Arc::new(AtomicI64::new(1000));
     let c = clock.clone();
     s.set_clock(move || c.load(Ordering::SeqCst));
-    let root = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let root = support::checkout_dir("checkout");
     call(
         &s,
         "repositories.put",
@@ -357,11 +355,7 @@ fn repository_revision_and_invalid_authority_fields_are_checked_before_a_decisio
             .is_err()
         );
     }
-    let root = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let root = support::checkout_dir("checkout");
     call(
         &s,
         "repositories.put",
@@ -552,11 +546,8 @@ fn change_review_refuses_an_unresolved_or_never_claimed_run() {
         .code,
         "invalid_state"
     );
-    let root = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let root = support::checkout_dir("checkout");
+    std::fs::create_dir_all(format!("{root}/other/.git")).unwrap();
     call(
         &s,
         "runs.prepare",
@@ -855,11 +846,7 @@ fn host_review_freshness_ignores_run_checkout_and_revisions_but_not_expiry() {
         "items.put",
         r#"{"id":"t","request_id":"edit","expected_revision":1,"title":"Changed task","repository_ids":["r"],"primary_repository_id":"r"}"#,
     );
-    let root = if cfg!(windows) {
-        "C:/checkout"
-    } else {
-        "/checkout"
-    };
+    let root = support::checkout_dir("checkout");
     call(
         &s,
         "repositories.put",
