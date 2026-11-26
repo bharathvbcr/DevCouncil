@@ -274,6 +274,13 @@ func peelCommand(words []shellWord) commandPeel {
 	wrapped := false
 	for i := 0; i < len(words); i++ {
 		word := words[i]
+		// A command word the shell computes behind a wrapper, quoted or not
+		// (`nice "$@"`, `timeout 5 $X`), is not one the gate can name.
+		if wrapped && word.expands {
+			p.computed, p.computedAt = word.text, i
+			p.at = guessCommandWord(words, i+1)
+			return p
+		}
 		if word.quotedHead {
 			p.at = i
 			return p
@@ -298,11 +305,6 @@ func peelCommand(words []shellWord) commandPeel {
 			i = next - 1
 			wrapped = true
 			continue
-		}
-		if wrapped && word.expands {
-			p.computed, p.computedAt = word.text, i
-			p.at = guessCommandWord(words, i+1)
-			return p
 		}
 		p.at = i
 		return p

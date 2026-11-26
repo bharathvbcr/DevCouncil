@@ -141,11 +141,20 @@ func lineBindings(command string) (values map[string][]string, dropped map[strin
 			}
 		}
 	}
+	// A name the line may also hold something else in keeps its literal
+	// values, each still a reading, and gains one more: the reference itself,
+	// left for the rungs to judge by its spelling. Dropping the literal values
+	// instead would let `F=.env; export F; cat "$F"` hide the credential it
+	// names behind an unbound variable.
 	for name := range unbindableNames(command) {
-		if name != "HOME" && name != "TMPDIR" {
-			delete(values, name)
-			delete(dropped, name)
+		if name == "HOME" || name == "TMPDIR" || len(values[name]) == 0 {
+			continue
 		}
+		if len(values[name]) >= maxBindingValues {
+			dropped[name] = true
+			continue
+		}
+		values[name] = append(values[name], "${"+name+"}")
 	}
 	values["~"] = values["HOME"]
 	return values, dropped

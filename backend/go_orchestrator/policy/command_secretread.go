@@ -62,15 +62,29 @@ const maxGlobMatchesJudged = 1024
 func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
 	peel := peelCommand(words)
+	// The line a wrapper parses itself (env -S) is judged as a clause of its
+	// own. The clause as written is judged too, as before the wrapper table
+	// (every word after the first wrapper): its redirections, and the words
+	// after the string as the shell spells them (a glob, an unbound variable),
+	// which the reparse sees only quoted.
+	reparsedReason := ""
 	if peel.reparse != "" {
-		return secretOperandViolation(reparseLine(peel.reparse, peel.reparseRest), root)
+		if reason, unverifiable := secretOperandViolation(reparseLine(peel.reparse, peel.reparseRest), root); reason != "" {
+			if !unverifiable {
+				return reason, false
+			}
+			reparsedReason = reason
+		}
 	}
 	// An option the wrapper table does not describe leaves the command behind
 	// it unknowable. The clause is then read as before the table existed
 	// (readerBehindWrapper from the first wrapper, every later word judged), so
 	// a spelled credential is still the hard refusal, and the unknown option is
 	// only the unverifiable reason when nothing harder fires.
-	commandAt, unknownReason := peel.at, ""
+	commandAt, unknownReason := peel.at, reparsedReason
+	if peel.reparse != "" {
+		commandAt = -1
+	}
 	if peel.unknown != "" {
 		commandAt = -1
 		unknownReason = fmt.Sprintf("a wrapper is handed an option (`%s`) the gate cannot step over to the command it runs, "+
