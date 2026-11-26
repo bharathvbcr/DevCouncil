@@ -111,7 +111,7 @@ HLSL).
 | Need | Tool |
 | --- | --- |
 | Where a symbol lives, callers, blast radius, dead code, affected tests | **DevMap** (`devmap_*` MCP tools or the `devmap` CLI). GitNexus is retired; do not install or consult it. |
-| What else is live in this repo: worktrees, agent sessions, contended files | **GitPulse Insights** (`gitpulse_insights`, `gitpulse_collision_risk`) |
+| What else is live in this repo: worktrees, agent sessions, contended files | **GitPulse Insights** (`waylode_insights`, `waylode_collision_risk`; the old `gitpulse_*` names are still accepted) |
 | Go hosting a Rust engine | **gusset** |
 | GEMM / NN kernels on Apple silicon | **tessl** (Rust, Metal 4; C ABI in `src/capi.rs`) |
 | An embeddable agent harness | **MANVI** (Go + Rust, zero-cgo, component contract over stdio) |

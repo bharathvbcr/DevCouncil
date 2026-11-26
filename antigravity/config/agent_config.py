@@ -92,8 +92,10 @@ class LocalAgentConfig:
     skills_paths: List[str] = field(default_factory=list)
 
     def get_server(self, name: str) -> Optional[BaseMcpServerConfig]:
+        # The pre-rename key resolves to the renamed server.
+        wanted = SERVER_KEY_ALIASES.get(name, name)
         for s in self.mcp_servers:
-            if s.name == name:
+            if s.name == wanted:
                 return s
         return None
 
@@ -134,6 +136,10 @@ DEVMAP_TOOLS = [
     "devmap_doc_drift",
 ]
 
+# Waylode is the new name of GitPulse. The server lists ``waylode_<x>`` and keeps
+# accepting ``gitpulse_<x>``, but a host started before the rename still lists the
+# old names, so an allowlist carries both. Drop GITPULSE_TOOLS (and the
+# ``gitpulse`` server alias below) once no host serves the old names.
 GITPULSE_TOOLS = [
     "gitpulse_insights",
     "gitpulse_status",
@@ -159,6 +165,14 @@ GITPULSE_TOOLS = [
     "gitpulse_agent_inbox",
     "gitpulse_agent_wait",
 ]
+
+WAYLODE_TOOLS = [name.replace("gitpulse_", "waylode_", 1) for name in GITPULSE_TOOLS]
+
+# What the server's allowlist enables: the new names first, then the old ones.
+WAYLODE_ALLOWLIST = WAYLODE_TOOLS + GITPULSE_TOOLS
+
+# Server keys that mean the same server. ``waylode`` is canonical.
+SERVER_KEY_ALIASES = {"gitpulse": "waylode"}
 
 
 def create_unified_antigravity_config(
@@ -203,21 +217,22 @@ def create_unified_antigravity_config(
         )
     mcp_servers.append(devmap_server)
 
-    # 3. GitPulse MCP Server (Stdio Transport)
-    gitpulse_server = McpStdioServer(
-        name="gitpulse",
+    # 3. Waylode (formerly GitPulse) MCP Server (Stdio Transport). The binary and
+    # its GITPULSE_REPOSITORY variable keep their names for now.
+    waylode_server = McpStdioServer(
+        name="waylode",
         command="gitpulse-mcp",
         args=["--repo", ws],
         env={"GITPULSE_REPOSITORY": ws},
-        enabled_tools=list(GITPULSE_TOOLS),
+        enabled_tools=list(WAYLODE_ALLOWLIST),
     )
-    mcp_servers.append(gitpulse_server)
+    mcp_servers.append(waylode_server)
 
     # 4. Declarative Safety Policies
     policies = [
         PolicyRule(rule_type="allow", target=devcouncil_server.name),
         PolicyRule(rule_type="allow", target=devmap_server.name),
-        PolicyRule(rule_type="allow", target=gitpulse_server.name),
+        PolicyRule(rule_type="allow", target=waylode_server.name),
         PolicyRule(rule_type="allow", target="view_file"),
         PolicyRule(rule_type="allow", target="list_directory"),
         PolicyRule(rule_type="allow", target="search_directory"),

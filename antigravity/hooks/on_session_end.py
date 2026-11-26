@@ -61,7 +61,7 @@ async def on_session_end_hook() -> Dict[str, Any]:
                 "force": False,  # Honors 6-point integration verification
             }
             prune_res = await call_mcp_tool(
-                "gitpulse", "gitpulse_worktree_prune", prune_payload
+                "waylode", "waylode_worktree_prune", prune_payload
             )
             teardown_report["worktree_pruned"] = prune_res.get("ok", True)
             logger.info(

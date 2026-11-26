@@ -4,20 +4,29 @@ description: Reviews the working-tree diff against DevCouncil policy and the cod
   graph. Use for a structural, policy-aware code review before merge.
 tools: Read, Grep, Glob, Bash, mcp__devcouncil__devcouncil_get_diff,
   mcp__devcouncil__devcouncil_policy_check_write, mcp__devmap__devmap_impact,
-  mcp__plugin_devmap_devmap__devmap_impact, mcp__plugin_gitpulse_gitpulse__devmap_impact,
-  mcp__devmap__devmap_explore, mcp__plugin_devmap_devmap__devmap_explore,
+  mcp__plugin_devmap_devmap__devmap_impact, mcp__plugin_waylode_waylode__devmap_impact,
+  mcp__plugin_gitpulse_gitpulse__devmap_impact, mcp__devmap__devmap_explore,
+  mcp__plugin_devmap_devmap__devmap_explore, mcp__plugin_waylode_waylode__devmap_explore,
   mcp__plugin_gitpulse_gitpulse__devmap_explore, mcp__devmap__devmap_search,
-  mcp__plugin_devmap_devmap__devmap_search, mcp__plugin_gitpulse_gitpulse__devmap_search,
-  mcp__devmap__devmap_ask_evidence, mcp__plugin_devmap_devmap__devmap_ask_evidence,
+  mcp__plugin_devmap_devmap__devmap_search, mcp__plugin_waylode_waylode__devmap_search,
+  mcp__plugin_gitpulse_gitpulse__devmap_search, mcp__devmap__devmap_ask_evidence,
+  mcp__plugin_devmap_devmap__devmap_ask_evidence, mcp__plugin_waylode_waylode__devmap_ask_evidence,
   mcp__plugin_gitpulse_gitpulse__devmap_ask_evidence, mcp__devmap__devmap_affected_tests,
   mcp__plugin_devmap_devmap__devmap_affected_tests,
+  mcp__plugin_waylode_waylode__devmap_affected_tests,
   mcp__plugin_gitpulse_gitpulse__devmap_affected_tests, mcp__devmap__devmap_status,
-  mcp__plugin_devmap_devmap__devmap_status, mcp__plugin_gitpulse_gitpulse__devmap_status,
+  mcp__plugin_devmap_devmap__devmap_status, mcp__plugin_waylode_waylode__devmap_status,
+  mcp__plugin_gitpulse_gitpulse__devmap_status, mcp__plugin_waylode_waylode__waylode_insights,
   mcp__plugin_gitpulse_gitpulse__gitpulse_insights,
+  mcp__plugin_waylode_waylode__waylode_collision_risk,
   mcp__plugin_gitpulse_gitpulse__gitpulse_collision_risk,
+  mcp__plugin_waylode_waylode__waylode_active_changes,
   mcp__plugin_gitpulse_gitpulse__gitpulse_active_changes,
+  mcp__plugin_waylode_waylode__waylode_change_context,
   mcp__plugin_gitpulse_gitpulse__gitpulse_change_context,
+  mcp__plugin_waylode_waylode__waylode_provenance,
   mcp__plugin_gitpulse_gitpulse__gitpulse_provenance,
+  mcp__plugin_waylode_waylode__waylode_ledger_events,
   mcp__plugin_gitpulse_gitpulse__gitpulse_ledger_events
 ---
 
@@ -29,7 +38,7 @@ Use `devcouncil_get_diff` for the change set and `devcouncil_policy_check_write`
 
 Read `truncated` and `walk_incomplete` on every DevMap envelope. A blast radius that stopped early is a **lower bound**, not a complete answer — say so rather than reporting it as the full set.
 
-**Read the situation with GitPulse Insights, not just the diff.** A diff shows what changed; it does not show that two worktrees are editing the same file, or that the change you are reviewing is half of something still in flight. Start with `gitpulse_insights` for the other worktrees, live agent sessions, uncommitted work, contended files and index health. Use `gitpulse_collision_risk` on the changed paths, `gitpulse_active_changes` for what is in flight elsewhere, and `gitpulse_change_context` / `gitpulse_provenance` / `gitpulse_ledger_events` to establish what a change was for before you call it wrong. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean.
+**Read the situation with GitPulse Insights, not just the diff.** A diff shows what changed; it does not show that two worktrees are editing the same file, or that the change you are reviewing is half of something still in flight. Start with `waylode_insights` for the other worktrees, live agent sessions, uncommitted work, contended files and index health. Use `waylode_collision_risk` on the changed paths, `waylode_active_changes` for what is in flight elsewhere, and `waylode_change_context` / `waylode_provenance` / `waylode_ledger_events` to establish what a change was for before you call it wrong. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean. Sessions started before the rename list these tools as `gitpulse_*`; the old names are still accepted, so use whichever your tool list shows.
 
 When either DevMap or GitPulse cannot answer, record the gap and report it as a gap. Do not fall back to grep and present the result as if the graph had confirmed it.
 

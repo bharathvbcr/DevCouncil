@@ -70,6 +70,19 @@ from antigravity.hooks.on_session_end import on_session_end_hook
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _offline_bridge(monkeypatch):
+    """These tests exercise the bridge's offline answers and in-process handlers.
+
+    An installed `devcouncil` or `gitpulse-mcp` must not stand in for them: the
+    bridge reports a server's refusal (not_initialized, bad arguments) as the
+    error it is, where it once replaced it with a simulated success.
+    """
+    from antigravity.config import mcp_bridge
+
+    monkeypatch.setattr(mcp_bridge, "_resolve_binary_command", lambda server_name: None)
+
+
 # ---------------------------------------------------------------------------
 # F27: Unified MCP Server Configuration Verification
 # ---------------------------------------------------------------------------
@@ -82,7 +95,8 @@ def test_mcp_config_json_validity():
     servers = data["mcpServers"]
     assert "devcouncil" in servers
     assert "devmap" in servers
-    assert "gitpulse" in servers
+    assert "waylode" in servers
+    assert "gitpulse" not in servers, "one server entry, not one per name"
     # Verify FastMCP identifiers
     for s_name, s_cfg in servers.items():
         for tool in s_cfg.get("tools", []):
@@ -97,7 +111,8 @@ def test_mcp_config_yaml_validity():
     assert "mcpServers:" in text
     assert "devcouncil:" in text
     assert "devmap:" in text
-    assert "gitpulse:" in text
+    assert "  waylode:" in text
+    assert "  gitpulse:" not in text
 
 
 def test_python_local_agent_config():
@@ -106,7 +121,8 @@ def test_python_local_agent_config():
     tools = config.list_all_tools()
     assert "devcouncil_checkout_task" in tools
     assert "devmap_search" in tools
-    assert "gitpulse_collision_risk" in tools
+    assert "waylode_collision_risk" in tools
+    assert "gitpulse_collision_risk" in tools, "the old name stays allowlisted during the transition"
     for a2a_tool in (
         "gitpulse_agent_register",
         "gitpulse_agent_peers",
@@ -185,6 +201,55 @@ def test_pre_tool_call_decide_collision_vetoed():
         result = asyncio.run(pre_tool_call_decide_hook(call))
         assert result.allow is False
         assert "COLLISION HAZARD" in result.reason
+    finally:
+        clear_in_process_handlers()
+
+
+def test_pre_tool_call_decide_collision_vetoed_by_a_handler_under_the_new_name():
+    def mock_waylode(tool, args):
+        if tool == "waylode_collision_risk":
+            return {
+                "ok": True,
+                "overlapping_files": [
+                    {"agent_id": "other_agent", "worktree_path": "/tmp/wt_other", "path": "src/conflict.rs"}
+                ],
+            }
+        return {"ok": True}
+
+    register_in_process_handler("waylode", mock_waylode)
+    try:
+        call = ToolCall(name="edit_file", arguments={"target_file": "src/conflict.rs"})
+        result = asyncio.run(pre_tool_call_decide_hook(call))
+        assert result.allow is False
+        assert "COLLISION HAZARD" in result.reason
+    finally:
+        clear_in_process_handlers()
+
+
+def test_pre_tool_call_decide_refuses_a_reply_with_no_verdict():
+    # A scan that answered {"ok": True} without saying anything about overlap --
+    # what the bridge's old fallthrough returned for a tool it did not know -- is
+    # not a clean scan. The real server answers with `overlapping_files`.
+    register_in_process_handler("waylode", lambda tool, args: {"ok": True, "simulated": True})
+    try:
+        call = ToolCall(name="edit_file", arguments={"target_file": "src/lib.rs"})
+        result = asyncio.run(pre_tool_call_decide_hook(call))
+        assert result.allow is False
+        assert "no verdict" in result.reason
+    finally:
+        clear_in_process_handlers()
+
+
+def test_pre_tool_call_decide_accepts_the_real_servers_clean_reply_shape():
+    # gitpulse-mcp's collision_risk carries `overlapping_files` and no `status`.
+    register_in_process_handler(
+        "waylode",
+        lambda tool, args: {"ok": True, "overlapping_files": [], "unscanned_worktrees": 0, "truncated": False},
+    )
+    try:
+        call = ToolCall(name="edit_file", arguments={"target_file": "src/lib.rs"})
+        result = asyncio.run(pre_tool_call_decide_hook(call))
+        assert result.allow is True
     finally:
         clear_in_process_handlers()
 
@@ -370,3 +435,55 @@ def test_progressive_agent_skills_exist():
         assert len(frontmatter["description"]) > 10
         body = parts[2]
         assert "Objective" in body or "Protocol" in body or "Rules" in body
+
+
+def test_pre_tool_call_decide_sends_only_the_arguments_the_server_accepts():
+    # gitpulse-mcp rejects any other argument ("accepted: [path, repo_path]").
+    seen = []
+
+    def capture(tool, args):
+        seen.append((tool, dict(args)))
+        return {"ok": True, "overlapping_files": 0, "items": []}
+
+    register_in_process_handler("waylode", capture)
+    try:
+        call = ToolCall(name="edit_file", arguments={"target_file": "src/lib.rs", "StartLine": 3, "EndLine": 9})
+        asyncio.run(pre_tool_call_decide_hook(call))
+    finally:
+        clear_in_process_handlers()
+    assert seen and seen[0][0] == "waylode_collision_risk"
+    assert set(seen[0][1]) == {"repo_path", "path"}
+
+
+def test_pre_tool_call_decide_reads_the_servers_counted_overlap_reply():
+    # The real reply carries a COUNT in `overlapping_files` and the rows in `items`;
+    # the hook used to index the count and raise TypeError on a real collision.
+    register_in_process_handler(
+        "waylode",
+        lambda tool, args: {
+            "ok": True,
+            "overlapping_files": 1,
+            # Row shape copied from a live gitpulse-mcp reply (2026-11-25).
+            "items": [
+                {
+                    "path": "src/conflict.rs",
+                    "worktrees": [
+                        {
+                            "agent_kind": "gitpulse",
+                            "branch": "fix/other-lane",
+                            "path": "/tmp/wt_other",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    try:
+        call = ToolCall(name="edit_file", arguments={"target_file": "src/conflict.rs"})
+        result = asyncio.run(pre_tool_call_decide_hook(call))
+    finally:
+        clear_in_process_handlers()
+    assert result.allow is False
+    assert "COLLISION HAZARD" in result.reason
+    assert "fix/other-lane" in result.reason
+    assert "/tmp/wt_other" in result.reason

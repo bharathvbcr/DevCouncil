@@ -1,5 +1,7 @@
 # Unified Antigravity MCP Server Configuration
-# Registers devcouncil, devmap, and gitpulse with FastMCP identifiers
+# Registers devcouncil, devmap, and waylode (formerly gitpulse) with FastMCP identifiers.
+# The waylode allowlist names each tool twice, waylode_<x> then gitpulse_<x>: hosts
+# started before the rename still list the old names.
 version: "1.0.0"
 mcpServers:
   devcouncil:
@@ -49,7 +51,7 @@ mcpServers:
       - devmap_doc_drift
     description: DevMap high-precision 11-tier code intelligence, AST extraction, and graph search
 
-  gitpulse:
+  waylode:
     command: gitpulse-mcp
     args:
       - --repo
@@ -58,6 +60,29 @@ mcpServers:
       GITPULSE_REPOSITORY: "${DEVCOUNCIL_WORKSPACE:-.}"
     transport: stdio
     tools:
+      - waylode_insights
+      - waylode_status
+      - waylode_active_changes
+      - waylode_collision_risk
+      - waylode_merge_conflicts
+      - waylode_change_context
+      - waylode_ledger_events
+      - waylode_task_view
+      - waylode_add_task
+      - waylode_list_tasks
+      - waylode_get_task
+      - waylode_complete_task
+      - waylode_delete_task
+      - waylode_worktree_create
+      - waylode_worktree_switch
+      - waylode_worktree_isolate
+      - waylode_worktree_prune
+      - waylode_worktree_merge
+      - waylode_agent_register
+      - waylode_agent_peers
+      - waylode_agent_send
+      - waylode_agent_inbox
+      - waylode_agent_wait
       - gitpulse_insights
       - gitpulse_status
       - gitpulse_active_changes
@@ -81,4 +106,4 @@ mcpServers:
       - gitpulse_agent_send
       - gitpulse_agent_inbox
       - gitpulse_agent_wait
-    description: GitPulse multi-agent worktree concurrency, line-level collision detection, and append-only ledger
+    description: Waylode (formerly GitPulse) multi-agent worktree concurrency, line-level collision detection, and append-only ledger

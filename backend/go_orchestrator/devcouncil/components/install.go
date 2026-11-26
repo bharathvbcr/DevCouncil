@@ -56,8 +56,10 @@ Options:
                       host installs only from a checkout: git clone <repo>, then
                       devcouncil install --src <dir>
   --dry-run           print the commands; build, check and copy nothing
-  --gitpulse DIR      GitPulse checkout for the schema-consumer check
-                      (default: $DEVCOUNCIL_GITPULSE_ROOT, then ../GitPulse)
+  --waylode DIR       Waylode/GitPulse checkout for the schema-consumer check
+                      (default: $DEVCOUNCIL_WAYLODE_ROOT, $DEVCOUNCIL_GITPULSE_ROOT,
+                       then ../Waylode or ../GitPulse)
+  --gitpulse DIR      legacy alias for --waylode
   --strict-consumers  fail the install when a schema consumer is stale or
                       unverifiable, or the check could not run
   --yes               skip uninstall confirmation

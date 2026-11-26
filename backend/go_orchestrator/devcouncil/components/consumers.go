@@ -30,10 +30,12 @@ import (
 )
 
 const (
-	// GitPulseRootEnv names a GitPulse checkout, as GitPulse's
-	// GITPULSE_MANVI_ROOT names a Manvi one. --gitpulse DIR wins over it.
+	// WaylodeRootEnv names a Waylode (formerly GitPulse) checkout, as
+	// Waylode's WAYLODE_MANVI_ROOT names a Manvi one. --waylode / --gitpulse DIR wins over it.
+	WaylodeRootEnv = "DEVCOUNCIL_WAYLODE_ROOT"
+	// GitPulseRootEnv is the pre-rename fallback for WaylodeRootEnv.
 	GitPulseRootEnv = "DEVCOUNCIL_GITPULSE_ROOT"
-	// parityScript is the check, relative to the GitPulse checkout.
+	// parityScript is the check, relative to the Waylode/GitPulse checkout.
 	parityScript = "scripts/check-schema-parity.mjs"
 	// consumerCheckTimeout bounds the whole check, including every reader it
 	// asks for a version.
@@ -90,13 +92,18 @@ func (r ConsumerReport) Passed() bool {
 	return r.Checked && r.OK && len(r.Lagging()) == 0
 }
 
-// findGitPulse returns the GitPulse checkout to run the check from. An
+// findGitPulse returns the Waylode/GitPulse checkout to run the check from. An
 // explicit choice (flag, then environment) that does not hold the check is an
 // answer in itself; it never falls through to the sibling guess.
 func findGitPulse(flag, src string) (root string, why string) {
-	explicit, from := strings.TrimSpace(flag), "--gitpulse"
-	if explicit == "" {
-		explicit, from = strings.TrimSpace(os.Getenv(GitPulseRootEnv)), GitPulseRootEnv
+	return findWaylode(flag, "--gitpulse", src)
+}
+
+func findWaylode(flag, flagName, src string) (root string, why string) {
+	explicit := strings.TrimSpace(flag)
+	from := strings.TrimSpace(flagName)
+	if from == "" {
+		from = "--gitpulse"
 	}
 	if explicit != "" {
 		if hasParityScript(explicit) {
@@ -104,17 +111,31 @@ func findGitPulse(flag, src string) (root string, why string) {
 		}
 		return "", fmt.Sprintf("%s=%s has no %s", from, explicit, parityScript)
 	}
+	for _, env := range []string{WaylodeRootEnv, GitPulseRootEnv} {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			if hasParityScript(v) {
+				return v, ""
+			}
+			return "", fmt.Sprintf("%s=%s has no %s", env, v, parityScript)
+		}
+	}
 	if src == "" {
-		return "", "no GitPulse checkout given (--gitpulse DIR or " + GitPulseRootEnv + ")"
+		return "", "no Waylode/GitPulse checkout given (--waylode / --gitpulse DIR or " + WaylodeRootEnv + " / " + GitPulseRootEnv + ")"
+	}
+	for _, name := range []string{"Waylode", "GitPulse"} {
+		sibling := filepath.Join(filepath.Dir(src), name)
+		if hasParityScript(sibling) {
+			return sibling, ""
+		}
+	}
+	for _, name := range []string{"Waylode", "GitPulse"} {
+		sibling := filepath.Join(filepath.Dir(src), name)
+		if _, err := os.Stat(sibling); err == nil {
+			return "", fmt.Sprintf("%s has no %s (a %s older than the parity check)", sibling, parityScript, name)
+		}
 	}
 	sibling := filepath.Join(filepath.Dir(src), "GitPulse")
-	if hasParityScript(sibling) {
-		return sibling, ""
-	}
-	if _, err := os.Stat(sibling); err == nil {
-		return "", fmt.Sprintf("%s has no %s (a GitPulse older than the parity check)", sibling, parityScript)
-	}
-	return "", fmt.Sprintf("no GitPulse checkout at %s; pass --gitpulse DIR or set %s", sibling, GitPulseRootEnv)
+	return "", fmt.Sprintf("no GitPulse checkout at %s; pass --waylode or --gitpulse DIR or set %s / %s", sibling, WaylodeRootEnv, GitPulseRootEnv)
 }
 
 func hasParityScript(root string) bool {
@@ -125,24 +146,29 @@ func hasParityScript(root string) bool {
 // consumerCheck carries the seams the tests replace.
 type consumerCheck struct {
 	src      string
-	gitpulse string // --gitpulse
+	gitpulse string // --waylode / --gitpulse
+	flagName string
 	lookPath func(string) (string, error)
 	timeout  time.Duration
 	limit    int
 }
 
-// CheckConsumers runs GitPulse's schema-parity check against the DevCouncil
+// CheckConsumers runs Waylode/GitPulse's schema-parity check against the DevCouncil
 // checkout src. Every way it can fail to produce an answer is a report with
 // Checked false.
 func CheckConsumers(src, gitpulse string, o Options) ConsumerReport {
-	return consumerCheck{src: src, gitpulse: gitpulse, lookPath: o.lookPath()}.run()
+	return checkConsumersWithFlag(src, gitpulse, "--gitpulse", o)
+}
+
+func checkConsumersWithFlag(src, gitpulse, flagName string, o Options) ConsumerReport {
+	return consumerCheck{src: src, gitpulse: gitpulse, flagName: flagName, lookPath: o.lookPath()}.run()
 }
 
 func (c consumerCheck) run() ConsumerReport {
 	if c.src == "" {
 		return notChecked("", "no DevCouncil checkout to read the owner's schema numbers from (this install came from cargo install --git)")
 	}
-	root, why := findGitPulse(c.gitpulse, c.src)
+	root, why := findWaylode(c.gitpulse, c.flagName, c.src)
 	if root == "" {
 		return notChecked("", "%s", why)
 	}
@@ -199,6 +225,7 @@ func (c consumerCheck) run() ConsumerReport {
 // what node needs to start on Windows, whose process environment spells PATH
 // "Path".
 var parityEnvExtra = []string{
+	"WAYLODE_MANVI_ROOT", "WAYLODE_JARVIS_ROOT",
 	"GITPULSE_MANVI_ROOT", "GITPULSE_JARVIS_ROOT",
 	"Path", "PATHEXT", "SystemRoot", "SYSTEMROOT", "windir", "WINDIR", "ComSpec", "COMSPEC",
 	"USERPROFILE", "APPDATA", "LOCALAPPDATA",
@@ -209,10 +236,53 @@ var parityEnvExtra = []string{
 // never the caller's environment wholesale: a credential in the installer's
 // environment does not reach it, and neither does NODE_OPTIONS. The DevCouncil
 // checkout it judges is always src, whatever the caller's
-// GITPULSE_DEVCOUNCIL_ROOT says. GitPulse's check reads the checkout from that
-// variable only; its command line takes no checkout argument.
+// WAYLODE_DEVCOUNCIL_ROOT / GITPULSE_DEVCOUNCIL_ROOT says. The check reads the
+// checkout from those variables only; its command line takes no checkout argument.
 func parityEnv(environ []string, src string) []string {
-	return append(proc.ScrubEnv(environ, parityEnvExtra...), "GITPULSE_DEVCOUNCIL_ROOT="+src)
+	out := proc.ScrubEnv(environ, parityEnvExtra...)
+	for _, pair := range [][2]string{
+		{"WAYLODE_MANVI_ROOT", "GITPULSE_MANVI_ROOT"},
+		{"WAYLODE_JARVIS_ROOT", "GITPULSE_JARVIS_ROOT"},
+	} {
+		out = mirrorEnvPair(out, pair[0], pair[1])
+	}
+	return append(out,
+		"WAYLODE_DEVCOUNCIL_ROOT="+src,
+		"GITPULSE_DEVCOUNCIL_ROOT="+src,
+	)
+}
+
+func mirrorEnvPair(env []string, primary, fallback string) []string {
+	pVal := envVal(env, primary)
+	fVal := envVal(env, fallback)
+	if pVal != "" && fVal == "" {
+		return setEnvVal(env, fallback, pVal)
+	}
+	if fVal != "" && pVal == "" {
+		return setEnvVal(env, primary, fVal)
+	}
+	return env
+}
+
+func envVal(env []string, key string) string {
+	prefix := key + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			return kv[len(prefix):]
+		}
+	}
+	return ""
+}
+
+func setEnvVal(env []string, key, val string) []string {
+	prefix := key + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + val
+			return env
+		}
+	}
+	return append(env, prefix+val)
 }
 
 // parityOutput is what `check-schema-parity.mjs --json` prints: one line,
@@ -289,10 +359,12 @@ func parseParity(root string, code int, stdout []byte, stderr string) ConsumerRe
 // done from here.
 func remedy(reader, gitpulse string) string {
 	switch {
-	case strings.HasPrefix(reader, "GitPulse vendored crates"):
+	case strings.HasPrefix(reader, "Waylode vendored crates"), strings.HasPrefix(reader, "GitPulse vendored crates"):
 		return fmt.Sprintf("in %s: node scripts/vendor-crates.mjs, then bun run check:vendor-schema, then commit (ask first)", gitpulse)
-	case strings.HasPrefix(reader, "gitpulse-mcp"):
+	case strings.HasPrefix(reader, "waylode-mcp"), strings.HasPrefix(reader, "gitpulse-mcp"):
 		return fmt.Sprintf("in %s: bun run mcp:install, then bun run mcp:doctor", gitpulse)
+	case strings.HasPrefix(reader, "Waylode.app"):
+		return fmt.Sprintf("in %s: re-vendor if needed, bun run tauri build, and reinstall Waylode.app (docs/INSTALLATION.md)", gitpulse)
 	case strings.HasPrefix(reader, "GitPulse.app"):
 		return fmt.Sprintf("in %s: re-vendor if needed, bun run tauri build, and reinstall GitPulse.app (docs/INSTALLATION.md)", gitpulse)
 	case strings.HasPrefix(reader, "devmap"), strings.HasPrefix(reader, "dcstore"):
@@ -301,9 +373,11 @@ func remedy(reader, gitpulse string) string {
 	case strings.HasPrefix(reader, "Manvi pin"):
 		return "bump Manvi's DevCouncil pin in scripts/module-pins.txt — a commit in Manvi: report the delta and ask before bumping"
 	case strings.Contains(reader, "serve contract"):
-		return fmt.Sprintf("copy Manvi's contracts/serve.ops.schema.json over %s's copy and update GitPulse's Rust side to it — a commit in GitPulse: ask first", gitpulse)
+		return fmt.Sprintf("copy Manvi's contracts/serve.ops.schema.json over %s's copy and update the Rust side to it — a commit in %s: ask first", gitpulse, gitpulse)
 	case strings.HasPrefix(reader, "Jarvis pin"):
 		return "bump Jarvis's DevCouncil pin in upstream.lock.json and go.mod — a commit in Jarvis: report the delta and ask before bumping"
+	case strings.HasPrefix(reader, "Waylode devmap tools"), strings.HasPrefix(reader, "GitPulse devmap tools"):
+		return fmt.Sprintf("in %s: update src-tauri/src/mcp/devmap_parity.rs to match devmap-serve TOOL_NAMES (ask first)", gitpulse)
 	}
 	return "see the detail; the check names no remedy this installer knows"
 }

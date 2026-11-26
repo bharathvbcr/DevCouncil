@@ -19,6 +19,8 @@ import {
   PLUGIN_AGENTS_DIR,
   drift,
   expandTools,
+  familyOf,
+  grantPairs,
   parseAgentMarkdown,
   pinnedGrants,
   plan,
@@ -131,7 +133,8 @@ describe("renderCodexToml", () => {
   });
 
   it("adds the host facts the shared body deliberately omits", () => {
-    assert.ok(rendered.includes("there is no `gitpulse`"));
+    assert.ok(rendered.includes("there is no `waylode` or `gitpulse` CLI for it"));
+    assert.ok(rendered.includes("`gitpulse-mcp call <tool> key=value` answers from the shell"));
     assert.ok(rendered.includes("no `tools` allowlist field"));
     assert.ok(rendered.includes(CODEX_HOST_NOTES));
   });
@@ -258,9 +261,40 @@ describe("MCP grant prefix expansion", () => {
       "Read",
       "mcp__devmap__devmap_impact",
       "mcp__plugin_devmap_devmap__devmap_impact",
+      "mcp__plugin_waylode_waylode__devmap_impact",
       "mcp__plugin_gitpulse_gitpulse__devmap_impact",
     ]);
     assert.deepEqual(pinnedGrants(expanded), [], "the widened grant is not pinned");
+  });
+
+  it("grants a renamed tool under both spellings, new first, each on its own server", () => {
+    // The Waylode server lists `waylode_<x>`; the GitPulse one lists
+    // `gitpulse_<x>`. A grant is matched against the listed name, so pairing
+    // either name with either prefix would grant nothing on one of them.
+    const want = [
+      "mcp__plugin_waylode_waylode__waylode_insights",
+      "mcp__plugin_gitpulse_gitpulse__gitpulse_insights",
+    ];
+    assert.deepEqual(expandTools(["mcp__plugin_gitpulse_gitpulse__gitpulse_insights"]), want);
+    assert.deepEqual(expandTools(["mcp__plugin_waylode_waylode__waylode_insights"]), want);
+    assert.deepEqual(
+      expandTools(want.slice().reverse()),
+      want,
+      "a grant that already names both spellings is a fixed point",
+    );
+    assert.deepEqual(pinnedGrants(want), []);
+    assert.deepEqual(
+      pinnedGrants(["mcp__plugin_gitpulse_gitpulse__gitpulse_insights"]),
+      [{ tool: "gitpulse_insights", missing: ["mcp__plugin_waylode_waylode__"] }],
+      "an old-only grant is reported as missing the new server",
+    );
+    assert.equal(familyOf("waylode_insights"), "waylode");
+    assert.equal(familyOf("gitpulse_insights"), "gitpulse");
+    assert.deepEqual(
+      grantPairs("gitpulse_insights").map((p) => p.prefix + p.tool),
+      want,
+    );
+    assert.equal(grantPairs("mcp_nothing"), null);
   });
 
   it("reports which prefix a pinned grant is missing", () => {
@@ -269,6 +303,7 @@ describe("MCP grant prefix expansion", () => {
     assert.equal(pinned[0].tool, "devmap_search");
     assert.deepEqual(pinned[0].missing, [
       "mcp__plugin_devmap_devmap__",
+      "mcp__plugin_waylode_waylode__",
       "mcp__plugin_gitpulse_gitpulse__",
     ]);
   });
@@ -388,6 +423,31 @@ describe("MCP grant prefix expansion", () => {
       declaredButAbsent.some((d) => d.prefix === "mcp__plugin_gitpulse_gitpulse__"),
       "the uninstalled prefix is reported separately, not as a failure",
     );
+  });
+
+  it("tracks both the old and the new server for the renamed tools", () => {
+    const served = [
+      "mcp__plugin_waylode_waylode__waylode_insights",
+      "mcp__plugin_waylode_waylode__devmap_search",
+      "mcp__plugin_gitpulse_gitpulse__gitpulse_insights",
+    ];
+    const live = observedPrefixes(served);
+    assert.deepEqual([...live.get("waylode")], ["mcp__plugin_waylode_waylode__"]);
+    assert.deepEqual([...live.get("gitpulse")], ["mcp__plugin_gitpulse_gitpulse__"]);
+    assert.deepEqual(comparePrefixes(live).gaps, [], "both names are declared");
+
+    // A table that only knows the old name does not even see the new server: its
+    // tools belong to no tracked family, so the probe cannot report a gap for it.
+    // That is why `waylode` must be a declared family (asserted below).
+    const stale = { gitpulse: ["mcp__plugin_gitpulse_gitpulse__"] };
+    const { gaps } = comparePrefixes(observedPrefixes(served, stale), stale);
+    assert.deepEqual(gaps, []);
+    assert.equal(
+      observedPrefixes(["mcp__plugin_waylode_waylode__waylode_insights"], stale).size,
+      0,
+      "an undeclared family is invisible to the probe, so the table must carry `waylode`",
+    );
+    assert.ok(MCP_TOOL_PREFIXES.waylode, "MCP_TOOL_PREFIXES must declare the waylode family");
   });
 
   it("ignores a served family the table does not track at all", () => {

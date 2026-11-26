@@ -60,8 +60,14 @@ func writeParityScript(t *testing.T, root, script string) {
 	}
 }
 
-func TestConsumersAreNotCheckedWithoutAGitPulseCheckout(t *testing.T) {
+func clearRootEnvs(t *testing.T) {
+	t.Helper()
+	t.Setenv(WaylodeRootEnv, "")
 	t.Setenv(GitPulseRootEnv, "")
+}
+
+func TestConsumersAreNotCheckedWithoutAGitPulseCheckout(t *testing.T) {
+	clearRootEnvs(t)
 	src, gitpulse := siblings(t, "")
 	r := consumerCheck{src: src, lookPath: onlyNode}.run()
 	if r.Checked || r.Passed() {
@@ -73,7 +79,7 @@ func TestConsumersAreNotCheckedWithoutAGitPulseCheckout(t *testing.T) {
 }
 
 func TestConsumersAreNotCheckedFromAGitPulseWithoutTheCheck(t *testing.T) {
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, gitpulse := siblings(t, "")
 	if err := os.MkdirAll(gitpulse, 0o755); err != nil {
 		t.Fatal(err)
@@ -89,20 +95,49 @@ func TestConsumersAreNotCheckedFromAGitPulseWithoutTheCheck(t *testing.T) {
 func TestAnExplicitGitPulseThatLacksTheCheckIsNotReplacedByTheSibling(t *testing.T) {
 	src, _ := siblings(t, `console.log("{}")`)
 	elsewhere := t.TempDir()
-	for _, tc := range []struct{ flag, env, want string }{
+	for _, tc := range []struct{ flag, flagName, waylodeEnv, gitpulseEnv, want string }{
 		{flag: elsewhere, want: "--gitpulse=" + elsewhere},
-		{env: elsewhere, want: GitPulseRootEnv + "=" + elsewhere},
+		{flag: elsewhere, flagName: "--waylode", want: "--waylode=" + elsewhere},
+		{waylodeEnv: elsewhere, want: WaylodeRootEnv + "=" + elsewhere},
+		{gitpulseEnv: elsewhere, want: GitPulseRootEnv + "=" + elsewhere},
 	} {
-		t.Setenv(GitPulseRootEnv, tc.env)
-		r := consumerCheck{src: src, gitpulse: tc.flag, lookPath: onlyNode}.run()
+		t.Setenv(WaylodeRootEnv, tc.waylodeEnv)
+		t.Setenv(GitPulseRootEnv, tc.gitpulseEnv)
+		r := consumerCheck{src: src, gitpulse: tc.flag, flagName: tc.flagName, lookPath: onlyNode}.run()
 		if r.Checked || !strings.Contains(r.Reason, tc.want) {
-			t.Fatalf("flag=%q env=%q: report = %+v", tc.flag, tc.env, r)
+			t.Fatalf("flag=%q waylode=%q gitpulse=%q: report = %+v", tc.flag, tc.waylodeEnv, tc.gitpulseEnv, r)
 		}
 	}
 }
 
+func TestFindWaylodePrefersWaylodeEnvAndFallsBackToGitPulseEnv(t *testing.T) {
+	clearRootEnvs(t)
+	src, _ := siblings(t, "")
+	waylode := t.TempDir()
+	gitpulse := t.TempDir()
+	writeParityScript(t, waylode, `console.log("{}")`)
+	writeParityScript(t, gitpulse, `console.log("{}")`)
+
+	t.Setenv(GitPulseRootEnv, gitpulse)
+	if root, why := findWaylode("", "", src); root != gitpulse || why != "" {
+		t.Fatalf("fallback findWaylode() = (%q, %q), want (%q, \"\")", root, why, gitpulse)
+	}
+
+	t.Setenv(WaylodeRootEnv, waylode)
+	if root, why := findWaylode("", "", src); root != waylode || why != "" {
+		t.Fatalf("Waylode-first findWaylode() = (%q, %q), want (%q, \"\")", root, why, waylode)
+	}
+
+	// Explicit DEVCOUNCIL_WAYLODE_ROOT lacking the script does not fall back to DEVCOUNCIL_GITPULSE_ROOT.
+	missing := t.TempDir()
+	t.Setenv(WaylodeRootEnv, missing)
+	if root, why := findWaylode("", "", src); root != "" || !strings.Contains(why, WaylodeRootEnv+"="+missing) {
+		t.Fatalf("explicit invalid WaylodeRootEnv = (%q, %q)", root, why)
+	}
+}
+
 func TestConsumersAreNotCheckedWithoutNode(t *testing.T) {
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, `console.log("{}")`)
 	r := consumerCheck{src: src, lookPath: noPath}.run()
 	if r.Checked || !strings.Contains(r.Reason, "node is not on PATH") {
@@ -119,7 +154,7 @@ func TestConsumersAreNotCheckedWithoutAnOwnerCheckout(t *testing.T) {
 
 func TestACheckThatHangsIsNotCheckedAndIsKilled(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, `setTimeout(() => {}, 60000)`)
 	start := time.Now()
 	r := consumerCheck{src: src, lookPath: onlyNode, timeout: 500 * time.Millisecond}.run()
@@ -133,7 +168,7 @@ func TestACheckThatHangsIsNotCheckedAndIsKilled(t *testing.T) {
 
 func TestACheckThatPrintsTooMuchIsNotChecked(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, `process.stdout.write("x".repeat(4096))`)
 	r := consumerCheck{src: src, lookPath: onlyNode, limit: 1024}.run()
 	if r.Checked || !strings.Contains(r.Reason, "more than 1024 bytes") {
@@ -177,7 +212,7 @@ func installWithChecker(t *testing.T, src string, extra ...string) (code int, st
 
 func TestInstallNamesAStaleConsumerAndItsRemedyButStillSucceeds(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, gitpulse := siblings(t, staleScript)
 	code, _, stderr := installWithChecker(t, src)
 	if code != 0 {
@@ -200,7 +235,7 @@ func TestInstallNamesAStaleConsumerAndItsRemedyButStillSucceeds(t *testing.T) {
 
 func TestStrictConsumersFailsTheInstallOnAStaleConsumer(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, staleScript)
 	if code, _, stderr := installWithChecker(t, src, "--strict-consumers"); code != 1 {
 		t.Fatalf("exit %d\n%s", code, stderr)
@@ -210,7 +245,7 @@ func TestStrictConsumersFailsTheInstallOnAStaleConsumer(t *testing.T) {
 // Strict means examined and matching. A consumer check that could not run
 // must not let a strict install through.
 func TestStrictConsumersFailsTheInstallWhenTheCheckCouldNotRun(t *testing.T) {
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, "")
 	code, _, stderr := installWithChecker(t, src, "--strict-consumers")
 	if code != 1 || !strings.Contains(stderr, "schema consumers: NOT CHECKED") {
@@ -220,7 +255,7 @@ func TestStrictConsumersFailsTheInstallWhenTheCheckCouldNotRun(t *testing.T) {
 
 func TestStrictConsumersPassesWhenEveryPresentReaderMatches(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, matchingConsumerScript)
 	if code, _, stderr := installWithChecker(t, src, "--strict-consumers"); code != 0 {
 		t.Fatalf("exit %d\n%s", code, stderr)
@@ -251,7 +286,7 @@ func mustInstallReceipt(t *testing.T, stdout string) installReceipt {
 
 func TestStrictConsumersJSONReportsNotOKOnAStaleConsumer(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, staleScript)
 	code, stdout, stderr := installWithChecker(t, src, "--json", "--strict-consumers")
 	if code != 1 {
@@ -267,7 +302,7 @@ func TestStrictConsumersJSONReportsNotOKOnAStaleConsumer(t *testing.T) {
 }
 
 func TestStrictConsumersJSONReportsNotOKWhenTheCheckCouldNotRun(t *testing.T) {
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, "")
 	code, stdout, stderr := installWithChecker(t, src, "--json", "--strict-consumers")
 	if code != 1 || !strings.Contains(stderr, "--strict-consumers") {
@@ -281,7 +316,7 @@ func TestStrictConsumersJSONReportsNotOKWhenTheCheckCouldNotRun(t *testing.T) {
 
 func TestStrictConsumersJSONReportsOKWhenEveryPresentReaderMatches(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, matchingConsumerScript)
 	code, stdout, stderr := installWithChecker(t, src, "--json", "--strict-consumers")
 	if code != 0 {
@@ -294,7 +329,7 @@ func TestStrictConsumersJSONReportsOKWhenEveryPresentReaderMatches(t *testing.T)
 }
 
 func TestInstallWithoutGitPulseSaysTheConsumersWereNotChecked(t *testing.T) {
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, gitpulse := siblings(t, "")
 	code, _, stderr := installWithChecker(t, src)
 	if code != 0 {
@@ -312,7 +347,7 @@ func TestInstallWithoutGitPulseSaysTheConsumersWereNotChecked(t *testing.T) {
 
 func TestInstallWithAHungCheckSaysNotChecked(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	src, _ := siblings(t, `setTimeout(() => {}, 60000)`)
 	// The production bound is minutes; drive the same path with a short one.
 	r := consumerCheck{src: src, lookPath: onlyNode, timeout: 300 * time.Millisecond}.run()
@@ -326,7 +361,8 @@ func TestInstallWithAHungCheckSaysNotChecked(t *testing.T) {
 
 func TestTheCheckIsPointedAtTheInstallingCheckout(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
+	t.Setenv("WAYLODE_DEVCOUNCIL_ROOT", "/somewhere/else")
 	t.Setenv("GITPULSE_DEVCOUNCIL_ROOT", "/somewhere/else")
 	src, _ := siblings(t, staleScript)
 	code, stdout, stderr := installWithChecker(t, src, "--json")
@@ -378,13 +414,15 @@ console.log(JSON.stringify({
 // whatever the caller's environment happened to say.
 func TestTheCheckDoesNotInheritTheCallersEnvironment(t *testing.T) {
 	needNode(t)
-	t.Setenv(GitPulseRootEnv, "")
+	clearRootEnvs(t)
 	t.Setenv("DEVCOUNCIL_PLANTED_SECRET", "s3cret-must-not-leak")
 	t.Setenv("GITHUB_TOKEN", "ghp_planted")
 	// NODE_OPTIONS would let the caller's environment inject code into node.
 	t.Setenv("NODE_OPTIONS", "--no-warnings")
+	t.Setenv("WAYLODE_DEVCOUNCIL_ROOT", "/somewhere/else")
 	t.Setenv("GITPULSE_DEVCOUNCIL_ROOT", "/somewhere/else")
 	manvi := t.TempDir()
+	t.Setenv("WAYLODE_MANVI_ROOT", "")
 	t.Setenv("GITPULSE_MANVI_ROOT", manvi)
 	src, _ := siblings(t, envEchoScript)
 
@@ -410,6 +448,30 @@ func TestTheCheckDoesNotInheritTheCallersEnvironment(t *testing.T) {
 	}
 	if got["argv"] != `["--json"]` {
 		t.Fatalf("the check was started with %s", got["argv"])
+	}
+
+	// WAYLODE_*_ROOT mirrors to GITPULSE_*_ROOT and vice versa, and overrides
+	// WAYLODE_DEVCOUNCIL_ROOT too.
+	envOut := parityEnv([]string{"WAYLODE_MANVI_ROOT=/w/manvi", "GITPULSE_JARVIS_ROOT=/g/jarvis"}, src)
+	wantPairs := []string{
+		"WAYLODE_MANVI_ROOT=/w/manvi",
+		"GITPULSE_MANVI_ROOT=/w/manvi",
+		"WAYLODE_JARVIS_ROOT=/g/jarvis",
+		"GITPULSE_JARVIS_ROOT=/g/jarvis",
+		"WAYLODE_DEVCOUNCIL_ROOT=" + src,
+		"GITPULSE_DEVCOUNCIL_ROOT=" + src,
+	}
+	for _, want := range wantPairs {
+		found := false
+		for _, kv := range envOut {
+			if kv == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("parityEnv missing %q in %v", want, envOut)
+		}
 	}
 }
 
@@ -450,9 +512,13 @@ func TestParseParityNeverReadsANonAnswerAsAVerdict(t *testing.T) {
 
 func TestEveryReaderTheCheckNamesHasARemedy(t *testing.T) {
 	for _, reader := range []string{
-		"GitPulse vendored crates", "devmap (PATH)", "dcstore (PATH)", "gitpulse-mcp (PATH)",
-		"GitPulse.app (its bundled gitpulse-mcp)", "Manvi pin (scripts/module-pins.txt)", "Jarvis pin (upstream.lock.json)",
-		"GitPulse copy of Manvi's serve contract",
+		"Waylode vendored crates", "GitPulse vendored crates",
+		"devmap (PATH)", "dcstore (PATH)",
+		"waylode-mcp (PATH)", "gitpulse-mcp (PATH)",
+		"Waylode.app (its bundled waylode-mcp)", "GitPulse.app (its bundled gitpulse-mcp)",
+		"Manvi pin (scripts/module-pins.txt)", "Jarvis pin (upstream.lock.json)",
+		"Waylode copy of Manvi's serve contract", "GitPulse copy of Manvi's serve contract",
+		"Waylode devmap tools (vs devmap-serve TOOL_NAMES)",
 	} {
 		if got := remedy(reader, "/gp"); strings.Contains(got, "names no remedy") {
 			t.Fatalf("%s has no remedy", reader)

@@ -70,7 +70,7 @@ async def post_tool_call_hook(data: Any) -> Dict[str, Any]:
         }
 
         ledger_res = await call_mcp_tool(
-            "gitpulse", "gitpulse_ledger_events", {"event": ledger_event}
+            "waylode", "waylode_ledger_events", {"event": ledger_event}
         )
         audit_record["ledger_appended"] = ledger_res.get("ok", True)
 

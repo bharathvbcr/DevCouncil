@@ -146,19 +146,17 @@ async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
             )
 
         # 4. Invariant B1: Query GitPulse Collision Risk
-        start_line = raw_args.get("StartLine", 1)
-        end_line = raw_args.get("EndLine", 1000000)
+        # Only the arguments the server accepts: it rejects the rest outright
+        # ("accepted: [path, repo_path]"), and a rejected scan is not a clean one.
+        # The answer is per file; line ranges and the caller's id are not part of it.
         collision_payload = {
             "repo_path": state.repo_path,
             "path": repo_rel_path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "agent_id": state.client_id,
         }
 
         try:
             collision_res = await call_mcp_tool(
-                "gitpulse", "gitpulse_collision_risk", collision_payload
+                "waylode", "waylode_collision_risk", collision_payload
             )
         except Exception as exc:
             # Invariant B1: An unavailable collision scan MUST fail closed
@@ -178,13 +176,46 @@ async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
                 ),
             )
 
+        # A reply that carries neither answer a collision scan gives is not a clean
+        # scan. The real server answers with `overlapping_files` (it has no
+        # `status`); the offline answer carries both. A reply with neither -- for
+        # example an `{"ok": True}` from a handler that never heard of the tool --
+        # must not read as "nothing overlaps".
+        if "overlapping_files" not in collision_res and "status" not in collision_res:
+            return HookResult(
+                allow=False,
+                reason=(
+                    f"SAFETY INTERCEPTION: GitPulse collision scan returned no verdict for "
+                    f"'{repo_rel_path}' (no overlapping_files or status in the reply). "
+                    "A scan that did not answer is not clean. Write refused."
+                ),
+            )
+
         # Check for overlapping files or status=contended
-        status = collision_res.get("status", "").lower()
+        status = str(collision_res.get("status", "")).lower()
         overlapping = collision_res.get("overlapping_files", [])
+        # The server reports `overlapping_files` as a COUNT with the rows in
+        # `items`; the offline answer and older callers use a list of rows.
+        rows = overlapping if isinstance(overlapping, list) else collision_res.get("items", [])
+        rows = [row for row in rows if isinstance(row, dict)]
         if status == "contended" or overlapping:
-            conflict = overlapping[0] if overlapping else collision_res
-            conflicting_agent = conflict.get("conflicting_agent") or conflict.get("agent_id", "unknown_agent")
-            conflicting_worktree = conflict.get("conflicting_worktree") or conflict.get("worktree_path", "unknown_worktree")
+            conflict = rows[0] if rows else collision_res
+            # The server names holders as `worktrees: [{agent_kind, branch, path}]`;
+            # the offline answer and older callers use flat keys.
+            holders = conflict.get("worktrees")
+            holder = holders[0] if isinstance(holders, list) and holders and isinstance(holders[0], dict) else {}
+            conflicting_agent = (
+                conflict.get("conflicting_agent")
+                or conflict.get("agent_id")
+                or holder.get("branch")
+                or "unknown_agent"
+            )
+            conflicting_worktree = (
+                conflict.get("conflicting_worktree")
+                or conflict.get("worktree_path")
+                or holder.get("path")
+                or "unknown_worktree"
+            )
             logger.warning(
                 "Collision detected on file %s with agent %s in %s",
                 repo_rel_path,

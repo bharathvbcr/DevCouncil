@@ -329,6 +329,11 @@ fn agents_that_can_reach_devmap_are_not_warned_about() {
         "one-tool",
         "tools: Read, Grep,\n  mcp__plugin_gitpulse_gitpulse__devmap_search\n",
     );
+    write_agent(
+        &agents,
+        "one-tool-waylode",
+        "tools: Read, Grep,\n  mcp__plugin_waylode_waylode__devmap_search\n",
+    );
     let payload = doctor_with_home(&home, &cwd);
     assert!(payload["agent_tools_warning"].is_null(), "{payload}");
     assert_eq!(
@@ -354,10 +359,15 @@ fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
         "gitpulse-only",
         "tools: Read, mcp__plugin_gitpulse_gitpulse__gitpulse_insights\n",
     );
+    let waylode_only = write_agent(
+        &agents,
+        "waylode-only",
+        "tools: Read, mcp__plugin_waylode_waylode__waylode_insights\n",
+    );
     let researcher = write_agent(&agents, "researcher", "tools: WebFetch, Read\n");
     let payload = doctor_with_home(&home, &cwd);
     let warning = payload["agent_tools_warning"].as_str().unwrap_or("");
-    for path in [&gitpulse_only, &researcher] {
+    for path in [&gitpulse_only, &waylode_only, &researcher] {
         assert!(
             names_path(warning, path),
             "{} not named: {payload}",
@@ -381,10 +391,12 @@ fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
         !warning.contains(&researcher.display().to_string()),
         "the printed opt-out did not clear it: {opt_out} -> {payload}"
     );
-    assert!(
-        warning.contains(&gitpulse_only.display().to_string()),
-        "{payload}"
-    );
+    for path in [&gitpulse_only, &waylode_only] {
+        assert!(
+            warning.contains(&path.display().to_string()),
+            "{payload}"
+        );
+    }
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cwd);
 }

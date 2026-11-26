@@ -60,9 +60,27 @@ func TestParseInstallArgsTakesOnlyAsAPositionalName(t *testing.T) {
 	if !reflect.DeepEqual(a.names, []string{"devmap", "dcgrep", "dcstore"}) {
 		t.Fatalf("names=%v", a.names)
 	}
-	for _, argv := range [][]string{{"--only"}, {"--only="}, {"--prefix"}, {"--prefix="}, {"--bogus"}, {"--gitpulse"}, {"--gitpulse="}} {
+	for _, argv := range [][]string{{"--only"}, {"--only="}, {"--prefix"}, {"--prefix="}, {"--bogus"}, {"--waylode"}, {"--waylode="}, {"--gitpulse"}, {"--gitpulse="}} {
 		if _, err := parseInstallArgs(argv); err == nil {
 			t.Fatalf("%v accepted", argv)
+		}
+	}
+	for _, tc := range []struct {
+		argv     []string
+		wantDir  string
+		wantFlag string
+	}{
+		{[]string{"--waylode", "/tmp/w1"}, "/tmp/w1", "--waylode"},
+		{[]string{"--waylode=/tmp/w2"}, "/tmp/w2", "--waylode"},
+		{[]string{"--gitpulse", "/tmp/g1"}, "/tmp/g1", "--gitpulse"},
+		{[]string{"--gitpulse=/tmp/g2"}, "/tmp/g2", "--gitpulse"},
+	} {
+		got, err := parseInstallArgs(tc.argv)
+		if err != nil {
+			t.Fatalf("%v rejected: %v", tc.argv, err)
+		}
+		if got.gitpulse != tc.wantDir || got.gitpulseFlag != tc.wantFlag {
+			t.Fatalf("%v => (%q, %q), want (%q, %q)", tc.argv, got.gitpulse, got.gitpulseFlag, tc.wantDir, tc.wantFlag)
 		}
 	}
 }

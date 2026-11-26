@@ -245,8 +245,14 @@ fn a_brief_opens_with_the_agent_guidance_and_then_the_task() {
         "Read before you write",
         "AGENTS.md, CLAUDE.md",
         "Never write over a file you have not read",
-        "gitpulse_insights",
-        "gitpulse_collision_risk",
+        "waylode_insights",
+        "waylode_collision_risk",
+        // The old spelling stays named while live sessions still list it.
+        "gitpulse_*",
+        "gitpulse:insights",
+        "waylode:insights",
+        "waylode:collisions",
+        "waylode:tasks",
         "devmap_impact",
         "devmap_affected_tests",
         "devcouncil_* MCP tools",
@@ -259,6 +265,7 @@ fn a_brief_opens_with_the_agent_guidance_and_then_the_task() {
         assert!(guidance.contains(named), "guidance omits {named:?}");
     }
     assert!(!guidance.contains("gitpulse_complete_task"));
+    assert!(!guidance.contains("waylode_complete_task"));
     // Every brief pays for it, and a stored task near the export bound is
     // refused rather than cut; keep the standing cost small.
     assert!(AGENT_GUIDANCE.len() < 4096, "{}", AGENT_GUIDANCE.len());

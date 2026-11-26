@@ -378,12 +378,14 @@ fn important_surfaces(map: &Value, map_rel: &str) -> Vec<String> {
 /// GitPulse's facets fail independently, so a facet that could not scan must
 /// never be read as a facet that scanned and found nothing.
 pub const GITPULSE_STEP: &str = "Before you change anything, ask GitPulse Insights what else is \
-live in this repository. `gitpulse_insights` names the other worktrees, the running agent \
+live in this repository. `waylode_insights` names the other worktrees, the running agent \
 sessions, uncommitted work, contended files and index health in one call. Then \
-`gitpulse_collision_risk` before touching a file another worktree may hold, \
-`gitpulse_active_changes` for what is in flight, `gitpulse_change_context` / \
-`gitpulse_provenance` for what changed and why, and `gitpulse_ledger_events` for the recorded \
-history. Its facets fail independently — check each `ok`, because a facet that could not scan \
+`waylode_collision_risk` before touching a file another worktree may hold, \
+`waylode_active_changes` for what is in flight, `waylode_change_context` / \
+`waylode_provenance` for what changed and why, and `waylode_ledger_events` for the recorded \
+history. A session started before the GitPulse to Waylode rename lists these as `gitpulse_*`; \
+those names are still accepted, so use whichever your tool list shows. \
+Its facets fail independently — check each `ok`, because a facet that could not scan \
 is not a facet that came back clean. A `deferred`, timed-out or `ok: false` facet is likewise \
 not a clean answer, and an absent `gitpulse-mcp` is reported the way an absent `devmap` is.";
 
@@ -1363,7 +1365,7 @@ mod tests {
     fn the_guide_puts_gitpulse_insights_before_the_devmap_workflow() {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
         let gitpulse = text
-            .find("gitpulse_insights")
+            .find("waylode_insights")
             .expect("the guide must name GitPulse Insights");
         let workflow = text
             .find("Workflow for agents:")
@@ -1373,14 +1375,20 @@ mod tests {
             "what else is live here is a question to ask before navigating, not after: {text}"
         );
         for tool in [
-            "gitpulse_collision_risk",
-            "gitpulse_active_changes",
-            "gitpulse_change_context",
-            "gitpulse_provenance",
-            "gitpulse_ledger_events",
+            "waylode_collision_risk",
+            "waylode_active_changes",
+            "waylode_change_context",
+            "waylode_provenance",
+            "waylode_ledger_events",
         ] {
             assert!(text.contains(tool), "the guide omits {tool}: {text}");
         }
+        // Live sessions keep the old tool list until they restart.
+        assert!(
+            text.contains("lists these as `gitpulse_*`")
+                && text.contains("those names are still accepted"),
+            "the guide must say the old names still work: {text}"
+        );
     }
 
     #[test]
@@ -1449,7 +1457,7 @@ mod tests {
     #[test]
     fn the_cursor_rule_names_both_tools_and_the_delegation_rule() {
         let rule = cursor_rule_text("m.json");
-        assert!(rule.contains("gitpulse_insights"), "{rule}");
+        assert!(rule.contains("waylode_insights"), "{rule}");
         assert!(rule.contains("devmap_impact"), "{rule}");
         assert!(
             rule.contains("name DevMap and GitPulse Insights in the prompt"),

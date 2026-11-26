@@ -161,8 +161,40 @@ func TestPlannedCommandsStandaloneHasNoGoBuild(t *testing.T) {
 func noCheckoutEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("DEVCOUNCIL_ROOT", "")
+	t.Setenv("WAYLODE_DEVCOUNCIL_ROOT", "")
 	t.Setenv("GITPULSE_DEVCOUNCIL_ROOT", "")
 	t.Chdir(t.TempDir())
+}
+
+func TestFindSourceRootPrefersWaylodeEnvAndFallsBackToGitPulse(t *testing.T) {
+	noCheckoutEnv(t)
+	waylodeRoot := t.TempDir()
+	gitpulseRoot := t.TempDir()
+	if err := osMkdirCheckout(waylodeRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := osMkdirCheckout(gitpulseRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GITPULSE_DEVCOUNCIL_ROOT", gitpulseRoot)
+	if got := FindSourceRoot(); got != gitpulseRoot {
+		t.Fatalf("fallback FindSourceRoot() = %q, want %q", got, gitpulseRoot)
+	}
+
+	t.Setenv("WAYLODE_DEVCOUNCIL_ROOT", waylodeRoot)
+	if got := FindSourceRoot(); got != waylodeRoot {
+		t.Fatalf("Waylode-first FindSourceRoot() = %q, want %q", got, waylodeRoot)
+	}
+
+	devcouncilRoot := t.TempDir()
+	if err := osMkdirCheckout(devcouncilRoot); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEVCOUNCIL_ROOT", devcouncilRoot)
+	if got := FindSourceRoot(); got != devcouncilRoot {
+		t.Fatalf("DEVCOUNCIL_ROOT FindSourceRoot() = %q, want %q", got, devcouncilRoot)
+	}
 }
 
 func TestInstallHostWithoutCheckoutRefusesAndNamesTheCheckoutRoute(t *testing.T) {

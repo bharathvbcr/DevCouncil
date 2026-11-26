@@ -17,6 +17,8 @@ from .agent_config import (
     DEVCOUNCIL_TOOLS,
     DEVMAP_TOOLS,
     GITPULSE_TOOLS,
+    WAYLODE_ALLOWLIST,
+    WAYLODE_TOOLS,
 )
 from .mcp_bridge import (
     call_mcp_tool,
@@ -37,6 +39,8 @@ __all__ = [
     "DEVCOUNCIL_TOOLS",
     "DEVMAP_TOOLS",
     "GITPULSE_TOOLS",
+    "WAYLODE_ALLOWLIST",
+    "WAYLODE_TOOLS",
     "call_mcp_tool",
     "register_in_process_handler",
     "clear_in_process_handlers",

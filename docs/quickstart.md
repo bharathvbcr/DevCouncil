@@ -163,7 +163,8 @@ dcgrep health
 Task verification needs a task in this repository's task store. A board card
 (a GitPulse `ft-...` id) is not a task in this store: `devcouncil verify ft-...`
 finds nothing and reports `not_run` (`task_not_found`) rather than a verdict. A
-card's verification is the board's own gate: `gitpulse_complete_task` with status
+card's verification is the board's own gate: `waylode_complete_task` (still accepted
+as `gitpulse_complete_task`) with status
 done lands the card in `review`, and the GitPulse app's verification driver then
 runs Manvi `work.verify.task` and moves it to `done` on a pass. Report a `not_run` as not run, never as
 verified or passed. A task is a

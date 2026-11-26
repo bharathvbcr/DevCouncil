@@ -46,7 +46,7 @@
       ],
       "description": "DevMap high-precision 11-tier code intelligence, AST extraction, and graph search"
     },
-    "gitpulse": {
+    "waylode": {
       "command": "gitpulse-mcp",
       "args": ["--repo", "${DEVCOUNCIL_WORKSPACE:-.}"],
       "env": {
@@ -54,6 +54,29 @@
       },
       "transport": "stdio",
       "tools": [
+        "waylode_insights",
+        "waylode_status",
+        "waylode_active_changes",
+        "waylode_collision_risk",
+        "waylode_merge_conflicts",
+        "waylode_change_context",
+        "waylode_ledger_events",
+        "waylode_task_view",
+        "waylode_add_task",
+        "waylode_list_tasks",
+        "waylode_get_task",
+        "waylode_complete_task",
+        "waylode_delete_task",
+        "waylode_worktree_create",
+        "waylode_worktree_switch",
+        "waylode_worktree_isolate",
+        "waylode_worktree_prune",
+        "waylode_worktree_merge",
+        "waylode_agent_register",
+        "waylode_agent_peers",
+        "waylode_agent_send",
+        "waylode_agent_inbox",
+        "waylode_agent_wait",
         "gitpulse_insights",
         "gitpulse_status",
         "gitpulse_active_changes",
@@ -78,7 +101,7 @@
         "gitpulse_agent_inbox",
         "gitpulse_agent_wait"
       ],
-      "description": "GitPulse multi-agent worktree concurrency, line-level collision detection, and append-only ledger"
+      "description": "Waylode (formerly GitPulse) multi-agent worktree concurrency, line-level collision detection, and append-only ledger"
     }
   }
 }

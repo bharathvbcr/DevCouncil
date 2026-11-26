@@ -8,19 +8,27 @@ tools: Read, Grep, Glob, Bash, Edit, Write, TodoWrite, mcp__devcouncil__devcounc
   mcp__devcouncil__devcouncil_policy_check_write, mcp__devcouncil__devcouncil_renew_lease,
   mcp__devcouncil__devcouncil_verify_task, mcp__devcouncil__devcouncil_release_task,
   mcp__devmap__devmap_search, mcp__plugin_devmap_devmap__devmap_search,
-  mcp__plugin_gitpulse_gitpulse__devmap_search, mcp__devmap__devmap_ask_evidence,
-  mcp__plugin_devmap_devmap__devmap_ask_evidence,
+  mcp__plugin_waylode_waylode__devmap_search, mcp__plugin_gitpulse_gitpulse__devmap_search,
+  mcp__devmap__devmap_ask_evidence, mcp__plugin_devmap_devmap__devmap_ask_evidence,
+  mcp__plugin_waylode_waylode__devmap_ask_evidence,
   mcp__plugin_gitpulse_gitpulse__devmap_ask_evidence, mcp__devmap__devmap_impact,
-  mcp__plugin_devmap_devmap__devmap_impact, mcp__plugin_gitpulse_gitpulse__devmap_impact,
-  mcp__devmap__devmap_explore, mcp__plugin_devmap_devmap__devmap_explore,
+  mcp__plugin_devmap_devmap__devmap_impact, mcp__plugin_waylode_waylode__devmap_impact,
+  mcp__plugin_gitpulse_gitpulse__devmap_impact, mcp__devmap__devmap_explore,
+  mcp__plugin_devmap_devmap__devmap_explore, mcp__plugin_waylode_waylode__devmap_explore,
   mcp__plugin_gitpulse_gitpulse__devmap_explore, mcp__devmap__devmap_affected_tests,
   mcp__plugin_devmap_devmap__devmap_affected_tests,
+  mcp__plugin_waylode_waylode__devmap_affected_tests,
   mcp__plugin_gitpulse_gitpulse__devmap_affected_tests,
-  mcp__plugin_gitpulse_gitpulse__gitpulse_insights,
+  mcp__plugin_waylode_waylode__waylode_insights, mcp__plugin_gitpulse_gitpulse__gitpulse_insights,
+  mcp__plugin_waylode_waylode__waylode_collision_risk,
   mcp__plugin_gitpulse_gitpulse__gitpulse_collision_risk,
+  mcp__plugin_waylode_waylode__waylode_active_changes,
   mcp__plugin_gitpulse_gitpulse__gitpulse_active_changes,
+  mcp__plugin_waylode_waylode__waylode_change_context,
   mcp__plugin_gitpulse_gitpulse__gitpulse_change_context,
+  mcp__plugin_waylode_waylode__waylode_provenance,
   mcp__plugin_gitpulse_gitpulse__gitpulse_provenance,
+  mcp__plugin_waylode_waylode__waylode_ledger_events,
   mcp__plugin_gitpulse_gitpulse__gitpulse_ledger_events
 ---
 
@@ -31,7 +39,7 @@ Workflow:
 2. Establish scope from the checkout result, and use `devcouncil_get_diff` to inspect the working tree.
 3. **Navigate with DevMap and GitPulse Insights before reading files.** They answer different questions and neither substitutes for the other:
    - **DevMap — where the code is and what it touches.** `devmap_ask_evidence` for a behaviour question in code you do not know yet (ranked files, their verbatim source, the call edges between them and the tests that reach them, in one answer), `devmap_search` to locate a name, `devmap_explore` for structure, `devmap_impact` for callers and blast radius, `devmap_affected_tests` for the tests your change should run. Pass `repo_path` every time, check `repository.root` in the envelope, and read `truncated` / `walk_incomplete` before treating an empty list as "nothing exists".
-   - **GitPulse Insights — who else is in this repository right now.** `gitpulse_insights` first: it names the other worktrees, the running agent sessions, uncommitted work, contended files and index health in one call. Then `gitpulse_collision_risk` before you touch a file another worktree may hold, `gitpulse_active_changes` for what is in flight, and `gitpulse_change_context` / `gitpulse_provenance` / `gitpulse_ledger_events` for what changed and why. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean.
+   - **GitPulse Insights — who else is in this repository right now.** `waylode_insights` first: it names the other worktrees, the running agent sessions, uncommitted work, contended files and index health in one call. Then `waylode_collision_risk` before you touch a file another worktree may hold, `waylode_active_changes` for what is in flight, and `waylode_change_context` / `waylode_provenance` / `waylode_ledger_events` for what changed and why. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean. Sessions started before the rename list these tools as `gitpulse_*`; the old names are still accepted, so use whichever your tool list shows.
 
    A lease makes the task yours; it does not make the files yours. Navigating the graph perfectly and then editing a file a sibling lane is holding is still a collision. When either tool cannot answer, record the gap and say so — do not fall back to grep and report the result as if the graph had confirmed it.
 4. Edit with the built-in `Edit` / `Write` tools and run tests with `Bash`. There is no `devcouncil_write_file`, `devcouncil_apply_patch` or `devcouncil_run_command` on this host — those belonged to the retired Python host. Before writing a path you are unsure about, call `devcouncil_policy_check_write` with the `path`, your `task_id` and the `operation` (`create`, `modify` or `delete`) to confirm it is in scope. Without `task_id` it cannot answer the scope question: the answer stops at `task.absent`.

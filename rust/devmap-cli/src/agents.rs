@@ -20,27 +20,30 @@ use crate::claude::{MCP_SERVER_NAME, PLUGIN_NAME};
 /// Every server a `devmap_*` tool is served under in Claude Code, as the
 /// `mcp__<server>` stem its tool IDs carry.
 ///
-/// One `devmap mcp` server reaches a session under up to three names: the
+/// One `devmap mcp` server reaches a session under up to four names: the
 /// user-scope `devmap` entry, the `devmap` plugin's own `.mcp.json`, and the
-/// `gitpulse` plugin, which serves the same `devmap_*` tools beside its own.
-/// `scripts/sync-agent-defs.mjs::MCP_TOOL_PREFIXES` declares the same three for
+/// `waylode` plugin and its predecessor the `gitpulse` plugin, which each serve
+/// the same `devmap_*` tools beside their own. Both stay until no host serves
+/// the old plugin: a session started before the rename keeps the old name.
+/// `scripts/sync-agent-defs.mjs::MCP_TOOL_PREFIXES` declares the same four for
 /// the agents DevCouncil generates, and `scripts/mcp-served-tools.mjs` fails
 /// when that declaration no longer matches the live hosts.
-fn devmap_servers() -> [String; 3] {
+fn devmap_servers() -> [String; 4] {
     [
         format!("mcp__{MCP_SERVER_NAME}"),
         format!("mcp__plugin_{PLUGIN_NAME}_{MCP_SERVER_NAME}"),
+        "mcp__plugin_waylode_waylode".to_string(),
         "mcp__plugin_gitpulse_gitpulse".to_string(),
     ]
 }
 
 /// The servers a whole-server grant may name to mean DevMap.
 ///
-/// The gitpulse plugin is left out: granting it whole hands an agent the task
-/// board's write tools too, which is not what a DevMap remedy should ask for.
-/// A gitpulse-served `devmap_*` tool named singly still counts.
+/// The waylode and gitpulse plugins are left out: granting either whole hands an
+/// agent the task board's write tools too, which is not what a DevMap remedy
+/// should ask for. A `devmap_*` tool they serve, named singly, still counts.
 fn devmap_only_servers() -> [String; 2] {
-    let [user, plugin, _] = devmap_servers();
+    let [user, plugin, _, _] = devmap_servers();
     [user, plugin]
 }
 
@@ -261,8 +264,8 @@ fn denies_devmap(entry: &str) -> bool {
     if entry == "mcp__*" {
         return true;
     }
-    // The gitpulse server is not DevMap's to opt out of: denying it whole
-    // removes gitpulse's own tools, and DevMap's own servers still serve.
+    // The waylode and gitpulse servers are not DevMap's to opt out of: denying
+    // one whole removes its own tools, and DevMap's own servers still serve.
     whole_server(entry).is_some_and(|server| devmap_only_servers().iter().any(|s| s == server))
 }
 
@@ -336,6 +339,23 @@ mod tests {
             gap("tools: Read,\n  mcp__plugin_gitpulse_gitpulse__devmap_impact\nmodel: opus\n"),
             None
         );
+        // The Waylode plugin serves the same tools under its own name.
+        assert_eq!(
+            gap("tools: Read,\n  mcp__plugin_waylode_waylode__devmap_impact\nmodel: opus\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_waylode_plugin_is_a_namesake_not_a_devmap_remedy() {
+        // Same rule as its predecessor: the server whole, or one of its own
+        // tools, is not DevMap.
+        assert!(gap("tools: Read, mcp__plugin_waylode_waylode\n").is_some());
+        assert!(gap("tools: mcp__plugin_waylode_waylode__waylode_insights\n").is_some());
+        assert!(
+            gap("tools: Read\ndisallowedTools: Bash, mcp__plugin_waylode_waylode\n").is_some()
+        );
+        assert!(!remedy_entries().contains("waylode"));
     }
 
     #[test]

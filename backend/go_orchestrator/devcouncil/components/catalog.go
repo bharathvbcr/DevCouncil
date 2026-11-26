@@ -189,11 +189,10 @@ func RustIDs(cs []Component) []string {
 
 // FindSourceRoot locates a DevCouncil checkout. Empty string means none.
 func FindSourceRoot() string {
-	if v := strings.TrimSpace(os.Getenv("DEVCOUNCIL_ROOT")); v != "" && looksLikeCheckout(v) {
-		return v
-	}
-	if v := strings.TrimSpace(os.Getenv("GITPULSE_DEVCOUNCIL_ROOT")); v != "" && looksLikeCheckout(v) {
-		return v
+	for _, env := range []string{"DEVCOUNCIL_ROOT", "WAYLODE_DEVCOUNCIL_ROOT", "GITPULSE_DEVCOUNCIL_ROOT"} {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" && looksLikeCheckout(v) {
+			return v
+		}
 	}
 	wd, err := os.Getwd()
 	if err != nil {

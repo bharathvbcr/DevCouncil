@@ -70,7 +70,7 @@ async def on_session_start_hook() -> dict:
             "task_id": state.task_id,
         }
         worktree_res = await call_mcp_tool(
-            "gitpulse", "gitpulse_worktree_create", worktree_payload
+            "waylode", "waylode_worktree_create", worktree_payload
         )
 
         state.worktree_path = worktree_res.get("worktree_path", state.repo_path)

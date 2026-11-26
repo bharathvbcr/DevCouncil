@@ -98,7 +98,7 @@ func runInstall(args []string, base Options) int {
 	case installErr != nil:
 		consumers = notChecked("", "the install failed")
 	default:
-		consumers = CheckConsumers(opts.source(), a.gitpulse, opts)
+		consumers = checkConsumersWithFlag(opts.source(), a.gitpulse, a.gitpulseFlag, opts)
 	}
 	if !jsonOut {
 		PrintConsumerReport(consumers)
@@ -166,9 +166,10 @@ type installArgs struct {
 	// rev pins a remote install to a commit instead of the release tag.
 	rev   string
 	names []string
-	// gitpulse is the GitPulse checkout whose schema-parity check runs after
-	// the install; empty means GitPulseRootEnv, then the sibling checkout.
-	gitpulse string
+	// gitpulse is the Waylode/GitPulse checkout whose schema-parity check runs after
+	// the install; empty means WaylodeRootEnv / GitPulseRootEnv, then the sibling checkout.
+	gitpulse     string
+	gitpulseFlag string
 	// strictConsumers fails the install when a consumer lags or was not checked.
 	strictConsumers bool
 }
@@ -207,12 +208,14 @@ func parseInstallArgs(args []string) (installArgs, error) {
 				return installArgs{}, fmt.Errorf("--src needs a directory")
 			}
 			a.src = args[i]
-		case "--gitpulse":
+		case "--waylode", "--gitpulse":
+			flag := args[i]
 			i++
 			if i >= len(args) || args[i] == "" {
-				return installArgs{}, fmt.Errorf("--gitpulse needs a directory")
+				return installArgs{}, fmt.Errorf("%s needs a directory", flag)
 			}
 			a.gitpulse = args[i]
+			a.gitpulseFlag = flag
 		case "--rev":
 			i++
 			if i >= len(args) || args[i] == "" {
@@ -256,11 +259,16 @@ func parseInstallArgs(args []string) (installArgs, error) {
 				}
 				continue
 			}
-			if strings.HasPrefix(args[i], "--gitpulse=") {
-				a.gitpulse = strings.TrimPrefix(args[i], "--gitpulse=")
-				if a.gitpulse == "" {
-					return installArgs{}, fmt.Errorf("--gitpulse needs a directory")
+			if strings.HasPrefix(args[i], "--waylode=") || strings.HasPrefix(args[i], "--gitpulse=") {
+				flag := "--gitpulse"
+				if strings.HasPrefix(args[i], "--waylode=") {
+					flag = "--waylode"
 				}
+				a.gitpulse = strings.TrimPrefix(args[i], flag+"=")
+				if a.gitpulse == "" {
+					return installArgs{}, fmt.Errorf("%s needs a directory", flag)
+				}
+				a.gitpulseFlag = flag
 				continue
 			}
 			if strings.HasPrefix(args[i], "-") {

@@ -105,9 +105,10 @@ once made them through DevCouncil are retired and nothing gates a write now.
 
 When the MCP tools are not loaded, the \`devmap\` CLI answers the same questions
 (\`devmap search\`, \`devmap explore <name>\`, \`devmap impact\`, \`devmap affected
-<target>\`). GitPulse Insights is served over MCP only — there is no \`gitpulse\`
-CLI, so when it is unavailable, report the situation as unestablished rather than
-guessing at it.`;
+<target>\`). GitPulse Insights (the \`waylode_*\` tools, formerly \`gitpulse_*\`) is served over MCP;
+there is no \`waylode\` or \`gitpulse\` CLI for it. Where the \`gitpulse-mcp\` binary is installed,
+\`gitpulse-mcp call <tool> key=value\` answers from the shell when the MCP connection is not loaded.
+When neither is available, report the situation as unestablished rather than guessing at it.`;
 
 /**
  * Host facts appended to the three Antigravity roles. The primary is copied
@@ -117,7 +118,7 @@ export const ANTIGRAVITY_HOST_NOTES = `## On this host
 
 Where the instructions name \`Read\`, \`Edit\`, \`Write\`, \`Grep\`, \`Glob\`, or \`Bash\`, use this host's file and shell tools.
 
-MCP tools are the unsuffixed \`devcouncil_*\`, \`devmap_*\`, and \`gitpulse_*\` names. The \`mcp__\` prefixes are Claude's. If DevMap MCP is absent, the \`devmap\` CLI answers the same questions. GitPulse has no CLI; an unavailable Insights call is unestablished, not clean.
+MCP tools are the unsuffixed \`devcouncil_*\`, \`devmap_*\`, and \`waylode_*\` names; \`gitpulse_*\` is the old spelling of the last and is still accepted. The \`mcp__\` prefixes are Claude's. If DevMap MCP is absent, the \`devmap\` CLI answers the same questions. GitPulse Insights has no CLI of its own (where installed, \`gitpulse-mcp call <tool> key=value\` answers from the shell); an unavailable Insights call is unestablished, not clean.
 
 Do not invoke another subagent. Return the result to the parent.`;
 
@@ -225,10 +226,10 @@ export function antigravityLibrary(root, names, parsedByName) {
  * instead, so those agents were granted zero DevMap tools. Transcripts show all
  * three prefixes in live use across sessions.
  *
- * The duplication is real: one `devmap mcp` server is registered three times —
+ * The duplication is real: one `devmap mcp` server is registered up to four times —
  * user scope in `~/.claude.json`, the `devmap` plugin's own `.mcp.json`, and the
- * `gitpulse` plugin, which serves the same eleven `devmap_*` tools beside its
- * own. Which prefix a session exposes is not a property of the agent, so a grant
+ * `waylode` plugin and its predecessor the `gitpulse` plugin, which each serve
+ * the same eleven `devmap_*` tools beside their own. Which prefix a session exposes is not a property of the agent, so a grant
  * must name all of them. Listing a prefix the session does not serve is inert;
  * omitting the one it does serve is silent failure.
  *
@@ -241,11 +242,25 @@ export const MCP_TOOL_PREFIXES = {
   devmap: [
     "mcp__devmap__",
     "mcp__plugin_devmap_devmap__",
+    "mcp__plugin_waylode_waylode__",
     "mcp__plugin_gitpulse_gitpulse__",
   ],
+  waylode: ["mcp__plugin_waylode_waylode__"],
   gitpulse: ["mcp__plugin_gitpulse_gitpulse__"],
   devcouncil: ["mcp__devcouncil__"],
 };
+
+/**
+ * Families whose tools were renamed: old family -> new family.
+ *
+ * GitPulse is becoming Waylode. The new server lists `waylode_<x>` and keeps
+ * accepting `gitpulse_<x>` as an alias, but a `tools:` grant is matched against
+ * the LISTED name, so the new plugin's grant must say `waylode_<x>`. Live
+ * sessions keep the old tool list until they restart, so a grant carries both
+ * spellings, new first, each under its own server prefix. Delete the old family
+ * (and this table) once no host serves the old names.
+ */
+export const RENAMED_FAMILIES = { gitpulse: "waylode" };
 
 /** Thrown for every rejected input, so callers can fail closed on one type. */
 export class AgentDefError extends Error {}
@@ -269,6 +284,34 @@ export function splitToolId(entry) {
 export function familyOf(tool) {
   const family = tool.split("_", 1)[0];
   return Object.hasOwn(MCP_TOOL_PREFIXES, family) ? family : null;
+}
+
+/**
+ * Every `{ prefix, tool }` pair a grant for this bare tool name must carry.
+ *
+ * A tool in a renamed family (`gitpulse_x` / `waylode_x`) yields the new name
+ * under the new prefixes, then the old name under the old prefixes, whichever
+ * spelling it was given. Any other tool is the same name under each prefix of
+ * its family. Null when the tool belongs to no known family.
+ */
+export function grantPairs(tool) {
+  const family = familyOf(tool);
+  if (family === null) return null;
+  for (const [oldFamily, newFamily] of Object.entries(RENAMED_FAMILIES)) {
+    if (family !== oldFamily && family !== newFamily) continue;
+    const rest = tool.slice(family.length + 1);
+    return [
+      ...MCP_TOOL_PREFIXES[newFamily].map((prefix) => ({ prefix, tool: `${newFamily}_${rest}` })),
+      ...MCP_TOOL_PREFIXES[oldFamily].map((prefix) => ({ prefix, tool: `${oldFamily}_${rest}` })),
+    ];
+  }
+  return MCP_TOOL_PREFIXES[family].map((prefix) => ({ prefix, tool }));
+}
+
+/** One key per logical tool, so `gitpulse_x` and `waylode_x` group together. */
+function grantKey(tool) {
+  const pairs = grantPairs(tool);
+  return pairs === null ? tool : pairs[0].tool;
 }
 
 /**
@@ -297,12 +340,12 @@ export function expandTools(tools) {
       if (!passthrough.includes(entry)) passthrough.push(entry);
       continue;
     }
-    if (!byTool.has(split.tool)) byTool.set(split.tool, true);
+    if (!byTool.has(grantKey(split.tool))) byTool.set(grantKey(split.tool), split.tool);
   }
   const expanded = [];
-  for (const tool of byTool.keys()) {
-    for (const prefix of MCP_TOOL_PREFIXES[familyOf(tool)]) {
-      const id = prefix + tool;
+  for (const tool of byTool.values()) {
+    for (const pair of grantPairs(tool)) {
+      const id = pair.prefix + pair.tool;
       if (!expanded.includes(id)) expanded.push(id);
     }
   }
@@ -320,12 +363,15 @@ export function pinnedGrants(tools) {
   for (const entry of tools) {
     const split = splitToolId(entry);
     if (split === null || familyOf(split.tool) === null) continue;
-    if (!seen.has(split.tool)) seen.set(split.tool, new Set());
-    seen.get(split.tool).add(split.prefix);
+    const key = grantKey(split.tool);
+    if (!seen.has(key)) seen.set(key, { tool: split.tool, ids: new Set() });
+    seen.get(key).ids.add(entry);
   }
   const pinned = [];
-  for (const [tool, prefixes] of seen) {
-    const missing = MCP_TOOL_PREFIXES[familyOf(tool)].filter((p) => !prefixes.has(p));
+  for (const { tool, ids } of seen.values()) {
+    const missing = grantPairs(tool)
+      .filter((pair) => !ids.has(pair.prefix + pair.tool))
+      .map((pair) => pair.prefix);
     if (missing.length > 0) pinned.push({ tool, missing });
   }
   return pinned;
