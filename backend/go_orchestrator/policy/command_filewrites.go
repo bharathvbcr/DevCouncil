@@ -706,13 +706,21 @@ func xargsWrites(args []shellWord, depth int) argWrites {
 		return argWrites{}
 	}
 	inner := args[k:]
-	at := argumentCommandWord(inner)
+	peel := peelCommand(inner)
+	at := peel.at
+	var w argWrites
+	w.merge(literalWrites(peel.writes))
+	if peel.unknown != "" {
+		w.unjudged = "`xargs` runs a wrapper with an option (`" + peel.unknown + "`) the gate cannot step over"
+	}
 	if at < 0 {
-		return argWrites{}
+		return w
 	}
 	static := commandWrites(inner, at, inner[at+1:], depth+1)
-	var w argWrites
-	w.opaque, w.unjudged = static.opaque, static.unjudged
+	w.opaque = static.opaque
+	if w.unjudged == "" {
+		w.unjudged = static.unjudged
+	}
 	for _, t := range static.targets {
 		if replacement != "" && strings.Contains(t, replacement) {
 			continue
@@ -765,7 +773,12 @@ func findWrites(args []shellWord, depth int) argWrites {
 			}
 			inner := args[start:end]
 			k = end
-			at := argumentCommandWord(inner)
+			peel := peelCommand(inner)
+			w.merge(literalWrites(peel.writes))
+			if peel.unknown != "" && w.unjudged == "" {
+				w.unjudged = "`find -exec` runs a wrapper with an option (`" + peel.unknown + "`) the gate cannot step over"
+			}
+			at := peel.at
 			if at < 0 {
 				continue
 			}

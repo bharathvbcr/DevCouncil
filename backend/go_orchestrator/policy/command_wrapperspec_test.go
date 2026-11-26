@@ -19,19 +19,39 @@ func TestPeelWrapperFindsWrappedCommand(t *testing.T) {
 		"env -- cat x": "cat", "command -p cat x": "cat",
 	} {
 		words := shellWords(line)
-		at, unknown := argumentCommandWordPeeled(words)
+		at, unknown := peelCommandPair(words)
 		if unknown != "" || at < 0 || words[at].text != want {
 			t.Errorf("%q: got at=%d unknown=%q, want command %q", line, at, unknown, want)
 		}
 	}
-	for line, want := range map[string]string{"env --frobnicate cat x": "--frobnicate", "sudo -e .env": "-e", "nice -z cat x": "-z", "nohup -x cat x": "-x"} {
-		if at, unknown := argumentCommandWordPeeled(shellWords(line)); at != -1 || unknown != want {
-			t.Errorf("%q: got at=%d unknown=%q, want unpeelable option %q", line, at, unknown, want)
+	for line, want := range map[string]string{"env --frobnicate cat x": "--frobnicate", "nice -z cat x": "-z", "nohup -x cat x": "-x"} {
+		words := shellWords(line)
+		if at, unknown := peelCommandPair(words); unknown != want || at < 0 || words[at].text != "cat" {
+			t.Errorf("%q: got at=%d unknown=%q, want unknown option %q and the guessed command cat", line, at, unknown, want)
 		}
 	}
+	for line, want := range map[string]string{"env -C .git rm x": "-C", "sudo -D d ls": "-D", "sudo --chroot=/ ls": "--chroot"} {
+		if p := peelCommand(shellWords(line)); p.chdir != want || p.at < 0 {
+			t.Errorf("%q: got chdir=%q at=%d, want chdir %q", line, p.chdir, p.at, want)
+		}
+	}
+	if p := peelCommand(shellWords("time -a -o out.txt true")); len(p.writes) != 1 || p.writes[0] != "out.txt" {
+		t.Errorf("time -o: got writes %v", p.writes)
+	}
+	if p := peelCommand(shellWords("sudo -e a b")); len(p.writes) != 2 || p.at != -1 {
+		t.Errorf("sudo -e: got writes %v at=%d, want both operands as writes", p.writes, p.at)
+	}
+	if p := peelCommand(shellWords("env -S 'cat .env' x")); p.reparse != "cat .env" || len(p.reparseRest) != 1 {
+		t.Errorf("env -S: got reparse %q rest %d", p.reparse, len(p.reparseRest))
+	}
 	for _, line := range []string{"env", "sudo", "command -v cat", "env FOO=1"} {
-		if at, unknown := argumentCommandWordPeeled(shellWords(line)); at != -1 || unknown != "" {
+		if at, unknown := peelCommandPair(shellWords(line)); at != -1 || unknown != "" {
 			t.Errorf("%q: got at=%d unknown=%q, want nothing run", line, at, unknown)
 		}
 	}
+}
+
+func peelCommandPair(words []shellWord) (int, string) {
+	p := peelCommand(words)
+	return p.at, p.unknown
 }

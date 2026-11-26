@@ -61,11 +61,21 @@ const maxGlobMatchesJudged = 1024
 // elsewhere in the clause takes precedence over it.
 func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
-	commandAt, unknownOption := argumentCommandWordPeeled(words)
-	if unknownOption != "" {
-		return fmt.Sprintf("a wrapper is handed an option (`%s`) the gate cannot step over to the command it runs, "+
+	peel := peelCommand(words)
+	if peel.reparse != "" {
+		return secretOperandViolation(reparseLine(peel.reparse, peel.reparseRest), root)
+	}
+	// An option the wrapper table does not describe leaves the command behind
+	// it unknowable. The clause is then read as before the table existed
+	// (readerBehindWrapper from the first wrapper, every later word judged), so
+	// a spelled credential is still the hard refusal, and the unknown option is
+	// only the unverifiable reason when nothing harder fires.
+	commandAt, unknownReason := peel.at, ""
+	if peel.unknown != "" {
+		commandAt = -1
+		unknownReason = fmt.Sprintf("a wrapper is handed an option (`%s`) the gate cannot step over to the command it runs, "+
 			"so that command's operands were not judged. Spell the command without the wrapper, or use an option "+
-			"the gate knows.", unknownOption), true
+			"the gate knows.", peel.unknown)
 	}
 	at, judgedFrom := readerBehindWrapper(words, commandAt)
 	framing := isBoundedShellCompoundFraming(clause)
@@ -120,7 +130,7 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		}
 	}
 
-	unbound := ""
+	unbound := unknownReason
 	for i := 0; i < len(words); i++ {
 		text := words[i].text
 		if target, isRedirect := redirectionPrefix(text); isRedirect {
