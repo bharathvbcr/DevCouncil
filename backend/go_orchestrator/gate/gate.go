@@ -260,6 +260,15 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 	if err != nil {
 		return policy.Decision{}, err
 	}
+	if refusal.Refused && refusal.Unjudgeable && decision.Blocked() && decision.Severity == policy.Hard {
+		// The operand rung already named why it cannot judge this command
+		// (command.operand.unverifiable), and keeps its rule and reason. It is
+		// returned from here without the unreadable-only marker the fall-through
+		// below adds, so a host that softens unreadable refusals cannot soften
+		// this one: the unjudgeable word is refused outright.
+		refusal.Decision.Rule = decision.Rule
+		refusal.Decision.Reason = decision.Reason
+	}
 	if refusal.Refused {
 		// Returned without settling the command decision, so a grant scoped to
 		// the command is not consumed for a command that will not run — and so
@@ -317,6 +326,11 @@ type RedirectRefusal struct {
 	Decision policy.Decision
 	// Refused reports whether any component was refused.
 	Refused bool
+	// Unjudgeable marks the refusal for a word whose expansion the gate cannot
+	// judge (policy.RedirectSet.Unjudgeable). A caller that already holds a hard
+	// refusal for the same command keeps that rule (its operand rung got there
+	// first), since both say the command is refused.
+	Unjudgeable bool
 	// FromTarget distinguishes the two kinds of refusal, and the distinction
 	// is not cosmetic. True means the refusal is a target's own write decision:
 	// the caller's WriteEvaluator produced it, so whatever that caller does
@@ -388,20 +402,47 @@ func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, e
 	if err != nil {
 		return RedirectRefusal{}, err
 	}
-	if opaque {
-		return RedirectRefusal{
+	// An opaque line is refused, but only after the files it does name are
+	// judged: a refusal for a write the gate could not read must not hide the
+	// one for a write it could (a credential target is path.secret, not this).
+	opaqueReason := "A file this command writes — a redirection target or a file operand — is chosen " +
+		"by a command substitution, or the line writes more files than the gate enumerates, " +
+		"and was judged as an unverifiable write. Write to a literal file path or use your file editing tools instead."
+	if set.OpaqueReason != "" {
+		opaqueReason = set.OpaqueReason
+	}
+	opaqueRefusal := RedirectRefusal{
+		Decision: policy.Decision{
+			Action:   policy.Deny,
+			Rule:     policy.RuleCommandSubstitution,
+			Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
+			Reason:   opaqueReason,
+			Target:   command,
+			TaskID:   taskID,
+		},
+		Refused: true,
+	}
+	// A word whose expansion can steer its path is refused as hard as an
+	// outside-root write: the gate cannot judge it, and resolving its text
+	// lexically (an unset $zz that a ".." cancels) judges a different file than
+	// the one the shell opens. No posture softens path.outside_root.
+	unjudgeableRefusal := RedirectRefusal{}
+	if len(set.Unjudgeable) > 0 {
+		unjudgeableRefusal = RedirectRefusal{
 			Decision: policy.Decision{
 				Action:   policy.Deny,
-				Rule:     policy.RuleCommandSubstitution,
-				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
-				Reason: "A file this command writes — a redirection target or a file operand — is chosen " +
-					"by a command substitution, or the line writes more files than the gate enumerates, " +
-					"and was judged as an unverifiable write. Write to a literal file path or use your file editing tools instead.",
+				Rule:     policy.RuleOutsideRoot,
+				Severity: policy.SeverityOf(policy.RuleOutsideRoot),
+				Reason: fmt.Sprintf("Command writes a path (%s) whose expansion the gate cannot judge: it holds an "+
+					"unset or computed variable, quoting or a brace that the shell expands next to \"..\", so the "+
+					"file it opens may be outside the repository or a protected path. This is refused as unjudgeable, not "+
+					"because the path is known to be outside. Spell the path out.", set.Unjudgeable[0]),
 				Target: command,
 				TaskID: taskID,
 			},
-			Refused: true,
-		}, nil
+			Refused:     true,
+			Unjudgeable: true,
+		}
 	}
 	var blocked []policy.Decision
 	judgeSet := func(paths, delPaths []string, eval func(target string, op dc.Operation) (policy.Decision, error)) (bool, error) {
@@ -456,7 +497,20 @@ func EvaluateRedirectsOpsInRoot(command, root, taskID string, scopeBound bool, e
 		}
 	}
 	if chosen, refused := policy.MostImportant(blocked); refused {
+		hardChosen := chosen.Severity == policy.Hard && !policy.IsUnreadableRule(chosen.Rule)
+		if unjudgeableRefusal.Refused && !hardChosen {
+			return unjudgeableRefusal, nil
+		}
+		if opaque && !hardChosen {
+			return opaqueRefusal, nil
+		}
 		return RedirectRefusal{Decision: chosen, Refused: true, FromTarget: true}, nil
+	}
+	if unjudgeableRefusal.Refused {
+		return unjudgeableRefusal, nil
+	}
+	if opaque {
+		return opaqueRefusal, nil
 	}
 	// A sibling's files are another session's, never the caller's scope, so this
 	// does not depend on scopeBound. Policy records why it could not name them

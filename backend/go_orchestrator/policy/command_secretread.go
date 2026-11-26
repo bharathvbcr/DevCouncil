@@ -61,7 +61,50 @@ const maxGlobMatchesJudged = 1024
 // elsewhere in the clause takes precedence over it.
 func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
-	at := readerBehindWrapper(words, argumentCommandWord(words))
+	peel := peelCommand(words)
+	// The line a wrapper parses itself (env -S) is judged as a clause of its
+	// own. The clause as written is judged too, as before the wrapper table
+	// (every word after the first wrapper): its redirections, and the words
+	// after the string as the shell spells them (a glob, an unbound variable),
+	// which the reparse sees only quoted.
+	reparsedReason := ""
+	if peel.reparse != "" {
+		if reason, unverifiable := secretOperandViolation(reparseLine(peel.reparse, peel.reparseRest), root); reason != "" {
+			if !unverifiable {
+				return reason, false
+			}
+			reparsedReason = reason
+		}
+	}
+	// An option the wrapper table does not describe leaves the command behind
+	// it unknowable. The clause is then read as before the table existed
+	// (readerBehindWrapper from the first wrapper, every later word judged), so
+	// a spelled credential is still the hard refusal, and the unknown option is
+	// only the unverifiable reason when nothing harder fires.
+	commandAt, unknownReason := peel.at, reparsedReason
+	if peel.reparse != "" {
+		commandAt = -1
+	}
+	if peel.unknown != "" {
+		commandAt = -1
+		unknownReason = fmt.Sprintf("a wrapper is handed an option (`%s`) the gate cannot step over to the command it runs, "+
+			"so that command's operands were not judged. Spell the command without the wrapper, or use an option "+
+			"the gate knows.", peel.unknown)
+	}
+	if peel.computed != "" {
+		commandAt = -1
+		unknownReason = fmt.Sprintf("a wrapper runs a command the shell computes (`%s`), so which program runs, and "+
+			"which of the later words it reads, cannot be told. Spell the command out.", peel.computed)
+	}
+	at, judgedFrom := readerBehindWrapper(words, commandAt)
+	if at < 0 && peel.computed != "" {
+		// No word names the program. Every word after the computed one may be
+		// what it reads, so each is judged as a reader's operand: a spelled
+		// credential stays the hard refusal rather than the unverifiable one.
+		// The computed word is judged too: `nice .e*` runs whatever .e*
+		// matches.
+		at, judgedFrom = peel.computedAt, peel.computedAt-1
+	}
 	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""
@@ -85,6 +128,15 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 	written := make(map[string]bool, len(argWrites.targets))
 	for _, w := range argWrites.targets {
 		written[w] = true
+	}
+	// touched also holds what the command deletes; see the expanded-target
+	// check in the operand loop.
+	touched := make(map[string]bool, len(written)+len(argWrites.deletes))
+	for w := range written {
+		touched[w] = true
+	}
+	for _, w := range argWrites.deletes {
+		touched[w] = true
 	}
 	if command == "git" {
 		for _, sib := range argWrites.siblings {
@@ -114,7 +166,7 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		}
 	}
 
-	unbound := ""
+	unbound := unknownReason
 	for i := 0; i < len(words); i++ {
 		text := words[i].text
 		if target, isRedirect := redirectionPrefix(text); isRedirect {
@@ -142,8 +194,34 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 			}
 			continue
 		}
-		if framing || at < 0 || i <= at {
+		// Every word after the command word as written is judged, whatever
+		// program it is handed to: the reader only classifies the command.
+		if framing || at < 0 || i <= judgedFrom {
 			continue
+		}
+		// A write or delete target the shell expands (`rm .e*`, `cp x $X`,
+		// `dd of=.e*`) is matched against the credentials it can expand to,
+		// whatever the command: the write rungs take a glob as the literal path
+		// it spells, and an unbound one as no path at all.
+		if words[i].bareExpands {
+			candidates := []string{text}
+			if _, value, ok := strings.Cut(text, "="); ok {
+				candidates = append(candidates, value)
+			}
+			for _, c := range candidates {
+				if !touched[c] {
+					continue
+				}
+				if reason := secretOperandReason(c, operandRoot); reason != "" {
+					return fmt.Sprintf("`%s` names %s", command, reason), false
+				}
+				// One that can steer the path (an expansion beside "..") is the
+				// write rungs' outside-root refusal, not an unreadable one.
+				if unbound == "" && unboundOperand(words[i]) && !escapingPathWord(words[i], false) {
+					unbound = fmt.Sprintf("`%s` writes through an operand (`%s`) holding an expansion the gate cannot "+
+						"resolve to a value, so the file it changes was not judged. Spell the operand out.", command, text)
+				}
+			}
 		}
 		reads := !nonReadingCommands[command]
 		if command == "git" {
@@ -160,7 +238,7 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 			}
 			continue
 		}
-		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
+		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") && !words[i].bareExpands {
 			continue
 		}
 		if unbound == "" && !written[text] && operandFromFile(command, words[i]) {
@@ -207,23 +285,31 @@ func operandFromFile(command string, w shellWord) bool {
 	return computedOperand(w)
 }
 
-// readerBehindWrapper moves the command word past the program wrappers
-// (commandWrappers, the one list the harness-only rung reads) to the reading
-// program they run: `nice -n 5 cat $zz` hands $zz to cat. A wrapper's own
-// options have an arity the gate does not know, so the reader is the first
-// later word that names one; with none, the wrapper stays the command word.
-// at is -1 when argumentCommandWord stopped at a wrapper followed by an option.
-func readerBehindWrapper(words []shellWord, at int) int {
+// readerBehindWrapper classifies the command a wrapper runs. It moves the
+// command word past the program wrappers (commandWrappers, the one list the
+// harness-only rung reads) to the reading program they run: `nice -n 5 cat $zz`
+// hands $zz to cat. A wrapper's own options have an arity the gate does not
+// know, so the reader is the first later word that names one; with none, the
+// wrapper stays the command word.
+//
+// reader only CLASSIFIES the command. judgedFrom is the index of the command
+// word as written (the first wrapper when argumentCommandWord stopped at a
+// wrapper followed by an option, -1 when there is none) and bounds which words
+// are judged: every word after it, including the ones between a wrapper and the
+// reader (`nice awk 1 .env cat`, `xargs -a .env cat`).
+func readerBehindWrapper(words []shellWord, at int) (reader, judgedFrom int) {
+	judgedFrom = at
 	start := at
 	if start < 0 {
 		for i, w := range words {
 			if !w.quotedHead && commandWrappers[wrapperName(w.text)] {
 				start = i
+				judgedFrom = i
 				break
 			}
 		}
 		if start < 0 {
-			return at
+			return at, at
 		}
 	}
 	for start < len(words) && !words[start].quotedHead && commandWrappers[wrapperName(words[start].text)] {
@@ -236,11 +322,11 @@ func readerBehindWrapper(words []shellWord, at int) int {
 			}
 		}
 		if next < 0 {
-			return at
+			return at, judgedFrom
 		}
 		start = next
 	}
-	return start
+	return start, judgedFrom
 }
 
 func wrapperName(word string) string {

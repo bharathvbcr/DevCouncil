@@ -48,7 +48,16 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 	var all argWrites
 	for _, clause := range SplitCommandChain(line) {
 		words := shellWords(clause)
-		at := argumentCommandWord(words)
+		peel := peelCommand(words)
+		all.merge(literalWrites(peel.writes))
+		if peel.computed != "" && all.unjudged == "" {
+			all.unjudged = "a wrapper runs a command the shell computes (`" + peel.computed + "`), so what it writes cannot be told"
+		}
+		if peel.reparse != "" {
+			all.merge(argumentWriteTargetsInRoot(reparseLine(peel.reparse, peel.reparseRest), root))
+			continue
+		}
+		at := peel.at
 		if at < 0 {
 			continue
 		}
@@ -67,6 +76,7 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 			args = append(args, words[k])
 		}
 		cw := commandWrites(words, at, args, 0)
+		cw.unjudgeable = unjudgeableTargets(args, cw)
 		if root != "" && isGitWord(words[at].text) {
 			if gitRoot, _, escaped := resolveGitClauseWorktree(words, at, root); !escaped && gitRoot != "" && !sameWorktreePath(gitRoot, root) {
 				// Another session's worktree: git may read it and record into
@@ -83,14 +93,43 @@ func argumentWriteTargetsInRoot(line, root string) argWrites {
 	return all
 }
 
-// argumentWrappers run the command named by the following words. Stepped over
-// when looking for the command word, like command/builtin in
-// reparsingCommandWord. A wrapper followed by an option stops the search: its
-// options may take arguments, and guessing which word is the command would
-// name a write that does not happen or miss one that does.
-var argumentWrappers = map[string]bool{
-	"command": true, "builtin": true, "exec": true, "env": true,
-	"sudo": true, "nohup": true, "time": true,
+// unjudgeableTargets returns the operand words (or the value of an `of=` /
+// `--opt=` word) that a command writes through and whose expansion can steer
+// the path (escapingPathWord). A word is one the command writes through when a
+// target it was judged to write is that word, or is built from it (the
+// DIR/basename of cp, the backup name of sed -i), so a source that is only read
+// is not refused here.
+func unjudgeableTargets(args []shellWord, cw argWrites) []string {
+	if len(cw.targets) == 0 && len(cw.deletes) == 0 {
+		return nil
+	}
+	builtFrom := func(candidate string) bool {
+		dir := strings.TrimRight(candidate, "/") + "/"
+		for _, set := range [][]string{cw.targets, cw.deletes} {
+			for _, t := range set {
+				if t == candidate || strings.HasPrefix(t, candidate) || strings.HasPrefix(t, dir) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	var out []string
+	for _, a := range args {
+		candidates := []string{a.text}
+		if _, value, ok := strings.Cut(a.text, "="); ok {
+			candidates = append(candidates, value)
+		}
+		for _, c := range candidates {
+			w := a
+			w.text = c
+			if c != "" && escapingPathWord(w, false) && builtFrom(c) {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // shellReservedPrefixes are the reserved words that may stand before a simple
@@ -103,31 +142,12 @@ var shellReservedPrefixes = map[string]bool{
 
 // argumentCommandWord returns the index of the word sh would run in one
 // clause, or -1. Assignments and redirections before it are stepped over as in
-// reparsingCommandWord; so are reserved words and argumentWrappers.
+// reparsingCommandWord; so are reserved words and the wrappers of wrapperSpecs
+// together with their own options (peelCommand). A wrapper option the table
+// does not describe gives the guessed command word, never -1 for a clause that
+// runs something.
 func argumentCommandWord(words []shellWord) int {
-	for i := 0; i < len(words); i++ {
-		word := words[i]
-		if word.quotedHead {
-			return i
-		}
-		if isAssignmentWord(word.text) || shellReservedPrefixes[word.text] {
-			continue
-		}
-		if operand, isRedirect := redirectionPrefix(word.text); isRedirect {
-			if operand {
-				i++
-			}
-			continue
-		}
-		if argumentWrappers[word.text] {
-			if i+1 < len(words) && strings.HasPrefix(words[i+1].text, "-") {
-				return -1
-			}
-			continue
-		}
-		return i
-	}
-	return -1
+	return peelCommand(words).at
 }
 
 // sedWrites reads a sed argument list the way GNU sed does — options may

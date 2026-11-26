@@ -213,7 +213,11 @@ func readOnlyArgumentViolation(clause, root string) string {
 		case !endOfOptions && text == "--":
 			endOfOptions = true
 		case !endOfOptions && strings.HasPrefix(text, "--"):
-			name, _, _ := strings.Cut(text, "=")
+			name, value, _ := strings.Cut(text, "=")
+			if w.bareExpands && hasExpansion(value) {
+				return fmt.Sprintf("`git %s` has an option value (`%s`) holding an unquoted expansion, which the "+
+					"shell word-splits into words the gate cannot judge.", sub, text)
+			}
 			if hasExpansion(name) {
 				return fmt.Sprintf("`git %s` has an option (`%s`) that only the shell can spell out, so the "+
 					"gate cannot tell what it is.", sub, text)
@@ -224,7 +228,7 @@ func readOnlyArgumentViolation(clause, root string) string {
 				}
 			}
 		case !endOfOptions && len(text) > 1 && text[0] == '-':
-			if hasExpansion(text[:2]) {
+			if hasExpansion(text[:2]) || (w.bareExpands && hasExpansion(text)) {
 				return fmt.Sprintf("`git %s` has an option (`%s`) that only the shell can spell out.", sub, text)
 			}
 			for _, c := range text[1:] {
@@ -236,9 +240,11 @@ func readOnlyArgumentViolation(clause, root string) string {
 				}
 			}
 		default:
-			if computedOperand(w) {
+			// A bare reference before ".." only counts where it can be a path:
+			// after "--", or with a slash (HEAD:src/$d/../x); $a..$b is a range.
+			if computedOperand(w) || (escapingPathWord(w, true) && (endOfOptions || strings.Contains(text, "/"))) {
 				return fmt.Sprintf("`git %s %s` is refused: the operand holds an expansion the gate cannot "+
-					"resolve to a value (a parameter operator, a special parameter or a brace expansion), "+
+					"resolve to a value (a parameter operator, a special parameter, a brace expansion, or an expansion beside a parent-directory component), "+
 					"so the path or revision it names was not judged. Spell the operand out.", sub, text)
 			}
 			if reason := readOnlyOperandViolation(text, effectiveRoot); reason != "" {

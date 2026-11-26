@@ -187,12 +187,26 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 	readings, truncated := expandBindings(command)
 	if truncated {
 		// A reading past the caps was never judged, so the line is refused
-		// rather than judged on the readings that fit.
-		return g.noteHardRules(deny(RuleCommandOperandUnverifiable,
+		// rather than judged on the readings that fit. That refusal is about
+		// the gate's reach (an unreadable rule), so it ranks below any hard
+		// refusal for what the line does: the line as written and every reading
+		// that fit are judged first, and a force push or a credential read among
+		// them is reported as itself (see unreadableRules).
+		truncation := g.noteHardRules(deny(RuleCommandOperandUnverifiable,
 			"A loop or variable in this command takes more values than the gate judges (at most "+
 				fmt.Sprint(maxBindingValues)+" values per name and "+fmt.Sprint(maxBindingVariants)+
 				" combinations), so some of what it would run was not examined. Split it into smaller loops or name the files.",
 			command, taskID))
+		decisions := []Decision{truncation}
+		for _, reading := range append([]string{command}, readings...) {
+			d := g.evaluate(reading, task, 0)
+			decisions = append(decisions, d)
+			if refusesForWhatItDoes(d) {
+				break
+			}
+		}
+		d, _ := mostImportant(decisions)
+		return d
 	}
 	if len(readings) == 1 {
 		return g.evaluate(readings[0], task, 0)
@@ -438,7 +452,7 @@ func (g CommandGate) noteDirectoryChanges(f *clauseFindings, command, normalized
 	// on the ground that it "cannot write" — true of the cd itself, and beside
 	// the point, because it decides where every relative path *after* it
 	// writes. See RuleCommandDirectoryChange.
-	if cdSegmentRe.MatchString(normalized) {
+	if peel := peelCommand(shellWords(command)); cdSegmentRe.MatchString(normalized) || peel.chdir != "" {
 		f.noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"Changing the working directory is not allowed: every relative path in this command "+
 				"would then resolve somewhere other than where the gate judged it. Use paths "+
@@ -1348,6 +1362,11 @@ type shellWord struct {
 	// scan does not, so the value the command is handed is not the text. The
 	// operand rungs treat such a word as computed (computedOperand).
 	ansiC bool
+	// bareExpands reports whether an expansion character appears outside any
+	// quotes. An unquoted expansion is word-split and globbed by sh, so one
+	// word of text may be several words at run time; an expansion wholly
+	// inside double quotes is always exactly one.
+	bareExpands bool
 }
 
 type shellWordSpan struct {
@@ -1378,7 +1397,7 @@ func shellWords(command string) []shellWord {
 func scanShellWords(command string) []shellWordSpan {
 	var spans []shellWordSpan
 	var cur, raw strings.Builder
-	started, quotedHead, anyQuoted, expands, ansiC := false, false, false, false, false
+	started, quotedHead, anyQuoted, expands, ansiC, bareExpands := false, false, false, false, false, false
 	quote := rune(0)
 	runes := []rune(command)
 	flush := func() {
@@ -1386,12 +1405,12 @@ func scanShellWords(command string) []shellWordSpan {
 			return
 		}
 		spans = append(spans, shellWordSpan{
-			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC},
+			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC, bareExpands: bareExpands},
 			raw:       raw.String(),
 		})
 		cur.Reset()
 		raw.Reset()
-		started, quotedHead, anyQuoted, expands, ansiC = false, false, false, false, false
+		started, quotedHead, anyQuoted, expands, ansiC, bareExpands = false, false, false, false, false, false
 	}
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
@@ -1436,6 +1455,7 @@ func scanShellWords(command string) []shellWordSpan {
 		default:
 			if strings.ContainsRune("$`{}*?[", r) {
 				expands = true
+				bareExpands = true
 			}
 			raw.WriteRune(r)
 			cur.WriteRune(r)

@@ -129,31 +129,150 @@ func lineBindings(command string) (values map[string][]string, dropped map[strin
 			}
 			continue
 		}
-		start := 0
-		switch words[0].text {
-		case "export", "local", "readonly", "declare", "typeset":
-			start = 1
-		}
-		pure := start < len(words)
-		for _, w := range words[start:] {
-			if !isAssignmentWord(w.text) && !(start > 0 && strings.HasPrefix(w.text, "-")) {
-				pure = false
-				break
-			}
-		}
+		assigned, pure := pureAssignmentWords(words)
 		if !pure {
 			// `FOO=x cmd $FOO` sets FOO for cmd's environment only; sh has
 			// already expanded $FOO by then, so the assignment binds nothing.
 			continue
 		}
-		for _, w := range words[start:] {
+		for _, w := range assigned {
 			if name, value, ok := strings.Cut(w.text, "="); ok && isAssignmentWord(w.text) {
 				add(name, value)
 			}
 		}
 	}
+	// A name the line may also hold something else in keeps its literal
+	// values, each still a reading, and gains one more: the reference itself,
+	// left for the rungs to judge by its spelling. Dropping the literal values
+	// instead would let `F=.env; export F; cat "$F"` hide the credential it
+	// names behind an unbound variable.
+	for name := range unbindableNames(command) {
+		if name == "HOME" || name == "TMPDIR" || len(values[name]) == 0 {
+			continue
+		}
+		if len(values[name]) >= maxBindingValues {
+			dropped[name] = true
+			continue
+		}
+		values[name] = append(values[name], "${"+name+"}")
+	}
 	values["~"] = values["HOME"]
 	return values, dropped
+}
+
+// pureAssignmentWords returns the assignment words of a clause made only of
+// assignments (after export/local/readonly/declare/typeset and their options),
+// and whether the clause is one.
+func pureAssignmentWords(words []shellWord) ([]shellWord, bool) {
+	start := 0
+	switch words[0].text {
+	case "export", "local", "readonly", "declare", "typeset":
+		start = 1
+	}
+	if start >= len(words) {
+		return nil, false
+	}
+	for _, w := range words[start:] {
+		if !isAssignmentWord(w.text) && !(start > 0 && strings.HasPrefix(w.text, "-")) {
+			return nil, false
+		}
+	}
+	return words[start:], true
+}
+
+// unbindableNames are the names the line does not bind to the values it
+// assigns them, because a reading it cannot see could hold something else: a
+// name that is also reassigned from something non-literal (d=$zz, d=$(cmd)),
+// unset, read, printf -v, mapfile/readarray or declared bare; and a name read
+// before its first assignment (echo $d/..; d=lib runs with d unset). Binding
+// such a name would judge a path by a value the shell does not use. Names
+// assigned only conditionally, in a subshell or in a pipeline are not detected
+// here (ft-258f2388 owns the real shell parse).
+func unbindableNames(command string) map[string]bool {
+	poisoned := map[string]bool{}
+	firstAssign := map[string]int{}
+	literal := func(value string) bool {
+		return literalBindingValue(value) || value == "~" || strings.HasPrefix(value, "~/") && literalBindingValue(value[1:])
+	}
+	note := func(name string, idx int) {
+		if _, seen := firstAssign[name]; !seen {
+			firstAssign[name] = idx
+		}
+	}
+	clauses := SplitCommandChain(command)
+	for idx, clause := range clauses {
+		words := shellWords(clause)
+		for len(words) > 0 && compoundKeywords[words[0].text] {
+			words = words[1:]
+		}
+		if len(words) == 0 {
+			continue
+		}
+		if name, items, ok := forHeader(words); ok {
+			note(name, idx)
+			for _, w := range items {
+				if !literal(w.text) {
+					poisoned[name] = true
+				}
+			}
+			continue
+		}
+		switch words[0].text {
+		case "unset", "read", "mapfile", "readarray":
+			for _, w := range words[1:] {
+				if !strings.HasPrefix(w.text, "-") {
+					poisoned[w.text] = true
+				}
+			}
+		case "printf":
+			for k := 1; k+1 < len(words); k++ {
+				if words[k].text == "-v" {
+					poisoned[strings.SplitN(words[k+1].text, "[", 2)[0]] = true
+				}
+			}
+		case "export", "local", "readonly", "declare", "typeset":
+			for _, w := range words[1:] {
+				if !strings.HasPrefix(w.text, "-") && !isAssignmentWord(w.text) {
+					poisoned[w.text] = true
+				}
+			}
+		}
+		assigned, pure := pureAssignmentWords(words)
+		if !pure {
+			continue
+		}
+		for _, w := range assigned {
+			if name, value, ok := strings.Cut(w.text, "="); ok && isAssignmentWord(w.text) {
+				note(name, idx)
+				if !literal(value) {
+					poisoned[name] = true
+				}
+			}
+		}
+	}
+	for idx, clause := range clauses {
+		for name, first := range firstAssign {
+			if idx <= first && readsName(clause, name) {
+				poisoned[name] = true
+			}
+		}
+	}
+	return poisoned
+}
+
+// readsName reports whether text holds a reference to name: $name or the
+// braced form.
+func readsName(text, name string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] != '$' {
+			continue
+		}
+		rest := strings.TrimPrefix(text[i+1:], "{")
+		if strings.HasPrefix(rest, name) && (len(rest) == len(name) || !isNameByte(rest[len(name)])) {
+			return true
+		}
+	}
+	return false
 }
 
 // compoundKeywords open a list inside a compound command, ahead of the clause
@@ -286,6 +405,88 @@ func unboundOperand(w shellWord) bool {
 // the rungs that keep that decision ask this narrower question.
 func computedOperand(w shellWord) bool {
 	return w.ansiC || (w.expands && (hasParameterReference(w.text, false) || hasBraceExpansion(w.text)))
+}
+
+// escapingPathWord reports whether a word's path can reach somewhere the gate
+// did not judge once the shell expands it: a place a later ".." leaves, or a
+// ".." the expansions assemble. It is the one owner of that question for the
+// rungs that name a path (write targets, argument writes, an unmodelled
+// program's operands, a git read's pathspec), where filepath.Clean would
+// otherwise treat an expansion as a directory a ".." cancels while the shell
+// expands an unset $zz to nothing: src/$zz/../Makefile is ./Makefile.
+//
+// It is true for:
+//
+//   - computedOperand: ANSI-C quoting (every $'...' word, so its \x2e\x2e and
+//     \56\56 spellings of ".." need no decoding), a parameter operator
+//     (${zz:-.}${zz:-.}), a special parameter, a brace expansion;
+//   - a component holding a bare unbound reference ($zz, ${zz}) before a ".."
+//     component, or a leading ~ (~root, ~+) before one;
+//   - a component whose text outside its expansions is two or more dots
+//     (.$zz. $zz.. ..$zz), which spell ".." when the expansion is empty.
+//
+// A word quoted so nothing in it expands ('src/$x/../y') is a literal and is
+// not one. An operand (as opposed to a write target) that reads as prose or a
+// URL (whitespace, "://", quotes or shell punctuation in it) is text, not a
+// path, so only computedOperand's train-era verdict applies to it.
+// A bare reference beside ".." with no slash ($a..$b, main..$b) is a revision
+// range, not a component pair, and is not one.
+func escapingPathWord(w shellWord, operand bool) bool {
+	if computedOperand(w) {
+		return true
+	}
+	tilde := strings.HasPrefix(w.text, "~")
+	if !w.expands && !tilde {
+		return false
+	}
+	if operand && (strings.Contains(w.text, "://") || strings.IndexFunc(w.text, isSpace) >= 0 ||
+		strings.ContainsAny(w.text, "'\"()<>|;&`!#")) {
+		return false
+	}
+	seen := false
+	for i, comp := range strings.Split(w.text, "/") {
+		if seen && comp == ".." {
+			return true
+		}
+		if (w.expands && hasParameterReference(comp, true)) || (i == 0 && tilde) {
+			seen = true
+		}
+		if w.expands && strings.Contains(comp, "$") {
+			if residue := expansionResidue(comp); len(residue) >= 2 && strings.Trim(residue, ".") == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// expansionResidue is a path component with its parameter references removed:
+// what the shell leaves in place whatever the references expand to.
+func expansionResidue(comp string) string {
+	var b strings.Builder
+	for i := 0; i < len(comp); i++ {
+		if comp[i] != '$' || i+1 >= len(comp) {
+			b.WriteByte(comp[i])
+			continue
+		}
+		switch c := comp[i+1]; {
+		case c == '{':
+			end := strings.IndexByte(comp[i:], '}')
+			if end < 0 {
+				return b.String() + comp[i:]
+			}
+			i += end
+		case isNameByte(c):
+			j := i + 1
+			for j < len(comp) && isNameByte(comp[j]) {
+				j++
+			}
+			i = j - 1
+		default:
+			i++
+		}
+	}
+	return b.String()
 }
 
 // hasParameterReference reports a `$` that opens a parameter expansion the

@@ -80,7 +80,7 @@ func unverifiableOperand(clause, root string, mt matching) string {
 				continue
 			}
 		}
-		if computedOperand(words[i]) {
+		if escapingOperand(words[i]) {
 			return fmt.Sprintf("`%s` is handed an operand (`%s`) holding an expansion the gate cannot resolve "+
 				"to a value (a parameter operator, a special parameter, a brace expansion or ANSI-C quoting), so "+
 				"the path it names was not judged and the gate cannot tell a read from a write. Spell the operand out.", name, text)
@@ -108,6 +108,19 @@ func unverifiableOperand(clause, root string, mt matching) string {
 		}
 	}
 	return ""
+}
+
+// escapingOperand is escapingPathWord for a program's operand, which may also
+// be the value of an `--opt=value` or `KEY=value` word.
+func escapingOperand(w shellWord) bool {
+	if escapingPathWord(w, true) {
+		return true
+	}
+	if _, value, ok := strings.Cut(w.text, "="); ok {
+		w.text = value
+		return escapingPathWord(w, true)
+	}
+	return false
 }
 
 // The bounds on a JSON operand the gate opens. Past any of them the operand is

@@ -25,6 +25,10 @@ type argWrites struct {
 	// opaque reports a file that is written but whose name only the shell can
 	// compute ($VAR, ~, a substitution): refused wherever it appears.
 	opaque bool
+	// unjudgeable are the operand words the command writes through whose
+	// expansion can steer the path (escapingPathWord): not in targets, because
+	// resolving their text lexically is the error.
+	unjudgeable []string
 	// unjudged is non-empty when the command writes files its text does not
 	// name — the paths come from a patch body or from another program's output.
 	// Nothing can be checked against a task's planned files before it runs, so
@@ -47,6 +51,9 @@ func (w *argWrites) mergeSibling(root string, o argWrites) {
 	if o.opaque {
 		w.opaque = true
 	}
+	// The word is refused whichever worktree the command writes in.
+	w.unjudgeable = append(w.unjudgeable, o.unjudgeable...)
+	o.unjudgeable = nil
 	if len(o.targets) == 0 && len(o.deletes) == 0 && o.unjudged == "" {
 		return
 	}
@@ -65,6 +72,7 @@ func (w *argWrites) merge(o argWrites) {
 	w.targets = append(w.targets, o.targets...)
 	w.deletes = append(w.deletes, o.deletes...)
 	w.opaque = w.opaque || o.opaque
+	w.unjudgeable = append(w.unjudgeable, o.unjudgeable...)
 	if w.unjudged == "" {
 		w.unjudged = o.unjudged
 	}
@@ -706,13 +714,24 @@ func xargsWrites(args []shellWord, depth int) argWrites {
 		return argWrites{}
 	}
 	inner := args[k:]
-	at := argumentCommandWord(inner)
+	peel := peelCommand(inner)
+	at := peel.at
+	var w argWrites
+	w.merge(literalWrites(peel.writes))
+	if peel.unknown != "" {
+		w.unjudged = "`xargs` runs a wrapper with an option (`" + peel.unknown + "`) the gate cannot step over"
+	}
+	if peel.computed != "" && w.unjudged == "" {
+		w.unjudged = "`xargs` runs a wrapper whose command the shell computes (`" + peel.computed + "`)"
+	}
 	if at < 0 {
-		return argWrites{}
+		return w
 	}
 	static := commandWrites(inner, at, inner[at+1:], depth+1)
-	var w argWrites
-	w.opaque, w.unjudged = static.opaque, static.unjudged
+	w.opaque = static.opaque
+	if w.unjudged == "" {
+		w.unjudged = static.unjudged
+	}
 	for _, t := range static.targets {
 		if replacement != "" && strings.Contains(t, replacement) {
 			continue
@@ -765,7 +784,15 @@ func findWrites(args []shellWord, depth int) argWrites {
 			}
 			inner := args[start:end]
 			k = end
-			at := argumentCommandWord(inner)
+			peel := peelCommand(inner)
+			w.merge(literalWrites(peel.writes))
+			if peel.unknown != "" && w.unjudged == "" {
+				w.unjudged = "`find -exec` runs a wrapper with an option (`" + peel.unknown + "`) the gate cannot step over"
+			}
+			if peel.computed != "" && w.unjudged == "" {
+				w.unjudged = "`find -exec` runs a wrapper whose command the shell computes (`" + peel.computed + "`)"
+			}
+			at := peel.at
 			if at < 0 {
 				continue
 			}
