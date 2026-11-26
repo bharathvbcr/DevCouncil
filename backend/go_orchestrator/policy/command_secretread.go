@@ -141,11 +141,10 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		if !reads {
 			continue
 		}
-		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") && !words[i].bareExpands {
+		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
 			continue
 		}
-		if unbound == "" && !written[text] && !inertCommands[command] &&
-			!computedOptionValue(command, gitSub, words, i) && operandFromFile(command, words[i]) {
+		if unbound == "" && !written[text] && operandFromFile(command, words[i]) {
 			unbound = fmt.Sprintf("`%s` has an operand (`%s`) holding an expansion the gate cannot resolve to a "+
 				"value (a variable nothing binds, a parameter operator or a brace expansion), so the file it "+
 				"names was not judged. Spell the operand out.", command, text)

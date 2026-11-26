@@ -81,31 +81,6 @@ func TestLandVTruncationKeepsWhatItDoes(t *testing.T) {
 	}
 }
 
-// Lane W false refusals: a command that reads no file, a computed number, and
-// the working directory are not unresolvable file operands.
-func TestLandControlRowsStayAllowed(t *testing.T) {
-	for _, posture := range []string{flags.PostureStrict, flags.PostureDev} {
-		g, _ := landGate(t, posture)
-		task := testTask()
-		task.AllowedCommands = []string{"exit *", "kill *", "wait *", "sleep *", "seq *", "make *", "go test *",
-			"npm run *", "head *", "cat *", "git log *", "git show *", "git diff *"}
-		for _, c := range []string{
-			"exit $?", "kill $!", "wait $!", "sleep ${D:-1}", "seq 1 ${N:-3}",
-			"make -j\"${N:-4}\"", "go test -count=\"${COUNT:-1}\" ./...",
-			"head -n \"${N:-5}\" README.md", "git log -n \"${N:-5}\"", "git log --max-count=\"${N:-5}\"",
-			"head -n \"$N\" README.md",
-		} {
-			d, err := g.EvaluateCommand(c, task)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if d.Blocked() {
-				t.Errorf("%s %q: control row refused: %s %q (%s)", posture, c, d.Action, d.Rule, d.Reason)
-			}
-		}
-	}
-}
-
 // Every refusal that the control rows sit beside stays: a computed value in a
 // file position, an unknown directory, and a computed git operand.
 func TestLandNarrowedRowsStillRefuse(t *testing.T) {
@@ -198,6 +173,37 @@ func TestLandRound3RowsRefuse(t *testing.T) {
 		"pytest -n ${x:-1 .env}", "make -j ${x:-4 -f.env}", "head -n${x:-1 .env}", "make -j${N:-4}",
 		"go test -count=${COUNT:-1} ./...", "cat \"$PWD/README.md\"", "cat ${PWD}/README.md", "cat $PWD/src/sl",
 	}
+	for c := range gitHard {
+		rows = append(rows, c)
+	}
+	for _, posture := range []string{flags.PostureStrict, flags.PostureDev} {
+		g, _ := landGate(t, posture)
+		task := testTask()
+		task.AllowedCommands = []string{"*"}
+		for _, c := range rows {
+			d, err := g.EvaluateCommand(c, task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Blocked() || d.Severity != policy.Hard {
+				t.Errorf("LEAK %s %q: want hard refusal, got %s %q", posture, c, d.Action, d.Rule)
+			}
+			if gitHard[c] && d.Rule != policy.RuleCommandGitReadArgument {
+				t.Errorf("%s %q: want %s as on the train, got %q", posture, c, policy.RuleCommandGitReadArgument, d.Rule)
+			}
+		}
+	}
+}
+
+// Final round: a quoted array or positional expansion is several words, so
+// no computed option value is exempt. The git rows keep the train's hard,
+// unsoftenable rule.
+func TestLandArrayExpansionRowsRefuse(t *testing.T) {
+	gitHard := map[string]bool{
+		"a=(1 .env); git log -p -n \"${a[@]}\"": true, "git log -p -n \"$@\"": true,
+		"a=(1 HEAD:.env); git show -n \"${a[@]}\"": true, "git log -p -n \"${a[@]:0}\"": true,
+	}
+	rows := []string{"a=(1 .env); head -n \"${a[@]}\" README.md", "head -n \"${a[@]:0}\" README.md", "head -n \"$@\" README.md"}
 	for c := range gitHard {
 		rows = append(rows, c)
 	}

@@ -306,10 +306,8 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 			// the clause does: the harness-only and substitution rungs below
 			// still run, and the finding is recorded as unreadable, as the
 			// operand rung's is, so a hard refusal elsewhere outranks it.
-			if !hasUnreadableOperand {
-				unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
-				hasUnreadableOperand = true
-			}
+			unreadableOperand = deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)
+			hasUnreadableOperand = true
 		}
 		// A write of evidence about the agent's own work. See
 		// RuleCommandHarnessOnly.
@@ -1364,11 +1362,6 @@ type shellWord struct {
 	// scan does not, so the value the command is handed is not the text. The
 	// operand rungs treat such a word as computed (computedOperand).
 	ansiC bool
-	// bareExpands reports whether an expansion character appears outside any
-	// quotes. An unquoted expansion is word-split and globbed by sh, so one
-	// word of text may be several words at run time; an expansion wholly
-	// inside double quotes is always exactly one.
-	bareExpands bool
 }
 
 type shellWordSpan struct {
@@ -1399,7 +1392,7 @@ func shellWords(command string) []shellWord {
 func scanShellWords(command string) []shellWordSpan {
 	var spans []shellWordSpan
 	var cur, raw strings.Builder
-	started, quotedHead, anyQuoted, expands, ansiC, bareExpands := false, false, false, false, false, false
+	started, quotedHead, anyQuoted, expands, ansiC := false, false, false, false, false
 	quote := rune(0)
 	runes := []rune(command)
 	flush := func() {
@@ -1407,12 +1400,12 @@ func scanShellWords(command string) []shellWordSpan {
 			return
 		}
 		spans = append(spans, shellWordSpan{
-			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC, bareExpands: bareExpands},
+			shellWord: shellWord{text: cur.String(), quotedHead: quotedHead, anyQuoted: anyQuoted, expands: expands, ansiC: ansiC},
 			raw:       raw.String(),
 		})
 		cur.Reset()
 		raw.Reset()
-		started, quotedHead, anyQuoted, expands, ansiC, bareExpands = false, false, false, false, false, false
+		started, quotedHead, anyQuoted, expands, ansiC = false, false, false, false, false
 	}
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
@@ -1457,7 +1450,6 @@ func scanShellWords(command string) []shellWordSpan {
 		default:
 			if strings.ContainsRune("$`{}*?[", r) {
 				expands = true
-				bareExpands = true
 			}
 			raw.WriteRune(r)
 			cur.WriteRune(r)
