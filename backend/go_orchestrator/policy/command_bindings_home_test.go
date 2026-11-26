@@ -15,8 +15,8 @@ func TestATildeResolvesToTheHomeDirectoryOnEveryPlatform(t *testing.T) {
 	t.Setenv("HOME", home)        // read by os.UserHomeDir off Windows
 	t.Setenv("USERPROFILE", home) // and on it
 	want := filepath.ToSlash(home) + "/.ssh/k"
-	got := expandBindings("echo x > ~/.ssh/k")
-	if len(got) != 1 || got[0] != "echo x > "+want {
-		t.Fatalf("expandBindings = %q, want [%q]", got, "echo x > "+want)
+	got, truncated := expandBindings("echo x > ~/.ssh/k")
+	if truncated || len(got) != 1 || got[0] != "echo x > "+want {
+		t.Fatalf("expandBindings = %q (truncated=%v), want [%q]", got, truncated, "echo x > "+want)
 	}
 }
