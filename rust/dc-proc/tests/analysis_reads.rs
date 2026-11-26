@@ -89,8 +89,10 @@ fn repo(dir: &Path) {
 
 /// Pins the network environment of a git the test runs, so no ambient proxy
 /// can divert a fetch away from the loopback server (which would let a
-/// guard-less run pass without ever reaching the credential helper) and no
-/// askpass program stands in for the planted one.
+/// guard-less run pass without ever reaching the credential helper), no
+/// askpass program stands in for the planted one, and no operator git config
+/// (a global `protocol.http.allow = never` would refuse the fetch before the
+/// helper runs and let a guard-less run pass) is read.
 fn pin_network_env(command: &mut Command) {
     for var in [
         "HTTP_PROXY",
@@ -106,7 +108,9 @@ fn pin_network_env(command: &mut Command) {
     }
     command
         .env("no_proxy", "127.0.0.1")
-        .env("NO_PROXY", "127.0.0.1");
+        .env("NO_PROXY", "127.0.0.1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
 fn read(program: &OsStr, root: &Path, args: &[&str]) -> Result<Captured, Failure> {
@@ -332,8 +336,6 @@ fn partial_clone_read_fails_rather_than_fetching(
         .arg(&root)
         .args(["diff", "HEAD"])
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null());
     pin_network_env(&mut unguarded);
     let _ = run_bounded(
