@@ -51,6 +51,9 @@ type RedirectSet struct {
 	Targets []string
 	// Opaque reports a write this scan could not name or enumerate.
 	Opaque bool
+	// OpaqueReason says why, when it is not a name only the shell can spell
+	// (a line past the binding caps); empty for the common case.
+	OpaqueReason string
 	// Deletes are the Targets that are only removed — rm, rmdir, unlink, shred
 	// -u, git rm, git clean — and never also written, so a caller that tells
 	// the operations apart can judge them as dc.OpDelete. They stay in Targets,
@@ -92,9 +95,20 @@ func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 	var found redirectFindings
 	memo := scanMemo{}
 	readings, truncated := expandBindings(command)
+	finish := func(set RedirectSet) RedirectSet { return set }
 	if truncated {
-		// Readings past the caps were never scanned: fail closed.
-		return RedirectSet{Opaque: true}, nil
+		// Readings past the caps were never scanned, so the line fails closed
+		// as opaque. The line as written and every reading that fit are still
+		// scanned, so a target a hard rule refuses is reported as itself and the
+		// opacity ranks below it (see unreadableRules).
+		readings = append([]string{command}, readings...)
+		finish = func(set RedirectSet) RedirectSet {
+			set.Opaque = true
+			set.OpaqueReason = "A loop or variable in this command takes more values than the gate judges (at most " +
+				fmt.Sprint(maxBindingValues) + " values per name and " + fmt.Sprint(maxBindingVariants) +
+				" combinations), so the files it writes were not all examined. Split it into smaller loops or name the files."
+			return set
+		}
 	}
 	for i, reading := range readings {
 		one, err := redirectTargetsMemo(reading, root, 0, memo)
@@ -109,7 +123,7 @@ func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 	}
 	distinct, deletes, overflow := dedupeWriteTargets(found.targets, found.deleted, maxRedirectTargets)
 	if overflow {
-		return RedirectSet{Targets: distinct, Deletes: deletes, Opaque: true, Unjudged: found.unjudged}, nil
+		return finish(RedirectSet{Targets: distinct, Deletes: deletes, Opaque: true, Unjudged: found.unjudged}), nil
 	}
 	total := len(distinct)
 	var siblingWrites []SiblingWrite
@@ -117,7 +131,7 @@ func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 		sibDistinct, sibDeletes, sibOverflow := dedupeWriteTargets(sib.targets, sib.deleted, maxRedirectTargets-total)
 		total += len(sibDistinct)
 		if sibOverflow {
-			return RedirectSet{Targets: distinct, Deletes: deletes, SiblingWrites: siblingWrites, Opaque: true, Unjudged: found.unjudged}, nil
+			return finish(RedirectSet{Targets: distinct, Deletes: deletes, SiblingWrites: siblingWrites, Opaque: true, Unjudged: found.unjudged}), nil
 		}
 		if len(sibDistinct) > 0 || sib.unjudged != "" {
 			siblingWrites = append(siblingWrites, SiblingWrite{
@@ -128,13 +142,13 @@ func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 			})
 		}
 	}
-	return RedirectSet{
+	return finish(RedirectSet{
 		Targets:       distinct,
 		Deletes:       deletes,
 		Opaque:        found.opaque,
 		Unjudged:      found.unjudged,
 		SiblingWrites: siblingWrites,
-	}, nil
+	}), nil
 }
 
 func dedupeWriteTargets(targets []string, delMap map[string]int, limit int) (distinct, deletes []string, overflow bool) {
