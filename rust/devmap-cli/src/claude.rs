@@ -1416,7 +1416,7 @@ fn executable_names(executable: &Path) -> Vec<std::ffi::OsString> {
 /// [`executable_names`] with `PATHEXT` passed in. An unset or empty variable
 /// falls back to Windows' own default list. Extensions are used as written (the
 /// Windows file system matches them case-insensitively), skipping empty entries.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn executable_names_with(
     executable: &Path,
     pathext: Option<&std::ffi::OsStr>,
@@ -1597,6 +1597,21 @@ fn canonical_with_missing_tail(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// `path` without Windows' verbatim prefix when it names a drive path:
+/// `\\?\C:\opt\devmap` is `C:\opt\devmap`. Canonicalizing on Windows yields the
+/// verbatim form, but a host runs its command line through the ordinary Win32
+/// path rules, so the entry it is given is the drive form. A verbatim UNC path
+/// (`\\?\UNC\server\share`) and every non-verbatim path are returned unchanged.
+fn without_verbatim_drive_prefix(path: PathBuf) -> PathBuf {
+    let Some(rest) = path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) else {
+        return path;
+    };
+    match rest.as_bytes() {
+        [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic() => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
 /// What command line reaches this binary: the one owner every writer shares.
 ///
 /// Always an absolute, canonical path that is not inside the repository at
@@ -1623,8 +1638,11 @@ pub fn reachable_command(
             // resolved through its links and the missing tail re-appended, so
             // `out/link/devmap` with `out/link -> repo/bin` is the repository's.
             let landing = canonical_with_missing_tail(path)?;
+            let spelled = without_verbatim_drive_prefix(landing.clone());
             if let Some(root) = root.filter(|root| {
-                crate::hook::executable_is_inside_repository(&landing, root).unwrap_or(true)
+                [&landing, &spelled].into_iter().any(|candidate| {
+                    crate::hook::executable_is_inside_repository(candidate, root).unwrap_or(true)
+                })
             }) {
                 anyhow::bail!(
                     "refusing to register the devmap command: {} lands inside the repository at {} ({})",
@@ -1633,7 +1651,7 @@ pub fn reachable_command(
                     landing.display()
                 );
             }
-            return Ok(landing);
+            return Ok(spelled);
         }
     }
     let chosen = explicit.unwrap_or(executable);
@@ -2710,6 +2728,26 @@ mod tests {
         );
         assert_eq!(names("devmap", Some("")), names("devmap", None));
         assert_eq!(names("devmap.exe", Some(".EXE")), ["devmap.exe"]);
+    }
+
+    /// A canonical Windows path is verbatim (`\\?\C:\...`); the host entry is
+    /// the drive form. A verbatim UNC path and an ordinary path are unchanged.
+    #[test]
+    fn a_verbatim_drive_path_is_written_in_its_drive_form() {
+        let strip = |text: &str| without_verbatim_drive_prefix(PathBuf::from(text));
+        assert_eq!(
+            strip(r"\\?\C:\opt\devcouncil-test\bin\devmap"),
+            PathBuf::from(r"C:\opt\devcouncil-test\bin\devmap")
+        );
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\devmap"),
+            PathBuf::from(r"\\?\UNC\server\share\devmap")
+        );
+        assert_eq!(strip(r"\\?\C:"), PathBuf::from(r"\\?\C:"));
+        assert_eq!(
+            strip("/usr/local/bin/devmap"),
+            PathBuf::from("/usr/local/bin/devmap")
+        );
     }
 
     #[cfg(windows)]

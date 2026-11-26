@@ -7,6 +7,9 @@
 //! the same entry point, to every ambiguous ledger row.
 #![allow(dead_code)]
 
+// The host-command tests plant Unix executables and symlinks; they and these
+// helpers are built on Unix only.
+#[cfg(unix)]
 pub mod host_cmd;
 
 use devmap_resolve::lsp::apply_language_server_resolutions;

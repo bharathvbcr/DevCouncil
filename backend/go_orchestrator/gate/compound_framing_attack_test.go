@@ -2,6 +2,7 @@ package gate
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -116,8 +117,11 @@ var (
 	}
 )
 
+// attackCommand names the sibling worktree in forward slashes: the commands are
+// POSIX shell, where an unquoted Windows backslash is an escape and
+// `C:\x\wt` reads as `C:xwt`, which is not the sibling at all.
 func attackCommand(cmd, sib string) string {
-	return strings.ReplaceAll(cmd, "SIB", sib)
+	return strings.ReplaceAll(cmd, "SIB", filepath.ToSlash(sib))
 }
 
 func TestCompoundFramingAttackRound(t *testing.T) {

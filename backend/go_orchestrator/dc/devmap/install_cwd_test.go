@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // The installing commands write host configuration, and a host entry must
@@ -15,6 +17,7 @@ import (
 // directory (the card's default path: the Go host always ran it with the
 // repository root as its cwd).
 func TestInstallingCommandsDoNotRunInsideTheRepository(t *testing.T) {
+	testsupport.RequireShellFakes(t)
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
 	if err := os.Mkdir(repo, 0o755); err != nil {
