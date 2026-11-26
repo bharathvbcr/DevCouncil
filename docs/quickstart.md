@@ -4,7 +4,31 @@ Install DevMap, index a repository, and explore its code without a model key.
 The Go host, task store, verifier and text search are optional additions.
 [Documentation index](README.md)
 
-## 1. Build the component you need
+## 1. Install a prebuilt DevMap
+
+No toolchain is needed. Each release publishes a self-contained `devmap`
+binary for macOS (arm64, x86_64), Linux (x86_64) and Windows (x64), each with a
+`.sha256` beside it, plus installers that fetch the right one:
+
+```bash
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.sh | sh
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/bharathvbcr/DevCouncil/releases/latest/download/devmap-cli-installer.ps1 | iex"
+```
+
+The shell and PowerShell installers write `devmap` to `~/.local/bin`, the same
+directory `scripts/install.sh` uses, and add it to PATH.
+`DEVMAP_CLI_NO_MODIFY_PATH=1` leaves PATH alone. To install by hand, download the
+archive for your platform from
+[Releases](https://github.com/bharathvbcr/DevCouncil/releases), check it with
+`shasum -a 256 -c <archive>.sha256`, and put `devmap` on PATH. Then go to
+[step 2](#2-index-your-project).
+
+## 1b. Or build the component you need
 
 Prerequisites: Git and a Rust/Cargo toolchain compatible with
 [`rust/Cargo.toml`](../rust/Cargo.toml) and its lockfile. Building the Go host

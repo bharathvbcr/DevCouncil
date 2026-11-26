@@ -717,16 +717,85 @@ jobs:
             gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" --title "$title" --notes-file "$NOTES_FILE" "${extra[@]}" "${files[@]}"
           fi
 
+  # Hand-ported from the job dist 0.32.0 generates for publish-jobs =
+  # ["homebrew"] (allow-dirty = ["ci"] stops dist from regenerating this
+  # file). Differences: digest-pinned actions, job-level permissions, and the
+  # formula list is read line by line from the plan instead of word-split.
+  # Needs the bharathvbcr/homebrew-tap repository and a HOMEBREW_TAP_TOKEN
+  # secret (a token that can push to that repository only). Prereleases skip.
+  # It runs only when the plan names the devmap.rb formula, which happens only
+  # while dist-workspace.toml declares the homebrew installer (off for now).
+  publish-homebrew-formula:
+    permissions:
+      "contents": "read"
+    needs:
+      - plan
+      - host
+    runs-on: "ubuntu-22.04"
+    env:
+      PLAN: ${{ needs.plan.outputs.val }}
+      GITHUB_USER: "github-actions[bot]"
+      GITHUB_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+    if: ${{ contains(needs.plan.outputs.val, '"devmap.rb"') && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The push below authenticates with this token.
+          persist-credentials: true
+          repository: "bharathvbcr/homebrew-tap"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      # So we have access to the formula
+      - name: Fetch homebrew formulae
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+      - name: Commit formula files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          mapfile -t formulae < <(jq --raw-output '.releases[] | .artifacts[] | select(endswith(".rb"))' <<<"$PLAN")
+          if [[ "${#formulae[@]}" -eq 0 ]]; then
+            echo "ERROR: the plan names no Homebrew formula" >&2
+            exit 1
+          fi
+          for filename in "${formulae[@]}"; do
+            case "$filename" in
+              *[!A-Za-z0-9._-]*|"")
+                printf '%s\n' "refusing formula name with unexpected characters" >&2
+                exit 1
+                ;;
+            esac
+            if [[ ! -f "Formula/${filename}" ]]; then
+              echo "ERROR: formula Formula/${filename} was not among the artifacts" >&2
+              exit 1
+            fi
+            name="${filename%.rb}"
+            version="$(jq --raw-output --arg f "$filename" '.releases[] | select(any(.artifacts[]; . == $f)) | .app_version' <<<"$PLAN")"
+            brew update
+            # Do not reformat user-provided data such as the description and homepage.
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+            git add "Formula/${filename}"
+            # A re-run after a successful push has nothing new to commit.
+            git diff --cached --quiet || git commit -m "${name} ${version}"
+          done
+          git push
+
   announce:
     permissions:
       "contents": "read"
     needs:
       - plan
       - host
+      - publish-homebrew-formula
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
