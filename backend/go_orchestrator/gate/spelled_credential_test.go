@@ -21,6 +21,10 @@ func TestSpelledCredentialSurvivesUnbindableNamesAndEnvSplit(t *testing.T) {
 		`<.env env -S cat`:                          {policy.RuleCommandSecretRead},
 		`env -S cat <.env`:                          {policy.RuleCommandSecretRead},
 		`nice "$@"`:                                 {policy.RuleCommandOperandUnverifiable, policy.RuleCommandSubstitution},
+		`nice tee .e*`:                              {policy.RuleCommandSecretRead},
+		`timeout 5 rm .e*`:                          {policy.RuleCommandSecretRead},
+		`env -i cp x .en?`:                          {policy.RuleCommandSecretRead},
+		`nice dd of=.e*`:                            {policy.RuleCommandSecretRead},
 		`env -S cat $X`:                             {policy.RuleCommandOperandUnverifiable},
 		`d=lib; d=$zz; echo x > src/$d/../../o.txt`: {policy.RuleOutsideRoot},
 	}
@@ -43,6 +47,17 @@ func TestSpelledCredentialSurvivesUnbindableNamesAndEnvSplit(t *testing.T) {
 				}
 				if !d.Blocked() || d.Severity != policy.Hard || !ok {
 					t.Errorf("%s task=%v %q: got %s %s %q, want a hard %v", posture, withTask, c, d.Action, d.Severity, d.Rule, rules)
+				}
+			}
+			// A write through an unbound operand behind a wrapper: refused in
+			// every posture (strict by the write gate, as without the wrapper).
+			for _, c := range []string{"timeout 5 cp x $X", "nice tee $X"} {
+				d, err := g.EvaluateCommand(c, task)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !d.Blocked() {
+					t.Errorf("%s task=%v %q: allowed, want a refusal", posture, withTask, c)
 				}
 			}
 		}

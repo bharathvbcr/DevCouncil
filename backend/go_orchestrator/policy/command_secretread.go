@@ -101,7 +101,9 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		// No word names the program. Every word after the computed one may be
 		// what it reads, so each is judged as a reader's operand: a spelled
 		// credential stays the hard refusal rather than the unverifiable one.
-		at, judgedFrom = peel.computedAt, peel.computedAt
+		// The computed word is judged too: `nice .e*` runs whatever .e*
+		// matches.
+		at, judgedFrom = peel.computedAt, peel.computedAt-1
 	}
 	framing := isBoundedShellCompoundFraming(clause)
 
@@ -126,6 +128,15 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 	written := make(map[string]bool, len(argWrites.targets))
 	for _, w := range argWrites.targets {
 		written[w] = true
+	}
+	// touched also holds what the command deletes; see the expanded-target
+	// check in the operand loop.
+	touched := make(map[string]bool, len(written)+len(argWrites.deletes))
+	for w := range written {
+		touched[w] = true
+	}
+	for _, w := range argWrites.deletes {
+		touched[w] = true
 	}
 	if command == "git" {
 		for _, sib := range argWrites.siblings {
@@ -187,6 +198,30 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 		// program it is handed to: the reader only classifies the command.
 		if framing || at < 0 || i <= judgedFrom {
 			continue
+		}
+		// A write or delete target the shell expands (`rm .e*`, `cp x $X`,
+		// `dd of=.e*`) is matched against the credentials it can expand to,
+		// whatever the command: the write rungs take a glob as the literal path
+		// it spells, and an unbound one as no path at all.
+		if words[i].bareExpands {
+			candidates := []string{text}
+			if _, value, ok := strings.Cut(text, "="); ok {
+				candidates = append(candidates, value)
+			}
+			for _, c := range candidates {
+				if !touched[c] {
+					continue
+				}
+				if reason := secretOperandReason(c, operandRoot); reason != "" {
+					return fmt.Sprintf("`%s` names %s", command, reason), false
+				}
+				// One that can steer the path (an expansion beside "..") is the
+				// write rungs' outside-root refusal, not an unreadable one.
+				if unbound == "" && unboundOperand(words[i]) && !escapingPathWord(words[i], false) {
+					unbound = fmt.Sprintf("`%s` writes through an operand (`%s`) holding an expansion the gate cannot "+
+						"resolve to a value, so the file it changes was not judged. Spell the operand out.", command, text)
+				}
+			}
 		}
 		reads := !nonReadingCommands[command]
 		if command == "git" {
