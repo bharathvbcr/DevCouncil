@@ -97,6 +97,19 @@ func secretOperandViolation(clause, root string) string {
 		operandRoot = effectiveGitRoot
 	}
 
+	// The program a search or text tool runs (`grep 'a:.*'`, `sed 's/:.*//'`,
+	// `jq .env`) is not a file it reads; its other operands and option values
+	// are. See programOperandsOf.
+	program := programOperands{}
+	if !framing {
+		program = programOperandsOf(command, words, at)
+	}
+	for _, value := range program.attached {
+		if reason := secretOperandReason(value, operandRoot); reason != "" {
+			return fmt.Sprintf("`%s` names %s", command, reason)
+		}
+	}
+
 	for i := 0; i < len(words); i++ {
 		text := words[i].text
 		if target, isRedirect := redirectionPrefix(text); isRedirect {
@@ -125,7 +138,7 @@ func secretOperandViolation(clause, root string) string {
 		if command == "git" {
 			reads = gitContentSubcommands[gitSub]
 		}
-		if !reads {
+		if !reads || program.exempt[i] {
 			continue
 		}
 		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
