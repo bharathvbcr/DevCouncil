@@ -1351,7 +1351,7 @@ const PRE_TOOL_SKELETON_CONTEXT_CAP: usize = 3500;
 const PROMPT_NUDGE: &str = "DevMap has recorded no query from this session. Before grepping or \
      reading files to find code, ask the index: devmap_search / devmap_explore for where a \
      symbol lives, devmap_ask_evidence for a behaviour you cannot name, devmap_impact before \
-     changing one.";
+     changing one (CLI: `devmap search|explore|ask --evidence|impact ... --json`).";
 
 /// Most prompt nudges one session receives, whatever else is true.
 ///

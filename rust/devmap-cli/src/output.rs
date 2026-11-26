@@ -125,7 +125,24 @@ pub(crate) fn emit_store_answer(
             .to_json()
         });
     }
-    emit_json(cli, &answer)
+    let result = emit_json(cli, &answer);
+    remember_answer(answer);
+    result
+}
+
+/// The last JSON answer `emit_store_answer` printed, kept for the query log's
+/// honesty fields (`truncated`, `walk_incomplete`, `empty`). A one-shot
+/// command prints at most one.
+static ANSWERED: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+fn remember_answer(answer: serde_json::Value) {
+    if let Ok(mut slot) = ANSWERED.lock() {
+        *slot = Some(answer);
+    }
+}
+
+pub(crate) fn take_answered() -> Option<serde_json::Value> {
+    ANSWERED.lock().ok().and_then(|mut slot| slot.take())
 }
 
 pub(crate) fn emit_json(cli: &Cli, payload: &serde_json::Value) -> anyhow::Result<()> {

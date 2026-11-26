@@ -13,7 +13,7 @@ pub mod watcher;
 
 pub use admission::{Admission, Admitted};
 pub use daemon::{default_ipc_path_for, Daemon, ShutdownSignals, DEFAULT_DRAIN_BATCH_LIMIT};
-pub use mcp::{serve_stdio, tool_specs, StoreSlot};
+pub use mcp::{serve_stdio, tool_for_command, tool_specs, StoreSlot};
 pub use mcp_http::serve_http;
 pub use protocol::{
     coverage_gaps_json, freshness_degraded_reason, handle_stream, index_is_fresh,

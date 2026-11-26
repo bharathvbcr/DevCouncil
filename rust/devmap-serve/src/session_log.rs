@@ -60,6 +60,11 @@ pub fn classify(structured: &Value) -> Honesty {
 /// rather than guessed at.
 pub const HOST_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 
+/// The `origin` a row carries when the query ran from the `devmap` command
+/// line. MCP rows carry no `origin` key, so a reader that predates the field
+/// sees them unchanged and a missing key means "MCP".
+pub const ORIGIN_CLI: &str = "cli";
+
 /// Longest session identifier kept. Hosts send UUIDs; this bounds a hostile or
 /// pathological one before it reaches a record or a file name.
 pub const MAX_SESSION_ID_CHARS: usize = 512;
@@ -237,13 +242,32 @@ pub fn append_query(
     error: Option<&str>,
     latency_ms: u64,
 ) {
+    append_query_from(
+        None, db_path, session_id, tool, args, structured, error, latency_ms,
+    );
+}
+
+/// [`append_query`] for a caller that is not the MCP server. `origin` (see
+/// [`ORIGIN_CLI`]) is written as an additive `origin` key; `None` writes the
+/// MCP row, byte for byte as before.
+#[allow(clippy::too_many_arguments)]
+pub fn append_query_from(
+    origin: Option<&str>,
+    db_path: &Path,
+    session_id: Option<&str>,
+    tool: &str,
+    args: Option<&Value>,
+    structured: Option<&Value>,
+    error: Option<&str>,
+    latency_ms: u64,
+) {
     let honesty = structured.map(classify).unwrap_or(Honesty {
         truncated: false,
         walk_incomplete: None,
         empty: false,
     });
     let session_id = session_id.and_then(normalize_session_id);
-    let record = json!({
+    let mut record = json!({
         "ts_ms": now_ms(),
         "session_id": session_id,
         "tool": tool,
@@ -255,6 +279,9 @@ pub fn append_query(
         "empty": honesty.empty && error.is_none(),
         "latency_ms": latency_ms,
     });
+    if let (Some(origin), Some(object)) = (origin, record.as_object_mut()) {
+        object.insert("origin".to_string(), json!(origin));
+    }
     let Ok(line) = serde_json::to_string(&record) else {
         return;
     };
@@ -285,13 +312,23 @@ pub fn append_query(
         append_line(&mut file, &line)
     })();
     if let Err(error) = result {
-        tracing::warn!("MCP query logging skipped: {error}");
+        // The CLI's diagnostics go to the caller's stderr, which agents parse
+        // beside --json, so a CLI row's failed write stays below INFO.
+        if origin.is_some() {
+            tracing::debug!("query logging skipped: {error}");
+        } else {
+            tracing::warn!("query logging skipped: {error}");
+        }
     }
     // Independent of the log: a log at its size limit refuses the row, and the
     // session has still queried. Behind the same store-exists check above.
     if let Some(id) = &session_id {
         if let Err(error) = mark_queried(db_path, id) {
-            tracing::warn!("MCP queried-session marker skipped: {error}");
+            if origin.is_some() {
+                tracing::debug!("queried-session marker skipped: {error}");
+            } else {
+                tracing::warn!("queried-session marker skipped: {error}");
+            }
         }
     }
 }
