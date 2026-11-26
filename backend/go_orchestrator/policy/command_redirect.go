@@ -54,6 +54,13 @@ type RedirectSet struct {
 	// OpaqueReason says why, when it is not a name only the shell can spell
 	// (a line past the binding caps); empty for the common case.
 	OpaqueReason string
+	// Unjudgeable are the written words (redirection targets and file operands)
+	// whose expansion can steer the path out of the repository or onto a
+	// protected path: an unset $zz that a later ".." cancels, ANSI-C quoting, a
+	// parameter operator. They are not in Targets, since judging their text is
+	// the lexical resolution that is wrong, and the caller refuses them hard.
+	// Opaque is set beside them for a caller that reads only Targets and Opaque.
+	Unjudgeable []string
 	// Deletes are the Targets that are only removed — rm, rmdir, unlink, shred
 	// -u, git rm, git clean — and never also written, so a caller that tells
 	// the operations apart can judge them as dc.OpDelete. They stay in Targets,
@@ -95,7 +102,16 @@ func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 	var found redirectFindings
 	memo := scanMemo{}
 	readings, truncated := expandBindings(command)
-	finish := func(set RedirectSet) RedirectSet { return set }
+	finish := func(set RedirectSet) RedirectSet {
+		// A word whose expansion can steer the path (see escapingPathWord) is
+		// reported beside the targets, bounded like them, and makes the set
+		// opaque for a caller that reads only Targets and Opaque.
+		if len(found.unjudgeable) > 0 {
+			set.Unjudgeable = dedupeStrings(found.unjudgeable, maxRedirectTargets)
+			set.Opaque = true
+		}
+		return set
+	}
 	if truncated {
 		// Readings past the caps were never scanned, so the line fails closed
 		// as opaque. The line as written and every reading that fit are still
@@ -149,6 +165,21 @@ func RedirectWritesInRoot(command, root string) (RedirectSet, error) {
 		Unjudged:      found.unjudged,
 		SiblingWrites: siblingWrites,
 	}), nil
+}
+
+// dedupeStrings returns the distinct strings of in, first-seen order, at most
+// limit of them.
+func dedupeStrings(in []string, limit int) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, dup := seen[s]; dup || len(out) >= limit {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func dedupeWriteTargets(targets []string, delMap map[string]int, limit int) (distinct, deletes []string, overflow bool) {
@@ -238,7 +269,8 @@ const maxRedirectTargets = 64
 
 // redirectFindings is what scanning one command line found.
 type redirectFindings struct {
-	targets []string
+	targets     []string
+	unjudgeable []string
 	// deleted counts, per target, the commands in the line that remove it. A
 	// deleted target is also in targets, once per command that names it; it is
 	// a delete only when every one of those is a removal.
@@ -257,6 +289,7 @@ type siblingRedirectFindings struct {
 
 func (f *redirectFindings) mergeFrom(o redirectFindings) {
 	f.targets = append(f.targets, o.targets...)
+	f.unjudgeable = append(f.unjudgeable, o.unjudgeable...)
 	f.opaque = f.opaque || o.opaque
 	if f.unjudged == "" {
 		f.unjudged = o.unjudged
@@ -353,11 +386,12 @@ func redirectTargetsMemo(command, root string, depth int, memo scanMemo) (redire
 	s.addArgumentWrites()
 	s.reconcileWithSubstitutions(command)
 	found := redirectFindings{
-		targets:  s.targets,
-		deleted:  s.deleted,
-		opaque:   s.opaque,
-		unjudged: s.unjudged,
-		siblings: s.siblings,
+		targets:     s.targets,
+		unjudgeable: s.unjudgeable,
+		deleted:     s.deleted,
+		opaque:      s.opaque,
+		unjudged:    s.unjudged,
+		siblings:    s.siblings,
 	}
 	memo[key] = found
 	return found, nil
@@ -371,11 +405,12 @@ type redirectScan struct {
 	depth int
 	memo  scanMemo
 
-	targets  []string
-	deleted  map[string]int
-	opaque   bool
-	unjudged string
-	siblings []siblingRedirectFindings
+	targets     []string
+	unjudgeable []string
+	deleted     map[string]int
+	opaque      bool
+	unjudged    string
+	siblings    []siblingRedirectFindings
 
 	// masked is this command line as the argument scan reads it: every
 	// substitution span scanOperators descends into is replaced by
@@ -455,6 +490,7 @@ func (s *redirectScan) descend(inner string) error {
 		return err
 	}
 	s.targets = append(s.targets, inside.targets...)
+	s.unjudgeable = append(s.unjudgeable, inside.unjudgeable...)
 	s.noteDeleted(inside.deleted)
 	s.opaque = s.opaque || inside.opaque
 	s.noteUnjudged(inside.unjudged)
@@ -583,11 +619,14 @@ func (s *redirectScan) outputRedirection(i int) (int, error) {
 		}
 		return i, nil
 	}
-	target, next, err := readRedirectTarget(runes, i)
+	target, raw, next, err := readRedirectTarget(runes, i)
 	if err != nil {
 		return 0, err
 	}
 	if unresolvableWord(target) {
+		s.opaque = true
+	} else if words := shellWords(raw); target != "" && len(words) == 1 && escapingPathWord(words[0], false) {
+		s.unjudgeable = append(s.unjudgeable, target)
 		s.opaque = true
 	} else if target != "" {
 		s.targets = append(s.targets, target)
@@ -598,25 +637,27 @@ func (s *redirectScan) outputRedirection(i int) (int, error) {
 }
 
 // readRedirectTarget reads the word an output redirection names, starting at
-// start (leading spaces skipped). It returns the dequoted target and the index
-// one past it; an empty target with no error is a dup to a descriptor (>&N,
+// start (leading spaces skipped). It returns the dequoted target, the word as
+// written (quotes kept, for the question of what the shell expands in it) and
+// the index one past it; an empty target with no error is a dup to a descriptor (>&N,
 // &N), which names no path.
-func readRedirectTarget(runes []rune, start int) (string, int, error) {
+func readRedirectTarget(runes []rune, start int) (target, raw string, next int, err error) {
 	n := len(runes)
 	j := start
 	for j < n && runes[j] == ' ' {
 		j++
 	}
 	if j >= n {
-		return "", 0, fmt.Errorf("redirection with no target")
+		return "", "", 0, fmt.Errorf("redirection with no target")
 	}
 	if runes[j] == '&' || (runes[j] >= '0' && runes[j] <= '9') && j+1 < n && runes[j+1] == '&' {
 		// >&N / &N — dup to a descriptor, not a path.
 		for j < n && runes[j] != ' ' {
 			j++
 		}
-		return "", j, nil
+		return "", "", j, nil
 	}
+	wordStart := j
 	var b strings.Builder
 	q := rune(0)
 	for j < n {
@@ -659,7 +700,7 @@ func readRedirectTarget(runes []rune, start int) (string, int, error) {
 		b.WriteRune(r)
 		j++
 	}
-	return b.String(), j, nil
+	return b.String(), string(runes[wordStart:j]), j, nil
 }
 
 // addArgumentWrites is the second stage: the files the line writes through its
@@ -675,6 +716,10 @@ func (s *redirectScan) addArgumentWrites() {
 		s.noteDeleted(map[string]int{d: 1})
 	}
 	s.opaque = s.opaque || args.opaque
+	s.unjudgeable = append(s.unjudgeable, args.unjudgeable...)
+	if len(args.unjudgeable) > 0 {
+		s.opaque = true
+	}
 	s.noteUnjudged(args.unjudged)
 	for _, sib := range args.siblings {
 		delMap := make(map[string]int, len(sib.writes.deletes))

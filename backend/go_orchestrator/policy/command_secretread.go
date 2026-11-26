@@ -178,7 +178,7 @@ func secretOperandViolation(clause, root string) (reason string, unverifiable bo
 			}
 			continue
 		}
-		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") {
+		if strings.HasPrefix(text, "-") && !strings.Contains(text, "=") && !words[i].bareExpands {
 			continue
 		}
 		if unbound == "" && !written[text] && operandFromFile(command, words[i]) {
