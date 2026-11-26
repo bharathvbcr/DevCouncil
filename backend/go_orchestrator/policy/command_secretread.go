@@ -61,7 +61,13 @@ const maxGlobMatchesJudged = 1024
 // elsewhere in the clause takes precedence over it.
 func secretOperandViolation(clause, root string) (reason string, unverifiable bool) {
 	words := shellWords(clause)
-	at, judgedFrom := readerBehindWrapper(words, argumentCommandWord(words))
+	commandAt, unknownOption := argumentCommandWordPeeled(words)
+	if unknownOption != "" {
+		return fmt.Sprintf("a wrapper is handed an option (`%s`) the gate cannot step over to the command it runs, "+
+			"so that command's operands were not judged. Spell the command without the wrapper, or use an option "+
+			"the gate knows.", unknownOption), true
+	}
+	at, judgedFrom := readerBehindWrapper(words, commandAt)
 	framing := isBoundedShellCompoundFraming(clause)
 
 	command, gitSub := "", ""
