@@ -1,6 +1,6 @@
 use super::{
     refusal, sidecar_links, GenerationChecks, LazyWalk, ReaderMemory, SidecarLinks, Store,
-    WriterLock, CONNECTION_SETUP,
+    WriterLock, WriterLockWait, CONNECTION_SETUP,
 };
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
@@ -1102,10 +1102,21 @@ impl Store {
     /// the lock was taken) or opened from another thread is not recognised and
     /// waits on the lock like any other process would.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        Self::lock_writer_at_watched(db_path, wait, &mut |_| std::ops::ControlFlow::Continue(()))
+    }
+
+    /// [`Store::lock_writer_at`] that shows the wait to `watch` while another
+    /// holder has the lock, and ends it when `watch` breaks. The one lock
+    /// implementation: the unwatched calls pass a watch that never breaks.
+    pub fn lock_writer_at_watched(
+        db_path: &Path,
+        wait: std::time::Duration,
+        watch: &mut dyn FnMut(&WriterLockWait<'_>) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<WriterLock> {
         let db_path = devmap_extract::safe_fs::resolve_file_alias(db_path)?;
         Self::validate_database_file(&db_path)?;
         let lock_path = Self::writer_lock_path(&db_path);
-        Self::lock_file_at(&lock_path, wait)
+        Self::lock_file_watched(&lock_path, wait, watch)
     }
 
     /// The bounded, pid-recording exclusive `flock` behind
@@ -1114,6 +1125,18 @@ impl Store {
     /// contention waits, a failed check is reported as such, and the timeout
     /// names the holder's pid.
     pub fn lock_file_at(lock_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        Self::lock_file_watched(
+            lock_path,
+            wait,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+        )
+    }
+
+    fn lock_file_watched(
+        lock_path: &Path,
+        wait: std::time::Duration,
+        watch: &mut dyn FnMut(&WriterLockWait<'_>) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<WriterLock> {
         use devmap_extract::safe_fs::{Access, Creation, SafeFile};
         let lock_path = lock_path.to_path_buf();
         let mut file = SafeFile::open(&lock_path, Access::ReadWrite, Creation::IfMissing).map_err(
@@ -1125,7 +1148,13 @@ impl Store {
             },
         )?;
 
-        Self::poll_writer_lock(|| file.try_lock(), wait, Self::WRITER_LOCK_POLL, &lock_path)?;
+        Self::poll_writer_lock_watched(
+            || file.try_lock(),
+            wait,
+            Self::WRITER_LOCK_POLL,
+            &lock_path,
+            watch,
+        )?;
 
         // The prior holder may have updated its pid while this caller waited.
         // After taking the lock, validate ownership of the actual descriptor
@@ -1170,8 +1199,9 @@ impl Store {
     /// owner and can be driven by a test — no filesystem refuses `flock` on
     /// demand, and an untestable policy is how the collapse survived here
     /// while being explicitly rejected one crate away.
+    #[cfg(test)]
     pub(super) fn poll_writer_lock<F>(
-        mut attempt: F,
+        attempt: F,
         wait: std::time::Duration,
         poll: std::time::Duration,
         lock_path: &Path,
@@ -1179,11 +1209,43 @@ impl Store {
     where
         F: FnMut() -> std::result::Result<(), std::fs::TryLockError>,
     {
-        let deadline = std::time::Instant::now() + wait;
+        Self::poll_writer_lock_watched(attempt, wait, poll, lock_path, &mut |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+    }
+
+    /// The unwatched poll that calls `watch` after each refused attempt
+    /// with how long the wait has run; `Break` ends it with a refusal that says
+    /// it was cancelled, not that the bound passed.
+    pub(super) fn poll_writer_lock_watched<F>(
+        mut attempt: F,
+        wait: std::time::Duration,
+        poll: std::time::Duration,
+        lock_path: &Path,
+        watch: &mut dyn FnMut(&WriterLockWait<'_>) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut() -> std::result::Result<(), std::fs::TryLockError>,
+    {
+        let started = std::time::Instant::now();
+        let deadline = started + wait;
         loop {
             match attempt() {
                 Ok(()) => return Ok(()),
                 Err(std::fs::TryLockError::WouldBlock) => {
+                    let waited = started.elapsed();
+                    if watch(&WriterLockWait {
+                        lock_path,
+                        waited,
+                        bound: wait,
+                    })
+                    .is_break()
+                    {
+                        anyhow::bail!(
+                            "waiting for the devmap writer lock {lock_path:?} was cancelled \
+                             after {waited:?}"
+                        );
+                    }
                     if std::time::Instant::now() >= deadline {
                         let owner = Self::writer_lock_holder(lock_path);
                         anyhow::bail!(
@@ -1205,7 +1267,7 @@ impl Store {
     ///
     /// Diagnostic only: the lock is the `flock`, not the file's contents, so
     /// every failure here degrades the message rather than the exclusion.
-    fn writer_lock_holder(lock_path: &Path) -> String {
+    pub(super) fn writer_lock_holder(lock_path: &Path) -> String {
         use devmap_extract::safe_fs::{Access, Creation, SafeFile};
 
         #[cfg(windows)]

@@ -545,6 +545,7 @@ dependencies = [
  "devmap-analyze",
  "devmap-extract",
  "devmap-resolve",
+ "devmap-store",
  "libc",
  "rayon",
  "rusqlite",

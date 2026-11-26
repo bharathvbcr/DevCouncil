@@ -3,7 +3,6 @@ package flags
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -839,10 +838,13 @@ func refuseRetiredConfig(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return nil
 	}
-	f, err := os.Open(path)
+	// OpenRegular, not os.Open: a named pipe at this path must be refused
+	// before it is opened, because opening one blocks until a writer appears.
+	f, err := OpenRegular(path)
 	if err != nil {
-		// Missing is not an error at this layer and every other read failure is
-		// LoadConfigFile's to report; it opens the same path immediately after.
+		// Missing is not an error at this layer and every other read failure,
+		// a refused file type included, is LoadConfigFile's to report; it
+		// opens the same path immediately after.
 		return nil
 	}
 	defer func() { _ = f.Close() }()
