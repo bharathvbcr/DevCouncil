@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -78,25 +76,6 @@ func cliTool(t *testing.T, root, name string, args map[string]any) (string, stri
 	restoreOut()
 	restoreErr()
 	return strings.TrimSuffix(stdout.String(), "\n"), stderr.String(), code
-}
-
-// lockedBuffer is an io.Writer the server goroutine writes while the test
-// reads.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) lines() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return strings.Split(b.buf.String(), "\n")
 }
 
 // mcpTool asks a real MCP server, built over this root as runMCP builds it,
