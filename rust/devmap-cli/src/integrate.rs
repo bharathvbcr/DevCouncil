@@ -123,11 +123,33 @@ impl Host {
     }
 
     fn registers_global_mcp(self) -> bool {
-        matches!(self, Self::Cursor | Self::Claude)
+        matches!(self, Self::Cursor | Self::Claude | Self::Antigravity)
     }
 
     fn registers_codex_mcp(self) -> bool {
         matches!(self, Self::Codex)
+    }
+}
+
+/// Which config scope `devmap integrate` targets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum IntegrateScope {
+    /// Both user-level and project-level host assets (default).
+    #[default]
+    All,
+    /// Project-level assets only (skips user-level configs).
+    Project,
+    /// User-level MCP config only (skips guides, skills, hooks, and project configs).
+    User,
+}
+
+impl IntegrateScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Project => "project",
+            Self::User => "user",
+        }
     }
 }
 
@@ -190,6 +212,7 @@ pub struct McpMergeOutcome {
 /// failure after that point — a full disk, a file that changed underneath — is
 /// reported with the list of what had already been written, because the
 /// receipt of a half-applied install is the only way to put it back.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn integrate(
     host: Host,
@@ -205,10 +228,50 @@ pub fn integrate(
     hand_written: devmap_query::guides::HandWrittenGuides,
     force: bool,
 ) -> anyhow::Result<IntegrateReport> {
+    integrate_with_scope(
+        host,
+        IntegrateScope::All,
+        project_root,
+        executable,
+        map,
+        map_rel,
+        graph_rel,
+        store_rel,
+        servers,
+        dry_run,
+        check,
+        hand_written,
+        force,
+    )
+}
+
+/// Apply (or check / dry-run) DevMap host assets for one repository under
+/// `scope` (`All` or `Project`). For `IntegrateScope::User`, call
+/// [`integrate_user_scope`].
+#[allow(clippy::too_many_arguments)]
+pub fn integrate_with_scope(
+    host: Host,
+    scope: IntegrateScope,
+    project_root: &Path,
+    executable: &Path,
+    map: &Value,
+    map_rel: &str,
+    graph_rel: &str,
+    store_rel: &str,
+    servers: &[ServerSpec],
+    dry_run: bool,
+    check: bool,
+    hand_written: devmap_query::guides::HandWrittenGuides,
+    force: bool,
+) -> anyhow::Result<IntegrateReport> {
+    if scope == IntegrateScope::User {
+        return integrate_user_scope(host, Some(executable), servers, false, dry_run, check);
+    }
     let writes = !dry_run && !check;
     if writes {
-        integrate(
+        integrate_with_scope(
             host,
+            scope,
             project_root,
             executable,
             map,
@@ -226,6 +289,7 @@ pub fn integrate(
     let mut report = IntegrateReport::default();
     match integrate_into(
         host,
+        scope,
         project_root,
         executable,
         map,
@@ -259,9 +323,136 @@ pub fn integrate(
     }
 }
 
+/// Register only the caller's `--servers-stdin` entries into `host`'s project
+/// document, skipping guides, skills, hooks, and DevMap's own server entry.
+pub fn integrate_project_servers_only(
+    host: Host,
+    project_root: &Path,
+    servers: &[ServerSpec],
+    dry_run: bool,
+    check: bool,
+) -> anyhow::Result<IntegrateReport> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("project root {}", project_root.display()))?;
+    for spec in servers {
+        register_server(host, &root, spec, true)?;
+    }
+    let mut report = IntegrateReport::default();
+    for spec in servers {
+        report
+            .servers
+            .push(register_server(host, &root, spec, dry_run || check)?);
+    }
+    report.check_ok = !report.servers.iter().any(|m| m.changed);
+    Ok(report)
+}
+
+/// Register user-level MCP configuration for `host` (no project root or DevMap
+/// store required). Refuses `Host::Warp`, which has no user-level config.
+pub fn integrate_user_scope(
+    host: Host,
+    executable: Option<&Path>,
+    servers: &[ServerSpec],
+    servers_only: bool,
+    dry_run: bool,
+    check: bool,
+) -> anyhow::Result<IntegrateReport> {
+    let home = dirs_home()?;
+    let (user_path, user_doc) = host.user_document(&home).ok_or_else(|| {
+        anyhow!(
+            "{}: host has no user-level MCP configuration; use --scope project",
+            host.as_str()
+        )
+    })?;
+    let writes = !dry_run && !check;
+    if writes {
+        integrate_user_scope(host, executable, servers, servers_only, true, false)
+            .context("nothing was written: the plan was refused")?;
+    }
+    let mut report = IntegrateReport::default();
+
+    if !servers_only {
+        let exe = executable.ok_or_else(|| {
+            anyhow!("internal error: devmap executable is required when --servers-only is unset")
+        })?;
+        match host {
+            Host::Claude => {
+                let install = claude::claude_plugin_install(&home);
+                let plugin_registration = claude_plugin_registration(&install);
+                if plugin_registration.is_none() {
+                    for error in install.record_error.iter().chain(&install.load_error) {
+                        report.notes.push(format!(
+                            "claude: could not tell whether the Dev Map plugin registers devmap \
+                             ({error}); the user-scope entry was managed as if it does not"
+                        ));
+                    }
+                }
+                let outcome = match &plugin_registration {
+                    Some(plugin_mcp) => retire_beside_plugin(
+                        &user_path,
+                        plugin_mcp,
+                        "user-scope",
+                        dry_run || check,
+                    )?,
+                    None => merge_global_mcp(&user_path, exe, dry_run || check)?,
+                };
+                report.global_mcp.push(outcome);
+            }
+            Host::Cursor | Host::Antigravity => {
+                report
+                    .global_mcp
+                    .push(merge_global_mcp(&user_path, exe, dry_run || check)?);
+            }
+            Host::Codex => {
+                report
+                    .global_mcp
+                    .push(merge_codex_mcp(&user_path, exe, dry_run || check)?);
+            }
+            Host::OpenCode => {
+                let standard = claude::mcp_entry(exe, None, None)?;
+                let command = standard
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("mcp entry has no command"))?;
+                let args = standard
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned();
+                let entry = argv_entry(command, args, None);
+                report.global_mcp.push(merge_user_json_server(
+                    &user_path,
+                    &user_doc,
+                    MCP_SERVER_NAME,
+                    entry,
+                    dry_run || check,
+                )?);
+            }
+            Host::Warp => unreachable!("Warp refused above"),
+        }
+    }
+
+    for spec in servers {
+        report
+            .servers
+            .push(register_user_server(host, &home, spec, dry_run || check)?);
+    }
+
+    let mcp_dirty = report
+        .global_mcp
+        .iter()
+        .chain(report.servers.iter())
+        .any(|m| m.changed);
+    report.check_ok = !mcp_dirty;
+    Ok(report)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn integrate_into(
     host: Host,
+    scope: IntegrateScope,
     project_root: &Path,
     executable: &Path,
     map: &Value,
@@ -356,7 +547,7 @@ fn integrate_into(
         _ => None,
     };
 
-    if host.registers_global_mcp() {
+    if scope != IntegrateScope::Project && host.registers_global_mcp() {
         for path in global_mcp_paths(host)? {
             let outcome = match &plugin_registration {
                 Some(plugin_mcp) => {
@@ -369,9 +560,11 @@ fn integrate_into(
     }
 
     if host.registers_codex_mcp() {
-        let path = dirs_home()?.join(".codex").join("config.toml");
-        let outcome = merge_codex_mcp(&path, executable, dry_run || check)?;
-        report.global_mcp.push(outcome);
+        if scope != IntegrateScope::Project {
+            let path = dirs_home()?.join(".codex").join("config.toml");
+            let outcome = merge_codex_mcp(&path, executable, dry_run || check)?;
+            report.global_mcp.push(outcome);
+        }
         report.notes.push(
             "Codex hooks require trust via `/hooks` after install (hash-based; \
              regenerating hooks re-requires trust)"
@@ -483,10 +676,10 @@ fn global_mcp_paths(host: Host) -> anyhow::Result<Vec<PathBuf>> {
     Ok(match host {
         Host::Cursor => vec![home.join(".cursor").join("mcp.json")],
         Host::Claude => vec![claude::claude_global_config(&home)],
-        // Project-scoped only. Antigravity and OpenCode keep their server list
-        // beside the repository, and Warp's file is handed to `oz` per run, so
-        // there is no user-level document to merge into for any of them.
-        Host::Codex | Host::Antigravity | Host::OpenCode | Host::Warp => Vec::new(),
+        Host::Antigravity => vec![home.join(".gemini").join("config").join("mcp_config.json")],
+        // Codex uses its TOML path via `merge_codex_mcp`; OpenCode user-level
+        // config is managed under `--scope user`; Warp is project-only.
+        Host::Codex | Host::OpenCode | Host::Warp => Vec::new(),
     })
 }
 
@@ -605,6 +798,53 @@ impl Host {
     /// one written by [`merge_host_mcp`].
     fn mcp_document(self) -> Option<HostMcpDoc> {
         Some(self.project_document()).filter(|doc| doc.carries_devmap)
+    }
+
+    /// The user-level server document this host reads, when it has one.
+    fn user_document(self, home: &Path) -> Option<(PathBuf, HostMcpDoc)> {
+        let json = |rel, container| HostMcpDoc {
+            rel,
+            format: DocFormat::Json,
+            container,
+            preamble: &[],
+            argv_form: false,
+            accepts_cwd: false,
+            carries_devmap: false,
+        };
+        match self {
+            Self::Cursor => Some((
+                home.join(".cursor").join("mcp.json"),
+                json("~/.cursor/mcp.json", Some("mcpServers")),
+            )),
+            Self::Claude => Some((
+                claude::claude_global_config(home),
+                json("~/.claude.json", Some("mcpServers")),
+            )),
+            Self::Codex => Some((
+                home.join(".codex").join("config.toml"),
+                HostMcpDoc {
+                    format: DocFormat::Toml,
+                    accepts_cwd: true,
+                    ..json("~/.codex/config.toml", Some("mcp_servers"))
+                },
+            )),
+            Self::Antigravity => Some((
+                home.join(".gemini").join("config").join("mcp_config.json"),
+                HostMcpDoc {
+                    accepts_cwd: true,
+                    ..json("~/.gemini/config/mcp_config.json", Some("mcpServers"))
+                },
+            )),
+            Self::OpenCode => Some((
+                home.join(".config").join("opencode").join("opencode.json"),
+                HostMcpDoc {
+                    preamble: &[("$schema", "https://opencode.ai/config.json")],
+                    argv_form: true,
+                    ..json("~/.config/opencode/opencode.json", Some("mcp"))
+                },
+            )),
+            Self::Warp => None,
+        }
     }
 }
 
@@ -939,6 +1179,155 @@ fn refuse_unknown_keys(
     }
 }
 
+/// Fold one named server entry into a user-level JSON config document.
+///
+/// Mirrors [`merge_json_server`] while reading via [`read_host_config`] (like
+/// [`merge_global_mcp`]), so normal home-directory layouts work cleanly.
+fn merge_user_json_server(
+    path: &Path,
+    doc: &HostMcpDoc,
+    name: &str,
+    entry: Value,
+    dry_run: bool,
+) -> anyhow::Result<McpMergeOutcome> {
+    let path = path.to_path_buf();
+    let mut document = match read_host_config(&path) {
+        Ok(text) if text.trim().is_empty() => empty_map(),
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|err| {
+            anyhow!(
+                "{}: not JSON ({err}); refuse to overwrite a host config this \
+                 module cannot read",
+                path.display()
+            )
+        })?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => empty_map(),
+        Err(err) => return Err(anyhow!("{}: {err}", path.display())),
+    };
+    if !document.is_object() {
+        bail!(
+            "{}: top level is {}, not a JSON object",
+            path.display(),
+            kind_of(&document)
+        );
+    }
+
+    for (key, value) in doc.preamble {
+        document
+            .as_object_mut()
+            .expect("object checked above")
+            .entry(key.to_string())
+            .or_insert_with(|| json!(value));
+    }
+
+    let before = server_of(&document, doc, name).cloned();
+    if before.as_ref() == Some(&entry) {
+        return Ok(McpMergeOutcome {
+            path,
+            changed: false,
+            removed_stale_db: false,
+            note: format!("{} already current", doc.rel),
+        });
+    }
+    let removed_stale_db =
+        name == MCP_SERVER_NAME && before.as_ref().is_some_and(entry_names_a_store);
+
+    servers_mut(&mut document, doc)?.insert(name.to_string(), entry);
+
+    if !dry_run {
+        write_json_pretty(&path, &document)?;
+    }
+    Ok(McpMergeOutcome {
+        path,
+        changed: true,
+        removed_stale_db,
+        note: if removed_stale_db {
+            format!("{}: replaced a pinned --db entry", doc.rel)
+        } else {
+            format!("{}: registered {name}", doc.rel)
+        },
+    })
+}
+
+/// Register a caller's server in `host`'s user-level document.
+pub fn register_user_server(
+    host: Host,
+    home: &Path,
+    spec: &ServerSpec,
+    dry_run: bool,
+) -> anyhow::Result<McpMergeOutcome> {
+    let (path, doc) = host.user_document(home).ok_or_else(|| {
+        anyhow!(
+            "{}: host has no user-level MCP configuration; use --scope project",
+            host.as_str()
+        )
+    })?;
+    let cwd = spec.cwd.as_ref().filter(|_| doc.accepts_cwd);
+    match doc.format {
+        DocFormat::Json => {
+            let entry = if doc.argv_form {
+                argv_entry(
+                    &spec.command,
+                    spec.args.iter().map(|a| json!(a)),
+                    Some(&spec.env),
+                )
+            } else {
+                let mut entry = json!({"command": spec.command, "args": spec.args});
+                if !spec.env.is_empty() {
+                    entry["env"] = json!(spec.env);
+                }
+                if let Some(cwd) = cwd {
+                    entry["cwd"] = json!(cwd);
+                }
+                entry
+            };
+            merge_user_json_server(&path, &doc, &spec.name, entry, dry_run)
+        }
+        DocFormat::Toml => {
+            let mut entry = toml::Table::new();
+            entry.insert("command".into(), toml::Value::String(spec.command.clone()));
+            entry.insert(
+                "args".into(),
+                toml::Value::Array(spec.args.iter().cloned().map(toml::Value::String).collect()),
+            );
+            if !spec.env.is_empty() {
+                let env: toml::Table = spec
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+                    .collect();
+                entry.insert("env".into(), toml::Value::Table(env));
+            }
+            if let Some(cwd) = cwd {
+                entry.insert("cwd".into(), toml::Value::String(cwd.clone()));
+            }
+            let container = doc
+                .container
+                .ok_or_else(|| anyhow!("{}: a TOML document names its server table", doc.rel))?;
+            let text = match read_host_config(&path) {
+                Ok(text) => text,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(err) => return Err(anyhow!("{}: {err}", path.display())),
+            };
+            let updated = splice_toml_server(&path, &text, container, &spec.name, entry)?;
+            let changed = updated.is_some();
+            if let (Some(updated), false) = (updated, dry_run) {
+                devmap_query::write_atomic(&path, updated.as_bytes())
+                    .with_context(|| format!("writing {}", path.display()))?;
+            }
+            Ok(McpMergeOutcome {
+                path,
+                changed,
+                removed_stale_db: false,
+                note: if changed {
+                    format!("{}: registered {}", doc.rel, spec.name)
+                } else {
+                    format!("{} already current", doc.rel)
+                },
+            })
+        }
+    }
+}
+
 /// Register a caller's server in `host`'s project document.
 pub fn register_server(
     host: Host,
@@ -1147,34 +1536,45 @@ pub struct McpRemoval {
 ///
 /// `devmap` itself is removed only when its entry is one this installer
 /// writes; a foreign `devmap` entry is left and said so.
-pub fn remove_registered(
+/// Take `names` back out of the host documents named in `only`, scoped to
+/// `scope` (`User` needs no `project_root`).
+pub fn remove_registered_in_scope(
     host: Host,
-    root: &Path,
+    scope: IntegrateScope,
+    root: Option<&Path>,
     names: &[String],
     only: &[PathBuf],
     dry_run: bool,
     check: bool,
 ) -> anyhow::Result<Vec<McpRemoval>> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("project root {}", root.display()))?;
-    let mut documents: Vec<(PathBuf, DocFormat, Option<&'static str>)> = Vec::new();
-    let project = host.project_document();
-    documents.push((root.join(project.rel), project.format, project.container));
-    if host.registers_global_mcp() {
-        for path in global_mcp_paths(host)? {
-            documents.push((path, DocFormat::Json, Some("mcpServers")));
+    // `(path, format, container, is_user_doc)`
+    let mut documents: Vec<(PathBuf, DocFormat, Option<&'static str>, bool)> = Vec::new();
+    if scope != IntegrateScope::User {
+        let root = root
+            .ok_or_else(|| anyhow!("project root is required for --scope {}", scope.as_str()))?
+            .canonicalize()
+            .with_context(|| format!("project root {}", root.unwrap().display()))?;
+        let project = host.project_document();
+        documents.push((
+            root.join(project.rel),
+            project.format,
+            project.container,
+            false,
+        ));
+        for site in project_mcp_sites(host, &root) {
+            documents.push((site.path, DocFormat::Json, Some("mcpServers"), false));
         }
     }
-    if host.registers_codex_mcp() {
-        documents.push((
-            dirs_home()?.join(".codex").join("config.toml"),
-            DocFormat::Toml,
-            Some("mcp_servers"),
-        ));
-    }
-    for site in project_mcp_sites(host, &root) {
-        documents.push((site.path, DocFormat::Json, Some("mcpServers")));
+    if scope != IntegrateScope::Project {
+        let home = dirs_home()?;
+        if let Some((path, doc)) = host.user_document(&home) {
+            documents.push((path, doc.format, doc.container, true));
+        } else if scope == IntegrateScope::User {
+            bail!(
+                "{}: host has no user-level MCP configuration; use --scope project",
+                host.as_str()
+            );
+        }
     }
     let wanted: Vec<PathBuf> = only
         .iter()
@@ -1182,12 +1582,20 @@ pub fn remove_registered(
         .collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut planned: Vec<(McpRemoval, Option<String>)> = Vec::new();
-    for (path, format, container) in documents {
+    for (path, format, container, is_user_doc) in documents {
         let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
         if !wanted.contains(&identity) || !seen.insert(identity) {
             continue;
         }
-        let Some(text) = read_project_doc(&path)? else {
+        let Some(text) = (if is_user_doc {
+            match read_host_config(&path) {
+                Ok(text) => Some(text),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(anyhow!("{}: {err}", path.display())),
+            }
+        } else {
+            read_project_doc(&path)?
+        }) else {
             continue;
         };
         let (updated, removed, note) = match format {
@@ -2439,9 +2847,12 @@ fn generated_manifest(document: &Value) -> bool {
     };
     object.get("name").and_then(Value::as_str) == Some(claude::PLUGIN_NAME)
         && object.get("hooks").and_then(Value::as_str) == Some("./hooks/hooks.json")
-        && object
-            .keys()
-            .all(|key| matches!(key.as_str(), "name" | "description" | "version" | "hooks"))
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "name" | "description" | "version" | "hooks" | "mcpServers" | "skills"
+            )
+        })
 }
 
 /// True when `document` is a `{"hooks": {...}}` block whose every handler is
@@ -2971,8 +3382,8 @@ pub(crate) fn registered_devmap_command(
     project_scope: bool,
 ) -> Option<String> {
     let own = host.project_document();
-    let own_shape =
-        (project_scope && path.ends_with(own.rel)) || (!project_scope && host == Host::Codex);
+    let own_shape = (project_scope && path.ends_with(own.rel))
+        || (!project_scope && matches!(host, Host::Codex | Host::OpenCode));
     let doc = if own_shape {
         own
     } else {

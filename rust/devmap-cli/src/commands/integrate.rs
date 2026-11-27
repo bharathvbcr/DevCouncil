@@ -13,9 +13,15 @@ pub(crate) struct Args {
     // which is what a hand-written list here did, naming three of six.
     #[arg(value_enum)]
     pub(crate) host: integrate::Host,
-    /// Repository root (defaults to the current worktree).
+    /// Repository root (defaults to the current worktree; unused under
+    /// `--scope user`).
     #[arg(long, default_value_os_t = default_root_hint())]
     pub(crate) project_root: PathBuf,
+    /// Config scope to manage: `all` (default: user + project), `project`, or
+    /// `user` (user-level MCP config only; skips guides, skills, hooks, and
+    /// project files).
+    #[arg(long, value_enum, default_value_t = integrate::IntegrateScope::All)]
+    pub(crate) scope: integrate::IntegrateScope,
     /// Report what would change without writing.
     #[arg(long)]
     pub(crate) dry_run: bool,
@@ -28,9 +34,13 @@ pub(crate) struct Args {
     /// Also register the servers named on stdin, in each host's own
     /// document shape: `{"servers": [{"name", "command", "args"?, "env"?,
     /// "cwd"?}]}`. `command` and `cwd` are absolute; `devmap` is reserved.
-    /// DevCouncil passes its own server this way.
+    /// DevCouncil and Waylode Connect pass their own servers this way.
     #[arg(long)]
     pub(crate) servers_stdin: bool,
+    /// Register (or `--remove`) ONLY the servers passed via `--servers-stdin`:
+    /// skip guides, skills, hooks, and DevMap's own server entry.
+    #[arg(long, requires = "servers_stdin")]
+    pub(crate) servers_only: bool,
     /// Take back what an apply registered instead of registering: remove
     /// `devmap` and the servers named on stdin from the host documents named by
     /// `--only-path`, leaving every other entry, key and comment. Guides,
@@ -60,10 +70,12 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     let Args {
         host,
         project_root,
+        scope,
         dry_run,
         check,
         binary,
         servers_stdin,
+        servers_only,
         remove,
         only_path,
         adopt_guides,
@@ -73,21 +85,25 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         return run_remove(
             cli,
             *host,
+            *scope,
             project_root,
             *dry_run,
             *check,
             *servers_stdin,
+            *servers_only,
             only_path,
         );
     }
     run_integrate(
         cli,
         *host,
+        *scope,
         project_root,
         *dry_run,
         *check,
         binary.as_deref(),
         *servers_stdin,
+        *servers_only,
         if *adopt_guides {
             devmap_query::guides::HandWrittenGuides::Adopt
         } else {
@@ -97,17 +113,24 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     )
 }
 
-/// `integrate HOST --remove`: see [`integrate::remove_registered`].
+/// `integrate HOST --remove`: see [`integrate::remove_registered_in_scope`].
+#[allow(clippy::too_many_arguments)]
 fn run_remove(
     cli: &Cli,
     host: integrate::Host,
+    scope: integrate::IntegrateScope,
     project_root: &Path,
     dry_run: bool,
     check: bool,
     servers_stdin: bool,
+    servers_only: bool,
     only: &[PathBuf],
 ) -> anyhow::Result<()> {
-    let mut names = vec![crate::claude::MCP_SERVER_NAME.to_string()];
+    let mut names = if servers_only {
+        Vec::new()
+    } else {
+        vec![crate::claude::MCP_SERVER_NAME.to_string()]
+    };
     if servers_stdin {
         let bytes = hook::read_stdin_limited(integrate::MAX_SERVER_REQUEST_BYTES)?;
         names.extend(
@@ -116,7 +139,9 @@ fn run_remove(
                 .map(|spec| spec.name),
         );
     }
-    let removals = integrate::remove_registered(host, project_root, &names, only, dry_run, check)?;
+    let root = (scope != integrate::IntegrateScope::User).then_some(project_root);
+    let removals =
+        integrate::remove_registered_in_scope(host, scope, root, &names, only, dry_run, check)?;
     // Still registered after this run: only a run that wrote nothing leaves
     // entries behind it found.
     let pending = (dry_run || check) && removals.iter().any(|r| !r.removed.is_empty());
@@ -128,6 +153,8 @@ fn run_remove(
             cli,
             &serde_json::json!({
                 "host": host.as_str(),
+                "scope": scope.as_str(),
+                "servers_only": servers_only,
                 "removed": removals.iter().map(|r| serde_json::json!({
                     "path": r.path.display().to_string(),
                     "servers": r.removed,
@@ -157,11 +184,13 @@ fn run_remove(
 fn run_integrate(
     cli: &Cli,
     host: integrate::Host,
+    scope: integrate::IntegrateScope,
     project_root: &Path,
     dry_run: bool,
     check: bool,
     binary: Option<&Path>,
     servers_stdin: bool,
+    servers_only: bool,
     hand_written: devmap_query::guides::HandWrittenGuides,
     force: bool,
 ) -> anyhow::Result<()> {
@@ -173,46 +202,82 @@ fn run_integrate(
     } else {
         Vec::new()
     };
-    // Absolute, canonical and outside the repository being configured: a
-    // `devmap` file in that repository must never become the command a host
-    // runs in every session.
-    let executable =
-        claude::reachable_command(&std::env::current_exe()?, binary, Some(project_root))?;
-    let db = cli.db();
-    let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
-    let mut report = integrate::integrate(
-        host,
-        project_root,
-        &executable,
-        &map,
-        &map_rel,
-        &graph_rel,
-        &store_rel,
-        &servers,
-        dry_run,
-        check,
-        hand_written,
-        force,
-    )?;
+    let (mut report, executable) = if scope == integrate::IntegrateScope::User {
+        let executable = if servers_only {
+            None
+        } else {
+            Some(claude::reachable_command(
+                &std::env::current_exe()?,
+                binary,
+                None,
+            )?)
+        };
+        let report = integrate::integrate_user_scope(
+            host,
+            executable.as_deref(),
+            &servers,
+            servers_only,
+            dry_run,
+            check,
+        )?;
+        (report, executable)
+    } else if servers_only {
+        let report = integrate::integrate_project_servers_only(
+            host,
+            project_root,
+            &servers,
+            dry_run,
+            check,
+        )?;
+        (report, None)
+    } else {
+        // Absolute, canonical and outside the repository being configured: a
+        // `devmap` file in that repository must never become the command a host
+        // runs in every session.
+        let executable =
+            claude::reachable_command(&std::env::current_exe()?, binary, Some(project_root))?;
+        let db = cli.db();
+        let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
+        let report = integrate::integrate_with_scope(
+            host,
+            scope,
+            project_root,
+            &executable,
+            &map,
+            &map_rel,
+            &graph_rel,
+            &store_rel,
+            &servers,
+            dry_run,
+            check,
+            hand_written,
+            force,
+        )?;
+        (report, Some(executable))
+    };
     // The warning `mcp_entry` prints on stderr, kept in the receipt's own
     // `notes` so a caller reading the JSON sees it too. It covers MCP entries
     // only. It is keyed on the documents as they stand after this run, not on
     // `changed`: an entry that was already current still breaks, and a removal
     // (`retire_beside_plugin`) leaves nothing to break.
-    let names_executable = |outcome: &integrate::McpMergeOutcome, project_scope: bool| {
-        integrate::registered_devmap_command(host, &outcome.path, project_scope)
-            .is_some_and(|command| command_names_executable(&command, &executable))
-    };
-    let registered = report.global_mcp.iter().any(|o| names_executable(o, false))
-        || report.project_mcp.iter().any(|o| names_executable(o, true));
-    if let Some(warning) = claude::mcp_receipt_note(&executable, registered) {
-        report.notes.push(warning);
+    if let Some(executable) = &executable {
+        let names_executable = |outcome: &integrate::McpMergeOutcome, project_scope: bool| {
+            integrate::registered_devmap_command(host, &outcome.path, project_scope)
+                .is_some_and(|command| command_names_executable(&command, executable))
+        };
+        let registered = report.global_mcp.iter().any(|o| names_executable(o, false))
+            || report.project_mcp.iter().any(|o| names_executable(o, true));
+        if let Some(warning) = claude::mcp_receipt_note(executable, registered) {
+            report.notes.push(warning);
+        }
     }
     if cli.json {
         emit_json(
             cli,
             &serde_json::json!({
                 "host": host.as_str(),
+                "scope": scope.as_str(),
+                "servers_only": servers_only,
                 "guides": report.guides.iter().map(|g| serde_json::json!({
                     "path": g.path.display().to_string(),
                     "disposition": g.disposition.as_str(),

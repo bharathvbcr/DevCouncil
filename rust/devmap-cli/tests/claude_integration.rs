@@ -393,7 +393,7 @@ fn the_bundle_is_written_atomically_and_re_running_changes_nothing() {
         .iter()
         .filter(|f| f["path"].as_str().unwrap().ends_with("SKILL.md"))
         .collect();
-    assert_eq!(json_files.len(), 7, "json files: {first}");
+    assert_eq!(json_files.len(), 9, "json files: {first}");
     assert_eq!(
         skill_files.len(),
         5,
@@ -708,7 +708,8 @@ fn every_emitted_file_passes_our_own_validator_in_strict_mode() {
     let mut skipped_assets = 0usize;
     for file in emitted["files"].as_array().unwrap() {
         let path = file["path"].as_str().unwrap();
-        if path.ends_with(".mcp.json") || path.ends_with("SKILL.md") {
+        let file_name = Path::new(path).file_name().and_then(|n| n.to_str());
+        if matches!(file_name, Some(".mcp.json" | "mcp.json" | "SKILL.md")) {
             continue; // MCP config and skills are not hook/manifest/marketplace JSON
         }
         if path.ends_with(".png") {
@@ -787,6 +788,9 @@ fn the_plugin_is_branded_in_the_manifests_that_render_branding() {
     let cursor = read("devmap/.cursor-plugin/plugin.json");
     assert_eq!(cursor["name"], "devmap");
     assert_eq!(cursor["displayName"], "Dev Map");
+    assert_eq!(cursor["skills"], "./skills");
+    assert_eq!(cursor["hooks"], "./hooks/hooks.json");
+    assert_eq!(cursor["mcpServers"], "./.mcp.json");
     let logo = cursor["logo"]
         .as_str()
         .expect("cursor manifest names a logo");
@@ -800,6 +804,33 @@ fn the_plugin_is_branded_in_the_manifests_that_render_branding() {
     let bytes = std::fs::read(&resolved)
         .unwrap_or_else(|e| panic!("the manifest names {logo}, which is not there: {e}"));
     assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{logo} is not a PNG");
+
+    let codex = read("devmap/.codex-plugin/plugin.json");
+    assert_eq!(codex["name"], "devmap");
+    assert_eq!(codex["hooks"], "./hooks/hooks.json");
+    assert_eq!(codex["mcpServers"], "./.mcp.json");
+    assert_eq!(codex["skills"], "./skills");
+
+    // Portable Agent Plugins 1.0.0 root manifests (Antigravity + spec clients).
+    let portable = read("devmap/plugin.json");
+    assert_eq!(
+        portable["$schema"],
+        "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+    );
+    assert_eq!(portable["name"], "devmap");
+    assert!(
+        portable.get("logo").is_none() && portable.get("displayName").is_none(),
+        "Agent Plugins 1.0.0 sets additionalProperties: false: {portable}"
+    );
+    let portable_mcp = read("devmap/mcp.json");
+    assert_eq!(
+        portable_mcp["$schema"],
+        "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+    );
+    assert!(
+        portable_mcp["mcpServers"]["devmap"]["command"].is_string(),
+        "root mcp.json must expose devmap server: {portable_mcp}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

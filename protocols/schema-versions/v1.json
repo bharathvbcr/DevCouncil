@@ -1,8 +1,14 @@
 {
-  "description": "Schema numbers owned by DevCouncil. Each is pinned to the crate constant by an integration test (dc-store and devmap-store tests/schema_versions_manifest.rs); change the code and this file together. No consumer reads this file yet; GitPulse check:schema-parity is the intended first reader.",
+  "description": "Schema numbers owned by DevCouncil. Each is pinned to the crate constant by integration tests (dc-store, devmap-store, and devmap-cli tests/schema_versions_manifest.rs); change the code and this file together. Consumed by cross-repo parity checks (e.g. Waylode scripts/check-schema-parity.mjs).",
   "devmap_store": {
     "current_schema_version": 29,
     "min_reader_schema_version": 29
+  },
+  "devmap_formats": {
+    "extraction_schema_version": "102",
+    "code_graph_schema_version": 2,
+    "resolution_reuse_epoch": "5",
+    "stack_lease_format": 2
   },
   "dc_store": {
     "schema_version": 11,

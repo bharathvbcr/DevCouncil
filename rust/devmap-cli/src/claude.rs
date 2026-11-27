@@ -1872,13 +1872,17 @@ pub fn codex_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
         manifest.insert("version".into(), json!(version));
     }
     manifest.insert("hooks".into(), json!("./hooks/hooks.json"));
-    Ok(Value::Object(manifest))
+    manifest.insert("mcpServers".into(), json!("./.mcp.json"));
+    manifest.insert("skills".into(), json!("./skills"));
+    let value = Value::Object(manifest);
+    Report::new(validate_plugin_manifest(&value), true).into_result()?;
+    Ok(value)
 }
 
 /// Cursor plugin manifest, written beside the Claude bundle under
 /// `.cursor-plugin/`.
 ///
-/// Cursor is the only one of the three hosts that renders a plugin logo.
+/// Cursor is the only one of the hosts that renders a plugin logo.
 /// Claude Code documents no field for one — not in `plugin.json`, not in
 /// `hooks.json`, not in `.mcp.json` — and the Agent Plugins 1.0.0 schema sets
 /// `additionalProperties: false`, so the same key in the portable manifest
@@ -1905,8 +1909,72 @@ pub fn cursor_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     manifest.insert("homepage".into(), json!(PLUGIN_HOMEPAGE));
     manifest.insert("repository".into(), json!(PLUGIN_REPOSITORY));
     manifest.insert("license".into(), json!(PLUGIN_LICENSE));
+    manifest.insert(
+        "keywords".into(),
+        json!([
+            "code-intelligence",
+            "code-graph",
+            "mcp",
+            "devmap",
+            "navigation"
+        ]),
+    );
     manifest.insert("logo".into(), json!(PLUGIN_LOGO_PATH));
-    Ok(Value::Object(manifest))
+    manifest.insert("skills".into(), json!("./skills"));
+    manifest.insert("hooks".into(), json!("./hooks/hooks.json"));
+    manifest.insert("mcpServers".into(), json!("./.mcp.json"));
+    let value = Value::Object(manifest);
+    Report::new(
+        validate_plugin_manifest_in(&value, ManifestDialect::Cursor),
+        true,
+    )
+    .into_result()?;
+    Ok(value)
+}
+
+/// Portable Agent Plugins 1.0.0 root `plugin.json` (used by Antigravity and
+/// other spec-conformant clients).
+///
+/// Agent Plugins 1.0.0 sets `additionalProperties: false`, so host-specific
+/// extensions (`displayName`, `logo`, path-override keys) stay in the host
+/// manifests while `skills/` and `mcp.json` are discovered by convention.
+pub fn agent_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
+    let mut manifest = Map::new();
+    manifest.insert(
+        "$schema".into(),
+        json!("https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"),
+    );
+    manifest.insert("name".into(), json!(PLUGIN_NAME));
+    if let Some(version) = version {
+        manifest.insert("version".into(), json!(version));
+    }
+    manifest.insert(
+        "description".into(),
+        json!(
+            "Dev Map: symbol-level code intelligence — search, callers, blast radius, \
+               dead code — over a local index."
+        ),
+    );
+    manifest.insert(
+        "author".into(),
+        json!({"name": "DevCouncil", "url": PLUGIN_HOMEPAGE}),
+    );
+    manifest.insert("homepage".into(), json!(PLUGIN_HOMEPAGE));
+    manifest.insert("repository".into(), json!(PLUGIN_REPOSITORY));
+    manifest.insert("license".into(), json!(PLUGIN_LICENSE));
+    manifest.insert(
+        "keywords".into(),
+        json!([
+            "code-intelligence",
+            "code-graph",
+            "mcp",
+            "devmap",
+            "navigation"
+        ]),
+    );
+    let value = Value::Object(manifest);
+    Report::new(validate_plugin_manifest(&value), true).into_result()?;
+    Ok(value)
 }
 
 /// Bundle files that are bytes rather than text.
@@ -2240,6 +2308,16 @@ pub fn plugin_mcp_config(executable: &Path, _db: &Path) -> anyhow::Result<Value>
     Ok(json!({"mcpServers": {MCP_SERVER_NAME: mcp_entry(executable, None, None)?}}))
 }
 
+/// Agent Plugins 1.0.0 root `mcp.json` (used by Antigravity and other
+/// spec-conformant clients). Carries the same global `devmap` server entry as
+/// `.mcp.json` plus the spec `$schema`.
+pub fn agent_plugin_mcp_config(executable: &Path, _db: &Path) -> anyhow::Result<Value> {
+    Ok(json!({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+        "mcpServers": {MCP_SERVER_NAME: mcp_entry(executable, None, None)?},
+    }))
+}
+
 /// One file the bundle writes.
 pub struct EmittedFile {
     pub path: PathBuf,
@@ -2274,12 +2352,20 @@ pub fn render_plugin_bundle(
             pretty(&plugin_manifest(version)?),
         ),
         (
+            plugin.join("plugin.json"),
+            pretty(&agent_plugin_manifest(version)?),
+        ),
+        (
             plugin.join("hooks").join("hooks.json"),
             pretty(&hooks_block(executable, subcommands)?),
         ),
         (
             plugin.join(".mcp.json"),
             pretty(&plugin_mcp_config(executable, db)?),
+        ),
+        (
+            plugin.join("mcp.json"),
+            pretty(&agent_plugin_mcp_config(executable, db)?),
         ),
         (
             plugin.join(".codex-plugin").join("plugin.json"),
@@ -2468,6 +2554,85 @@ pub struct ClaudePluginInstall {
     pub leftovers: Vec<PathBuf>,
 }
 
+/// One Claude Code profile directory and its paired global config document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeProfile {
+    /// Host bucket reported by `devmap doctor`: `"claude-code"` for the active
+    /// profile (`CLAUDE_CONFIG_DIR` or `~/.claude`), and
+    /// `"claude-code (<dir>)"` for sibling profiles such as `~/.claude-chandra`.
+    pub host_label: String,
+    pub config_dir: PathBuf,
+    pub global_config: PathBuf,
+    pub is_active: bool,
+}
+
+/// Enumerate every Claude Code profile under `home`, starting with the active
+/// profile (`CLAUDE_CONFIG_DIR` or `~/.claude`), followed by `~/.claude` (when
+/// `CLAUDE_CONFIG_DIR` points elsewhere and default state exists) and every
+/// sibling `~/.claude-*` directory holding `.claude.json`, `settings.json`, or
+/// `plugins/`.
+pub fn claude_profiles(home: &Path) -> Vec<ClaudeProfile> {
+    let canonical_key = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let active_dir = claude_config_dir(home);
+    let active_global = claude_global_config(home);
+    let mut seen = vec![canonical_key(&active_dir)];
+    let mut profiles = vec![ClaudeProfile {
+        host_label: "claude-code".to_string(),
+        config_dir: active_dir,
+        global_config: active_global,
+        is_active: true,
+    }];
+
+    let default_dir = home.join(".claude");
+    let default_global = home.join(".claude.json");
+    let default_key = canonical_key(&default_dir);
+    if !seen.contains(&default_key) && (default_dir.is_dir() || default_global.is_file()) {
+        seen.push(default_key);
+        profiles.push(ClaudeProfile {
+            host_label: "claude-code (~/.claude)".to_string(),
+            config_dir: default_dir,
+            global_config: default_global,
+            is_active: false,
+        });
+    }
+
+    let mut siblings: Vec<(String, PathBuf)> = std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            if !name.starts_with(".claude-") {
+                return None;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let has_state = path.join(".claude.json").is_file()
+                || path.join("settings.json").is_file()
+                || path.join("plugins").is_dir();
+            has_state.then_some((name, path))
+        })
+        .collect();
+    siblings.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, dir) in siblings {
+        let key = canonical_key(&dir);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let global_config = dir.join(".claude.json");
+        profiles.push(ClaudeProfile {
+            host_label: format!("claude-code ({name})"),
+            config_dir: dir,
+            global_config,
+            is_active: false,
+        });
+    }
+    profiles
+}
+
 /// Whether a settings file Claude Code reads names the project `.mcp.json`
 /// server `name` in `disabledMcpjsonServers`.
 ///
@@ -2478,8 +2643,19 @@ pub struct ClaudePluginInstall {
 /// read, so a server rejected only there is still counted — an over-report,
 /// never a missed duplicate. An unreadable file rejects nothing.
 pub fn claude_project_server_rejected(home: Option<&Path>, project: &Path, name: &str) -> bool {
+    let config_dir = home.map(claude_config_dir);
+    claude_project_server_rejected_in(config_dir.as_deref(), project, name)
+}
+
+/// [`claude_project_server_rejected`] scoped to an explicit Claude profile dir.
+pub fn claude_project_server_rejected_in(
+    config_dir: Option<&Path>,
+    project: &Path,
+    name: &str,
+) -> bool {
     let project_settings = project.join(".claude");
-    home.map(|home| claude_config_dir(home).join("settings.json"))
+    config_dir
+        .map(|dir| dir.join("settings.json"))
         .into_iter()
         .chain([
             project_settings.join("settings.json"),
@@ -2512,7 +2688,12 @@ pub fn claude_project_server_rejected(home: Option<&Path>, project: &Path, name:
 /// copies the plugin into the cache and loads that copy, so for those the
 /// install record is the answer.
 pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
-    let plugins = claude_config_dir(home).join("plugins");
+    claude_plugin_install_in(&claude_config_dir(home))
+}
+
+/// [`claude_plugin_install`] for one explicit Claude Code profile directory.
+pub fn claude_plugin_install_in(config_dir: &Path) -> ClaudePluginInstall {
+    let plugins = config_dir.join("plugins");
     let cache = plugins
         .join("cache")
         .join(MARKETPLACE_NAME)
@@ -2581,7 +2762,7 @@ pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
             })
             .collect(),
     };
-    let enabled = std::fs::read_to_string(claude_config_dir(home).join("settings.json"))
+    let enabled = std::fs::read_to_string(config_dir.join("settings.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|settings| {
@@ -2613,6 +2794,74 @@ pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
     }
 }
 
+/// Enabled non-`devmap` plugins in `config_dir` that ship a `.mcp.json` or
+/// `mcp.json`, returned as `(plugin_key, mcp_config_path)`.
+///
+/// Used by `devmap doctor` to detect embedded `devmap_*` providers shipped
+/// inside plugins such as `waylode@*` or `gitpulse@*`.
+pub fn claude_enabled_other_plugin_mcps_in(config_dir: &Path) -> Vec<(String, PathBuf)> {
+    let settings_text = match std::fs::read_to_string(config_dir.join("settings.json")) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(settings) = serde_json::from_str::<Value>(&settings_text) else {
+        return Vec::new();
+    };
+    let Some(enabled_map) = settings.get("enabledPlugins").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let plugins = config_dir.join("plugins");
+    let installed_map: Option<Map<String, Value>> =
+        std::fs::read_to_string(plugins.join("installed_plugins.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| v.get("plugins")?.as_object().cloned());
+
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut keys: Vec<(&String, bool)> = enabled_map
+        .iter()
+        .filter_map(|(k, v)| Some((k, v.as_bool()?)))
+        .filter(|(_, on)| *on)
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (key, _) in keys {
+        let Some((plugin_name, marketplace)) = key.split_once('@') else {
+            continue;
+        };
+        if plugin_name == PLUGIN_NAME {
+            continue;
+        }
+        let mut dirs = Vec::new();
+        if let Ok(Some(dir)) = in_place_named_plugin_dir(&plugins, marketplace, plugin_name) {
+            dirs.push(dir);
+        } else if let Some(map) = &installed_map {
+            if let Some(installs) = map.get(key).and_then(Value::as_array) {
+                for install in installs {
+                    if let Some(path) = install.get("installPath").and_then(Value::as_str) {
+                        dirs.push(PathBuf::from(path));
+                    }
+                }
+            }
+        }
+        for dir in dirs {
+            let mcp = [".mcp.json", "mcp.json"]
+                .into_iter()
+                .map(|name| dir.join(name))
+                .find(|p| p.is_file());
+            if let Some(mcp) = mcp {
+                let canon = mcp.canonicalize().unwrap_or_else(|_| mcp.clone());
+                if !seen.contains(&canon) {
+                    seen.push(canon);
+                    out.push((key.clone(), mcp));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The in-place plugin directory, when the Dev Map marketplace is a local
 /// directory whose entry for the plugin is a relative path.
 ///
@@ -2620,6 +2869,14 @@ pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
 /// remote source whose plugins are copied into the cache, or its entry is not
 /// a relative path. `Err` means the question could not be answered.
 fn in_place_plugin_dir(plugins: &Path) -> Result<Option<PathBuf>, String> {
+    in_place_named_plugin_dir(plugins, MARKETPLACE_NAME, PLUGIN_NAME)
+}
+
+fn in_place_named_plugin_dir(
+    plugins: &Path,
+    marketplace_name: &str,
+    plugin_name: &str,
+) -> Result<Option<PathBuf>, String> {
     let known = plugins.join("known_marketplaces.json");
     let text = match std::fs::read_to_string(&known) {
         Ok(text) => text,
@@ -2628,7 +2885,7 @@ fn in_place_plugin_dir(plugins: &Path) -> Result<Option<PathBuf>, String> {
     };
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| format!("{} is not JSON: {error}", known.display()))?;
-    let Some(entry) = value.get(MARKETPLACE_NAME) else {
+    let Some(entry) = value.get(marketplace_name) else {
         return Ok(None);
     };
     let root = match entry.pointer("/source/source").and_then(Value::as_str) {
@@ -2641,7 +2898,7 @@ fn in_place_plugin_dir(plugins: &Path) -> Result<Option<PathBuf>, String> {
             .map(PathBuf::from)
             .ok_or_else(|| {
                 format!(
-                    "{}: the `{MARKETPLACE_NAME}` directory marketplace names no path",
+                    "{}: the `{marketplace_name}` directory marketplace names no path",
                     known.display()
                 )
             })?,
@@ -2650,7 +2907,7 @@ fn in_place_plugin_dir(plugins: &Path) -> Result<Option<PathBuf>, String> {
         // a guess, and a guess here decides which copy every check reads.
         Some("file") => {
             return Err(format!(
-                "{}: the `{MARKETPLACE_NAME}` marketplace is a `file` source, whose plugin \
+                "{}: the `{marketplace_name}` marketplace is a `file` source, whose plugin \
                  location is not resolved here",
                 known.display()
             ))
@@ -2667,7 +2924,7 @@ fn in_place_plugin_dir(plugins: &Path) -> Result<Option<PathBuf>, String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find(|plugin| plugin.get("name").and_then(Value::as_str) == Some(PLUGIN_NAME))
+        .find(|plugin| plugin.get("name").and_then(Value::as_str) == Some(plugin_name))
         .and_then(|plugin| plugin.get("source")?.as_str());
     let Some(source) = source.filter(|s| s.starts_with("./") || s.starts_with("../")) else {
         return Ok(None);

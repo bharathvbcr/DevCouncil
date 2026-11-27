@@ -111,6 +111,7 @@ mod relative_db_anchor;
 mod relative_root_attack;
 mod repo_scope_hardening;
 mod resolution_rate_attack;
+mod schema_versions_manifest;
 mod secret_paths_stay_out_of_answers_and_artifacts;
 mod shipped_skills_name_only_real_devmap_surface;
 mod small_native_stack;

@@ -1084,3 +1084,210 @@ fn integrate_warp_notes_a_lane_binary_in_a_rootless_document() {
     let report = one_json(&out, "integrate warp");
     assert!(has_lane_note(&report), "{report}");
 }
+
+/// A sibling Claude profile (`~/.claude-chandra`) holding both its own
+/// `.claude.json` and an enabled `devmap` plugin must be caught even when
+/// `CLAUDE_CONFIG_DIR` is unset and the default `~/.claude` profile is clean.
+#[test]
+fn sibling_claude_profile_duplicate_is_detected() {
+    let home = scratch("sibling-claude-home");
+    let cwd = scratch("sibling-claude-cwd");
+    let profile = home.join(".claude-chandra");
+    write_mcp(&profile.join(".claude.json"), "/abs/devmap");
+    let plugin_dir = profile.join("plugins/cache/devmap-local/devmap/0.2.5");
+    write_mcp(&plugin_dir.join(".mcp.json"), "/abs/devmap");
+    std::fs::write(
+        profile.join("plugins/installed_plugins.json"),
+        serde_json::json!({"version": 2, "plugins": {"devmap@devmap-local": [
+            {"scope": "user", "installPath": plugin_dir, "version": "0.2.5"}
+        ]}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        profile.join("settings.json"),
+        serde_json::json!({"enabledPlugins": {"devmap@devmap-local": true}}).to_string(),
+    )
+    .unwrap();
+
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains("claude-code (.claude-chandra)")
+            && names(warning, &profile.join(".claude.json"))
+            && names(warning, &plugin_dir.join(".mcp.json")),
+        "sibling profile duplicate must be reported: {payload}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// Antigravity global `~/.gemini/config/mcp_config.json` beside an installed
+/// plugin under `~/.gemini/config/plugins/` that also spawns `gitpulse-mcp` /
+/// `waylode-mcp` (without `WAYLODE_MCP_NO_DEVMAP=1`) is detected as a duplicate.
+#[test]
+fn antigravity_global_and_plugin_embedded_duplicate_is_detected() {
+    let home = scratch("agy-dup-home");
+    let cwd = scratch("agy-dup-cwd");
+    let global = home.join(".gemini/config/mcp_config.json");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    std::fs::write(
+        &global,
+        serde_json::json!({"mcpServers": {
+            "gitpulse": {"command": "/Users/example/.cargo/bin/gitpulse-mcp"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let plugin_mcp = home.join(".gemini/config/plugins/gitpulse/mcp.json");
+    std::fs::create_dir_all(plugin_mcp.parent().unwrap()).unwrap();
+    std::fs::write(
+        &plugin_mcp,
+        serde_json::json!({"mcpServers": {
+            "gitpulse": {"type": "stdio", "command": "./bin/gitpulse-mcp"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains("antigravity")
+            && warning.contains("WAYLODE_MCP_NO_DEVMAP=1")
+            && names(warning, &global)
+            && names(warning, &plugin_mcp),
+        "antigravity global + plugin embedded duplicate must be caught: {payload}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// Standalone `devmap` beside embedded `waylode-mcp` (without
+/// `WAYLODE_MCP_NO_DEVMAP=1`) is detected across Codex TOML, OpenCode JSON,
+/// and Claude Code; setting `WAYLODE_MCP_NO_DEVMAP=1` suppresses the duplicate.
+#[test]
+fn embedded_waylode_beside_standalone_devmap_is_detected_and_no_devmap_env_clears_it() {
+    // Codex TOML
+    let home = scratch("codex-embed-home");
+    let cwd = scratch("codex-embed-cwd");
+    let codex = home.join(".codex/config.toml");
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::fs::write(
+        &codex,
+        "[mcp_servers.devmap]\ncommand = \"/abs/devmap\"\nargs = [\"mcp\"]\n\n\
+         [mcp_servers.waylode]\ncommand = \"/abs/waylode-mcp\"\nargs = []\n",
+    )
+    .unwrap();
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains("codex") && warning.contains("WAYLODE_MCP_NO_DEVMAP=1"),
+        "codex standalone + embedded waylode-mcp must warn: {payload}"
+    );
+    std::fs::write(
+        &codex,
+        "[mcp_servers.devmap]\ncommand = \"/abs/devmap\"\nargs = [\"mcp\"]\n\n\
+         [mcp_servers.waylode]\ncommand = \"/abs/waylode-mcp\"\nargs = []\n\
+         [mcp_servers.waylode.env]\nWAYLODE_MCP_NO_DEVMAP = \"1\"\n",
+    )
+    .unwrap();
+    let clean = doctor_payload(&home, &cwd);
+    assert!(
+        clean["duplicate_mcp_registration_warning"].is_null(),
+        "WAYLODE_MCP_NO_DEVMAP=1 must clear the codex duplicate warning: {clean}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&cwd);
+
+    // OpenCode JSON
+    let home = scratch("opencode-embed-home");
+    let cwd = scratch("opencode-embed-cwd");
+    let oc = home.join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(oc.parent().unwrap()).unwrap();
+    std::fs::write(
+        &oc,
+        serde_json::json!({
+            "mcp": {
+                "devmap": {"type": "local", "command": ["/abs/devmap", "mcp"], "enabled": true},
+                "waylode": {"type": "local", "command": ["/abs/waylode-mcp"], "enabled": true}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains("opencode") && warning.contains("WAYLODE_MCP_NO_DEVMAP=1"),
+        "opencode standalone + embedded waylode-mcp must warn: {payload}"
+    );
+    std::fs::write(
+        &oc,
+        serde_json::json!({
+            "mcp": {
+                "devmap": {"type": "local", "command": ["/abs/devmap", "mcp"], "enabled": true},
+                "waylode": {
+                    "type": "local",
+                    "command": ["/abs/waylode-mcp"],
+                    "enabled": true,
+                    "environment": {"WAYLODE_MCP_NO_DEVMAP": "1"}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let clean = doctor_payload(&home, &cwd);
+    assert!(
+        clean["duplicate_mcp_registration_warning"].is_null(),
+        "WAYLODE_MCP_NO_DEVMAP=1 must clear the opencode duplicate warning: {clean}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&cwd);
+
+    // Claude Code: enabled waylode plugin beside standalone devmap in ~/.claude.json
+    let home = scratch("claude-waylode-plugin-home");
+    let cwd = scratch("claude-waylode-plugin-cwd");
+    write_mcp(&home.join(".claude.json"), "/abs/devmap");
+    let waylode_plugin = home.join(".claude/plugins/cache/waylode-local/waylode/0.2.0");
+    std::fs::create_dir_all(&waylode_plugin).unwrap();
+    std::fs::write(
+        waylode_plugin.join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"waylode": {"command": "/abs/waylode-mcp"}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude/plugins/installed_plugins.json"),
+        serde_json::json!({"version": 2, "plugins": {"waylode@waylode-local": [
+            {"scope": "user", "installPath": waylode_plugin, "version": "0.2.0"}
+        ]}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        serde_json::json!({"enabledPlugins": {"waylode@waylode-local": true}}).to_string(),
+    )
+    .unwrap();
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains("claude-code")
+            && warning.contains("waylode@waylode-local")
+            && warning.contains("WAYLODE_MCP_NO_DEVMAP=1"),
+        "enabled waylode plugin beside standalone devmap must warn: {payload}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&cwd);
+}

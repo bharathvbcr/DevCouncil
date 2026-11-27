@@ -136,15 +136,11 @@ pub(crate) fn inventory_devmap_binaries(
             }
         }
     }
-    for McpConfigSite {
-        label,
-        path: config_path,
-        ..
-    } in host_mcp_config_paths()
-    {
-        if let Some(command) = read_devmap_command_from_mcp_config(&config_path) {
+    for site in host_mcp_config_paths() {
+        if let Some(command) = read_devmap_command_from_site(&site) {
             let resolved = resolve_devmap_command(&command);
             let key = resolved.display().to_string();
+            let label = site.label;
             if seen.insert(key.clone()) {
                 let probe = inspect_devmap_identity(&resolved);
                 let exists = resolved.is_file();
@@ -174,42 +170,80 @@ pub(crate) fn inventory_devmap_binaries(
     Ok(rows)
 }
 
-/// The host that loads an MCP config document.
+/// The host (or Claude Code profile) that loads an MCP config document.
 ///
-/// Two registrations are duplicates only when one host loads both. Cursor and
-/// Claude Code never share a process, so an entry in each is two hosts served
-/// once apiece — counting them together reported a duplicate on every machine
-/// that had integrated both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Two registrations are duplicates only when one host/profile loads both.
+/// Cursor, Antigravity, Codex, OpenCode, and distinct Claude Code profiles
+/// never share a process, so an entry in each is separate hosts served once
+/// apiece.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum McpHost {
     Cursor,
-    ClaudeCode,
+    /// `"claude-code"` for the active profile (`CLAUDE_CONFIG_DIR` or
+    /// `~/.claude`), and `"claude-code (<name>)"` for sibling profiles such as
+    /// `~/.claude-chandra`.
+    ClaudeCode(String),
+    Antigravity,
+    Codex,
+    OpenCode,
 }
 
 impl McpHost {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &str {
         match self {
             Self::Cursor => "cursor",
-            Self::ClaudeCode => "claude-code",
+            Self::ClaudeCode(label) => label.as_str(),
+            Self::Antigravity => "antigravity",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
         }
     }
+
+    fn rewrite_host(&self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::ClaudeCode(_) => "claude",
+            Self::Antigravity => "antigravity",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+/// How an MCP config document encodes its server map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpConfigFormat {
+    /// JSON `{"mcpServers": { "<name>": { "command": "...", "args": [...] } }}`.
+    JsonMcpServers,
+    /// TOML `[mcp_servers.<name>]`.
+    TomlMcpServers,
+    /// OpenCode JSON `{"mcp": { "<name>": { "command": ["...", ...] } }}`.
+    JsonOpenCodeMcp,
 }
 
 /// One MCP config document a diagnostic inspects.
 struct McpConfigSite {
     label: String,
     path: PathBuf,
+    format: McpConfigFormat,
     /// `None` for a document no host loads as it stands: the plugin bundle a
     /// marketplace installs *from*, a plugin Claude Code has disabled, or a
     /// project server rejected by `disabledMcpjsonServers`. Still inventoried —
     /// it names a binary — but never counted as a registration.
     host: Option<McpHost>,
-    /// The enabled Claude Code plugin's own registration. Claude Code drops a
-    /// plugin server only when another server has the same command, and the
-    /// entries `devmap integrate` writes carry an absolute path that never
-    /// matches the plugin's, so beside it even a pinned entry is a second
-    /// server for that host.
+    /// True for a plugin-provided registration (Claude Code plugin `.mcp.json`
+    /// or Antigravity plugin `mcp.json`). Plugin servers do not collapse with
+    /// user/project scopes, so even a pinned entry beside one is a second server.
     plugin: bool,
+    /// True when this site is Claude Code's project `<cwd>/.mcp.json`, so
+    /// per-server `disabledMcpjsonServers` checks apply.
+    claude_project_mcp: bool,
+    /// True when the host profile's own settings (e.g. Claude Code
+    /// `<profile>/settings.json`'s `env`) set `WAYLODE_MCP_NO_DEVMAP=1` (or
+    /// legacy `GITPULSE_MCP_NO_DEVMAP=1`), suppressing embedded `devmap_*`
+    /// tools for plugins loaded by that profile even when the upstream plugin
+    /// `.mcp.json` does not set `env`.
+    profile_disables_embedded_devmap: bool,
 }
 
 /// Marketplace-root `.mcp.json` files from the bundle layout before the plugin
@@ -236,70 +270,207 @@ fn display_under_home(path: &Path, home: &Path) -> String {
 }
 
 fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> {
-    let site = |label: String, path: PathBuf, host: Option<McpHost>| McpConfigSite {
-        label,
-        path,
-        host,
-        plugin: false,
+    let site = |label: String, path: PathBuf, format: McpConfigFormat, host: Option<McpHost>| {
+        McpConfigSite {
+            label,
+            path,
+            format,
+            host,
+            plugin: false,
+            claude_project_mcp: false,
+            profile_disables_embedded_devmap: false,
+        }
     };
     let mut out = Vec::new();
     if let Some(home) = home {
+        // Cursor global
         out.push(site(
             "~/.cursor/mcp.json".to_string(),
             home.join(".cursor/mcp.json"),
+            McpConfigFormat::JsonMcpServers,
             Some(McpHost::Cursor),
         ));
-        let global = claude::claude_global_config(home);
-        out.push(site(
-            display_under_home(&global, home),
-            global,
-            Some(McpHost::ClaudeCode),
-        ));
-        // Only the copy Claude Code loads: in place for a local-directory
-        // marketplace, else the version its install record names. Every other
-        // directory under the cache is a leftover from an earlier install that
-        // nothing loads; `plugin_cleanup_note` reports those.
-        let install = claude::claude_plugin_install(home);
-        let host = (install.enabled == Some(true)).then_some(McpHost::ClaudeCode);
-        for plugin in &install.loaded {
-            let mcp = plugin.dir.join(".mcp.json");
-            if mcp.is_file() {
+
+        // Claude Code: scan EVERY profile (`~/.claude`, `CLAUDE_CONFIG_DIR`,
+        // and sibling `~/.claude-*` profiles such as `~/.claude-chandra`).
+        for profile in claude::claude_profiles(home) {
+            let claude_host = McpHost::ClaudeCode(profile.host_label.clone());
+            let profile_no_devmap = claude_settings_disables_embedded_devmap(&profile.config_dir);
+            out.push(McpConfigSite {
+                profile_disables_embedded_devmap: profile_no_devmap,
+                ..site(
+                    display_under_home(&profile.global_config, home),
+                    profile.global_config.clone(),
+                    McpConfigFormat::JsonMcpServers,
+                    Some(claude_host.clone()),
+                )
+            });
+            // Only the copy Claude Code loads: in place for a local-directory
+            // marketplace, else the version its install record names.
+            let install = claude::claude_plugin_install_in(&profile.config_dir);
+            let plugin_host = (install.enabled == Some(true)).then(|| claude_host.clone());
+            for plugin in &install.loaded {
+                let mcp = plugin.dir.join(".mcp.json");
+                if mcp.is_file() {
+                    out.push(McpConfigSite {
+                        plugin: plugin_host.is_some(),
+                        ..site(
+                            mcp.display().to_string(),
+                            mcp,
+                            McpConfigFormat::JsonMcpServers,
+                            plugin_host.clone(),
+                        )
+                    });
+                }
+            }
+            // Enabled non-devmap plugins in this profile (e.g. waylode@* or
+            // gitpulse@*) that may serve embedded `devmap_*` tools.
+            for (plugin_key, mcp) in
+                claude::claude_enabled_other_plugin_mcps_in(&profile.config_dir)
+            {
                 out.push(McpConfigSite {
-                    plugin: host.is_some(),
-                    ..site(mcp.display().to_string(), mcp, host)
+                    plugin: true,
+                    profile_disables_embedded_devmap: profile_no_devmap,
+                    ..site(
+                        format!("{plugin_key} ({})", display_under_home(&mcp, home)),
+                        mcp,
+                        McpConfigFormat::JsonMcpServers,
+                        Some(claude_host.clone()),
+                    )
                 });
             }
         }
+
+        // Antigravity global config and installed plugins under
+        // `~/.gemini/config/plugins/<plugin>/`.
+        out.push(site(
+            "~/.gemini/config/mcp_config.json".to_string(),
+            home.join(".gemini/config/mcp_config.json"),
+            McpConfigFormat::JsonMcpServers,
+            Some(McpHost::Antigravity),
+        ));
+        let agy_plugins = home.join(".gemini/config/plugins");
+        if let Ok(entries) = std::fs::read_dir(&agy_plugins) {
+            let mut plugin_dirs: Vec<(String, PathBuf)> = entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        return None;
+                    }
+                    let name = entry.file_name().to_str()?.to_string();
+                    Some((name, path))
+                })
+                .collect();
+            plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, dir) in plugin_dirs {
+                // Pick at most one MCP manifest per plugin directory so a
+                // plugin shipping both `mcp.json` and `mcp_config.json` for
+                // compatibility does not self-duplicate.
+                if let Some((file_name, mcp)) = ["mcp.json", ".mcp.json", "mcp_config.json"]
+                    .into_iter()
+                    .map(|f| (f, dir.join(f)))
+                    .find(|(_, p)| p.is_file())
+                {
+                    out.push(McpConfigSite {
+                        plugin: true,
+                        ..site(
+                            format!("~/.gemini/config/plugins/{name}/{file_name}"),
+                            mcp,
+                            McpConfigFormat::JsonMcpServers,
+                            Some(McpHost::Antigravity),
+                        )
+                    });
+                }
+            }
+        }
+
+        // Codex global
+        out.push(site(
+            "~/.codex/config.toml".to_string(),
+            home.join(".codex/config.toml"),
+            McpConfigFormat::TomlMcpServers,
+            Some(McpHost::Codex),
+        ));
+
+        // OpenCode global
+        let opencode_dir = home.join(".config/opencode");
+        out.push(site(
+            "~/.config/opencode/opencode.json".to_string(),
+            opencode_dir.join("opencode.json"),
+            McpConfigFormat::JsonOpenCodeMcp,
+            Some(McpHost::OpenCode),
+        ));
+        let opencode_jsonc = opencode_dir.join("opencode.jsonc");
+        if opencode_jsonc.is_file() {
+            out.push(site(
+                "~/.config/opencode/opencode.jsonc".to_string(),
+                opencode_jsonc,
+                McpConfigFormat::JsonOpenCodeMcp,
+                Some(McpHost::OpenCode),
+            ));
+        }
+
         for rel in PLUGIN_BUNDLE_SOURCES {
             let path = home.join(rel);
             if path.is_file() {
-                out.push(site(format!("~/{rel}"), path, None));
+                out.push(site(
+                    format!("~/{rel}"),
+                    path,
+                    McpConfigFormat::JsonMcpServers,
+                    None,
+                ));
             }
         }
     }
+
+    // Project-scoped configs
     out.push(site(
         ".cursor/mcp.json".to_string(),
         cwd.join(".cursor").join("mcp.json"),
+        McpConfigFormat::JsonMcpServers,
         Some(McpHost::Cursor),
     ));
     // Claude Code's project scope. A server there connects only once approved
     // in an interactive session, but `claude -p`, Agent SDK and cloud sessions
     // load it without asking, so an unapproved one still counts. A rejection
     // in `disabledMcpjsonServers` blocks it in every mode.
-    let rejected = claude::claude_project_server_rejected(home, cwd, claude::MCP_SERVER_NAME);
+    out.push(McpConfigSite {
+        claude_project_mcp: true,
+        ..site(
+            ".mcp.json".to_string(),
+            cwd.join(".mcp.json"),
+            McpConfigFormat::JsonMcpServers,
+            Some(McpHost::ClaudeCode("claude-code".to_string())),
+        )
+    });
     out.push(site(
-        if rejected {
-            ".mcp.json (rejected by disabledMcpjsonServers)".to_string()
-        } else {
-            ".mcp.json".to_string()
-        },
-        cwd.join(".mcp.json"),
-        (!rejected).then_some(McpHost::ClaudeCode),
+        ".agents/mcp_config.json".to_string(),
+        cwd.join(".agents").join("mcp_config.json"),
+        McpConfigFormat::JsonMcpServers,
+        Some(McpHost::Antigravity),
+    ));
+    out.push(site(
+        ".codex/config.toml".to_string(),
+        cwd.join(".codex").join("config.toml"),
+        McpConfigFormat::TomlMcpServers,
+        Some(McpHost::Codex),
+    ));
+    out.push(site(
+        "opencode.json".to_string(),
+        cwd.join("opencode.json"),
+        McpConfigFormat::JsonOpenCodeMcp,
+        Some(McpHost::OpenCode),
     ));
     for rel in PLUGIN_BUNDLE_SOURCES {
         let path = cwd.join(rel);
         if path.is_file() {
-            out.push(site(rel.to_string(), path, None));
+            out.push(site(
+                rel.to_string(),
+                path,
+                McpConfigFormat::JsonMcpServers,
+                None,
+            ));
         }
     }
     out
@@ -362,74 +533,117 @@ fn host_devmap_entries(home: Option<&Path>, cwd: &Path) -> HostEntries {
     let mut found = HostEntries::default();
     for site in host_mcp_config_sites(home, cwd) {
         let Some(host) = site.host else { continue };
-        let Some(value) = found.read_json(&site.path) else {
-            continue;
-        };
-        let Some(entry) = value.pointer("/mcpServers/devmap") else {
-            continue;
-        };
-        let mut words: Vec<String> = entry
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .into_iter()
-            .collect();
-        words.extend(
-            entry
-                .get("args")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string),
-        );
-        let rewrite = match host {
-            McpHost::Cursor => "cursor",
-            McpHost::ClaudeCode => "claude",
-        };
-        found.entries.push(HostEntry {
-            at: site.path.display().to_string(),
-            rewrite,
-            hook: false,
-            words,
-        });
-    }
-    if let Some(home) = home {
-        let codex = home.join(".codex").join("config.toml");
-        if let Some(text) = found.read(&codex) {
-            match text.parse::<toml::Table>() {
-                Ok(table) => {
-                    if let Some(entry) = table
-                        .get("mcp_servers")
-                        .and_then(|servers| servers.get(claude::MCP_SERVER_NAME))
-                    {
-                        let mut words: Vec<String> = entry
-                            .get("command")
-                            .and_then(toml::Value::as_str)
-                            .map(str::to_string)
-                            .into_iter()
-                            .collect();
-                        words.extend(
+        let rewrite = host.rewrite_host();
+        match site.format {
+            McpConfigFormat::JsonMcpServers => {
+                let Some(value) = found.read_json(&site.path) else {
+                    continue;
+                };
+                if site.claude_project_mcp
+                    && claude::claude_project_server_rejected(home, cwd, claude::MCP_SERVER_NAME)
+                {
+                    continue;
+                }
+                let Some(entry) = value.pointer("/mcpServers/devmap") else {
+                    continue;
+                };
+                let mut words: Vec<String> = entry
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect();
+                words.extend(
+                    entry
+                        .get("args")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string),
+                );
+                found.entries.push(HostEntry {
+                    at: site.path.display().to_string(),
+                    rewrite,
+                    hook: false,
+                    words,
+                });
+            }
+            McpConfigFormat::TomlMcpServers => {
+                let Some(text) = found.read(&site.path) else {
+                    continue;
+                };
+                match text.parse::<toml::Table>() {
+                    Ok(table) => {
+                        if let Some(entry) = table
+                            .get("mcp_servers")
+                            .and_then(|servers| servers.get(claude::MCP_SERVER_NAME))
+                        {
+                            let mut words: Vec<String> = entry
+                                .get("command")
+                                .and_then(toml::Value::as_str)
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect();
+                            words.extend(
+                                entry
+                                    .get("args")
+                                    .and_then(toml::Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(toml::Value::as_str)
+                                    .map(str::to_string),
+                            );
+                            found.entries.push(HostEntry {
+                                at: site.path.display().to_string(),
+                                rewrite,
+                                hook: false,
+                                words,
+                            });
+                        }
+                    }
+                    Err(error) => found.unchecked.push(format!(
+                        "could not check {}: not valid TOML ({error})",
+                        site.path.display()
+                    )),
+                }
+            }
+            McpConfigFormat::JsonOpenCodeMcp => {
+                let Some(value) = found.read_json(&site.path) else {
+                    continue;
+                };
+                let Some(entry) = value.pointer("/mcp/devmap") else {
+                    continue;
+                };
+                let words: Vec<String> = match entry.get("command") {
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    Some(serde_json::Value::String(cmd)) => {
+                        let mut w = vec![cmd.clone()];
+                        w.extend(
                             entry
                                 .get("args")
-                                .and_then(toml::Value::as_array)
+                                .and_then(serde_json::Value::as_array)
                                 .into_iter()
                                 .flatten()
-                                .filter_map(toml::Value::as_str)
+                                .filter_map(serde_json::Value::as_str)
                                 .map(str::to_string),
                         );
-                        found.entries.push(HostEntry {
-                            at: codex.display().to_string(),
-                            rewrite: "codex",
-                            hook: false,
-                            words,
-                        });
+                        w
                     }
+                    _ => Vec::new(),
+                };
+                if !words.is_empty() {
+                    found.entries.push(HostEntry {
+                        at: site.path.display().to_string(),
+                        rewrite,
+                        hook: false,
+                        words,
+                    });
                 }
-                Err(error) => found.unchecked.push(format!(
-                    "could not check {}: not valid TOML ({error})",
-                    codex.display()
-                )),
             }
         }
     }
@@ -703,12 +917,34 @@ fn resolve_on_path(command: &str) -> Option<PathBuf> {
     None
 }
 
-fn read_devmap_command_from_mcp_config(path: &Path) -> Option<String> {
-    let text = integrate::read_host_config(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let servers = value.get("mcpServers")?.as_object()?;
-    let entry = servers.get("devmap")?;
-    entry.get("command")?.as_str().map(str::to_string)
+fn read_devmap_command_from_site(site: &McpConfigSite) -> Option<String> {
+    let text = integrate::read_host_config(&site.path).ok()?;
+    match site.format {
+        McpConfigFormat::JsonMcpServers => {
+            let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+            value
+                .pointer("/mcpServers/devmap/command")?
+                .as_str()
+                .map(str::to_string)
+        }
+        McpConfigFormat::TomlMcpServers => {
+            let table: toml::Table = text.parse().ok()?;
+            table
+                .get("mcp_servers")?
+                .get(claude::MCP_SERVER_NAME)?
+                .get("command")?
+                .as_str()
+                .map(str::to_string)
+        }
+        McpConfigFormat::JsonOpenCodeMcp => {
+            let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let command = value.pointer("/mcp/devmap/command")?;
+            command
+                .as_str()
+                .or_else(|| command.as_array()?.first()?.as_str())
+                .map(str::to_string)
+        }
+    }
 }
 
 struct BinaryIdentity {
@@ -846,73 +1082,286 @@ pub(crate) fn missing_binary_warning(binaries: &[serde_json::Value]) -> Option<S
     ))
 }
 
-fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
-    let Ok(text) = integrate::read_host_config(path) else {
+/// One `devmap_*` provider discovered in a host MCP config document.
+struct DetectedProvider {
+    server_name: String,
+    pinned: bool,
+    /// True when the entry launches `waylode-mcp` or `gitpulse-mcp` without
+    /// `WAYLODE_MCP_NO_DEVMAP=1` (or legacy `GITPULSE_MCP_NO_DEVMAP=1`), which
+    /// embeds the 11 `devmap_*` tools alongside Waylode's own tools.
+    embedded: bool,
+}
+
+fn is_truthy_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn claude_settings_disables_embedded_devmap(config_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(config_dir.join("settings.json")) else {
         return false;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    let Some(entry) = value.get("mcpServers").and_then(|s| s.get("devmap")) else {
-        return false;
-    };
-    let args = entry
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .map(|args| {
-            args.iter()
-                .filter_map(serde_json::Value::as_str)
-                .any(|a| a == "mcp")
-        })
-        .unwrap_or(false);
-    args || entry
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .is_some()
+    env_disables_embedded_devmap_json(&value)
 }
 
-fn mcp_entry_is_pinned(path: &Path) -> bool {
-    let Ok(text) = integrate::read_host_config(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    value
-        .pointer("/mcpServers/devmap")
-        .is_some_and(integrate::entry_is_pinned)
+fn env_disables_embedded_devmap_json(entry: &serde_json::Value) -> bool {
+    for container in ["env", "environment"] {
+        if let Some(map) = entry.get(container).and_then(serde_json::Value::as_object) {
+            for key in ["WAYLODE_MCP_NO_DEVMAP", "GITPULSE_MCP_NO_DEVMAP"] {
+                if map
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_truthy_env_flag)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
-/// Registrations of `devmap mcp` across the documents a diagnostic inspects.
+fn env_disables_embedded_devmap_toml(entry: &toml::Table) -> bool {
+    let Some(map) = entry.get("env").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    for key in ["WAYLODE_MCP_NO_DEVMAP", "GITPULSE_MCP_NO_DEVMAP"] {
+        if map
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .is_some_and(is_truthy_env_flag)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn word_is_embedded_devmap_host(word: &str) -> bool {
+    Path::new(word).file_name().is_some_and(|name| {
+        let lower = name.to_string_lossy().to_ascii_lowercase();
+        let stem = lower
+            .strip_suffix(".exe")
+            .or_else(|| lower.strip_suffix(".cmd"))
+            .or_else(|| lower.strip_suffix(".bat"))
+            .or_else(|| lower.strip_suffix(".ps1"))
+            .unwrap_or(&lower);
+        matches!(stem, "waylode-mcp" | "gitpulse-mcp")
+    })
+}
+
+fn command_is_embedded_devmap_host(command: &str, args: &[&str]) -> bool {
+    word_is_embedded_devmap_host(command)
+        || args.iter().any(|arg| word_is_embedded_devmap_host(arg))
+}
+
+fn entry_disabled_json(entry: &serde_json::Value, is_opencode: bool) -> bool {
+    entry.get("disabled").and_then(serde_json::Value::as_bool) == Some(true)
+        || (is_opencode && entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(false))
+}
+
+fn detect_devmap_providers(site: &McpConfigSite) -> Vec<DetectedProvider> {
+    let Ok(text) = integrate::read_host_config(&site.path) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    match site.format {
+        McpConfigFormat::JsonMcpServers => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return Vec::new();
+            };
+            let Some(servers) = value
+                .get("mcpServers")
+                .and_then(serde_json::Value::as_object)
+            else {
+                return Vec::new();
+            };
+            for (name, entry) in servers {
+                if entry_disabled_json(entry, false) {
+                    continue;
+                }
+                let command = entry.get("command").and_then(serde_json::Value::as_str);
+                let args: Vec<&str> = entry
+                    .get("args")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect();
+                if name == claude::MCP_SERVER_NAME && (args.contains(&"mcp") || command.is_some()) {
+                    found.push(DetectedProvider {
+                        server_name: name.clone(),
+                        pinned: integrate::entry_is_pinned(entry),
+                        embedded: false,
+                    });
+                } else if command.is_some_and(|cmd| command_is_embedded_devmap_host(cmd, &args))
+                    && !site.profile_disables_embedded_devmap
+                    && !env_disables_embedded_devmap_json(entry)
+                {
+                    found.push(DetectedProvider {
+                        server_name: name.clone(),
+                        pinned: false,
+                        embedded: true,
+                    });
+                }
+            }
+        }
+        McpConfigFormat::TomlMcpServers => {
+            let Ok(table) = text.parse::<toml::Table>() else {
+                return Vec::new();
+            };
+            let Some(servers) = table.get("mcp_servers").and_then(toml::Value::as_table) else {
+                return Vec::new();
+            };
+            for (name, entry) in servers {
+                let Some(entry_table) = entry.as_table() else {
+                    continue;
+                };
+                if entry_table.get("disabled").and_then(toml::Value::as_bool) == Some(true)
+                    || entry_table.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+                {
+                    continue;
+                }
+                let command = entry_table.get("command").and_then(toml::Value::as_str);
+                let args: Vec<&str> = entry_table
+                    .get("args")
+                    .and_then(toml::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(toml::Value::as_str)
+                    .collect();
+                if name == claude::MCP_SERVER_NAME && (args.contains(&"mcp") || command.is_some()) {
+                    let pinned = args.iter().any(|a| *a == "--root" || *a == "--db");
+                    found.push(DetectedProvider {
+                        server_name: name.clone(),
+                        pinned,
+                        embedded: false,
+                    });
+                } else if command.is_some_and(|cmd| command_is_embedded_devmap_host(cmd, &args))
+                    && !env_disables_embedded_devmap_toml(entry_table)
+                {
+                    found.push(DetectedProvider {
+                        server_name: name.clone(),
+                        pinned: false,
+                        embedded: true,
+                    });
+                }
+            }
+        }
+        McpConfigFormat::JsonOpenCodeMcp => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return Vec::new();
+            };
+            let Some(servers) = value.get("mcp").and_then(serde_json::Value::as_object) else {
+                return Vec::new();
+            };
+            for (name, entry) in servers {
+                if entry_disabled_json(entry, true) {
+                    continue;
+                }
+                let (command, args): (Option<&str>, Vec<&str>) = match entry.get("command") {
+                    Some(serde_json::Value::Array(items)) => {
+                        let strs: Vec<&str> =
+                            items.iter().filter_map(serde_json::Value::as_str).collect();
+                        (strs.first().copied(), strs.into_iter().skip(1).collect())
+                    }
+                    Some(serde_json::Value::String(cmd)) => (
+                        Some(cmd.as_str()),
+                        entry
+                            .get("args")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect(),
+                    ),
+                    _ => (None, Vec::new()),
+                };
+                if name == claude::MCP_SERVER_NAME && (args.contains(&"mcp") || command.is_some()) {
+                    let pinned = args.iter().any(|a| *a == "--root" || *a == "--db");
+                    found.push(DetectedProvider {
+                        server_name: name.clone(),
+                        pinned,
+                        embedded: false,
+                    });
+                } else if command.is_some_and(|cmd| command_is_embedded_devmap_host(cmd, &args))
+                    && !site.profile_disables_embedded_devmap
+                    && !env_disables_embedded_devmap_json(entry)
+                {
+                    found.push(DetectedProvider {
+                        server_name: name.clone(),
+                        pinned: false,
+                        embedded: true,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Registrations of `devmap mcp` (and embedded `devmap_*` providers inside
+/// `waylode-mcp`/`gitpulse-mcp`) across every inspected host and profile.
 ///
 /// `global` and `pinned` hold what a host loads, each row naming that host;
 /// `not_loaded` holds documents that name the server but that no host loads as
 /// they stand (a plugin bundle source, a disabled plugin, a project server
 /// rejected by `disabledMcpjsonServers`).
 pub(crate) fn mcp_registration_inventory() -> serde_json::Value {
-    mcp_registration_inventory_of(&host_mcp_config_paths())
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    mcp_registration_inventory_for(home.as_deref(), &cwd)
 }
 
-fn mcp_registration_inventory_of(sites: &[McpConfigSite]) -> serde_json::Value {
+fn mcp_registration_inventory_for(home: Option<&Path>, cwd: &Path) -> serde_json::Value {
+    let sites = host_mcp_config_sites(home, cwd);
+    mcp_registration_inventory_of(&sites, home, cwd)
+}
+
+fn mcp_registration_inventory_of(
+    sites: &[McpConfigSite],
+    home: Option<&Path>,
+    cwd: &Path,
+) -> serde_json::Value {
     let mut global = Vec::new();
     let mut pinned = Vec::new();
     let mut not_loaded = Vec::new();
     for site in sites {
-        if !site.path.is_file() || !mcp_entry_looks_like_devmap_mcp(&site.path) {
+        if !site.path.is_file() {
             continue;
         }
-        let row = serde_json::json!({
-            "label": site.label,
-            "path": site.path.display().to_string(),
-            "host": site.host.map(McpHost::as_str),
-            "plugin": site.plugin,
-        });
-        if site.host.is_none() {
-            not_loaded.push(row);
-        } else if mcp_entry_is_pinned(&site.path) {
-            pinned.push(row);
-        } else {
-            global.push(row);
+        for provider in detect_devmap_providers(site) {
+            let rejected = site.claude_project_mcp
+                && claude::claude_project_server_rejected(home, cwd, &provider.server_name);
+            let effective_host = if rejected { None } else { site.host.as_ref() };
+            let mut label = if rejected {
+                format!("{} (rejected by disabledMcpjsonServers)", site.label)
+            } else {
+                site.label.clone()
+            };
+            if provider.embedded {
+                label = format!("{label} [{} embeds devmap_*]", provider.server_name);
+            }
+            let row = serde_json::json!({
+                "label": label,
+                "path": site.path.display().to_string(),
+                "host": effective_host.map(McpHost::as_str),
+                "plugin": site.plugin,
+                "server": provider.server_name,
+                "embedded": provider.embedded,
+            });
+            if effective_host.is_none() {
+                not_loaded.push(row);
+            } else if provider.pinned {
+                pinned.push(row);
+            } else {
+                global.push(row);
+            }
         }
     }
     serde_json::json!({ "global": global, "pinned": pinned, "not_loaded": not_loaded })
@@ -922,15 +1371,15 @@ pub(crate) fn duplicate_mcp_registration_warning() -> Option<String> {
     duplicate_registration_message(&mcp_registration_inventory())
 }
 
-/// A duplicate is one host loading `devmap mcp` twice — a `~/.claude.json` or
-/// project `.mcp.json` entry beside an enabled plugin's `.mcp.json`, or
-/// `~/.cursor/mcp.json` beside a project `.cursor/mcp.json`. One registration
-/// per host, across several hosts, is the intended shape and says nothing.
+/// A duplicate is one host/profile loading `devmap_*` tools more than once — a
+/// `~/.claude.json` or project `.mcp.json` entry beside an enabled plugin's
+/// `.mcp.json`, two global/plugin entries in Antigravity/Cursor/Codex/OpenCode,
+/// or a standalone `devmap` beside an embedded `waylode-mcp`/`gitpulse-mcp`
+/// server without `WAYLODE_MCP_NO_DEVMAP=1`. One registration per host/profile
+/// across several hosts is the intended shape and says nothing.
 ///
-/// Pinned (`--root`/`--db`) entries count only beside an enabled plugin.
-/// Claude Code collapses same-named servers across its own scopes, but keeps a
-/// plugin server unless another has the same command, so a pinned entry there
-/// is a second server rather than a narrower view of the same one.
+/// Pinned (`--root`/`--db`) entries count beside an enabled plugin or embedded
+/// provider, because neither collapses with a standalone `devmap` entry.
 fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<String> {
     let rows = |key: &str| {
         inventory
@@ -945,19 +1394,24 @@ fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<Strin
             .map(str::to_string)
     };
     let global = rows("global");
-    let plugin_hosts: std::collections::BTreeSet<String> = global
+    let plugin_or_embedded_hosts: std::collections::BTreeSet<String> = global
         .iter()
-        .filter(|row| row.get("plugin").and_then(serde_json::Value::as_bool) == Some(true))
+        .filter(|row| {
+            row.get("plugin").and_then(serde_json::Value::as_bool) == Some(true)
+                || row.get("embedded").and_then(serde_json::Value::as_bool) == Some(true)
+        })
         .filter_map(host_of)
         .collect();
     let (counted_pinned, other_pinned): (Vec<_>, Vec<_>) = rows("pinned")
         .into_iter()
-        .partition(|row| host_of(row).is_some_and(|host| plugin_hosts.contains(&host)));
-    // Each entry is (server, shown). Claude Code "connects to it once, using
-    // the definition from the highest-precedence source" when its own scopes
-    // name the same server, so `~/.claude.json` and a project `.mcp.json` are
-    // one server between them; only the plugin stands apart.
-    let mut by_host: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+        .partition(|row| host_of(row).is_some_and(|host| plugin_or_embedded_hosts.contains(&host)));
+    // Each entry is (server_key, shown, embedded). Claude Code "connects to it
+    // once, using the definition from the highest-precedence source" when its
+    // own scopes name the same server, so `~/.claude.json` and a project
+    // `.mcp.json` naming `devmap` are one server between them; a plugin server
+    // or a differently-named embedded server stands apart.
+    let mut by_host: std::collections::BTreeMap<String, Vec<(String, String, bool)>> =
+        Default::default();
     for row in global.iter().chain(&counted_pinned) {
         let (Some(host), Some(label), Some(path)) = (
             host_of(row),
@@ -967,28 +1421,37 @@ fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<Strin
             continue;
         };
         let plugin = row.get("plugin").and_then(serde_json::Value::as_bool) == Some(true);
-        let server = if host == McpHost::ClaudeCode.as_str() && !plugin {
-            "claude-code scopes".to_string()
+        let embedded = row.get("embedded").and_then(serde_json::Value::as_bool) == Some(true);
+        let server_name = row
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(claude::MCP_SERVER_NAME);
+        let server = if host.starts_with("claude-code") && !plugin {
+            format!("claude-code scopes:{server_name}")
         } else {
-            path.to_string()
+            format!("{path}#{server_name}")
         };
         by_host
             .entry(host)
             .or_default()
-            .push((server, format!("{label} ({path})")));
+            .push((server, format!("{label} ({path})"), embedded));
     }
+    let mut any_embedded = false;
     let duplicated: Vec<String> = by_host
         .into_iter()
         .filter(|(_, entries)| {
             entries
                 .iter()
-                .map(|(server, _)| server)
+                .map(|(server, _, _)| server)
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
                 > 1
         })
         .map(|(host, entries)| {
-            let shown: Vec<String> = entries.into_iter().map(|(_, shown)| shown).collect();
+            if entries.iter().any(|(_, _, embedded)| *embedded) {
+                any_embedded = true;
+            }
+            let shown: Vec<String> = entries.into_iter().map(|(_, shown, _)| shown).collect();
             format!("{host} loads {}", shown.join("; "))
         })
         .collect();
@@ -1001,10 +1464,17 @@ fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<Strin
          duplicates, and neither replaces passing repo_path",
         duplicated.join(" | ")
     );
+    if any_embedded {
+        message.push_str(
+            ". Embedded devmap_* tools from waylode-mcp / gitpulse-mcp count as a second \
+             provider beside standalone devmap; set WAYLODE_MCP_NO_DEVMAP=1 on the embedded \
+             server or keep only one registration",
+        );
+    }
     if !counted_pinned.is_empty() {
         message.push_str(
-            ". A pinned (--root/--db) entry beside an enabled plugin is counted: Claude Code \
-             keeps a plugin server unless another has the same command",
+            ". A pinned (--root/--db) entry beside an enabled plugin or embedded provider is \
+             counted: hosts do not collapse separate server registrations",
         );
     }
     if !other_pinned.is_empty() {
@@ -2083,5 +2553,67 @@ mod tests {
         assert!(pieces.contains(&"./devmap"), "{pieces:?}");
         assert!(word_references_devmap("DEVMAP.PS1") && word_references_devmap("./devmap.cmd"));
         assert!(!word_references_devmap("devmapper") && !word_references_devmap("devmap.txt"));
+    }
+
+    #[test]
+    fn claude_profile_settings_env_suppresses_embedded_waylode_devmap_duplicate() {
+        let base =
+            std::env::temp_dir().join(format!("devmap-claude-env-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let claude_dir = base.join(".claude");
+        let waylode_dir = base.join("waylode-plugin");
+        let devmap_dir = claude_dir.join("plugins/cache/devmap-local/devmap/0.2.5");
+        std::fs::create_dir_all(claude_dir.join("plugins")).unwrap();
+        std::fs::create_dir_all(&waylode_dir).unwrap();
+        std::fs::create_dir_all(&devmap_dir).unwrap();
+
+        std::fs::write(
+            devmap_dir.join(".mcp.json"),
+            r#"{"mcpServers":{"devmap":{"type":"stdio","command":"/usr/local/bin/devmap","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            waylode_dir.join(".mcp.json"),
+            r#"{"mcpServers":{"waylode":{"type":"stdio","command":"waylode-mcp"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            claude_dir.join("plugins/installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "devmap@devmap-local": [{"scope": "user", "installPath": devmap_dir}],
+                    "waylode@waylode": [{"scope": "user", "installPath": waylode_dir}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Without settings.json env, embedded waylode triggers duplicate warning.
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"enabledPlugins":{"devmap@devmap-local":true,"waylode@waylode":true}}"#,
+        )
+        .unwrap();
+        let inv_before = mcp_registration_inventory_for(Some(&base), &base);
+        assert!(
+            duplicate_registration_message(&inv_before).is_some(),
+            "expected duplicate warning without WAYLODE_MCP_NO_DEVMAP"
+        );
+
+        // With settings.json env WAYLODE_MCP_NO_DEVMAP=1, duplicate warning clears.
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"enabledPlugins":{"devmap@devmap-local":true,"waylode@waylode":true},"env":{"WAYLODE_MCP_NO_DEVMAP":"1"}}"#,
+        )
+        .unwrap();
+        let inv_after = mcp_registration_inventory_for(Some(&base), &base);
+        assert_eq!(
+            duplicate_registration_message(&inv_after),
+            None,
+            "settings.json env WAYLODE_MCP_NO_DEVMAP=1 should suppress embedded duplicate: {inv_after}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

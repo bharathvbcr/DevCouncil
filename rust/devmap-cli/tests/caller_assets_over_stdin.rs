@@ -561,3 +561,232 @@ fn a_kept_foreign_codex_manifest_fails_check_and_force_plans_a_backup() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// `--scope user --servers-only --servers-stdin` is the contract Waylode Connect
+/// (`OV-INTEGRATE-01`) uses to register/remove user-level servers without
+/// touching guides, skills, hooks, or DevMap's own entry, and without needing a
+/// git repository or DevMap store.
+#[test]
+fn scope_user_servers_only_registers_and_removes_across_hosts_without_repo() {
+    let home = scratch("user-servers-only-home");
+    let waylode_cmd = if cfg!(windows) {
+        r"C:\opt\waylode\bin\waylode-mcp"
+    } else {
+        "/opt/waylode/bin/waylode-mcp"
+    };
+    let request = serde_json::to_vec(&json!({"servers": [{
+        "name": "waylode",
+        "command": waylode_cmd,
+        "args": [],
+        "env": {"WAYLODE_MCP_NO_DEVMAP": "1"},
+    }]}))
+    .unwrap();
+
+    // Seed an existing devmap entry in ~/.claude.json so we prove --servers-only
+    // --remove leaves devmap untouched.
+    let claude_path = home.join(".claude.json");
+    std::fs::write(
+        &claude_path,
+        serde_json::to_string_pretty(&json!({
+            "mcpServers": {
+                "devmap": {"type": "stdio", "command": "/opt/bin/devmap", "args": ["mcp"]}
+            }
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
+
+    for (host, expected_path) in [
+        ("claude", home.join(".claude.json")),
+        ("cursor", home.join(".cursor/mcp.json")),
+        ("codex", home.join(".codex/config.toml")),
+        ("antigravity", home.join(".gemini/config/mcp_config.json")),
+        ("opencode", home.join(".config/opencode/opencode.json")),
+    ] {
+        let apply = devmap(
+            &[
+                "--json",
+                "integrate",
+                host,
+                "--scope",
+                "user",
+                "--servers-stdin",
+                "--servers-only",
+            ],
+            &request,
+            &home,
+        );
+        assert_eq!(apply.status, Some(0), "{host}: {}", apply.stderr);
+        let report: Value = serde_json::from_str(&apply.stdout).unwrap();
+        assert_eq!(report["scope"], "user", "{host}: {report}");
+        assert_eq!(report["servers_only"], true, "{host}: {report}");
+        assert!(report["guides"].as_array().unwrap().is_empty(), "{host}");
+        assert!(
+            report["global_mcp"].as_array().unwrap().is_empty(),
+            "{host}"
+        );
+        assert!(
+            report["project_mcp"].as_array().unwrap().is_empty(),
+            "{host}"
+        );
+        assert!(report["hooks"].as_array().unwrap().is_empty(), "{host}");
+        assert_eq!(report["servers"][0]["changed"], true, "{host}: {report}");
+        assert!(
+            expected_path.is_file(),
+            "{host}: missing {}",
+            expected_path.display()
+        );
+
+        let text = std::fs::read_to_string(&expected_path).unwrap();
+        assert!(text.contains("waylode"), "{host}: {text}");
+        assert!(text.contains("WAYLODE_MCP_NO_DEVMAP"), "{host}: {text}");
+        if host != "claude" {
+            assert!(
+                !text.contains("devmap"),
+                "{host}: must not write devmap: {text}"
+            );
+        }
+
+        // `--check` passes once applied.
+        let check = devmap(
+            &[
+                "--json",
+                "integrate",
+                host,
+                "--scope",
+                "user",
+                "--servers-stdin",
+                "--servers-only",
+                "--check",
+            ],
+            &request,
+            &home,
+        );
+        assert_eq!(
+            check.status,
+            Some(0),
+            "{host} check: {}{}",
+            check.stdout,
+            check.stderr
+        );
+
+        // `--remove --servers-only` removes ONLY `waylode`.
+        let remove = devmap(
+            &[
+                "--json",
+                "integrate",
+                host,
+                "--scope",
+                "user",
+                "--servers-stdin",
+                "--servers-only",
+                "--remove",
+                "--only-path",
+                expected_path.to_str().unwrap(),
+            ],
+            &request,
+            &home,
+        );
+        assert_eq!(remove.status, Some(0), "{host} remove: {}", remove.stderr);
+        let rm_report: Value = serde_json::from_str(&remove.stdout).unwrap();
+        assert_eq!(rm_report["scope"], "user", "{host}: {rm_report}");
+        assert_eq!(rm_report["servers_only"], true, "{host}: {rm_report}");
+        assert_eq!(
+            rm_report["removed"][0]["servers"],
+            json!(["waylode"]),
+            "{host}: {rm_report}"
+        );
+        if host == "claude" {
+            let after: Value =
+                serde_json::from_str(&std::fs::read_to_string(&claude_path).unwrap()).unwrap();
+            assert!(after["mcpServers"].get("devmap").is_some(), "{after}");
+            assert!(after["mcpServers"].get("waylode").is_none(), "{after}");
+        }
+    }
+
+    // Warp has no user-level config and must refuse cleanly.
+    let warp_refused = devmap(
+        &[
+            "integrate",
+            "warp",
+            "--scope",
+            "user",
+            "--servers-stdin",
+            "--servers-only",
+        ],
+        &request,
+        &home,
+    );
+    assert_ne!(
+        warp_refused.status,
+        Some(0),
+        "warp must refuse --scope user"
+    );
+    assert!(
+        warp_refused
+            .stderr
+            .contains("no user-level MCP configuration"),
+        "{}",
+        warp_refused.stderr
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `devmap integrate antigravity` now writes global
+/// `~/.gemini/config/mcp_config.json` (unpinned) alongside repo-local
+/// `.agents/mcp_config.json`, while `--scope project` leaves global untouched.
+#[test]
+fn antigravity_integrate_writes_global_mcp_and_scope_project_skips_it() {
+    let home = scratch("agy-global-home");
+    let root = scratch("agy-global-root");
+    let root_arg = root.to_str().unwrap();
+
+    // `--scope project` writes only repo-local `.agents/mcp_config.json`.
+    let project_only = devmap(
+        &[
+            "--json",
+            "integrate",
+            "antigravity",
+            "--scope",
+            "project",
+            "--project-root",
+            root_arg,
+        ],
+        b"",
+        &home,
+    );
+    assert_eq!(project_only.status, Some(0), "{}", project_only.stderr);
+    assert!(root.join(".agents/mcp_config.json").is_file());
+    assert!(
+        !home.join(".gemini/config/mcp_config.json").exists(),
+        "--scope project must not write global Antigravity config"
+    );
+
+    // Default `--scope all` also writes global `~/.gemini/config/mcp_config.json`.
+    let full = devmap(
+        &[
+            "--json",
+            "integrate",
+            "antigravity",
+            "--project-root",
+            root_arg,
+        ],
+        b"",
+        &home,
+    );
+    assert_eq!(full.status, Some(0), "{}", full.stderr);
+    let global_path = home.join(".gemini/config/mcp_config.json");
+    assert!(global_path.is_file(), "missing global Antigravity config");
+    let global_doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
+    assert_eq!(
+        global_doc["mcpServers"]["devmap"]["args"],
+        json!(["mcp"]),
+        "global Antigravity entry must be unpinned: {global_doc}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
