@@ -2591,7 +2591,14 @@ mod plugin_asset_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const EXE: &str = "/opt/devmap/bin/devmap";
+    /// Absolute on the platform under test (see `claude::absolute_fixture_slashed`).
+    const EXE: &str = if cfg!(windows) {
+        "C:/opt/devmap/bin/devmap"
+    } else {
+        "/opt/devmap/bin/devmap"
+    };
+    /// The drive a fixture path needs to be absolute here: none on Unix.
+    const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2908,14 +2915,14 @@ mod plugin_asset_tests {
 
     #[test]
     fn a_path_with_an_apostrophe_in_it_is_still_devmaps() {
-        let exe = Path::new("/opt/it's/devmap");
+        let exe = &PathBuf::from(format!("{DRIVE}/opt/it's/devmap"));
         let hooks = claude::codex_hooks_block(exe, &["hook".to_string()]).unwrap();
         let command = hooks["hooks"].as_object().unwrap().values().next().unwrap()[0]["hooks"][0]
             ["command"]
             .as_str()
             .unwrap();
         assert!(
-            command.starts_with("'/opt/it'\\''s/devmap' hook "),
+            command.starts_with(&format!("'{DRIVE}/opt/it'\\''s/devmap' hook ")),
             "{command}"
         );
         assert!(generated_hooks(&hooks), "{hooks}");
@@ -2929,10 +2936,12 @@ mod plugin_asset_tests {
         assert!(!is_devmap_hook_command(
             "'/opt/devmap.py' hook session-start"
         ));
-        assert!(is_devmap_hook_command("'/opt/devmap' hook session-start"));
-        assert!(is_devmap_hook_command(
-            "'/opt/devmap.exe' hook session-start"
-        ));
+        assert!(is_devmap_hook_command(&format!(
+            "'{DRIVE}/opt/devmap' hook session-start"
+        )));
+        assert!(is_devmap_hook_command(&format!(
+            "'{DRIVE}/opt/devmap.exe' hook session-start"
+        )));
         #[cfg(windows)]
         assert!(is_devmap_hook_command(
             "'C:\\x\\devmap.exe' hook session-start"
@@ -2990,6 +2999,11 @@ mod tests {
     use super::*;
     use clap::ValueEnum;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// An executable path that is absolute on the platform under test.
+    fn fixture_exe(unix_path: &str) -> PathBuf {
+        PathBuf::from(claude::absolute_fixture_slashed(unix_path))
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -3076,7 +3090,7 @@ mod tests {
             r#"{"mcpServers":{"other":{"type":"stdio","command":"x","args":[]}}}"#,
         )
         .unwrap();
-        let exe = PathBuf::from("/tmp/fake-devmap-bin");
+        let exe = fixture_exe("/tmp/fake-devmap-bin");
         let outcome = merge_global_mcp(&path, &exe, false).unwrap();
         assert!(outcome.changed);
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -3101,7 +3115,7 @@ mod tests {
             r#"{"mcpServers":{"devmap":{"type":"stdio","command":"/old/devmap","args":["--db","/repo/.devcouncil/codeintel/devmap.sqlite","mcp"]}}}"#,
         )
         .unwrap();
-        let exe = PathBuf::from("/tmp/new-devmap");
+        let exe = fixture_exe("/tmp/new-devmap");
         let outcome = merge_global_mcp(&path, &exe, false).unwrap();
         assert!(outcome.changed);
         assert!(outcome.removed_stale_db);
@@ -3120,7 +3134,7 @@ mod tests {
             r#"{"mcpServers":{"devmap":{"type":"stdio","command":"/x","args":["--db","y","mcp"]},"keep":{"type":"stdio","command":"z","args":[]}}}"#,
         )
         .unwrap();
-        let outcome = clean_project_mcp(&path, Path::new("/x"), false)
+        let outcome = clean_project_mcp(&path, &fixture_exe("/x"), false)
             .unwrap()
             .unwrap();
         assert!(outcome.removed_stale_db);
@@ -3149,7 +3163,7 @@ mod tests {
     fn offer_project_mcp_creates_root_entry_when_missing() {
         let dir = scratch("offer-mcp");
         let path = dir.join(".cursor").join("mcp.json");
-        let outcome = offer_project_mcp(&path, Path::new("/x"), false)
+        let outcome = offer_project_mcp(&path, &fixture_exe("/x"), false)
             .unwrap()
             .unwrap();
         assert!(outcome.changed);
@@ -3166,7 +3180,7 @@ mod tests {
             "must document that --root is insufficient for multi-tab: {}",
             outcome.note
         );
-        assert!(offer_project_mcp(&path, Path::new("/x"), false)
+        assert!(offer_project_mcp(&path, &fixture_exe("/x"), false)
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -3182,7 +3196,7 @@ mod tests {
             r#"{"mcpServers":{"devmap":{"type":"stdio","command":"/x","args":["mcp"]},"keep":{"type":"stdio","command":"z","args":[]}}}"#,
         )
         .unwrap();
-        let outcome = clean_project_mcp(&path, Path::new("/x"), false)
+        let outcome = clean_project_mcp(&path, &fixture_exe("/x"), false)
             .unwrap()
             .expect("owned [\"mcp\"] project entry must become --root");
         assert!(outcome.changed);
@@ -3273,7 +3287,7 @@ mod tests {
 
     #[test]
     fn the_opencode_plugin_is_written_and_listed() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("oc-plugin");
         merge_opencode_plugin(&root, &exe, false).unwrap();
 
@@ -3308,7 +3322,7 @@ mod tests {
 
     #[test]
     fn a_second_run_adds_no_duplicate_plugin_entry() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("oc-idem");
         merge_opencode_plugin(&root, &exe, false).unwrap();
         let outcomes = merge_opencode_plugin(&root, &exe, false).unwrap();
@@ -3323,7 +3337,7 @@ mod tests {
 
     #[test]
     fn another_projects_plugins_are_kept_in_every_spelling() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         // `plugin` is a bare string in some configs and an array in others.
         for existing in [
             json!("./theirs.mjs"),
@@ -3370,7 +3384,7 @@ mod tests {
 
     #[test]
     fn a_wrongly_shaped_plugin_key_is_refused_not_replaced() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("oc-bad");
         let body = r#"{"plugin": {"not": "a list"}}"#;
         fs::write(root.join("opencode.json"), body).unwrap();
@@ -3384,7 +3398,7 @@ mod tests {
 
     #[test]
     fn an_opencode_dry_run_writes_neither_artifact() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("oc-dry");
         let outcomes = merge_opencode_plugin(&root, &exe, true).unwrap();
         assert!(outcomes.iter().any(|o| o.changed), "dry run reports intent");
@@ -3406,9 +3420,9 @@ mod tests {
         // The executable path is baked into the module. An install that moved
         // must refresh it, or the plugin spawns a binary that is gone.
         let root = scratch("oc-move");
-        merge_opencode_plugin(&root, Path::new("/old/devmap"), false).unwrap();
+        merge_opencode_plugin(&root, &fixture_exe("/old/devmap"), false).unwrap();
         assert!(plugin_module(&root).contains("/old/devmap"));
-        let outcomes = merge_opencode_plugin(&root, Path::new("/new/devmap"), false).unwrap();
+        let outcomes = merge_opencode_plugin(&root, &fixture_exe("/new/devmap"), false).unwrap();
         assert!(
             outcomes.iter().any(|o| o.changed),
             "module was not refreshed"
@@ -3423,7 +3437,7 @@ mod tests {
 
     #[test]
     fn a_pinned_db_registration_is_repaired_for_every_host() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         for (host, rel, stale) in [
             (
                 Host::Antigravity,
@@ -3482,7 +3496,7 @@ mod tests {
         // Warp carried no devmap entry at all, so registering one is a first
         // write, not a repair. A receipt that called both the same could not
         // show that the stale registrations were actually replaced.
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("warp-fresh");
         let outcome = merge_host_mcp(Host::Warp, &root, &exe, false)
             .unwrap()
@@ -3502,7 +3516,7 @@ mod tests {
         // `opencode.json` is a user's configuration that happens to hold a
         // server list. Losing an unrelated key is a bug even when the server
         // entry comes out right.
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("opencode-keys");
         fs::write(
             root.join("opencode.json"),
@@ -3529,7 +3543,7 @@ mod tests {
 
     #[test]
     fn a_second_run_changes_nothing() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         for host in [Host::Antigravity, Host::OpenCode, Host::Warp] {
             let root = scratch(&format!("idem-{}", host.as_str()));
             merge_host_mcp(host, &root, &exe, false).unwrap();
@@ -3548,7 +3562,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_writes_nothing() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("dry");
         let outcome = merge_host_mcp(Host::Warp, &root, &exe, true)
             .unwrap()
@@ -3563,7 +3577,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_or_wrongly_shaped_config_is_refused_not_overwritten() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         for (label, body) in [
             ("not-json", "{ this is not json"),
             ("top-level-array", "[1, 2, 3]"),
@@ -3588,7 +3602,7 @@ mod tests {
     fn an_empty_file_is_treated_as_an_empty_document() {
         // A zero-byte config is what an interrupted write leaves behind. It
         // carries no user keys to lose, so it is filled in rather than refused.
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("empty");
         fs::write(root.join("opencode.json"), "   \n").unwrap();
         merge_host_mcp(Host::OpenCode, &root, &exe, false).unwrap();
@@ -3600,7 +3614,7 @@ mod tests {
 
     #[test]
     fn the_hosts_without_their_own_document_are_left_to_the_existing_merge() {
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let root = scratch("nodoc");
         for host in [Host::Cursor, Host::Claude, Host::Codex] {
             assert!(
@@ -3726,7 +3740,7 @@ mod tests {
         let dir = scratch("codex-mcp");
         let path = dir.join("config.toml");
         fs::write(&path, "[mcp_servers.other]\ncommand = \"x\"\nargs = []\n").unwrap();
-        let outcome = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let outcome = merge_codex_mcp(&path, &fixture_exe("/tmp/fake-devmap"), false).unwrap();
         assert!(outcome.changed);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("mcp_servers"));
@@ -3744,7 +3758,7 @@ mod tests {
                         [profiles.fast]   # inline\nmodel = \"o5-mini\"\n\n\
                         [mcp_servers.other]\ncommand = \"x\"   # theirs\nargs = []\n";
         fs::write(&path, original).unwrap();
-        let outcome = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let outcome = merge_codex_mcp(&path, &fixture_exe("/tmp/fake-devmap"), false).unwrap();
         assert!(outcome.changed);
         let after = fs::read_to_string(&path).unwrap();
         assert!(
@@ -3758,14 +3772,14 @@ mod tests {
         );
 
         // A second merge is a no-op, byte for byte.
-        let again = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let again = merge_codex_mcp(&path, &fixture_exe("/tmp/fake-devmap"), false).unwrap();
         assert!(!again.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), after);
 
         // A stale devmap entry is replaced in place and the rest kept.
         let stale = after.replace("/tmp/fake-devmap", "/old/devmap");
         fs::write(&path, &stale).unwrap();
-        merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        merge_codex_mcp(&path, &fixture_exe("/tmp/fake-devmap"), false).unwrap();
         let healed = fs::read_to_string(&path).unwrap();
         assert!(healed.starts_with(original), "{healed}");
         assert!(!healed.contains("/old/devmap"), "{healed}");
@@ -3791,7 +3805,7 @@ env = { FOO = \"bar\" }\n\
 [mcp_servers.other]\n\
 command = \"x\"\n";
         fs::write(&path, original).unwrap();
-        merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        merge_codex_mcp(&path, &fixture_exe("/tmp/fake-devmap"), false).unwrap();
         let after = fs::read_to_string(&path).unwrap();
         for line in [
             "# my codex config",
@@ -3819,7 +3833,7 @@ command = \"x\"\n";
         let original =
             "# keep\nmcp_servers = { devmap = { command = \"old\", args = [\"mcp\"] } }\n";
         fs::write(&path, original).unwrap();
-        let err = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap_err();
+        let err = merge_codex_mcp(&path, &fixture_exe("/tmp/fake-devmap"), false).unwrap_err();
         assert!(err.to_string().contains("edit it by hand"), "{err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         let _ = fs::remove_dir_all(&dir);
@@ -4303,7 +4317,7 @@ command = \"x\"\n";
         let result = integrate(
             Host::OpenCode,
             &root,
-            Path::new("/opt/devmap/bin/devmap"),
+            &fixture_exe("/opt/devmap/bin/devmap"),
             &empty_map(),
             "m",
             "g",
@@ -4335,7 +4349,7 @@ command = \"x\"\n";
     fn integrate_writes_the_callers_server_and_check_reports_instead_of_failing() {
         let root = scratch("integrate-servers");
         let spec = devcouncil_spec(&root);
-        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let exe = fixture_exe("/opt/devmap/bin/devmap");
         let map = empty_map();
         // Warp: no user-level document and no skills, so nothing here reaches
         // the user's home directory.

@@ -1365,6 +1365,20 @@ pub(crate) fn absolute_fixture(unix_path: &str) -> PathBuf {
     }
 }
 
+/// [`absolute_fixture`] with forward slashes, as text: `C:/opt/x` on Windows.
+/// Windows takes it as absolute, and JSON, TOML and JavaScript write it
+/// unescaped, so the Unix spelling is still a substring of the written document
+/// on every platform.
+#[cfg(test)]
+pub(crate) fn absolute_fixture_slashed(unix_path: &str) -> String {
+    debug_assert!(unix_path.starts_with('/'), "{unix_path}");
+    if cfg!(windows) {
+        format!("C:{unix_path}")
+    } else {
+        unix_path.to_string()
+    }
+}
+
 #[cfg(test)]
 fn resolve_hook_executable(
     executable: &Path,
@@ -2875,7 +2889,8 @@ mod tests {
     }
 
     fn command_group(matcher: Option<&str>, extra: Value) -> Value {
-        let mut handler = json!({"type": "command", "command": "/bin/true"});
+        let mut handler =
+            json!({"type": "command", "command": absolute_fixture_slashed("/bin/true")});
         if let Some(map) = extra.as_object() {
             for (k, v) in map {
                 handler[k] = v.clone();
@@ -3763,7 +3778,7 @@ mod tests {
     /// owner, so they cannot disagree; this pins that they still share it.
     #[test]
     fn the_url_an_agent_is_given_is_the_address_the_server_binds() {
-        let executable = Path::new("/usr/local/bin/devmap");
+        let executable = &absolute_fixture("/usr/local/bin/devmap");
         let db = Path::new("/repo/.devcouncil/codeintel/devmap.sqlite");
         for address in ["8080", "127.0.0.1:9000", "[::1]:9100"] {
             let entry = mcp_entry(executable, Some(db), Some(address)).expect("http entry renders");
@@ -4050,10 +4065,8 @@ mod tests {
                 "{relative}"
             );
         }
-        assert_eq!(
-            absolute_executable(Path::new("/usr/local/bin/devmap")).unwrap(),
-            Path::new("/usr/local/bin/devmap")
-        );
+        let installed = absolute_fixture("/usr/local/bin/devmap");
+        assert_eq!(absolute_executable(&installed).unwrap(), installed);
     }
 
     #[test]
@@ -4071,8 +4084,9 @@ mod tests {
         ] {
             assert_eq!(verdict(expanded), WordVerdict::Expanded, "{expanded}");
         }
+        let usr_bin = absolute_fixture_slashed("/usr/bin/devmap");
         for fine in [
-            "/usr/bin/devmap",
+            usr_bin.as_str(),
             "~/.local/bin/devmap",
             "$HOME/.local/bin/devmap",
             "${HOME}/.local/bin/devmap",
@@ -4081,7 +4095,7 @@ mod tests {
         }
         assert!(judge_command_word("~/devmap", None, None).is_err());
         assert!(command_word_defect("'$CLAUDE_PROJECT_DIR'/devmap hook x").is_some());
-        assert!(command_word_defect("'/usr/bin/devmap' hook x").is_none());
+        assert!(command_word_defect(&format!("'{usr_bin}' hook x")).is_none());
         assert!(command_word_defect("devmap hook x").is_some());
     }
 }
