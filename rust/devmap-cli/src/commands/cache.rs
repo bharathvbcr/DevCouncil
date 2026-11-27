@@ -2007,13 +2007,8 @@ pub fn pull_cache_opts(
         "refusing unencrypted remote cache payload (must start with DMC1)"
     );
 
-    let manifest = unpack_bytes_into_store_inner(
-        root,
-        db_path,
-        &archive_bytes,
-        unpack_opts,
-        Some(&enc_key),
-    )?;
+    let manifest =
+        unpack_bytes_into_store_inner(root, db_path, &archive_bytes, unpack_opts, Some(&enc_key))?;
     let _ = write_local_cache_state(
         root,
         &LocalCacheState {
@@ -2691,8 +2686,7 @@ mod tests {
         let dst_db = devmap_extract::paths::store_path(&dst_repo);
 
         let repo_hash = resolve_repo_hash(&src_repo, None).unwrap();
-        let (dmc1, manifest, digest) =
-            pack_store_to_bytes(&src_repo, &src_db, &repo_hash).unwrap();
+        let (dmc1, manifest, digest) = pack_store_to_bytes(&src_repo, &src_db, &repo_hash).unwrap();
         assert!(
             is_dmc1_container(&dmc1),
             "packed archive must be encrypted DMC1 when key is set"
@@ -3773,14 +3767,7 @@ mod tests {
                 Some(v) => CacheEnvGuard::set(v),
             };
             let push_err = push_cache_opts(
-                &src_repo,
-                &src_db,
-                &base_url,
-                None,
-                None,
-                &repo_hash,
-                "tok-1",
-                false,
+                &src_repo, &src_db, &base_url, None, None, &repo_hash, "tok-1", false,
             )
             .unwrap_err();
             assert!(
@@ -3956,9 +3943,8 @@ mod tests {
         // 1. Without key: pack fails closed unless allow_plaintext=true.
         {
             let _env = CacheEnvGuard::unset();
-            let err =
-                pack_store_to_bytes_with_policy(&src_repo, &src_db, &repo_hash, false, false)
-                    .unwrap_err();
+            let err = pack_store_to_bytes_with_policy(&src_repo, &src_db, &repo_hash, false, false)
+                .unwrap_err();
             assert!(err.to_string().contains(CACHE_ENCRYPTION_KEY_ENV), "{err}");
 
             let (plain_gz, _, _) =
@@ -4081,8 +4067,24 @@ mod tests {
     #[test]
     fn h5_cli_parser_forbids_allow_plaintext_on_push_and_pull() {
         use clap::Parser;
-        assert!(Cli::try_parse_from(["devmap", "cache", "pack", "--out", "a.dmc1", "--allow-plaintext"]).is_ok());
-        assert!(Cli::try_parse_from(["devmap", "cache", "unpack", "--in", "a.dmc1", "--allow-plaintext"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "devmap",
+            "cache",
+            "pack",
+            "--out",
+            "a.dmc1",
+            "--allow-plaintext"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "devmap",
+            "cache",
+            "unpack",
+            "--in",
+            "a.dmc1",
+            "--allow-plaintext"
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
             "devmap",
             "cache",
@@ -4121,6 +4123,9 @@ mod tests {
 
         let mut bad = b"bad\x00key".to_vec();
         assert!(parse_cache_encryption_key_bytes(&mut bad).is_err());
-        assert!(bad.iter().all(|&b| b == 0), "raw buffer must be zeroized on error");
+        assert!(
+            bad.iter().all(|&b| b == 0),
+            "raw buffer must be zeroized on error"
+        );
     }
 }
