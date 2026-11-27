@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // attackFixture is a repository holding an executable file named devmap that
@@ -16,6 +18,7 @@ type attackFixture struct {
 }
 
 func newAttackFixture(t *testing.T) attackFixture {
+	testsupport.RequireShellFakes(t)
 	t.Helper()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

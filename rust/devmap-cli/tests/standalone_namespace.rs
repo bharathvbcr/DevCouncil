@@ -214,8 +214,7 @@ fn an_emitted_hook_does_not_name_a_path_that_exists_on_one_machine() {
     let root = fixture("binary-flag");
     assert_built(&build(&root, None));
 
-    // Absolute on the host: a drive-less `/usr/...` is refused on Windows, and
-    // forward slashes survive the JSON the command prints unescaped.
+    // Absolute on the host: a drive-less `/usr/...` is refused on Windows.
     let binary = if cfg!(windows) {
         "C:/usr/local/bin/devmap"
     } else {
@@ -231,8 +230,16 @@ fn an_emitted_hook_does_not_name_a_path_that_exists_on_one_machine() {
     assert!(output.status.success());
 
     let text = String::from_utf8_lossy(&output.stdout);
+    // A path not installed yet is written where it lands, in the platform's
+    // own separators: `C:\usr\local\bin\devmap` on Windows, which the JSON
+    // printed here escapes.
+    let named = if cfg!(windows) {
+        binary.replace('/', r"\\")
+    } else {
+        binary.to_string()
+    };
     assert!(
-        text.contains(binary),
+        text.contains(&named),
         "--binary must be what the emitted handlers name: {text}"
     );
     assert!(

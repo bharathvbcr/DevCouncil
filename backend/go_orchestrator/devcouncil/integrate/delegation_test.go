@@ -160,7 +160,7 @@ func anyFileUnder(t *testing.T, dir, want string) bool {
 	found := false
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err == nil && d.Type().IsRegular() {
-			if b, rerr := os.ReadFile(path); rerr == nil && strings.Contains(string(b), want) {
+			if b, rerr := os.ReadFile(path); rerr == nil && containsPathSpelling(string(b), want) {
 				found = true
 			}
 		}
@@ -196,7 +196,21 @@ func anyWrittenFileContains(root string, receipt *Receipt, want string) bool {
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(root, path)
 		}
-		if body, err := os.ReadFile(path); err == nil && strings.Contains(string(body), want) {
+		if body, err := os.ReadFile(path); err == nil && containsPathSpelling(string(body), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsPathSpelling reports whether text names the path want in one of the
+// spellings a host document carries it in: as given, in the platform's own
+// separators, or with those separators escaped as a JSON or TOML basic string
+// writes them (`C:\\opt\\bin`). On Unix all three are the same string.
+func containsPathSpelling(text, want string) bool {
+	native := filepath.FromSlash(want)
+	for _, spelling := range []string{want, native, strings.ReplaceAll(native, `\`, `\\`)} {
+		if strings.Contains(text, spelling) {
 			return true
 		}
 	}

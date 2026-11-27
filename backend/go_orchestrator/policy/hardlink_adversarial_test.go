@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -145,6 +146,9 @@ func TestHLALinkSurvivingTheSecretsDeletionIsOrdinary(t *testing.T) {
 func TestHLAUnreadableDirectoryInTheWalk(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads every directory")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod(dir, 0) leaves a directory readable on Windows, so there is no unreadable directory to walk")
 	}
 	root := t.TempDir()
 	hlaWrite(t, root, "src/x.go", "package x")

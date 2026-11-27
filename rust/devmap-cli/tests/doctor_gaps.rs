@@ -58,12 +58,22 @@ fn record_install(home: &Path, dir: &Path) {
     .unwrap();
 }
 
+/// An executable that is absolute on the platform under test: a drive-less
+/// `/abs/devmap` is relative on Windows, and doctor rightly flags it there.
+const ABS_DEVMAP: &str = if cfg!(windows) {
+    "C:/abs/devmap"
+} else {
+    "/abs/devmap"
+};
+
 /// A well-formed bundle directory.
 fn write_healthy_bundle(dir: &Path) {
     fs::create_dir_all(dir.join("hooks")).unwrap();
     fs::write(
         dir.join("hooks/hooks.json"),
-        r#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"/abs/devmap hook session-end","timeout":3}]}]}}"#,
+        format!(
+            r#"{{"hooks":{{"SessionEnd":[{{"hooks":[{{"type":"command","command":"{ABS_DEVMAP} hook session-end","timeout":3}}]}}]}}}}"#
+        ),
     )
     .unwrap();
     fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
