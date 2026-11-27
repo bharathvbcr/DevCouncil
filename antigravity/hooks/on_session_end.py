@@ -2,7 +2,7 @@
 on_session_end.py - Antigravity Agent Lifecycle Hook: Session Teardown & Hygiene.
 
 Releases DevCouncil task leases, shuts down tethered background daemons,
-and prunes integrated worktrees following 6-point verification.
+and prunes integrated Waylode worktrees following 6-point verification.
 """
 
 import asyncio
@@ -27,12 +27,12 @@ async def on_session_end_hook() -> Dict[str, Any]:
     """
     Executes upon session termination (normal completion, error, or cancellation).
     1. Releases active DevCouncil task lease.
-    2. Prunes or detaches worktree in GitPulse if integrated.
+    2. Prunes or detaches worktree in Waylode if integrated.
     3. Reaps orphaned or tethered subprocesses.
     4. Resets session state.
     """
     logger.info("Executing Antigravity Session Teardown [Client: %s]", state.client_id)
-    teardown_report = {
+    teardown_report: Dict[str, Any] = {
         "ok": True,
         "client_id": state.client_id,
         "lease_released": False,
@@ -42,18 +42,28 @@ async def on_session_end_hook() -> Dict[str, Any]:
     try:
         # Step 1: Release Task Lease in DevCouncil
         if state.task_id and state.lease_token:
-            release_payload = {
+            release_payload: Dict[str, Any] = {
                 "task_id": state.task_id,
                 "lease_token": state.lease_token,
-                "client_id": state.client_id,
             }
+            if state.repo_path and os.path.isabs(state.repo_path):
+                release_payload["repo_path"] = state.repo_path
             rel_res = await call_mcp_tool(
                 "devcouncil", "devcouncil_release_task", release_payload
             )
-            teardown_report["lease_released"] = rel_res.get("ok", True)
-            logger.info("DevCouncil task lease %s successfully released.", state.task_id)
+            released = isinstance(rel_res, dict) and rel_res.get("ok") is True
+            teardown_report["lease_released"] = released
+            if released:
+                logger.info("DevCouncil task lease %s successfully released.", state.task_id)
+            else:
+                teardown_report["ok"] = False
+                logger.warning(
+                    "DevCouncil task lease %s release failed: %s",
+                    state.task_id,
+                    rel_res.get("error") if isinstance(rel_res, dict) else rel_res,
+                )
 
-        # Step 2: Prune Worktree in GitPulse if safe
+        # Step 2: Prune Worktree in Waylode if safe
         if state.worktree_path and state.worktree_path != state.repo_path:
             prune_payload = {
                 "repo_path": state.repo_path,
@@ -63,10 +73,19 @@ async def on_session_end_hook() -> Dict[str, Any]:
             prune_res = await call_mcp_tool(
                 "waylode", "waylode_worktree_prune", prune_payload
             )
-            teardown_report["worktree_pruned"] = prune_res.get("ok", True)
-            logger.info(
-                "GitPulse worktree %s processed for hygiene pruning.", state.worktree_path
-            )
+            pruned = isinstance(prune_res, dict) and prune_res.get("ok") is True
+            teardown_report["worktree_pruned"] = pruned
+            if pruned:
+                logger.info(
+                    "Waylode worktree %s processed for hygiene pruning.", state.worktree_path
+                )
+            else:
+                teardown_report["ok"] = False
+                logger.warning(
+                    "Waylode worktree %s prune failed: %s",
+                    state.worktree_path,
+                    prune_res.get("error") if isinstance(prune_res, dict) else prune_res,
+                )
 
     except Exception as exc:
         logger.error("Session teardown error: %s", exc, exc_info=True)

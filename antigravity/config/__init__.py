@@ -1,7 +1,7 @@
 """
 antigravity.config package.
 
-Provides unified MCP configuration and tool bridge for DevCouncil, DevMap, and GitPulse.
+Provides unified MCP configuration and tool bridge for DevCouncil, DevMap, and Waylode (formerly GitPulse).
 """
 
 from .agent_config import (

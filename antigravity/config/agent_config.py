@@ -2,14 +2,14 @@
 agent_config.py - Unified MCP Server Configuration for Google Antigravity.
 
 Configures stdio and streamable HTTP transports with FastMCP identifiers
-and strict tool allowlists for DevCouncil, DevMap, and GitPulse.
+and strict tool allowlists for DevCouncil, DevMap, and Waylode (formerly GitPulse).
 """
 
 import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 # FastMCP Identifier validation invariant (Invariant B3)
 FASTMCP_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -118,55 +118,62 @@ DEVCOUNCIL_TOOLS = [
     "devcouncil_policy_check_write",
 ]
 
+# Full 21-tool surface published by `devmap mcp` (rust/devmap-serve/src/mcp.rs).
 DEVMAP_TOOLS = [
     "devmap_status",
     "devmap_search",
-    "devmap_explore",
+    "devmap_ask",
+    "devmap_ask_evidence",
     "devmap_dependencies",
     "devmap_impact",
     "devmap_trace",
     "devmap_neighbors",
     "devmap_dead_symbols",
+    "devmap_skeleton",
     "devmap_clones",
     "devmap_preview",
-    "devmap_affected_tests",
-    "devmap_blast",
-    "devmap_suspects",
-    "devmap_ask_evidence",
+    "devmap_explore",
+    "devmap_literals",
     "devmap_doc_drift",
+    "devmap_affected_tests",
+    "devmap_suspects",
+    "devmap_blast",
+    "devmap_routes",
+    "devmap_api_impact",
+    "devmap_cypher",
 ]
 
 # Waylode is the new name of GitPulse. The server lists ``waylode_<x>`` and keeps
 # accepting ``gitpulse_<x>``, but a host started before the rename still lists the
 # old names, so an allowlist carries both. Drop GITPULSE_TOOLS (and the
 # ``gitpulse`` server alias below) once no host serves the old names.
-GITPULSE_TOOLS = [
-    "gitpulse_insights",
-    "gitpulse_status",
-    "gitpulse_active_changes",
-    "gitpulse_collision_risk",
-    "gitpulse_merge_conflicts",
-    "gitpulse_change_context",
-    "gitpulse_ledger_events",
-    "gitpulse_task_view",
-    "gitpulse_add_task",
-    "gitpulse_list_tasks",
-    "gitpulse_get_task",
-    "gitpulse_complete_task",
-    "gitpulse_delete_task",
-    "gitpulse_worktree_create",
-    "gitpulse_worktree_switch",
-    "gitpulse_worktree_isolate",
-    "gitpulse_worktree_prune",
-    "gitpulse_worktree_merge",
-    "gitpulse_agent_register",
-    "gitpulse_agent_peers",
-    "gitpulse_agent_send",
-    "gitpulse_agent_inbox",
-    "gitpulse_agent_wait",
+WAYLODE_TOOLS = [
+    "waylode_insights",
+    "waylode_status",
+    "waylode_active_changes",
+    "waylode_collision_risk",
+    "waylode_merge_conflicts",
+    "waylode_change_context",
+    "waylode_ledger_events",
+    "waylode_task_view",
+    "waylode_add_task",
+    "waylode_list_tasks",
+    "waylode_get_task",
+    "waylode_complete_task",
+    "waylode_delete_task",
+    "waylode_worktree_create",
+    "waylode_worktree_switch",
+    "waylode_worktree_isolate",
+    "waylode_worktree_prune",
+    "waylode_worktree_merge",
+    "waylode_agent_register",
+    "waylode_agent_peers",
+    "waylode_agent_send",
+    "waylode_agent_inbox",
+    "waylode_agent_wait",
 ]
 
-WAYLODE_TOOLS = [name.replace("gitpulse_", "waylode_", 1) for name in GITPULSE_TOOLS]
+GITPULSE_TOOLS = [name.replace("waylode_", "gitpulse_", 1) for name in WAYLODE_TOOLS]
 
 # What the server's allowlist enables: the new names first, then the old ones.
 WAYLODE_ALLOWLIST = WAYLODE_TOOLS + GITPULSE_TOOLS
@@ -183,17 +190,17 @@ def create_unified_antigravity_config(
 ) -> LocalAgentConfig:
     """
     Constructs a fully configured LocalAgentConfig hosting DevCouncil,
-    DevMap, and GitPulse MCP servers with zero-collision tool namespaces.
+    DevMap, and Waylode MCP servers with zero-collision tool namespaces.
     """
-    ws = workspace_root or os.getcwd()
+    ws = os.path.abspath(workspace_root or os.getcwd())
     mcp_servers: List[BaseMcpServerConfig] = []
 
     # 1. DevCouncil MCP Server (Stdio Transport)
     devcouncil_server = McpStdioServer(
         name="devcouncil",
         command="devcouncil",
-        args=["mcp", "serve"],
-        env={"DEVCOUNCIL_WORKSPACE": ws},
+        args=["mcp"],
+        env={"DEVCOUNCIL_PROJECT_ROOT": ws},
         enabled_tools=list(DEVCOUNCIL_TOOLS),
     )
     mcp_servers.append(devcouncil_server)
@@ -203,27 +210,31 @@ def create_unified_antigravity_config(
         devmap_server = McpStreamableHttpServer(
             name="devmap",
             url=f"http://127.0.0.1:{devmap_daemon_port}/mcp",
-            headers={"X-Workspace-Root": ws},
+            headers={"MCP-Protocol-Version": "2026-07-28"},
             fallback_command="devmap",
-            fallback_args=["serve", "--mcp", "--root", ws],
+            fallback_args=["mcp", "--root", ws],
             enabled_tools=list(DEVMAP_TOOLS),
         )
     else:
         devmap_server = McpStdioServer(
             name="devmap",
             command="devmap",
-            args=["serve", "--mcp", "--root", ws],
+            args=["mcp", "--root", ws],
             enabled_tools=list(DEVMAP_TOOLS),
         )
     mcp_servers.append(devmap_server)
 
-    # 3. Waylode (formerly GitPulse) MCP Server (Stdio Transport). The binary and
-    # its GITPULSE_REPOSITORY variable keep their names for now.
+    # 3. Waylode (formerly GitPulse) MCP Server (Stdio Transport).
+    # Suppress embedded devmap_* tools when standalone devmap is attached.
     waylode_server = McpStdioServer(
         name="waylode",
-        command="gitpulse-mcp",
-        args=["--repo", ws],
-        env={"GITPULSE_REPOSITORY": ws},
+        command="waylode-mcp",
+        args=[],
+        env={
+            "WAYLODE_REPOSITORY": ws,
+            "GITPULSE_REPOSITORY": ws,
+            "WAYLODE_MCP_NO_DEVMAP": "1",
+        },
         enabled_tools=list(WAYLODE_ALLOWLIST),
     )
     mcp_servers.append(waylode_server)

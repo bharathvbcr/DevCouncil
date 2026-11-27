@@ -2,8 +2,9 @@
 stop.py - Antigravity Agent Lifecycle Hook: The Hero Loop (Deterministic Self-Repair).
 
 Intercepts agent completion and invokes devcouncil_verify_task.
-If blocking verification gaps exist, returns StopDecision.CONTINUE with
-typed next actions to drive autonomous self-repair.
+If blocking verification gaps exist (or verification fails/degrades), returns
+StopDecision.CONTINUE with typed next_actions from verify.MCPResult to drive
+autonomous self-repair.
 """
 
 import asyncio
@@ -11,7 +12,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 from antigravity.config.mcp_bridge import call_mcp_tool
 from antigravity.hooks.session_state import (
@@ -30,15 +31,28 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
+def _format_location(item: Dict[str, Any]) -> str:
+    file_path = item.get("file") or ""
+    line = item.get("line")
+    if file_path and line is not None:
+        return f"{file_path}:{line}"
+    return str(file_path)
+
+
 @ag_hooks.stop
 async def stop_hook(data: Union[StopArgs, Any] = None) -> StopHookResult:
     """
     Executes when the root trajectory reaches idle and the agent attempts to stop.
     Invokes DevCouncil deterministic verification gates.
 
-    If blocking gaps exist:
+    Reads the real verify.MCPResult contract (backend/go_orchestrator/devcouncil/verify/types.go):
+      - ok, passed, status, degraded_reasons
+      - blocking_gaps[].{id, severity, description, file, line, recommended_fix}
+      - next_actions[].{category, action, file, line, gap_id, suggested_command}
+
+    If verification fails, degrades, or blocking gaps exist:
       - Intercepts termination.
-      - Injects typed next_actions (e.g. fix_code, add_test, fix_stub).
+      - Injects typed next_actions (e.g. fix_code, add_test, scope, security).
       - Returns StopDecision.CONTINUE with structured repair prompt.
     """
     continuation_count = 0
@@ -94,19 +108,56 @@ async def stop_hook(data: Union[StopArgs, Any] = None) -> StopHookResult:
 
     try:
         # 3. Invoke DevCouncil Deterministic Task Verification
-        verify_payload = {
+        verify_payload: Dict[str, Any] = {
             "task_id": state.task_id,
             "lease_token": state.lease_token,
         }
+        if state.repo_path and os.path.isabs(state.repo_path):
+            verify_payload["repo_path"] = state.repo_path
+
         verify_result = await call_mcp_tool(
             "devcouncil", "devcouncil_verify_task", verify_payload
         )
 
-        passed = verify_result.get("passed", False)
-        blocking_gaps: List[Dict[str, Any]] = verify_result.get("blocking_gaps", [])
-        typed_next_actions: List[Dict[str, Any]] = verify_result.get("typed_next_actions", [])
+        if not isinstance(verify_result, dict) or verify_result.get("ok") is not True:
+            err_msg = (
+                verify_result.get("error") or verify_result.get("code") or "verification call failed"
+                if isinstance(verify_result, dict)
+                else str(verify_result)
+            )
+            logger.error("DevCouncil verification call failed closed: %s", err_msg)
+            return StopHookResult(
+                decision=StopDecision.CONTINUE,
+                reason=(
+                    f"### DevCouncil Verification Unavailable (Hero Loop Attempt {continuation_count + 1}/{state.continuation_threshold})\n"
+                    f"`devcouncil_verify_task` failed closed and did not produce a passing verdict: {err_msg}\n\n"
+                    "Do NOT declare completion on an unverified task. Check the DevCouncil MCP server "
+                    "or run `dev tool call devcouncil_verify_task` from the shell and resolve the failure."
+                ),
+            )
 
-        if passed and not blocking_gaps:
+        passed = verify_result.get("passed") is True
+        status = str(verify_result.get("status", "")).lower()
+        raw_gaps = verify_result.get("blocking_gaps")
+        blocking_gaps: List[Dict[str, Any]] = (
+            [g for g in raw_gaps if isinstance(g, dict)]
+            if isinstance(raw_gaps, list)
+            else []
+        )
+        raw_actions = verify_result.get("next_actions")
+        next_actions: List[Dict[str, Any]] = (
+            [a for a in raw_actions if isinstance(a, dict)]
+            if isinstance(raw_actions, list)
+            else []
+        )
+        raw_degraded = verify_result.get("degraded_reasons")
+        degraded_reasons: List[str] = (
+            [str(r) for r in raw_degraded if r]
+            if isinstance(raw_degraded, list)
+            else []
+        )
+
+        if passed and not blocking_gaps and status != "degraded" and not degraded_reasons:
             logger.info("DevCouncil Verification PASSED with 0 blocking gaps. Completion approved.")
             return StopHookResult(decision=StopDecision.ALLOW_STOP)
 
@@ -115,28 +166,46 @@ async def stop_hook(data: Union[StopArgs, Any] = None) -> StopHookResult:
             f"### DevCouncil Verification Gate Refusal (Hero Loop Attempt {continuation_count + 1}/{state.continuation_threshold})",
             "Your proposed completion was rejected by deterministic verification because blocking gaps remain in your task implementation:",
             "",
-            "#### Blocking Gaps:",
         ]
 
+        if status == "degraded" or degraded_reasons:
+            repair_prompt_lines.append("#### Degraded Verification Checks (Never Passed):")
+            if degraded_reasons:
+                for reason in degraded_reasons:
+                    repair_prompt_lines.append(f"- {reason}")
+            else:
+                repair_prompt_lines.append("- Verification status is `degraded`; required checks did not complete.")
+            repair_prompt_lines.append("")
+
+        repair_prompt_lines.append("#### Blocking Gaps:")
         if not blocking_gaps:
             repair_prompt_lines.append("- [BLOCKING] `VERIFICATION_FAILED`: Task gates did not pass.")
         else:
             for gap in blocking_gaps:
-                gap_id = gap.get("gap_id", "GAP_UNKNOWN")
-                severity = gap.get("severity", "BLOCKING")
-                message = gap.get("message", "No description provided.")
-                repair_prompt_lines.append(f"- [{severity}] `{gap_id}`: {message}")
+                gap_id = gap.get("id") or "GAP_UNKNOWN"
+                severity = gap.get("severity") or "BLOCKING"
+                description = gap.get("description") or "No description provided."
+                location = _format_location(gap)
+                loc_suffix = f" ({location})" if location else ""
+                repair_prompt_lines.append(f"- [{severity}] `{gap_id}`{loc_suffix}: {description}")
 
         repair_prompt_lines.append("")
         repair_prompt_lines.append("#### Required Typed Next Actions:")
-        if not typed_next_actions:
+        if not next_actions:
             repair_prompt_lines.append("- **REPAIR**: Inspect test failures, fix failing assertions, and re-run verification.")
         else:
-            for action in typed_next_actions:
-                act_type = action.get("type", "REPAIR")
-                target = action.get("target", "")
-                instruction = action.get("instruction", "")
-                repair_prompt_lines.append(f"- **{act_type}** (`{target}`): {instruction}")
+            for act in next_actions:
+                category = act.get("category") or "repair"
+                action_text = act.get("action") or "Inspect and resolve the blocking gap."
+                target = _format_location(act) or str(act.get("gap_id") or "")
+                suggested_cmd = act.get("suggested_command")
+                cmd_suffix = f" (run: `{suggested_cmd}`)" if suggested_cmd else ""
+                if target:
+                    repair_prompt_lines.append(
+                        f"- **{category}** (`{target}`): {action_text}{cmd_suffix}"
+                    )
+                else:
+                    repair_prompt_lines.append(f"- **{category}**: {action_text}{cmd_suffix}")
 
         repair_prompt_lines.extend([
             "",
@@ -151,7 +220,7 @@ async def stop_hook(data: Union[StopArgs, Any] = None) -> StopHookResult:
         reason_text = "\n".join(repair_prompt_lines)
         logger.info(
             "Hero Loop self-repair triggered. Resuming agent loop with %d typed actions.",
-            len(typed_next_actions),
+            len(next_actions),
         )
 
         return StopHookResult(

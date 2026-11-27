@@ -1,8 +1,8 @@
 """
 on_session_start.py - Antigravity Agent Lifecycle Hook: Session Startup.
 
-Leases task via devcouncil_checkout_task and commands GitPulse to provision
-an isolated worktree with Copy-on-Write (CoW) build cache cloning.
+Leases task via devcouncil_checkout_task and commands Waylode (formerly GitPulse)
+to provision an isolated worktree with Copy-on-Write (CoW) build cache cloning.
 """
 
 import asyncio
@@ -26,7 +26,7 @@ async def on_session_start_hook() -> dict:
     """
     Executes at agent startup.
     1. Checks out a task lease from DevCouncil via devcouncil_checkout_task.
-    2. Provisions or registers an isolated worktree in GitPulse with CoW cache cloning.
+    2. Provisions or registers an isolated worktree in Waylode with CoW cache cloning.
     3. Binds the lease token and worktree path into session state.
     """
     logger.info(
@@ -50,17 +50,29 @@ async def on_session_start_hook() -> dict:
             "agent": "antigravity",
             "force": False,
         }
+        if state.repo_path and os.path.isabs(state.repo_path):
+            checkout_payload["repo_path"] = state.repo_path
+
         lease_result = await call_mcp_tool(
             "devcouncil", "devcouncil_checkout_task", checkout_payload
         )
-        if not lease_result.get("ok", True):
-            err_msg = lease_result.get("error", "Unknown error during checkout")
+        if not isinstance(lease_result, dict) or lease_result.get("ok") is not True:
+            err_msg = (
+                lease_result.get("error", "Unknown error during checkout")
+                if isinstance(lease_result, dict)
+                else str(lease_result)
+            )
             raise RuntimeError(f"Failed to acquire task lease for {state.task_id}: {err_msg}")
 
-        state.lease_token = lease_result.get("lease_token")
+        lease_token = lease_result.get("lease_token")
+        if not lease_token:
+            raise RuntimeError(
+                f"DevCouncil checkout for {state.task_id} returned no lease_token"
+            )
+        state.lease_token = lease_token
         logger.info("Acquired DevCouncil Lease Token: %s", state.lease_token)
 
-        # Step 2: Provision or Register Worktree in GitPulse with CoW cache sharing
+        # Step 2: Provision or Register Worktree in Waylode with CoW cache sharing
         branch_name = f"agent/{state.task_id}/{state.client_id}"
         state.active_branch = branch_name
         worktree_payload = {
@@ -72,11 +84,18 @@ async def on_session_start_hook() -> dict:
         worktree_res = await call_mcp_tool(
             "waylode", "waylode_worktree_create", worktree_payload
         )
+        if not isinstance(worktree_res, dict) or worktree_res.get("ok") is not True:
+            err_msg = (
+                worktree_res.get("error", "Unknown error provisioning worktree")
+                if isinstance(worktree_res, dict)
+                else str(worktree_res)
+            )
+            raise RuntimeError(f"Failed to provision Waylode worktree for {state.task_id}: {err_msg}")
 
         state.worktree_path = worktree_res.get("worktree_path", state.repo_path)
         shared_bytes = worktree_res.get("reflink_bytes_shared", 0)
         logger.info(
-            "GitPulse worktree assigned at %s (Reflink CoW shared bytes: %s)",
+            "Waylode worktree assigned at %s (Reflink CoW shared bytes: %s)",
             state.worktree_path,
             shared_bytes,
         )
@@ -92,7 +111,7 @@ async def on_session_start_hook() -> dict:
 
     except Exception as exc:
         logger.critical("Session start initialization failed: %s", exc, exc_info=True)
-        # Invariant B4 & Fail Closed: halt session if lease acquisition fails
+        # Invariant B4 & Fail Closed: halt session if lease or worktree setup fails
         raise RuntimeError(f"Antigravity session initialization halted: {exc}") from exc
 
 

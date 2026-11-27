@@ -2,9 +2,10 @@
 pre_tool_call_decide.py - Antigravity Agent Lifecycle Hook: Pre-Tool Interception.
 
 Guards all mutating tool calls:
-1. GitPulse line-level collision risk detection (fails closed if contended or scan fails).
-2. GateSecretScan and .env* / credential lockdown.
-3. DevCouncil policy_check_write scope and constitution validation.
+1. GateSecretScan and .env* / credential lockdown.
+2. Waylode line-level collision risk detection (fails closed if contended or scan fails).
+3. DevCouncil policy_check_write scope and constitution validation (fails closed on errors,
+   missing verdicts, or exceptions).
 4. Command security policies for shell execution.
 """
 
@@ -13,7 +14,7 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from antigravity.config.mcp_bridge import call_mcp_tool
 from antigravity.hooks.session_state import HookResult, ToolCall, ag_hooks, state
@@ -81,12 +82,22 @@ def is_protected_secret_file(path: str) -> bool:
     return False
 
 
+def _policy_operation_for_tool(tool_name: str) -> str:
+    """Maps a mutating tool name to DevCouncil's policy operation enum."""
+    if "delete" in tool_name:
+        return "delete"
+    if "edit" in tool_name or "replace" in tool_name or "append" in tool_name:
+        return "modify"
+    return "create"
+
+
 @ag_hooks.pre_tool_call_decide
 async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
     """
     Intercepts mutating actions before execution.
     Fails closed if another worktree holds the target file dirty, if the write
-    contains secrets, or if DevCouncil constitution gates forbid the operation.
+    contains secrets, or if DevCouncil constitution gates forbid or cannot
+    verify the operation.
     """
     tool_name = getattr(data, "name", "").lower()
     raw_args = getattr(data, "arguments", None) or {}
@@ -145,10 +156,9 @@ async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
                 ),
             )
 
-        # 4. Invariant B1: Query GitPulse Collision Risk
+        # 4. Invariant B1: Query Waylode Collision Risk
         # Only the arguments the server accepts: it rejects the rest outright
         # ("accepted: [path, repo_path]"), and a rejected scan is not a clean one.
-        # The answer is per file; line ranges and the caller's id are not part of it.
         collision_payload = {
             "repo_path": state.repo_path,
             "path": repo_rel_path,
@@ -160,32 +170,31 @@ async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
             )
         except Exception as exc:
             # Invariant B1: An unavailable collision scan MUST fail closed
-            logger.error("GitPulse collision scan threw exception: %s", exc)
+            logger.error("Waylode collision scan threw exception: %s", exc)
             return HookResult(
                 allow=False,
-                reason=f"SAFETY INTERCEPTION: GitPulse collision scanner unavailable ({exc}). Fails closed.",
+                reason=f"SAFETY INTERCEPTION: Waylode collision scanner unavailable ({exc}). Fails closed.",
             )
 
-        if not collision_res.get("ok", False):
+        if not isinstance(collision_res, dict) or not collision_res.get("ok", False):
             # Invariant B1: A failed scan is not clean
+            err_detail = collision_res.get("error") if isinstance(collision_res, dict) else collision_res
             return HookResult(
                 allow=False,
                 reason=(
-                    f"SAFETY INTERCEPTION: GitPulse collision scan could not verify '{repo_rel_path}' "
-                    f"(ok=False, error={collision_res.get('error')}). Write refused."
+                    f"SAFETY INTERCEPTION: Waylode collision scan could not verify '{repo_rel_path}' "
+                    f"(ok=False, error={err_detail}). Write refused."
                 ),
             )
 
         # A reply that carries neither answer a collision scan gives is not a clean
         # scan. The real server answers with `overlapping_files` (it has no
-        # `status`); the offline answer carries both. A reply with neither -- for
-        # example an `{"ok": True}` from a handler that never heard of the tool --
-        # must not read as "nothing overlaps".
+        # `status`); a reply with neither must not read as "nothing overlaps".
         if "overlapping_files" not in collision_res and "status" not in collision_res:
             return HookResult(
                 allow=False,
                 reason=(
-                    f"SAFETY INTERCEPTION: GitPulse collision scan returned no verdict for "
+                    f"SAFETY INTERCEPTION: Waylode collision scan returned no verdict for "
                     f"'{repo_rel_path}' (no overlapping_files or status in the reply). "
                     "A scan that did not answer is not clean. Write refused."
                 ),
@@ -195,13 +204,11 @@ async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
         status = str(collision_res.get("status", "")).lower()
         overlapping = collision_res.get("overlapping_files", [])
         # The server reports `overlapping_files` as a COUNT with the rows in
-        # `items`; the offline answer and older callers use a list of rows.
+        # `items`; older callers may supply a list of rows directly.
         rows = overlapping if isinstance(overlapping, list) else collision_res.get("items", [])
         rows = [row for row in rows if isinstance(row, dict)]
         if status == "contended" or overlapping:
             conflict = rows[0] if rows else collision_res
-            # The server names holders as `worktrees: [{agent_kind, branch, path}]`;
-            # the offline answer and older callers use flat keys.
             holders = conflict.get("worktrees")
             holder = holders[0] if isinstance(holders, list) and holders and isinstance(holders[0], dict) else {}
             conflicting_agent = (
@@ -232,31 +239,88 @@ async def pre_tool_call_decide_hook(data: Union[ToolCall, Any]) -> HookResult:
                 ),
             )
 
-        # 5. Query DevCouncil Policy Check Write
+        # 5. Query DevCouncil Policy Check Write (fail closed on error, missing verdict, or exception)
+        # Omit task_id when unleased: devcouncil_policy_check_write rejects an empty
+        # task_id string with invalid_argument, and without task_id still enforces
+        # hard-safety, restricted-path, and configured posture rules.
         policy_payload = {
             "path": repo_rel_path,
-            "task_id": state.task_id or "",
-            "operation": "modify" if ("edit" in tool_name or "replace" in tool_name) else "create",
+            "operation": _policy_operation_for_tool(tool_name),
         }
+        if state.task_id and str(state.task_id).strip():
+            policy_payload["task_id"] = str(state.task_id).strip()
+        if state.repo_path and os.path.isabs(state.repo_path):
+            policy_payload["repo_path"] = state.repo_path
+
         try:
             policy_res = await call_mcp_tool(
                 "devcouncil", "devcouncil_policy_check_write", policy_payload
             )
-            if not policy_res.get("allowed", True):
-                policy_reason = policy_res.get(
-                    "reason", "Violates DevCouncil gate policies or scope boundary."
-                )
-                logger.warning(
-                    "DevCouncil Policy check denied write to %s: %s",
-                    repo_rel_path,
-                    policy_reason,
-                )
-                return HookResult(
-                    allow=False,
-                    reason=f"POLICY DENIAL: Write to '{repo_rel_path}' refused by DevCouncil: {policy_reason}",
-                )
         except Exception as exc:
-            logger.warning("DevCouncil policy check warning: %s", exc)
+            logger.error("DevCouncil policy check threw exception: %s", exc)
+            return HookResult(
+                allow=False,
+                reason=(
+                    f"POLICY INTERCEPTION: DevCouncil policy check unavailable for "
+                    f"'{repo_rel_path}' ({exc}). Fails closed."
+                ),
+            )
+
+        if not isinstance(policy_res, dict) or policy_res.get("ok") is not True:
+            err_detail = (
+                policy_res.get("error") or policy_res.get("code") or "policy check failed"
+                if isinstance(policy_res, dict)
+                else str(policy_res)
+            )
+            logger.warning(
+                "DevCouncil policy check failed for %s: %s",
+                repo_rel_path,
+                err_detail,
+            )
+            return HookResult(
+                allow=False,
+                reason=(
+                    f"POLICY INTERCEPTION: DevCouncil could not verify write to "
+                    f"'{repo_rel_path}' (ok=False, error={err_detail}). Fails closed."
+                ),
+            )
+
+        allowed = policy_res.get("allowed")
+        if not isinstance(allowed, bool):
+            logger.warning(
+                "DevCouncil policy check omitted boolean 'allowed' for %s: %r",
+                repo_rel_path,
+                policy_res,
+            )
+            return HookResult(
+                allow=False,
+                reason=(
+                    f"POLICY INTERCEPTION: DevCouncil policy check returned no boolean "
+                    f"'allowed' verdict for '{repo_rel_path}'. Fails closed."
+                ),
+            )
+
+        if not allowed:
+            decision = policy_res.get("decision")
+            decision_reason = (
+                decision.get("reason")
+                if isinstance(decision, dict) and decision.get("reason")
+                else None
+            )
+            policy_reason = (
+                policy_res.get("reason")
+                or decision_reason
+                or "Violates DevCouncil gate policies or scope boundary."
+            )
+            logger.warning(
+                "DevCouncil Policy check denied write to %s: %s",
+                repo_rel_path,
+                policy_reason,
+            )
+            return HookResult(
+                allow=False,
+                reason=f"POLICY DENIAL: Write to '{repo_rel_path}' refused by DevCouncil: {policy_reason}",
+            )
 
     # Case B: Shell Commands (run_command)
     elif tool_name == "run_command":

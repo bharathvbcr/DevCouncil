@@ -2,12 +2,11 @@
 post_tool_call.py - Antigravity Agent Lifecycle Hook: Post-Tool Execution.
 
 Triggers incremental DevMap CAS index warming and appends tool execution
-and file mutation events to the GitPulse append-only ledger.
+and file mutation events to the Waylode (formerly GitPulse) append-only ledger.
 """
 
 import asyncio
 import logging
-import os
 import sys
 import time
 from typing import Any, Dict
@@ -36,7 +35,7 @@ MUTATING_FILE_TOOLS = {
 async def post_tool_call_hook(data: Any) -> Dict[str, Any]:
     """
     Executes immediately after any tool finishes.
-    1. Records tool mutation event in GitPulse append-only ledger.
+    1. Records tool mutation event in Waylode append-only ledger.
     2. If a file was modified, triggers DevMap incremental index warming.
     """
     tool_name = getattr(data, "name", None) or (data.get("name") if isinstance(data, dict) else "unknown_tool")
@@ -44,7 +43,7 @@ async def post_tool_call_hook(data: Any) -> Dict[str, Any]:
     has_error = getattr(data, "error", False) or (data.get("error", False) if isinstance(data, dict) else False)
 
     logger.debug("Processing post_tool_call for tool '%s'", tool_name)
-    audit_record = {
+    audit_record: Dict[str, Any] = {
         "ok": True,
         "tool_name": tool_name,
         "ledger_appended": False,
@@ -52,7 +51,7 @@ async def post_tool_call_hook(data: Any) -> Dict[str, Any]:
     }
 
     try:
-        # 1. Append tool mutation event to GitPulse ledger
+        # 1. Append tool mutation event to Waylode ledger
         ledger_event = {
             "timestamp": time.time(),
             "repo_path": state.repo_path,
@@ -72,19 +71,24 @@ async def post_tool_call_hook(data: Any) -> Dict[str, Any]:
         ledger_res = await call_mcp_tool(
             "waylode", "waylode_ledger_events", {"event": ledger_event}
         )
-        audit_record["ledger_appended"] = ledger_res.get("ok", True)
+        audit_record["ledger_appended"] = (
+            isinstance(ledger_res, dict) and ledger_res.get("ok") is True
+        )
 
         # 2. If a file was modified, trigger DevMap warm build / CAS cache update
         if tool_name.lower() in MUTATING_FILE_TOOLS and not has_error:
             devmap_res = await call_mcp_tool(
                 "devmap", "devmap_status", {"repo_path": state.repo_path}
             )
-            audit_record["devmap_warmed"] = devmap_res.get("ok", True)
-            logger.info(
-                "Triggered DevMap incremental CAS index warm for %s [Gen: %s]",
-                state.repo_path,
-                devmap_res.get("generation_id", "latest"),
-            )
+            warmed = isinstance(devmap_res, dict) and devmap_res.get("ok") is True
+            audit_record["devmap_warmed"] = warmed
+            if warmed:
+                gen = devmap_res.get("store_generation", devmap_res.get("generation_id", "latest"))
+                logger.info(
+                    "Triggered DevMap incremental CAS index warm for %s [Gen: %s]",
+                    state.repo_path,
+                    gen,
+                )
 
     except Exception as exc:
         # Post-tool telemetry warnings should be non-blocking

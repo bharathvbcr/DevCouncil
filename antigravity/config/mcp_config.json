@@ -4,10 +4,7 @@
   "mcpServers": {
     "devcouncil": {
       "command": "devcouncil",
-      "args": ["mcp", "serve"],
-      "env": {
-        "DEVCOUNCIL_WORKSPACE": "${DEVCOUNCIL_WORKSPACE:-.}"
-      },
+      "args": ["mcp"],
       "transport": "stdio",
       "tools": [
         "devcouncil_checkout_task",
@@ -23,34 +20,40 @@
     },
     "devmap": {
       "command": "devmap",
-      "args": ["serve", "--mcp", "--root", "${DEVCOUNCIL_WORKSPACE:-.}"],
+      "args": ["mcp"],
       "url": "http://127.0.0.1:9095/mcp",
       "transport": "http",
       "fallback_transport": "stdio",
       "tools": [
         "devmap_status",
         "devmap_search",
-        "devmap_explore",
+        "devmap_ask",
+        "devmap_ask_evidence",
         "devmap_dependencies",
         "devmap_impact",
         "devmap_trace",
         "devmap_neighbors",
         "devmap_dead_symbols",
+        "devmap_skeleton",
         "devmap_clones",
         "devmap_preview",
+        "devmap_explore",
+        "devmap_literals",
+        "devmap_doc_drift",
         "devmap_affected_tests",
-        "devmap_blast",
         "devmap_suspects",
-        "devmap_ask_evidence",
-        "devmap_doc_drift"
+        "devmap_blast",
+        "devmap_routes",
+        "devmap_api_impact",
+        "devmap_cypher"
       ],
       "description": "DevMap high-precision 11-tier code intelligence, AST extraction, and graph search"
     },
     "waylode": {
-      "command": "gitpulse-mcp",
-      "args": ["--repo", "${DEVCOUNCIL_WORKSPACE:-.}"],
+      "command": "waylode-mcp",
+      "args": [],
       "env": {
-        "GITPULSE_REPOSITORY": "${DEVCOUNCIL_WORKSPACE:-.}"
+        "WAYLODE_MCP_NO_DEVMAP": "1"
       },
       "transport": "stdio",
       "tools": [
