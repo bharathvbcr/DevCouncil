@@ -12,8 +12,10 @@
 //!   backslashes, duplicate paths, or oversized payloads.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 use anyhow::{anyhow, bail, ensure, Result};
+use sha2::{Digest, Sha256};
 
 /// Hard ceiling (256 MiB) on compressed archive input, decompressed tar stream,
 /// and total extracted payload bytes.
@@ -897,6 +899,575 @@ pub fn unpack_tar_gz_strict(gz_bytes: &[u8], max_bytes: usize) -> Result<Vec<(St
     read_tar_strict(&tar, max_bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Zeroization, CSPRNG, RFC 5869 HKDF-SHA256, RFC 8439 ChaCha20-Poly1305, DMC1
+// ---------------------------------------------------------------------------
+
+/// Magic header for authenticated encrypted DevMap cache containers (`DMC1`).
+pub const DMC1_MAGIC: &[u8; 4] = b"DMC1";
+/// Container format version byte.
+pub const DMC1_VERSION: u8 = 1;
+/// 12-byte ChaCha20-Poly1305 nonce length.
+pub const DMC1_NONCE_LEN: usize = 12;
+/// 16-byte Poly1305 authentication tag length.
+pub const DMC1_TAG_LEN: usize = 16;
+/// Fixed header length: `b"DMC1"` (4) || `version` (1) || `nonce` (12).
+pub const DMC1_HEADER_LEN: usize = 4 + 1 + DMC1_NONCE_LEN;
+/// Domain-separation prefix for AEAD AAD and HKDF `info`.
+pub const DMC1_DOMAIN_PREFIX: &[u8] = b"devmap-cache/v1\0";
+/// HKDF-SHA256 salt for deriving the per-repo cache AEAD subkey.
+const DMC1_HKDF_SALT: &[u8] = b"devmap-cache-hkdf-v1";
+
+/// Wipe a byte slice in pure safe Rust without `unsafe`, using `black_box` +
+/// `SeqCst` compiler fence so the optimizer cannot elide the zeroing stores.
+pub(crate) fn zeroize_bytes(buf: &mut [u8]) {
+    buf.fill(0);
+    let _ = std::hint::black_box(&*buf);
+    compiler_fence(Ordering::SeqCst);
+}
+
+fn zeroize_u32s(buf: &mut [u32]) {
+    buf.fill(0);
+    let _ = std::hint::black_box(&*buf);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// 32-byte secret key buffer zeroized automatically on drop.
+pub struct ZeroizingKey32([u8; 32]);
+
+impl ZeroizingKey32 {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingKey32 {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
+
+/// Variable-length secret buffer zeroized automatically on drop.
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
+
+/// Fill `out` from the OS CSPRNG via `getrandom` (cross-platform, zero `unsafe`).
+fn csprng_fill(out: &mut [u8]) -> Result<()> {
+    getrandom::fill(out).map_err(|err| anyhow!("OS CSPRNG failed for cache nonce: {err}"))
+}
+
+/// Constant-time byte slice equality.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    let _ = std::hint::black_box(diff);
+    diff == 0
+}
+
+/// Pure-Rust RFC 2104 HMAC-SHA256 returning raw 32-byte tag.
+pub(crate) fn hmac_sha256_raw(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let mut digest = Sha256::digest(key);
+        k[..32].copy_from_slice(&digest);
+        zeroize_bytes(&mut digest);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut i_key_pad = [0x36u8; BLOCK];
+    let mut o_key_pad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        i_key_pad[i] ^= k[i];
+        o_key_pad[i] ^= k[i];
+    }
+    zeroize_bytes(&mut k);
+
+    let mut inner = Sha256::new();
+    inner.update(i_key_pad);
+    inner.update(data);
+    let mut inner_hash = inner.finalize();
+    zeroize_bytes(&mut i_key_pad);
+
+    let mut outer = Sha256::new();
+    outer.update(o_key_pad);
+    outer.update(inner_hash);
+    zeroize_bytes(&mut o_key_pad);
+    zeroize_bytes(&mut inner_hash);
+
+    let mut out = [0u8; 32];
+    let mut finalized = outer.finalize();
+    out.copy_from_slice(&finalized);
+    zeroize_bytes(&mut finalized);
+    out
+}
+
+/// Pure-Rust RFC 5869 HKDF-Extract using SHA-256.
+pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    if salt.is_empty() {
+        let zeros = [0u8; 32];
+        hmac_sha256_raw(&zeros, ikm)
+    } else {
+        hmac_sha256_raw(salt, ikm)
+    }
+}
+
+/// Pure-Rust RFC 5869 HKDF-Expand using SHA-256.
+pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) -> Result<()> {
+    const HASH_LEN: usize = 32;
+    ensure!(
+        okm.len() <= 255 * HASH_LEN,
+        "HKDF output length {} exceeds 255 * {HASH_LEN}",
+        okm.len()
+    );
+    if okm.is_empty() {
+        return Ok(());
+    }
+
+    let mut t_prev = [0u8; HASH_LEN];
+    let mut t_len = 0usize;
+    let mut offset = 0usize;
+    let mut counter: u8 = 1;
+    let mut input_buf = Vec::with_capacity(HASH_LEN + info.len() + 1);
+
+    while offset < okm.len() {
+        input_buf.clear();
+        input_buf.extend_from_slice(&t_prev[..t_len]);
+        input_buf.extend_from_slice(info);
+        input_buf.push(counter);
+
+        t_prev = hmac_sha256_raw(prk, &input_buf);
+        t_len = HASH_LEN;
+        let take = (okm.len() - offset).min(HASH_LEN);
+        okm[offset..offset + take].copy_from_slice(&t_prev[..take]);
+        offset += take;
+        counter = counter.wrapping_add(1);
+    }
+
+    zeroize_bytes(&mut t_prev);
+    zeroize_bytes(&mut input_buf);
+    Ok(())
+}
+
+/// Pure-Rust RFC 5869 HKDF-SHA256 (Extract + Expand) with intermediate zeroization.
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
+    let mut prk = hkdf_extract(salt, ikm);
+    let res = hkdf_expand(&prk, info, okm);
+    zeroize_bytes(&mut prk);
+    res
+}
+
+#[inline]
+fn chacha_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(7);
+}
+
+#[inline]
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Pure-Rust RFC 8439 Section 2.3 ChaCha20 block function.
+pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    let mut state = [0u32; 16];
+    state[0] = 0x6170_7865;
+    state[1] = 0x3320_646e;
+    state[2] = 0x7962_2d32;
+    state[3] = 0x6b20_6574;
+    for i in 0..8 {
+        state[4 + i] = read_u32_le(&key[i * 4..i * 4 + 4]);
+    }
+    state[12] = counter;
+    state[13] = read_u32_le(&nonce[0..4]);
+    state[14] = read_u32_le(&nonce[4..8]);
+    state[15] = read_u32_le(&nonce[8..12]);
+
+    let mut working = state;
+    for _ in 0..10 {
+        chacha_quarter_round(&mut working, 0, 4, 8, 12);
+        chacha_quarter_round(&mut working, 1, 5, 9, 13);
+        chacha_quarter_round(&mut working, 2, 6, 10, 14);
+        chacha_quarter_round(&mut working, 3, 7, 11, 15);
+        chacha_quarter_round(&mut working, 0, 5, 10, 15);
+        chacha_quarter_round(&mut working, 1, 6, 11, 12);
+        chacha_quarter_round(&mut working, 2, 7, 8, 13);
+        chacha_quarter_round(&mut working, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 64];
+    for i in 0..16 {
+        let word = working[i].wrapping_add(state[i]);
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    zeroize_u32s(&mut working);
+    zeroize_u32s(&mut state);
+    out
+}
+
+/// Pure-Rust RFC 8439 Section 2.4 ChaCha20 XOR stream cipher (in-place).
+pub fn chacha20_xor_in_place(
+    key: &[u8; 32],
+    initial_counter: u32,
+    nonce: &[u8; 12],
+    data: &mut [u8],
+) -> Result<()> {
+    let mut counter = initial_counter;
+    let mut first = true;
+    for chunk in data.chunks_mut(64) {
+        if !first {
+            counter = counter
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("ChaCha20 block counter overflow"))?;
+        }
+        first = false;
+        let mut keystream = chacha20_block(key, counter, nonce);
+        for (dst, &ks) in chunk.iter_mut().zip(keystream.iter()) {
+            *dst ^= ks;
+        }
+        zeroize_bytes(&mut keystream);
+    }
+    Ok(())
+}
+
+/// Pure-Rust RFC 8439 Section 2.5 Poly1305 one-time MAC using 5x26-bit limbs.
+pub fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+    let mut r_bytes = [0u8; 16];
+    r_bytes.copy_from_slice(&key[0..16]);
+    r_bytes[3] &= 15;
+    r_bytes[7] &= 15;
+    r_bytes[11] &= 15;
+    r_bytes[15] &= 15;
+    r_bytes[4] &= 252;
+    r_bytes[8] &= 252;
+    r_bytes[12] &= 252;
+
+    let r_u128 = u128::from_le_bytes(r_bytes);
+    zeroize_bytes(&mut r_bytes);
+    let r0 = (r_u128 & 0x03ff_ffff) as u64;
+    let r1 = ((r_u128 >> 26) & 0x03ff_ffff) as u64;
+    let r2 = ((r_u128 >> 52) & 0x03ff_ffff) as u64;
+    let r3 = ((r_u128 >> 78) & 0x03ff_ffff) as u64;
+    let r4 = ((r_u128 >> 104) & 0x03ff_ffff) as u64;
+
+    let s1 = r1 * 5;
+    let s2 = r2 * 5;
+    let s3 = r3 * 5;
+    let s4 = r4 * 5;
+
+    let mut h0: u64 = 0;
+    let mut h1: u64 = 0;
+    let mut h2: u64 = 0;
+    let mut h3: u64 = 0;
+    let mut h4: u64 = 0;
+
+    let mut block = [0u8; 17];
+    for chunk in msg.chunks(16) {
+        block.fill(0);
+        block[..chunk.len()].copy_from_slice(chunk);
+        block[chunk.len()] = 1;
+
+        let lo = u128::from_le_bytes([
+            block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7],
+            block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15],
+        ]);
+        let hi = u128::from(block[16]);
+
+        h0 += (lo & 0x03ff_ffff) as u64;
+        h1 += ((lo >> 26) & 0x03ff_ffff) as u64;
+        h2 += ((lo >> 52) & 0x03ff_ffff) as u64;
+        h3 += ((lo >> 78) & 0x03ff_ffff) as u64;
+        h4 += (((lo >> 104) | (hi << 24)) & 0x03ff_ffff) as u64;
+
+        let d0 = u128::from(h0) * u128::from(r0)
+            + u128::from(h1) * u128::from(s4)
+            + u128::from(h2) * u128::from(s3)
+            + u128::from(h3) * u128::from(s2)
+            + u128::from(h4) * u128::from(s1);
+        let mut d1 = u128::from(h0) * u128::from(r1)
+            + u128::from(h1) * u128::from(r0)
+            + u128::from(h2) * u128::from(s4)
+            + u128::from(h3) * u128::from(s3)
+            + u128::from(h4) * u128::from(s2);
+        let mut d2 = u128::from(h0) * u128::from(r2)
+            + u128::from(h1) * u128::from(r1)
+            + u128::from(h2) * u128::from(r0)
+            + u128::from(h3) * u128::from(s4)
+            + u128::from(h4) * u128::from(s3);
+        let mut d3 = u128::from(h0) * u128::from(r3)
+            + u128::from(h1) * u128::from(r2)
+            + u128::from(h2) * u128::from(r1)
+            + u128::from(h3) * u128::from(r0)
+            + u128::from(h4) * u128::from(s4);
+        let mut d4 = u128::from(h0) * u128::from(r4)
+            + u128::from(h1) * u128::from(r3)
+            + u128::from(h2) * u128::from(r2)
+            + u128::from(h3) * u128::from(r1)
+            + u128::from(h4) * u128::from(r0);
+
+        let mut c = d0 >> 26;
+        h0 = (d0 & 0x03ff_ffff) as u64;
+        d1 += c;
+        c = d1 >> 26;
+        h1 = (d1 & 0x03ff_ffff) as u64;
+        d2 += c;
+        c = d2 >> 26;
+        h2 = (d2 & 0x03ff_ffff) as u64;
+        d3 += c;
+        c = d3 >> 26;
+        h3 = (d3 & 0x03ff_ffff) as u64;
+        d4 += c;
+        c = d4 >> 26;
+        h4 = (d4 & 0x03ff_ffff) as u64;
+        h0 += (c as u64) * 5;
+        let c0 = h0 >> 26;
+        h0 &= 0x03ff_ffff;
+        h1 += c0;
+    }
+    zeroize_bytes(&mut block);
+
+    let mut c = h1 >> 26;
+    h1 &= 0x03ff_ffff;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= 0x03ff_ffff;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= 0x03ff_ffff;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= 0x03ff_ffff;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 &= 0x03ff_ffff;
+    h1 += c;
+
+    let mut g0 = h0 + 5;
+    c = g0 >> 26;
+    g0 &= 0x03ff_ffff;
+    let mut g1 = h1 + c;
+    c = g1 >> 26;
+    g1 &= 0x03ff_ffff;
+    let mut g2 = h2 + c;
+    c = g2 >> 26;
+    g2 &= 0x03ff_ffff;
+    let mut g3 = h3 + c;
+    c = g3 >> 26;
+    g3 &= 0x03ff_ffff;
+    let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
+
+    let mask = (g4 >> 63).wrapping_sub(1);
+    h0 = (h0 & !mask) | (g0 & mask);
+    h1 = (h1 & !mask) | (g1 & mask);
+    h2 = (h2 & !mask) | (g2 & mask);
+    h3 = (h3 & !mask) | (g3 & mask);
+    h4 = (h4 & !mask) | (g4 & mask);
+
+    let f = u128::from(h0)
+        | (u128::from(h1) << 26)
+        | (u128::from(h2) << 52)
+        | (u128::from(h3) << 78)
+        | (u128::from(h4) << 104);
+    let s = u128::from_le_bytes([
+        key[16], key[17], key[18], key[19], key[20], key[21], key[22], key[23], key[24], key[25],
+        key[26], key[27], key[28], key[29], key[30], key[31],
+    ]);
+    f.wrapping_add(s).to_le_bytes()
+}
+
+fn poly1305_aead_tag(otk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
+    let aad_pad = (16 - (aad.len() % 16)) % 16;
+    let ct_pad = (16 - (ciphertext.len() % 16)) % 16;
+    let total_len = aad.len() + aad_pad + ciphertext.len() + ct_pad + 16;
+    let mut mac_data = Vec::with_capacity(total_len);
+    mac_data.extend_from_slice(aad);
+    mac_data.resize(mac_data.len() + aad_pad, 0);
+    mac_data.extend_from_slice(ciphertext);
+    mac_data.resize(mac_data.len() + ct_pad, 0);
+    mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    poly1305_mac(otk, &mac_data)
+}
+
+fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
+    let mut block0 = chacha20_block(key, 0, nonce);
+    let mut otk = [0u8; 32];
+    otk.copy_from_slice(&block0[..32]);
+    zeroize_bytes(&mut block0);
+    otk
+}
+
+/// Pure-Rust RFC 8439 Section 2.8 ChaCha20-Poly1305 AEAD encryption.
+/// Returns `ciphertext || 16-byte tag`.
+pub fn chacha20_poly1305_seal(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let mut otk = poly1305_key_gen(key, nonce);
+    let mut out = Vec::with_capacity(plaintext.len() + DMC1_TAG_LEN);
+    out.extend_from_slice(plaintext);
+    chacha20_xor_in_place(key, 1, nonce, &mut out)?;
+    let tag = poly1305_aead_tag(&otk, aad, &out);
+    zeroize_bytes(&mut otk);
+    out.extend_from_slice(&tag);
+    Ok(out)
+}
+
+/// Pure-Rust RFC 8439 Section 2.8 ChaCha20-Poly1305 AEAD decryption.
+/// Verifies the 16-byte Poly1305 tag in constant time before decrypting.
+pub fn chacha20_poly1305_open(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext_and_tag: &[u8],
+) -> Result<Vec<u8>> {
+    ensure!(
+        ciphertext_and_tag.len() >= DMC1_TAG_LEN,
+        "ChaCha20-Poly1305 ciphertext truncated (< {DMC1_TAG_LEN} bytes)"
+    );
+    let split = ciphertext_and_tag.len() - DMC1_TAG_LEN;
+    let ciphertext = &ciphertext_and_tag[..split];
+    let tag = &ciphertext_and_tag[split..];
+
+    let mut otk = poly1305_key_gen(key, nonce);
+    let expected_tag = poly1305_aead_tag(&otk, aad, ciphertext);
+    zeroize_bytes(&mut otk);
+
+    ensure!(
+        constant_time_eq(&expected_tag, tag),
+        "ChaCha20-Poly1305 authentication failed (wrong key, wrong repo_root_hash AAD, or tampered archive)"
+    );
+
+    let mut plaintext = ciphertext.to_vec();
+    chacha20_xor_in_place(key, 1, nonce, &mut plaintext)?;
+    Ok(plaintext)
+}
+
+/// Returns `true` when `bytes` begins with the `DMC1` container magic.
+pub fn is_dmc1_container(bytes: &[u8]) -> bool {
+    bytes.starts_with(DMC1_MAGIC)
+}
+
+/// Build the domain-separated AEAD AAD / HKDF info: `b"devmap-cache/v1\0" || repo_root_hash.as_bytes()`.
+pub fn build_cache_aad(repo_root_hash: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(DMC1_DOMAIN_PREFIX.len() + repo_root_hash.len());
+    aad.extend_from_slice(DMC1_DOMAIN_PREFIX);
+    aad.extend_from_slice(repo_root_hash.as_bytes());
+    aad
+}
+
+/// Derive the 32-byte ChaCha20-Poly1305 subkey via RFC 5869 HKDF-SHA256.
+pub fn derive_cache_subkey(key_material: &[u8], repo_root_hash: &str) -> Result<ZeroizingKey32> {
+    ensure!(
+        !key_material.is_empty(),
+        "cache encryption key material must not be empty"
+    );
+    ensure!(
+        !repo_root_hash.is_empty(),
+        "repo_root_hash must not be empty for cache key derivation"
+    );
+    let info = build_cache_aad(repo_root_hash);
+    let mut subkey = [0u8; 32];
+    hkdf_sha256(DMC1_HKDF_SALT, key_material, &info, &mut subkey)?;
+    Ok(ZeroizingKey32(subkey))
+}
+
+/// Encrypt `.tar.gz` bytes into an authenticated `DMC1` container:
+/// `b"DMC1"` (4 B) || `1u8` (1 B) || 12-byte CSPRNG nonce || ChaCha20-Poly1305 ciphertext+tag.
+pub fn encrypt_cache_archive(
+    gz_bytes: &[u8],
+    key_material: &[u8],
+    repo_root_hash: &str,
+) -> Result<Vec<u8>> {
+    let total_len = gz_bytes
+        .len()
+        .checked_add(DMC1_HEADER_LEN + DMC1_TAG_LEN)
+        .ok_or_else(|| anyhow!("encrypted cache archive size overflow"))?;
+    ensure!(
+        total_len <= MAX_ARCHIVE_BYTES,
+        "encrypted cache archive ({total_len} bytes) exceeds maximum allowed size ({MAX_ARCHIVE_BYTES} bytes)"
+    );
+
+    let subkey = derive_cache_subkey(key_material, repo_root_hash)?;
+    let aad = build_cache_aad(repo_root_hash);
+    let mut nonce = [0u8; DMC1_NONCE_LEN];
+    csprng_fill(&mut nonce)?;
+
+    let ct_and_tag = chacha20_poly1305_seal(subkey.as_bytes(), &nonce, &aad, gz_bytes)?;
+    let mut out = Vec::with_capacity(DMC1_HEADER_LEN + ct_and_tag.len());
+    out.extend_from_slice(DMC1_MAGIC);
+    out.push(DMC1_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct_and_tag);
+    Ok(out)
+}
+
+/// Decrypt and authenticate a `DMC1` container back into `.tar.gz` bytes.
+pub fn decrypt_cache_archive(
+    container: &[u8],
+    key_material: &[u8],
+    repo_root_hash: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        container.len() <= max_bytes,
+        "encrypted cache archive ({} bytes) exceeds maximum allowed size ({max_bytes} bytes)",
+        container.len()
+    );
+    ensure!(
+        container.starts_with(DMC1_MAGIC),
+        "cache archive is not an encrypted DMC1 container"
+    );
+    ensure!(
+        container.len() >= DMC1_HEADER_LEN + DMC1_TAG_LEN,
+        "truncated DMC1 cache archive ({} bytes)",
+        container.len()
+    );
+    ensure!(
+        container[4] == DMC1_VERSION,
+        "unsupported DMC1 container version {} (expected {DMC1_VERSION})",
+        container[4]
+    );
+
+    let nonce: [u8; DMC1_NONCE_LEN] = container[5..DMC1_HEADER_LEN]
+        .try_into()
+        .map_err(|_| anyhow!("invalid DMC1 nonce slice"))?;
+    let ct_and_tag = &container[DMC1_HEADER_LEN..];
+
+    let subkey = derive_cache_subkey(key_material, repo_root_hash)?;
+    let aad = build_cache_aad(repo_root_hash);
+    chacha20_poly1305_open(subkey.as_bytes(), &nonce, &aad, ct_and_tag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,5 +1563,141 @@ mod tests {
         assert_eq!(gz_a, gz_b, "entry ordering must not change archive bytes");
         let entries = unpack_tar_gz_strict(&gz_a, MAX_ARCHIVE_BYTES).unwrap();
         assert_eq!(entries, b);
+    }
+
+    fn decode_hex(s: &str) -> Vec<u8> {
+        let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        assert_eq!(clean.len() % 2, 0);
+        clean
+            .chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn rfc8439_section_2_3_2_chacha20_block_kat() {
+        let key: [u8; 32] =
+            decode_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .try_into()
+                .unwrap();
+        let nonce: [u8; 12] = decode_hex("000000090000004a00000000").try_into().unwrap();
+        let expected = decode_hex(
+            "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e\
+             d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e",
+        );
+        let block = chacha20_block(&key, 1, &nonce);
+        assert_eq!(block.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn rfc8439_section_2_5_2_poly1305_mac_kat() {
+        let key: [u8; 32] =
+            decode_hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+                .try_into()
+                .unwrap();
+        let msg = b"Cryptographic Forum Research Group";
+        let expected = decode_hex("a8061dc1305136c6c22b8baf0c0127a9");
+        let tag = poly1305_mac(&key, msg);
+        assert_eq!(tag.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn rfc8439_section_2_8_2_aead_chacha20_poly1305_kat() {
+        let key: [u8; 32] =
+            decode_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+                .try_into()
+                .unwrap();
+        let nonce: [u8; 12] = decode_hex("070000004041424344454647").try_into().unwrap();
+        let aad = decode_hex("50515253c0c1c2c3c4c5c6c7");
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected = decode_hex(
+            "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6\
+             3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36\
+             92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc\
+             3ff4def08e4b7a9de576d26586cec64b6116\
+             1ae10b594f09e26a7e902ecbd0600691",
+        );
+
+        let sealed = chacha20_poly1305_seal(&key, &nonce, &aad, plaintext).unwrap();
+        assert_eq!(sealed, expected);
+
+        let opened = chacha20_poly1305_open(&key, &nonce, &aad, &sealed).unwrap();
+        assert_eq!(opened, plaintext);
+
+        // Wrong AAD must fail closed.
+        assert!(chacha20_poly1305_open(&key, &nonce, b"wrong-aad", &sealed).is_err());
+
+        // Tampered tag or ciphertext must fail closed.
+        let mut tampered_tag = sealed.clone();
+        *tampered_tag.last_mut().unwrap() ^= 0x01;
+        assert!(chacha20_poly1305_open(&key, &nonce, &aad, &tampered_tag).is_err());
+
+        let mut tampered_ct = sealed;
+        tampered_ct[0] ^= 0x80;
+        assert!(chacha20_poly1305_open(&key, &nonce, &aad, &tampered_ct).is_err());
+    }
+
+    #[test]
+    fn rfc5869_hkdf_sha256_kat() {
+        // RFC 5869 Appendix A.1 (Test Case 1)
+        let ikm = decode_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+        let salt = decode_hex("000102030405060708090a0b0c");
+        let info = decode_hex("f0f1f2f3f4f5f6f7f8f9");
+        let expected = decode_hex(
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        );
+        let mut okm = [0u8; 42];
+        hkdf_sha256(&salt, &ikm, &info, &mut okm).unwrap();
+        assert_eq!(okm.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn dmc1_container_roundtrip_and_fail_closed_tamper_aad_key() {
+        let entries = vec![("a.txt".to_string(), b"secret-cache-payload".to_vec())];
+        let gz = pack_tar_gz(&entries).unwrap();
+        let key = b"super-secret-32-byte-key-material";
+        let repo_hash = "a".repeat(64);
+
+        let c1 = encrypt_cache_archive(&gz, key, &repo_hash).unwrap();
+        let c2 = encrypt_cache_archive(&gz, key, &repo_hash).unwrap();
+        assert!(is_dmc1_container(&c1));
+        assert_eq!(&c1[..4], b"DMC1");
+        assert_eq!(c1[4], 1);
+        assert_eq!(c1.len(), DMC1_HEADER_LEN + gz.len() + DMC1_TAG_LEN);
+        // Fresh CSPRNG nonces make ciphertexts distinct.
+        assert_ne!(c1[5..17], c2[5..17]);
+        assert_ne!(c1, c2);
+
+        // Decryption restores exact tar.gz bytes.
+        let dec = decrypt_cache_archive(&c1, key, &repo_hash, MAX_ARCHIVE_BYTES).unwrap();
+        assert_eq!(dec, gz);
+
+        // Wrong key fails closed.
+        assert!(decrypt_cache_archive(&c1, b"wrong-key", &repo_hash, MAX_ARCHIVE_BYTES).is_err());
+
+        // Wrong repo_root_hash AAD fails closed.
+        let wrong_repo = "b".repeat(64);
+        assert!(decrypt_cache_archive(&c1, key, &wrong_repo, MAX_ARCHIVE_BYTES).is_err());
+
+        // Tampered ciphertext / tag / nonce / version fail closed.
+        let mut bad_ct = c1.clone();
+        bad_ct[DMC1_HEADER_LEN] ^= 0x01;
+        assert!(decrypt_cache_archive(&bad_ct, key, &repo_hash, MAX_ARCHIVE_BYTES).is_err());
+
+        let mut bad_tag = c1.clone();
+        *bad_tag.last_mut().unwrap() ^= 0x01;
+        assert!(decrypt_cache_archive(&bad_tag, key, &repo_hash, MAX_ARCHIVE_BYTES).is_err());
+
+        let mut bad_nonce = c1.clone();
+        bad_nonce[5] ^= 0x01;
+        assert!(decrypt_cache_archive(&bad_nonce, key, &repo_hash, MAX_ARCHIVE_BYTES).is_err());
+
+        let mut bad_ver = c1.clone();
+        bad_ver[4] = 2;
+        assert!(decrypt_cache_archive(&bad_ver, key, &repo_hash, MAX_ARCHIVE_BYTES).is_err());
+
+        // Plaintext .tar.gz rejected as non-DMC1.
+        assert!(!is_dmc1_container(&gz));
+        assert!(decrypt_cache_archive(&gz, key, &repo_hash, MAX_ARCHIVE_BYTES).is_err());
     }
 }

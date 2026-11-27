@@ -28,8 +28,9 @@ use devmap_store::seed::{self, SQLITE_SIDECARS};
 use devmap_store::{current_git_head, Store, CURRENT_SCHEMA_VERSION};
 
 use crate::cache_archive::{
-    pack_tar_gz, unpack_tar_gz_strict, validate_archive_entry_path, CACHE_FORMAT_VERSION,
-    MAX_ARCHIVE_BYTES,
+    decrypt_cache_archive, encrypt_cache_archive, hmac_sha256_raw, is_dmc1_container, pack_tar_gz,
+    unpack_tar_gz_strict, validate_archive_entry_path, zeroize_bytes, SecretBytes,
+    CACHE_FORMAT_VERSION, MAX_ARCHIVE_BYTES,
 };
 use crate::cli::{root_parser, Cli};
 use crate::output::{emit_json, ensure_parent};
@@ -42,6 +43,9 @@ pub const RELAY_URL_ENV: &str = "GITPULSE_RELAY_URL";
 /// Optional environment variable carrying a shared team HMAC-SHA256 signing key
 /// for verifying cache manifest provenance on unpack/pull (C8).
 pub const CACHE_SIGNING_KEY_ENV: &str = "DEVMAP_CACHE_SIGNING_KEY";
+/// Environment variable carrying the E2EE cache encryption key (read strictly
+/// from env, never argv, zeroized after use). Required for remote push/pull.
+pub const CACHE_ENCRYPTION_KEY_ENV: &str = "DEVMAP_CACHE_ENCRYPTION_KEY";
 
 /// Scope for remote relay cache bundles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -76,9 +80,10 @@ pub(crate) struct Args {
 
 #[derive(Subcommand)]
 pub(crate) enum CacheAction {
-    /// Pack the local store and CSR/extract-cache sidecars into a deterministic .tar.gz.
+    /// Pack the local store and CSR/extract-cache sidecars into an encrypted DMC1
+    /// (or local `--allow-plaintext` `.tar.gz`) archive.
     Pack {
-        /// Destination archive path (.tar.gz).
+        /// Destination archive path (.tar.gz / .dmc1).
         #[arg(long, value_parser = root_parser())]
         out: PathBuf,
         /// Optional explicit 64-hex repository hash (defaults to SHA-256 of canonical repo root).
@@ -88,10 +93,14 @@ pub(crate) enum CacheAction {
         /// By default literals are stripped so possible secrets in source literals are never exported.
         #[arg(long, default_value_t = false)]
         include_literals: bool,
+        /// Allow writing an unencrypted local-only `.tar.gz` when `DEVMAP_CACHE_ENCRYPTION_KEY` is unset.
+        #[arg(long, default_value_t = false)]
+        allow_plaintext: bool,
     },
-    /// Verify and atomically unpack a cache .tar.gz into this repository's store.
+    /// Verify and atomically unpack an encrypted DMC1 (or `--allow-plaintext` `.tar.gz`)
+    /// cache archive into this repository's store.
     Unpack {
-        /// Source archive path (.tar.gz).
+        /// Source archive path.
         #[arg(long = "in", value_parser = root_parser())]
         input: PathBuf,
         /// Optional explicit 64-hex repository hash expected in manifest.json.
@@ -103,6 +112,9 @@ pub(crate) enum CacheAction {
         /// Refuse unpacking unless manifest git_head exactly matches this checkout's HEAD.
         #[arg(long, default_value_t = false)]
         require_git_head: bool,
+        /// Allow unpacking an unencrypted local-only `.tar.gz` archive (forbidden for remote pull).
+        #[arg(long, default_value_t = false)]
+        allow_plaintext: bool,
     },
     /// Report local store cache readiness, schema version, and relay auth availability.
     Status {
@@ -302,43 +314,106 @@ impl CacheManifest {
     }
 }
 
-/// Pure-Rust RFC 2104 HMAC-SHA256 using workspace `sha2` (zero extra crates).
+/// Pure-Rust RFC 2104 HMAC-SHA256 hex digest using `cache_archive::hmac_sha256_raw`.
 fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    const BLOCK: usize = 64;
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = Sha256::digest(key);
-        k[..32].copy_from_slice(&digest);
-    } else {
-        k[..key.len()].copy_from_slice(key);
+    let tag = hmac_sha256_raw(key, data);
+    let mut hex = String::with_capacity(64);
+    for byte in tag {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
     }
-    let mut i_key_pad = [0x36u8; BLOCK];
-    let mut o_key_pad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        i_key_pad[i] ^= k[i];
-        o_key_pad[i] ^= k[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(i_key_pad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(o_key_pad);
-    outer.update(inner_hash);
-    format!("{:x}", outer.finalize())
+    hex
 }
 
 fn constant_time_eq_hex(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+    crate::cache_archive::constant_time_eq(a.as_bytes(), b.as_bytes())
+}
+
+fn decode_std_base64_32(input: &[u8]) -> Option<[u8; 32]> {
+    if input.len() != 44 || input[43] != b'=' {
+        return None;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        diff |= x ^ y;
+    let val = |b: u8| -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; 32];
+    for (idx, chunk) in input[..40].as_chunks::<4>().0.iter().enumerate() {
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        let c = val(chunk[2])?;
+        let d = val(chunk[3])?;
+        out[idx * 3] = (a << 2) | (b >> 4);
+        out[idx * 3 + 1] = ((b & 0x0f) << 4) | (c >> 2);
+        out[idx * 3 + 2] = ((c & 0x03) << 6) | d;
     }
-    diff == 0
+    let a = val(input[40])?;
+    let b = val(input[41])?;
+    let c = val(input[42])?;
+    // 32 bytes => 256 bits; 43rd sextet carries 4 data bits + 2 zero pad bits.
+    if c & 0x03 != 0 {
+        zeroize_bytes(&mut out);
+        return None;
+    }
+    out[30] = (a << 2) | (b >> 4);
+    out[31] = ((b & 0x0f) << 4) | (c >> 2);
+    Some(out)
+}
+
+fn parse_cache_encryption_key_bytes(raw: &mut [u8]) -> Result<Option<SecretBytes>> {
+    let start = raw
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |idx| idx + 1);
+    if start >= end {
+        zeroize_bytes(raw);
+        return Ok(None);
+    }
+    let trimmed = &raw[start..end];
+    if trimmed.iter().any(|&b| b <= 0x1f || b == 0x7f) {
+        zeroize_bytes(raw);
+        bail!("{CACHE_ENCRYPTION_KEY_ENV} contains invalid control characters");
+    }
+    let secret = if let Some(mut decoded32) = decode_std_base64_32(trimmed) {
+        let s = SecretBytes::new(decoded32.to_vec());
+        zeroize_bytes(&mut decoded32);
+        s
+    } else {
+        SecretBytes::new(trimmed.to_vec())
+    };
+    zeroize_bytes(raw);
+    Ok(Some(secret))
+}
+
+fn read_optional_cache_encryption_key() -> Result<Option<SecretBytes>> {
+    match std::env::var(CACHE_ENCRYPTION_KEY_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{CACHE_ENCRYPTION_KEY_ENV} must be valid UTF-8")
+        }
+        Ok(val) => {
+            let mut raw = val.into_bytes();
+            parse_cache_encryption_key_bytes(&mut raw)
+        }
+    }
+}
+
+fn require_cache_encryption_key() -> Result<SecretBytes> {
+    read_optional_cache_encryption_key()?.ok_or_else(|| {
+        anyhow!(
+            "{CACHE_ENCRYPTION_KEY_ENV} environment variable is required for remote cache push/pull (missing or empty; keys are never accepted via CLI flags)"
+        )
+    })
 }
 
 /// Integrity record for one payload file inside a cache archive.
@@ -585,12 +660,13 @@ impl LatestPointerResponse {
     }
 }
 
-/// Unpack provenance options controlling `repo_root_hash` and `git_head` checks.
+/// Unpack provenance and encryption options.
 #[derive(Debug, Clone, Default)]
 pub struct UnpackOptions {
     pub expected_repo_hash: Option<String>,
     pub allow_foreign_repo: bool,
     pub require_git_head: bool,
+    pub allow_plaintext: bool,
 }
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
@@ -601,10 +677,17 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
             out,
             repo_hash,
             include_literals,
+            allow_plaintext,
         } => {
             let repo_root_hash = resolve_repo_hash(&root, repo_hash.as_deref())?;
-            let (archive_bytes, manifest, archive_sha256) =
-                pack_store_to_bytes_opts(&root, &db_path, &repo_root_hash, *include_literals)?;
+            let (archive_bytes, manifest, archive_sha256) = pack_store_to_bytes_with_policy(
+                &root,
+                &db_path,
+                &repo_root_hash,
+                *include_literals,
+                *allow_plaintext,
+            )?;
+            let encrypted = is_dmc1_container(&archive_bytes);
             ensure_parent(out)?;
             write_file_atomic(out, &archive_bytes)?;
             let payload = serde_json::json!({
@@ -612,6 +695,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                 "out": out,
                 "bytes": archive_bytes.len(),
                 "sha256": archive_sha256,
+                "encrypted": encrypted,
                 "schema_version": manifest.schema_version,
                 "format_version": manifest.format_version,
                 "repo_root_hash": manifest.repo_root_hash,
@@ -623,10 +707,11 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                 emit_json(cli, &payload)?;
             } else {
                 outln!(
-                    "packed {} ({} bytes, sha256 {}, {} entries, schema {})",
+                    "packed {} ({} bytes, sha256 {}, encrypted={}, {} entries, schema {})",
                     out.display(),
                     archive_bytes.len(),
                     &archive_sha256[..12],
+                    encrypted,
                     manifest.entries.len(),
                     manifest.schema_version
                 );
@@ -637,6 +722,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
             repo_hash,
             allow_foreign_repo,
             require_git_head,
+            allow_plaintext,
         } => {
             let meta = std::fs::metadata(input)
                 .with_context(|| format!("cannot inspect cache archive {}", input.display()))?;
@@ -655,6 +741,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
             let expected_repo_hash = Some(resolve_repo_hash(&root, repo_hash.as_deref())?);
             let archive_bytes = std::fs::read(input)
                 .with_context(|| format!("cannot read cache archive {}", input.display()))?;
+            let encrypted = is_dmc1_container(&archive_bytes);
             let archive_sha256 = sha256_hex(&archive_bytes);
             let manifest = unpack_bytes_into_store_opts(
                 &root,
@@ -664,6 +751,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                     expected_repo_hash,
                     allow_foreign_repo: *allow_foreign_repo,
                     require_git_head: *require_git_head,
+                    allow_plaintext: *allow_plaintext,
                 },
             )?;
             let local_head = current_git_head(&root).unwrap_or_default();
@@ -673,6 +761,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                 "in": input,
                 "db_path": db_path,
                 "sha256": archive_sha256,
+                "encrypted": encrypted,
                 "schema_version": manifest.schema_version,
                 "format_version": manifest.format_version,
                 "repo_root_hash": manifest.repo_root_hash,
@@ -684,10 +773,11 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                 emit_json(cli, &payload)?;
             } else {
                 outln!(
-                    "unpacked {} into {} (schema {}, {} entries, head_match={})",
+                    "unpacked {} into {} (schema {}, encrypted={}, {} entries, head_match={})",
                     input.display(),
                     db_path.display(),
                     manifest.schema_version,
+                    encrypted,
                     manifest.entries.len(),
                     git_head_matches
                 );
@@ -715,6 +805,8 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
             let relay_token_present = std::env::var(RELAY_TOKEN_ENV)
                 .ok()
                 .is_some_and(|v| !v.trim().is_empty());
+            let encryption_key_configured =
+                read_optional_cache_encryption_key().is_ok_and(|k| k.is_some());
             let last_state = read_local_cache_state(&root);
             let payload = serde_json::json!({
                 "db_path": db_path,
@@ -728,13 +820,14 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                 "git_head": git_head,
                 "generation": generation,
                 "relay_token_configured": relay_token_present,
+                "encryption_key_configured": encryption_key_configured,
                 "last_pushed_digest": last_state.map(|s| s.last_digest),
             });
             if cli.json {
                 emit_json(cli, &payload)?;
             } else {
                 outln!(
-                    "db={} present={} ({} bytes) csr={} ({} bytes) schema={} repo_hash={} relay_token={}",
+                    "db={} present={} ({} bytes) csr={} ({} bytes) schema={} repo_hash={} relay_token={} encryption_key={}",
                     db_path.display(),
                     db_present,
                     db_bytes,
@@ -742,7 +835,8 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                     csr_bytes,
                     CURRENT_SCHEMA_VERSION,
                     &repo_root_hash[..12],
-                    if relay_token_present { "set" } else { "unset" }
+                    if relay_token_present { "set" } else { "unset" },
+                    if encryption_key_configured { "set" } else { "unset" }
                 );
             }
         }
@@ -817,6 +911,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<()> {
                     expected_repo_hash: Some(repo_root_hash.clone()),
                     allow_foreign_repo: *allow_foreign_repo,
                     require_git_head: *require_git_head,
+                    allow_plaintext: false,
                 },
             )?;
             let payload = serde_json::json!({
@@ -1127,9 +1222,10 @@ fn write_file_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Pack a repository's SQLite store, CSR sidecar, and extract/resolution caches
-/// into a deterministic `.tar.gz` byte vector + manifest + archive SHA-256.
+/// into an authenticated encrypted `DMC1` container (or plaintext `.tar.gz` only
+/// when `allow_plaintext` is true and `DEVMAP_CACHE_ENCRYPTION_KEY` is unset).
 /// Strips source string literals by default (pass `include_literals = true` to retain them).
-/// Test-only shorthand; the `cache` command calls [`pack_store_to_bytes_opts`].
+/// Test-only shorthand; the `cache` command calls [`pack_store_to_bytes_with_policy`].
 #[cfg(test)]
 pub fn pack_store_to_bytes(
     root: &Path,
@@ -1139,12 +1235,48 @@ pub fn pack_store_to_bytes(
     pack_store_to_bytes_opts(root, db_path, repo_root_hash, false)
 }
 
+#[allow(dead_code)]
 pub fn pack_store_to_bytes_opts(
     root: &Path,
     db_path: &Path,
     repo_root_hash: &str,
     include_literals: bool,
 ) -> Result<(Vec<u8>, CacheManifest, String)> {
+    pack_store_to_bytes_with_policy(root, db_path, repo_root_hash, include_literals, false)
+}
+
+pub fn pack_store_to_bytes_with_policy(
+    root: &Path,
+    db_path: &Path,
+    repo_root_hash: &str,
+    include_literals: bool,
+    allow_plaintext: bool,
+) -> Result<(Vec<u8>, CacheManifest, String)> {
+    let enc_key = read_optional_cache_encryption_key()?;
+    pack_store_to_bytes_inner(
+        root,
+        db_path,
+        repo_root_hash,
+        include_literals,
+        enc_key.as_ref(),
+        allow_plaintext,
+    )
+}
+
+fn pack_store_to_bytes_inner(
+    root: &Path,
+    db_path: &Path,
+    repo_root_hash: &str,
+    include_literals: bool,
+    encryption_key: Option<&SecretBytes>,
+    allow_plaintext: bool,
+) -> Result<(Vec<u8>, CacheManifest, String)> {
+    let repo_root_hash = validate_hex64(repo_root_hash, "repo_root_hash")?;
+    if encryption_key.is_none() && !allow_plaintext {
+        bail!(
+            "{CACHE_ENCRYPTION_KEY_ENV} environment variable is required to encrypt cache archives (pass --allow-plaintext only for local offline archives)"
+        );
+    }
     let db_meta = std::fs::symlink_metadata(db_path).with_context(|| {
         format!(
             "no devmap store at {} — run `devmap build` first",
@@ -1265,7 +1397,7 @@ pub fn pack_store_to_bytes_opts(
         format_version: CACHE_FORMAT_VERSION,
         schema_version: CURRENT_SCHEMA_VERSION,
         extraction_schema_version: devmap_extract::cache::EXTRACTION_SCHEMA_VERSION.to_string(),
-        repo_root_hash: repo_root_hash.to_string(),
+        repo_root_hash: repo_root_hash.clone(),
         git_head: current_git_head(root).unwrap_or_default(),
         entries: manifest_entries,
         manifest_hmac: None,
@@ -1289,8 +1421,23 @@ pub fn pack_store_to_bytes_opts(
         "compressed cache archive ({} bytes) exceeds maximum allowed size ({MAX_ARCHIVE_BYTES} bytes)",
         gz_bytes.len()
     );
-    let archive_sha256 = sha256_hex(&gz_bytes);
-    Ok((gz_bytes, manifest, archive_sha256))
+    let archive_bytes = match encryption_key {
+        Some(key) => encrypt_cache_archive(&gz_bytes, key.as_slice(), &repo_root_hash)?,
+        None => {
+            ensure!(
+                allow_plaintext,
+                "{CACHE_ENCRYPTION_KEY_ENV} is not set; refusing unencrypted cache archive"
+            );
+            gz_bytes
+        }
+    };
+    ensure!(
+        archive_bytes.len() <= MAX_ARCHIVE_BYTES,
+        "final cache archive ({} bytes) exceeds maximum allowed size ({MAX_ARCHIVE_BYTES} bytes)",
+        archive_bytes.len()
+    );
+    let archive_sha256 = sha256_hex(&archive_bytes);
+    Ok((archive_bytes, manifest, archive_sha256))
 }
 
 fn is_allowed_payload_path(path: &str) -> bool {
@@ -1307,41 +1454,57 @@ fn is_allowed_payload_path(path: &str) -> bool {
     false
 }
 
-/// Test convenience wrapper for unpacking without repo-hash enforcement.
-/// Production callers MUST use [`unpack_bytes_into_store_opts`] with
-/// `allow_foreign_repo: false` by default (C8).
-#[cfg(test)]
-pub fn unpack_bytes_into_store(
-    root: &Path,
-    db_path: &Path,
-    gz_bytes: &[u8],
-) -> Result<CacheManifest> {
-    unpack_bytes_into_store_opts(
-        root,
-        db_path,
-        gz_bytes,
-        &UnpackOptions {
-            expected_repo_hash: None,
-            allow_foreign_repo: true,
-            require_git_head: false,
-        },
-    )
-}
-
-/// Strictly verify provenance (`repo_root_hash`, optional `git_head`), SQLite
-/// defensive `PRAGMA quick_check(1)` + `cell_size_check`, and atomically unpack
-/// a `.tar.gz` cache archive into `db_path`.
+/// Strictly verify E2EE (`DMC1` unless `opts.allow_plaintext`), provenance
+/// (`repo_root_hash`, optional `git_head`), SQLite defensive `PRAGMA quick_check(1)`
+/// + `cell_size_check`, and atomically unpack a cache archive into `db_path`.
 pub fn unpack_bytes_into_store_opts(
     root: &Path,
     db_path: &Path,
-    gz_bytes: &[u8],
+    archive_bytes: &[u8],
     opts: &UnpackOptions,
 ) -> Result<CacheManifest> {
+    let enc_key = read_optional_cache_encryption_key()?;
+    unpack_bytes_into_store_inner(root, db_path, archive_bytes, opts, enc_key.as_ref())
+}
+
+fn unpack_bytes_into_store_inner(
+    root: &Path,
+    db_path: &Path,
+    archive_bytes: &[u8],
+    opts: &UnpackOptions,
+    encryption_key: Option<&SecretBytes>,
+) -> Result<CacheManifest> {
     ensure!(
-        gz_bytes.len() <= MAX_ARCHIVE_BYTES,
+        archive_bytes.len() <= MAX_ARCHIVE_BYTES,
         "cache archive ({} bytes) exceeds maximum allowed size ({MAX_ARCHIVE_BYTES} bytes)",
-        gz_bytes.len()
+        archive_bytes.len()
     );
+
+    let decrypted_gz: Vec<u8>;
+    let gz_bytes: &[u8] = if is_dmc1_container(archive_bytes) {
+        let key = encryption_key.ok_or_else(|| {
+            anyhow!(
+                "{CACHE_ENCRYPTION_KEY_ENV} environment variable is required to decrypt DMC1 cache archive"
+            )
+        })?;
+        let aad_repo_hash = opts.expected_repo_hash.as_deref().ok_or_else(|| {
+            anyhow!("repo_root_hash is required to authenticate DMC1 cache archive")
+        })?;
+        let aad_repo_hash = validate_hex64(aad_repo_hash, "expected_repo_hash")?;
+        decrypted_gz = decrypt_cache_archive(
+            archive_bytes,
+            key.as_slice(),
+            &aad_repo_hash,
+            MAX_ARCHIVE_BYTES,
+        )?;
+        &decrypted_gz
+    } else {
+        ensure!(
+            opts.allow_plaintext,
+            "refusing unencrypted cache archive (missing DMC1 header); set {CACHE_ENCRYPTION_KEY_ENV} or pass --allow-plaintext for local offline archives"
+        );
+        archive_bytes
+    };
 
     let extracted = unpack_tar_gz_strict(gz_bytes, MAX_ARCHIVE_BYTES)?;
     let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -1617,6 +1780,7 @@ pub fn push_cache_opts(
     bearer_token: &str,
     include_literals: bool,
 ) -> Result<PushReport> {
+    let enc_key = require_cache_encryption_key()?;
     let token = validate_relay_token(bearer_token)?;
     let base = validate_relay_base_url(relay_url, "--relay-url")?;
     let relay_is_loopback = base.starts_with("http://");
@@ -1624,8 +1788,18 @@ pub fn push_cache_opts(
     let (resolved_scope, resolved_space_id) = resolve_scope_and_space_id(scope, space_id)?;
     let scope_str = resolved_scope.as_str().to_string();
 
-    let (archive_bytes, manifest, archive_sha256) =
-        pack_store_to_bytes_opts(root, db_path, &repo_root_hash, include_literals)?;
+    let (archive_bytes, manifest, archive_sha256) = pack_store_to_bytes_inner(
+        root,
+        db_path,
+        &repo_root_hash,
+        include_literals,
+        Some(&enc_key),
+        false,
+    )?;
+    ensure!(
+        is_dmc1_container(&archive_bytes),
+        "refusing to push unencrypted cache archive (missing DMC1 header)"
+    );
     let req = PresignRequest {
         scope: scope_str.clone(),
         space_id: resolved_space_id.clone(),
@@ -1734,6 +1908,7 @@ pub fn pull_cache(
             expected_repo_hash: Some(repo_root_hash.to_string()),
             allow_foreign_repo: false,
             require_git_head: false,
+            allow_plaintext: false,
         },
     )
 }
@@ -1750,6 +1925,11 @@ pub fn pull_cache_opts(
     bearer_token: &str,
     unpack_opts: &UnpackOptions,
 ) -> Result<(CacheManifest, String)> {
+    ensure!(
+        !unpack_opts.allow_plaintext,
+        "plaintext archives are forbidden on remote cache pull"
+    );
+    let enc_key = require_cache_encryption_key()?;
     let token = validate_relay_token(bearer_token)?;
     let base = validate_relay_base_url(relay_url, "--relay-url")?;
     let relay_is_loopback = base.starts_with("http://");
@@ -1822,8 +2002,18 @@ pub fn pull_cache_opts(
         actual_digest == requested_digest,
         "downloaded cache SHA-256 mismatch: expected {requested_digest}, got {actual_digest}"
     );
+    ensure!(
+        is_dmc1_container(&archive_bytes),
+        "refusing unencrypted remote cache payload (must start with DMC1)"
+    );
 
-    let manifest = unpack_bytes_into_store_opts(root, db_path, &archive_bytes, unpack_opts)?;
+    let manifest = unpack_bytes_into_store_inner(
+        root,
+        db_path,
+        &archive_bytes,
+        unpack_opts,
+        Some(&enc_key),
+    )?;
     let _ = write_local_cache_state(
         root,
         &LocalCacheState {
@@ -2427,7 +2617,40 @@ mod tests {
     use super::*;
     use crate::cache_archive::{gzip_compress, write_tar};
     use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const TEST_CACHE_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+
+    struct CacheEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl CacheEnvGuard {
+        fn set(val: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os(CACHE_ENCRYPTION_KEY_ENV);
+            std::env::set_var(CACHE_ENCRYPTION_KEY_ENV, val);
+            Self { _lock: lock, prev }
+        }
+
+        fn unset() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os(CACHE_ENCRYPTION_KEY_ENV);
+            std::env::remove_var(CACHE_ENCRYPTION_KEY_ENV);
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for CacheEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(CACHE_ENCRYPTION_KEY_ENV, v),
+                None => std::env::remove_var(CACHE_ENCRYPTION_KEY_ENV),
+            }
+        }
+    }
 
     fn scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2462,17 +2685,34 @@ mod tests {
 
     #[test]
     fn pack_and_unpack_roundtrip_restores_queryable_store() {
+        let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
         let (src_repo, src_db) = build_indexed_repo("pack-src");
         let dst_repo = scratch_dir("pack-dst");
         let dst_db = devmap_extract::paths::store_path(&dst_repo);
 
         let repo_hash = resolve_repo_hash(&src_repo, None).unwrap();
-        let (gz, manifest, digest) = pack_store_to_bytes(&src_repo, &src_db, &repo_hash).unwrap();
+        let (dmc1, manifest, digest) =
+            pack_store_to_bytes(&src_repo, &src_db, &repo_hash).unwrap();
+        assert!(
+            is_dmc1_container(&dmc1),
+            "packed archive must be encrypted DMC1 when key is set"
+        );
         assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(manifest.format_version, CACHE_FORMAT_VERSION);
         assert_eq!(digest.len(), 64);
 
-        let unpacked = unpack_bytes_into_store(&dst_repo, &dst_db, &gz).unwrap();
+        let unpacked = unpack_bytes_into_store_opts(
+            &dst_repo,
+            &dst_db,
+            &dmc1,
+            &UnpackOptions {
+                expected_repo_hash: Some(repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+                allow_plaintext: false,
+            },
+        )
+        .unwrap();
         assert_eq!(unpacked.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(dst_db.is_file());
 
@@ -2500,6 +2740,7 @@ mod tests {
 
     #[test]
     fn unpack_rejects_schema_mismatch_and_bad_entry_digest() {
+        let _env = CacheEnvGuard::unset();
         let (src_repo, src_db) = build_indexed_repo("bad-manifest");
         let dst_repo = scratch_dir("bad-manifest-dst");
         let dst_db = devmap_extract::paths::store_path(&dst_repo);
@@ -2527,7 +2768,18 @@ mod tests {
             (DB_ENTRY_NAME.to_string(), db_bytes.clone()),
         ])
         .unwrap();
-        let err = unpack_bytes_into_store(&dst_repo, &dst_db, &gz).unwrap_err();
+        let err = unpack_bytes_into_store_opts(
+            &dst_repo,
+            &dst_db,
+            &gz,
+            &UnpackOptions {
+                expected_repo_hash: None,
+                allow_foreign_repo: true,
+                require_git_head: false,
+                allow_plaintext: true,
+            },
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("schema_version"), "{err}");
         assert!(!dst_db.exists());
 
@@ -2553,7 +2805,18 @@ mod tests {
             (DB_ENTRY_NAME.to_string(), db_bytes),
         ])
         .unwrap();
-        let err = unpack_bytes_into_store(&dst_repo, &dst_db, &gz).unwrap_err();
+        let err = unpack_bytes_into_store_opts(
+            &dst_repo,
+            &dst_db,
+            &gz,
+            &UnpackOptions {
+                expected_repo_hash: None,
+                allow_foreign_repo: true,
+                require_git_head: false,
+                allow_plaintext: true,
+            },
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("SHA-256 digest mismatch"), "{err}");
         assert!(!dst_db.exists());
 
@@ -2563,6 +2826,7 @@ mod tests {
 
     #[test]
     fn unpack_rejects_undeclared_extra_file() {
+        let _env = CacheEnvGuard::unset();
         let (src_repo, src_db) = build_indexed_repo("extra-file");
         let dst_repo = scratch_dir("extra-file-dst");
         let dst_db = devmap_extract::paths::store_path(&dst_repo);
@@ -2591,7 +2855,18 @@ mod tests {
         ])
         .unwrap();
         let gz = gzip_compress(&tar);
-        let err = unpack_bytes_into_store(&dst_repo, &dst_db, &gz).unwrap_err();
+        let err = unpack_bytes_into_store_opts(
+            &dst_repo,
+            &dst_db,
+            &gz,
+            &UnpackOptions {
+                expected_repo_hash: None,
+                allow_foreign_repo: true,
+                require_git_head: false,
+                allow_plaintext: true,
+            },
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("undeclared extra file"), "{err}");
 
         let _ = std::fs::remove_dir_all(&src_repo);
@@ -2600,6 +2875,7 @@ mod tests {
 
     #[test]
     fn push_and_pull_mock_http_presign_server() {
+        let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
         let (src_repo, src_db) = build_indexed_repo("http-src");
         let dst_repo = scratch_dir("http-dst");
         let dst_db = devmap_extract::paths::store_path(&dst_repo);
@@ -2759,6 +3035,14 @@ mod tests {
         assert_eq!(pushed.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(pushed.key.starts_with("devmap-cache/spaces/space-123/"));
         assert_eq!(pushed.updated_at, "2026-11-25T23:00:00Z");
+        {
+            let guard = blobs.lock().unwrap();
+            let uploaded = guard.get(&pushed.digest).unwrap();
+            assert!(
+                is_dmc1_container(uploaded),
+                "uploaded remote cache blob must be encrypted DMC1 container"
+            );
+        }
 
         let (pulled_manifest, pulled_digest) = pull_cache(
             &dst_repo,
@@ -2802,6 +3086,7 @@ mod tests {
 
     #[test]
     fn relay_push_latest_and_pull_without_digest_roundtrip() {
+        let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
         let (src_repo, src_db) = build_indexed_repo("relay-rt-src");
         let dst_space_repo = scratch_dir("relay-rt-dst-space");
         let dst_space_db = devmap_extract::paths::store_path(&dst_space_repo);
@@ -3107,6 +3392,7 @@ mod tests {
                 expected_repo_hash: Some(repo_hash.clone()),
                 allow_foreign_repo: false,
                 require_git_head: false,
+                allow_plaintext: false,
             },
         )
         .unwrap();
@@ -3155,6 +3441,7 @@ mod tests {
                 expected_repo_hash: Some(repo_hash.clone()),
                 allow_foreign_repo: false,
                 require_git_head: false,
+                allow_plaintext: false,
             },
         )
         .unwrap();
@@ -3176,6 +3463,7 @@ mod tests {
                 expected_repo_hash: Some(missing_repo_hash.clone()),
                 allow_foreign_repo: false,
                 require_git_head: false,
+                allow_plaintext: false,
             },
         )
         .unwrap_err();
@@ -3197,6 +3485,7 @@ mod tests {
                 expected_repo_hash: Some(repo_hash.clone()),
                 allow_foreign_repo: false,
                 require_git_head: false,
+                allow_plaintext: false,
             },
         )
         .unwrap_err();
@@ -3292,6 +3581,7 @@ mod tests {
 
     #[test]
     fn unpack_rejects_foreign_repo_hash_unless_explicitly_allowed() {
+        let _env = CacheEnvGuard::unset();
         let (src_repo, src_db) = build_indexed_repo("foreign-src");
         let dst_repo = scratch_dir("foreign-dst");
         let dst_db = devmap_extract::paths::store_path(&dst_repo);
@@ -3300,7 +3590,8 @@ mod tests {
         let dst_hash = resolve_repo_hash(&dst_repo, None).unwrap();
         assert_ne!(src_hash, dst_hash);
 
-        let (gz, _, _) = pack_store_to_bytes(&src_repo, &src_db, &src_hash).unwrap();
+        let (gz, _, _) =
+            pack_store_to_bytes_with_policy(&src_repo, &src_db, &src_hash, false, true).unwrap();
         let err = unpack_bytes_into_store_opts(
             &dst_repo,
             &dst_db,
@@ -3309,6 +3600,7 @@ mod tests {
                 expected_repo_hash: Some(dst_hash.clone()),
                 allow_foreign_repo: false,
                 require_git_head: false,
+                allow_plaintext: true,
             },
         )
         .unwrap_err();
@@ -3324,6 +3616,7 @@ mod tests {
                 expected_repo_hash: Some(dst_hash),
                 allow_foreign_repo: true,
                 require_git_head: false,
+                allow_plaintext: true,
             },
         )
         .unwrap();
@@ -3336,6 +3629,7 @@ mod tests {
     #[test]
     fn pack_strips_planted_secret_literal_from_raw_sqlite_and_extractions() {
         const SECRET_MARKER: &str = "AKIA_TEST_PLANTED_LITERAL_9988776655";
+        let _env = CacheEnvGuard::unset();
         let repo = scratch_dir("secret-scrub");
         let src = format!(
             "/// Docstring with {SECRET_MARKER}\npub fn leak_probe() -> &'static str {{ \"{SECRET_MARKER}\" }}\n"
@@ -3354,7 +3648,8 @@ mod tests {
         }
 
         let repo_hash = resolve_repo_hash(&repo, None).unwrap();
-        let (gz, _, _) = pack_store_to_bytes(&repo, &db, &repo_hash).unwrap();
+        let (gz, _, _) =
+            pack_store_to_bytes_with_policy(&repo, &db, &repo_hash, false, true).unwrap();
         let entries = unpack_tar_gz_strict(&gz, MAX_ARCHIVE_BYTES).unwrap();
         let (_, packed_db_bytes) = entries
             .iter()
@@ -3380,6 +3675,7 @@ mod tests {
                 expected_repo_hash: Some(repo_hash),
                 allow_foreign_repo: false,
                 require_git_head: false,
+                allow_plaintext: true,
             },
         )
         .unwrap();
@@ -3457,5 +3753,374 @@ mod tests {
         tampered.git_head = "cafebabe".to_string();
         let recomputed = hmac_sha256_hex(key, &tampered.canonical_unsigned_bytes().unwrap());
         assert!(!constant_time_eq_hex(&sig, &recomputed));
+    }
+
+    #[test]
+    fn h5_push_and_pull_fail_closed_when_encryption_key_missing_or_empty() {
+        let (src_repo, src_db) = build_indexed_repo("h5-missing-key-src");
+        let dst_repo = scratch_dir("h5-missing-key-dst");
+        let dst_db = devmap_extract::paths::store_path(&dst_repo);
+        let repo_hash = resolve_repo_hash(&src_repo, None).unwrap();
+
+        // Bind a loopback listener that must NEVER receive a connection when key is missing/empty.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        for env_val in [None, Some(""), Some("   \t\n  ")] {
+            let _env = match env_val {
+                None => CacheEnvGuard::unset(),
+                Some(v) => CacheEnvGuard::set(v),
+            };
+            let push_err = push_cache_opts(
+                &src_repo,
+                &src_db,
+                &base_url,
+                None,
+                None,
+                &repo_hash,
+                "tok-1",
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                push_err.to_string().contains(CACHE_ENCRYPTION_KEY_ENV),
+                "push must fail closed naming {CACHE_ENCRYPTION_KEY_ENV}: {push_err}"
+            );
+
+            let pull_err = pull_cache_opts(
+                &dst_repo,
+                &dst_db,
+                &base_url,
+                None,
+                None,
+                Some(&"a".repeat(64)),
+                &repo_hash,
+                "tok-1",
+                &UnpackOptions {
+                    expected_repo_hash: Some(repo_hash.clone()),
+                    allow_foreign_repo: false,
+                    require_git_head: false,
+                    allow_plaintext: false,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                pull_err.to_string().contains(CACHE_ENCRYPTION_KEY_ENV),
+                "pull must fail closed naming {CACHE_ENCRYPTION_KEY_ENV}: {pull_err}"
+            );
+            assert!(
+                listener.accept().is_err(),
+                "must fail closed before making any network connection"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&src_repo);
+        let _ = std::fs::remove_dir_all(&dst_repo);
+    }
+
+    #[test]
+    fn h5_pull_rejects_unencrypted_tar_gz_even_with_valid_sha256() {
+        let (src_repo, src_db) = build_indexed_repo("h5-plain-pull-src");
+        let dst_repo = scratch_dir("h5-plain-pull-dst");
+        let dst_db = devmap_extract::paths::store_path(&dst_repo);
+        let repo_hash = resolve_repo_hash(&src_repo, None).unwrap();
+
+        let (plain_gz, _, plain_digest) = {
+            let _env = CacheEnvGuard::unset();
+            pack_store_to_bytes_with_policy(&src_repo, &src_db, &repo_hash, false, true).unwrap()
+        };
+        assert!(!is_dmc1_container(&plain_gz));
+
+        let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
+
+        // 1. Even if a caller attempts to pass allow_plaintext: true into pull_cache_opts, fail closed.
+        let opt_err = pull_cache_opts(
+            &dst_repo,
+            &dst_db,
+            "http://127.0.0.1:1",
+            None,
+            None,
+            Some(&plain_digest),
+            &repo_hash,
+            "tok-1",
+            &UnpackOptions {
+                expected_repo_hash: Some(repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+                allow_plaintext: true,
+            },
+        )
+        .unwrap_err();
+        assert!(opt_err.to_string().contains("forbidden"), "{opt_err}");
+
+        // 2. Serve the valid plaintext .tar.gz with matching SHA-256 from mock relay -> pull MUST reject.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let server_base = base_url.clone();
+        let plain_for_srv = plain_gz.clone();
+        let digest_for_srv = plain_digest.clone();
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos);
+                            let hdr = std::str::from_utf8(&raw[..pos]).unwrap();
+                            for line in hdr.split("\r\n") {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(pos) = header_end {
+                        if raw.len() >= pos + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let pos = header_end.unwrap();
+                let hdr = std::str::from_utf8(&raw[..pos]).unwrap();
+                let first_line = hdr.split("\r\n").next().unwrap();
+                let path = first_line.split_whitespace().nth(1).unwrap();
+                let resp_body = if path == "/v1/devmap-cache/presign" {
+                    serde_json::to_vec(&serde_json::json!({
+                        "url": format!("{server_base}/r2/{digest_for_srv}"),
+                        "method": "GET",
+                        "digest": digest_for_srv,
+                    }))
+                    .unwrap()
+                } else {
+                    plain_for_srv.clone()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(&resp_body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let err = pull_cache_opts(
+            &dst_repo,
+            &dst_db,
+            &base_url,
+            None,
+            None,
+            Some(&plain_digest),
+            &repo_hash,
+            "tok-1",
+            &UnpackOptions {
+                expected_repo_hash: Some(repo_hash.clone()),
+                allow_foreign_repo: false,
+                require_git_head: false,
+                allow_plaintext: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("DMC1"),
+            "pull must reject unencrypted .tar.gz payload: {err}"
+        );
+        assert!(!dst_db.exists());
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&src_repo);
+        let _ = std::fs::remove_dir_all(&dst_repo);
+    }
+
+    #[test]
+    fn h5_pack_unpack_plaintext_policy_and_tamper_wrong_key_wrong_aad() {
+        let (src_repo, src_db) = build_indexed_repo("h5-policy-src");
+        let dst_repo = scratch_dir("h5-policy-dst");
+        let dst_db = devmap_extract::paths::store_path(&dst_repo);
+        let repo_hash = resolve_repo_hash(&src_repo, None).unwrap();
+
+        // 1. Without key: pack fails closed unless allow_plaintext=true.
+        {
+            let _env = CacheEnvGuard::unset();
+            let err =
+                pack_store_to_bytes_with_policy(&src_repo, &src_db, &repo_hash, false, false)
+                    .unwrap_err();
+            assert!(err.to_string().contains(CACHE_ENCRYPTION_KEY_ENV), "{err}");
+
+            let (plain_gz, _, _) =
+                pack_store_to_bytes_with_policy(&src_repo, &src_db, &repo_hash, false, true)
+                    .unwrap();
+            assert!(!is_dmc1_container(&plain_gz));
+
+            // Unpack rejects plaintext unless allow_plaintext=true.
+            let err = unpack_bytes_into_store_opts(
+                &dst_repo,
+                &dst_db,
+                &plain_gz,
+                &UnpackOptions {
+                    expected_repo_hash: Some(repo_hash.clone()),
+                    allow_foreign_repo: false,
+                    require_git_head: false,
+                    allow_plaintext: false,
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("DMC1"), "{err}");
+            assert!(!dst_db.exists());
+        }
+
+        // 2. With key set: pack ALWAYS encrypts (even if allow_plaintext=true),
+        //    and unpack rejects plaintext unless allow_plaintext=true.
+        let encrypted = {
+            let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
+            let (enc, _, _) =
+                pack_store_to_bytes_with_policy(&src_repo, &src_db, &repo_hash, false, true)
+                    .unwrap();
+            assert!(is_dmc1_container(&enc));
+            enc
+        };
+
+        // 3. Unpacking DMC1 without key fails closed.
+        {
+            let _env = CacheEnvGuard::unset();
+            let err = unpack_bytes_into_store_opts(
+                &dst_repo,
+                &dst_db,
+                &encrypted,
+                &UnpackOptions {
+                    expected_repo_hash: Some(repo_hash.clone()),
+                    allow_foreign_repo: false,
+                    require_git_head: false,
+                    allow_plaintext: true,
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains(CACHE_ENCRYPTION_KEY_ENV), "{err}");
+            assert!(!dst_db.exists());
+        }
+
+        // 4. Wrong key fails closed.
+        {
+            let _env = CacheEnvGuard::set("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+            let err = unpack_bytes_into_store_opts(
+                &dst_repo,
+                &dst_db,
+                &encrypted,
+                &UnpackOptions {
+                    expected_repo_hash: Some(repo_hash.clone()),
+                    allow_foreign_repo: false,
+                    require_git_head: false,
+                    allow_plaintext: false,
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("authentication failed"), "{err}");
+            assert!(!dst_db.exists());
+        }
+
+        // 5. Wrong repo_root_hash AAD fails closed.
+        {
+            let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
+            let wrong_repo_hash = "f".repeat(64);
+            let err = unpack_bytes_into_store_opts(
+                &dst_repo,
+                &dst_db,
+                &encrypted,
+                &UnpackOptions {
+                    expected_repo_hash: Some(wrong_repo_hash),
+                    allow_foreign_repo: true,
+                    require_git_head: false,
+                    allow_plaintext: false,
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("authentication failed"), "{err}");
+            assert!(!dst_db.exists());
+        }
+
+        // 6. Tampered ciphertext/tag fails closed.
+        {
+            let _env = CacheEnvGuard::set(TEST_CACHE_KEY_B64);
+            let mut tampered = encrypted.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0x42;
+            let err = unpack_bytes_into_store_opts(
+                &dst_repo,
+                &dst_db,
+                &tampered,
+                &UnpackOptions {
+                    expected_repo_hash: Some(repo_hash),
+                    allow_foreign_repo: false,
+                    require_git_head: false,
+                    allow_plaintext: false,
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("authentication failed"), "{err}");
+            assert!(!dst_db.exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&src_repo);
+        let _ = std::fs::remove_dir_all(&dst_repo);
+    }
+
+    #[test]
+    fn h5_cli_parser_forbids_allow_plaintext_on_push_and_pull() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["devmap", "cache", "pack", "--out", "a.dmc1", "--allow-plaintext"]).is_ok());
+        assert!(Cli::try_parse_from(["devmap", "cache", "unpack", "--in", "a.dmc1", "--allow-plaintext"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "devmap",
+            "cache",
+            "push",
+            "--relay-url",
+            "https://relay.example.com",
+            "--allow-plaintext"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "devmap",
+            "cache",
+            "pull",
+            "--relay-url",
+            "https://relay.example.com",
+            "--allow-plaintext"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn h5_key_parsing_handles_base64_passphrase_and_rejects_control_chars() {
+        let mut b64 = TEST_CACHE_KEY_B64.as_bytes().to_vec();
+        let parsed = parse_cache_encryption_key_bytes(&mut b64)
+            .unwrap()
+            .expect("valid 32B base64");
+        assert_eq!(parsed.as_slice(), b"0123456789abcdef0123456789abcdef");
+        assert!(b64.iter().all(|&b| b == 0), "raw buffer must be zeroized");
+
+        let mut pass = b"  my-arbitrary-team-passphrase  ".to_vec();
+        let parsed_pass = parse_cache_encryption_key_bytes(&mut pass)
+            .unwrap()
+            .expect("arbitrary passphrase");
+        assert_eq!(parsed_pass.as_slice(), b"my-arbitrary-team-passphrase");
+        assert!(pass.iter().all(|&b| b == 0), "raw buffer must be zeroized");
+
+        let mut bad = b"bad\x00key".to_vec();
+        assert!(parse_cache_encryption_key_bytes(&mut bad).is_err());
+        assert!(bad.iter().all(|&b| b == 0), "raw buffer must be zeroized on error");
     }
 }

@@ -398,6 +398,7 @@ dependencies = [
  "devmap-resolve",
  "devmap-serve",
  "devmap-store",
+ "getrandom",
  "libc",
  "rayon",
  "rusqlite",
