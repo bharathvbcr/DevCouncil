@@ -149,7 +149,12 @@ fn a_relink_waits_for_live_runs_and_then_moves_new_runs_to_the_new_checkout() {
     // The finished attempt keeps its repository and the checkout it ran in.
     let old = call(&store, "runs.get", r#"{"id":"run"}"#);
     assert_eq!(text(&store, &old, "$.item.repository_id"), "r");
-    assert!(text(&store, &old, "$.item.git_dir").ends_with("/checkout/.git"));
+    // Resolved by the store, so Windows spells it with backslashes.
+    assert!(
+        text(&store, &old, "$.item.git_dir")
+            .replace('\\', "/")
+            .ends_with("/checkout/.git")
+    );
     // A new attempt is admitted only from the checkout the repository now names.
     let stale = PREPARE
         .replace("\"run\"", "\"run-stale\"")

@@ -2052,7 +2052,10 @@ mod tests {
                 at: "cfg".to_string(),
                 rewrite: "cursor",
                 hook: false,
-                words: vec!["/usr/bin/devmap".to_string(), "mcp".to_string()],
+                words: vec![
+                    crate::claude::absolute_fixture_slashed("/usr/bin/devmap"),
+                    "mcp".to_string(),
+                ],
             }],
             unchecked: Vec::new(),
         };

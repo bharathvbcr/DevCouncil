@@ -440,13 +440,23 @@ fn local_marketplace(home: &Path, root: &Path, version: &str) -> PathBuf {
     dir
 }
 
+/// An executable that is absolute on the platform under test: a drive-less
+/// `/abs/devmap` is relative on Windows, and doctor rightly flags it there.
+const ABS_DEVMAP: &str = if cfg!(windows) {
+    "C:/abs/devmap"
+} else {
+    "/abs/devmap"
+};
+
 /// A plugin directory that passes every `plugin_health` check at `version`.
 fn write_healthy_plugin(dir: &Path, version: &str) {
     write_mcp(&dir.join(".mcp.json"), "devmap");
     std::fs::create_dir_all(dir.join("hooks")).unwrap();
     std::fs::write(
         dir.join("hooks").join("hooks.json"),
-        r#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"/abs/devmap hook session-end","timeout":3}]}]}}"#,
+        format!(
+            r#"{{"hooks":{{"SessionEnd":[{{"hooks":[{{"type":"command","command":"{ABS_DEVMAP} hook session-end","timeout":3}}]}}]}}}}"#
+        ),
     )
     .unwrap();
     std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
