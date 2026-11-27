@@ -187,6 +187,9 @@ func callToolInProcess(root, name string, toolArgs map[string]any) devcouncil.To
 		defer client.Close()
 	}
 	reg := devcouncil.NewRegistry(root, client, g)
+	pool := newMCPRegistryPool(console.Stderr(), "devcouncil tool")
+	defer pool.Close()
+	reg.ResolveRepo = pool.Get
 
 	budget := mcp.ToolCallBudget(name)
 	parent, stop := signal.NotifyContext(console.Context(), os.Interrupt, syscall.SIGTERM)

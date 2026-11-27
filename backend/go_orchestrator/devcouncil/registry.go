@@ -40,6 +40,19 @@ type Registry struct {
 	// "off".
 	OpenGate func() (*gate.Gate, error)
 
+	// OpenStore, when set, lazily opens the repository's task store when Store
+	// is still nil (for example when .devcouncil/state.sqlite is initialized
+	// after a global MCP server started).
+	OpenStore func() *store.Client
+
+	// ResolveRepo, when set, resolves a validated absolute repo_path/root that
+	// differs from r.Root to a *Registry configured for that repository. When
+	// nil, calls naming a different repository fail closed rather than silently
+	// answering against r.Root.
+	ResolveRepo func(root string) (*Registry, error)
+
+	storeMu sync.Mutex
+
 	gateMu    sync.Mutex
 	gateBuilt bool
 	gateKey   gatescfg.FileKey
@@ -90,29 +103,138 @@ func toolSpecs() []ToolSpec {
 // verify_task came back as a report the caller would read as the isolated run
 // it asked for, while every command ran on the host (TASK-P7-2).
 func (r *Registry) Call(ctx context.Context, name string, args map[string]any) (any, error) {
+	return r.CallWithResolver(ctx, name, args, nil)
+}
+
+// CallWithResolver dispatches one tool by name, using fallbackResolver when
+// args names a different repository via repo_path/root and r.ResolveRepo is nil.
+func (r *Registry) CallWithResolver(
+	ctx context.Context,
+	name string,
+	args map[string]any,
+	fallbackResolver func(root string) (*Registry, error),
+) (any, error) {
 	if refusal, ok := undeclaredArgument(name, args); ok {
 		return refusal, nil
 	}
+	target, refusal := r.resolveTarget(name, args, fallbackResolver)
+	if refusal != nil {
+		return *refusal, nil
+	}
+	target.ensureStore()
 	switch name {
 	case "devcouncil_get_diff":
-		return r.callGetDiff(ctx, args)
+		return target.callGetDiff(ctx, args)
 	case "devcouncil_checkout_task":
-		return r.callCheckout(ctx, args), nil
+		return target.callCheckout(ctx, args), nil
 	case "devcouncil_renew_lease":
-		return r.callRenew(ctx, args), nil
+		return target.callRenew(ctx, args), nil
 	case "devcouncil_release_task":
-		return r.callRelease(ctx, args), nil
+		return target.callRelease(ctx, args), nil
 	case "devcouncil_next_task":
-		return r.callNextTask(ctx), nil
+		return target.callNextTask(ctx), nil
 	case "devcouncil_verify_task":
-		return r.callVerify(ctx, args), nil
+		return target.callVerify(ctx, args), nil
 	case "devcouncil_get_gaps":
-		return r.callGetGaps(ctx, args), nil
+		return target.callGetGaps(ctx, args), nil
 	case "devcouncil_policy_check_write":
-		return r.callPolicyCheck(ctx, args), nil
+		return target.callPolicyCheck(ctx, args), nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+func (r *Registry) ensureStore() {
+	if r.OpenStore == nil {
+		return
+	}
+	r.storeMu.Lock()
+	defer r.storeMu.Unlock()
+	if r.Store != nil {
+		return
+	}
+	if st := r.OpenStore(); st != nil {
+		r.Store = st
+		if r.Lease == nil {
+			r.Lease = &LeaseService{Store: st, Root: r.Root}
+		} else {
+			r.Lease.Store = st
+		}
+	}
+}
+
+func (r *Registry) currentStore() *store.Client {
+	r.storeMu.Lock()
+	defer r.storeMu.Unlock()
+	return r.Store
+}
+
+func (r *Registry) resolveTarget(
+	tool string,
+	args map[string]any,
+	fallbackResolver func(root string) (*Registry, error),
+) (*Registry, *ErrorPayload) {
+	rawRepoPath, hasRepoPath := args["repo_path"].(string)
+	rawRoot, hasRoot := args["root"].(string)
+	if !hasRepoPath && !hasRoot {
+		return r, nil
+	}
+	var cleanRepoPath, cleanRoot string
+	if hasRepoPath {
+		var err error
+		cleanRepoPath, err = validateRepoRootArg(tool, "repo_path", rawRepoPath)
+		if err != nil {
+			return nil, &ErrorPayload{OK: false, Code: "invalid_argument", Error: err.Error()}
+		}
+	}
+	if hasRoot {
+		var err error
+		cleanRoot, err = validateRepoRootArg(tool, "root", rawRoot)
+		if err != nil {
+			return nil, &ErrorPayload{OK: false, Code: "invalid_argument", Error: err.Error()}
+		}
+	}
+	if hasRepoPath && hasRoot && !sameRepoDir(cleanRepoPath, cleanRoot) {
+		return nil, &ErrorPayload{
+			OK:    false,
+			Code:  "invalid_argument",
+			Error: fmt.Sprintf("%s: repo_path (%q) and root (%q) disagree; pass one repository root", tool, cleanRepoPath, cleanRoot),
+		}
+	}
+	requested := cleanRepoPath
+	if requested == "" {
+		requested = cleanRoot
+	}
+	if r.Root != "" && sameRepoDir(requested, r.Root) {
+		return r, nil
+	}
+	resolver := r.ResolveRepo
+	if resolver == nil {
+		resolver = fallbackResolver
+	}
+	if resolver == nil {
+		return nil, &ErrorPayload{
+			OK:    false,
+			Code:  "not_initialized",
+			Error: fmt.Sprintf("%s: this server is scoped to %q and cannot switch to %q", tool, r.Root, requested),
+		}
+	}
+	other, err := resolver(requested)
+	if err != nil {
+		return nil, &ErrorPayload{
+			OK:    false,
+			Code:  "invalid_argument",
+			Error: fmt.Sprintf("%s: cannot resolve repository %q: %v", tool, requested, err),
+		}
+	}
+	if other == nil {
+		return nil, &ErrorPayload{
+			OK:    false,
+			Code:  "not_initialized",
+			Error: fmt.Sprintf("%s: repository %q could not be initialized", tool, requested),
+		}
+	}
+	return other, nil
 }
 
 func (r *Registry) callGetDiff(ctx context.Context, args map[string]any) (any, error) {

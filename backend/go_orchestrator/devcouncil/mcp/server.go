@@ -41,9 +41,14 @@ const (
 // Server is a hand-rolled JSON-RPC MCP stdio server.
 type Server struct {
 	Registry *devcouncil.Registry
-	In       io.Reader
-	Out      io.Writer
-	Err      io.Writer
+	// ResolveRegistry, when set, supplies per-repository registries when a tool
+	// call passes repo_path or root pointing outside Registry.Root (or when
+	// Registry is nil). When Registry.ResolveRepo is already set, Registry's
+	// own resolver takes precedence.
+	ResolveRegistry func(root string) (*devcouncil.Registry, error)
+	In              io.Reader
+	Out             io.Writer
+	Err             io.Writer
 
 	// DefaultProtocol is what an `initialize` that names no supported
 	// revision is answered with: "legacy" (the default, the newest handshake
@@ -636,7 +641,11 @@ func (s *Server) legacyHandle(ctx context.Context, req rpcRequest) rpcResponse {
 func (s *Server) listTools() (map[string]any, error) {
 	specs := s.specsOverride
 	if specs == nil {
-		specs = s.Registry.Specs()
+		if s.Registry != nil {
+			specs = s.Registry.Specs()
+		} else {
+			specs = devcouncil.ServedToolSpecs()
+		}
 	}
 	return devcouncil.ToolsListResult(specs)
 }
@@ -649,9 +658,13 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	if params.Arguments == nil {
 		params.Arguments = map[string]any{}
 	}
+	reg := s.Registry
+	if reg == nil {
+		reg = devcouncil.NewRegistry("", nil, nil)
+	}
 	// Rendered by the same function `devcouncil tool call` uses, so the shell
 	// fallback prints the bytes this reply carries.
-	answer := devcouncil.AnswerTool(s.Registry.Call(ctx, params.Name, params.Arguments))
+	answer := devcouncil.AnswerTool(reg.CallWithResolver(ctx, params.Name, params.Arguments, s.ResolveRegistry))
 	return okResult(req.ID, map[string]any{
 		"content": []map[string]any{{"type": "text", "text": answer.Text}},
 		"isError": answer.IsError,

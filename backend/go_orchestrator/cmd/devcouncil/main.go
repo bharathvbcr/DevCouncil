@@ -69,8 +69,8 @@ func dispatch(args []string) int {
 // `dev checkout` or `dev doctor`, which exit 2 here; a name that is not a key
 // in this table is a name no agent can run.
 var commands = map[string]func(args []string) int{
-	"mcp":          func([]string) int { return runMCP() },
-	"mcp-server":   func([]string) int { return runMCP() },
+	"mcp":          runMCP,
+	"mcp-server":   runMCP,
 	"integrate":    runIntegrate,
 	"integrations": runIntegrate,
 	"skills":       runSkills,
@@ -126,7 +126,8 @@ func usage() {
 The same binary is installed as ` + "`devc`" + `, ` + "`dev`" + `, and ` + "`devcouncil`" + `.
 
 Usage:
-  devcouncil mcp              Run the MCP stdio server
+  devcouncil mcp [--project-root DIR]
+                                   Run the MCP stdio server (tools also accept per-call repo_path/root)
   devcouncil install [names…] [--list] [--json] [--prefix DIR] [--dry-run] [--rev COMMIT]
   devcouncil uninstall [names…] [--yes] [--prefix DIR]
   devcouncil disable NAME [--prefix DIR]
@@ -266,8 +267,50 @@ func projectRootFlag(args []string, i int) (root string, ok bool) {
 	return root, true
 }
 
-func runMCP() int {
-	root, err := projectRoot()
+const mcpHelp = `devcouncil mcp — run the DevCouncil MCP stdio server
+
+Usage:
+  devcouncil mcp [--project-root DIR]
+
+Options:
+  --project-root DIR   Default repository root when tool calls omit repo_path/root
+                       (defaults to DEVCOUNCIL_PROJECT_ROOT or current working directory)
+  -h, --help           Print this help message and exit
+
+All eight devcouncil_* MCP tools also accept an optional repo_path (alias: root)
+argument so a single global server can serve multiple repositories.
+`
+
+func runMCP(args []string) int {
+	rootFlag := ""
+	sawServe := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "--help", "help":
+			console.Error(mcpHelp)
+			return 0
+		case "--project-root":
+			i++
+			r, ok := projectRootFlag(args, i)
+			if !ok {
+				return 2
+			}
+			rootFlag = r
+		case "serve":
+			if sawServe {
+				console.Errorf("devcouncil mcp: unexpected argument: %s\n", args[i])
+				console.Error(mcpHelp)
+				return 2
+			}
+			sawServe = true
+			console.Errorln(`devcouncil mcp: "serve" subcommand is deprecated; invoke "devcouncil mcp" directly`)
+		default:
+			console.Errorf("devcouncil mcp: unknown argument: %s\n", args[i])
+			console.Error(mcpHelp)
+			return 2
+		}
+	}
+	root, err := resolveRoot(rootFlag)
 	if err != nil {
 		console.Errorf("devcouncil mcp: %v\n", err)
 		return 2
@@ -277,13 +320,31 @@ func runMCP() int {
 	// devcouncil_policy_check_write answers not_initialized instead of a
 	// verdict it could not reach. The gate is rebuilt whenever config.yaml
 	// changes, so a corrected file recovers on this same server.
-	reg := newMCPRegistry(root, openStore(root), console.Stderr())
-	srv := &mcp.Server{Registry: reg}
+	st := openStore(root)
+	if st != nil {
+		defer st.Close()
+	}
+	reg := newMCPRegistry(root, st, console.Stderr())
+	reg.OpenStore = func() *store.Client { return openStore(root) }
+	pool := newMCPRegistryPool(console.Stderr(), "devcouncil mcp")
+	defer pool.Close()
+	reg.ResolveRepo = pool.Get
+
+	srv := &mcp.Server{Registry: reg, ResolveRegistry: pool.Get}
 	if err := srv.Serve(); err != nil {
 		console.Errorf("devcouncil mcp: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func newMCPRegistryPool(w io.Writer, who string) *devcouncil.RegistryPool {
+	return devcouncil.NewRegistryPool(16, func(repoRoot string) (*devcouncil.Registry, error) {
+		r := devcouncil.NewRegistry(repoRoot, openStore(repoRoot), nil)
+		r.OpenStore = func() *store.Client { return openStore(repoRoot) }
+		r.OpenGate = func() (*gate.Gate, error) { return openAnnouncedGate(repoRoot, w, who) }
+		return r, nil
+	})
 }
 
 // openStore returns the task-store client, or nil when the project has no

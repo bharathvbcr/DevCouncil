@@ -42,6 +42,20 @@ func TestSharedToolSpecsAndNames(t *testing.T) {
 		if schema["additionalProperties"] != false {
 			t.Errorf("%s InputSchema additionalProperties = %v, want false", spec.Name, schema["additionalProperties"])
 		}
+		props, _ := schema["properties"].(map[string]any)
+		for _, selector := range []string{"repo_path", "root"} {
+			prop, ok := props[selector].(map[string]any)
+			if !ok || prop["type"] != "string" {
+				t.Errorf("%s InputSchema missing optional string property %q: %v", spec.Name, selector, props[selector])
+			}
+		}
+		if reqs, ok := schema["required"].([]any); ok {
+			for _, r := range reqs {
+				if r == "repo_path" || r == "root" {
+					t.Errorf("%s InputSchema marks %q as required; must remain optional", spec.Name, r)
+				}
+			}
+		}
 		ann := spec.Behaviour.Annotations()
 		if ann["readOnlyHint"] != spec.Behaviour.ReadOnly ||
 			ann["destructiveHint"] != spec.Behaviour.Destructive ||
