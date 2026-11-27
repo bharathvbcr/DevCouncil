@@ -17,9 +17,9 @@ Use `devcouncil_get_diff` for the change set and `devcouncil_policy_check_write`
 
 Read `truncated` and `walk_incomplete` on every DevMap envelope. A blast radius that stopped early is a **lower bound**, not a complete answer — say so rather than reporting it as the full set.
 
-**Read the situation with GitPulse Insights, not just the diff.** A diff shows what changed; it does not show that two worktrees are editing the same file, or that the change you are reviewing is half of something still in flight. Start with `waylode_insights` for the other worktrees, live agent sessions, uncommitted work, contended files and index health. Use `waylode_collision_risk` on the changed paths, `waylode_active_changes` for what is in flight elsewhere, and `waylode_change_context` / `waylode_provenance` / `waylode_ledger_events` to establish what a change was for before you call it wrong. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean. Sessions started before the rename list these tools as `gitpulse_*`; the old names are still accepted, so use whichever your tool list shows.
+**Read the situation with Waylode Insights, not just the diff.** A diff shows what changed; it does not show that two worktrees are editing the same file, or that the change you are reviewing is half of something still in flight. Start with `waylode_insights` for the other worktrees, live agent sessions, uncommitted work, contended files and index health. Use `waylode_collision_risk` on the changed paths, `waylode_active_changes` for what is in flight elsewhere, and `waylode_change_context` / `waylode_provenance` / `waylode_ledger_events` to establish what a change was for before you call it wrong. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean. Sessions started before the GitPulse-to-Waylode rename list these tools as `gitpulse_*`; the old names are still accepted, so use whichever your tool list shows.
 
-When either DevMap or GitPulse cannot answer, record the gap and report it as a gap. Do not fall back to grep and present the result as if the graph had confirmed it.
+When either DevMap or Waylode cannot answer, record the gap and report it as a gap. Do not fall back to grep and present the result as if the graph had confirmed it.
 
 Summarize findings as blocking vs advisory and reference `file:line`. Where you could not verify something, say that explicitly instead of omitting it.
 
@@ -29,6 +29,6 @@ If the `devcouncil_*` MCP tools are absent (a cloud session has none), say so, t
 
 Where the instructions name `Read`, `Edit`, `Write`, `Grep`, `Glob`, or `Bash`, use this host's file and shell tools.
 
-MCP tools are the unsuffixed `devcouncil_*`, `devmap_*`, and `waylode_*` names; `gitpulse_*` is the old spelling of the last and is still accepted. The `mcp__` prefixes are Claude's. If DevMap MCP is absent, the `devmap` CLI answers the same questions. GitPulse Insights has no CLI of its own (where installed, `gitpulse-mcp call <tool> key=value` answers from the shell); an unavailable Insights call is unestablished, not clean.
+MCP tools are the unsuffixed `devcouncil_*`, `devmap_*`, and `waylode_*` names; `gitpulse_*` is the old spelling of the last and is still accepted. The `mcp__` prefixes are Claude's. If DevMap MCP is absent, the `devmap` CLI answers the same questions. Waylode Insights has no CLI of its own (where installed, `waylode-mcp call <tool> key=value` or legacy `gitpulse-mcp` answers from the shell); an unavailable Insights call is unestablished, not clean.
 
 Do not invoke another subagent. Return the result to the parent.

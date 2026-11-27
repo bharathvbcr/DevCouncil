@@ -134,7 +134,7 @@ describe("renderCodexToml", () => {
 
   it("adds the host facts the shared body deliberately omits", () => {
     assert.ok(rendered.includes("there is no `waylode` or `gitpulse` CLI for it"));
-    assert.ok(rendered.includes("`gitpulse-mcp call <tool> key=value` answers from the shell"));
+    assert.ok(rendered.includes("`waylode-mcp call <tool> key=value` answers from the shell"));
     assert.ok(rendered.includes("no `tools` allowlist field"));
     assert.ok(rendered.includes(CODEX_HOST_NOTES));
   });
@@ -529,7 +529,7 @@ describe("Antigravity library", () => {
       "`inherit` when review or verification must see",
       "Do not invoke `devcouncil` from itself",
       "registers `devmap` and `devcouncil`",
-      "does not register GitPulse",
+      "does not register Waylode",
       "unestablished situation",
     ]) {
       assert.ok(primary.contents.includes(phrase), `primary is missing ${phrase}`);

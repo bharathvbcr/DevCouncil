@@ -105,9 +105,9 @@ once made them through DevCouncil are retired and nothing gates a write now.
 
 When the MCP tools are not loaded, the \`devmap\` CLI answers the same questions
 (\`devmap search\`, \`devmap explore <name>\`, \`devmap impact\`, \`devmap affected
-<target>\`). GitPulse Insights (the \`waylode_*\` tools, formerly \`gitpulse_*\`) is served over MCP;
-there is no \`waylode\` or \`gitpulse\` CLI for it. Where the \`gitpulse-mcp\` binary is installed,
-\`gitpulse-mcp call <tool> key=value\` answers from the shell when the MCP connection is not loaded.
+<target>\`). Waylode Insights (the \`waylode_*\` tools, formerly \`gitpulse_*\`) is served over MCP;
+there is no \`waylode\` or \`gitpulse\` CLI for it. Where the \`waylode-mcp\` (or legacy \`gitpulse-mcp\`) binary is installed,
+\`waylode-mcp call <tool> key=value\` answers from the shell when the MCP connection is not loaded.
 When neither is available, report the situation as unestablished rather than guessing at it.`;
 
 /**
@@ -118,7 +118,7 @@ export const ANTIGRAVITY_HOST_NOTES = `## On this host
 
 Where the instructions name \`Read\`, \`Edit\`, \`Write\`, \`Grep\`, \`Glob\`, or \`Bash\`, use this host's file and shell tools.
 
-MCP tools are the unsuffixed \`devcouncil_*\`, \`devmap_*\`, and \`waylode_*\` names; \`gitpulse_*\` is the old spelling of the last and is still accepted. The \`mcp__\` prefixes are Claude's. If DevMap MCP is absent, the \`devmap\` CLI answers the same questions. GitPulse Insights has no CLI of its own (where installed, \`gitpulse-mcp call <tool> key=value\` answers from the shell); an unavailable Insights call is unestablished, not clean.
+MCP tools are the unsuffixed \`devcouncil_*\`, \`devmap_*\`, and \`waylode_*\` names; \`gitpulse_*\` is the old spelling of the last and is still accepted. The \`mcp__\` prefixes are Claude's. If DevMap MCP is absent, the \`devmap\` CLI answers the same questions. Waylode Insights has no CLI of its own (where installed, \`waylode-mcp call <tool> key=value\` or legacy \`gitpulse-mcp\` answers from the shell); an unavailable Insights call is unestablished, not clean.
 
 Do not invoke another subagent. Return the result to the parent.`;
 

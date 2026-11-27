@@ -11,7 +11,7 @@ Navigate with DevMap before reading or grepping: `devmap_explore`, `devmap_searc
 
 ## Product stack
 
-DevCouncil is **components and modules** (`devmap`, `dcstore`, `dcverify`, `dcgrep`, and this host). **Manvi** wraps them into a coding-agent harness. Host apps such as **GitPulse** use Manvi for policy, workbench and agent hosting, and DevCouncil components for code intelligence and related analysis. Take only the modules an app needs; update them independently.
+DevCouncil is **components and modules** (`devmap`, `dcstore`, `dcverify`, `dcgrep`, and this host). **Manvi** wraps them into a coding-agent harness. Host apps such as **Waylode** (formerly GitPulse) use Manvi for policy, workbench and agent hosting, and DevCouncil components for code intelligence and related analysis. Take only the modules an app needs; update them independently.
 
 ## Tasks and gates are opt-in
 

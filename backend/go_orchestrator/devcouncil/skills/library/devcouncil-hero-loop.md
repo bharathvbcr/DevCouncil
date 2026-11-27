@@ -34,6 +34,8 @@ Each step below names the MCP tool; from a shell run the same tool as
 `dev tool call <name> --args '<json>'` (for example
 `dev tool call devcouncil_checkout_task --args '{"task_id":"T-1","client_id":"me"}'`).
 Reuse one `client_id` across MCP and shell so the lease is yours in both.
+Every `devcouncil_*` tool also accepts optional `repo_path` (alias `root`) when
+talking to a globally registered `devcouncil mcp` server across multiple repositories.
 
 ### 1. Pick up work
 
@@ -98,6 +100,35 @@ devcouncil_release_task       # only after verify passes (or explicit abandon po
 ```
 
 Report: task ID, what changed, verification result, and any advisory (non-blocking) gaps.
+
+## Waylode multi-agent handoffs (worktrees, A2A, landing)
+
+A DevCouncil lease makes the task yours; it does not isolate your working tree or
+prevent another worktree from editing the same files. When **Waylode** (formerly
+GitPulse) MCP tools are available, pair the hero loop with Waylode across three seams:
+
+1. **Before editing (isolation & collision preflight):**
+   - Call `waylode_insights` to see active worktrees, agent sessions, and contended files,
+     and `waylode_collision_risk` on your task's planned paths before touching them.
+   - Provision an isolated lane worktree with `waylode_worktree_create` (with
+     `share_cache: true`) so edits stay isolated from sibling lanes.
+2. **During execution (A2A peer coordination):**
+   - Register your lane with `waylode_agent_register` and discover peers via
+     `waylode_agent_peers`.
+   - Coordinate overlapping interfaces or handoffs with `waylode_agent_send`,
+     `waylode_agent_peek` / `waylode_agent_inbox`, `waylode_agent_wait`, or structured
+     asks (`waylode_inbox_post`, `waylode_inbox_read`, `waylode_inbox_answer`).
+3. **After `devcouncil_verify_task` passes & `devcouncil_release_task` completes (landing & wrap-up):**
+   - Commit cleanly inside your lane (`waylode_worktree_commit`), then hand off to
+     Waylode's **commit-and-merge** workflow (`waylode_worktree_merge` or
+     `waylode_worktree_merge_batch`) to land onto the integration branch safely.
+   - Finish with Waylode's **wrap-up** hygiene: drain remaining inbox messages,
+     `waylode_agent_deregister`, and prune integrated worktrees with
+     `waylode_worktree_prune`.
+
+(Sessions started before the rename list these tools as `gitpulse_*`; legacy aliases
+remain accepted, and an unavailable Waylode call must be reported as unestablished,
+never as clean.)
 
 ## Alternatives to manual MCP driving
 

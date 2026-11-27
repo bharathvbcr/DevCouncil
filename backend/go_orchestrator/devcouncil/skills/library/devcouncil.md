@@ -27,6 +27,7 @@ user explicitly asks for that workflow.
 2. Read `AGENTS.md` / `CLAUDE.md` for workspace conventions.
 3. Read the gate mode with `dev gate status --json`; `dev doctor --json` says which task store `next_task` reads.
 4. Navigate with `devmap search|explore|affected … --json --root <abs repo path>` (the shell form of the `devmap_*` MCP tools).
+5. Check concurrent worktrees and collisions with **Waylode Insights** (`waylode_insights`, `waylode_collision_risk`; legacy `gitpulse_*` aliases remain accepted) before editing files another lane may hold.
 
 ## Dead code / liveness
 
@@ -93,6 +94,9 @@ and says whether the served tools match this binary.
 
 This host serves exactly eight tools; `tools/list` is generated from
 `devcouncil/registry.go`'s `toolSpecs()`, so it can report no others.
+Every tool accepts an optional `repo_path` (alias `root`) argument naming the
+absolute repository path so a single global `devcouncil mcp` server can serve
+multiple repositories.
 
 **Task loop:** `devcouncil_next_task`, `devcouncil_checkout_task`,
 `devcouncil_renew_lease`, `devcouncil_release_task`

@@ -21,4 +21,4 @@ Delegate file-changing work to `devcouncil-implementer`, diff review to `devcoun
 
 ## What integrate registers
 
-`devcouncil integrate` registers `devmap` and `devcouncil`. It does not register GitPulse. A missing GitPulse server is an unestablished situation.
+`devcouncil integrate` registers `devmap` and `devcouncil`. It does not register Waylode (formerly GitPulse). A missing Waylode server is an unestablished situation.

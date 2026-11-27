@@ -365,7 +365,7 @@ fn important_surfaces(map: &Value, map_rel: &str) -> Vec<String> {
     lines
 }
 
-/// What GitPulse Insights answers that the code graph cannot: who else is in
+/// What Waylode Insights answers that the code graph cannot: who else is in
 /// this repository right now.
 ///
 /// DevMap describes the code. It has nothing to say about the other worktrees,
@@ -375,9 +375,9 @@ fn important_surfaces(map: &Value, map_rel: &str) -> Vec<String> {
 /// answer is complete on its own.
 ///
 /// The `ok` warning is the same honesty rule the rest of the kernel follows:
-/// GitPulse's facets fail independently, so a facet that could not scan must
+/// Waylode's facets fail independently, so a facet that could not scan must
 /// never be read as a facet that scanned and found nothing.
-pub const GITPULSE_STEP: &str = "Before you change anything, ask GitPulse Insights what else is \
+pub const WAYLODE_STEP: &str = "Before you change anything, ask Waylode Insights what else is \
 live in this repository. `waylode_insights` names the other worktrees, the running agent \
 sessions, uncommitted work, contended files and index health in one call. Then \
 `waylode_collision_risk` before touching a file another worktree may hold, \
@@ -387,7 +387,11 @@ history. A session started before the GitPulse to Waylode rename lists these as 
 those names are still accepted, so use whichever your tool list shows. \
 Its facets fail independently — check each `ok`, because a facet that could not scan \
 is not a facet that came back clean. A `deferred`, timed-out or `ok: false` facet is likewise \
-not a clean answer, and an absent `gitpulse-mcp` is reported the way an absent `devmap` is.";
+not a clean answer, and an absent `waylode-mcp` (or legacy `gitpulse-mcp`) is reported the \
+way an absent `devmap` is.";
+
+/// Legacy alias for [`WAYLODE_STEP`], kept so in-tree callers keep compiling.
+pub const GITPULSE_STEP: &str = WAYLODE_STEP;
 
 /// Why the guide addresses agents it will never be loaded by.
 ///
@@ -397,16 +401,16 @@ not a clean answer, and an absent `gitpulse-mcp` is reported the way an absent `
 /// grepping.
 pub const DELEGATION_RULE: &str = "This binds every agent working here, not only the one reading \
 this file. When you delegate — a subagent, a worktree lane, a handoff plan — name DevMap and \
-GitPulse Insights in the prompt with the same precedence, rather than leaving that agent to grep \
+Waylode Insights in the prompt with the same precedence, rather than leaving that agent to grep \
 its way in. When either tool cannot answer (truncated, `walk_incomplete`, empty on a built index, \
 or a capability it does not have), record the gap and say so; do not silently fall back to grep \
 and report the result as if the graph had confirmed it. When the tools are not installed at all \
-(`devmap` or `gitpulse-mcp` is command not found, or their MCP server is not loaded, as in a cloud \
-session), say so once in your reply, naming the missing command (`devmap gap-record` is a devmap \
-command and fails when devmap is absent), then navigate by source inspection: that is not a silent \
-fallback. Without `devmap`, skip the `devmap paths --json` / `devmap status --json` / \
-`devmap build --manifest` steps (1 and 10) and the `.devcouncil/...` store reads; they are not \
-required then.";
+(`devmap` or `waylode-mcp` / legacy `gitpulse-mcp` is command not found, or their MCP server is \
+not loaded, as in a cloud session), say so once in your reply, naming the missing command \
+(`devmap gap-record` is a devmap command and fails when devmap is absent), then navigate by \
+source inspection: that is not a silent fallback. Without `devmap`, skip the `devmap paths --json` \
+/ `devmap status --json` / `devmap build --manifest` steps (1 and 10) and the `.devcouncil/...` \
+store reads; they are not required then.";
 
 /// Render the guide for `map`, whose artifact sits at `map_rel` relative to the
 /// repository root.
@@ -525,19 +529,19 @@ break before it is written."
 /// Cursor rule body: workflow summary plus the canonical hygiene rules.
 ///
 /// Frontmatter sets `alwaysApply: true` so every Cursor session gets DevMap
-/// navigation and GitPulse Insights without depending on a skill being
+/// navigation and Waylode Insights without depending on a skill being
 /// selected.
 pub fn cursor_rule_text(map_rel: &str) -> String {
     let map_rel = inline_text(map_rel);
     format!(
         "---\n\
-description: DevMap navigation, GitPulse Insights and repository hygiene\n\
+description: DevMap navigation, Waylode Insights and repository hygiene\n\
 alwaysApply: true\n\
 ---\n\
 \n\
-# DevMap and GitPulse Insights\n\
+# DevMap and Waylode Insights\n\
 \n\
-{gitpulse}\n\
+{waylode}\n\
 \n\
 Use `{map_rel}` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.\n\
 \n\
@@ -549,7 +553,7 @@ Before editing a symbol, run impact analysis. Before committing, review the diff
 \n\
 {rules}\n",
         map_rel = map_rel,
-        gitpulse = GITPULSE_STEP,
+        waylode = WAYLODE_STEP,
         delegation = DELEGATION_RULE,
         rules = crate::hygiene::AGENT_RULES
     )
@@ -1362,17 +1366,25 @@ mod tests {
     // exactly the property these are supposed to be able to falsify.
 
     #[test]
-    fn the_guide_puts_gitpulse_insights_before_the_devmap_workflow() {
+    fn the_guide_puts_waylode_insights_before_the_devmap_workflow() {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
-        let gitpulse = text
+        let waylode = text
             .find("waylode_insights")
-            .expect("the guide must name GitPulse Insights");
+            .expect("the guide must name Waylode Insights");
         let workflow = text
             .find("Workflow for agents:")
             .expect("the guide must keep its DevMap workflow");
         assert!(
-            gitpulse < workflow,
+            waylode < workflow,
             "what else is live here is a question to ask before navigating, not after: {text}"
+        );
+        assert!(
+            text.contains("ask Waylode Insights"),
+            "the guide must name Waylode Insights: {text}"
+        );
+        assert!(
+            !text.contains("GitPulse Insights"),
+            "the guide must not mix GitPulse Insights with waylode_* tools: {text}"
         );
         for tool in [
             "waylode_collision_risk",
@@ -1396,7 +1408,7 @@ mod tests {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
         assert!(
             text.contains("check each `ok`"),
-            "GitPulse facets fail independently; the guide must say so: {text}"
+            "Waylode facets fail independently; the guide must say so: {text}"
         );
         assert!(
             text.contains("not a facet that came back clean"),
@@ -1408,7 +1420,7 @@ mod tests {
     fn the_guide_carries_both_tools_into_every_delegation() {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
         assert!(
-            text.contains("name DevMap and GitPulse Insights in the prompt"),
+            text.contains("name DevMap and Waylode Insights in the prompt"),
             "a subagent reads its parent's prompt, not this file: {text}"
         );
         assert!(
@@ -1449,8 +1461,10 @@ mod tests {
             "a slow or failed Insights facet is not a clean answer: {text}"
         );
         assert!(
-            text.contains("an absent `gitpulse-mcp` is reported the way an absent `devmap` is"),
-            "an absent gitpulse-mcp is reported like an absent devmap: {text}"
+            text.contains(
+                "an absent `waylode-mcp` (or legacy `gitpulse-mcp`) is reported the way an absent `devmap` is"
+            ),
+            "an absent waylode-mcp is reported like an absent devmap: {text}"
         );
     }
 
@@ -1460,12 +1474,16 @@ mod tests {
         assert!(rule.contains("waylode_insights"), "{rule}");
         assert!(rule.contains("devmap_impact"), "{rule}");
         assert!(
-            rule.contains("name DevMap and GitPulse Insights in the prompt"),
+            rule.contains("name DevMap and Waylode Insights in the prompt"),
             "{rule}"
         );
         assert!(
-            rule.contains("description: DevMap navigation, GitPulse Insights"),
+            rule.contains("description: DevMap navigation, Waylode Insights"),
             "the frontmatter description must say what the rule now covers: {rule}"
+        );
+        assert!(
+            !rule.contains("GitPulse Insights"),
+            "the Cursor rule must not mix GitPulse Insights with waylode_* tools: {rule}"
         );
     }
 
