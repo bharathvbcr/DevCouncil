@@ -10,8 +10,11 @@ use serde_json::Value;
 /// written, or canonical. Windows canonicalises to a `\\?\` verbatim path
 /// with long names where the temp dir used 8.3 short ones (`RUNNER~1`), and
 /// macOS to `/private/var` for `/var`; every one is the same directory.
+/// Windows also accepts either separator, so a report that joined a
+/// `/`-spelled relative path onto a native one (`.gemini/config/plugins\gitpulse`)
+/// still names the file the test spelled with `/` throughout.
 fn names(text: &str, path: &std::path::Path) -> bool {
-    if text.contains(&path.display().to_string()) {
+    if contains_path(text, &path.display().to_string()) {
         return true;
     }
     // The path may name a file that was deliberately not written, so resolve
@@ -26,7 +29,16 @@ fn names(text: &str, path: &std::path::Path) -> bool {
         return false;
     };
     let shown = canonical.display().to_string();
-    text.contains(shown.trim_prefix(r"\\?\"))
+    contains_path(text, shown.trim_prefix(r"\\?\"))
+}
+
+/// `text.contains(path)`, comparing separators loosely on Windows only, where
+/// `/` and `\` name the same directory boundary.
+fn contains_path(text: &str, path: &str) -> bool {
+    if text.contains(path) {
+        return true;
+    }
+    cfg!(windows) && text.replace('\\', "/").contains(&path.replace('\\', "/"))
 }
 
 fn scratch(name: &str) -> PathBuf {
