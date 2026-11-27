@@ -3,12 +3,16 @@ Copyright (c) 2026 Bharath Chandra Vaddaram
 
 This software is dual-licensed under your option of either the MIT License
 (LICENSE-MIT) or the Apache License, Version 2.0 (LICENSE-APACHE).
+See PRIVACY.md and SECURITY.md for privacy, zero-telemetry, and security notices.
 
 Third-Party Attributions
 ------------------------
 - tree-sitter (https://github.com/tree-sitter/tree-sitter)
   Copyright (c) Max Brunsfeld & contributors (MIT License)
   Multi-language AST parsing used by devmap and dc-verify.
+- Cryptographic crates used by remote cache encryption (`DMC1`) and digesting
+  (`chacha20poly1305`, `hkdf`, `sha2`, `getrandom`, `blake3`, `zeroize`) remain
+  subject to their upstream MIT / Apache-2.0 licenses.
 
 Third-party Rust, Go, and Node dependencies retain their respective upstream
 licenses as declared in rust/Cargo.toml, backend/go_orchestrator/go.mod, and

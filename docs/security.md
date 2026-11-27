@@ -1,6 +1,7 @@
 # Security and execution boundaries
 
-DevCouncil provides local code analysis, task policy and verification evidence.
+DevCouncil provides local code analysis, task policy and verification evidence
+with **zero product telemetry** (see [Privacy & Telemetry Notice](../PRIVACY.md)).
 The implementation-level reference is
 [repository input and verification boundaries](SECURITY_BOUNDARIES.md).
 [Documentation index](README.md)

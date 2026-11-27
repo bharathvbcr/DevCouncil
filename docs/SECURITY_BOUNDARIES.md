@@ -246,6 +246,15 @@ cannot slip a literal credential file through. In `devmap cache push|pull`,
 `GITPULSE_RELAY_TOKEN` is read exclusively from the environment (never argv)
 and passed to `curl` via a mode-0600 temporary `--config` file deleted on drop.
 
+### Remote DevMap Cache Encryption (`DMC1`)
+
+Remote cache artifacts (`devmap cache pack|unpack|push|pull` in `rust/devmap-cli/src/cache_archive.rs` and `commands/cache.rs`) encrypt `.tar.gz` bundles in authenticated `DMC1` containers:
+
+- **Wire format & cipher:** Fixed 17-byte header (`b"DMC1"` || `1u8` version || 12-byte CSPRNG nonce) followed by RFC 8439 ChaCha20-Poly1305 ciphertext and 16-byte authentication tag.
+- **Key derivation & AAD binding:** Per-repo subkey derived via RFC 5869 HKDF-SHA256 (`devmap-cache-hkdf-v1` salt from `DEVMAP_CACHE_ENCRYPTION_KEY`), with AAD authenticating `devmap-cache/v1\0` || `repo_root_hash`.
+- **Fail-closed remote operations:** Both `devmap cache push` and `devmap cache pull` refuse plaintext `.tar.gz` archives (`missing DMC1 header` / `must start with DMC1`), missing keys, unsupported container versions, truncated inputs, or tag mismatches (`--allow-plaintext` applies strictly to local offline pack/unpack archives).
+- **Default literal stripping & memory hygiene:** Packed cache stores strip source literals unless `--include-literals` is explicitly passed; read-side secret-path redaction (`dc_glob::secret_paths`, `dc-redact`) still applies. Key material is zeroized after derivation/use.
+
 These checks protect against hostile repository paths and files. They are not
 an operating-system sandbox against a privileged actor or another process
 already running with the same user's authority. Cross-platform runtime

@@ -41,9 +41,11 @@ service level.
 
 ## Scope
 
-DevCouncil analyses repositories and verifies task evidence locally. Its
-execution and input boundaries (which executables it runs, filesystem
-protections, resource limits) are documented in
+DevCouncil analyses repositories and verifies task evidence locally with **zero
+product telemetry** (see [PRIVACY.md](PRIVACY.md) and [NOTICE](NOTICE)). Its
+execution, remote-cache encryption (`DMC1` / `ChaCha20-Poly1305` + `HKDF-SHA256`),
+and input boundaries (which executables it runs, filesystem protections,
+resource limits) are documented in
 [docs/SECURITY_BOUNDARIES.md](docs/SECURITY_BOUNDARIES.md) and
 [docs/security.md](docs/security.md). A report that shows one of those
 documented boundaries failing is in scope.

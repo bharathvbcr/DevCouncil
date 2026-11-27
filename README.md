@@ -131,11 +131,12 @@ DevCouncil is built around deterministic truth and modular engines before the ed
 | Components and state ownership | [Architecture](docs/architecture.md) |
 | Task workflow and verification | [Workflow](docs/workflow.md) and [MCP loop](docs/hero-loop.md) |
 | Security boundaries | [Repository input and verification boundaries](docs/SECURITY_BOUNDARIES.md) |
+| Privacy & telemetry notice | [PRIVACY.md](PRIVACY.md) · [Security policy](SECURITY.md) |
 | Everything else | [Documentation index](docs/README.md) |
 
 ## License
 
-Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option, with Developer Certificate of Origin 1.1 (`Signed-off-by:` required; see [DCO.txt](DCO.txt)). See [LICENSE](LICENSE), [NOTICE](NOTICE), and [CONTRIBUTING.md](CONTRIBUTING.md). The Python CLI, its release lineage and its historical
+Dual-licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`), at your option, with Developer Certificate of Origin 1.1 (`Signed-off-by:` required; see [DCO.txt](DCO.txt)). See [LICENSE](LICENSE), [NOTICE](NOTICE), [PRIVACY.md](PRIVACY.md), and [CONTRIBUTING.md](CONTRIBUTING.md). The Python CLI, its release lineage and its historical
 workflow certifications are retired; current native source and installed
 binary identities must be checked separately.
 
