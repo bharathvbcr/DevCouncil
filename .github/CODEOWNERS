@@ -1,1 +1,14 @@
-* @bharathvbcr
+# Protect CI workflows, custom actions, and the DevCouncil PR Gate action
+# definition so pull requests cannot weaken branch protection, request write
+# permissions on untrusted branches, or forge `devcouncil/pr-gate` statuses.
+#
+# Repository branch-protection requirements for this file to take effect:
+#   1. Enable "Require a pull request before merging" + "Require review from
+#      Code Owners" on the default branch.
+#   2. Note: GitHub does not allow a single listed owner to approve their own
+#      pull requests; add a second maintainer or maintainer team here once
+#      onboarding additional maintainers.
+/.github/CODEOWNERS    @bharathvbcr
+/.github/workflows/**  @bharathvbcr
+/.github/actions/**    @bharathvbcr
+/action.yml            @bharathvbcr

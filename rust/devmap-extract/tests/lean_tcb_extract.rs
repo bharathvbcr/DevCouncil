@@ -370,9 +370,9 @@ theorem stillSound : 1 = 1 := rfl
 #[test]
 fn committed_workspace_lean_specs_satisfy_sound_tcb() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // DevCouncil lives at <Code>/devtools/DevCouncil; sibling specs live at
-    // <Code>/devtools/gocap/specs/FeatherweightGoSree.lean and
-    // <Code>/apps/Graft/specs/GraftProtocol.lean.
+    // DevCouncil lives at <Code>/devtools/DevCouncil; the sibling spec lives at
+    // <Code>/apps/Graft/specs/GraftProtocol.lean. (GoSree, formerly gocap, was
+    // archived on 2026-11-25 and its spec is no longer checked here.)
     let code_root = manifest_dir
         .parent()
         .and_then(Path::parent)
@@ -380,10 +380,7 @@ fn committed_workspace_lean_specs_satisfy_sound_tcb() {
         .and_then(Path::parent)
         .expect("resolve workspace parent above rust/devmap-extract");
 
-    let specs = [
-        code_root.join("devtools/gocap/specs/FeatherweightGoSree.lean"),
-        code_root.join("apps/Graft/specs/GraftProtocol.lean"),
-    ];
+    let specs = [code_root.join("apps/Graft/specs/GraftProtocol.lean")];
     let mut checked = 0usize;
     for spec_path in &specs {
         if !spec_path.exists() {
@@ -419,10 +416,13 @@ fn committed_workspace_lean_specs_satisfy_sound_tcb() {
         );
         checked += 1;
     }
-    if code_root.join("devtools/gocap").is_dir() && code_root.join("apps/Graft").is_dir() {
+    // A checkout without the Graft sibling (CI) skips; one that has Graft must
+    // have read its spec, so a moved or renamed spec fails instead of skipping.
+    if code_root.join("apps/Graft").is_dir() {
         assert_eq!(
-            checked, 2,
-            "both sibling formal specs (FeatherweightGoSree.lean and GraftProtocol.lean) must be verified"
+            checked,
+            specs.len(),
+            "the sibling formal spec GraftProtocol.lean must be verified"
         );
     }
 }

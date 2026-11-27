@@ -6,8 +6,8 @@ gates:
   mode: enforce
 indexing:
   primary_languages:
-  - swift
-  - kotlin
+  - rust
+  - go
 integrations:
   antigravity:
     enabled: true
@@ -34,8 +34,6 @@ integrations:
     enabled: true
     mcp_config_path: .devcouncil/integrations/warp-mcp.json
     run_mode: local
-  aider:
-    enabled: true
 models:
   provider: openrouter
   roles:
