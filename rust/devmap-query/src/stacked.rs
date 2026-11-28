@@ -27,7 +27,7 @@
 //! under the writer lock and answers `None`; provision refuses a lane that has
 //! a store.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,9 @@ use devmap_extract::paths::{
     same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
 };
 use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
-use devmap_resolve::model::LangFamily;
+use devmap_resolve::model::{
+    LangFamily, Resolution, ResolutionKind, UnresolvedClass, UnresolvedKind,
+};
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore, DEFAULT_READ_WAIT};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
@@ -2142,6 +2144,9 @@ impl StackedStore {
     /// [`Self::clear_reverted_file`] for a caller that holds the delta writer lock.
     fn clear_reverted_file_locked(&mut self, rel_path: &str) -> Result<()> {
         let normalized = normalize_rel_path(rel_path)?;
+        if self.delta.is_none() && !stack_delta_path(&self.worktree_root).exists() {
+            return Ok(());
+        }
         self.writable_delta()?.remove_clean_file(&normalized)?;
         self.reload_overlay()
     }
@@ -2162,42 +2167,29 @@ impl StackedStore {
             return Ok(());
         }
         let full = self.worktree_root.join(&normalized);
-        match fs::symlink_metadata(&full) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if self.base.latest_path_is_indexed(&normalized)? {
-                    self.record_deleted_file_locked(&normalized)
-                } else {
-                    self.clear_reverted_file_locked(&normalized)
-                }
-            }
-            Err(err) => Err(err).with_context(|| format!("cannot stat {}", full.display())),
-            Ok(meta) if !meta.is_file() => {
-                if self.base.latest_path_is_indexed(&normalized)? {
-                    self.record_deleted_file_locked(&normalized)
-                } else {
-                    self.clear_reverted_file_locked(&normalized)
-                }
-            }
-            Ok(_) => {
-                if !devmap_extract::languages::is_indexable_source(&normalized) {
-                    return Ok(());
-                }
-                let bytes =
-                    fs::read(&full).with_context(|| format!("cannot read {}", full.display()))?;
-                let Ok(source_str) = std::str::from_utf8(&bytes) else {
-                    return Ok(());
-                };
-                if let Some(base_file) = self.base.latest_file(&normalized)? {
-                    let lang = devmap_extract::languages::detect_language(Path::new(&normalized));
-                    let key = devmap_extract::cache::CacheKey::for_source(lang, source_str);
-                    if key.content_hash == base_file.content_hash {
-                        return self.clear_reverted_file_locked(&normalized);
-                    }
-                }
-                let extraction = devmap_extract::extract_file(&normalized, source_str);
-                self.record_extracted_file_locked(&normalized, &bytes, &extraction)
+        if !classify_worktree_file(&self.worktree_root, &full)? {
+            return if self.base.latest_path_is_indexed(&normalized)? {
+                self.record_deleted_file_locked(&normalized)
+            } else {
+                self.clear_reverted_file_locked(&normalized)
+            };
+        }
+        if !devmap_extract::languages::is_indexable_source(&normalized) {
+            return Ok(());
+        }
+        let bytes = fs::read(&full).with_context(|| format!("cannot read {}", full.display()))?;
+        let Ok(source_str) = std::str::from_utf8(&bytes) else {
+            return Ok(());
+        };
+        if let Some(base_file) = self.base.latest_file(&normalized)? {
+            let lang = devmap_extract::languages::detect_language(Path::new(&normalized));
+            let key = devmap_extract::cache::CacheKey::for_source(lang, source_str);
+            if key.content_hash == base_file.content_hash {
+                return self.clear_reverted_file_locked(&normalized);
             }
         }
+        let extraction = devmap_extract::extract_file(&normalized, source_str);
+        self.record_extracted_file_locked(&normalized, &bytes, &extraction)
     }
 
     /// Synchronize uncommitted/diverged git paths in `worktree_root` into `delta.sqlite`
@@ -2230,17 +2222,18 @@ impl StackedStore {
                 continue;
             }
             let full = self.worktree_root.join(rel_path);
-            if full.is_file() {
+            if classify_worktree_file(&self.worktree_root, &full)? {
                 if !devmap_extract::languages::is_indexable_source(rel_path) {
                     continue;
                 }
                 self.sync_file_from_disk_locked(rel_path)?;
                 synced_files += 1;
-            } else if self.base.latest_path_is_indexed(rel_path)?
-                || existing_delta.contains(rel_path)
-            {
+            } else if self.base.latest_path_is_indexed(rel_path)? {
                 self.record_deleted_file_locked(rel_path)?;
                 deleted_files += 1;
+            } else if existing_delta.contains(rel_path) {
+                self.clear_reverted_file_locked(rel_path)?;
+                cleaned_files += 1;
             }
         }
 
@@ -2323,8 +2316,15 @@ impl StackedStore {
         }
         let path = Path::new(rel_path);
         let full = self.worktree_root.join(rel_path);
+        let is_in_repo_file = matches!(
+            devmap_extract::candidate_kind(&self.worktree_root, &full),
+            devmap_extract::CandidateKind::File { .. }
+        );
         if self.overlay.is_file_tombstoned(path) {
-            return !full.is_file();
+            return !is_in_repo_file;
+        }
+        if !is_in_repo_file {
+            return false;
         }
         match self.overlay.modified_files.get(path) {
             Some(recorded) => fs::read(&full)
@@ -2500,70 +2500,23 @@ impl StackedStore {
     }
 
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<StoredSymbol>> {
-        if limit == 0 {
+        if let Some(offset) = query.find('\0') {
+            bail!(
+                "search query contains a NUL byte at offset {offset}; SQLite's \
+                 full-text parser reads the query as a C string, so no escaping \
+                 can carry one through"
+            );
+        }
+        if limit == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let needle = query.trim().to_ascii_lowercase();
-        let mut results = Vec::new();
-        let mut seen = BTreeSet::new();
-
-        let mut modified_paths: Vec<&String> = self.overlay.added_extractions.keys().collect();
-        modified_paths.sort();
-        for path in modified_paths {
-            if let Some(ext) = self.overlay.added_extractions.get(path) {
-                for sym in &ext.symbols {
-                    if (needle.is_empty()
-                        || sym.name.to_ascii_lowercase().contains(&needle)
-                        || sym.qualified_name.to_ascii_lowercase().contains(&needle))
-                        && seen.insert((path.clone(), sym.qualified_name.clone()))
-                    {
-                        results.push(StoredSymbol {
-                            name: sym.name.clone(),
-                            qualified_name: sym.qualified_name.clone(),
-                            kind: sym.kind.as_str().to_string(),
-                            path: path.clone(),
-                            span_start: sym.span.start_byte,
-                            span_end: sym.span.end_byte,
-                            is_exported: sym.is_exported,
-                            content_hash: ext.content_hash,
-                        });
-                        if results.len() >= limit {
-                            return Ok(results);
-                        }
-                    }
-                }
-            }
+        if !self.has_delta_changes() {
+            return Ok(self.base.search_symbols(query, limit)?);
         }
-
-        let base_rows = if needle.is_empty() {
-            self.base
-                .all_symbols_page()?
-                .map(|p| p.rows)
-                .unwrap_or_default()
-        } else {
-            self.base.search_symbols(
-                query,
-                limit
-                    .saturating_add(self.overlay.modified_files.len() * 8)
-                    .max(64),
-            )?
-        };
-        for sym in base_rows {
-            let p = Path::new(&sym.path);
-            if self.overlay.is_file_tombstoned(p)
-                || self.overlay.modified_files.contains_key(p)
-                || self.overlay.is_symbol_tombstoned(&sym.qualified_name)
-            {
-                continue;
-            }
-            if seen.insert((sym.path.clone(), sym.qualified_name.clone())) {
-                results.push(sym);
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(results)
+        Ok(self
+            .keyword_page(query, limit, None)?
+            .map(|page| page.rows)
+            .unwrap_or_default())
     }
 
     pub fn edges_for_symbol(&self, symbol: &str) -> Result<Vec<OverlayEdge>> {
@@ -2884,7 +2837,9 @@ impl StackedStore {
         }
 
         let trimmed = query.trim();
-        if !trimmed.is_empty() {
+        if trimmed.is_empty() {
+            page.rows.clear();
+        } else {
             // Mirror `Store::search_page` (`nodes_fts` using FTS5 `unicode61` over
             // `name`, `qualified_name`, and `path` with `fts_match_query` splitting
             // on whitespace and `::` into AND-ed quoted prefix phrases).
@@ -3249,14 +3204,256 @@ impl StackedStore {
     }
 }
 
-/// Tokenize text under SQLite FTS5 `unicode61` rules: Unicode letters and
-/// decimal digits form tokens (lowercased); underscores, punctuation, and
-/// whitespace are separators.
+/// Whether `full` names a valid in-repository regular file (or in-repository
+/// symlink to a regular file) under `worktree_root`, matching cold discovery
+/// (`devmap_extract::candidate_kind`).
+///
+/// Returns `Ok(true)` for a regular file or an in-repo symlink to one,
+/// `Ok(false)` when absent (including `ENOTDIR` when an ancestor became a
+/// regular file), a directory/linked-directory, a special file, or a dangling /
+/// root-escaping symlink, and `Err` when stat/canonicalization could not decide
+/// (e.g. `EACCES`, symlink loop, I/O error).
+#[cfg(feature = "parse")]
+fn classify_worktree_file(worktree_root: &Path, full: &Path) -> Result<bool> {
+    match fs::symlink_metadata(full) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot stat {}", full.display()));
+        }
+        Ok(_) => {}
+    }
+    match devmap_extract::candidate_kind(worktree_root, full) {
+        devmap_extract::CandidateKind::File { .. } => Ok(true),
+        devmap_extract::CandidateKind::Absent
+        | devmap_extract::CandidateKind::Directory
+        | devmap_extract::CandidateKind::LinkedDirectory
+        | devmap_extract::CandidateKind::Other
+        | devmap_extract::CandidateKind::Refused(_) => Ok(false),
+        devmap_extract::CandidateKind::Undecidable(reason) => {
+            bail!("cannot stat {}: {reason}", full.display())
+        }
+    }
+}
+
+/// Whether `c` is a combining diacritical mark stripped inside tokens by
+/// SQLite FTS5 `unicode61` (`remove_diacritics 1`, matching
+/// `sqlite3Fts5UnicodeIsdiacritic`).
+fn is_fts5_diacritic(c: char) -> bool {
+    let cp = c as u32;
+    const MASK0: u32 = 0x0802_9FDF;
+    const MASK1: u32 = 0x0003_61F8;
+    if !(768..=817).contains(&cp) {
+        return false;
+    }
+    if cp < 768 + 32 {
+        (MASK0 & (1u32 << (cp - 768))) != 0
+    } else {
+        (MASK1 & (1u32 << (cp - 768 - 32))) != 0
+    }
+}
+
+/// Remove diacritics from a folded Unicode codepoint under SQLite FTS5
+/// `unicode61` default mode (`remove_diacritics 1`, matching SQLite's
+/// `fts5_remove_diacritic(c, bComplex = 0)`).
+fn fts5_remove_diacritic_r1(c: char) -> char {
+    const HIBIT: u8 = 0x80;
+    const A_DIA: [u16; 126] = [
+        0, 1797, 1848, 1859, 1891, 1928, 1940, 1995, 2024, 2040, 2060, 2110, 2168, 2206, 2264,
+        2286, 2344, 2383, 2472, 2488, 2516, 2596, 2668, 2732, 2782, 2842, 2894, 2954, 2984, 3000,
+        3028, 3336, 3456, 3696, 3712, 3728, 3744, 3766, 3832, 3896, 3912, 3928, 3944, 3968, 4008,
+        4040, 4056, 4106, 4138, 4170, 4202, 4234, 4266, 4296, 4312, 4344, 4408, 4424, 4442, 4472,
+        4488, 4504, 6148, 6198, 6264, 6280, 6360, 6429, 6505, 6529, 61448, 61468, 61512, 61534,
+        61592, 61610, 61642, 61672, 61688, 61704, 61726, 61784, 61800, 61816, 61836, 61880, 61896,
+        61914, 61948, 61998, 62062, 62122, 62154, 62184, 62200, 62218, 62252, 62302, 62364, 62410,
+        62442, 62478, 62536, 62554, 62584, 62604, 62640, 62648, 62656, 62664, 62730, 62766, 62830,
+        62890, 62924, 62974, 63032, 63050, 63082, 63118, 63182, 63242, 63274, 63310, 63368, 63390,
+    ];
+    const A_CHAR: [u8; 126] = [
+        0,
+        b'a',
+        b'c',
+        b'e',
+        b'i',
+        b'n',
+        b'o',
+        b'u',
+        b'y',
+        b'y',
+        b'a',
+        b'c',
+        b'd',
+        b'e',
+        b'e',
+        b'g',
+        b'h',
+        b'i',
+        b'j',
+        b'k',
+        b'l',
+        b'n',
+        b'o',
+        b'r',
+        b's',
+        b't',
+        b'u',
+        b'u',
+        b'w',
+        b'y',
+        b'z',
+        b'o',
+        b'u',
+        b'a',
+        b'i',
+        b'o',
+        b'u',
+        b'u' | HIBIT,
+        b'a' | HIBIT,
+        b'g',
+        b'k',
+        b'o',
+        b'o' | HIBIT,
+        b'j',
+        b'g',
+        b'n',
+        b'a' | HIBIT,
+        b'a',
+        b'e',
+        b'i',
+        b'o',
+        b'r',
+        b'u',
+        b's',
+        b't',
+        b'h',
+        b'a',
+        b'e',
+        b'o' | HIBIT,
+        b'o',
+        b'o' | HIBIT,
+        b'y',
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        b'a',
+        b'b',
+        b'c' | HIBIT,
+        b'd',
+        b'd',
+        b'e' | HIBIT,
+        b'e',
+        b'e' | HIBIT,
+        b'f',
+        b'g',
+        b'h',
+        b'h',
+        b'i',
+        b'i' | HIBIT,
+        b'k',
+        b'l',
+        b'l' | HIBIT,
+        b'l',
+        b'm',
+        b'n',
+        b'o' | HIBIT,
+        b'p',
+        b'r',
+        b'r' | HIBIT,
+        b'r',
+        b's',
+        b's' | HIBIT,
+        b't',
+        b'u',
+        b'u' | HIBIT,
+        b'v',
+        b'w',
+        b'w',
+        b'x',
+        b'y',
+        b'z',
+        b'h',
+        b't',
+        b'w',
+        b'y',
+        b'a',
+        b'a' | HIBIT,
+        b'a' | HIBIT,
+        b'a' | HIBIT,
+        b'e',
+        b'e' | HIBIT,
+        b'e' | HIBIT,
+        b'i',
+        b'o',
+        b'o' | HIBIT,
+        b'o' | HIBIT,
+        b'o' | HIBIT,
+        b'u',
+        b'u' | HIBIT,
+        b'u' | HIBIT,
+        b'y',
+    ];
+    let cp = c as u32;
+    if !(128..65536).contains(&cp) {
+        return c;
+    }
+    let key = (cp << 3) | 0x07;
+    let idx = A_DIA
+        .partition_point(|&entry| u32::from(entry) <= key)
+        .saturating_sub(1);
+    let ch = A_CHAR[idx];
+    if (ch & HIBIT) != 0 {
+        return c;
+    }
+    let base = u32::from(A_DIA[idx] >> 3);
+    let span = u32::from(A_DIA[idx] & 0x07);
+    if cp > base + span {
+        c
+    } else {
+        char::from(ch & 0x7F)
+    }
+}
+
+/// Tokenize text under SQLite FTS5 `unicode61` (`remove_diacritics 1`) rules:
+/// Unicode letters and decimal digits form tokens (case-folded with Latin
+/// diacritics stripped); combining diacritical marks inside tokens are ignored
+/// rather than splitting tokens; underscores, punctuation, and whitespace are
+/// separators.
 fn fts_unicode61_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|tok| !tok.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if is_fts5_diacritic(c) {
+            continue;
+        }
+        if c.is_alphanumeric() {
+            if c == '\u{0130}' {
+                current.push('i');
+            } else {
+                for lc in c.to_lowercase() {
+                    if !is_fts5_diacritic(lc) {
+                        current.push(fts5_remove_diacritic_r1(lc));
+                    }
+                }
+            }
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// Whether `haystack` contains an adjacent token run matching `phrase` with a
@@ -3277,6 +3474,17 @@ fn bare_tail(symbol: &str) -> Option<&str> {
     let tail = symbol.rsplit("::").next().unwrap_or(symbol);
     let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
     (!tail.is_empty()).then_some(tail)
+}
+
+fn qual_tail(symbol: &str) -> &str {
+    symbol.rsplit("::").next().unwrap_or(symbol).trim()
+}
+
+fn parent_dir_str(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    }
 }
 
 struct ImportAliasMaps {
@@ -3374,6 +3582,133 @@ fn base_symbols_for_callee_within(
     Ok((page.rows, exhaustive))
 }
 
+/// Whether any live file other than `rel_path` in the merged corpus (delta +
+/// unmasked base) with a mutually admitted `LangFamily` declares a symbol whose
+/// bare name matches `name`, or whether the base lookup hit its ceiling
+/// (non-exhaustive, so uniqueness cannot be proven).
+fn corpus_has_other_symbol_named(
+    name: &str,
+    rel_path: &str,
+    caller_family: LangFamily,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+    lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>,
+    cancel: &crate::cancel::Cancel,
+) -> Result<bool> {
+    if !caller_family.admits(caller_family) {
+        return Ok(true);
+    }
+    for (other_path, other_ext) in &overlay.added_extractions {
+        if other_path == rel_path {
+            continue;
+        }
+        let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(
+            other_path,
+        )));
+        if !caller_family.admits(fam) {
+            continue;
+        }
+        if other_ext
+            .symbols
+            .iter()
+            .any(|s| s.name == name || bare_tail(&s.qualified_name) == Some(name))
+        {
+            return Ok(true);
+        }
+    }
+    if !lookups.contains_key(name) {
+        cancel.check()?;
+        lookups.insert(name.to_string(), base_symbols_for_callee(base, name)?);
+    }
+    let (base_rows, base_exhaustive) = &lookups[name];
+    if !*base_exhaustive {
+        return Ok(true);
+    }
+    for sym in base_rows {
+        if sym.path == rel_path {
+            continue;
+        }
+        let p = Path::new(&sym.path);
+        if overlay.is_file_tombstoned(p)
+            || overlay.modified_files.contains_key(p)
+            || overlay.is_symbol_tombstoned(&sym.qualified_name)
+        {
+            continue;
+        }
+        let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
+        if !caller_family.admits(fam) {
+            continue;
+        }
+        if sym.name == name || bare_tail(&sym.qualified_name) == Some(name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether another visible live Go file in the same directory as `rel_path`
+/// declares the same `Type.Method` (`target_qtail`), matching `devmap-resolve`'s
+/// same-package ambiguity abstention for Go `ReceiverType` edges.
+fn go_same_dir_has_other_method(
+    rel_path: &str,
+    target_qtail: &str,
+    method_name: &str,
+    overlay: &WorktreeOverlay,
+    base: &Store,
+    lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>,
+    cancel: &crate::cancel::Cancel,
+) -> Result<bool> {
+    let dir = parent_dir_str(rel_path);
+    let caller_is_test = rel_path.ends_with("_test.go");
+    for (other_path, other_ext) in &overlay.added_extractions {
+        if other_path == rel_path
+            || !other_path.ends_with(".go")
+            || parent_dir_str(other_path) != dir
+            || (!caller_is_test && other_path.ends_with("_test.go"))
+        {
+            continue;
+        }
+        if other_ext
+            .symbols
+            .iter()
+            .any(|s| qual_tail(&s.qualified_name) == target_qtail)
+        {
+            return Ok(true);
+        }
+    }
+    if !lookups.contains_key(method_name) {
+        cancel.check()?;
+        lookups.insert(
+            method_name.to_string(),
+            base_symbols_for_callee(base, method_name)?,
+        );
+    }
+    let (base_rows, base_exhaustive) = &lookups[method_name];
+    if !*base_exhaustive {
+        return Ok(true);
+    }
+    for sym in base_rows {
+        if sym.path == rel_path
+            || !sym.path.ends_with(".go")
+            || parent_dir_str(&sym.path) != dir
+            || (!caller_is_test && sym.path.ends_with("_test.go"))
+        {
+            continue;
+        }
+        let p = Path::new(&sym.path);
+        if overlay.is_file_tombstoned(p)
+            || overlay.modified_files.contains_key(p)
+            || overlay.is_symbol_tombstoned(&sym.qualified_name)
+        {
+            continue;
+        }
+        if qual_tail(&sym.qualified_name) == target_qtail {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The edges one dirty file contributes to the merged index.
 ///
 /// `base_scope_paths` is every path the base indexes, read once per merge by the
@@ -3387,6 +3722,7 @@ fn resolve_delta_stored_edges(
     lookups: &mut BTreeMap<String, (Vec<StoredSymbol>, bool)>,
     cancel: &crate::cancel::Cancel,
 ) -> Result<Vec<StoredEdge>> {
+    cancel.check()?;
     let mut out = Vec::new();
     let caller_family = LangFamily::from_lang(devmap_extract::languages::detect_language(
         Path::new(rel_path),
@@ -3398,8 +3734,49 @@ fn resolve_delta_stored_edges(
     //    real `devmap_resolve::Resolver` over just this delta extraction.
     let mut local_resolver = devmap_resolve::Resolver::new();
     local_resolver.index_extractions(std::slice::from_ref(ext));
+    cancel.check()?;
     let local_res = local_resolver.resolve_all(std::slice::from_ref(ext))?;
-    for edge in &local_res.edges {
+    cancel.check()?;
+
+    for (edge_idx, edge) in local_res.edges.iter().enumerate() {
+        cancel.check_every(edge_idx)?;
+        let res_kind = edge.resolution.as_ref().map(|res| res.kind());
+        // Single-file `local_resolver` cannot see namesakes in other live files:
+        // drop `UniqueGlobal` edges (Calls or References) when another live file
+        // in a mutually admitted `LangFamily` declares the same bare name.
+        if res_kind == Some(ResolutionKind::UniqueGlobal) {
+            if let Some(target_bare) = bare_tail(&edge.target_symbol) {
+                if corpus_has_other_symbol_named(
+                    target_bare,
+                    rel_path,
+                    caller_family,
+                    overlay,
+                    base,
+                    lookups,
+                    cancel,
+                )? {
+                    continue;
+                }
+            }
+        }
+        // In Go, duplicate `Type.Method` declarations across sibling files in
+        // the same package cause cold resolution to abstain on `ReceiverType`.
+        if caller_family == LangFamily::Go && res_kind == Some(ResolutionKind::ReceiverType) {
+            let target_qtail = qual_tail(&edge.target_symbol);
+            if let Some((_, method_name)) = target_qtail.rsplit_once('.') {
+                if go_same_dir_has_other_method(
+                    rel_path,
+                    target_qtail,
+                    method_name,
+                    overlay,
+                    base,
+                    lookups,
+                    cancel,
+                )? {
+                    continue;
+                }
+            }
+        }
         out.push(StoredEdge {
             source_file: edge.source_file.clone(),
             target_file: edge.target_file.clone(),
@@ -3407,27 +3784,76 @@ fn resolve_delta_stored_edges(
             target_symbol: edge.target_symbol.clone(),
             edge_kind: format!("{:?}", edge.edge_kind),
             confidence: edge.confidence.persist_real() as f32,
-            resolution: edge
-                .resolution
-                .as_ref()
-                .map(|res| res.kind().label().to_string()),
+            resolution: res_kind.map(|kind| kind.label().to_string()),
         });
     }
 
-    let unresolved_call_sites: HashSet<(usize, usize)> = local_res
-        .unresolved
-        .iter()
-        .filter(|u| u.kind == devmap_resolve::model::UnresolvedKind::Call)
-        .filter_map(|u| u.site.map(|s| (s.start, s.end)))
-        .collect();
+    // Only admit cross-file eligible unresolved call sites into Step 2.
+    // Never admit local bindings, builtins, host globals, typed-receiver member
+    // misses, intra-file ambiguous/capped globals, over-cap dispatch sites
+    // (which already emitted their direct edge into `local_res.edges`), or
+    // overload self-calls. Key by `(start, end, callee, receiver, source_symbol)`
+    // so shared-span calls resolved in `local_res.edges` cannot re-enter Step 2.
+    let mut unresolved_call_sites: HashMap<(usize, usize, &str, Option<&str>, &str), usize> =
+        HashMap::new();
+    for u in &local_res.unresolved {
+        if u.kind != UnresolvedKind::Call {
+            continue;
+        }
+        let class_eligible = matches!(
+            u.class,
+            UnresolvedClass::NoNamesake
+                | UnresolvedClass::UninferredReceiver
+                | UnresolvedClass::External { .. }
+                | UnresolvedClass::Unresolved
+                | UnresolvedClass::ModulePath
+        );
+        if !class_eligible {
+            continue;
+        }
+        let resolution_eligible = match &u.resolution {
+            Resolution::AmbiguousGlobal { .. }
+            | Resolution::CappedGlobal { .. }
+            | Resolution::Dispatch { .. } => false,
+            Resolution::Unresolved { reason } if reason.contains("overloads share one id") => false,
+            _ => true,
+        };
+        if !resolution_eligible {
+            continue;
+        }
+        if let Some(s) = u.site {
+            *unresolved_call_sites
+                .entry((
+                    s.start,
+                    s.end,
+                    u.callee_name.as_str(),
+                    u.receiver.as_deref(),
+                    u.source_symbol.as_str(),
+                ))
+                .or_insert(0) += 1;
+        }
+    }
 
-    if ext
-        .capabilities()
-        .contains(devmap_extract::languages::Capability::Calls)
+    if caller_family.admits(caller_family)
+        && ext
+            .capabilities()
+            .contains(devmap_extract::languages::Capability::Calls)
     {
-        for call in &ext.calls {
-            if !unresolved_call_sites.contains(&(call.span.start_byte, call.span.end_byte)) {
-                continue;
+        for (call_idx, call) in ext.calls.iter().enumerate() {
+            cancel.check_every(call_idx)?;
+            let raw_caller = call.caller_symbol.as_deref().unwrap_or(rel_path);
+            let site_key = (
+                call.span.start_byte,
+                call.span.end_byte,
+                call.callee_name.as_str(),
+                call.receiver_expr.as_deref(),
+                raw_caller,
+            );
+            match unresolved_call_sites.get_mut(&site_key) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                }
+                _ => continue,
             }
             let raw_callee = call.callee_name.trim();
             if raw_callee.is_empty() {
@@ -3495,7 +3921,7 @@ fn resolve_delta_stored_edges(
                 let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(
                     Path::new(other_path),
                 ));
-                if fam != caller_family {
+                if !caller_family.admits(fam) {
                     continue;
                 }
                 for s in &other_ext.symbols {
@@ -3521,7 +3947,7 @@ fn resolve_delta_stored_edges(
                     continue;
                 }
                 let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
-                if fam != caller_family {
+                if !caller_family.admits(fam) {
                     continue;
                 }
                 if sym.name == callee || bare_tail(&sym.qualified_name) == Some(callee) {
@@ -3566,29 +3992,37 @@ fn resolve_delta_stored_edges(
                     source_symbol,
                     target_symbol: target_symbol.clone(),
                     edge_kind: "Calls".to_string(),
-                    confidence: 0.9,
-                    resolution: Some("ImportScoped".to_string()),
+                    confidence: ResolutionKind::ImportScoped.confidence().persist_real() as f32,
+                    resolution: Some(ResolutionKind::ImportScoped.label().to_string()),
                 });
             } else if candidates.len() == 1 && *base_exhaustive {
                 // `UniqueGlobal` claims no other symbol in the corpus carries the
-                // name. That holds only when the base lookup saw every match; a read
-                // that hit the ceiling proves nothing, so it adds no edge.
-                if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
-                    out.push(StoredEdge {
-                        source_file: rel_path.to_string(),
-                        target_file,
-                        source_symbol,
-                        target_symbol,
-                        edge_kind: "Calls".to_string(),
-                        confidence: 0.9,
-                        resolution: Some("UniqueGlobal".to_string()),
-                    });
+                // name. That holds only when the base lookup saw every match and
+                // this file itself does not also declare a namesake.
+                let self_declares_callee = ext
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == callee || bare_tail(&s.qualified_name) == Some(callee));
+                if !self_declares_callee {
+                    if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
+                        out.push(StoredEdge {
+                            source_file: rel_path.to_string(),
+                            target_file,
+                            source_symbol,
+                            target_symbol,
+                            edge_kind: "Calls".to_string(),
+                            confidence: ResolutionKind::UniqueGlobal.confidence().persist_real()
+                                as f32,
+                            resolution: Some(ResolutionKind::UniqueGlobal.label().to_string()),
+                        });
+                    }
                 }
             }
         }
     }
 
-    for imp in &ext.imports {
+    for (imp_idx, imp) in ext.imports.iter().enumerate() {
+        cancel.check_every(imp_idx)?;
         let spec = imp.module_specifier.trim();
         if spec.is_empty() {
             continue;
@@ -3665,10 +4099,53 @@ fn merge_generation_edges(
         )
     };
 
+    // Precompute delta declaration tables once in O(delta_symbols) so the base
+    // edge pass below can suppress base edges shadowed by delta collisions in
+    // O(1) per edge (zero allocations on the common `SameFile`/`Contains` path).
+    let mut delta_bare_names_by_family: HashMap<LangFamily, HashSet<&str>> = HashMap::new();
+    let mut delta_go_dir_any_methods: HashSet<(&str, &str)> = HashSet::new();
+    let mut delta_go_dir_non_test_methods: HashSet<(&str, &str)> = HashSet::new();
+    let mut delta_go_dir_any_pkg_syms: HashSet<(&str, &str)> = HashSet::new();
+    let mut delta_go_dir_non_test_pkg_syms: HashSet<(&str, &str)> = HashSet::new();
+    for (delta_path, ext) in &overlay.added_extractions {
+        let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(
+            delta_path,
+        )));
+        if fam.admits(fam) {
+            let names = delta_bare_names_by_family.entry(fam).or_default();
+            for s in &ext.symbols {
+                names.insert(s.name.as_str());
+                if let Some(tail) = bare_tail(&s.qualified_name) {
+                    names.insert(tail);
+                }
+            }
+        }
+        if fam == LangFamily::Go {
+            let dir = parent_dir_str(delta_path);
+            let is_test = delta_path.ends_with("_test.go");
+            for s in &ext.symbols {
+                let qtail = qual_tail(&s.qualified_name);
+                if qtail.contains('.') {
+                    delta_go_dir_any_methods.insert((dir, qtail));
+                    if !is_test {
+                        delta_go_dir_non_test_methods.insert((dir, qtail));
+                    }
+                } else if !qtail.is_empty() {
+                    delta_go_dir_any_pkg_syms.insert((dir, qtail));
+                    if !is_test {
+                        delta_go_dir_non_test_pkg_syms.insert((dir, qtail));
+                    }
+                }
+            }
+        }
+    }
+
     for id in 0..base_index.len() as u32 {
         cancel.check_every(id as usize)?;
-        let src_p = Path::new(base_index.source_file(id));
-        let dst_p = Path::new(base_index.target_file(id));
+        let src_file = base_index.source_file(id);
+        let dst_file = base_index.target_file(id);
+        let src_p = Path::new(src_file);
+        let dst_p = Path::new(dst_file);
         if overlay.is_file_tombstoned(src_p)
             || overlay.modified_files.contains_key(src_p)
             || overlay.is_file_tombstoned(dst_p)
@@ -3676,6 +4153,59 @@ fn merge_generation_edges(
             || overlay.is_symbol_tombstoned(base_index.target_symbol(id))
         {
             continue;
+        }
+        // Every surviving base edge has `dst_file` outside `overlay.modified_files`,
+        // so every file in `overlay.added_extractions` is strictly another file.
+        match base_index.resolution_label(id) {
+            Some("UniqueGlobal") if !delta_bare_names_by_family.is_empty() => {
+                let dst_fam =
+                    LangFamily::from_lang(devmap_extract::languages::detect_language(dst_p));
+                if let Some(names) = delta_bare_names_by_family.get(&dst_fam) {
+                    if bare_tail(base_index.target_symbol(id))
+                        .is_some_and(|bare| names.contains(bare))
+                    {
+                        continue;
+                    }
+                }
+            }
+            Some("ReceiverType")
+                if !delta_go_dir_any_methods.is_empty()
+                    && src_file.ends_with(".go")
+                    && dst_file.ends_with(".go") =>
+            {
+                let dir = parent_dir_str(dst_file);
+                if parent_dir_str(src_file) == dir {
+                    let target_qtail = qual_tail(base_index.target_symbol(id));
+                    let shadowed = if src_file.ends_with("_test.go") {
+                        delta_go_dir_any_methods.contains(&(dir, target_qtail))
+                    } else {
+                        delta_go_dir_non_test_methods.contains(&(dir, target_qtail))
+                    };
+                    if shadowed {
+                        continue;
+                    }
+                }
+            }
+            Some("SamePackage")
+                if !delta_go_dir_any_pkg_syms.is_empty()
+                    && src_file.ends_with(".go")
+                    && dst_file.ends_with(".go") =>
+            {
+                let dir = parent_dir_str(dst_file);
+                if parent_dir_str(src_file) == dir {
+                    if let Some(target_bare) = bare_tail(base_index.target_symbol(id)) {
+                        let shadowed = if src_file.ends_with("_test.go") {
+                            delta_go_dir_any_pkg_syms.contains(&(dir, target_bare))
+                        } else {
+                            delta_go_dir_non_test_pkg_syms.contains(&(dir, target_bare))
+                        };
+                        if shadowed {
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         let edge = base_index.stored_edge(id);
         seen.insert(key_of(&edge));
@@ -3812,17 +4342,41 @@ fn extract_delta_edges(rel_path: &str, extraction: &Extraction) -> Vec<DeltaEdge
 }
 
 fn normalize_rel_path(rel_path: &str) -> Result<String> {
-    let trimmed = rel_path.trim().replace('\\', "/");
-    let trimmed = trimmed.trim_start_matches("./");
-    if trimmed.is_empty() || trimmed.starts_with('/') {
+    if rel_path.contains('\0') {
+        bail!("overlay path must not contain NUL bytes: {rel_path:?}");
+    }
+    let replaced = rel_path.trim().replace('\\', "/");
+    let bytes = replaced.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        bail!("overlay path must be repository-relative (no drive prefix): {rel_path:?}");
+    }
+    if replaced.is_empty() || replaced.starts_with('/') {
         bail!("overlay path must be non-empty and repository-relative: {rel_path:?}");
     }
-    for comp in Path::new(trimmed).components() {
-        if matches!(comp, std::path::Component::ParentDir) {
-            bail!("overlay path must not traverse '..': {rel_path:?}");
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in Path::new(&replaced).components() {
+        match comp {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                bail!("overlay path must be repository-relative: {rel_path:?}");
+            }
+            std::path::Component::ParentDir => {
+                bail!("overlay path must not traverse '..': {rel_path:?}");
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(seg) => {
+                let s = seg.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("overlay path must be valid UTF-8: {rel_path:?}")
+                })?;
+                if !s.is_empty() {
+                    parts.push(s);
+                }
+            }
         }
     }
-    Ok(trimmed.to_string())
+    if parts.is_empty() {
+        bail!("overlay path must be non-empty and repository-relative: {rel_path:?}");
+    }
+    Ok(parts.join("/"))
 }
 
 /// Paths that differ from the base: `git status` plus `base_head..HEAD`.
@@ -4050,7 +4604,7 @@ mod tests {
             .current_dir(cwd)
             // Git for Windows checks a worktree out with CRLF under its default
             // autocrlf=true, which would make every lane look edited.
-            .args(["-c", "core.autocrlf=false"])
+            .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -9472,6 +10026,539 @@ mod tests {
             fs::set_permissions(state_dir, fs::Permissions::from_mode(0o755)).unwrap();
             fs::set_permissions(&delta_path, fs::Permissions::from_mode(0o644)).unwrap();
         }
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn fts_unicode61_tokens_matches_live_sqlite_fts5_on_diacritics_nfd_and_turkish_i() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='unicode61');")
+            .unwrap();
+
+        let corpus = [
+            "café",
+            "ÉCLAIR",
+            "résumé_handler",
+            "naïve_parser",
+            "façade::build",
+            "über_config",
+            "piñata",
+            "Ångström",
+            "cafe\u{0301}bar",
+            "e\u{0301}clair",
+            "\u{0130}stanbul",
+            "İstanbul_route",
+            "straße",
+            "ø_helper",
+            "Łódź",
+            "Đà_Nẵng",
+            "tiếng_việt",
+            "foo_bar::Baz123",
+        ];
+        for doc in &corpus {
+            conn.execute("INSERT INTO docs (body) VALUES (?1)", [doc])
+                .unwrap();
+        }
+
+        let queries = [
+            "cafe",
+            "café",
+            "eclair",
+            "ÉCLAIR",
+            "resume",
+            "naive",
+            "facade",
+            "uber",
+            "pinata",
+            "angstrom",
+            "cafebar",
+            "cafe bar",
+            "istanbul",
+            "İstanbul",
+            "strasse",
+            "straße",
+            "lodz",
+            "łódź",
+            "ø",
+            "o",
+            "tieng",
+            "viet",
+            "baz12",
+        ];
+
+        for query in &queries {
+            let fts_q = query
+                .split_whitespace()
+                .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut stmt = conn
+                .prepare("SELECT body FROM docs WHERE docs MATCH ?1")
+                .unwrap();
+            let sqlite_hits: BTreeSet<String> = stmt
+                .query_map([&fts_q], |row| row.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+
+            let phrases: Vec<Vec<String>> =
+                query.split_whitespace().map(fts_unicode61_tokens).collect();
+            let rust_hits: BTreeSet<String> = corpus
+                .iter()
+                .filter(|doc| {
+                    let tokens = fts_unicode61_tokens(doc);
+                    !phrases.is_empty()
+                        && !phrases.iter().any(Vec::is_empty)
+                        && phrases.iter().all(|p| phrase_matches_tokens(&tokens, p))
+                })
+                .map(|s| (*s).to_string())
+                .collect();
+
+            assert_eq!(
+                rust_hits, sqlite_hits,
+                "FTS5 unicode61 parity mismatch for query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_rel_path_collapses_canonical_segments_and_rejects_drive_prefixes() {
+        assert_eq!(normalize_rel_path("src/./a.rs").unwrap(), "src/a.rs");
+        assert_eq!(normalize_rel_path("src//a.rs").unwrap(), "src/a.rs");
+        assert_eq!(normalize_rel_path("src/a.rs/").unwrap(), "src/a.rs");
+        assert_eq!(
+            normalize_rel_path("./src/./sub//a.rs/").unwrap(),
+            "src/sub/a.rs"
+        );
+        assert_eq!(
+            normalize_rel_path(r"src\sub\.\a.rs").unwrap(),
+            "src/sub/a.rs"
+        );
+        for bad in [
+            "",
+            ".",
+            "./",
+            "./.",
+            "/abs/a.rs",
+            r"\abs\a.rs",
+            "../a.rs",
+            "src/../a.rs",
+            "C:foo.rs",
+            "C:/foo.rs",
+            r"C:\foo.rs",
+            "c:sub/foo.rs",
+            "src/a\0b.rs",
+        ] {
+            assert!(
+                normalize_rel_path(bad).is_err(),
+                "normalize_rel_path must reject {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn empty_and_whitespace_queries_return_empty_in_keyword_page_and_search_symbols() {
+        let (root, stacked) = dirty_stacked_lane("empty-query-parity");
+
+        for q in ["", "   ", "\t\n"] {
+            let page = stacked.keyword_page(q, 50, None).unwrap().unwrap();
+            assert_eq!(page.total, 0, "keyword_page({q:?}) total must be 0");
+            assert!(
+                page.rows.is_empty(),
+                "keyword_page({q:?}) rows must be empty"
+            );
+
+            let filter = crate::scope::NameQueryFilter::new(&["src".to_string()], &[], &[])
+                .unwrap()
+                .unwrap();
+            let filtered = stacked.keyword_page(q, 50, Some(&filter)).unwrap().unwrap();
+            assert_eq!(
+                filtered.total, 0,
+                "filtered keyword_page({q:?}) total must be 0"
+            );
+            assert!(filtered.rows.is_empty());
+            assert!(filtered.narrowing.is_some());
+
+            let syms = stacked.search_symbols(q, 50).unwrap();
+            assert!(syms.is_empty(), "search_symbols({q:?}) must be empty");
+        }
+
+        // NUL byte must be refused even when delta rows would otherwise satisfy limit=1.
+        assert!(
+            stacked.search_symbols("Handle\0", 1).is_err(),
+            "search_symbols must refuse NUL byte even with delta rows and limit=1"
+        );
+
+        // FTS5 prefix semantics: prefix matches, mid-word non-prefix substring does not.
+        let prefix_hits = stacked.search_symbols("Hand", 50).unwrap();
+        assert!(
+            prefix_hits.iter().any(|s| s.name == "Handle"),
+            "search_symbols must match prefix 'Hand' -> 'Handle'"
+        );
+        let mid_hits = stacked.search_symbols("andle", 50).unwrap();
+        assert!(
+            mid_hits.is_empty(),
+            "search_symbols must not match mid-word substring 'andle': {mid_hits:?}"
+        );
+        let path_hits = stacked.search_symbols("svc", 50).unwrap();
+        assert!(
+            path_hits.iter().any(|s| s.path == "src/svc.go"),
+            "search_symbols must match path tokens like FTS5"
+        );
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn clear_reverted_file_is_lazy_when_delta_sqlite_absent() {
+        let root = temp_repo_dir("lazy-clear-delta");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        let delta_path = stack_delta_path(&lane);
+        assert!(!delta_path.exists());
+
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        stacked
+            .sync_file_from_disk("src/does_not_exist.rs")
+            .unwrap();
+        stacked
+            .clear_reverted_file("src/does_not_exist.rs")
+            .unwrap();
+        assert!(
+            !delta_path.exists(),
+            "clearing/syncing a nonexistent non-base file must not eagerly create delta.sqlite"
+        );
+        assert!(!stacked.delta_present());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn step2_filters_local_builtin_host_unresolved_member_ambiguous_and_sets_import_confidence_1() {
+        let root = temp_repo_dir("step2-filter-classes");
+        let anchor = root.join("anchor");
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        fs::write(
+            anchor.join("src/base_lib.rs"),
+            "pub fn cb() {}\npub fn missing_member() {}\npub fn dup_fn() {}\npub fn real_imported() -> i32 { 7 }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("src/base_ts.ts"),
+            "export function fetch(): void {}\nexport function helperTs(): number { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("src/base_go.go"),
+            "package p\n\nfunc len() int { return 0 }\n",
+        )
+        .unwrap();
+        run_git_ok(&anchor, &["init", "-b", "main"]);
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "init"]);
+        index_tree(
+            &anchor,
+            &["src/base_lib.rs", "src/base_ts.ts", "src/base_go.go"],
+        );
+
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        fs::write(
+            lane.join("src/caller.rs"),
+            concat!(
+                "use crate::base_lib::real_imported;\n",
+                "struct LocalBox {}\n",
+                "mod m1 { pub fn dup_fn() {} }\n",
+                "mod m2 { pub fn dup_fn() {} }\n",
+                "pub fn drive(cb: fn()) -> i32 {\n",
+                "    cb();\n",
+                "    let b = LocalBox {};\n",
+                "    b.missing_member();\n",
+                "    dup_fn();\n",
+                "    real_imported()\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            lane.join("src/caller.ts"),
+            concat!(
+                "import { helperTs } from './base_ts';\n",
+                "export function driveTs(): number {\n",
+                "    fetch('https://example.com');\n",
+                "    return helperTs();\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            lane.join("src/caller.go"),
+            "package p\n\nfunc driveGo(xs []int) int { return len(xs) }\n",
+        )
+        .unwrap();
+
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        stacked.sync_worktree().unwrap();
+        let cancel = crate::cancel::Cancel::new();
+
+        // Rust checks: ImportScoped real_imported has confidence 1.0; local cb, LocalBox.missing_member,
+        // and intra-file AmbiguousGlobal dup_fn must NOT bind to src/base_lib.rs!
+        let rs_edges = stacked
+            .file_edges("src/caller.rs", 0.0, &cancel)
+            .unwrap()
+            .unwrap()
+            .edges;
+        let rs_calls: Vec<&StoredEdge> =
+            rs_edges.iter().filter(|e| e.edge_kind == "Calls").collect();
+        for forbidden in ["cb", "missing_member", "dup_fn"] {
+            assert!(
+                !rs_calls
+                    .iter()
+                    .any(|e| e.target_file == "src/base_lib.rs"
+                        && e.target_symbol.ends_with(forbidden)),
+                "Step 2 fabricated bogus cross-file edge to {forbidden}: {rs_calls:#?}"
+            );
+        }
+        let imp_edge = rs_calls
+            .iter()
+            .find(|e| e.target_symbol == "src/base_lib.rs::real_imported")
+            .expect("ImportScoped call to real_imported must resolve");
+        assert_eq!(imp_edge.resolution.as_deref(), Some("ImportScoped"));
+        assert!(
+            (imp_edge.confidence - 1.0).abs() < 1e-6,
+            "Step 2 ImportScoped confidence must be 1.0, got {}",
+            imp_edge.confidence
+        );
+        // Must survive a deterministic-rung (min_confidence = 1.0) query.
+        let det_edges = stacked
+            .file_edges("src/caller.rs", 1.0, &cancel)
+            .unwrap()
+            .unwrap()
+            .edges;
+        assert!(
+            det_edges
+                .iter()
+                .any(|e| e.target_symbol == "src/base_lib.rs::real_imported"),
+            "ImportScoped edge must survive min_confidence = 1.0"
+        );
+
+        // TS check: HostGlobal fetch() must NOT bind to src/base_ts.ts::fetch.
+        let ts_edges = stacked
+            .file_edges("src/caller.ts", 0.0, &cancel)
+            .unwrap()
+            .unwrap()
+            .edges;
+        assert!(
+            !ts_edges
+                .iter()
+                .any(|e| e.edge_kind == "Calls" && e.target_symbol.ends_with("fetch")),
+            "HostGlobal fetch() leaked into Step 2: {ts_edges:#?}"
+        );
+
+        // Go check: Builtin len() must NOT bind to src/base_go.go::len.
+        let go_edges = stacked
+            .file_edges("src/caller.go", 0.0, &cancel)
+            .unwrap()
+            .unwrap()
+            .edges;
+        assert!(
+            !go_edges
+                .iter()
+                .any(|e| e.edge_kind == "Calls" && e.target_symbol.ends_with("len")),
+            "Builtin len() leaked into Step 2: {go_edges:#?}"
+        );
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn single_file_unique_global_is_dropped_when_base_declares_namesake() {
+        let root = temp_repo_dir("unique-global-shadow");
+        let anchor = root.join("anchor");
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        fs::write(
+            anchor.join("src/base_target.rs"),
+            "pub fn shadowed_global() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        run_git_ok(&anchor, &["init", "-b", "main"]);
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "init"]);
+        index_tree(&anchor, &["src/base_target.rs"]);
+
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        // Inside `delta_mod.rs`, `inner::shadowed_global` is non-lexical so 1-file
+        // `local_resolver` emits `UniqueGlobal`. Across base + delta there are 2
+        // declarations, so cold build abstains (`AmbiguousGlobal`) and stacked must too.
+        fs::write(
+            lane.join("src/delta_mod.rs"),
+            concat!(
+                "mod inner {\n",
+                "    pub fn shadowed_global() -> i32 { 2 }\n",
+                "}\n",
+                "pub fn call_it() -> i32 {\n",
+                "    shadowed_global()\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        stacked.sync_worktree().unwrap();
+        let cancel = crate::cancel::Cancel::new();
+        let edges = stacked
+            .file_edges("src/delta_mod.rs", 0.0, &cancel)
+            .unwrap()
+            .unwrap()
+            .edges;
+        let calls: Vec<&StoredEdge> = edges
+            .iter()
+            .filter(|e| e.edge_kind == "Calls" && e.target_symbol.contains("shadowed_global"))
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "single-file UniqueGlobal must be dropped when base declares a namesake: {calls:#?}"
+        );
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn step2_generic_lang_family_does_not_cross_resolve() {
+        let root = temp_repo_dir("generic-lang-admits");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        let mut caller_ext =
+            devmap_extract::extract_file("misc/a.rs", "pub fn run() { cross_generic(); }\n");
+        caller_ext.file_path = "misc/a.unknown_ext".to_string();
+        caller_ext.language = "unknown_a".to_string();
+        for s in &mut caller_ext.symbols {
+            s.qualified_name = s.qualified_name.replace("misc/a.rs", "misc/a.unknown_ext");
+        }
+        for c in &mut caller_ext.calls {
+            if let Some(ref mut caller) = c.caller_symbol {
+                *caller = caller.replace("misc/a.rs", "misc/a.unknown_ext");
+            }
+        }
+
+        let mut target_ext =
+            devmap_extract::extract_file("misc/b.rs", "pub fn cross_generic() {}\n");
+        target_ext.file_path = "misc/b.unknown_ext".to_string();
+        target_ext.language = "unknown_b".to_string();
+        for s in &mut target_ext.symbols {
+            s.qualified_name = s.qualified_name.replace("misc/b.rs", "misc/b.unknown_ext");
+        }
+
+        let mut overlay = WorktreeOverlay::new("generic-test", 1);
+        overlay.record_modified_file("misc/a.unknown_ext", "hash-a", Some(1));
+        overlay.record_extraction("misc/a.unknown_ext".to_string(), caller_ext.clone(), 1);
+        overlay.record_modified_file("misc/b.unknown_ext", "hash-b", Some(2));
+        overlay.record_extraction("misc/b.unknown_ext".to_string(), target_ext, 2);
+
+        let mut lookups = BTreeMap::new();
+        let cancel = crate::cancel::Cancel::new();
+        let edges = resolve_delta_stored_edges(
+            "misc/a.unknown_ext",
+            &caller_ext,
+            &overlay,
+            stacked.base_store(),
+            &[],
+            &mut lookups,
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            !edges.iter().any(|e| e.target_file == "misc/b.unknown_ext"),
+            "LangFamily::Generic must never cross-resolve into another Generic file: {edges:#?}"
+        );
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn sync_handles_in_repo_symlinks_escaping_symlinks_and_enotdir() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_repo_dir("symlink-and-enotdir");
+        let anchor = root.join("anchor");
+        fs::create_dir_all(anchor.join("src/nested")).unwrap();
+        fs::write(
+            anchor.join("src/limits.rs"),
+            "pub fn limit_fn() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("src/nested/child.rs"),
+            "pub fn child_fn() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        run_git_ok(&anchor, &["init", "-b", "main"]);
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "init"]);
+        index_tree(&anchor, &["src/limits.rs", "src/nested/child.rs"]);
+
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        // 1. Valid in-repo symlink to regular file -> indexed cleanly.
+        symlink(lane.join("src/limits.rs"), lane.join("src/alias.rs")).unwrap();
+        // 2. Escaping symlink outside repo root -> refused (not indexed, not counted as synced).
+        let outside = root.join("outside.rs");
+        fs::write(&outside, "pub fn outside_secret() {}\n").unwrap();
+        symlink(&outside, lane.join("src/escape.rs")).unwrap();
+
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        let report = stacked.sync_worktree().unwrap();
+        assert_eq!(
+            report.synced_files, 1,
+            "only the valid in-repo symlink should count as synced: {report:?}"
+        );
+        assert!(
+            stacked
+                .symbols_for_file("src/alias.rs")
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "limit_fn"),
+            "valid in-repo symlink must be indexed"
+        );
+        assert!(
+            stacked
+                .symbols_for_file("src/escape.rs")
+                .unwrap()
+                .is_empty(),
+            "escaping symlink must never be indexed"
+        );
+
+        // 3. ENOTDIR: replace parent directory `src/nested` with a regular file.
+        fs::remove_dir_all(lane.join("src/nested")).unwrap();
+        fs::write(lane.join("src/nested"), "not a dir").unwrap();
+        stacked
+            .sync_file_from_disk("src/nested/child.rs")
+            .expect("ENOTDIR on base file parent must tombstone cleanly instead of failing");
+        assert!(
+            stacked
+                .symbols_for_file("src/nested/child.rs")
+                .unwrap()
+                .is_empty(),
+            "ENOTDIR-removed base file must be tombstoned"
+        );
 
         let _ = remove_readonly_tree(&root);
     }
