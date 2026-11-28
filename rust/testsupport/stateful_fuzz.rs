@@ -260,26 +260,62 @@ impl Source {
         }
     }
 
+    /// Draw a 16-bit value for weighted selection: consumes at most 2 bytes in
+    /// byte-backed mode, and falls back to an advancing deterministic SplitMix64
+    /// mix once raw bytes are exhausted so weighted picks never collapse onto
+    /// candidate 0.
+    fn pick_u16(&mut self) -> u16 {
+        if self.bytes.is_some() {
+            match self.remaining_bytes() {
+                0 => (self.next_splitmix64() >> 48) as u16,
+                1 => {
+                    let lo = self.u8();
+                    let hi = (self.next_splitmix64() >> 56) as u8;
+                    u16::from_le_bytes([lo, hi])
+                }
+                _ => {
+                    let lo = self.u8();
+                    let hi = self.u8();
+                    u16::from_le_bytes([lo, hi])
+                }
+            }
+        } else {
+            (self.next_splitmix64() >> 48) as u16
+        }
+    }
+
     /// Bounded continuation loop condition (`s.more()`) capped at `max_items`.
     ///
     /// Returns `false` once `max_items` consecutive items have been yielded,
     /// when `max_items == 0`, or when a byte-backed stream is exhausted.
     pub fn more(&mut self, max_items: usize) -> bool {
-        if max_items == 0 || self.more_run >= max_items {
-            self.more_run = 0;
+        let mut count = self.more_run;
+        let cont = self.more_counted(&mut count, max_items);
+        self.more_run = count;
+        cont
+    }
+
+    /// Nesting-safe bounded continuation loop condition using a caller-owned
+    /// counter `count` capped at `max_items`.
+    ///
+    /// Pass a local `let mut count = 0;` per loop so nested loops or early
+    /// `break`s cannot collide on shared state.
+    pub fn more_counted(&mut self, count: &mut usize, max_items: usize) -> bool {
+        if max_items == 0 || *count >= max_items {
+            *count = 0;
             return false;
         }
         if self.is_byte_backed() && self.remaining_bytes() == 0 {
-            self.more_run = 0;
+            *count = 0;
             return false;
         }
-        // Continue with probability ~75%, resetting on stop so subsequent loops
-        // start fresh.
+        // Continue with probability ~75%, resetting on stop so a reused counter
+        // starts fresh.
         if self.chance(3, 4) {
-            self.more_run += 1;
+            *count += 1;
             true
         } else {
-            self.more_run = 0;
+            *count = 0;
             false
         }
     }
@@ -505,15 +541,19 @@ impl HealthTracker {
             if let Some(p) = prev {
                 w *= self.pair_rate(cand, p);
             }
-            let w = w.max(0.0);
+            let w = if w.is_finite() && w > 0.0 { w } else { 0.0 };
             weights.push(w);
             total += w;
         }
-        if total <= 0.0 {
-            let idx = src.usize_below(candidates.len());
+        if !total.is_finite() || total <= 0.0 {
+            let idx = if candidates.len() <= 65_536 {
+                usize::from(src.pick_u16()) % candidates.len()
+            } else {
+                src.usize_below(candidates.len())
+            };
             return candidates[idx];
         }
-        let unit = f64::from(src.u32()) / (f64::from(u32::MAX) + 1.0);
+        let unit = f64::from(src.pick_u16()) / (f64::from(u16::MAX) + 1.0);
         let mut target = unit * total;
         for (i, &w) in weights.iter().enumerate() {
             if target < w {
@@ -736,6 +776,16 @@ fn prev_char_boundary(s: &str, mut byte_idx: usize) -> usize {
     byte_idx
 }
 
+fn next_char_boundary(s: &str, mut byte_idx: usize) -> usize {
+    if byte_idx >= s.len() {
+        return s.len();
+    }
+    while byte_idx < s.len() && !s.is_char_boundary(byte_idx) {
+        byte_idx += 1;
+    }
+    byte_idx
+}
+
 /// Shrink `input` while preserving UTF-8 char boundaries and `expected_sig`.
 ///
 /// Tries: empty string -> prefix/suffix halves -> line drops -> char-indexed
@@ -764,7 +814,11 @@ where
 
     // 2. Coarse prefix / suffix halves at char boundaries.
     while cur.len() > 1 && attempts < max_attempts {
-        let mid = prev_char_boundary(&cur, cur.len() / 2);
+        let half = cur.len() / 2;
+        let mut mid = prev_char_boundary(&cur, half);
+        if mid == 0 {
+            mid = next_char_boundary(&cur, half);
+        }
         if mid > 0 && mid < cur.len() {
             if reproduces(&cur[..mid], &mut attempts) {
                 cur.truncate(mid);
@@ -809,18 +863,14 @@ where
     let mut changed = true;
     while changed && attempts < max_attempts {
         changed = false;
-        let char_count = cur.chars().count();
-        if char_count <= 1 {
+        let mut offsets: Vec<usize> = cur.char_indices().map(|(o, _)| o).collect();
+        if offsets.len() <= 1 {
             break;
         }
-        let mut chunk = (char_count / 2).max(1);
-        while chunk >= 1 && attempts < max_attempts {
+        let mut chunk = (offsets.len() / 2).max(1);
+        while chunk >= 1 && offsets.len() > 1 && attempts < max_attempts {
             let mut char_pos = 0usize;
-            loop {
-                let offsets: Vec<usize> = cur.char_indices().map(|(o, _)| o).collect();
-                if char_pos >= offsets.len() || offsets.len() <= 1 || attempts >= max_attempts {
-                    break;
-                }
+            while char_pos < offsets.len() && offsets.len() > 1 && attempts < max_attempts {
                 let end_char = (char_pos + chunk).min(offsets.len());
                 let start_byte = offsets[char_pos];
                 let end_byte = if end_char < offsets.len() {
@@ -836,6 +886,7 @@ where
                 cand.push_str(&cur[end_byte..]);
                 if reproduces(&cand, &mut attempts) {
                     cur = cand;
+                    offsets = cur.char_indices().map(|(o, _)| o).collect();
                     changed = true;
                 } else {
                     char_pos += chunk;
@@ -1095,36 +1146,82 @@ fn is_header_block(lang: MicroLang, block: &str) -> bool {
     }
 }
 
-fn extract_first_fn_name(lang: MicroLang, block: &str) -> Option<String> {
+fn extract_fn_name_from_line(lang: MicroLang, line: &str) -> Option<String> {
     let keyword = match lang {
         MicroLang::Rust => "fn ",
         MicroLang::TypeScript => "function ",
         MicroLang::Go => "func ",
         MicroLang::Python => "def ",
     };
-    for line in block.lines() {
-        let trimmed = line.trim();
-        if let Some(pos) = trimmed.find(keyword) {
-            let after = &trimmed[pos + keyword.len()..];
-            // Skip Go method receivers `func (w *Worker) Name(`
-            let after = if lang == MicroLang::Go && after.starts_with('(') {
-                match after.find(')') {
-                    Some(close) => after[close + 1..].trim_start(),
-                    None => continue,
-                }
-            } else {
-                after
-            };
-            let name: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                return Some(name);
-            }
+    let trimmed = line.trim();
+    let pos = trimmed.find(keyword)?;
+    let after = &trimmed[pos + keyword.len()..];
+    // Skip Go method receivers `func (w *Worker) Name(`
+    let after = if lang == MicroLang::Go && after.starts_with('(') {
+        let close = after.find(')')?;
+        after[close + 1..].trim_start()
+    } else {
+        after
+    };
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// True when `block`'s opening line declares a top-level function whose body
+/// begins immediately on line 1 (never `impl`, `struct`, `class`, or `type`).
+fn is_top_level_fn_block(lang: MicroLang, block: &str) -> bool {
+    let first_line = match block.lines().next() {
+        Some(line) => line.trim(),
+        None => return false,
+    };
+    match lang {
+        MicroLang::Rust => {
+            let starts_fn = first_line.starts_with("fn ")
+                || first_line.starts_with("pub fn ")
+                || first_line.starts_with("pub(crate) fn ")
+                || first_line.starts_with("async fn ")
+                || first_line.starts_with("pub async fn ");
+            starts_fn && first_line.ends_with('{')
+        }
+        MicroLang::TypeScript => {
+            let starts_fn = first_line.starts_with("function ")
+                || first_line.starts_with("export function ")
+                || first_line.starts_with("async function ")
+                || first_line.starts_with("export async function ");
+            starts_fn && first_line.ends_with('{')
+        }
+        MicroLang::Go => first_line.starts_with("func ") && first_line.ends_with('{'),
+        MicroLang::Python => {
+            (first_line.starts_with("def ") || first_line.starts_with("async def "))
+                && first_line.ends_with(':')
         }
     }
-    None
+}
+
+/// Extract the name of a top-level function block (returns `None` for `impl`,
+/// `struct`, `class`, or `type` blocks).
+fn extract_top_level_fn_name(lang: MicroLang, block: &str) -> Option<String> {
+    if !is_top_level_fn_block(lang, block) {
+        return None;
+    }
+    let first_line = block.lines().next()?;
+    extract_fn_name_from_line(lang, first_line)
+}
+
+/// Extract the name of a callable free top-level function (excludes Go receiver
+/// methods `func (r *T) Name(...)` as well as `impl`/`class` blocks).
+fn extract_free_fn_name(lang: MicroLang, block: &str) -> Option<String> {
+    if !is_top_level_fn_block(lang, block) {
+        return None;
+    }
+    let first_line = block.lines().next()?.trim();
+    if lang == MicroLang::Go && first_line.starts_with("func (") {
+        return None;
+    }
+    extract_fn_name_from_line(lang, first_line)
 }
 
 fn synth_fn_block(src: &mut Source, lang: MicroLang, callee: Option<&str>) -> String {
@@ -1180,7 +1277,7 @@ pub fn mutate_file_elements(src: &mut Source, lang: MicroLang, content: &str) ->
     let first_body = usize::from(is_header_block(lang, &blocks[0]));
     let existing_fns: Vec<String> = blocks
         .iter()
-        .filter_map(|b| extract_first_fn_name(lang, b))
+        .filter_map(|b| extract_free_fn_name(lang, b))
         .collect();
 
     match src.usize_below(5) {
@@ -1205,11 +1302,11 @@ pub fn mutate_file_elements(src: &mut Source, lang: MicroLang, content: &str) ->
                 blocks.push(synth_fn_block(src, lang, callee));
             }
         }
-        // 2: Duplicate a function block with a fresh renamed identifier.
+        // 2: Duplicate a top-level function block with a fresh renamed identifier.
         2 => {
             if blocks.len() > first_body {
                 let idx = first_body + src.usize_below(blocks.len() - first_body);
-                if let Some(old_name) = extract_first_fn_name(lang, &blocks[idx]) {
+                if let Some(old_name) = extract_top_level_fn_name(lang, &blocks[idx]) {
                     let suffix = src.usize_below(10_000);
                     let new_name = format!("{old_name}_dup_{suffix}");
                     let dup = blocks[idx].replacen(&old_name, &new_name, 1);
@@ -1235,39 +1332,41 @@ pub fn mutate_file_elements(src: &mut Source, lang: MicroLang, content: &str) ->
                 blocks.push(synth_fn_block(src, lang, callee));
             }
         }
-        // 4: Tweak a body line by adding a local binding or call to an existing symbol.
+        // 4: Tweak a top-level function body by adding a local binding or call
+        //    to an existing free symbol (never mutating `impl`/`struct`/`class`
+        //    headers directly; falls back to appending a valid free helper).
         _ => {
-            let body_count = blocks.len().saturating_sub(first_body);
-            if body_count > 0 {
-                let idx = first_body + src.usize_below(body_count);
+            let fn_indices: Vec<usize> = (first_body..blocks.len())
+                .filter(|&i| {
+                    is_top_level_fn_block(lang, &blocks[i]) && blocks[i].lines().count() >= 2
+                })
+                .collect();
+            let callee = src.choose(&existing_fns).cloned();
+            if let Some(&idx) = src.choose(&fn_indices) {
                 let val = (src.usize_below(50) + 1) as i32;
-                let callee = src.choose(&existing_fns).cloned();
                 let mut lines: Vec<String> = blocks[idx].lines().map(String::from).collect();
-                if lines.len() >= 2 {
-                    let inject = match lang {
-                        MicroLang::Rust => match callee {
-                            Some(c) => format!("    let _t = {c}({val});"),
-                            None => format!("    let _t = {val};"),
-                        },
-                        MicroLang::TypeScript => match callee {
-                            Some(c) => format!("  const _t = {c}({val});"),
-                            None => format!("  const _t = {val};"),
-                        },
-                        MicroLang::Go => match callee {
-                            Some(c) => format!("\t_ = {c}({val})"),
-                            None => format!("\t_ = {val}"),
-                        },
-                        MicroLang::Python => match callee {
-                            Some(c) => format!("    _t = {c}({val})"),
-                            None => format!("    _t = {val}"),
-                        },
-                    };
-                    // Insert right after the opening signature line if it's a fn block.
-                    if extract_first_fn_name(lang, &blocks[idx]).is_some() {
-                        lines.insert(1, inject);
-                        blocks[idx] = lines.join("\n");
-                    }
-                }
+                let inject = match lang {
+                    MicroLang::Rust => match callee {
+                        Some(c) => format!("    let _t = {c}({val});"),
+                        None => format!("    let _t = {val};"),
+                    },
+                    MicroLang::TypeScript => match callee {
+                        Some(c) => format!("  const _t = {c}({val});"),
+                        None => format!("  const _t = {val};"),
+                    },
+                    MicroLang::Go => match callee {
+                        Some(c) => format!("\t_ = {c}({val})"),
+                        None => format!("\t_ = {val}"),
+                    },
+                    MicroLang::Python => match callee {
+                        Some(c) => format!("    _t = {c}({val})"),
+                        None => format!("    _t = {val}"),
+                    },
+                };
+                lines.insert(1, inject);
+                blocks[idx] = lines.join("\n");
+            } else {
+                blocks.push(synth_fn_block(src, lang, callee.as_deref()));
             }
         }
     }

@@ -123,6 +123,7 @@ struct CanonicalSnapshot {
     structured_edges: Vec<StructuredEdge>,
     unresolved_rows: Vec<UnresolvedRow>,
     analysis_unresolved_calls: Option<usize>,
+    coverage_gap_totals: BTreeMap<&'static str, usize>,
     coverage_gaps: Vec<(&'static str, String)>,
     dead_symbols: Vec<DeadSymbolRow>,
     resolution_rate_json: String,
@@ -130,10 +131,14 @@ struct CanonicalSnapshot {
     fts_hits: BTreeMap<String, Vec<(String, String)>>,
 }
 
-fn collect_coverage_gaps(store: &Store, db_label: &str) -> Vec<(&'static str, String)> {
-    let status = store.status(db_label).expect("store status");
+type CoverageGapSummary = (BTreeMap<&'static str, usize>, Vec<(&'static str, String)>);
+
+fn collect_coverage_gaps(store: &Store, db_label: &str) -> Result<CoverageGapSummary, String> {
+    let status = store
+        .status(db_label)
+        .map_err(|e| format!("store status: {e}"))?;
     let g = &status.coverage_gaps;
-    let mut rows: Vec<(&'static str, String)> = [
+    let samples = [
         ("discovery_refused", &g.discovery_refused),
         ("parse_failed", &g.parse_failed),
         ("pattern_recovered", &g.pattern_recovered),
@@ -143,36 +148,58 @@ fn collect_coverage_gaps(store: &Store, db_label: &str) -> Vec<(&'static str, St
         ("over_limit", &g.over_limit),
         ("partial_parse", &g.partial_parse),
         ("resolution_budget", &g.resolution_budget),
-    ]
-    .into_iter()
-    .flat_map(|(label, sample)| {
-        sample
-            .shown
-            .iter()
-            .map(move |row| (label, row.path.clone()))
-    })
-    .collect();
+    ];
+    let mut totals = BTreeMap::new();
+    let mut rows = Vec::new();
+    for (label, sample) in samples {
+        totals.insert(label, sample.total);
+        for row in &sample.shown {
+            rows.push((label, row.path.clone()));
+        }
+    }
     rows.sort();
-    rows
+    Ok((totals, rows))
 }
 
-fn fts_sample_queries(symbols_by_file: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
-    let mut names = BTreeSet::new();
+fn is_fts_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn fts_sample_queries(
+    symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    deleted_symbols: &[String],
+) -> Vec<String> {
+    let mut live_names = BTreeSet::new();
     for syms in symbols_by_file.values() {
         for name in syms {
             // Keep simple identifier-like names that FTS5 unicode61 accepts cleanly.
-            if !name.is_empty()
-                && name.len() <= 64
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                names.insert(name.clone());
+            if is_fts_ident(name) {
+                live_names.insert(name.clone());
             }
         }
     }
-    names.into_iter().take(12).collect()
+    let mut queries: Vec<String> = live_names.into_iter().take(12).collect();
+    let mut seen: BTreeSet<String> = queries.iter().cloned().collect();
+    let mut added_deleted = 0usize;
+    for name in deleted_symbols.iter().rev() {
+        if added_deleted >= 12 {
+            break;
+        }
+        if is_fts_ident(name) && seen.insert(name.clone()) {
+            queries.push(name.clone());
+            added_deleted += 1;
+        }
+    }
+    queries
 }
 
-fn canonical_snapshot(store: &Store, db_label: &str) -> Result<CanonicalSnapshot, String> {
+fn canonical_snapshot(
+    store: &Store,
+    db_label: &str,
+    deleted_symbols: &[String],
+) -> Result<CanonicalSnapshot, String> {
     let symbols_by_file = store
         .latest_symbol_names_by_file()
         .map_err(|e| format!("latest_symbol_names_by_file: {e}"))?;
@@ -210,7 +237,7 @@ fn canonical_snapshot(store: &Store, db_label: &str) -> Result<CanonicalSnapshot
         .map_err(|e| format!("latest_analysis: {e}"))?
         .map(|a| a.unresolved_calls);
 
-    let coverage_gaps = collect_coverage_gaps(store, db_label);
+    let (coverage_gap_totals, coverage_gaps) = collect_coverage_gaps(store, db_label)?;
 
     let mut dead_symbols: Vec<_> = store
         .latest_dead_symbols()
@@ -239,7 +266,7 @@ fn canonical_snapshot(store: &Store, db_label: &str) -> Result<CanonicalSnapshot
         .map_err(|e| format!("edge_confidence_mismatches: {e}"))?;
 
     let mut fts_hits = BTreeMap::new();
-    for query in fts_sample_queries(&symbols_by_file) {
+    for query in fts_sample_queries(&symbols_by_file, deleted_symbols) {
         let mut hits: Vec<(String, String)> = store
             .search_symbols(&query, 64)
             .map_err(|e| format!("search_symbols({query:?}): {e}"))?
@@ -256,6 +283,7 @@ fn canonical_snapshot(store: &Store, db_label: &str) -> Result<CanonicalSnapshot
         structured_edges,
         unresolved_rows,
         analysis_unresolved_calls,
+        coverage_gap_totals,
         coverage_gaps,
         dead_symbols,
         resolution_rate_json,
@@ -310,6 +338,12 @@ fn diff_snapshots(
             live.analysis_unresolved_calls, cold.analysis_unresolved_calls
         ));
     }
+    if live.coverage_gap_totals != cold.coverage_gap_totals {
+        diffs.push(format!(
+            "coverage_gap_totals mismatch:\n  live={:?}\n  cold={:?}",
+            live.coverage_gap_totals, cold.coverage_gap_totals
+        ));
+    }
     if live.coverage_gaps != cold.coverage_gaps {
         diffs.push(format!(
             "coverage_gaps mismatch:\n  live={:?}\n  cold={:?}",
@@ -343,7 +377,10 @@ fn diff_snapshots(
     Some(format!("{label}: {}", diffs.join("; ")))
 }
 
-fn cold_build_snapshot(files: &[(String, String)]) -> Result<CanonicalSnapshot, String> {
+fn cold_build_snapshot(
+    files: &[(String, String)],
+    deleted_symbols: &[String],
+) -> Result<CanonicalSnapshot, String> {
     let extractions: Vec<Extraction> = files
         .iter()
         .map(|(path, body)| extract_file(path, body))
@@ -359,7 +396,7 @@ fn cold_build_snapshot(files: &[(String, String)]) -> Result<CanonicalSnapshot, 
     store
         .save_generation(&extractions, &resolution, &analysis)
         .map_err(|e| format!("cold save_generation: {e}"))?;
-    canonical_snapshot(&store, ":memory:")
+    canonical_snapshot(&store, ":memory:", deleted_symbols)
 }
 
 /// Mirror `commands/build.rs::affected_closure` so `SaveGenFullSlice` exercises
@@ -572,7 +609,6 @@ fn lang_for_path(path: &str) -> Option<MicroLang> {
 }
 
 struct HarnessState {
-    _dir: TempDirGuard,
     db_path: PathBuf,
     store: Store,
     working: MicroRepo,
@@ -582,6 +618,12 @@ struct HarnessState {
     reuse_cache: BTreeMap<String, ReusedFileResolution>,
     reuse_bound_generation: Option<u32>,
     generations_written: usize,
+    last_committed_symbols: BTreeSet<String>,
+    recently_deleted_symbols: Vec<String>,
+    last_step_reused_files: usize,
+    // Declared LAST so `store` drops and closes SQLite handles before
+    // `TempDirGuard::drop` runs `remove_dir_all` (required on Windows).
+    _dir: TempDirGuard,
 }
 
 impl HarnessState {
@@ -591,7 +633,6 @@ impl HarnessState {
         let store = Store::open(&db_path).expect("open disk store");
         let dirty_paths: BTreeSet<String> = initial_repo.keys().cloned().collect();
         Self {
-            _dir: dir,
             db_path,
             store,
             working: initial_repo,
@@ -601,7 +642,37 @@ impl HarnessState {
             reuse_cache: BTreeMap::new(),
             reuse_bound_generation: None,
             generations_written: 0,
+            last_committed_symbols: BTreeSet::new(),
+            recently_deleted_symbols: Vec::new(),
+            last_step_reused_files: 0,
+            _dir: dir,
         }
+    }
+
+    fn record_committed_symbols(&mut self, extractions: &[Extraction]) {
+        let mut current = BTreeSet::new();
+        for ext in extractions {
+            for sym in &ext.symbols {
+                if is_fts_ident(&sym.name) {
+                    current.insert(sym.name.clone());
+                }
+            }
+        }
+        // Remove any names that came back into existence, and append newly
+        // disappeared names so FTS parity checks probe for stale rows.
+        self.recently_deleted_symbols
+            .retain(|name| !current.contains(name));
+        for old in &self.last_committed_symbols {
+            if !current.contains(old) && !self.recently_deleted_symbols.contains(old) {
+                self.recently_deleted_symbols.push(old.clone());
+            }
+        }
+        const MAX_DELETED_TRACKED: usize = 32;
+        if self.recently_deleted_symbols.len() > MAX_DELETED_TRACKED {
+            let excess = self.recently_deleted_symbols.len() - MAX_DELETED_TRACKED;
+            self.recently_deleted_symbols.drain(..excess);
+        }
+        self.last_committed_symbols = current;
     }
 
     fn db_label(&self) -> String {
@@ -617,6 +688,7 @@ impl HarnessState {
     }
 
     fn apply(&mut self, action: &Action) -> StepOutcome {
+        self.last_step_reused_files = 0;
         let act_name = action.name();
         match action {
             Action::CreateFile { path, content } => {
@@ -737,7 +809,16 @@ impl HarnessState {
                     }
                 };
 
-                let latest_gen = self.store.latest_generation_id().ok().flatten();
+                let latest_gen = match self.store.latest_generation_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "latest_generation_id",
+                            act_name,
+                            format!("latest_generation_id failed: {e}"),
+                        ));
+                    }
+                };
                 let mut reusable: BTreeMap<String, ReusedFileResolution> = BTreeMap::new();
                 if let Some(ref affected_set) = closure {
                     if self.reuse_bound_generation == latest_gen && latest_gen.is_some() {
@@ -753,6 +834,7 @@ impl HarnessState {
                         }
                     }
                 }
+                let reused_count = reusable.len();
 
                 let mut resolver = Resolver::new();
                 resolver.index_extractions(&extractions);
@@ -815,8 +897,19 @@ impl HarnessState {
                 self.dirty_paths.clear();
                 self.deleted_paths.clear();
                 self.generations_written += 1;
+                self.last_step_reused_files = reused_count;
+                self.record_committed_symbols(&extractions);
 
-                let mismatches = self.store.edge_confidence_mismatches().ok().flatten();
+                let mismatches = match self.store.edge_confidence_mismatches() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "edge_confidence_mismatches",
+                            act_name,
+                            format!("edge_confidence_mismatches failed: {e}"),
+                        ));
+                    }
+                };
                 check(
                     mismatches == Some(0),
                     "edge_confidence_mismatches",
@@ -902,8 +995,18 @@ impl HarnessState {
                 self.dirty_paths.clear();
                 self.deleted_paths.clear();
                 self.generations_written += 1;
+                self.record_committed_symbols(&all_extractions);
 
-                let mismatches = self.store.edge_confidence_mismatches().ok().flatten();
+                let mismatches = match self.store.edge_confidence_mismatches() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "edge_confidence_mismatches",
+                            act_name,
+                            format!("edge_confidence_mismatches failed: {e}"),
+                        ));
+                    }
+                };
                 check(
                     mismatches == Some(0),
                     "edge_confidence_mismatches",
@@ -982,6 +1085,7 @@ impl HarnessState {
                         self.deleted_paths.clear();
                         self.reuse_bound_generation = None;
                         self.generations_written += 1;
+                        self.record_committed_symbols(&extractions);
 
                         let hashes = match self.store.latest_file_hashes() {
                             Ok(h) => h,
@@ -1007,7 +1111,16 @@ impl HarnessState {
                         if self.committed.len() < 2 {
                             return bail("need_two_files_for_deleted_edge");
                         }
-                        let before_gen = self.store.latest_generation_id().ok().flatten();
+                        let before_gen = match self.store.latest_generation_id() {
+                            Ok(id) => id,
+                            Err(e) => {
+                                return StepOutcome::CheckFailed(CheckFailure::new(
+                                    "deleted_edge_before_gen",
+                                    act_name,
+                                    format!("latest_generation_id before write failed: {e}"),
+                                ));
+                            }
+                        };
                         let mut iter = self.committed.keys();
                         let gone_path = iter.next().unwrap().clone();
                         let survivor_path = iter.next().unwrap().clone();
@@ -1050,7 +1163,16 @@ impl HarnessState {
                                 ..Default::default()
                             },
                         );
-                        let after_gen = self.store.latest_generation_id().ok().flatten();
+                        let after_gen = match self.store.latest_generation_id() {
+                            Ok(id) => id,
+                            Err(e) => {
+                                return StepOutcome::CheckFailed(CheckFailure::new(
+                                    "deleted_edge_after_gen",
+                                    act_name,
+                                    format!("latest_generation_id after write failed: {e}"),
+                                ));
+                            }
+                        };
                         if res.is_ok() {
                             return StepOutcome::CheckFailed(CheckFailure::new(
                                 "deleted_edge_guard",
@@ -1061,7 +1183,7 @@ impl HarnessState {
                             ));
                         }
                         check(
-                            before_gen == after_gen,
+                            before_gen.is_some() && before_gen == after_gen,
                             "deleted_edge_rollback",
                             act_name,
                             format!(
@@ -1139,7 +1261,16 @@ impl HarnessState {
                 if self.generations_written == 0 {
                     return skip_missing("no_generation_before_reopen");
                 }
-                let before_gen = self.store.latest_generation_id().ok().flatten();
+                let before_gen = match self.store.latest_generation_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "reopen_before_gen",
+                            act_name,
+                            format!("latest_generation_id before reopen failed: {e}"),
+                        ));
+                    }
+                };
                 let reopened = match Store::open(&self.db_path) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1151,8 +1282,17 @@ impl HarnessState {
                     }
                 };
                 self.store = reopened;
-                let after_gen = self.store.latest_generation_id().ok().flatten();
-                if before_gen != after_gen {
+                let after_gen = match self.store.latest_generation_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "reopen_after_gen",
+                            act_name,
+                            format!("latest_generation_id after reopen failed: {e}"),
+                        ));
+                    }
+                };
+                if before_gen.is_none() || before_gen != after_gen {
                     return StepOutcome::CheckFailed(CheckFailure::new(
                         "reopen_generation_preserved",
                         act_name,
@@ -1176,7 +1316,16 @@ impl HarnessState {
                         ));
                     }
                 }
-                let mismatches = self.store.edge_confidence_mismatches().ok().flatten();
+                let mismatches = match self.store.edge_confidence_mismatches() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "reopen_edge_confidence",
+                            act_name,
+                            format!("edge_confidence_mismatches after reopen failed: {e}"),
+                        ));
+                    }
+                };
                 check(
                     mismatches == Some(0),
                     "reopen_edge_confidence",
@@ -1188,7 +1337,11 @@ impl HarnessState {
                 if self.committed.is_empty() || self.generations_written == 0 {
                     return skip_missing("no_committed_generation");
                 }
-                let live = match canonical_snapshot(&self.store, &self.db_label()) {
+                let live = match canonical_snapshot(
+                    &self.store,
+                    &self.db_label(),
+                    &self.recently_deleted_symbols,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         return StepOutcome::CheckFailed(CheckFailure::new(
@@ -1214,7 +1367,7 @@ impl HarnessState {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                let cold = match cold_build_snapshot(&files) {
+                let cold = match cold_build_snapshot(&files, &self.recently_deleted_symbols) {
                     Ok(s) => s,
                     Err(e) => {
                         return StepOutcome::CheckFailed(CheckFailure::new(
@@ -1234,7 +1387,8 @@ impl HarnessState {
 
                 if *reverse_scan_order && files.len() >= 2 {
                     files.reverse();
-                    let permuted = match cold_build_snapshot(&files) {
+                    let permuted = match cold_build_snapshot(&files, &self.recently_deleted_symbols)
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             return StepOutcome::CheckFailed(CheckFailure::new(
@@ -1445,6 +1599,9 @@ fn stateful_incremental_store_model_checker() {
             let act_name = action.name();
             let outcome = state.apply(&action);
             health.record(act_name, prev, &outcome);
+            if state.last_step_reused_files > 0 {
+                health.record("ResolveReuseHit", Some(act_name), &StepOutcome::Ok);
+            }
             history.push(action);
             prev = Some(act_name);
 
@@ -1456,13 +1613,13 @@ fn stateful_incremental_store_model_checker() {
                 let rendered: Vec<String> = minimal.iter().map(Action::summary).collect();
                 let repro = format_repro_test(
                     &format!("repro_incremental_store_round_{round}"),
-                    round_seed,
+                    base_seed,
                     &failure,
                     &rendered,
                 );
                 panic!(
-                    "stateful incremental store oracle violation (round={round}, seed={round_seed:#x}, \
-                     shrunk {} -> {} steps):\n{failure}\n\n{repro}\n{}",
+                    "stateful incremental store oracle violation (round={round}, base_seed={base_seed:#x}, \
+                     round_seed={round_seed:#x}, shrunk {} -> {} steps):\n{failure}\n\n{repro}\n{}",
                     history.len(),
                     minimal.len(),
                     health.probe_report("stateful_incremental_store")
@@ -1483,6 +1640,9 @@ fn stateful_incremental_store_model_checker() {
             let act_name = action.name();
             let outcome = state.apply(&action);
             health.record(act_name, prev, &outcome);
+            if state.last_step_reused_files > 0 {
+                health.record("ResolveReuseHit", Some(act_name), &StepOutcome::Ok);
+            }
             history.push(action);
             prev = Some(act_name);
 
@@ -1494,13 +1654,13 @@ fn stateful_incremental_store_model_checker() {
                 let rendered: Vec<String> = minimal.iter().map(Action::summary).collect();
                 let repro = format_repro_test(
                     &format!("repro_incremental_store_tail_{round}"),
-                    round_seed,
+                    base_seed,
                     &failure,
                     &rendered,
                 );
                 panic!(
-                    "stateful incremental store tail check failed (round={round}, seed={round_seed:#x}, \
-                     shrunk {} -> {} steps):\n{failure}\n\n{repro}\n{}",
+                    "stateful incremental store tail check failed (round={round}, base_seed={base_seed:#x}, \
+                     round_seed={round_seed:#x}, shrunk {} -> {} steps):\n{failure}\n\n{repro}\n{}",
                     history.len(),
                     minimal.len(),
                     health.probe_report("stateful_incremental_store")
@@ -1516,6 +1676,7 @@ fn stateful_incremental_store_model_checker() {
     );
 
     health.assert_actions_exercised(&ALL_ACTIONS);
+    health.assert_actions_exercised(&["ResolveReuseHit"]);
     assert_eq!(
         health.total_failed(),
         0,
@@ -1584,6 +1745,205 @@ fn minimizer_shrinks_synthetic_bug_to_minimal_sequence() {
     assert!(repro.contains("TriggerB"));
 }
 
+#[test]
+fn stateful_fuzz_primitives_handle_nesting_exhaustion_multibyte_and_rust_impl() {
+    use devmap_extract::model::ParseOutcome;
+
+    // 1. Nested `more_counted` loops keep independent bounds.
+    let mut src = Source::from_seed(0xA1B2_C3D4);
+    let mut outer_count = 0usize;
+    let mut outer_iters = 0usize;
+    while src.more_counted(&mut outer_count, 3) {
+        outer_iters += 1;
+        let mut inner_count = 0usize;
+        let mut inner_iters = 0usize;
+        while src.more_counted(&mut inner_count, 4) {
+            inner_iters += 1;
+        }
+        assert!(inner_iters <= 4);
+    }
+    assert!(outer_iters <= 3);
+
+    // 2. `pick_weighted` consumes <= 2 bytes in byte-backed mode and keeps
+    //    advancing across candidates once bytes are exhausted.
+    let tracker = HealthTracker::new();
+    let candidates = ["a", "b", "c", "d"];
+    let mut byte_src = Source::from_bytes(&[0x12, 0x34, 0x56, 0x78]);
+    let _ = tracker.pick_weighted(&mut byte_src, &candidates, None);
+    assert_eq!(byte_src.remaining_bytes(), 2);
+    let _ = tracker.pick_weighted(&mut byte_src, &candidates, None);
+    assert_eq!(byte_src.remaining_bytes(), 0);
+    let mut post_exhaust = BTreeSet::new();
+    for _ in 0..32 {
+        post_exhaust.insert(tracker.pick_weighted(&mut byte_src, &candidates, None));
+    }
+    assert!(
+        post_exhaust.len() >= 2,
+        "exhausted byte-backed pick_weighted collapsed to {post_exhaust:?}"
+    );
+
+    // 3. `minimize_str` halves short multi-byte strings where `prev_char_boundary(len/2) == 0`.
+    let sig = CheckFailure::new("mb", "act", "boom").signature();
+    let shrunk = stateful_fuzz::minimize_str("🎉a", &sig, 4, |cand| {
+        cand.contains('a')
+            .then(|| CheckFailure::new("mb", "act", "boom"))
+    });
+    assert_eq!(shrunk, "a");
+
+    // 4. `mutate_file_elements` never injects statements inside a Rust `impl` header.
+    let rust_impl_only = "pub struct Widget0 {\n    pub value: i32,\n}\n\n\
+                          impl Widget0 {\n    pub fn step(&self, x: i32) -> i32 {\n        self.value + x\n    }\n}\n";
+    let mut mut_src = Source::from_seed(0x5151_6262);
+    let mut cur = rust_impl_only.to_string();
+    for step in 0..25 {
+        cur = mutate_file_elements(&mut mut_src, MicroLang::Rust, &cur);
+        let ext = extract_file("src/widget.rs", &cur);
+        assert!(
+            matches!(ext.parse_outcome, ParseOutcome::Clean),
+            "step {step} broke Rust syntax ({:?}):\n{cur}",
+            ext.parse_outcome
+        );
+    }
+}
+
+/// Regression test for the live P1 bug surfaced by elevated seed
+/// `0xA1B2C3D4E5F60002`: when a broken (`parse_failed`) file is repaired on
+/// disk and saved in a differential full-slice write with `deleted_paths`
+/// non-empty and the repaired file omitted from `affected_paths`, the store
+/// rebuilds the file's payload/nodes (because `content_matches` is false) and
+/// MUST also drop its stale `parse_failed` coverage gap from `prev_gen`, while
+/// still carrying forward gaps of untouched carried files across partial writes.
+#[test]
+fn differential_write_drops_stale_gap_when_rebuilt_file_omitted_from_affected() {
+    let mut initial = MicroRepo::new();
+    initial.insert(
+        "py/mod_0.py".to_string(),
+        "def api_0(x: int) -> int:\n    return x + 1\n".to_string(),
+    );
+    initial.insert(
+        "src/mod_1.rs".to_string(),
+        "pub fn api_1(x: i32) -> i32 {\n    x + 2\n}\n".to_string(),
+    );
+
+    let mut state = HarnessState::new("repro-gap-carry", initial);
+
+    // Initial committed generation.
+    assert_eq!(
+        state.apply(&Action::SaveGenFullSlice {
+            verify_every_row: false,
+        }),
+        StepOutcome::Ok
+    );
+
+    // Rename py/mod_0.py, inject a NUL byte so extraction records `parse_failed`,
+    // and commit.
+    assert_eq!(
+        state.apply(&Action::RenameFile {
+            from: "py/mod_0.py".to_string(),
+            to: "py/renamed_3894.py".to_string(),
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(
+        state.apply(&Action::EditBrokenSyntax {
+            path: "py/renamed_3894.py".to_string(),
+            new_content: "def api_0(x: int) -> int:\n    return x + 1\0\n".to_string(),
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(
+        state.apply(&Action::SaveGenFullSlice {
+            verify_every_row: false,
+        }),
+        StepOutcome::Ok
+    );
+
+    let (totals_broken, gaps_broken) =
+        collect_coverage_gaps(&state.store, &state.db_label()).expect("collect gaps after break");
+    assert_eq!(totals_broken.get("parse_failed").copied(), Some(1));
+    assert!(
+        gaps_broken.contains(&("parse_failed", "py/renamed_3894.py".to_string())),
+        "expected parse_failed gap on py/renamed_3894.py, got {gaps_broken:?}"
+    );
+
+    // Repair py/renamed_3894.py AND delete src/mod_1.rs in the same batch so
+    // `compute_affected_closure` returns `None` and `SaveGenFullSlice` passes
+    // `affected_paths = []`, `deleted_paths = ["src/mod_1.rs"]`.
+    assert_eq!(
+        state.apply(&Action::EditValid {
+            path: "py/renamed_3894.py".to_string(),
+            new_content: "def api_0(x: int) -> int:\n    return x + 42\n".to_string(),
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(
+        state.apply(&Action::DeleteFile {
+            path: "src/mod_1.rs".to_string(),
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(
+        state.apply(&Action::SaveGenFullSlice {
+            verify_every_row: false,
+        }),
+        StepOutcome::Ok
+    );
+
+    let (totals_fixed, gaps_fixed) =
+        collect_coverage_gaps(&state.store, &state.db_label()).expect("collect gaps after fix");
+    assert_eq!(
+        totals_fixed.get("parse_failed").copied(),
+        Some(0),
+        "stale parse_failed gap survived differential rebuild: {gaps_fixed:?}"
+    );
+    assert!(
+        !gaps_fixed.contains(&("parse_failed", "py/renamed_3894.py".to_string())),
+        "stale parse_failed row remained for repaired file: {gaps_fixed:?}"
+    );
+    assert_eq!(
+        state.apply(&Action::CheckColdEquivalence {
+            reverse_scan_order: true,
+        }),
+        StepOutcome::Ok
+    );
+
+    // Confirm the opposite direction still holds: an untouched gap file
+    // (absent from `extractions` in a daemon partial-slice write) keeps its gap.
+    assert_eq!(
+        state.apply(&Action::EditGapFile {
+            toggle: GapToggle::AddPsd1,
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(
+        state.apply(&Action::SaveGenFullSlice {
+            verify_every_row: false,
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(
+        state.apply(&Action::EditValid {
+            path: "py/renamed_3894.py".to_string(),
+            new_content: "def api_0(x: int) -> int:\n    return x + 99\n".to_string(),
+        }),
+        StepOutcome::Ok
+    );
+    assert_eq!(state.apply(&Action::SaveGenPartialSlice), StepOutcome::Ok);
+    let (totals_partial, gaps_partial) =
+        collect_coverage_gaps(&state.store, &state.db_label()).expect("collect gaps after partial");
+    assert_eq!(totals_partial.get("parse_failed").copied(), Some(1));
+    assert!(
+        gaps_partial.contains(&("parse_failed", PSD1_PATH.to_string())),
+        "untouched gap file lost its gap on partial-slice write: {gaps_partial:?}"
+    );
+    assert_eq!(
+        state.apply(&Action::CheckColdEquivalence {
+            reverse_scan_order: true,
+        }),
+        StepOutcome::Ok
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 3: CsrGraphReader Byte-Level & Structured Mutation Fuzzer
 // ---------------------------------------------------------------------------
@@ -1628,8 +1988,39 @@ fn exercise_csr_reader(reader: &CsrGraphReader) {
     assert!(reader.node(u32::MAX).is_none());
     assert!(reader.outgoing_edges(u32::MAX).is_empty());
     assert!(reader.edge_attributes(u32::MAX).is_empty());
+    assert!(
+        reader.bfs_reachability(u32::MAX, 4).is_empty(),
+        "bfs_reachability from out-of-range node must be empty"
+    );
     if n > 0 {
-        let _ = reader.bfs_reachability(0, 4);
+        assert!(
+            reader.bfs_reachability(0, 0).is_empty(),
+            "bfs_reachability with max_depth=0 must be empty"
+        );
+        let reached = reader.bfs_reachability(0, 4);
+        assert!(
+            reached.len() <= m,
+            "bfs_reachability returned {} nodes, exceeding edge_count {m}",
+            reached.len()
+        );
+        let unique: BTreeSet<u32> = reached.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            reached.len(),
+            "bfs_reachability must not return duplicate nodes"
+        );
+        assert!(
+            !unique.contains(&0),
+            "bfs_reachability must not include start_node 0"
+        );
+        for &neighbor in reader.outgoing_edges(0) {
+            if neighbor != 0 {
+                assert!(
+                    unique.contains(&neighbor),
+                    "direct neighbor {neighbor} of node 0 missing from bfs_reachability(0, 4)"
+                );
+            }
+        }
     }
 }
 

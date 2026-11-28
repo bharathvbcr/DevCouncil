@@ -21,10 +21,11 @@ use stateful_fuzz::{
 /// without burning libFuzzer timeout budgets on multi-megabyte inputs.
 const MAX_FUZZ_SOURCE_BYTES: usize = 16_384;
 
-/// Representative file path for every linked grammar key (plus aliases and
-/// intentionally refused unsafe grammars like COBOL).
-fn path_for_grammar(key: &str) -> &'static str {
-    match key {
+/// Representative file path for every known linked grammar key. Unknown future
+/// grammar keys return `None` instead of falling back to a non-source extension
+/// (like `.txt`) that would return `Skipped` and false-positive `nul_byte_refused`.
+fn path_for_grammar(key: &str) -> Option<&'static str> {
+    let path = match key {
         "astro" => "fuzz.astro",
         "c" => "fuzz.c",
         "cfml" => "fuzz.cfm",
@@ -58,8 +59,9 @@ fn path_for_grammar(key: &str) -> &'static str {
         "tsx" => "fuzz.tsx",
         "typescript" => "fuzz.ts",
         "vue" => "fuzz.vue",
-        _ => "fuzz.txt",
-    }
+        _ => return None,
+    };
+    Some(path)
 }
 
 /// Seeds that exercise `parse_repair`, `kotlinsemi`, and `sveltetext`
@@ -209,9 +211,21 @@ fn run_and_check(action: &'static str, path: &str, source: &str) {
     ));
     verify_extraction(action, path, source, &first);
 
+    // Wall-clock parse-budget refusals embed the measured elapsed duration in
+    // `ParseOutcome::Failed { reason }` and already consumed `DEFAULT_PARSE_BUDGET`.
+    // Skip the second parse so ASan jitter cannot cause false-positive timing-text
+    // mismatches or trip libFuzzer's `-timeout=25` ceiling.
+    if first.is_budget_refusal() {
+        return;
+    }
+
     // Byte-for-byte determinism: incremental builds rely on identical bytes
     // producing identical extractions.
     let second = extract_file(path, source);
+    if second.is_budget_refusal() {
+        return;
+    }
+    verify_extraction(action, path, source, &second);
     let first_json = serde_json::to_string(&first).expect("serialize first extraction");
     let second_json = serde_json::to_string(&second).expect("serialize second extraction");
     fail_check(check(
@@ -235,8 +249,10 @@ fuzz_target!(|data: &[u8]| {
         // (plus Metal, ArkTS, and refused COBOL).
         0 => {
             let keys = linked_grammar_keys();
-            let mut paths: Vec<&'static str> =
-                keys.iter().map(|key| path_for_grammar(key)).collect();
+            let mut paths: Vec<&'static str> = keys
+                .iter()
+                .filter_map(|key| path_for_grammar(key))
+                .collect();
             paths.extend(["fuzz.metal", "fuzz.ets", "fuzz.cbl"]);
             let unique_paths: Vec<&'static str> = paths
                 .into_iter()

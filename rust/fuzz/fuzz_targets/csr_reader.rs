@@ -3,6 +3,11 @@
 use devmap_store::csr::{CsrGraphReader, CsrGraphWriter, CsrNodeRecord};
 use libfuzzer_sys::fuzz_target;
 
+/// Cap structured mutation rounds and mutated buffer size so large `-max_len`
+/// inputs cannot trigger an allocation or timeout bomb under ASan.
+const MAX_MUTATION_STEPS: usize = 64;
+const MAX_MUTATED_BYTES: usize = 65_536;
+
 /// Exercise every read accessor on an accepted `CsrGraphReader` so ASan/UBSan
 /// observes any out-of-bounds slice, misaligned read, or length mismatch.
 fn exercise_reader(reader: &CsrGraphReader) {
@@ -105,9 +110,11 @@ fn fuzz_structured_then_mutated(data: &[u8]) {
     assert_eq!(reader.edge_count(), expected_edges);
     exercise_reader(&reader);
 
-    // Apply fuzz-guided byte mutations and truncations to the valid CSR image.
+    // Apply bounded fuzz-guided byte mutations and truncations to the valid CSR image.
     let mut mutated = valid_bytes;
-    while cursor + 2 <= data.len() && !mutated.is_empty() {
+    let mut steps = 0usize;
+    while steps < MAX_MUTATION_STEPS && cursor + 2 <= data.len() && !mutated.is_empty() {
+        steps += 1;
         let op = data[cursor];
         let arg = data[cursor + 1];
         cursor += 2;
@@ -128,8 +135,9 @@ fn fuzz_structured_then_mutated(data: &[u8]) {
                 mutated.truncate(new_len);
             }
             _ => {
-                // Append unaligned trailing bytes.
-                let extra = usize::from(arg & 0x0F);
+                // Append unaligned trailing bytes, bounded to MAX_MUTATED_BYTES.
+                let room = MAX_MUTATED_BYTES.saturating_sub(mutated.len());
+                let extra = usize::from(arg & 0x0F).min(room);
                 mutated.extend(std::iter::repeat_n(op, extra));
             }
         }

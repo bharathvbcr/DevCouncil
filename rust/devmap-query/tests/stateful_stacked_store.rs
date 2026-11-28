@@ -268,7 +268,7 @@ fn remove_readonly_tree(path: &Path) {
 fn run_git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(cwd)
-        .args(["-c", "core.autocrlf=false"])
+        .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
         .args(args)
         .env("GIT_AUTHOR_NAME", "DevMapTest")
         .env("GIT_AUTHOR_EMAIL", "devmap-test@example.com")
@@ -787,11 +787,18 @@ impl World {
                 if lane.working_files.len() <= 1 {
                     return bail("keep_at_least_one_file");
                 }
-                if lane.working_files.remove(path).is_none() {
+                if !lane.working_files.contains_key(path) {
                     return bail("delete_missing_path");
                 }
                 let full = lane.root.join(path);
-                let _ = fs::remove_file(&full);
+                if let Err(e) = fs::remove_file(&full) {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "lane_delete_remove_failed",
+                        ACT_LANE_DELETE,
+                        format!("fs::remove_file({}) failed: {e}", full.display()),
+                    ));
+                }
+                lane.working_files.remove(path);
                 self.check_unsynced_oracle(*lane_idx, ACT_LANE_DELETE)
             }
 
@@ -837,7 +844,14 @@ impl World {
                         lane.working_files.insert(path.clone(), orig);
                     }
                     None => {
-                        let _ = fs::remove_file(lane.root.join(path));
+                        let full = lane.root.join(path);
+                        if let Err(e) = fs::remove_file(&full) {
+                            return StepOutcome::CheckFailed(CheckFailure::new(
+                                "lane_revert_remove_failed",
+                                ACT_LANE_REVERT,
+                                format!("fs::remove_file({}) failed: {e}", full.display()),
+                            ));
+                        }
                         lane.working_files.remove(path);
                     }
                 }
@@ -1683,13 +1697,104 @@ impl World {
                 }
             }
 
-            // edges_for_symbol must succeed without error.
-            if let Err(e) = stacked.edges_for_symbol(qn) {
+            // edges_for_symbol: no tombstone leaks and exact parity when clean.
+            let s_sym_edges = match stacked.edges_for_symbol(qn) {
+                Ok(edges) => edges,
+                Err(e) => {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "edges_for_symbol_err",
+                        ACT_QUERY_PARITY,
+                        format!("edges_for_symbol({qn:?}): {e:#}"),
+                    ));
+                }
+            };
+            fn file_prefix(sym: &str) -> &str {
+                sym.split_once("::").map(|(f, _)| f).unwrap_or(sym)
+            }
+            for edge in &s_sym_edges {
+                if lane.is_deleted_file(file_prefix(&edge.source))
+                    || lane.is_deleted_file(file_prefix(&edge.target))
+                {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "edges_for_symbol_tombstone_leak",
+                        ACT_QUERY_PARITY,
+                        format!(
+                            "edges_for_symbol({qn:?}) leaked deleted file edge {} -> {} ({})",
+                            edge.source, edge.target, edge.kind
+                        ),
+                    ));
+                }
+            }
+            if lane.is_deleted_file(file_prefix(qn)) && !s_sym_edges.is_empty() {
                 return StepOutcome::CheckFailed(CheckFailure::new(
-                    "edges_for_symbol_err",
+                    "edges_for_symbol_deleted_target_leak",
                     ACT_QUERY_PARITY,
-                    format!("edges_for_symbol({qn:?}): {e:#}"),
+                    format!(
+                        "edges_for_symbol({qn:?}) on deleted file returned non-empty: {s_sym_edges:?}"
+                    ),
                 ));
+            }
+            if !stacked.has_delta_changes() {
+                let s_set: BTreeSet<(String, String, String)> = s_sym_edges
+                    .iter()
+                    .map(|e| (e.source.clone(), e.target.clone(), e.kind.clone()))
+                    .collect();
+                let mut c_set: BTreeSet<(String, String, String)> = BTreeSet::new();
+                let callers = match cold_store.callers_of(std::slice::from_ref(qn), "", 0.0) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "cold_edges_for_symbol_callers_err",
+                            ACT_QUERY_PARITY,
+                            format!("{e:#}"),
+                        ));
+                    }
+                };
+                for e in callers {
+                    c_set.insert((e.source_symbol, e.target_symbol, e.edge_kind));
+                }
+                let syms = match cold_store.search_symbols(qn, 64) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "cold_edges_for_symbol_search_err",
+                            ACT_QUERY_PARITY,
+                            format!("{e:#}"),
+                        ));
+                    }
+                };
+                let mut def_files = BTreeSet::new();
+                for sym in syms {
+                    if sym.name == *qn || sym.qualified_name == *qn {
+                        def_files.insert(sym.path);
+                    }
+                }
+                for file_path in def_files {
+                    let file_edges = match cold_store.latest_edges_for_file(&file_path, 0.0) {
+                        Ok(fe) => fe,
+                        Err(e) => {
+                            return StepOutcome::CheckFailed(CheckFailure::new(
+                                "cold_edges_for_symbol_file_err",
+                                ACT_QUERY_PARITY,
+                                format!("{e:#}"),
+                            ));
+                        }
+                    };
+                    for e in file_edges {
+                        if e.source_symbol == *qn || e.target_symbol == *qn {
+                            c_set.insert((e.source_symbol, e.target_symbol, e.edge_kind));
+                        }
+                    }
+                }
+                if s_set != c_set {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "edges_for_symbol_clean_parity",
+                        ACT_QUERY_PARITY,
+                        format!(
+                            "clean edges_for_symbol({qn:?}) mismatch:\nstacked={s_set:?}\ncold={c_set:?}"
+                        ),
+                    ));
+                }
             }
 
             // impact parity.
@@ -1880,7 +1985,12 @@ fn synth_action(
         }
         ACT_LANE_CREATE => {
             let lane_idx = pick_stacked_lane(src);
-            let langs = [MicroLang::Rust, MicroLang::TypeScript, MicroLang::Go];
+            let langs = [
+                MicroLang::Rust,
+                MicroLang::TypeScript,
+                MicroLang::Go,
+                MicroLang::Python,
+            ];
             let lang = *src.choose(&langs).unwrap_or(&MicroLang::Rust);
             let dir = match lang {
                 MicroLang::Rust => "src",
@@ -1961,9 +2071,13 @@ fn synth_action(
                     let dir = Path::new(&from)
                         .parent()
                         .and_then(|p| p.to_str())
-                        .unwrap_or("src");
+                        .unwrap_or("");
                     let tag = src.usize_below(10_000);
-                    let to = format!("{dir}/renamed_{step_idx}_{tag}.{}", lang.ext());
+                    let to = if dir.is_empty() {
+                        format!("renamed_{step_idx}_{tag}.{}", lang.ext())
+                    } else {
+                        format!("{dir}/renamed_{step_idx}_{tag}.{}", lang.ext())
+                    };
                     (from, to)
                 } else {
                     ("src/mod_0.rs".to_string(), "src/renamed_0.rs".to_string())
@@ -2087,7 +2201,12 @@ fn stateful_stacked_store_model_checker() {
         let mut src = Source::from_seed(round_seed);
         let initial_repo = generate_micro_repo(
             &mut src,
-            &[MicroLang::Rust, MicroLang::TypeScript, MicroLang::Go],
+            &[
+                MicroLang::Rust,
+                MicroLang::TypeScript,
+                MicroLang::Go,
+                MicroLang::Python,
+            ],
             4,
         );
         let mut world = World::new(&format!("r{round}"), &initial_repo);
@@ -2109,10 +2228,18 @@ fn stateful_stacked_store_model_checker() {
                     replay_sequence(&initial_repo, seq)
                 });
                 let summaries: Vec<String> = minimal.iter().map(Action::summary).collect();
+                let repro_failure = CheckFailure::new(
+                    failure.oracle,
+                    failure.action,
+                    format!(
+                        "{} (round={round}, round_seed={round_seed:#x})",
+                        failure.detail
+                    ),
+                );
                 let repro = format_repro_test(
                     "repro_stacked_store_failure",
-                    round_seed,
-                    &failure,
+                    seed,
+                    &repro_failure,
                     &summaries,
                 );
                 panic!(
@@ -2167,10 +2294,18 @@ fn stateful_stacked_store_model_checker() {
                     replay_sequence(&initial_repo, seq)
                 });
                 let summaries: Vec<String> = minimal.iter().map(Action::summary).collect();
+                let repro_failure = CheckFailure::new(
+                    failure.oracle,
+                    failure.action,
+                    format!(
+                        "{} (round={round}, round_seed={round_seed:#x})",
+                        failure.detail
+                    ),
+                );
                 let repro = format_repro_test(
                     "repro_stacked_store_failure",
-                    round_seed,
-                    &failure,
+                    seed,
+                    &repro_failure,
                     &summaries,
                 );
                 panic!(
@@ -2202,10 +2337,18 @@ fn stateful_stacked_store_model_checker() {
                         replay_sequence(&initial_repo, seq)
                     });
                     let summaries: Vec<String> = minimal.iter().map(Action::summary).collect();
+                    let repro_failure = CheckFailure::new(
+                        failure.oracle,
+                        failure.action,
+                        format!(
+                            "{} (round={round}, round_seed={round_seed:#x})",
+                            failure.detail
+                        ),
+                    );
                     let repro = format_repro_test(
                         "repro_stacked_store_failure",
-                        round_seed,
-                        &failure,
+                        seed,
+                        &repro_failure,
                         &summaries,
                     );
                     panic!(
@@ -2333,4 +2476,116 @@ fn minimizer_shrinks_stacked_action_sequence_and_emits_repro() {
     assert!(repro.contains("#[test]"));
     assert!(repro.contains("synthetic_stacked_oracle|QueryAndCheckParity"));
     assert!(repro.contains("src/trigger.rs"));
+}
+
+#[test]
+fn sync_worktree_clears_deleted_staged_non_base_file_without_phantom_tombstone() {
+    let mut initial = MicroRepo::new();
+    initial.insert(
+        "src/base.rs".to_string(),
+        "pub fn base_fn(x: i32) -> i32 {\n    x + 1\n}\n".to_string(),
+    );
+    let mut world = World::new("wt-staged-delete", &initial);
+    assert!(world.step(&Action::BuildDonorAndPublishBase).is_ok());
+    assert!(world.step(&Action::ProvisionLane { lane_idx: 0 }).is_ok());
+
+    let lane_root = world.lanes[0].root.clone();
+    let new_path = "src/staged_ephemeral.rs";
+    write_rel(&lane_root, new_path, "pub fn temp_fn() -> i32 { 1 }\n");
+    run_git(&lane_root, &["add", new_path]);
+
+    let mut stacked = StackedStore::open(&lane_root).expect("open lane");
+    let first = stacked.sync_worktree().expect("sync staged file");
+    assert_eq!(first.synced_files, 1);
+    assert!(stacked.has_delta_changes());
+
+    // Delete from disk while still staged in git index (`AD` in `git status`),
+    // so `changed_paths` still includes `new_path` even though it is absent on disk
+    // and never existed in base.
+    fs::remove_file(lane_root.join(new_path)).expect("remove staged file");
+    let second = stacked
+        .sync_worktree()
+        .expect("sync_worktree after deleting staged non-base file");
+    assert_eq!(
+        second.deleted_files, 0,
+        "non-base file must not be tombstoned: {second:?}"
+    );
+    assert_eq!(
+        second.cleaned_files, 1,
+        "deleted non-base file must be cleared from delta: {second:?}"
+    );
+    assert!(
+        !stacked.has_delta_changes(),
+        "sync_worktree must not leave a phantom tombstone for a deleted non-base file"
+    );
+}
+
+#[test]
+fn go_same_package_duplicate_shadowing_matches_cold_rebuild_0xcafebabe13370002() {
+    let mut initial = MicroRepo::new();
+    initial.insert(
+        "go/mod_0.go".to_string(),
+        concat!(
+            "package micro\n\n",
+            "type Worker0 struct {\n",
+            "\tValue int\n",
+            "}\n\n",
+            "func (w *Worker0) Step(x int) int {\n",
+            "\treturn helper0(w.Value + x)\n",
+            "}\n\n",
+            "func Api0(x int) int {\n",
+            "\tbase := x + 3\n",
+            "\tw := &Worker0{Value: base}\n",
+            "\treturn w.Step(helper0(base))\n",
+            "}\n\n",
+            "func helper0(x int) int {\n",
+            "\treturn x + 3\n",
+            "}\n",
+        )
+        .to_string(),
+    );
+
+    let actions = [
+        Action::BuildDonorAndPublishBase,
+        Action::ProvisionLane { lane_idx: 0 },
+        Action::LaneRenameFile {
+            lane_idx: 0,
+            from: "go/mod_0.go".to_string(),
+            to: "go/renamed_1_4931.go".to_string(),
+        },
+        Action::LaneRevertToBase {
+            lane_idx: 0,
+            path: "go/mod_0.go".to_string(),
+        },
+        Action::SyncWorktree { lane_idx: 0 },
+        Action::QueryAndCheckParity { lane_idx: 0 },
+    ];
+
+    let mut world = World::new("go-pkg-shadow-repro", &initial);
+    for act in &actions {
+        let outcome = world.step(act);
+        assert!(
+            outcome.is_ok(),
+            "Go same-package shadowing reproducer failed at {}: {outcome:?}",
+            act.summary()
+        );
+    }
+
+    // Explicitly verify both base (`go/mod_0.go`) and delta (`go/renamed_1_4931.go`)
+    // abstain on shadowed `Worker0.Step`, matching cold flat rebuild.
+    let stacked = StackedStore::open(&world.lanes[0].root).expect("reopen lane");
+    let cancel = Cancel::new();
+    for path in ["go/mod_0.go", "go/renamed_1_4931.go"] {
+        let edges = stacked
+            .file_edges(path, 0.0, &cancel)
+            .expect("file_edges")
+            .expect("indexed file")
+            .edges;
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.edge_kind == "Calls" && e.target_symbol.ends_with("Worker0.Step")),
+            "shadowed Worker0.Step call in {path} must abstain like cold build: {edges:#?}"
+        );
+    }
 }

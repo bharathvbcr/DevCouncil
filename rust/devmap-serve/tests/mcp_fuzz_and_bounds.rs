@@ -18,7 +18,7 @@
 //!    nesting depth, batch length and frame size all have to be refused rather
 //!    than obeyed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use devmap_serve::mcp::{handle_line, serve_streams, structured_content_violation, StoreSlot};
@@ -193,11 +193,20 @@ fn classify_mcp_outcome(response: &Option<Value>) -> &'static str {
 async fn mutated_frames_never_panic_and_always_answer_in_shape() {
     let slot = corpus();
     let seed = stateful_fuzz::env_u64("DEVMAP_FUZZ_SEED", 0x5EED_1234_ABCD_0001);
+    let rounds = if std::env::var_os("DEVMAP_FUZZ_ROUNDS").is_some() {
+        stateful_fuzz::env_usize("DEVMAP_FUZZ_ROUNDS", 4_000).max(1)
+    } else if std::env::var_os("DEVMAP_STATEFUL_ROUNDS").is_some() {
+        stateful_fuzz::env_usize("DEVMAP_STATEFUL_ROUNDS", 8)
+            .saturating_mul(500)
+            .max(1)
+    } else {
+        4_000
+    };
     let mut rng = Rng(seed);
     let seeds = seeds();
     let mut tracker = stateful_fuzz::HealthTracker::new();
 
-    for round in 0..4_000 {
+    for round in 0..rounds {
         let mut bytes = seeds[rng.below(seeds.len())].clone().into_bytes();
         // One to four mutations, so some frames stay nearly valid (which
         // reaches deeper code) and some become noise (which reaches the parser).
@@ -269,14 +278,16 @@ async fn mutated_frames_never_panic_and_always_answer_in_shape() {
     }
 
     eprintln!("{}", tracker.probe_report("mcp_fuzz::mutated_frames"));
-    tracker.assert_actions_exercised(&[
-        "frame::mutated",
-        "outcome::parse_error",
-        "outcome::valid_result",
-        "outcome::tool_error",
-        "outcome::notification",
-        "outcome::batch",
-    ]);
+    if rounds >= 500 {
+        tracker.assert_actions_exercised(&[
+            "frame::mutated",
+            "outcome::parse_error",
+            "outcome::valid_result",
+            "outcome::tool_error",
+            "outcome::notification",
+            "outcome::batch",
+        ]);
+    }
 }
 
 /// A deeply nested batch must be refused, not recursed into.
@@ -1074,19 +1085,25 @@ fn micro_lang_for_path(path: &str) -> stateful_fuzz::MicroLang {
     }
 }
 
-fn collect_repo_symbols(repo: &stateful_fuzz::MicroRepo) -> Vec<String> {
+fn collect_repo_symbols(repo: &stateful_fuzz::MicroRepo) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::new();
+    let mut qualified = Vec::new();
     for (path, source) in repo {
         let ext = devmap_extract::extract_file(path, source);
         for sym in ext.symbols {
             if sym.kind != devmap_extract::model::SymbolKind::File && !sym.name.is_empty() {
                 names.push(sym.name);
+                if !sym.qualified_name.is_empty() {
+                    qualified.push(sym.qualified_name);
+                }
             }
         }
     }
     names.sort();
     names.dedup();
-    names
+    qualified.sort();
+    qualified.dedup();
+    (names, qualified)
 }
 
 fn make_request_id(src: &mut stateful_fuzz::Source, seq: usize) -> Value {
@@ -1103,6 +1120,7 @@ fn build_session_action(
     seq: usize,
     repo: &stateful_fuzz::MicroRepo,
     symbols: &[String],
+    qualified_symbols: &[String],
     issued_ids: &[Value],
 ) -> SessionAction {
     let id = make_request_id(src, seq);
@@ -1112,6 +1130,16 @@ fn build_session_action(
             s.choose(symbols)
                 .cloned()
                 .unwrap_or_else(|| "api_0".to_string())
+        } else {
+            s.ident("missing_sym")
+        }
+    };
+    let pick_unambiguous_target = |s: &mut stateful_fuzz::Source| -> String {
+        if s.chance(4, 5) {
+            s.choose(qualified_symbols)
+                .cloned()
+                .or_else(|| s.choose(&files).map(|p| (*p).clone()))
+                .unwrap_or_else(|| "src/mod_0.rs".to_string())
         } else {
             s.ident("missing_sym")
         }
@@ -1153,7 +1181,7 @@ fn build_session_action(
         },
         "mcp::devmap_impact" => SessionAction::Impact {
             id,
-            target: pick_sym(src),
+            target: pick_unambiguous_target(src),
             depth: (1 + src.usize_below(4)) as u32,
             layers: src.bool(),
         },
@@ -1500,45 +1528,69 @@ async fn execute_session_action(
                     .get("isError")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if !is_err {
-                    if let Some(structured) = result.get("structuredContent") {
-                        if let Some(violation) = structured_content_violation(tool_name, structured)
-                        {
-                            return stateful_fuzz::StepOutcome::CheckFailed(
-                                stateful_fuzz::CheckFailure::new(
-                                    "output_schema_conformance",
-                                    act_name,
-                                    format!("{violation} (payload: {structured})"),
+                if let Some(failure) = stateful_fuzz::check(
+                    !is_err,
+                    "valid_tool_not_error",
+                    act_name,
+                    format!("valid tool call {tool_name} returned isError=true: {frame}"),
+                )
+                .into_failure()
+                {
+                    return stateful_fuzz::StepOutcome::CheckFailed(failure);
+                }
+                let Some(structured) = result.get("structuredContent") else {
+                    return stateful_fuzz::StepOutcome::CheckFailed(
+                        stateful_fuzz::CheckFailure::new(
+                            "valid_tool_has_structured_content",
+                            act_name,
+                            format!(
+                                "valid tool call {tool_name} omitted structuredContent: {frame}"
+                            ),
+                        ),
+                    );
+                };
+                if let Some(violation) = structured_content_violation(tool_name, structured) {
+                    return stateful_fuzz::StepOutcome::CheckFailed(
+                        stateful_fuzz::CheckFailure::new(
+                            "output_schema_conformance",
+                            act_name,
+                            format!("{violation} (payload: {structured})"),
+                        ),
+                    );
+                }
+                if tool_name == "devmap_status" {
+                    let Some(gen_id) = structured.get("generation_id").and_then(Value::as_u64)
+                    else {
+                        return stateful_fuzz::StepOutcome::CheckFailed(
+                            stateful_fuzz::CheckFailure::new(
+                                "status_has_generation_id",
+                                act_name,
+                                format!(
+                                    "devmap_status omitted integer generation_id: {structured}"
                                 ),
-                            );
-                        }
-                        if tool_name == "devmap_status" {
-                            if let Some(gen_id) =
-                                structured.get("generation_id").and_then(Value::as_u64)
-                            {
-                                let ok = if state.evolved_since_status {
-                                    gen_id > state.last_observed_gen
-                                } else {
-                                    gen_id >= state.last_observed_gen
-                                };
-                                if let Some(failure) = stateful_fuzz::check(
-                                    ok,
-                                    "status_generation_monotonic",
-                                    act_name,
-                                    format!(
-                                        "devmap_status generation_id={gen_id}, prev={}, evolved={}",
-                                        state.last_observed_gen, state.evolved_since_status
-                                    ),
-                                )
-                                .into_failure()
-                                {
-                                    return stateful_fuzz::StepOutcome::CheckFailed(failure);
-                                }
-                                state.last_observed_gen = gen_id;
-                                state.evolved_since_status = false;
-                            }
-                        }
+                            ),
+                        );
+                    };
+                    let ok = if state.evolved_since_status {
+                        gen_id > state.last_observed_gen
+                    } else {
+                        gen_id >= state.last_observed_gen
+                    };
+                    if let Some(failure) = stateful_fuzz::check(
+                        ok,
+                        "status_generation_monotonic",
+                        act_name,
+                        format!(
+                            "devmap_status generation_id={gen_id}, prev={}, evolved={}",
+                            state.last_observed_gen, state.evolved_since_status
+                        ),
+                    )
+                    .into_failure()
+                    {
+                        return stateful_fuzz::StepOutcome::CheckFailed(failure);
                     }
+                    state.last_observed_gen = gen_id;
+                    state.evolved_since_status = false;
                 }
             }
 
@@ -1601,7 +1653,7 @@ async fn stateful_multiturn_mcp_session_fuzz() {
             last_observed_gen: initial_gen,
             evolved_since_status: false,
         };
-        let mut symbols = collect_repo_symbols(&state.repo);
+        let (mut symbols, mut qualified_symbols) = collect_repo_symbols(&state.repo);
         let mut issued_ids: Vec<Value> = Vec::new();
         let mut executed: Vec<SessionAction> = Vec::new();
         let mut prev_action: Option<&'static str> = None;
@@ -1613,8 +1665,15 @@ async fn stateful_multiturn_mcp_session_fuzz() {
                 tracker.pick_weighted(&mut src, SESSION_ACTION_NAMES, prev_action)
             };
             let seq = round * 1_000 + step + 1;
-            let action =
-                build_session_action(chosen, &mut src, seq, &state.repo, &symbols, &issued_ids);
+            let action = build_session_action(
+                chosen,
+                &mut src,
+                seq,
+                &state.repo,
+                &symbols,
+                &qualified_symbols,
+                &issued_ids,
+            );
             match &action {
                 SessionAction::Initialize { id, .. }
                 | SessionAction::Ping { id }
@@ -1636,7 +1695,9 @@ async fn stateful_multiturn_mcp_session_fuzz() {
             tracker.record(label, prev_action, &outcome);
             executed.push(action.clone());
             if matches!(action, SessionAction::EvolveRepo { .. }) {
-                symbols = collect_repo_symbols(&state.repo);
+                let (next_syms, next_qual) = collect_repo_symbols(&state.repo);
+                symbols = next_syms;
+                qualified_symbols = next_qual;
             }
 
             if let Some(failure) = outcome.into_failure() {
@@ -1670,10 +1731,10 @@ async fn stateful_multiturn_mcp_session_fuzz() {
         // Also exercise a real multi-turn duplex `serve_streams` session on the
         // evolved store, interleaving initialize, initialized notification,
         // tool calls, cancellation, and a final ping sentinel.
-        let target_sym = symbols
+        let target_sym = qualified_symbols
             .first()
             .cloned()
-            .unwrap_or_else(|| "api_0".to_string());
+            .unwrap_or_else(|| "src/mod_0.rs".to_string());
         let first_file = state
             .repo
             .keys()
@@ -1724,8 +1785,6 @@ async fn stateful_multiturn_mcp_session_fuzz() {
 
         let frames = session(&state.slot, &lines).await;
         let mut seen_ids: HashMap<String, usize> = HashMap::new();
-        let mut sentinel_seen = false;
-        let mut valid_response_ids: HashSet<String> = HashSet::new();
         for frame in &frames {
             // Skip server-initiated notifications (e.g. `notifications/tools/list_changed`).
             if frame.get("id").is_none() && frame.get("method").is_some() {
@@ -1733,11 +1792,7 @@ async fn stateful_multiturn_mcp_session_fuzz() {
             }
             assert_response_shape("transport_multiturn", &Some(frame.clone()));
             let key = frame["id"].to_string();
-            *seen_ids.entry(key.clone()).or_insert(0) += 1;
-            valid_response_ids.insert(key);
-            if frame["id"] == sentinel_id {
-                sentinel_seen = true;
-            }
+            *seen_ids.entry(key).or_insert(0) += 1;
         }
         for (id_key, count) in &seen_ids {
             assert_eq!(
@@ -1745,10 +1800,21 @@ async fn stateful_multiturn_mcp_session_fuzz() {
                 "round {round}: response id {id_key} emitted {count} times in duplex session"
             );
         }
-        assert!(
-            sentinel_seen && valid_response_ids.contains(&json!("init-1").to_string()),
-            "round {round}: duplex session lost init or sentinel frame: {frames:?}"
-        );
+        let uncancelled_ids = [
+            json!("init-1"),
+            json!(10),
+            json!(11),
+            json!(13),
+            sentinel_id.clone(),
+        ];
+        for req_id in &uncancelled_ids {
+            let key = req_id.to_string();
+            assert_eq!(
+                seen_ids.get(&key).copied().unwrap_or(0),
+                1,
+                "round {round}: uncancelled request id {key} was not answered exactly once in duplex session: {frames:?}"
+            );
+        }
         tracker.record(
             "mcp::transport_multiturn",
             prev_action,

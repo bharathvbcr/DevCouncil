@@ -40,8 +40,36 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  select:
+    name: select fuzz targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.select.outputs.targets }}
+    steps:
+      - name: Resolve fuzz target matrix
+        id: select
+        shell: bash
+        env:
+          SELECTED_TARGET: ${{ inputs.target || 'all' }}
+        run: |
+          set -euo pipefail
+          case "$SELECTED_TARGET" in
+            all)
+              echo 'targets=["csr_reader","extract_parse_repair","stateful_incremental_store","stateful_stacked_store"]' >> "$GITHUB_OUTPUT"
+              ;;
+            csr_reader|extract_parse_repair|stateful_incremental_store|stateful_stacked_store)
+              echo "targets=[\"${SELECTED_TARGET}\"]" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::unknown fuzz target '$SELECTED_TARGET'"
+              exit 1
+              ;;
+          esac
+
   fuzz:
     name: fuzz (${{ matrix.target }})
+    needs: select
     permissions:
       contents: read
       actions: write
@@ -50,11 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - csr_reader
-          - extract_parse_repair
-          - stateful_incremental_store
-          - stateful_stacked_store
+        target: ${{ fromJSON(needs.select.outputs.targets) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -71,6 +95,8 @@ jobs:
           cargo +nightly --version
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         with:
           cache-on-failure: true
           workspaces: rust/fuzz
@@ -96,17 +122,11 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          SELECTED_TARGET: ${{ inputs.target || 'all' }}
           DURATION_SECONDS: ${{ inputs.duration_seconds || '120' }}
-          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1"
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1:detect_odr_violation=0"
           RUST_BACKTRACE: "1"
         run: |
           set -euo pipefail
-          if [[ "$SELECTED_TARGET" != "all" && "$SELECTED_TARGET" != "$TARGET" ]]; then
-            echo "Skipping $TARGET (workflow_dispatch requested $SELECTED_TARGET)"
-            echo "status=skipped" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           if ! [[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] || [[ "$DURATION_SECONDS" -le 0 ]]; then
             echo "::error::duration_seconds must be a positive integer, got '$DURATION_SECONDS'"
             exit 1
@@ -170,7 +190,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: ${{ always() && steps.campaign.outputs.status != 'skipped' && steps.campaign.outputs.status != '0' }}
+        if: ${{ always() && steps.campaign.outputs.status != '0' }}
         with:
           name: fuzz-crashes-${{ matrix.target }}
           path: rust/fuzz/crash-report/${{ matrix.target }}
@@ -178,7 +198,6 @@ jobs:
           retention-days: 30
 
       - name: Enforce clean fuzz campaign
-        if: ${{ steps.campaign.outputs.status != 'skipped' }}
         shell: bash
         env:
           TARGET: ${{ matrix.target }}

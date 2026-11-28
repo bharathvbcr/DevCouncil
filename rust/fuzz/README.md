@@ -54,7 +54,7 @@ cargo +nightly fuzz run --fuzz-dir . --sanitizer=address stateful_stacked_store 
 
 - Pass `-use_value_profile=1` to libFuzzer for comparison-operand feedback (similar to cmplog) on magic bytes, header fields, and syntax keywords.
 - Pass `-jobs=4 -workers=4` to run parallel workers sharing the corpus directory.
-- To run with UndefinedBehaviorSanitizer alongside ASan on Linux, pass `RUSTFLAGS="-Zsanitizer=address"`.
+- `cargo-fuzz` selects the sanitizer via `--sanitizer=<address|leak|memory|thread|none>` (defaulting to `--sanitizer=address`, which configures `-Zsanitizer=address` and matching C/C++ flags automatically). Avoid overriding `RUSTFLAGS` with a bare `-Zsanitizer=...` flag, because replacing `RUSTFLAGS` can clobber the coverage and sanitizer flags `cargo-fuzz` passes to `rustc`; run additional sanitizers (such as `--sanitizer=memory` or `--sanitizer=thread` on supported Linux targets) in separate invocations instead.
 
 ## Replaying & Minimizing Saved Artifacts
 
@@ -90,6 +90,7 @@ TARGET="${1:?usage: bisect-fuzz.sh <target> <artifact-path> <expected-signature>
 ARTIFACT="${2:?missing artifact path}"
 EXPECTED_SIG="${3:?missing expected signature}"
 
+[[ -d rust/fuzz ]] || exit 125
 cd rust/fuzz
 
 # 1. Build the fuzz binary; skip commits that do not compile (exit 125).

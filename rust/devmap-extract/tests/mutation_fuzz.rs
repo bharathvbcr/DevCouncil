@@ -127,9 +127,9 @@ fn repo_root() -> PathBuf {
 /// would be fuzzing inputs production never sees.
 fn corpus(files_per_language: usize) -> BTreeMap<String, Vec<(String, String)>> {
     let mut roots = vec![repo_root()];
-    if let Ok(extra) = std::env::var("DEVMAP_FUZZ_CORPUS") {
-        for entry in extra.split(':').filter(|value| !value.is_empty()) {
-            roots.push(PathBuf::from(entry));
+    if let Some(extra) = std::env::var_os("DEVMAP_FUZZ_CORPUS") {
+        for entry in std::env::split_paths(&extra).filter(|path| !path.as_os_str().is_empty()) {
+            roots.push(entry);
         }
     }
 
@@ -404,6 +404,20 @@ fn check_invariants(
                         range.start_byte,
                         range.end_byte,
                         source.len()
+                    ),
+                )
+                .into_failure()
+                {
+                    return Err(failure);
+                }
+                if let Some(failure) = stateful_fuzz::check(
+                    source.is_char_boundary(range.start_byte)
+                        && source.is_char_boundary(range.end_byte),
+                    "error_range_char_boundary",
+                    action,
+                    format!(
+                        "{label}: error range {}..{} splits a UTF-8 character",
+                        range.start_byte, range.end_byte
                     ),
                 )
                 .into_failure()
@@ -967,6 +981,12 @@ fn micro_lang_for_path(path: &str) -> stateful_fuzz::MicroLang {
 #[test]
 fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
     let seed = fuzz_seed();
+    let rounds = env_usize("DEVMAP_FUZZ_ROUNDS", DEFAULT_ROUNDS).max(1);
+    let micro_param_rounds = rounds.max(2);
+    let grammar_lower_rounds = rounds.max(2);
+    let grammar_mutate_rounds = (rounds / 2).max(1);
+    let repair_lower_rounds = rounds.max(3);
+    let repair_mutate_rounds = rounds.max(2);
     let mut src = stateful_fuzz::Source::from_seed(seed);
     let mut rng = Rng(src.fork_seed());
     let mut tracker = stateful_fuzz::HealthTracker::new();
@@ -1025,9 +1045,9 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
             &stateful_fuzz::StepOutcome::Ok,
         );
 
-        // Structural `param_elements` mutations (2 rounds).
+        // Structural `param_elements` mutations (must stay syntactically valid).
         let mut evolved = content.clone();
-        for round in 0..2 {
+        for round in 0..micro_param_rounds {
             evolved = stateful_fuzz::mutate_file_elements(&mut src, lang, &evolved);
             let label = format!("seed {seed} / micro::param_elements / {path} / round {round}");
             let ext = match check_extraction_and_determinism(
@@ -1047,6 +1067,27 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
                     failure,
                 ),
             };
+            if let Some(failure) = stateful_fuzz::check(
+                matches!(ext.parse_outcome, ParseOutcome::Clean),
+                "micro_param_elements_clean_parse",
+                "micro::param_elements",
+                format!(
+                    "{label}: mutate_file_elements broke syntax; expected Clean, got {:?}",
+                    ext.parse_outcome
+                ),
+            )
+            .into_failure()
+            {
+                fail_with_minimized_repro(
+                    seed,
+                    "repro_micro_param_elements_clean",
+                    &label,
+                    path,
+                    &evolved,
+                    true,
+                    failure,
+                );
+            }
             tracker.record(
                 "micro::param_elements",
                 Some("micro::clean"),
@@ -1174,8 +1215,8 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
             &stateful_fuzz::StepOutcome::Ok,
         );
 
-        // 2 rounds of `lower_damage` across every linked grammar.
-        for round in 0..2 {
+        // Rounds of `lower_damage` across every linked grammar.
+        for round in 0..grammar_lower_rounds {
             let damaged = stateful_fuzz::lower_damage(&mut src, snippet);
             let label = format!("seed {seed} / grammar::lower_damage / {grammar} / round {round}");
             let ext = match check_extraction_and_determinism(
@@ -1207,37 +1248,41 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
             );
         }
 
-        // 1 round of byte/text Mutation across every linked grammar.
-        let mutation = MUTATIONS[rng.below(MUTATIONS.len())];
-        let mutated = apply(mutation, snippet, &mut rng);
-        let label = format!("seed {seed} / grammar::byte_mutate / {grammar} / {mutation:?}");
-        let ext = match check_extraction_and_determinism(
-            "grammar::byte_mutate",
-            &label,
-            path,
-            &mutated,
-        ) {
-            Ok(ext) => ext,
-            Err(failure) => fail_with_minimized_repro(
-                seed,
-                "repro_grammar_mutate",
+        // Rounds of byte/text Mutation across every linked grammar.
+        for round in 0..grammar_mutate_rounds {
+            let mutation = MUTATIONS[rng.below(MUTATIONS.len())];
+            let mutated = apply(mutation, snippet, &mut rng);
+            let label = format!(
+                "seed {seed} / grammar::byte_mutate / {grammar} / round {round} / {mutation:?}"
+            );
+            let ext = match check_extraction_and_determinism(
+                "grammar::byte_mutate",
                 &label,
                 path,
                 &mutated,
-                true,
-                failure,
-            ),
-        };
-        tracker.record(
-            "grammar::byte_mutate",
-            Some("grammar::clean"),
-            &stateful_fuzz::StepOutcome::Ok,
-        );
-        tracker.record(
-            outcome_label(&ext.parse_outcome),
-            Some("grammar::byte_mutate"),
-            &stateful_fuzz::StepOutcome::Ok,
-        );
+            ) {
+                Ok(ext) => ext,
+                Err(failure) => fail_with_minimized_repro(
+                    seed,
+                    "repro_grammar_mutate",
+                    &label,
+                    path,
+                    &mutated,
+                    true,
+                    failure,
+                ),
+            };
+            tracker.record(
+                "grammar::byte_mutate",
+                Some("grammar::clean"),
+                &stateful_fuzz::StepOutcome::Ok,
+            );
+            tracker.record(
+                outcome_label(&ext.parse_outcome),
+                Some("grammar::byte_mutate"),
+                &stateful_fuzz::StepOutcome::Ok,
+            );
+        }
     }
 
     // 3. Same-width `parse_repair` / `kotlinsemi` / `sveltetext` quirk seeds +
@@ -1297,7 +1342,7 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
             &stateful_fuzz::StepOutcome::Ok,
         );
 
-        for round in 0..3 {
+        for round in 0..repair_lower_rounds {
             let damaged = stateful_fuzz::lower_damage(&mut src, snippet);
             let label =
                 format!("seed {seed} / parse_repair::lower_damage / {name} / round {round}");
@@ -1330,7 +1375,7 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
             );
         }
 
-        for round in 0..2 {
+        for round in 0..repair_mutate_rounds {
             let m = repair_mutations[src.usize_below(repair_mutations.len())];
             let damaged = apply(m, snippet, &mut rng);
             let label = format!(
@@ -1366,6 +1411,12 @@ fn stateful_micro_repo_and_all_33_grammars_parse_repair_sweep() {
         }
     }
 
+    eprintln!(
+        "micro & 33-grammar sweep: seed {seed}, rounds={rounds} \
+         (micro_param={micro_param_rounds}, grammar_lower={grammar_lower_rounds}, \
+          grammar_mutate={grammar_mutate_rounds}, repair_lower={repair_lower_rounds}, \
+          repair_mutate={repair_mutate_rounds})"
+    );
     eprintln!(
         "{}",
         tracker.probe_report("mutation_fuzz::micro_and_33_grammars")

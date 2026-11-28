@@ -245,12 +245,16 @@ fn check_equivalence(action: &'static str, store: &Store, repo: &MicroRepo) -> S
         return c5;
     }
 
-    // Spot-check FTS search parity on a live symbol name.
+    // Spot-check FTS search parity on a live simple-identifier symbol name.
     if let Some(sample_name) = cold_snap
         .symbols_by_file
         .values()
         .flat_map(|names| names.iter())
-        .find(|n| !n.contains('/') && !n.contains('.'))
+        .find(|n| {
+            !n.is_empty()
+                && n.len() <= 64
+                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
     {
         let inc_hits: BTreeSet<(String, String)> = match store.search_symbols(sample_name, 64) {
             Ok(rows) => rows
@@ -413,8 +417,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let Ok(store) = Store::open_in_memory() else {
-        return;
+    let store = match Store::open_in_memory() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("DEVMAP_FUZZ_SIG=store_open_ok|init");
+            panic!("Store::open_in_memory() failed: {e:#}");
+        }
     };
 
     let mut state = FuzzState {

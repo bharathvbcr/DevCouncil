@@ -3,14 +3,16 @@
 //!   parity (`InMemory == Store == IPC == MCP`) across evolving generations.
 //! - Suite B: `blast` / `suspects` duality and `unattributed`/`complete` honesty
 //!   over synthetic multi-commit git repositories.
-//! - Suite C: Virtualized `DebounceBuffer` collapse + `Daemon` drain state
-//!   machine (monotonic `(epoch, revision)` watermarks, zero cross-charging of
-//!   quarantine attempts across batch-mates, and final indexed store == cold
-//!   full build).
+//! - Suite C: Real `Store` pending-queue burst (>4,096 paths) + root-rescan
+//!   (`"."`) + `Daemon` drain state machine (monotonic `(epoch, revision)`
+//!   watermarks, zero cross-charging of quarantine attempts across batch-mates,
+//!   quarantine transitions at `MAX_PENDING_ATTEMPTS`, and final indexed store
+//!   == cold full build).
 //!
 //! Configurable via environment variables:
 //! - `DEVMAP_STATEFUL_SEED` (u64, decimal or `0x` hex)
-//! - `DEVMAP_STATEFUL_ROUNDS` (usize)
+//! - `DEVMAP_STATEFUL_ROUNDS` (usize; Suite B scenario count, default 3)
+//! - `DEVMAP_STATEFUL_STEPS` (usize; Suite A default 28, Suite C default 32)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -33,7 +35,7 @@ use devmap_query::{
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
 use devmap_serve::mcp::{handle_line, StoreSlot};
-use devmap_serve::{handle_stream, Daemon, PROTOCOL_VERSION};
+use devmap_serve::{handle_stream, Daemon, DEFAULT_DRAIN_BATCH_LIMIT, PROTOCOL_VERSION};
 use devmap_store::{
     current_git_head, discovery_refusals, over_limit_inventory, GenerationWriteOpts, Store,
     MAX_PENDING_ATTEMPTS, UNAVAILABLE_HEAD,
@@ -170,46 +172,144 @@ fn build_generation_from_disk(
     Ok((extractions, resolution, gen_id))
 }
 
-async fn ipc_request(store: Arc<Store>, payload: Value) -> Value {
+async fn ipc_request(
+    action: &'static str,
+    store: Arc<Store>,
+    payload: Value,
+) -> Result<Value, CheckFailure> {
     let (client, server) = tokio::io::duplex(256 * 1024);
     let task = tokio::spawn(handle_stream(server, store));
     let (mut reader, mut writer) = tokio::io::split(client);
-    let mut bytes = serde_json::to_vec(&payload).expect("serialize IPC request");
+    let mut bytes = serde_json::to_vec(&payload).map_err(|err| {
+        CheckFailure::new(
+            "ipc_request_serialize",
+            action,
+            format!("failed to serialize IPC request: {err}"),
+        )
+    })?;
     bytes.push(b'\n');
 
     let pump = tokio::spawn(async move {
-        let _ = writer.write_all(&bytes).await;
-        let _ = writer.shutdown().await;
+        writer.write_all(&bytes).await?;
+        writer.shutdown().await
     });
     let mut reply = Vec::new();
-    tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut reply))
-        .await
-        .expect("IPC exchange timed out")
-        .expect("IPC read failed");
-    let _ = pump.await;
-    let _ = task.await;
+    match tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut reply)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            task.abort();
+            pump.abort();
+            let _ = pump.await;
+            let _ = task.await;
+            return Err(CheckFailure::new(
+                "ipc_read_ok",
+                action,
+                format!("IPC read failed: {err}"),
+            ));
+        }
+        Err(_) => {
+            task.abort();
+            pump.abort();
+            let _ = pump.await;
+            let _ = task.await;
+            return Err(CheckFailure::new(
+                "ipc_exchange_timeout",
+                action,
+                format!("IPC exchange timed out for payload {payload}"),
+            ));
+        }
+    }
+    match pump.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let _ = task.await;
+            return Err(CheckFailure::new(
+                "ipc_write_ok",
+                action,
+                format!("IPC request write/shutdown failed: {err}"),
+            ));
+        }
+        Err(join_err) => {
+            let _ = task.await;
+            return Err(CheckFailure::new(
+                "ipc_pump_no_panic",
+                action,
+                format!("IPC pump task failed: {join_err}"),
+            ));
+        }
+    }
+    match task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return Err(CheckFailure::new(
+                "ipc_server_ok",
+                action,
+                format!("IPC handle_stream returned error: {err:#}"),
+            ));
+        }
+        Err(join_err) => {
+            return Err(CheckFailure::new(
+                "ipc_server_no_panic",
+                action,
+                format!("IPC server task panicked/cancelled: {join_err}"),
+            ));
+        }
+    }
 
-    assert_eq!(
-        reply.last().copied(),
-        Some(b'\n'),
-        "IPC reply not newline-framed"
-    );
+    if reply.last().copied() != Some(b'\n') {
+        return Err(CheckFailure::new(
+            "ipc_reply_newline_framed",
+            action,
+            format!("IPC reply not newline-framed: {reply:?}"),
+        ));
+    }
     let body = &reply[..reply.len() - 1];
-    assert!(
-        !body.contains(&b'\n'),
-        "IPC reply contained multiple frames"
-    );
-    let env: Value = serde_json::from_slice(body).expect("IPC reply JSON");
-    assert_eq!(env["protocol_version"], PROTOCOL_VERSION);
-    assert_eq!(
-        env["ok"],
-        Value::Bool(true),
-        "IPC request failed unexpectedly: {env}"
-    );
-    env["result"].clone()
+    if body.contains(&b'\n') {
+        return Err(CheckFailure::new(
+            "ipc_reply_single_frame",
+            action,
+            format!(
+                "IPC reply contained multiple frames: {:?}",
+                String::from_utf8_lossy(body)
+            ),
+        ));
+    }
+    let env: Value = serde_json::from_slice(body).map_err(|err| {
+        CheckFailure::new(
+            "ipc_reply_valid_json",
+            action,
+            format!(
+                "IPC reply invalid JSON ({err}): {:?}",
+                String::from_utf8_lossy(body)
+            ),
+        )
+    })?;
+    if env["protocol_version"] != json!(PROTOCOL_VERSION) {
+        return Err(CheckFailure::new(
+            "ipc_protocol_version",
+            action,
+            format!(
+                "IPC protocol_version {:?} != {PROTOCOL_VERSION}: {env}",
+                env["protocol_version"]
+            ),
+        ));
+    }
+    if env["ok"] != Value::Bool(true) {
+        return Err(CheckFailure::new(
+            "ipc_reply_ok",
+            action,
+            format!("IPC request failed unexpectedly: {env}"),
+        ));
+    }
+    Ok(env["result"].clone())
 }
 
-async fn mcp_call_tool(slot: &Arc<StoreSlot>, tool: &str, arguments: Value) -> Value {
+async fn mcp_call_tool(
+    action: &'static str,
+    slot: &Arc<StoreSlot>,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value, CheckFailure> {
     let frame = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -219,22 +319,50 @@ async fn mcp_call_tool(slot: &Arc<StoreSlot>, tool: &str, arguments: Value) -> V
             "arguments": arguments,
         }
     });
-    let resp = handle_line(slot, &frame.to_string())
-        .await
-        .expect("MCP tools/call must reply");
-    assert_eq!(resp["jsonrpc"], json!("2.0"));
-    assert_eq!(resp["id"], json!(1));
-    assert!(
-        resp.get("error").is_none(),
-        "MCP protocol error on {tool}: {resp}"
-    );
+    let Some(resp) = handle_line(slot, &frame.to_string()).await else {
+        return Err(CheckFailure::new(
+            "mcp_tools_call_replied",
+            action,
+            format!("MCP tools/call for {tool} returned no response"),
+        ));
+    };
+    if resp["jsonrpc"] != json!("2.0") {
+        return Err(CheckFailure::new(
+            "mcp_jsonrpc_version",
+            action,
+            format!("MCP response jsonrpc != 2.0 on {tool}: {resp}"),
+        ));
+    }
+    if resp["id"] != json!(1) {
+        return Err(CheckFailure::new(
+            "mcp_response_id",
+            action,
+            format!("MCP response id != 1 on {tool}: {resp}"),
+        ));
+    }
+    if resp.get("error").is_some() {
+        return Err(CheckFailure::new(
+            "mcp_no_protocol_error",
+            action,
+            format!("MCP protocol error on {tool}: {resp}"),
+        ));
+    }
     let result = &resp["result"];
-    assert_ne!(
-        result["isError"],
-        json!(true),
-        "MCP tool error on {tool}: {resp}"
-    );
-    result["structuredContent"].clone()
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return Err(CheckFailure::new(
+            "mcp_no_tool_error",
+            action,
+            format!("MCP tool error on {tool}: {resp}"),
+        ));
+    }
+    let Some(structured) = result.get("structuredContent") else {
+        return Err(CheckFailure::new(
+            "mcp_has_structured_content",
+            action,
+            format!("MCP response omitted structuredContent on {tool}: {resp}"),
+        ));
+    };
+    Ok(structured.clone())
 }
 
 /// Normalize transport-only metadata (`repository` added by MCP, volatile
@@ -439,7 +567,6 @@ fn candidate_helper_name(lang: MicroLang, path: &str) -> Option<String> {
 }
 
 struct SuiteAState {
-    _guard: TempDirGuard,
     root: PathBuf,
     shadow_root: PathBuf,
     files: BTreeMap<String, String>,
@@ -449,6 +576,9 @@ struct SuiteAState {
     resolution: ResolutionResult,
     last_gen_id: u32,
     store_in_sync_with_disk: bool,
+    last_preview_clean_oracle: bool,
+    // Keep TempDirGuard LAST so SQLite/Store/StoreSlot handles drop before remove_dir_all (Windows safety).
+    _guard: TempDirGuard,
 }
 
 impl SuiteAState {
@@ -467,7 +597,6 @@ impl SuiteAState {
             build_generation_from_disk(&store, &root).expect("initial build");
         let slot = Arc::new(StoreSlot::ready(&db_path, Arc::clone(&store)));
         Self {
-            _guard: guard,
             root,
             shadow_root,
             files: initial_files,
@@ -477,14 +606,35 @@ impl SuiteAState {
             resolution,
             last_gen_id: gen_id,
             store_in_sync_with_disk: true,
+            last_preview_clean_oracle: false,
+            _guard: guard,
         }
     }
 
+    fn take_last_preview_clean_oracle(&mut self) -> bool {
+        std::mem::replace(&mut self.last_preview_clean_oracle, false)
+    }
+
     async fn apply(&mut self, action: &SuiteAAction) -> StepOutcome {
+        self.last_preview_clean_oracle = false;
         match action {
             SuiteAAction::EditDisk { path, content } => {
                 if !self.files.contains_key(path) {
                     return skip_missing("edit_missing_file");
+                }
+                let ext = extract_file(path, content);
+                if !matches!(
+                    ext.parse_outcome,
+                    devmap_extract::model::ParseOutcome::Clean
+                ) {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "edit_disk_parses_clean",
+                        "EditDisk",
+                        format!(
+                            "clean EditDisk mutation on {path} failed to parse cleanly: {:?}",
+                            ext.parse_outcome
+                        ),
+                    ));
                 }
                 write_repo_file(&self.root, path, content);
                 self.files.insert(path.clone(), content.clone());
@@ -526,6 +676,7 @@ impl SuiteAState {
                     | PreviewKind::SignatureChange { content: s, .. }
                     | PreviewKind::UnindexedNewFile { content: s } => s.as_str(),
                 };
+                let is_clean_edit = !matches!(kind, PreviewKind::BrokenSyntax(_));
                 let budget = 20_000;
                 let min_conf = PREVIEW_CALLER_MIN_CONFIDENCE;
 
@@ -545,33 +696,41 @@ impl SuiteAState {
                 let store_json = normalize_transport_json(
                     serde_json::to_value(&store_preview).expect("serialize preview"),
                 );
-                let ipc_json = normalize_transport_json(
-                    ipc_request(
-                        Arc::clone(&self.store),
-                        json!({
-                            "version": PROTOCOL_VERSION,
-                            "cmd": "preview",
-                            "file": path,
-                            "content": unsaved,
-                            "budget": budget,
-                            "min_confidence": min_conf,
-                        }),
-                    )
-                    .await,
-                );
-                let mcp_json = normalize_transport_json(
-                    mcp_call_tool(
-                        &self.slot,
-                        "devmap_preview",
-                        json!({
-                            "file": path,
-                            "content": unsaved,
-                            "budget": budget,
-                            "min_confidence": min_conf,
-                        }),
-                    )
-                    .await,
-                );
+                let ipc_raw = match ipc_request(
+                    "PreviewUnsaved",
+                    Arc::clone(&self.store),
+                    json!({
+                        "version": PROTOCOL_VERSION,
+                        "cmd": "preview",
+                        "file": path,
+                        "content": unsaved,
+                        "budget": budget,
+                        "min_confidence": min_conf,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(failure) => return StepOutcome::CheckFailed(failure),
+                };
+                let ipc_json = normalize_transport_json(ipc_raw);
+                let mcp_raw = match mcp_call_tool(
+                    "PreviewUnsaved",
+                    &self.slot,
+                    "devmap_preview",
+                    json!({
+                        "file": path,
+                        "content": unsaved,
+                        "budget": budget,
+                        "min_confidence": min_conf,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(failure) => return StepOutcome::CheckFailed(failure),
+                };
+                let mcp_json = normalize_transport_json(mcp_raw);
 
                 if store_json != ipc_json {
                     return StepOutcome::CheckFailed(CheckFailure::new(
@@ -601,13 +760,19 @@ impl SuiteAState {
                 }
 
                 // 2. Differential oracle: preview vs. actual save + cold rebuild in shadow dir
-                if let Err(failure) =
-                    self.verify_preview_vs_save_rebuild(path, unsaved, &store_preview)
-                {
-                    return StepOutcome::CheckFailed(failure);
+                match self.verify_preview_vs_save_rebuild(
+                    path,
+                    unsaved,
+                    is_clean_edit,
+                    &store_preview,
+                ) {
+                    Ok(ran_clean_oracle) => {
+                        self.last_preview_clean_oracle = ran_clean_oracle;
+                    }
+                    Err(failure) => return StepOutcome::CheckFailed(failure),
                 }
 
-                // 3. Targeted expectations by preview mode
+                // 3. Targeted expectations by preview mode (no silent delta_available bypasses)
                 match kind {
                     PreviewKind::UnindexedNewFile { .. } => {
                         if store_preview.compared_against != "nothing"
@@ -624,41 +789,37 @@ impl SuiteAState {
                         }
                     }
                     PreviewKind::RemoveCalledSymbol { removed_name, .. } => {
-                        if store_preview.delta_available && store_preview.parse_status == "clean" {
-                            let has_removed = store_preview.symbols.iter().any(|s| {
-                                s.symbol_name == *removed_name && s.change == PreviewChange::Removed
-                            });
-                            if !has_removed {
-                                return StepOutcome::CheckFailed(CheckFailure::new(
-                                    "preview_reports_removed_symbol",
-                                    "PreviewUnsaved",
-                                    format!(
-                                        "expected {removed_name} Removed in {path}, got {:?}",
-                                        store_preview.symbols
-                                    ),
-                                ));
-                            }
+                        let has_removed = store_preview.symbols.iter().any(|s| {
+                            s.symbol_name == *removed_name && s.change == PreviewChange::Removed
+                        });
+                        if !has_removed {
+                            return StepOutcome::CheckFailed(CheckFailure::new(
+                                "preview_reports_removed_symbol",
+                                "PreviewUnsaved",
+                                format!(
+                                    "expected {removed_name} Removed in {path}, got {:?}",
+                                    store_preview.symbols
+                                ),
+                            ));
                         }
                     }
                     PreviewKind::SignatureChange { target_name, .. } => {
-                        if store_preview.delta_available && store_preview.parse_status == "clean" {
-                            let reported = store_preview.symbols.iter().any(|s| {
-                                s.symbol_name == *target_name
-                                    && matches!(
-                                        s.change,
-                                        PreviewChange::SignatureChanged | PreviewChange::Changed
-                                    )
-                            });
-                            if !reported {
-                                return StepOutcome::CheckFailed(CheckFailure::new(
-                                    "preview_reports_signature_change",
-                                    "PreviewUnsaved",
-                                    format!(
-                                        "expected SignatureChanged/Changed for {target_name} in {path}, got {:?}",
-                                        store_preview.symbols
-                                    ),
-                                ));
-                            }
+                        let reported = store_preview.symbols.iter().any(|s| {
+                            s.symbol_name == *target_name
+                                && matches!(
+                                    s.change,
+                                    PreviewChange::SignatureChanged | PreviewChange::Changed
+                                )
+                        });
+                        if !reported {
+                            return StepOutcome::CheckFailed(CheckFailure::new(
+                                "preview_reports_signature_change",
+                                "PreviewUnsaved",
+                                format!(
+                                    "expected SignatureChanged/Changed for {target_name} in {path}, got {:?}",
+                                    store_preview.symbols
+                                ),
+                            ));
                         }
                     }
                     PreviewKind::BrokenSyntax(_) => {
@@ -697,10 +858,21 @@ impl SuiteAState {
         &self,
         path: &str,
         unsaved: &str,
+        is_clean_edit: bool,
         preview: &PreviewReport,
-    ) -> Result<(), CheckFailure> {
+    ) -> Result<bool, CheckFailure> {
+        if (is_clean_edit || preview.parse_status == "clean") && !preview.delta_available {
+            return Err(CheckFailure::new(
+                "preview_clean_delta_available",
+                "PreviewUnsaved",
+                format!(
+                    "{path}: clean preview must report delta_available=true (parse_status={:?}): {preview:?}",
+                    preview.parse_status
+                ),
+            ));
+        }
         if !preview.delta_available {
-            return Ok(());
+            return Ok(false);
         }
         // Check `compared_against` matches disk presence.
         let disk_exists = self.root.join(path).is_file();
@@ -716,9 +888,19 @@ impl SuiteAState {
             ));
         }
 
-        // Only compare exact symbol sets when the candidate parsed cleanly.
+        // Clean edits MUST parse cleanly so they never silently bypass the differential oracle.
         if preview.parse_status != "clean" {
-            return Ok(());
+            if is_clean_edit {
+                return Err(CheckFailure::new(
+                    "preview_clean_edit_parses_clean",
+                    "PreviewUnsaved",
+                    format!(
+                        "{path}: expected clean preview edit to parse cleanly, got parse_status={:?} ({preview:?})",
+                        preview.parse_status
+                    ),
+                ));
+            }
+            return Ok(false);
         }
 
         // Materialize shadow copy of current disk repo + unsaved buffer written to disk,
@@ -889,7 +1071,7 @@ impl SuiteAState {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn verify_transport_parity(&self, query: &TransportQuery) -> StepOutcome {
@@ -916,29 +1098,37 @@ impl SuiteAState {
                 };
                 let store_json =
                     normalize_transport_json(serde_json::to_value(&store_resp).unwrap());
-                let ipc_json = normalize_transport_json(
-                    ipc_request(
-                        Arc::clone(&self.store),
-                        json!({
-                            "version": PROTOCOL_VERSION,
-                            "cmd": "search",
-                            "query": q,
-                            "budget": budget,
-                        }),
-                    )
-                    .await,
-                );
-                let mcp_json = normalize_transport_json(
-                    mcp_call_tool(
-                        &self.slot,
-                        "devmap_search",
-                        json!({
-                            "query": q,
-                            "budget": budget,
-                        }),
-                    )
-                    .await,
-                );
+                let ipc_raw = match ipc_request(
+                    "QueryAllTransports",
+                    Arc::clone(&self.store),
+                    json!({
+                        "version": PROTOCOL_VERSION,
+                        "cmd": "search",
+                        "query": q,
+                        "budget": budget,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let ipc_json = normalize_transport_json(ipc_raw);
+                let mcp_raw = match mcp_call_tool(
+                    "QueryAllTransports",
+                    &self.slot,
+                    "devmap_search",
+                    json!({
+                        "query": q,
+                        "budget": budget,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let mcp_json = normalize_transport_json(mcp_raw);
 
                 if let Err(f) =
                     check_envelope_invariants(&store_json, "QueryAllTransports", "search.store")
@@ -1034,31 +1224,39 @@ impl SuiteAState {
                 };
                 let store_json =
                     normalize_transport_json(serde_json::to_value(&store_resp).unwrap());
-                let ipc_json = normalize_transport_json(
-                    ipc_request(
-                        Arc::clone(&self.store),
-                        json!({
-                            "version": PROTOCOL_VERSION,
-                            "cmd": "impact",
-                            "target": target,
-                            "budget": budget,
-                            "depth": depth,
-                        }),
-                    )
-                    .await,
-                );
-                let mcp_json = normalize_transport_json(
-                    mcp_call_tool(
-                        &self.slot,
-                        "devmap_impact",
-                        json!({
-                            "target": target,
-                            "budget": budget,
-                            "depth": depth,
-                        }),
-                    )
-                    .await,
-                );
+                let ipc_raw = match ipc_request(
+                    "QueryAllTransports",
+                    Arc::clone(&self.store),
+                    json!({
+                        "version": PROTOCOL_VERSION,
+                        "cmd": "impact",
+                        "target": target,
+                        "budget": budget,
+                        "depth": depth,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let ipc_json = normalize_transport_json(ipc_raw);
+                let mcp_raw = match mcp_call_tool(
+                    "QueryAllTransports",
+                    &self.slot,
+                    "devmap_impact",
+                    json!({
+                        "target": target,
+                        "budget": budget,
+                        "depth": depth,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let mcp_json = normalize_transport_json(mcp_raw);
 
                 if let Err(f) =
                     check_envelope_invariants(&store_json, "QueryAllTransports", "impact.store")
@@ -1163,29 +1361,37 @@ impl SuiteAState {
                 };
                 let store_json =
                     normalize_transport_json(serde_json::to_value(&store_resp).unwrap());
-                let ipc_json = normalize_transport_json(
-                    ipc_request(
-                        Arc::clone(&self.store),
-                        json!({
-                            "version": PROTOCOL_VERSION,
-                            "cmd": "deps",
-                            "target": target,
-                            "budget": budget,
-                        }),
-                    )
-                    .await,
-                );
-                let mcp_json = normalize_transport_json(
-                    mcp_call_tool(
-                        &self.slot,
-                        "devmap_dependencies",
-                        json!({
-                            "target": target,
-                            "budget": budget,
-                        }),
-                    )
-                    .await,
-                );
+                let ipc_raw = match ipc_request(
+                    "QueryAllTransports",
+                    Arc::clone(&self.store),
+                    json!({
+                        "version": PROTOCOL_VERSION,
+                        "cmd": "deps",
+                        "target": target,
+                        "budget": budget,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let ipc_json = normalize_transport_json(ipc_raw);
+                let mcp_raw = match mcp_call_tool(
+                    "QueryAllTransports",
+                    &self.slot,
+                    "devmap_dependencies",
+                    json!({
+                        "target": target,
+                        "budget": budget,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let mcp_json = normalize_transport_json(mcp_raw);
 
                 if let Err(f) =
                     check_envelope_invariants(&store_json, "QueryAllTransports", "deps.store")
@@ -1280,25 +1486,33 @@ impl SuiteAState {
                 };
                 let store_json =
                     normalize_transport_json(serde_json::to_value(&store_resp).unwrap());
-                let ipc_json = normalize_transport_json(
-                    ipc_request(
-                        Arc::clone(&self.store),
-                        json!({
-                            "version": PROTOCOL_VERSION,
-                            "cmd": "dead",
-                            "budget": budget,
-                        }),
-                    )
-                    .await,
-                );
-                let mcp_json = normalize_transport_json(
-                    mcp_call_tool(
-                        &self.slot,
-                        "devmap_dead_symbols",
-                        json!({ "budget": budget }),
-                    )
-                    .await,
-                );
+                let ipc_raw = match ipc_request(
+                    "QueryAllTransports",
+                    Arc::clone(&self.store),
+                    json!({
+                        "version": PROTOCOL_VERSION,
+                        "cmd": "dead",
+                        "budget": budget,
+                    }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let ipc_json = normalize_transport_json(ipc_raw);
+                let mcp_raw = match mcp_call_tool(
+                    "QueryAllTransports",
+                    &self.slot,
+                    "devmap_dead_symbols",
+                    json!({ "budget": budget }),
+                )
+                .await
+                {
+                    Ok(val) => val,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                let mcp_json = normalize_transport_json(mcp_raw);
 
                 if let Err(f) =
                     check_envelope_invariants(&store_json, "QueryAllTransports", "dead.store")
@@ -1344,7 +1558,7 @@ fn replay_suite_a(
 fn stateful_suite_a_preview_and_cross_transport_parity() {
     let started = Instant::now();
     let seed = env_u64("DEVMAP_STATEFUL_SEED", DEFAULT_SEED);
-    let rounds = env_usize("DEVMAP_STATEFUL_ROUNDS", 28);
+    let steps = env_usize("DEVMAP_STATEFUL_STEPS", 28);
     let mut src = Source::from_seed(seed ^ 0xA0A0_0001);
 
     let initial_files = generate_micro_repo(&mut src, ALL_LANGS, 8);
@@ -1355,7 +1569,7 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
 
     let mut state = SuiteAState::new(initial_files.clone());
     let mut tracker = HealthTracker::new();
-    let mut history: Vec<SuiteAAction> = Vec::with_capacity(rounds);
+    let mut history: Vec<SuiteAAction> = Vec::with_capacity(steps);
     let mut prev_action: Option<&'static str> = None;
 
     let candidates: &[&'static str] = &[
@@ -1366,9 +1580,40 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
     ];
     let mut query_cycle = 0usize;
     let mut preview_cycle = 0usize;
+    let mut clean_lang_cycle = 0usize;
 
-    for _step in 0..rounds {
-        let chosen = tracker.pick_weighted(&mut src, candidates, prev_action);
+    let pick_path_for_lang =
+        |paths: &[String], lang: MicroLang, prefer_mod0: bool, src: &mut Source| -> String {
+            let matching: Vec<String> = paths
+                .iter()
+                .filter(|p| lang_for_path(p) == lang)
+                .cloned()
+                .collect();
+            if prefer_mod0 {
+                if let Some(mod0) = matching.iter().find(|p| p.contains("mod_0.")) {
+                    return mod0.clone();
+                }
+            }
+            src.choose(&matching)
+                .or_else(|| src.choose(paths))
+                .expect("non-empty repo")
+                .clone()
+        };
+
+    for step in 0..steps {
+        let remaining = steps.saturating_sub(step);
+        let unexercised: Vec<&'static str> = candidates
+            .iter()
+            .copied()
+            .filter(|&name| tracker.action_stats(name).ok == 0)
+            .collect();
+        let chosen = if !unexercised.is_empty() && remaining <= unexercised.len() {
+            unexercised[0]
+        } else if tracker.action_stats("preview_clean_oracle").ok == 0 && remaining <= 2 {
+            "PreviewUnsaved"
+        } else {
+            tracker.pick_weighted(&mut src, candidates, prev_action)
+        };
         let paths: Vec<String> = state.files.keys().cloned().collect();
         let action = match chosen {
             "EditDisk" => {
@@ -1386,17 +1631,10 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
                 preview_cycle += 1;
                 match mode {
                     0 => {
-                        // Remove a called symbol (`api_0` / `Api0` or `helper_0`) to exercise broken_callers!
-                        let target_path = paths
-                            .iter()
-                            .find(|p| {
-                                p.ends_with("mod_0.rs")
-                                    || p.ends_with("mod_0.py")
-                                    || p.ends_with("mod_0.ts")
-                                    || p.ends_with("mod_0.go")
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| paths[0].clone());
+                        // Remove a called symbol (`api_0` / `Api0`) rotating across Rust/TS/Go/Python.
+                        let target_lang = ALL_LANGS[clean_lang_cycle % ALL_LANGS.len()];
+                        clean_lang_cycle += 1;
+                        let target_path = pick_path_for_lang(&paths, target_lang, true, &mut src);
                         let lang = lang_for_path(&target_path);
                         let cur = &state.files[&target_path];
                         let api_name = candidate_api_name(lang, &target_path);
@@ -1419,8 +1657,10 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
                         }
                     }
                     1 => {
-                        // Signature change on a symbol
-                        let path = src.choose(&paths).unwrap().clone();
+                        // Signature change rotating across Rust/TS/Go/Python.
+                        let target_lang = ALL_LANGS[clean_lang_cycle % ALL_LANGS.len()];
+                        clean_lang_cycle += 1;
+                        let path = pick_path_for_lang(&paths, target_lang, false, &mut src);
                         let lang = lang_for_path(&path);
                         let cur = &state.files[&path];
                         let target_name = candidate_helper_name(lang, &path)
@@ -1454,17 +1694,41 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
                         }
                     }
                     3 => {
-                        // Brand-new unindexed file preview
+                        // Brand-new unindexed file preview rotating across Rust/TS/Go/Python.
+                        let target_lang = ALL_LANGS[clean_lang_cycle % ALL_LANGS.len()];
+                        clean_lang_cycle += 1;
                         let id = src.ident("unsaved");
-                        let path = format!("src/{id}.rs");
-                        let content = format!("pub fn {id}_fn(x: i32) -> i32 {{\n    x + 42\n}}\n");
+                        let (path, content) = match target_lang {
+                            MicroLang::Rust => (
+                                format!("src/{id}.rs"),
+                                format!("pub fn {id}_fn(x: i32) -> i32 {{\n    x + 42\n}}\n"),
+                            ),
+                            MicroLang::TypeScript => (
+                                format!("ts/{id}.ts"),
+                                format!(
+                                    "export function {id}_fn(x: number): number {{\n  return x + 42;\n}}\n"
+                                ),
+                            ),
+                            MicroLang::Go => (
+                                format!("go/{id}.go"),
+                                format!(
+                                    "package micro\n\nfunc Unsaved_{clean_lang_cycle}(x int) int {{\n\treturn x + 42\n}}\n"
+                                ),
+                            ),
+                            MicroLang::Python => (
+                                format!("py/{id}.py"),
+                                format!("def {id}_fn(x: int) -> int:\n    return x + 42\n"),
+                            ),
+                        };
                         SuiteAAction::PreviewUnsaved {
                             path,
                             kind: PreviewKind::UnindexedNewFile { content },
                         }
                     }
                     _ => {
-                        let path = src.choose(&paths).unwrap().clone();
+                        let target_lang = ALL_LANGS[clean_lang_cycle % ALL_LANGS.len()];
+                        clean_lang_cycle += 1;
+                        let path = pick_path_for_lang(&paths, target_lang, false, &mut src);
                         let lang = lang_for_path(&path);
                         let cur = &state.files[&path];
                         let mutated = mutate_file_elements(&mut src, lang, cur);
@@ -1551,6 +1815,13 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
         let act_name = action.name();
         let outcome = rt.block_on(state.apply(&action));
         tracker.record(act_name, prev_action, &outcome);
+        if outcome.is_ok() && state.take_last_preview_clean_oracle() {
+            tracker.record(
+                "preview_clean_oracle",
+                Some("PreviewUnsaved"),
+                &StepOutcome::Ok,
+            );
+        }
         history.push(action);
         prev_action = Some(act_name);
 
@@ -1580,7 +1851,13 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
         tracker.probe_report("SuiteA:preview_transport_parity"),
         started.elapsed()
     );
-    tracker.assert_actions_exercised(candidates);
+    tracker.assert_actions_exercised(&[
+        "EditDisk",
+        "PreviewUnsaved",
+        "RebuildStore",
+        "QueryAllTransports",
+        "preview_clean_oracle",
+    ]);
 }
 
 // ===========================================================================
@@ -1589,6 +1866,7 @@ fn stateful_suite_a_preview_and_cross_transport_parity() {
 
 fn run_git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
+        .args(["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false"])
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -1834,6 +2112,7 @@ fn run_suite_b_scenario(
         }
         run_git(&root, &["add", "-A"]);
         let diff_check = Command::new("git")
+            .args(["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false"])
             .arg("-C")
             .arg(&root)
             .args(["diff", "--cached", "--quiet"])
@@ -2082,7 +2361,8 @@ fn run_suite_b_scenario(
         // 5. Cross-transport parity for `blast` and `suspects` (Direct == IPC == MCP)
         let slot = Arc::new(StoreSlot::ready(&db_path, Arc::clone(&store)));
         let direct_blast = normalize_transport_json(serde_json::to_value(&blast_last).unwrap());
-        let ipc_blast = normalize_transport_json(rt.block_on(ipc_request(
+        let ipc_blast_raw = match rt.block_on(ipc_request(
+            "DualityCheck",
             Arc::clone(&store),
             json!({
                 "version": PROTOCOL_VERSION,
@@ -2090,15 +2370,24 @@ fn run_suite_b_scenario(
                 "since": parent_of_head,
                 "depth": depth,
             }),
-        )));
-        let mcp_blast = normalize_transport_json(rt.block_on(mcp_call_tool(
+        )) {
+            Ok(val) => val,
+            Err(failure) => return Some(failure),
+        };
+        let ipc_blast = normalize_transport_json(ipc_blast_raw);
+        let mcp_blast_raw = match rt.block_on(mcp_call_tool(
+            "DualityCheck",
             &slot,
             "devmap_blast",
             json!({
                 "since": parent_of_head,
                 "depth": depth,
             }),
-        )));
+        )) {
+            Ok(val) => val,
+            Err(failure) => return Some(failure),
+        };
+        let mcp_blast = normalize_transport_json(mcp_blast_raw);
         if direct_blast != ipc_blast || direct_blast != mcp_blast {
             return Some(CheckFailure::new(
                 "blast_transport_parity",
@@ -2108,7 +2397,8 @@ fn run_suite_b_scenario(
         }
 
         let direct_susp = normalize_transport_json(serde_json::to_value(&susp_full).unwrap());
-        let ipc_susp = normalize_transport_json(rt.block_on(ipc_request(
+        let ipc_susp_raw = match rt.block_on(ipc_request(
+            "DualityCheck",
             Arc::clone(&store),
             json!({
                 "version": PROTOCOL_VERSION,
@@ -2117,8 +2407,13 @@ fn run_suite_b_scenario(
                 "since": base_sha,
                 "depth": depth,
             }),
-        )));
-        let mcp_susp = normalize_transport_json(rt.block_on(mcp_call_tool(
+        )) {
+            Ok(val) => val,
+            Err(failure) => return Some(failure),
+        };
+        let ipc_susp = normalize_transport_json(ipc_susp_raw);
+        let mcp_susp_raw = match rt.block_on(mcp_call_tool(
+            "DualityCheck",
             &slot,
             "devmap_suspects",
             json!({
@@ -2126,7 +2421,11 @@ fn run_suite_b_scenario(
                 "since": base_sha,
                 "depth": depth,
             }),
-        )));
+        )) {
+            Ok(val) => val,
+            Err(failure) => return Some(failure),
+        };
+        let mcp_susp = normalize_transport_json(mcp_susp_raw);
         if direct_susp != ipc_susp || direct_susp != mcp_susp {
             return Some(CheckFailure::new(
                 "suspects_transport_parity",
@@ -2196,17 +2495,33 @@ fn stateful_suite_b_blast_suspects_duality() {
 
         let mut ops: Vec<GitCommitOp> = Vec::with_capacity(num_commits);
         let mut prev_op: Option<&'static str> = None;
+        let mut scheduled_this_round: BTreeSet<&'static str> = BTreeSet::new();
 
         for c in 0..num_commits {
+            let remaining_before_final = num_commits.saturating_sub(1).saturating_sub(c);
+            let missing_ops: Vec<&'static str> = if round + 1 == rounds {
+                op_candidates
+                    .iter()
+                    .copied()
+                    .filter(|&name| {
+                        tracker.action_stats(name).ok == 0 && !scheduled_this_round.contains(name)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Ensure at least one EditModuleLevel lands as a final commit on one round,
             // and at least one EditFunctionBody lands as a final commit on other rounds!
             let chosen = if c == num_commits - 1 && round % 2 == 0 {
                 "EditFunctionBody"
             } else if c == num_commits - 1 && round % 2 == 1 {
                 "EditModuleLevel"
+            } else if !missing_ops.is_empty() && remaining_before_final <= missing_ops.len() {
+                missing_ops[0]
             } else {
                 tracker.pick_weighted(&mut src, op_candidates, prev_op)
             };
+            scheduled_this_round.insert(chosen);
             prev_op = Some(chosen);
 
             let op = match chosen {
@@ -2344,45 +2659,18 @@ fn stateful_suite_b_blast_suspects_duality() {
 }
 
 // ===========================================================================
-// Suite C: Virtualized Debounce Collapse + Daemon Drain State Machine
+// Suite C: Pending-Queue Storm (>4,096 Paths) + Root Rescan + Daemon Drain
 // ===========================================================================
 
-/// Virtualized model of `watcher.rs::DebounceBuffer` (`MAX_DEBOUNCE_PATHS = 4096`)
-/// for synthesizing bursts over 4,096 paths without OS sleeps or `notify` timing.
-const VIRTUAL_DEBOUNCE_CAP: usize = 4_096;
+/// Threshold matching `watcher::MAX_DEBOUNCE_PATHS` so storm bursts feed >4,096
+/// real paths into `Store::enqueue_pending_paths_under_root` and exercise the
+/// real `"."` whole-tree root-rescan drain path.
+const STORM_BURST_THRESHOLD: usize = 4_096;
 
-struct VirtualDebounce {
-    pending: BTreeSet<String>,
-    collapse_to: String,
-    collapsed: bool,
-}
-
-impl VirtualDebounce {
-    fn new(root: &Path) -> Self {
-        Self {
-            pending: BTreeSet::new(),
-            collapse_to: root.to_string_lossy().into_owned(),
-            collapsed: false,
-        }
-    }
-
-    fn push_burst<I: IntoIterator<Item = String>>(&mut self, paths: I) {
-        if self.collapsed {
-            return;
-        }
-        self.pending.extend(paths);
-        if self.pending.len() > VIRTUAL_DEBOUNCE_CAP {
-            self.pending.clear();
-            self.pending.insert(self.collapse_to.clone());
-            self.collapsed = true;
-        }
-    }
-
-    fn flush(&mut self) -> Vec<String> {
-        self.collapsed = false;
-        std::mem::take(&mut self.pending).into_iter().collect()
-    }
-}
+/// Stable poison path reused across `UnreadablePath` drain cycles so its
+/// `attempts` counter advances all the way to `MAX_PENDING_ATTEMPTS` and
+/// genuinely exercises quarantine transitions.
+const TRACKED_POISON_PATH: &str = "../poison_escape_tracked.py";
 
 #[derive(Clone, Debug)]
 enum SuiteCAction {
@@ -2404,6 +2692,7 @@ enum SuiteCAction {
     CollapseOver4096 {
         edited_path: String,
         edited_content: String,
+        rescan_banner: String,
         extra_synthetic_count: usize,
     },
     UnreadablePath {
@@ -2497,16 +2786,17 @@ fn snapshot_store(store: &Store) -> CanonicalStoreSnapshot {
 }
 
 struct SuiteCState {
-    _guard: TempDirGuard,
     root: PathBuf,
     db_path: PathBuf,
     daemon: Daemon,
     reader: Store,
     files: BTreeMap<String, String>,
-    debounce: VirtualDebounce,
     expected_epoch: String,
     last_revision: i64,
     active_poisons: BTreeSet<String>,
+    last_step_quarantined: bool,
+    // Keep TempDirGuard LAST so Daemon/Store handles drop before remove_dir_all (Windows safety).
+    _guard: TempDirGuard,
 }
 
 impl SuiteCState {
@@ -2532,19 +2822,22 @@ impl SuiteCState {
         let wm = reader.pending_watermark().expect("pending_watermark");
         assert_eq!(wm.epoch(), epoch);
 
-        let debounce = VirtualDebounce::new(&root);
         Self {
-            _guard: guard,
             root,
             db_path,
             daemon,
             reader,
             files: initial_files,
-            debounce,
             expected_epoch: epoch,
             last_revision: revision,
             active_poisons: BTreeSet::new(),
+            last_step_quarantined: false,
+            _guard: guard,
         }
+    }
+
+    fn take_last_step_quarantined(&mut self) -> bool {
+        std::mem::replace(&mut self.last_step_quarantined, false)
     }
 
     fn check_watermark_monotonic(
@@ -2589,14 +2882,17 @@ impl SuiteCState {
         Ok(())
     }
 
-    fn flush_debounce_to_store(&mut self, action: &'static str) -> Result<usize, CheckFailure> {
-        let batch = self.debounce.flush();
-        if batch.is_empty() {
-            return Ok(0);
+    fn enqueue_under_root(
+        &mut self,
+        action: &'static str,
+        paths: &[String],
+    ) -> Result<devmap_store::PendingEnqueueReport, CheckFailure> {
+        if paths.is_empty() {
+            return Ok(devmap_store::PendingEnqueueReport::default());
         }
         let report = self
             .reader
-            .enqueue_pending_paths_under_root(&self.root, &batch)
+            .enqueue_pending_paths_under_root(&self.root, paths)
             .map_err(|err| {
                 CheckFailure::new(
                     "enqueue_under_root_ok",
@@ -2605,10 +2901,60 @@ impl SuiteCState {
                 )
             })?;
         self.check_watermark_monotonic(action, !report.enqueued.is_empty())?;
-        Ok(report.enqueued.len())
+        Ok(report)
+    }
+
+    fn verify_cold_parity(&self, action: &'static str) -> Result<(), CheckFailure> {
+        let cold_store = Store::open_in_memory().expect("cold store");
+        if let Err(err) = build_generation_from_disk(&cold_store, &self.root) {
+            return Err(CheckFailure::new(
+                "cold_build_succeeds",
+                action,
+                format!("cold build failed: {err:#}"),
+            ));
+        }
+        let inc_snap = snapshot_store(&self.reader);
+        let cold_snap = snapshot_store(&cold_store);
+        if inc_snap != cold_snap {
+            return Err(CheckFailure::new(
+                "daemon_incremental_eq_cold_full_build",
+                action,
+                format!(
+                    "incremental daemon store != cold full build!\n\
+                     hashes_eq={}, symbols_eq={}, edges_eq={}, dead_eq={}\n\
+                     inc_hashes={:?}\ncold_hashes={:?}\n\
+                     inc_syms_only={:?}\ncold_syms_only={:?}\n\
+                     inc_edges_only={:?}\ncold_edges_only={:?}",
+                    inc_snap.file_hashes == cold_snap.file_hashes,
+                    inc_snap.symbols == cold_snap.symbols,
+                    inc_snap.edges == cold_snap.edges,
+                    inc_snap.dead_symbols == cold_snap.dead_symbols,
+                    inc_snap.file_hashes,
+                    cold_snap.file_hashes,
+                    inc_snap
+                        .symbols
+                        .difference(&cold_snap.symbols)
+                        .collect::<Vec<_>>(),
+                    cold_snap
+                        .symbols
+                        .difference(&inc_snap.symbols)
+                        .collect::<Vec<_>>(),
+                    inc_snap
+                        .edges
+                        .difference(&cold_snap.edges)
+                        .collect::<Vec<_>>(),
+                    cold_snap
+                        .edges
+                        .difference(&inc_snap.edges)
+                        .collect::<Vec<_>>(),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn apply(&mut self, action: &SuiteCAction) -> StepOutcome {
+        self.last_step_quarantined = false;
         let act_name = action.name();
         match action {
             SuiteCAction::Create { path, content } => {
@@ -2617,9 +2963,8 @@ impl SuiteCState {
                 }
                 write_repo_file(&self.root, path, content);
                 self.files.insert(path.clone(), content.clone());
-                self.debounce
-                    .push_burst([self.root.join(path).to_string_lossy().into_owned()]);
-                if let Err(f) = self.flush_debounce_to_store(act_name) {
+                let raw = [self.root.join(path).to_string_lossy().into_owned()];
+                if let Err(f) = self.enqueue_under_root(act_name, &raw) {
                     return StepOutcome::CheckFailed(f);
                 }
                 StepOutcome::Ok
@@ -2630,9 +2975,8 @@ impl SuiteCState {
                 }
                 write_repo_file(&self.root, path, content);
                 self.files.insert(path.clone(), content.clone());
-                self.debounce
-                    .push_burst([self.root.join(path).to_string_lossy().into_owned()]);
-                if let Err(f) = self.flush_debounce_to_store(act_name) {
+                let raw = [self.root.join(path).to_string_lossy().into_owned()];
+                if let Err(f) = self.enqueue_under_root(act_name, &raw) {
                     return StepOutcome::CheckFailed(f);
                 }
                 StepOutcome::Ok
@@ -2646,9 +2990,8 @@ impl SuiteCState {
                     fs::remove_file(&full).expect("remove source file");
                 }
                 self.files.remove(path);
-                self.debounce
-                    .push_burst([full.to_string_lossy().into_owned()]);
-                if let Err(f) = self.flush_debounce_to_store(act_name) {
+                let raw = [full.to_string_lossy().into_owned()];
+                if let Err(f) = self.enqueue_under_root(act_name, &raw) {
                     return StepOutcome::CheckFailed(f);
                 }
                 StepOutcome::Ok
@@ -2665,12 +3008,11 @@ impl SuiteCState {
                 }
                 fs::rename(&old_full, &new_full).expect("rename file");
                 self.files.insert(new_path.clone(), content);
-                // Watcher emits both old and new paths in the same burst.
-                self.debounce.push_burst([
+                let raw = [
                     old_full.to_string_lossy().into_owned(),
                     new_full.to_string_lossy().into_owned(),
-                ]);
-                if let Err(f) = self.flush_debounce_to_store(act_name) {
+                ];
+                if let Err(f) = self.enqueue_under_root(act_name, &raw) {
                     return StepOutcome::CheckFailed(f);
                 }
                 StepOutcome::Ok
@@ -2678,19 +3020,23 @@ impl SuiteCState {
             SuiteCAction::CollapseOver4096 {
                 edited_path,
                 edited_content,
+                rescan_banner,
                 extra_synthetic_count,
             } => {
                 if !self.files.contains_key(edited_path) {
                     return skip_missing("collapse_missing_target");
                 }
+                // Phase 1: Feed >4,096 paths directly into the real Store pending queue
+                // and verify real Daemon::drain_pending_batch drains the burst cleanly
+                // and persists the edited file's updated content hash.
                 write_repo_file(&self.root, edited_path, edited_content);
                 self.files
                     .insert(edited_path.clone(), edited_content.clone());
 
                 let mut burst =
-                    Vec::with_capacity(VIRTUAL_DEBOUNCE_CAP + extra_synthetic_count + 2);
+                    Vec::with_capacity(STORM_BURST_THRESHOLD + extra_synthetic_count + 2);
                 burst.push(self.root.join(edited_path).to_string_lossy().into_owned());
-                for i in 0..=(VIRTUAL_DEBOUNCE_CAP + *extra_synthetic_count) {
+                for i in 0..=(STORM_BURST_THRESHOLD + *extra_synthetic_count) {
                     burst.push(
                         self.root
                             .join(format!("synthetic_storm/f_{i}.py"))
@@ -2698,46 +3044,118 @@ impl SuiteCState {
                             .into_owned(),
                     );
                 }
-                self.debounce.push_burst(burst);
-                if !self.debounce.collapsed {
+                let burst_report = match self.enqueue_under_root(act_name, &burst) {
+                    Ok(r) => r,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                if burst_report.enqueued.len() <= STORM_BURST_THRESHOLD
+                    || !burst_report.refused.is_empty()
+                {
                     return StepOutcome::CheckFailed(CheckFailure::new(
-                        "debounce_collapses_over_4096",
+                        "real_pending_queue_admits_over_4096_burst",
                         act_name,
-                        "expected VirtualDebounce to collapse when > 4096 paths pushed",
+                        format!(
+                            "expected > {STORM_BURST_THRESHOLD} enqueued with 0 refused, got enqueued={} refused={:?}",
+                            burst_report.enqueued.len(),
+                            burst_report.refused
+                        ),
                     ));
                 }
-                let flushed = self.debounce.flush();
-                if flushed.len() != 1 {
+                let drained_burst = match self.daemon.drain_pending_batch() {
+                    Ok(n) => n,
+                    Err(err) => {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "over_4096_burst_drain_succeeds",
+                            act_name,
+                            format!("drain of >4096 pending burst failed: {err:#}"),
+                        ));
+                    }
+                };
+                if drained_burst <= STORM_BURST_THRESHOLD {
                     return StepOutcome::CheckFailed(CheckFailure::new(
-                        "collapsed_batch_has_single_root_entry",
+                        "over_4096_burst_drained_in_batch",
                         act_name,
-                        format!("expected 1 collapsed root entry, got {}", flushed.len()),
+                        format!(
+                            "expected > {STORM_BURST_THRESHOLD} paths drained from burst, got {drained_burst}"
+                        ),
                     ));
                 }
-                let report = self
+                let expected_burst_hash = extract_file(edited_path, edited_content).content_hash;
+                let hashes_after_burst = self
                     .reader
-                    .enqueue_pending_paths_under_root(&self.root, &flushed)
-                    .expect("enqueue collapsed root");
-                if report.enqueued != vec![".".to_string()] {
+                    .latest_file_hashes()
+                    .expect("latest_file_hashes after burst");
+                if hashes_after_burst.get(edited_path) != Some(&expected_burst_hash) {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "over_4096_burst_persists_edited_file",
+                        act_name,
+                        format!(
+                            "{edited_path}: hash after >4096 burst drain {:?} != expected {expected_burst_hash}",
+                            hashes_after_burst.get(edited_path)
+                        ),
+                    ));
+                }
+
+                // Phase 2: Write an un-itemized edit on disk and enqueue ONLY the repo root
+                // (the real root-rescan contract after debounce collapse), verifying real Store
+                // canonicalizes it to `["."]` and real `Daemon::drain_pending_batch` reconciles
+                // the full tree cleanly!
+                let lang = lang_for_path(edited_path);
+                let rescan_content = format!(
+                    "{}{}",
+                    edited_content,
+                    module_level_line(lang, rescan_banner)
+                );
+                write_repo_file(&self.root, edited_path, &rescan_content);
+                self.files
+                    .insert(edited_path.clone(), rescan_content.clone());
+
+                let root_entry = [self.root.to_string_lossy().into_owned()];
+                let root_report = match self.enqueue_under_root(act_name, &root_entry) {
+                    Ok(r) => r,
+                    Err(f) => return StepOutcome::CheckFailed(f),
+                };
+                if root_report.enqueued != vec![".".to_string()] {
                     return StepOutcome::CheckFailed(CheckFailure::new(
                         "collapsed_root_canonicalizes_to_dot",
                         act_name,
-                        format!("expected canonical [\".\"], got {:?}", report.enqueued),
+                        format!("expected canonical [\".\"], got {:?}", root_report.enqueued),
                     ));
                 }
-                if let Err(f) = self.check_watermark_monotonic(act_name, true) {
-                    return StepOutcome::CheckFailed(f);
-                }
-                // Drain the collapsed whole-tree rescan immediately and confirm the edit landed.
                 if let Err(err) = self.daemon.drain_pending_batch() {
                     return StepOutcome::CheckFailed(CheckFailure::new(
-                        "collapsed_drain_succeeds",
+                        "collapsed_root_rescan_drain_succeeds",
                         act_name,
-                        format!("drain after >4096 collapse failed: {err:#}"),
+                        format!("drain after root-rescan collapse failed: {err:#}"),
+                    ));
+                }
+                let expected_rescan_hash = extract_file(edited_path, &rescan_content).content_hash;
+                let hashes_after_rescan = self
+                    .reader
+                    .latest_file_hashes()
+                    .expect("latest_file_hashes after root rescan");
+                if hashes_after_rescan.get(edited_path) != Some(&expected_rescan_hash) {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "collapsed_root_rescan_picks_up_unitemized_edit",
+                        act_name,
+                        format!(
+                            "{edited_path}: hash after \".\" rescan {:?} != expected {expected_rescan_hash}",
+                            hashes_after_rescan.get(edited_path)
+                        ),
                     ));
                 }
                 if let Err(f) = self.check_watermark_monotonic(act_name, false) {
                     return StepOutcome::CheckFailed(f);
+                }
+                // When no poisons are pending, verify the real root-rescan matches a fresh cold build!
+                let status = self
+                    .reader
+                    .status("test")
+                    .expect("status after root rescan");
+                if status.pending_count == 0 && status.quarantined_count == 0 {
+                    if let Err(f) = self.verify_cold_parity(act_name) {
+                        return StepOutcome::CheckFailed(f);
+                    }
                 }
                 StepOutcome::Ok
             }
@@ -2749,8 +3167,8 @@ impl SuiteCState {
                 if !self.files.contains_key(healthy_mate_path) {
                     return skip_missing("unreadable_missing_mate");
                 }
-                // Mutate a real healthy batch-mate on disk and enqueue it alongside a
-                // poison path that fails in isolation (`collect_pending_path` refuses `..`).
+                // Mutate a real healthy batch-mate on disk and drain it alongside the
+                // tracked poison path (`collect_pending_path` refuses `..`).
                 write_repo_file(&self.root, healthy_mate_path, healthy_mate_content);
                 self.files
                     .insert(healthy_mate_path.clone(), healthy_mate_content.clone());
@@ -2758,21 +3176,38 @@ impl SuiteCState {
                 let prev_poison_attempts = self
                     .reader
                     .pending_attempts(poison_path)
-                    .expect("pending_attempts poison")
-                    .unwrap_or(0);
+                    .expect("pending_attempts poison");
 
-                // Raw enqueue for poison (simulating a pre-existing / uncanonicalized row)
-                // + canonical enqueue for the healthy mate.
-                self.reader
-                    .enqueue_pending_paths(&[poison_path.clone(), healthy_mate_path.clone()])
-                    .expect("enqueue poison + healthy mate");
-                self.active_poisons.insert(poison_path.clone());
-                if let Err(f) = self.check_watermark_monotonic(act_name, true) {
-                    return StepOutcome::CheckFailed(f);
+                // Reuse the tracked poison path WITHOUT re-enqueueing it when already pending,
+                // because `upsert_pending` resets `attempts = 0` on conflict; leaving it in the
+                // queue lets consecutive drains genuinely advance `attempts` to `MAX_PENDING_ATTEMPTS`!
+                match prev_poison_attempts {
+                    None => {
+                        self.reader
+                            .enqueue_pending_paths(&[
+                                poison_path.clone(),
+                                healthy_mate_path.clone(),
+                            ])
+                            .expect("enqueue poison + healthy mate");
+                        self.active_poisons.insert(poison_path.clone());
+                        if let Err(f) = self.check_watermark_monotonic(act_name, true) {
+                            return StepOutcome::CheckFailed(f);
+                        }
+                    }
+                    Some(_) => {
+                        let mate_raw = [self
+                            .root
+                            .join(healthy_mate_path)
+                            .to_string_lossy()
+                            .into_owned()];
+                        if let Err(f) = self.enqueue_under_root(act_name, &mate_raw) {
+                            return StepOutcome::CheckFailed(f);
+                        }
+                    }
                 }
 
                 // Drain: healthy batch-mate MUST succeed and be cleared (attempts = None),
-                // while ONLY the poison path is charged an attempt (+1, up to quarantine).
+                // while ONLY an unquarantined poison path is charged an attempt (+1, up to quarantine).
                 let drained = match self.daemon.drain_pending_batch() {
                     Ok(n) => n,
                     Err(err) => {
@@ -2811,21 +3246,38 @@ impl SuiteCState {
                     .reader
                     .pending_attempts(poison_path)
                     .expect("pending_attempts poison after drain");
-                let expected_attempts = if prev_poison_attempts >= MAX_PENDING_ATTEMPTS {
-                    // Already quarantined before this drain — re-enqueueing reset attempts to 0
-                    // so draining it once charges 1.
-                    1
-                } else {
-                    prev_poison_attempts + 1
+                let expected_attempts = match prev_poison_attempts {
+                    None => 1,
+                    Some(prev) if prev < MAX_PENDING_ATTEMPTS => prev + 1,
+                    // Already quarantined: `claim_pending_batch` must skip it without charging more attempts.
+                    Some(prev) => prev,
                 };
                 if new_poison_attempts != Some(expected_attempts) {
                     return StepOutcome::CheckFailed(CheckFailure::new(
                         "poison_charged_exact_attempt",
                         act_name,
                         format!(
-                            "poison {poison_path} expected attempts={expected_attempts}, got {new_poison_attempts:?}"
+                            "poison {poison_path} (prev={prev_poison_attempts:?}) expected attempts={expected_attempts}, got {new_poison_attempts:?}"
                         ),
                     ));
+                }
+                if expected_attempts >= MAX_PENDING_ATTEMPTS {
+                    let status = self
+                        .reader
+                        .status("test")
+                        .expect("status after poison quarantine");
+                    if status.quarantined_count == 0
+                        || !status.quarantined_paths.iter().any(|p| p == poison_path)
+                    {
+                        return StepOutcome::CheckFailed(CheckFailure::new(
+                            "poison_quarantine_reported_in_status",
+                            act_name,
+                            format!(
+                                "poison {poison_path} reached {expected_attempts} attempts but status did not report it quarantined: {status:?}"
+                            ),
+                        ));
+                    }
+                    self.last_step_quarantined = true;
                 }
                 if let Err(f) = self.check_watermark_monotonic(act_name, false) {
                     return StepOutcome::CheckFailed(f);
@@ -2848,14 +3300,14 @@ impl SuiteCState {
                 self.files
                     .insert(live_mate_path.clone(), live_mate_content.clone());
 
-                self.debounce.push_burst([
+                let raw = [
                     vanish_full.to_string_lossy().into_owned(),
                     self.root
                         .join(live_mate_path)
                         .to_string_lossy()
                         .into_owned(),
-                ]);
-                if let Err(f) = self.flush_debounce_to_store(act_name) {
+                ];
+                if let Err(f) = self.enqueue_under_root(act_name, &raw) {
                     return StepOutcome::CheckFailed(f);
                 }
 
@@ -2901,31 +3353,89 @@ impl SuiteCState {
                 StepOutcome::Ok
             }
             SuiteCAction::DrainAndVerifyColdParity => {
-                // Flush any remaining debounced paths, then drain all non-poison pending work.
-                if let Err(f) = self.flush_debounce_to_store(act_name) {
-                    return StepOutcome::CheckFailed(f);
-                }
-
-                // Drive any active poison rows to quarantine or clear them after verifying
-                // zero cross-charging, so the final store can be compared cleanly against a
-                // cold full build.
+                // Drive any active poison rows to quarantine while propagating any unexpected
+                // `drain_pending_batch` errors, so the final store can be compared cleanly
+                // against a cold full build.
                 if !self.active_poisons.is_empty() {
                     let poisons: Vec<String> = self.active_poisons.iter().cloned().collect();
-                    // Drive one poison to full quarantine (MAX_PENDING_ATTEMPTS) if any remain
-                    // queued below threshold, checking that no healthy path is ever touched.
-                    for _ in 0..MAX_PENDING_ATTEMPTS {
-                        let _ = self.daemon.drain_pending_batch();
+                    let status_start = self
+                        .reader
+                        .status("test")
+                        .expect("status before poison quarantine loop");
+                    let max_poison_drains = (MAX_PENDING_ATTEMPTS as usize)
+                        .saturating_mul(poisons.len())
+                        .saturating_add(status_start.pending_count / DEFAULT_DRAIN_BATCH_LIMIT + 8);
+                    for _ in 0..max_poison_drains {
+                        let unquarantined: Vec<(String, u32)> = poisons
+                            .iter()
+                            .filter_map(|p| {
+                                let a =
+                                    self.reader.pending_attempts(p).expect("pending_attempts")?;
+                                (a < MAX_PENDING_ATTEMPTS).then(|| (p.clone(), a))
+                            })
+                            .collect();
+                        if unquarantined.is_empty() {
+                            break;
+                        }
+                        let status_before = self
+                            .reader
+                            .status("test")
+                            .expect("status before poison drain");
+                        let non_poison_pending = status_before
+                            .pending_count
+                            .saturating_sub(status_before.quarantined_count)
+                            .saturating_sub(unquarantined.len());
+                        match self.daemon.drain_pending_batch() {
+                            Ok(drained) => {
+                                if non_poison_pending == 0 {
+                                    return StepOutcome::CheckFailed(CheckFailure::new(
+                                        "all_poison_drain_reports_error",
+                                        act_name,
+                                        format!(
+                                            "expected all-poison drain to return Err for {unquarantined:?}, got Ok({drained})"
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                if non_poison_pending > 0 {
+                                    return StepOutcome::CheckFailed(CheckFailure::new(
+                                        "drain_with_healthy_work_succeeds_alongside_poison",
+                                        act_name,
+                                        format!(
+                                            "drain failed despite {non_poison_pending} live non-poison pending path(s): {err:#}"
+                                        ),
+                                    ));
+                                }
+                                let any_advanced = unquarantined.iter().any(|(p, before)| {
+                                    self.reader
+                                        .pending_attempts(p)
+                                        .expect("pending_attempts after poison drain")
+                                        .is_some_and(|after| after > *before)
+                                });
+                                if !any_advanced {
+                                    return StepOutcome::CheckFailed(CheckFailure::new(
+                                        "poison_drain_advances_attempts",
+                                        act_name,
+                                        format!(
+                                            "drain returned error without advancing attempts for {unquarantined:?}: {err:#}"
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                     }
                     let status_with_q = self.reader.status("test").expect("status");
-                    if status_with_q.quarantined_count == 0 {
+                    if status_with_q.quarantined_count < poisons.len() {
                         return StepOutcome::CheckFailed(CheckFailure::new(
                             "poison_reaches_quarantine",
                             act_name,
                             format!(
-                                "expected active poisons {poisons:?} to reach quarantine after {MAX_PENDING_ATTEMPTS} drains, got status={status_with_q:?}"
+                                "expected active poisons {poisons:?} to reach quarantine, got status={status_with_q:?}"
                             ),
                         ));
                     }
+                    self.last_step_quarantined = true;
                     let dropped = self
                         .reader
                         .drop_quarantined_pending_paths()
@@ -2935,10 +3445,23 @@ impl SuiteCState {
                     }
                 }
 
-                // Drain any remaining live pending work.
-                for _ in 0..4 {
+                // Drain all remaining live pending work until empty, using a safety bound
+                // scaled to pending_count rather than a hardcoded constant.
+                let remaining_before = self
+                    .reader
+                    .status("test")
+                    .expect("status before final drain")
+                    .pending_count;
+                let max_drains = (remaining_before / DEFAULT_DRAIN_BATCH_LIMIT)
+                    .saturating_add(remaining_before)
+                    .saturating_add(8);
+                let mut converged = false;
+                for _ in 0..max_drains {
                     match self.daemon.drain_pending_batch() {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            converged = true;
+                            break;
+                        }
                         Ok(_) => {}
                         Err(err) => {
                             return StepOutcome::CheckFailed(CheckFailure::new(
@@ -2948,6 +3471,15 @@ impl SuiteCState {
                             ));
                         }
                     }
+                }
+                if !converged {
+                    return StepOutcome::CheckFailed(CheckFailure::new(
+                        "drain_converges_to_empty",
+                        act_name,
+                        format!(
+                            "pending queue did not drain to empty within {max_drains} iterations (started with pending_count={remaining_before})"
+                        ),
+                    ));
                 }
                 if let Err(f) = self.check_watermark_monotonic(act_name, false) {
                     return StepOutcome::CheckFailed(f);
@@ -2967,50 +3499,8 @@ impl SuiteCState {
 
                 // Build a completely fresh cold Store on the same directory and assert
                 // full canonical equivalence!
-                let cold_store = Store::open_in_memory().expect("cold store");
-                if let Err(err) = build_generation_from_disk(&cold_store, &self.root) {
-                    return StepOutcome::CheckFailed(CheckFailure::new(
-                        "cold_build_succeeds",
-                        act_name,
-                        format!("cold build failed: {err:#}"),
-                    ));
-                }
-                let inc_snap = snapshot_store(&self.reader);
-                let cold_snap = snapshot_store(&cold_store);
-                if inc_snap != cold_snap {
-                    return StepOutcome::CheckFailed(CheckFailure::new(
-                        "daemon_incremental_eq_cold_full_build",
-                        act_name,
-                        format!(
-                            "incremental daemon store != cold full build!\n\
-                             hashes_eq={}, symbols_eq={}, edges_eq={}, dead_eq={}\n\
-                             inc_hashes={:?}\ncold_hashes={:?}\n\
-                             inc_syms_only={:?}\ncold_syms_only={:?}\n\
-                             inc_edges_only={:?}\ncold_edges_only={:?}",
-                            inc_snap.file_hashes == cold_snap.file_hashes,
-                            inc_snap.symbols == cold_snap.symbols,
-                            inc_snap.edges == cold_snap.edges,
-                            inc_snap.dead_symbols == cold_snap.dead_symbols,
-                            inc_snap.file_hashes,
-                            cold_snap.file_hashes,
-                            inc_snap
-                                .symbols
-                                .difference(&cold_snap.symbols)
-                                .collect::<Vec<_>>(),
-                            cold_snap
-                                .symbols
-                                .difference(&inc_snap.symbols)
-                                .collect::<Vec<_>>(),
-                            inc_snap
-                                .edges
-                                .difference(&cold_snap.edges)
-                                .collect::<Vec<_>>(),
-                            cold_snap
-                                .edges
-                                .difference(&inc_snap.edges)
-                                .collect::<Vec<_>>(),
-                        ),
-                    ));
+                if let Err(f) = self.verify_cold_parity(act_name) {
+                    return StepOutcome::CheckFailed(f);
                 }
 
                 StepOutcome::Ok
@@ -3037,13 +3527,13 @@ fn replay_suite_c(
 fn stateful_suite_c_virtualized_debounce_and_daemon_drain() {
     let started = Instant::now();
     let seed = env_u64("DEVMAP_STATEFUL_SEED", DEFAULT_SEED);
-    let rounds = env_usize("DEVMAP_STATEFUL_ROUNDS", 32);
+    let steps = env_usize("DEVMAP_STATEFUL_STEPS", 32);
     let mut src = Source::from_seed(seed ^ 0xC0C0_0003);
 
     let initial_files = generate_micro_repo(&mut src, ALL_LANGS, 8);
     let mut state = SuiteCState::new(initial_files.clone());
     let mut tracker = HealthTracker::new();
-    let mut history: Vec<SuiteCAction> = Vec::with_capacity(rounds + 1);
+    let mut history: Vec<SuiteCAction> = Vec::with_capacity(steps + 1);
     let mut prev_action: Option<&'static str> = None;
 
     let candidates: &[&'static str] = &[
@@ -3057,10 +3547,22 @@ fn stateful_suite_c_virtualized_debounce_and_daemon_drain() {
         "DrainAndVerifyColdParity",
     ];
 
-    for step in 0..rounds {
-        let chosen = if step + 1 == rounds {
+    for step in 0..steps {
+        let remaining_before_final = steps.saturating_sub(1).saturating_sub(step);
+        let unexercised: Vec<&'static str> = candidates
+            .iter()
+            .copied()
+            .filter(|&name| {
+                name != "DrainAndVerifyColdParity" && tracker.action_stats(name).ok == 0
+            })
+            .collect();
+        let chosen = if step + 1 == steps {
             // Always finish with a full drain + cold-build equivalence check!
             "DrainAndVerifyColdParity"
+        } else if !unexercised.is_empty() && remaining_before_final <= unexercised.len() {
+            // Guarantee every required action runs before the final drain so no seed
+            // flakes on coupon-collector coverage.
+            unexercised[0]
         } else {
             tracker.pick_weighted(&mut src, candidates, prev_action)
         };
@@ -3122,6 +3624,7 @@ fn stateful_suite_c_virtualized_debounce_and_daemon_drain() {
                 SuiteCAction::CollapseOver4096 {
                     edited_path,
                     edited_content,
+                    rescan_banner: format!("root_rescan_step_{step}"),
                     extra_synthetic_count: 1 + src.usize_below(64),
                 }
             }
@@ -3131,7 +3634,7 @@ fn stateful_suite_c_virtualized_debounce_and_daemon_drain() {
                 let healthy_mate_content =
                     mutate_file_elements(&mut src, lang, &state.files[&healthy_mate_path]);
                 SuiteCAction::UnreadablePath {
-                    poison_path: format!("../poison_escape_{step}.py"),
+                    poison_path: TRACKED_POISON_PATH.to_string(),
                     healthy_mate_path,
                     healthy_mate_content,
                 }
@@ -3153,6 +3656,9 @@ fn stateful_suite_c_virtualized_debounce_and_daemon_drain() {
         let act_name = action.name();
         let outcome = state.apply(&action);
         tracker.record(act_name, prev_action, &outcome);
+        if outcome.is_ok() && state.take_last_step_quarantined() {
+            tracker.record("poison_quarantined", Some(act_name), &StepOutcome::Ok);
+        }
         history.push(action);
         prev_action = Some(act_name);
 
@@ -3182,5 +3688,15 @@ fn stateful_suite_c_virtualized_debounce_and_daemon_drain() {
         tracker.probe_report("SuiteC:debounce_daemon_drain"),
         started.elapsed()
     );
-    tracker.assert_actions_exercised(candidates);
+    tracker.assert_actions_exercised(&[
+        "Create",
+        "Edit",
+        "Delete",
+        "Rename",
+        "CollapseOver4096",
+        "UnreadablePath",
+        "VanishedFile",
+        "DrainAndVerifyColdParity",
+        "poison_quarantined",
+    ]);
 }
