@@ -525,3 +525,7 @@ blob-report/
 *.bundle
 !rust/devmap-query/assets/*.bundle
 *.gitbundle
+
+# Launch plans and adoption-gap audits are local-only: untracked 2026-11-28;
+# tracked docs link to them by permalink at fa7d62420a.
+/docs/launch/

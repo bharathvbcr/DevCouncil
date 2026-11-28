@@ -22,7 +22,7 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 ## Evidence and operations
 
 - [DevMap comparison](devmap/comparison.md): recorded competitor measurements and limits.
-- [Adoption gaps and launch plan](launch/adoption-gaps.md): the 2026-11-22 audits, the wedge, and the installer release checklist.
+- [Adoption gaps and launch plan](https://github.com/bharathvbcr/DevCouncil/blob/fa7d62420af6685fe5f59c35b2d3b1665a3e6ca3/docs/launch/adoption-gaps.md): the 2026-11-22 audits, the wedge, and the installer release checklist.
 - [Benchmark plots](../benchmarks/README.md#plots-of-every-recorded-run): every recorded benchmark run as a chart, regenerated from the result JSON.
 - [Repository input and verification boundaries](SECURITY_BOUNDARIES.md): executable selection, filesystem handling and unavailable evidence.
 - [Repository hygiene](repository-hygiene.md): generated state, caches and cleanup ownership.
