@@ -1,0 +1,191 @@
+name: fuzzing (cargo-fuzz + ASan)
+
+# Nightly coverage-guided + AddressSanitizer fuzzing of DevMap's highest-risk
+# C/unsafe and stateful surfaces:
+#   - csr_reader:                 zero-copy CSR header/offset/alignment parser
+#   - extract_parse_repair:       33 C/C++ tree-sitter grammars + parse_repair
+#   - stateful_incremental_store: incremental Store + ResolveReuse + prune vs cold oracle
+#   - stateful_stacked_store:     StackedStore / DeltaStore vs cold flat oracle
+#
+# rust/fuzz is a standalone workspace excluded from rust/Cargo.toml so
+# rust/Cargo.lock and `--workspace --locked` CI jobs stay untouched.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Per-target fuzzing budget in seconds
+        required: false
+        default: "120"
+        type: string
+      target:
+        description: Specific fuzz target to run, or all
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - csr_reader
+          - extract_parse_repair
+          - stateful_incremental_store
+          - stateful_stacked_store
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    permissions:
+      contents: read
+      actions: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - csr_reader
+          - extract_parse_repair
+          - stateful_incremental_store
+          - stateful_stacked_store
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install nightly toolchain for cargo-fuzz + ASan
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Installed via rustup rather than dtolnay/rust-toolchain so the
+          # workflow adheres to the repository's toolchain policy.
+          rustup toolchain install nightly --profile minimal --component llvm-tools-preview --no-self-update
+          rustc +nightly --version --verbose
+          cargo +nightly --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          workspaces: rust/fuzz
+          shared-key: fuzz-nightly-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo-fuzz --version
+
+      - name: Check fuzz target formatting
+        working-directory: rust/fuzz
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2021 --check fuzz_targets/*.rs
+
+      - name: Run bounded ASan fuzz campaign
+        id: campaign
+        working-directory: rust/fuzz
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SELECTED_TARGET: ${{ inputs.target || 'all' }}
+          DURATION_SECONDS: ${{ inputs.duration_seconds || '120' }}
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1"
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          if [[ "$SELECTED_TARGET" != "all" && "$SELECTED_TARGET" != "$TARGET" ]]; then
+            echo "Skipping $TARGET (workflow_dispatch requested $SELECTED_TARGET)"
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] || [[ "$DURATION_SECONDS" -le 0 ]]; then
+            echo "::error::duration_seconds must be a positive integer, got '$DURATION_SECONDS'"
+            exit 1
+          fi
+
+          report_dir="crash-report/${TARGET}"
+          mkdir -p "$report_dir" "corpus/${TARGET}" "artifacts/${TARGET}"
+
+          set +e
+          cargo +nightly fuzz run \
+            --fuzz-dir . \
+            --sanitizer=address \
+            "$TARGET" \
+            "corpus/${TARGET}" \
+            -- \
+            "-max_total_time=${DURATION_SECONDS}" \
+            -max_len=65536 \
+            -timeout=25 \
+            -rss_limit_mb=4096 \
+            -use_value_profile=1 \
+            "-artifact_prefix=artifacts/${TARGET}/" \
+            2>&1 | tee "${report_dir}/fuzz.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          # Deduplicate crash artifacts by failure signature so triage uploads
+          # only unique bugs rather than redundant libFuzzer dumps.
+          sig_line="$(grep -E -m1 '(DEVMAP_FUZZ_SIG=|ERROR: AddressSanitizer:|SUMMARY:|panicked at )' "${report_dir}/fuzz.log" || true)"
+          if [[ -z "$sig_line" ]]; then
+            sig_line="exit-${rc}"
+          fi
+          sig_hash="$(printf '%s' "$sig_line" | sha256sum | awk '{print substr($1, 1, 12)}')"
+          {
+            echo "target=${TARGET}"
+            echo "exit_code=${rc}"
+            echo "signature=${sig_line}"
+            echo "signature_hash=${sig_hash}"
+          } > "${report_dir}/summary.txt"
+
+          shopt -s nullglob
+          artifacts=(artifacts/"${TARGET}"/crash-* artifacts/"${TARGET}"/timeout-* artifacts/"${TARGET}"/oom-*)
+          if [[ ${#artifacts[@]} -gt 0 ]]; then
+            # Keep the smallest artifact per unique failure signature.
+            best="${artifacts[0]}"
+            best_size="$(wc -c < "$best")"
+            for art in "${artifacts[@]:1}"; do
+              sz="$(wc -c < "$art")"
+              if [[ "$sz" -lt "$best_size" ]]; then
+                best="$art"
+                best_size="$sz"
+              fi
+            done
+            cp "$best" "${report_dir}/unique-${sig_hash}-$(basename "$best")"
+            echo "artifact_count=${#artifacts[@]}" >> "${report_dir}/summary.txt"
+            echo "kept_artifact=$(basename "$best") (${best_size} bytes)" >> "${report_dir}/summary.txt"
+          fi
+
+          echo "status=${rc}" >> "$GITHUB_OUTPUT"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::fuzz target ${TARGET} failed (exit ${rc}): ${sig_line}"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: ${{ always() && steps.campaign.outputs.status != 'skipped' && steps.campaign.outputs.status != '0' }}
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: rust/fuzz/crash-report/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Enforce clean fuzz campaign
+        if: ${{ steps.campaign.outputs.status != 'skipped' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          CAMPAIGN_STATUS: ${{ steps.campaign.outputs.status }}
+        run: |
+          set -euo pipefail
+          if [[ "$CAMPAIGN_STATUS" != "0" ]]; then
+            echo "::error::fuzz target ${TARGET} exited with status ${CAMPAIGN_STATUS}; inspect uploaded artifact fuzz-crashes-${TARGET}"
+            exit 1
+          fi

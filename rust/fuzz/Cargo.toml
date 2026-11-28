@@ -1,0 +1,55 @@
+[workspace]
+
+# Standalone cargo-fuzz workspace, deliberately excluded from `../Cargo.toml`
+# so `rust/Cargo.lock` and `--workspace --locked` CI jobs stay untouched.
+
+[package]
+name = "devmap-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Coverage-guided cargo-fuzz + ASan harnesses for DevMap"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+devmap-extract = { path = "../devmap-extract" }
+devmap-resolve = { path = "../devmap-resolve" }
+devmap-analyze = { path = "../devmap-analyze" }
+devmap-store = { path = "../devmap-store" }
+devmap-query = { path = "../devmap-query" }
+devmap-serve = { path = "../devmap-serve" }
+
+[[bin]]
+name = "csr_reader"
+path = "fuzz_targets/csr_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_parse_repair"
+path = "fuzz_targets/extract_parse_repair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stateful_incremental_store"
+path = "fuzz_targets/stateful_incremental_store.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stateful_stacked_store"
+path = "fuzz_targets/stateful_stacked_store.rs"
+test = false
+doc = false
+bench = false

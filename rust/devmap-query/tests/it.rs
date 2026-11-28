@@ -149,6 +149,8 @@ mod snapshot_budget;
 mod source_read_security;
 mod stat_memo_spawns_are_test_only;
 #[cfg(feature = "parse")]
+mod stateful_stacked_store;
+#[cfg(feature = "parse")]
 mod stored_edge_resolution_is_read_not_guessed;
 #[cfg(feature = "parse")]
 mod stored_edges_keep_the_confidence_their_evidence_earned;

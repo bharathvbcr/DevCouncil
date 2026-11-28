@@ -18,12 +18,18 @@
 //!    nesting depth, batch length and frame size all have to be refused rather
 //!    than obeyed.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use devmap_serve::mcp::{handle_line, serve_streams, StoreSlot};
+use devmap_serve::mcp::{handle_line, serve_streams, structured_content_violation, StoreSlot};
 use devmap_store::Store;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
+
+#[allow(dead_code)]
+mod stateful_fuzz {
+    include!("../../testsupport/stateful_fuzz.rs");
+}
 
 fn corpus() -> Arc<StoreSlot> {
     let files = [
@@ -79,36 +85,105 @@ fn seeds() -> Vec<String> {
     ]
 }
 
-/// Check the invariants that must hold for ANY input.
-fn assert_response_shape(input: &str, response: &Option<Value>) {
+/// Check the invariants that must hold for ANY input, returning a structured
+/// `CheckFailure` so callers can minimize failing inputs via `stateful_fuzz`.
+fn check_response_shape(
+    action: &'static str,
+    input: &str,
+    response: &Option<Value>,
+) -> Result<(), stateful_fuzz::CheckFailure> {
     let Some(frame) = response else {
-        return; // no response is legal: notifications, all-notification batches
+        return Ok(()); // no response is legal: notifications, all-notification batches
     };
     // The transport writes this as one line, so an embedded newline in the
     // serialized form would corrupt the following frame.
     let text = frame.to_string();
-    assert!(
+    if let Some(failure) = stateful_fuzz::check(
         !text.contains('\n'),
-        "a response must serialize to one line or it corrupts the next frame.\ninput={input:?}\nout={text:?}"
-    );
+        "single_line_framing",
+        action,
+        format!("response contains embedded newline.\ninput={input:?}\nout={text:?}"),
+    )
+    .into_failure()
+    {
+        return Err(failure);
+    }
     // A batch answers with an array; a single request with an object.
     let members: Vec<&Value> = match frame {
         Value::Array(items) => items.iter().collect(),
         other => vec![other],
     };
     for member in members {
-        assert_eq!(
-            member["jsonrpc"], "2.0",
-            "every response carries the version.\ninput={input:?}\nout={text:?}"
-        );
-        assert!(
-            member.get("result").is_some() || member.get("error").is_some(),
-            "a response is a result or an error, never neither.\ninput={input:?}\nout={text:?}"
-        );
-        assert!(
-            !(member.get("result").is_some() && member.get("error").is_some()),
-            "a response is a result or an error, never both.\ninput={input:?}\nout={text:?}"
-        );
+        if let Some(failure) = stateful_fuzz::check(
+            member["jsonrpc"] == "2.0",
+            "jsonrpc_version",
+            action,
+            format!("every response carries jsonrpc 2.0.\ninput={input:?}\nout={text:?}"),
+        )
+        .into_failure()
+        {
+            return Err(failure);
+        }
+        let has_result = member.get("result").is_some();
+        let has_error = member.get("error").is_some();
+        if let Some(failure) = stateful_fuzz::check(
+            has_result || has_error,
+            "result_or_error_present",
+            action,
+            format!("response has neither result nor error.\ninput={input:?}\nout={text:?}"),
+        )
+        .into_failure()
+        {
+            return Err(failure);
+        }
+        if let Some(failure) = stateful_fuzz::check(
+            !(has_result && has_error),
+            "result_xor_error",
+            action,
+            format!("response has both result and error.\ninput={input:?}\nout={text:?}"),
+        )
+        .into_failure()
+        {
+            return Err(failure);
+        }
+    }
+    Ok(())
+}
+
+/// Check the invariants that must hold for ANY input.
+fn assert_response_shape(input: &str, response: &Option<Value>) {
+    if let Err(failure) = check_response_shape("assert_response_shape", input, response) {
+        panic!("{failure}");
+    }
+}
+
+fn classify_mcp_outcome(response: &Option<Value>) -> &'static str {
+    let Some(frame) = response else {
+        return "outcome::notification";
+    };
+    match frame {
+        Value::Array(_) => "outcome::batch",
+        Value::Object(obj) => {
+            if let Some(err) = obj.get("error") {
+                if err.get("code").and_then(Value::as_i64)
+                    == Some(devmap_serve::mcp::codes::PARSE_ERROR)
+                {
+                    "outcome::parse_error"
+                } else {
+                    "outcome::protocol_error"
+                }
+            } else if obj
+                .get("result")
+                .and_then(|r| r.get("isError"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                "outcome::tool_error"
+            } else {
+                "outcome::valid_result"
+            }
+        }
+        _ => "outcome::unexpected",
     }
 }
 
@@ -117,8 +192,10 @@ fn assert_response_shape(input: &str, response: &Option<Value>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutated_frames_never_panic_and_always_answer_in_shape() {
     let slot = corpus();
-    let mut rng = Rng(0x5EED_1234_ABCD_0001);
+    let seed = stateful_fuzz::env_u64("DEVMAP_FUZZ_SEED", 0x5EED_1234_ABCD_0001);
+    let mut rng = Rng(seed);
     let seeds = seeds();
+    let mut tracker = stateful_fuzz::HealthTracker::new();
 
     for round in 0..4_000 {
         let mut bytes = seeds[rng.below(seeds.len())].clone().into_bytes();
@@ -150,11 +227,56 @@ async fn mutated_frames_never_panic_and_always_answer_in_shape() {
         // Non-UTF-8 is handled by the transport, not the dispatcher; this test
         // drives the dispatcher, so keep the input a `str`.
         let Ok(input) = String::from_utf8(bytes) else {
+            tracker.record(
+                "frame::mutated",
+                None,
+                &stateful_fuzz::bail("non_utf8_bytes"),
+            );
             continue;
         };
         let response = handle_line(&slot, &input).await;
-        assert_response_shape(&format!("round {round}: {input}"), &response);
+        if let Err(failure) = check_response_shape("frame::mutated", &input, &response) {
+            let sig = failure.signature();
+            let handle = tokio::runtime::Handle::current();
+            let minimized = tokio::task::block_in_place(|| {
+                stateful_fuzz::minimize_str(&input, &sig, 128, |cand| {
+                    let resp = handle.block_on(handle_line(&slot, cand));
+                    check_response_shape("frame::mutated", cand, &resp).err()
+                })
+            });
+            let repro = stateful_fuzz::format_repro_test(
+                "repro_mcp_mutated_frame",
+                seed,
+                &failure,
+                &[format!("handle_line(&slot, {:?})", minimized)],
+            );
+            panic!(
+                "round {round} failed: {failure}\n\
+                 Minimized input ({} -> {} bytes): {minimized:?}\n\
+                 Replay: DEVMAP_FUZZ_SEED={seed} cargo test --locked -p devmap-serve --test mcp_fuzz_and_bounds -- mutated_frames_never_panic_and_always_answer_in_shape\n\n\
+                 {repro}",
+                input.len(),
+                minimized.len()
+            );
+        }
+        tracker.record("frame::mutated", None, &stateful_fuzz::StepOutcome::Ok);
+        let bucket = classify_mcp_outcome(&response);
+        tracker.record(
+            bucket,
+            Some("frame::mutated"),
+            &stateful_fuzz::StepOutcome::Ok,
+        );
     }
+
+    eprintln!("{}", tracker.probe_report("mcp_fuzz::mutated_frames"));
+    tracker.assert_actions_exercised(&[
+        "frame::mutated",
+        "outcome::parse_error",
+        "outcome::valid_result",
+        "outcome::tool_error",
+        "outcome::notification",
+        "outcome::batch",
+    ]);
 }
 
 /// A deeply nested batch must be refused, not recursed into.
@@ -815,4 +937,839 @@ async fn a_batch_answer_is_bounded_by_the_same_ceiling_a_single_result_is() {
         }
         other => panic!("a batch is answered with an array or one refusal, got {other}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stateful multi-turn MCP session fuzzer
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum InvalidArgKind {
+    OversizedQuery,
+    ZeroBudget,
+    UnknownTool,
+    LayersAndMinRungConflict,
+    UnknownArgumentField,
+}
+
+#[derive(Clone, Debug)]
+enum SessionAction {
+    Initialize {
+        id: Value,
+        protocol_version: String,
+    },
+    Ping {
+        id: Value,
+    },
+    ToolsList {
+        id: Value,
+    },
+    Status {
+        id: Value,
+    },
+    Search {
+        id: Value,
+        query: String,
+        budget: u32,
+    },
+    Explore {
+        id: Value,
+        query: String,
+        limit: u32,
+    },
+    Impact {
+        id: Value,
+        target: String,
+        depth: u32,
+        layers: bool,
+    },
+    DeadSymbols {
+        id: Value,
+        budget: u32,
+    },
+    Preview {
+        id: Value,
+        file: String,
+        content: String,
+    },
+    InvalidOrOversized {
+        id: Value,
+        kind: InvalidArgKind,
+    },
+    CancelNotification {
+        target_id: Value,
+    },
+    EvolveRepo {
+        file: String,
+        new_content: String,
+    },
+}
+
+impl SessionAction {
+    fn label(&self) -> &'static str {
+        match self {
+            SessionAction::Initialize { .. } => "mcp::initialize",
+            SessionAction::Ping { .. } => "mcp::ping",
+            SessionAction::ToolsList { .. } => "mcp::tools_list",
+            SessionAction::Status { .. } => "mcp::devmap_status",
+            SessionAction::Search { .. } => "mcp::devmap_search",
+            SessionAction::Explore { .. } => "mcp::devmap_explore",
+            SessionAction::Impact { .. } => "mcp::devmap_impact",
+            SessionAction::DeadSymbols { .. } => "mcp::devmap_dead_symbols",
+            SessionAction::Preview { .. } => "mcp::devmap_preview",
+            SessionAction::InvalidOrOversized { .. } => "mcp::invalid_or_oversized",
+            SessionAction::CancelNotification { .. } => "mcp::notifications_cancelled",
+            SessionAction::EvolveRepo { .. } => "mcp::evolve_repo",
+        }
+    }
+}
+
+const SESSION_ACTION_NAMES: &[&str] = &[
+    "mcp::initialize",
+    "mcp::ping",
+    "mcp::tools_list",
+    "mcp::devmap_status",
+    "mcp::devmap_search",
+    "mcp::devmap_explore",
+    "mcp::devmap_impact",
+    "mcp::devmap_dead_symbols",
+    "mcp::devmap_preview",
+    "mcp::invalid_or_oversized",
+    "mcp::notifications_cancelled",
+    "mcp::evolve_repo",
+];
+
+fn save_repo_generation(store: &Store, repo: &stateful_fuzz::MicroRepo) -> u64 {
+    let extractions: Vec<_> = repo
+        .iter()
+        .map(|(path, source)| devmap_extract::extract_file(path, source))
+        .collect();
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).expect("resolve");
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    u64::from(
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .expect("save generation"),
+    )
+}
+
+fn build_repo_store(repo: &stateful_fuzz::MicroRepo) -> (Arc<Store>, Arc<StoreSlot>, u64) {
+    let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
+    let generation_id = save_repo_generation(&store, repo);
+    let slot = Arc::new(StoreSlot::ready("in-memory", Arc::clone(&store)));
+    (store, slot, generation_id)
+}
+
+fn micro_lang_for_path(path: &str) -> stateful_fuzz::MicroLang {
+    if path.ends_with(".rs") {
+        stateful_fuzz::MicroLang::Rust
+    } else if path.ends_with(".ts") {
+        stateful_fuzz::MicroLang::TypeScript
+    } else if path.ends_with(".go") {
+        stateful_fuzz::MicroLang::Go
+    } else {
+        stateful_fuzz::MicroLang::Python
+    }
+}
+
+fn collect_repo_symbols(repo: &stateful_fuzz::MicroRepo) -> Vec<String> {
+    let mut names = Vec::new();
+    for (path, source) in repo {
+        let ext = devmap_extract::extract_file(path, source);
+        for sym in ext.symbols {
+            if sym.kind != devmap_extract::model::SymbolKind::File && !sym.name.is_empty() {
+                names.push(sym.name);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn make_request_id(src: &mut stateful_fuzz::Source, seq: usize) -> Value {
+    if src.bool() {
+        json!(seq)
+    } else {
+        json!(format!("req-{seq}"))
+    }
+}
+
+fn build_session_action(
+    name: &str,
+    src: &mut stateful_fuzz::Source,
+    seq: usize,
+    repo: &stateful_fuzz::MicroRepo,
+    symbols: &[String],
+    issued_ids: &[Value],
+) -> SessionAction {
+    let id = make_request_id(src, seq);
+    let files: Vec<&String> = repo.keys().collect();
+    let pick_sym = |s: &mut stateful_fuzz::Source| -> String {
+        if s.chance(4, 5) {
+            s.choose(symbols)
+                .cloned()
+                .unwrap_or_else(|| "api_0".to_string())
+        } else {
+            s.ident("missing_sym")
+        }
+    };
+    let pick_file = |s: &mut stateful_fuzz::Source| -> (String, String) {
+        let path = s
+            .choose(&files)
+            .map(|p| (*p).clone())
+            .unwrap_or_else(|| "src/mod_0.rs".to_string());
+        let content = repo.get(&path).cloned().unwrap_or_default();
+        (path, content)
+    };
+
+    match name {
+        "mcp::initialize" => {
+            let versions = ["2025-11-25", "2025-06-18", "2024-11-05", "2099-01-01"];
+            let protocol_version = src
+                .choose(&versions)
+                .copied()
+                .unwrap_or("2025-11-25")
+                .to_string();
+            SessionAction::Initialize {
+                id,
+                protocol_version,
+            }
+        }
+        "mcp::ping" => SessionAction::Ping { id },
+        "mcp::tools_list" => SessionAction::ToolsList { id },
+        "mcp::devmap_status" => SessionAction::Status { id },
+        "mcp::devmap_search" => SessionAction::Search {
+            id,
+            query: pick_sym(src),
+            budget: (500 + src.usize_below(3_500)) as u32,
+        },
+        "mcp::devmap_explore" => SessionAction::Explore {
+            id,
+            query: pick_sym(src),
+            limit: (1 + src.usize_below(8)) as u32,
+        },
+        "mcp::devmap_impact" => SessionAction::Impact {
+            id,
+            target: pick_sym(src),
+            depth: (1 + src.usize_below(4)) as u32,
+            layers: src.bool(),
+        },
+        "mcp::devmap_dead_symbols" => SessionAction::DeadSymbols {
+            id,
+            budget: (500 + src.usize_below(3_500)) as u32,
+        },
+        "mcp::devmap_preview" => {
+            let (file, content) = pick_file(src);
+            let lang = micro_lang_for_path(&file);
+            let preview_content = if src.chance(3, 4) {
+                stateful_fuzz::mutate_file_elements(src, lang, &content)
+            } else {
+                stateful_fuzz::lower_damage(src, &content)
+            };
+            SessionAction::Preview {
+                id,
+                file,
+                content: preview_content,
+            }
+        }
+        "mcp::invalid_or_oversized" => {
+            let kinds = [
+                InvalidArgKind::OversizedQuery,
+                InvalidArgKind::ZeroBudget,
+                InvalidArgKind::UnknownTool,
+                InvalidArgKind::LayersAndMinRungConflict,
+                InvalidArgKind::UnknownArgumentField,
+            ];
+            let kind = src
+                .choose(&kinds)
+                .copied()
+                .unwrap_or(InvalidArgKind::ZeroBudget);
+            SessionAction::InvalidOrOversized { id, kind }
+        }
+        "mcp::notifications_cancelled" => {
+            let target_id = src
+                .choose(issued_ids)
+                .cloned()
+                .unwrap_or_else(|| json!(999_999));
+            SessionAction::CancelNotification { target_id }
+        }
+        _ => {
+            let (file, content) = pick_file(src);
+            let lang = micro_lang_for_path(&file);
+            let new_content = if src.chance(4, 5) {
+                stateful_fuzz::mutate_file_elements(src, lang, &content)
+            } else {
+                stateful_fuzz::lower_damage(src, &content)
+            };
+            SessionAction::EvolveRepo { file, new_content }
+        }
+    }
+}
+
+struct SessionState {
+    repo: stateful_fuzz::MicroRepo,
+    store: Arc<Store>,
+    slot: Arc<StoreSlot>,
+    last_observed_gen: u64,
+    evolved_since_status: bool,
+}
+
+async fn execute_session_action(
+    state: &mut SessionState,
+    action: &SessionAction,
+) -> stateful_fuzz::StepOutcome {
+    let act_name = action.label();
+
+    if let SessionAction::EvolveRepo { file, new_content } = action {
+        state.repo.insert(file.clone(), new_content.clone());
+        let new_gen = save_repo_generation(&state.store, &state.repo);
+        if let Some(failure) = stateful_fuzz::check(
+            new_gen > state.last_observed_gen,
+            "generation_monotonic",
+            act_name,
+            format!(
+                "save_generation produced {new_gen} <= last_observed_gen {}",
+                state.last_observed_gen
+            ),
+        )
+        .into_failure()
+        {
+            return stateful_fuzz::StepOutcome::CheckFailed(failure);
+        }
+        state.evolved_since_status = true;
+        return stateful_fuzz::StepOutcome::Ok;
+    }
+
+    let (input, expected_id, expected_tool, expect_refusal): (
+        String,
+        Option<Value>,
+        Option<&'static str>,
+        bool,
+    ) = match action {
+        SessionAction::Initialize {
+            id,
+            protocol_version,
+        } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "stateful-fuzz", "version": "1.0"}
+                }
+            })
+            .to_string(),
+            Some(id.clone()),
+            None,
+            false,
+        ),
+        SessionAction::Ping { id } => (
+            json!({"jsonrpc": "2.0", "id": id, "method": "ping"}).to_string(),
+            Some(id.clone()),
+            None,
+            false,
+        ),
+        SessionAction::ToolsList { id } => (
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}).to_string(),
+            Some(id.clone()),
+            None,
+            false,
+        ),
+        SessionAction::Status { id } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "devmap_status", "arguments": {}}
+            })
+            .to_string(),
+            Some(id.clone()),
+            Some("devmap_status"),
+            false,
+        ),
+        SessionAction::Search { id, query, budget } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "devmap_search", "arguments": {"query": query, "budget": budget}}
+            })
+            .to_string(),
+            Some(id.clone()),
+            Some("devmap_search"),
+            false,
+        ),
+        SessionAction::Explore { id, query, limit } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "devmap_explore", "arguments": {"query": query, "limit": limit}}
+            })
+            .to_string(),
+            Some(id.clone()),
+            Some("devmap_explore"),
+            false,
+        ),
+        SessionAction::Impact {
+            id,
+            target,
+            depth,
+            layers,
+        } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "devmap_impact",
+                    "arguments": {"target": target, "depth": depth, "layers": layers}
+                }
+            })
+            .to_string(),
+            Some(id.clone()),
+            Some("devmap_impact"),
+            false,
+        ),
+        SessionAction::DeadSymbols { id, budget } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "devmap_dead_symbols", "arguments": {"budget": budget}}
+            })
+            .to_string(),
+            Some(id.clone()),
+            Some("devmap_dead_symbols"),
+            false,
+        ),
+        SessionAction::Preview { id, file, content } => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "devmap_preview", "arguments": {"file": file, "content": content}}
+            })
+            .to_string(),
+            Some(id.clone()),
+            Some("devmap_preview"),
+            false,
+        ),
+        SessionAction::InvalidOrOversized { id, kind } => {
+            let params = match kind {
+                InvalidArgKind::OversizedQuery => json!({
+                    "name": "devmap_search",
+                    "arguments": {"query": "q".repeat(5_000)}
+                }),
+                InvalidArgKind::ZeroBudget => json!({
+                    "name": "devmap_search",
+                    "arguments": {"query": "api", "budget": 0}
+                }),
+                InvalidArgKind::UnknownTool => json!({
+                    "name": "devmap_nonexistent_tool",
+                    "arguments": {}
+                }),
+                InvalidArgKind::LayersAndMinRungConflict => json!({
+                    "name": "devmap_impact",
+                    "arguments": {"target": "api_0", "layers": true, "min_rung": "high"}
+                }),
+                InvalidArgKind::UnknownArgumentField => json!({
+                    "name": "devmap_status",
+                    "arguments": {"unexpected_flag": true}
+                }),
+            };
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": params
+                })
+                .to_string(),
+                Some(id.clone()),
+                None,
+                true,
+            )
+        }
+        SessionAction::CancelNotification { target_id } => (
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": target_id}
+            })
+            .to_string(),
+            None,
+            None,
+            false,
+        ),
+        SessionAction::EvolveRepo { .. } => unreachable!(),
+    };
+
+    let response = handle_line(&state.slot, &input).await;
+    if let Err(failure) = check_response_shape(act_name, &input, &response) {
+        return stateful_fuzz::StepOutcome::CheckFailed(failure);
+    }
+
+    match expected_id {
+        None => {
+            if let Some(failure) = stateful_fuzz::check(
+                response.is_none(),
+                "notification_unanswered",
+                act_name,
+                format!("notification must produce no response, got {response:?}"),
+            )
+            .into_failure()
+            {
+                return stateful_fuzz::StepOutcome::CheckFailed(failure);
+            }
+            stateful_fuzz::StepOutcome::Ok
+        }
+        Some(want_id) => {
+            let Some(frame) = response else {
+                return stateful_fuzz::StepOutcome::CheckFailed(stateful_fuzz::CheckFailure::new(
+                    "request_answered",
+                    act_name,
+                    format!("request with id {want_id} received no response: {input}"),
+                ));
+            };
+            if let Some(failure) = stateful_fuzz::check(
+                frame["id"] == want_id,
+                "id_preserved",
+                act_name,
+                format!(
+                    "response id {:?} != request id {want_id} for {input}",
+                    frame["id"]
+                ),
+            )
+            .into_failure()
+            {
+                return stateful_fuzz::StepOutcome::CheckFailed(failure);
+            }
+
+            // Round-trip serialization check for single-line JSON framing.
+            let wire = frame.to_string();
+            if let Some(failure) = stateful_fuzz::check(
+                !wire.contains('\n') && serde_json::from_str::<Value>(&wire).is_ok(),
+                "wire_roundtrip",
+                act_name,
+                format!("response failed single-line JSON roundtrip: {wire:?}"),
+            )
+            .into_failure()
+            {
+                return stateful_fuzz::StepOutcome::CheckFailed(failure);
+            }
+
+            if expect_refusal {
+                let is_rpc_err = frame.get("error").is_some();
+                let is_tool_err = frame
+                    .get("result")
+                    .and_then(|r| r.get("isError"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if let Some(failure) = stateful_fuzz::check(
+                    is_rpc_err || is_tool_err,
+                    "invalid_args_refused",
+                    act_name,
+                    format!("invalid/oversized request was silently accepted: {frame}"),
+                )
+                .into_failure()
+                {
+                    return stateful_fuzz::StepOutcome::CheckFailed(failure);
+                }
+                return stateful_fuzz::StepOutcome::Ok;
+            }
+
+            if let Some(tool_name) = expected_tool {
+                if let Some(failure) = stateful_fuzz::check(
+                    frame.get("error").is_none(),
+                    "valid_tool_no_rpc_error",
+                    act_name,
+                    format!("valid tool call {tool_name} returned JSON-RPC error: {frame}"),
+                )
+                .into_failure()
+                {
+                    return stateful_fuzz::StepOutcome::CheckFailed(failure);
+                }
+                let result = &frame["result"];
+                let is_err = result
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !is_err {
+                    if let Some(structured) = result.get("structuredContent") {
+                        if let Some(violation) = structured_content_violation(tool_name, structured)
+                        {
+                            return stateful_fuzz::StepOutcome::CheckFailed(
+                                stateful_fuzz::CheckFailure::new(
+                                    "output_schema_conformance",
+                                    act_name,
+                                    format!("{violation} (payload: {structured})"),
+                                ),
+                            );
+                        }
+                        if tool_name == "devmap_status" {
+                            if let Some(gen_id) =
+                                structured.get("generation_id").and_then(Value::as_u64)
+                            {
+                                let ok = if state.evolved_since_status {
+                                    gen_id > state.last_observed_gen
+                                } else {
+                                    gen_id >= state.last_observed_gen
+                                };
+                                if let Some(failure) = stateful_fuzz::check(
+                                    ok,
+                                    "status_generation_monotonic",
+                                    act_name,
+                                    format!(
+                                        "devmap_status generation_id={gen_id}, prev={}, evolved={}",
+                                        state.last_observed_gen, state.evolved_since_status
+                                    ),
+                                )
+                                .into_failure()
+                                {
+                                    return stateful_fuzz::StepOutcome::CheckFailed(failure);
+                                }
+                                state.last_observed_gen = gen_id;
+                                state.evolved_since_status = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            stateful_fuzz::StepOutcome::Ok
+        }
+    }
+}
+
+fn replay_session_sync(
+    handle: &tokio::runtime::Handle,
+    initial_repo: &stateful_fuzz::MicroRepo,
+    actions: &[SessionAction],
+) -> Option<stateful_fuzz::CheckFailure> {
+    let (store, slot, initial_gen) = build_repo_store(initial_repo);
+    let mut state = SessionState {
+        repo: initial_repo.clone(),
+        store,
+        slot,
+        last_observed_gen: initial_gen,
+        evolved_since_status: false,
+    };
+    for action in actions {
+        let outcome = handle.block_on(execute_session_action(&mut state, action));
+        if let Some(failure) = outcome.into_failure() {
+            return Some(failure);
+        }
+    }
+    None
+}
+
+/// Stateful multi-turn MCP session fuzzing over an evolving `MicroRepoGen` store,
+/// exercising handshake, tools, invalid/oversized refusals, live generation
+/// evolution, cancellations, and duplex `serve_streams` framing with
+/// `HealthTracker` telemetry and `minimize_sequence` reproducer emission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stateful_multiturn_mcp_session_fuzz() {
+    let seed = stateful_fuzz::env_u64(
+        "DEVMAP_STATEFUL_SEED",
+        stateful_fuzz::env_u64("DEVMAP_FUZZ_SEED", 0x5717_C400_CAFE_0001),
+    );
+    let rounds = stateful_fuzz::env_usize("DEVMAP_STATEFUL_ROUNDS", 8);
+    let steps_per_round = stateful_fuzz::env_usize("DEVMAP_STATEFUL_STEPS", 28);
+    let mut src = stateful_fuzz::Source::from_seed(seed);
+    let mut tracker = stateful_fuzz::HealthTracker::new();
+
+    let langs = [
+        stateful_fuzz::MicroLang::Rust,
+        stateful_fuzz::MicroLang::TypeScript,
+        stateful_fuzz::MicroLang::Go,
+        stateful_fuzz::MicroLang::Python,
+    ];
+
+    for round in 0..rounds {
+        let initial_repo = stateful_fuzz::generate_micro_repo(&mut src, &langs, 6);
+        let (store, slot, initial_gen) = build_repo_store(&initial_repo);
+        let mut state = SessionState {
+            repo: initial_repo.clone(),
+            store,
+            slot,
+            last_observed_gen: initial_gen,
+            evolved_since_status: false,
+        };
+        let mut symbols = collect_repo_symbols(&state.repo);
+        let mut issued_ids: Vec<Value> = Vec::new();
+        let mut executed: Vec<SessionAction> = Vec::new();
+        let mut prev_action: Option<&'static str> = None;
+
+        for step in 0..steps_per_round {
+            let chosen = if step == 0 {
+                "mcp::initialize"
+            } else {
+                tracker.pick_weighted(&mut src, SESSION_ACTION_NAMES, prev_action)
+            };
+            let seq = round * 1_000 + step + 1;
+            let action =
+                build_session_action(chosen, &mut src, seq, &state.repo, &symbols, &issued_ids);
+            match &action {
+                SessionAction::Initialize { id, .. }
+                | SessionAction::Ping { id }
+                | SessionAction::ToolsList { id }
+                | SessionAction::Status { id }
+                | SessionAction::Search { id, .. }
+                | SessionAction::Explore { id, .. }
+                | SessionAction::Impact { id, .. }
+                | SessionAction::DeadSymbols { id, .. }
+                | SessionAction::Preview { id, .. }
+                | SessionAction::InvalidOrOversized { id, .. } => {
+                    issued_ids.push(id.clone());
+                }
+                SessionAction::CancelNotification { .. } | SessionAction::EvolveRepo { .. } => {}
+            }
+
+            let outcome = execute_session_action(&mut state, &action).await;
+            let label = action.label();
+            tracker.record(label, prev_action, &outcome);
+            executed.push(action.clone());
+            if matches!(action, SessionAction::EvolveRepo { .. }) {
+                symbols = collect_repo_symbols(&state.repo);
+            }
+
+            if let Some(failure) = outcome.into_failure() {
+                let sig = failure.signature();
+                let handle = tokio::runtime::Handle::current();
+                let minimized = tokio::task::block_in_place(|| {
+                    stateful_fuzz::minimize_sequence(&executed, &sig, 64, |cand| {
+                        replay_session_sync(&handle, &initial_repo, cand)
+                    })
+                });
+                let rendered: Vec<String> = minimized.iter().map(|a| format!("{a:?}")).collect();
+                let repro = stateful_fuzz::format_repro_test(
+                    "repro_mcp_stateful_session",
+                    seed,
+                    &failure,
+                    &rendered,
+                );
+                panic!(
+                    "stateful MCP session round {round} step {step} failed: {failure}\n\
+                     Minimized sequence ({} -> {} actions)\n\
+                     Replay: DEVMAP_STATEFUL_SEED={seed} cargo test --locked -p devmap-serve --test mcp_fuzz_and_bounds -- stateful_multiturn_mcp_session_fuzz --nocapture\n\n\
+                     {repro}",
+                    executed.len(),
+                    minimized.len()
+                );
+            }
+
+            prev_action = Some(label);
+        }
+
+        // Also exercise a real multi-turn duplex `serve_streams` session on the
+        // evolved store, interleaving initialize, initialized notification,
+        // tool calls, cancellation, and a final ping sentinel.
+        let target_sym = symbols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "api_0".to_string());
+        let first_file = state
+            .repo
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "src/mod_0.rs".to_string());
+        let first_content = state.repo.get(&first_file).cloned().unwrap_or_default();
+        let sentinel_id = json!(format!("sentinel-{round}"));
+        let lines = vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": "init-1",
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "stateful-fuzz", "version": "1"}}
+            })
+            .to_string(),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list"}).to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {"name": "devmap_status", "arguments": {}}
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {"name": "devmap_impact", "arguments": {"target": target_sym, "depth": 2}}
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 12}
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {"name": "devmap_preview", "arguments": {"file": first_file, "content": first_content}}
+            })
+            .to_string(),
+            json!({"jsonrpc": "2.0", "id": sentinel_id, "method": "ping"}).to_string(),
+        ];
+
+        let frames = session(&state.slot, &lines).await;
+        let mut seen_ids: HashMap<String, usize> = HashMap::new();
+        let mut sentinel_seen = false;
+        let mut valid_response_ids: HashSet<String> = HashSet::new();
+        for frame in &frames {
+            // Skip server-initiated notifications (e.g. `notifications/tools/list_changed`).
+            if frame.get("id").is_none() && frame.get("method").is_some() {
+                continue;
+            }
+            assert_response_shape("transport_multiturn", &Some(frame.clone()));
+            let key = frame["id"].to_string();
+            *seen_ids.entry(key.clone()).or_insert(0) += 1;
+            valid_response_ids.insert(key);
+            if frame["id"] == sentinel_id {
+                sentinel_seen = true;
+            }
+        }
+        for (id_key, count) in &seen_ids {
+            assert_eq!(
+                *count, 1,
+                "round {round}: response id {id_key} emitted {count} times in duplex session"
+            );
+        }
+        assert!(
+            sentinel_seen && valid_response_ids.contains(&json!("init-1").to_string()),
+            "round {round}: duplex session lost init or sentinel frame: {frames:?}"
+        );
+        tracker.record(
+            "mcp::transport_multiturn",
+            prev_action,
+            &stateful_fuzz::StepOutcome::Ok,
+        );
+    }
+
+    eprintln!("{}", tracker.probe_report("mcp_fuzz::stateful_session"));
+    tracker.assert_actions_exercised(&[
+        "mcp::initialize",
+        "mcp::ping",
+        "mcp::tools_list",
+        "mcp::devmap_status",
+        "mcp::devmap_search",
+        "mcp::devmap_explore",
+        "mcp::devmap_impact",
+        "mcp::devmap_dead_symbols",
+        "mcp::devmap_preview",
+        "mcp::invalid_or_oversized",
+        "mcp::notifications_cancelled",
+        "mcp::evolve_repo",
+        "mcp::transport_multiturn",
+    ]);
 }

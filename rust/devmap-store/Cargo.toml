@@ -197,3 +197,9 @@ required-features = ["parse"]
 [[test]]
 name = "atk_s_r4_staged_lock"
 required-features = ["parse"]
+
+# Stateful incremental store, ResolveReuse, carry-forward, and CSR reader fuzz
+# suite: builds generations from extracted source.
+[[test]]
+name = "stateful_incremental_store"
+required-features = ["parse"]
