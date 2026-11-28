@@ -2164,10 +2164,20 @@ impl StackedStore {
         let full = self.worktree_root.join(&normalized);
         match fs::symlink_metadata(&full) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.record_deleted_file_locked(&normalized)
+                if self.base.latest_path_is_indexed(&normalized)? {
+                    self.record_deleted_file_locked(&normalized)
+                } else {
+                    self.clear_reverted_file_locked(&normalized)
+                }
             }
             Err(err) => Err(err).with_context(|| format!("cannot stat {}", full.display())),
-            Ok(meta) if !meta.is_file() => self.record_deleted_file_locked(&normalized),
+            Ok(meta) if !meta.is_file() => {
+                if self.base.latest_path_is_indexed(&normalized)? {
+                    self.record_deleted_file_locked(&normalized)
+                } else {
+                    self.clear_reverted_file_locked(&normalized)
+                }
+            }
             Ok(_) => {
                 if !devmap_extract::languages::is_indexable_source(&normalized) {
                     return Ok(());
@@ -2815,6 +2825,13 @@ impl StackedStore {
         pool: usize,
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> Result<Option<SearchPage>> {
+        if let Some(offset) = query.find('\0') {
+            bail!(
+                "search query contains a NUL byte at offset {offset}; SQLite's \
+                 full-text parser reads the query as a C string, so no escaping \
+                 can carry one through"
+            );
+        }
         let Some((mut page, (_, root, all_files))) = self.merged_corpus()? else {
             return Ok(None);
         };
@@ -2866,29 +2883,37 @@ impl StackedStore {
             });
         }
 
-        let trimmed = query.trim().to_ascii_lowercase();
+        let trimmed = query.trim();
         if !trimmed.is_empty() {
-            let terms: Vec<&str> = trimmed
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .filter(|t| !t.is_empty())
+            // Mirror `Store::search_page` (`nodes_fts` using FTS5 `unicode61` over
+            // `name`, `qualified_name`, and `path` with `fts_match_query` splitting
+            // on whitespace and `::` into AND-ed quoted prefix phrases).
+            let phrases: Vec<Vec<String>> = trimmed
+                .split_whitespace()
+                .flat_map(|word| word.split("::"))
+                .filter(|term| !term.is_empty())
+                .map(fts_unicode61_tokens)
                 .collect();
-            page.rows.retain(|sym| {
-                let name_l = sym.name.to_ascii_lowercase();
-                let qual_l = sym.qualified_name.to_ascii_lowercase();
-                if terms.is_empty() {
-                    name_l.contains(&trimmed) || qual_l.contains(&trimmed)
-                } else {
-                    terms
-                        .iter()
-                        .all(|term| name_l.contains(term) || qual_l.contains(term))
-                }
-            });
+            if phrases.is_empty() || phrases.iter().any(Vec::is_empty) {
+                page.rows.clear();
+            } else {
+                page.rows.retain(|sym| {
+                    let name_tokens = fts_unicode61_tokens(&sym.name);
+                    let qual_tokens = fts_unicode61_tokens(&sym.qualified_name);
+                    let path_tokens = fts_unicode61_tokens(&sym.path);
+                    phrases.iter().all(|phrase| {
+                        phrase_matches_tokens(&name_tokens, phrase)
+                            || phrase_matches_tokens(&qual_tokens, phrase)
+                            || phrase_matches_tokens(&path_tokens, phrase)
+                    })
+                });
+            }
         }
 
         page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
         page.rows.sort_by(|a, b| {
-            let exact_a = a.name.eq_ignore_ascii_case(&trimmed);
-            let exact_b = b.name.eq_ignore_ascii_case(&trimmed);
+            let exact_a = a.name.eq_ignore_ascii_case(trimmed);
+            let exact_b = b.name.eq_ignore_ascii_case(trimmed);
             exact_b
                 .cmp(&exact_a)
                 .then_with(|| a.name.len().cmp(&b.name.len()))
@@ -3224,6 +3249,30 @@ impl StackedStore {
     }
 }
 
+/// Tokenize text under SQLite FTS5 `unicode61` rules: Unicode letters and
+/// decimal digits form tokens (lowercased); underscores, punctuation, and
+/// whitespace are separators.
+fn fts_unicode61_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether `haystack` contains an adjacent token run matching `phrase` with a
+/// prefix match on its last token (matching FTS5 `"t0 t1 ... tk"*`).
+fn phrase_matches_tokens(haystack: &[String], phrase: &[String]) -> bool {
+    let Some((last, prefix)) = phrase.split_last() else {
+        return false;
+    };
+    if haystack.len() < phrase.len() {
+        return false;
+    }
+    haystack.windows(phrase.len()).any(|window| {
+        window[..prefix.len()] == *prefix && window[prefix.len()].starts_with(last.as_str())
+    })
+}
+
 fn bare_tail(symbol: &str) -> Option<&str> {
     let tail = symbol.rsplit("::").next().unwrap_or(symbol);
     let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
@@ -3344,209 +3393,197 @@ fn resolve_delta_stored_edges(
     ));
     let aliases = import_alias_maps(ext);
 
-    for sym in &ext.symbols {
+    // 1. Canonical intra-file resolution (`Contains`, `SameFile`, `ReceiverType`,
+    //    Go/Rust type-literal `References`, local bindings, builtins) via the
+    //    real `devmap_resolve::Resolver` over just this delta extraction.
+    let mut local_resolver = devmap_resolve::Resolver::new();
+    local_resolver.index_extractions(std::slice::from_ref(ext));
+    let local_res = local_resolver.resolve_all(std::slice::from_ref(ext))?;
+    for edge in &local_res.edges {
         out.push(StoredEdge {
-            source_file: rel_path.to_string(),
-            target_file: rel_path.to_string(),
-            source_symbol: rel_path.to_string(),
-            target_symbol: sym.qualified_name.clone(),
-            edge_kind: "Contains".to_string(),
-            confidence: 1.0,
-            resolution: Some("Structural".to_string()),
+            source_file: edge.source_file.clone(),
+            target_file: edge.target_file.clone(),
+            source_symbol: edge.source_symbol.clone(),
+            target_symbol: edge.target_symbol.clone(),
+            edge_kind: format!("{:?}", edge.edge_kind),
+            confidence: edge.confidence.persist_real() as f32,
+            resolution: edge
+                .resolution
+                .as_ref()
+                .map(|res| res.kind().label().to_string()),
         });
     }
 
-    for call in &ext.calls {
-        let raw_callee = call.callee_name.trim();
-        if raw_callee.is_empty() {
-            continue;
-        }
-        let source_symbol = call
-            .caller_symbol
-            .as_deref()
-            .map(|caller| {
-                let want_qual = node_id_of(rel_path, caller);
-                ext.symbols
-                    .iter()
-                    .find(|s| {
-                        s.qualified_name == caller
-                            || s.name == caller
-                            || node_id_of(rel_path, &s.qualified_name) == want_qual
-                    })
-                    .map(|s| s.qualified_name.clone())
-                    .unwrap_or(want_qual)
-            })
-            .unwrap_or_else(|| rel_path.to_string());
-        let raw_recv =
-            call.receiver_expr.as_deref().map(str::trim).filter(|r| {
+    let unresolved_call_sites: HashSet<(usize, usize)> = local_res
+        .unresolved
+        .iter()
+        .filter(|u| u.kind == devmap_resolve::model::UnresolvedKind::Call)
+        .filter_map(|u| u.site.map(|s| (s.start, s.end)))
+        .collect();
+
+    if ext
+        .capabilities()
+        .contains(devmap_extract::languages::Capability::Calls)
+    {
+        for call in &ext.calls {
+            if !unresolved_call_sites.contains(&(call.span.start_byte, call.span.end_byte)) {
+                continue;
+            }
+            let raw_callee = call.callee_name.trim();
+            if raw_callee.is_empty() {
+                continue;
+            }
+            let source_symbol = call
+                .caller_symbol
+                .as_deref()
+                .map(|caller| {
+                    let want_qual = node_id_of(rel_path, caller);
+                    ext.symbols
+                        .iter()
+                        .find(|s| {
+                            s.qualified_name == caller
+                                || s.name == caller
+                                || node_id_of(rel_path, &s.qualified_name) == want_qual
+                        })
+                        .map(|s| s.qualified_name.clone())
+                        .unwrap_or(want_qual)
+                })
+                .unwrap_or_else(|| rel_path.to_string());
+            let raw_recv = call.receiver_expr.as_deref().map(str::trim).filter(|r| {
                 !r.is_empty() && !matches!(*r, "self" | "this" | "Self" | "super" | "cls")
             });
 
-        // 1. SameFile resolution (deterministic 1.0) checks raw local callee/receiver first.
-        let same_file: Vec<&devmap_extract::model::ExtractedSymbol> = ext
-            .symbols
-            .iter()
-            .filter(|s| {
-                let tail_ok =
-                    s.name == raw_callee || bare_tail(&s.qualified_name) == Some(raw_callee);
-                if !tail_ok {
-                    return false;
-                }
-                match raw_recv {
-                    Some(r) => {
-                        s.qualified_name.contains(&format!("{r}.{raw_callee}"))
-                            || s.qualified_name.contains(&format!("{r}::{raw_callee}"))
-                    }
-                    None => true,
-                }
-            })
-            .collect();
-        if same_file.len() == 1 {
-            out.push(StoredEdge {
-                source_file: rel_path.to_string(),
-                target_file: rel_path.to_string(),
-                source_symbol,
-                target_symbol: same_file[0].qualified_name.clone(),
-                edge_kind: "Calls".to_string(),
-                confidence: 1.0,
-                resolution: Some("SameFile".to_string()),
-            });
-            continue;
-        }
-        if !same_file.is_empty() {
-            continue;
-        }
-
-        // Resolve symbol and module import aliases (`use a::b as c`, `import { b as c }`,
-        // `use crate::mod_a as m`, `import * as m`).
-        let mut explicit_specs: Vec<String> = Vec::new();
-        let (callee, recv): (&str, Option<&str>) = match raw_recv {
-            None => {
-                if let Some((spec, imported)) = aliases.symbol_aliases.get(raw_callee) {
-                    if !spec.is_empty() {
-                        explicit_specs.push(spec.clone());
-                    }
-                    (imported.as_str(), None)
-                } else {
-                    (raw_callee, None)
-                }
-            }
-            Some(r) => {
-                if let Some(mod_spec) = aliases.module_aliases.get(r) {
-                    explicit_specs.push(mod_spec.clone());
-                    (raw_callee, None)
-                } else if let Some((spec, imported)) = aliases.symbol_aliases.get(r) {
-                    if !spec.is_empty() {
-                        explicit_specs.push(spec.clone());
-                        explicit_specs.push(format!("{spec}::{imported}"));
-                        explicit_specs.push(format!("{spec}/{imported}"));
+            // Resolve symbol and module import aliases (`use a::b as c`, `import { b as c }`,
+            // `use crate::mod_a as m`, `import * as m`).
+            let mut explicit_specs: Vec<String> = Vec::new();
+            let (callee, recv): (&str, Option<&str>) = match raw_recv {
+                None => {
+                    if let Some((spec, imported)) = aliases.symbol_aliases.get(raw_callee) {
+                        if !spec.is_empty() {
+                            explicit_specs.push(spec.clone());
+                        }
+                        (imported.as_str(), None)
                     } else {
-                        explicit_specs.push(imported.clone());
+                        (raw_callee, None)
                     }
-                    (raw_callee, Some(imported.as_str()))
-                } else {
-                    (raw_callee, Some(r))
+                }
+                Some(r) => {
+                    if let Some(mod_spec) = aliases.module_aliases.get(r) {
+                        explicit_specs.push(mod_spec.clone());
+                        (raw_callee, None)
+                    } else if let Some((spec, imported)) = aliases.symbol_aliases.get(r) {
+                        if !spec.is_empty() {
+                            explicit_specs.push(spec.clone());
+                            explicit_specs.push(format!("{spec}::{imported}"));
+                            explicit_specs.push(format!("{spec}/{imported}"));
+                        } else {
+                            explicit_specs.push(imported.clone());
+                        }
+                        (raw_callee, Some(imported.as_str()))
+                    } else {
+                        (raw_callee, Some(r))
+                    }
+                }
+            };
+
+            // 2. Cross-file resolution across other delta extractions + non-masked base symbols.
+            let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+            for (other_path, other_ext) in &overlay.added_extractions {
+                if other_path == rel_path {
+                    continue;
+                }
+                let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(
+                    Path::new(other_path),
+                ));
+                if fam != caller_family {
+                    continue;
+                }
+                for s in &other_ext.symbols {
+                    if s.name == callee || bare_tail(&s.qualified_name) == Some(callee) {
+                        candidates.insert((other_path.clone(), s.qualified_name.clone()));
+                    }
                 }
             }
-        };
-
-        // 2. Cross-file resolution across other delta extractions + non-masked base symbols.
-        let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
-        for (other_path, other_ext) in &overlay.added_extractions {
-            if other_path == rel_path {
-                continue;
+            if !lookups.contains_key(callee) {
+                cancel.check()?;
+                lookups.insert(callee.to_string(), base_symbols_for_callee(base, callee)?);
             }
-            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(
-                other_path,
-            )));
-            if fam != caller_family {
-                continue;
-            }
-            for s in &other_ext.symbols {
-                if s.name == callee || bare_tail(&s.qualified_name) == Some(callee) {
-                    candidates.insert((other_path.clone(), s.qualified_name.clone()));
+            let (base_rows, base_exhaustive) = &lookups[callee];
+            for sym in base_rows {
+                if sym.path == rel_path {
+                    continue;
+                }
+                let p = Path::new(&sym.path);
+                if overlay.is_file_tombstoned(p)
+                    || overlay.modified_files.contains_key(p)
+                    || overlay.is_symbol_tombstoned(&sym.qualified_name)
+                {
+                    continue;
+                }
+                let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
+                if fam != caller_family {
+                    continue;
+                }
+                if sym.name == callee || bare_tail(&sym.qualified_name) == Some(callee) {
+                    candidates.insert((sym.path.clone(), sym.qualified_name.clone()));
                 }
             }
-        }
-        if !lookups.contains_key(callee) {
-            cancel.check()?;
-            lookups.insert(callee.to_string(), base_symbols_for_callee(base, callee)?);
-        }
-        let (base_rows, base_exhaustive) = &lookups[callee];
-        for sym in base_rows {
-            if sym.path == rel_path {
-                continue;
-            }
-            let p = Path::new(&sym.path);
-            if overlay.is_file_tombstoned(p)
-                || overlay.modified_files.contains_key(p)
-                || overlay.is_symbol_tombstoned(&sym.qualified_name)
-            {
-                continue;
-            }
-            let fam = LangFamily::from_lang(devmap_extract::languages::detect_language(p));
-            if fam != caller_family {
-                continue;
-            }
-            if sym.name == callee || bare_tail(&sym.qualified_name) == Some(callee) {
-                candidates.insert((sym.path.clone(), sym.qualified_name.clone()));
-            }
-        }
 
-        if let Some(r) = recv {
-            let narrowed: BTreeSet<(String, String)> = candidates
+            if let Some(r) = recv {
+                let narrowed: BTreeSet<(String, String)> = candidates
+                    .iter()
+                    .filter(|(cand_file, cand_qual)| {
+                        cand_qual.contains(&format!("{r}.{callee}"))
+                            || cand_qual.contains(&format!("{r}::{callee}"))
+                            || Path::new(cand_file).file_stem().and_then(|s| s.to_str()) == Some(r)
+                    })
+                    .cloned()
+                    .collect();
+                if !narrowed.is_empty() {
+                    candidates = narrowed;
+                }
+            }
+
+            let imported: Vec<&(String, String)> = candidates
                 .iter()
-                .filter(|(cand_file, cand_qual)| {
-                    cand_qual.contains(&format!("{r}.{callee}"))
-                        || cand_qual.contains(&format!("{r}::{callee}"))
-                        || Path::new(cand_file).file_stem().and_then(|s| s.to_str()) == Some(r)
+                .filter(|(cand_file, _)| {
+                    Path::new(cand_file).parent() == Path::new(rel_path).parent()
+                        || explicit_specs
+                            .iter()
+                            .any(|spec| specifier_matches_path(spec, cand_file))
+                        || ext
+                            .imports
+                            .iter()
+                            .any(|imp| specifier_matches_path(&imp.module_specifier, cand_file))
                 })
-                .cloned()
                 .collect();
-            if !narrowed.is_empty() {
-                candidates = narrowed;
-            }
-        }
 
-        let imported: Vec<&(String, String)> = candidates
-            .iter()
-            .filter(|(cand_file, _)| {
-                Path::new(cand_file).parent() == Path::new(rel_path).parent()
-                    || explicit_specs
-                        .iter()
-                        .any(|spec| specifier_matches_path(spec, cand_file))
-                    || ext
-                        .imports
-                        .iter()
-                        .any(|imp| specifier_matches_path(&imp.module_specifier, cand_file))
-            })
-            .collect();
-
-        if imported.len() == 1 {
-            let (target_file, target_symbol) = imported[0];
-            out.push(StoredEdge {
-                source_file: rel_path.to_string(),
-                target_file: target_file.clone(),
-                source_symbol,
-                target_symbol: target_symbol.clone(),
-                edge_kind: "Calls".to_string(),
-                confidence: 0.9,
-                resolution: Some("ImportScoped".to_string()),
-            });
-        } else if candidates.len() == 1 && *base_exhaustive {
-            // `UniqueGlobal` claims no other symbol in the corpus carries the
-            // name. That holds only when the base lookup saw every match; a read
-            // that hit the ceiling proves nothing, so it adds no edge.
-            if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
+            if imported.len() == 1 {
+                let (target_file, target_symbol) = imported[0];
                 out.push(StoredEdge {
                     source_file: rel_path.to_string(),
-                    target_file,
+                    target_file: target_file.clone(),
                     source_symbol,
-                    target_symbol,
+                    target_symbol: target_symbol.clone(),
                     edge_kind: "Calls".to_string(),
                     confidence: 0.9,
-                    resolution: Some("UniqueGlobal".to_string()),
+                    resolution: Some("ImportScoped".to_string()),
                 });
+            } else if candidates.len() == 1 && *base_exhaustive {
+                // `UniqueGlobal` claims no other symbol in the corpus carries the
+                // name. That holds only when the base lookup saw every match; a read
+                // that hit the ceiling proves nothing, so it adds no edge.
+                if let Some((target_file, target_symbol)) = candidates.into_iter().next() {
+                    out.push(StoredEdge {
+                        source_file: rel_path.to_string(),
+                        target_file,
+                        source_symbol,
+                        target_symbol,
+                        edge_kind: "Calls".to_string(),
+                        confidence: 0.9,
+                        resolution: Some("UniqueGlobal".to_string()),
+                    });
+                }
             }
         }
     }
