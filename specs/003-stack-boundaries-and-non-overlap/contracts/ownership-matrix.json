@@ -517,7 +517,7 @@
         "go -C backend/go_orchestrator test ./policy/... ./gate/... ./devcouncil/...",
         "node scripts/check-stack-boundaries.mjs",
         "node scripts/sync-agent-defs.mjs --check",
-        "devcouncil spec validate 003-stack-boundaries-and-non-overlap --strict --project-root ."
+        "devcouncil spec validate 003-stack-boundaries-and-non-overlap --strict"
       ]
     },
     {
@@ -548,8 +548,8 @@
       "required_checks": [
         "GOMAXPROCS=4 go -C manvi test ./internal/contract/...",
         "go -C manvi test ./devcouncil -run TestDocumentedToolCountMatchesRegistry -count=1",
-        "devcouncil spec validate 001-agent-harness-and-serve-plane --strict --project-root .",
-        "devcouncil spec validate 002-policy-enforcement-and-hardening --strict --project-root ."
+        "devcouncil spec validate 001-agent-harness-and-serve-plane --strict",
+        "devcouncil spec validate 002-policy-enforcement-and-hardening --strict"
       ]
     },
     {
@@ -587,9 +587,9 @@
       "required_checks": [
         "node scripts/check-schema-parity.mjs",
         "bun run vitest run scripts/brand-rename-contract.test.ts scripts/architecture-docs-contract.test.ts scripts/verdict-contract.test.ts scripts/check-schema-parity.test.ts",
-        "devcouncil spec validate 001-local-first-ade-and-worktrees --strict --project-root .",
-        "devcouncil spec validate 002-host-integration-and-cross-repo-seams --strict --project-root .",
-        "devcouncil spec validate 003-primary-and-labs-editions --strict --project-root ."
+        "devcouncil spec validate 001-local-first-ade-and-worktrees --strict",
+        "devcouncil spec validate 002-host-integration-and-cross-repo-seams --strict",
+        "devcouncil spec validate 003-primary-and-labs-editions --strict"
       ]
     },
     {

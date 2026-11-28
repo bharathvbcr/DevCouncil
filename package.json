@@ -59,6 +59,7 @@
     "build:code-map": "node scripts/code-map-bundle.mjs build",
     "check:code-map": "node scripts/code-map-bundle.mjs check",
     "test:code-map": "bun test rust/devmap-query/assets/code-map",
+    "check:specs": "devcouncil spec validate --all --strict",
     "ci:local": "node scripts/ci-local.mjs"
   },
   "engines": {

@@ -315,11 +315,19 @@ devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case] [--proje
 ```bash
 devcouncil spec init <feature-name> [--project-root DIR]
 devcouncil spec validate <feature-name|feature-dir> [--strict] [--json] [--project-root DIR]
+devcouncil spec validate --all [--strict] [--json] [--project-root DIR]
 devcouncil spec export-tasks <feature-name|feature-dir> [--target-status STATUS] [--dry-run] [--json] [--project-root DIR]
 ```
 
 - `init`: Scaffolds a 7-layer specification directory under `specs/###-<feature-name>/` (`spec.md`, `plan.md`, `research.md`, `data-model.md`, `contracts/`, `tasks.md`, and root `constitution.md` reference).
-- `validate`: Statically validates the specification against schema and constitutional rules (`[NEEDS CLARIFICATION]` markers, user stories, tasks, and success metrics). `--strict` treats warnings as validation failures.
+- `validate`: Statically validates the specification against schema and constitutional rules (`[NEEDS CLARIFICATION]` markers, user stories, tasks, success metrics, and unedited `spec init` placeholder text). `--strict` makes the strict-mode rules blocking: missing or incomplete acceptance scenarios, a missing `tasks.md`, and `scaffold_placeholder` (placeholder text `spec init` wrote into `spec.md`, `plan.md` or `tasks.md` and nobody replaced).
+- `validate --all`: Validates every `specs/NNN-*` directory (other entries under `specs/`, such as a README or a Lean project, are ignored) through the same path as the single-spec form. It exits 0 only when every spec is valid, and exits 1 when any spec fails or when `specs/` is missing or holds no `NNN-` spec, since a gate that found nothing to check has not passed. `--json` prints an envelope with `valid`, `specs_root`, `strict`, `total`, `valid_count`, `invalid_count`, `error` (when there was nothing to check) and `specs` (one validation result per spec). Combining `--all` with a feature name exits 2. As a repository gate:
+
+  ```bash
+  devcouncil spec validate --all --strict --project-root "$PWD"
+  ```
+
+  `--project-root` must be absolute; a relative value such as `.` is refused.
 - `export-tasks`: Parses `tasks.md` into DAG-ordered workbench tasks and scope envelopes (persisting to `.devcouncil/state.sqlite` unless `--dry-run` is passed).
 
 ### Declarative DAG Workflows (`workflow`)

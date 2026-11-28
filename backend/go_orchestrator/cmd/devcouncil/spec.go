@@ -19,12 +19,27 @@ const specHelp = `devcouncil spec — specification-driven workflow tools
 Usage:
   devcouncil spec init <feature-name> [--project-root DIR]
   devcouncil spec validate <feature-name> [--strict] [--json] [--project-root DIR]
+  devcouncil spec validate --all [--strict] [--json] [--project-root DIR]
   devcouncil spec export-tasks <feature-name|feature-dir> [--target-status STATUS] [--dry-run] [--json] [--project-root DIR]
 
 Commands:
   init          Scaffold a new 7-layer specification under specs/###-<feature-name>/
   validate      Statically validate a specification against schema and constitutional rules
   export-tasks  Parse tasks.md and generate DevCouncil workbench tasks and scope envelopes
+
+Validate options:
+  --all         Validate every specs/NNN-* directory (other entries under specs/
+                are ignored). Exits 0 only when every spec is valid; exits 1 when
+                any spec fails, or when specs/ is missing or holds no NNN- spec.
+                Cannot be combined with a feature name.
+  --strict      Make the strict-mode rules blocking instead of advisory: missing or
+                incomplete acceptance scenarios, missing tasks.md, and unedited
+                'spec init' placeholder text (scaffold_placeholder)
+  --json        Print the result as JSON (with --all: an envelope with valid,
+                total, valid_count, invalid_count and per-spec results)
+
+Repository gate:
+  devcouncil spec validate --all --strict --project-root "$PWD"
 `
 
 func runSpec(args []string) int {
@@ -106,6 +121,7 @@ func runSpecValidate(args []string) int {
 	featureName := ""
 	strict := false
 	jsonOut := false
+	all := false
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -116,6 +132,8 @@ func runSpecValidate(args []string) int {
 			strict = true
 		case "--json":
 			jsonOut = true
+		case "--all":
+			all = true
 		case "--project-root":
 			i++
 			r, ok := projectRootFlag(args, i)
@@ -133,8 +151,12 @@ func runSpecValidate(args []string) int {
 		}
 	}
 
-	if featureName == "" {
-		console.Errorln("spec validate requires a feature name or path")
+	if all && featureName != "" {
+		console.Errorf("spec validate: --all validates every spec; it cannot be combined with a feature name (%s)\n", featureName)
+		return 2
+	}
+	if !all && featureName == "" {
+		console.Errorln("spec validate requires a feature name or path, or --all")
 		return 2
 	}
 
@@ -144,19 +166,17 @@ func runSpecValidate(args []string) int {
 		return 2
 	}
 
+	if all {
+		return runSpecValidateAll(root, strict, jsonOut)
+	}
+
 	specDir, err := spec.ResolveSpecDir(root, featureName)
 	if err != nil {
 		console.Errorf("spec validate: %v\n", err)
 		return 1
 	}
 
-	parsed, err := spec.ParseSpecification(specDir)
-	if err != nil {
-		console.Errorf("spec validate: failed to parse: %v\n", err)
-		return 1
-	}
-
-	result, err := spec.ValidateSpecification(parsed, strict)
+	result, err := spec.ValidateSpecDir(specDir, strict)
 	if err != nil {
 		console.Errorf("spec validate: %v\n", err)
 		return 1
@@ -168,21 +188,51 @@ func runSpecValidate(args []string) int {
 			return 1
 		}
 	} else {
-		if result.Valid {
-			console.Printf("Specification %s conforms to Constitution and schema rules (%d user stories, %d tasks, %d metrics)\n",
-				result.FeatureID, result.StoryCount, result.TaskCount, result.MetricCount)
-		} else {
-			console.Printf("Specification %s failed validation with %d findings:\n", result.FeatureID, len(result.Findings))
-			for _, f := range result.Findings {
-				console.Printf("  [%s] %s: %s (%s)\n", f.Severity, f.Rule, f.Message, f.File)
-			}
-		}
+		printSpecValidation(result)
 	}
 
 	if !result.Valid {
 		return 1
 	}
 	return 0
+}
+
+// runSpecValidateAll validates every specs/NNN-* directory under root. It
+// exits 0 only when at least one spec was checked and all passed; finding
+// nothing to check is a failure, and under --json still prints the envelope.
+func runSpecValidateAll(root string, strict, jsonOut bool) int {
+	suite, err := spec.ValidateAllSpecifications(root, strict)
+	if err != nil {
+		console.Errorf("spec validate --all: %v\n", err)
+	}
+	if jsonOut {
+		if jerr := console.JSON(suite); jerr != nil {
+			console.Errorf("spec validate json: %v\n", jerr)
+			return 1
+		}
+	} else if err == nil {
+		for i := range suite.Specs {
+			printSpecValidation(&suite.Specs[i])
+		}
+		console.Printf("%d of %d specifications valid (%d invalid) under %s\n",
+			suite.ValidCount, suite.Total, suite.InvalidCount, suite.SpecsRoot)
+	}
+	if err != nil || !suite.Valid {
+		return 1
+	}
+	return 0
+}
+
+func printSpecValidation(result *spec.ValidationResult) {
+	if result.Valid {
+		console.Printf("Specification %s conforms to Constitution and schema rules (%d user stories, %d tasks, %d metrics)\n",
+			result.FeatureID, result.StoryCount, result.TaskCount, result.MetricCount)
+		return
+	}
+	console.Printf("Specification %s failed validation with %d findings:\n", result.FeatureID, len(result.Findings))
+	for _, f := range result.Findings {
+		console.Printf("  [%s] %s: %s (%s)\n", f.Severity, f.Rule, f.Message, f.File)
+	}
 }
 
 func runSpecExportTasks(args []string) int {

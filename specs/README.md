@@ -19,8 +19,6 @@
 ## Validation
 
 ```bash
-for id in 001-realtime-sync 002-zero-copy-worktrees 003-stack-boundaries-and-non-overlap 004-modular-engines-and-policy; do
-  devcouncil spec validate "$id" --strict --project-root .
-done
+devcouncil spec validate --all --strict --project-root "$PWD"
 devmap doc-drift --json specs/
 ```

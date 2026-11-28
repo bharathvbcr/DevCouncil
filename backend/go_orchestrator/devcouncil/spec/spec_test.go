@@ -3,6 +3,7 @@ package spec
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -119,6 +120,99 @@ func TestScaffoldFeature(t *testing.T) {
 	}
 	if !res.Valid {
 		t.Errorf("scaffolded feature should pass baseline validation, got: %+v", res.Findings)
+	}
+}
+
+func TestValidateStrictBlocksUneditedScaffoldPlaceholders(t *testing.T) {
+	dir, err := ScaffoldFeature(t.TempDir(), "placeholder-check")
+	if err != nil {
+		t.Fatalf("scaffold failed: %v", err)
+	}
+	parsed, err := ParseSpecification(dir)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	byFile := func(res *ValidationResult) map[string]ValidationFinding {
+		out := map[string]ValidationFinding{}
+		for _, f := range res.Findings {
+			if f.Rule == "scaffold_placeholder" {
+				out[filepath.Base(f.File)] = f
+			}
+		}
+		return out
+	}
+
+	res, err := ValidateSpecification(parsed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Valid {
+		t.Fatalf("strict validation must reject an unedited scaffold, got valid with findings %+v", res.Findings)
+	}
+	strictFindings := byFile(res)
+	for _, file := range []string{"spec.md", "plan.md", "tasks.md"} {
+		f, ok := strictFindings[file]
+		if !ok {
+			t.Fatalf("expected scaffold_placeholder finding for %s, got %+v", file, res.Findings)
+		}
+		if f.Severity != "blocking" || f.Line == 0 {
+			t.Fatalf("%s: want blocking finding with a line number, got %+v", file, f)
+		}
+	}
+
+	// Editing every placeholder away clears the rule.
+	for file, markers := range scaffoldPlaceholders {
+		p := filepath.Join(dir, file)
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+		for _, m := range markers {
+			text = strings.ReplaceAll(text, m, "Edited by the feature author")
+		}
+		if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	edited, err := ParseSpecification(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err = ValidateSpecification(edited, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := byFile(res); len(got) != 0 {
+		t.Fatalf("edited spec still flagged: %+v", got)
+	}
+}
+
+func TestValidateNonStrictReportsScaffoldPlaceholdersAsAdvisory(t *testing.T) {
+	dir, err := ScaffoldFeature(t.TempDir(), "advisory-check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseSpecification(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ValidateSpecification(parsed, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, f := range res.Findings {
+		if f.Rule == "scaffold_placeholder" {
+			n++
+			if f.Severity != "advisory" {
+				t.Fatalf("non-strict scaffold_placeholder must be advisory, got %+v", f)
+			}
+		}
+	}
+	if n == 0 || !res.Valid {
+		t.Fatalf("want advisory scaffold_placeholder findings on a valid result, got valid=%v %+v", res.Valid, res.Findings)
 	}
 }
 

@@ -11,6 +11,27 @@ import (
 
 var reFeatureNum = regexp.MustCompile(`^(\d{3})[-_]`)
 
+// Placeholder text ScaffoldFeature writes for the author to replace. The
+// templates below are built from these constants, and the scaffold_placeholder
+// validation rule matches against them, so the two cannot drift apart.
+const (
+	scaffoldProblemPlaceholder = "Describe the core problem this feature solves, user impact, and failure modes being prevented."
+	scaffoldStoryPlaceholder   = "I want to execute the primary operation"
+	scaffoldPlanPlaceholder    = "Implemented as standalone package"
+	scaffoldTask1Placeholder   = "Initialize data models and interface boundaries"
+	scaffoldTask2Placeholder   = "Scaffold unit and integration test fixtures"
+	scaffoldTask3Placeholder   = "Implement core library logic"
+	scaffoldTask4Placeholder   = "Wire CLI commands and verify tests pass"
+)
+
+// scaffoldPlaceholders maps each scaffolded file the validator checks to the
+// placeholder text that marks it as unedited.
+var scaffoldPlaceholders = map[string][]string{
+	"spec.md":  {scaffoldProblemPlaceholder, scaffoldStoryPlaceholder},
+	"plan.md":  {scaffoldPlanPlaceholder},
+	"tasks.md": {scaffoldTask1Placeholder, scaffoldTask2Placeholder, scaffoldTask3Placeholder, scaffoldTask4Placeholder},
+}
+
 // NextFeatureNumber inspects specs/ to find the next available 3-digit sequential number.
 func NextFeatureNumber(specsRoot string) int {
 	entries, err := os.ReadDir(specsRoot)
@@ -64,13 +85,13 @@ func ScaffoldFeature(projectRoot, featureName string) (string, error) {
 	specContent := fmt.Sprintf(`# Feature: %s
 
 ## 1. Problem Statement & Motivation
-Describe the core problem this feature solves, user impact, and failure modes being prevented.
+%s
 
 ## 2. User Stories & Acceptance Scenarios
 
 ### US1: Primary Capability (Priority: P1 - MVP)
 As a user or agent,
-I want to execute the primary operation,
+%s,
 So that the objective is achieved with deterministic verification.
 
 **Acceptance Scenarios**:
@@ -85,7 +106,7 @@ So that the objective is achieved with deterministic verification.
 
 ## 4. Edge Cases & Exclusions
 - **Exclusion**: Non-conforming payloads are rejected at the boundary.
-`, dirName)
+`, dirName, scaffoldProblemPlaceholder, scaffoldStoryPlaceholder)
 
 	// 2. research.md
 	researchContent := `# Technical Research & Alternatives
@@ -108,14 +129,14 @@ So that the objective is achieved with deterministic verification.
 ## 2. Constitution Check & Complexity Tracking
 | Article | Status | Compliance Details / Justification |
 | :--- | :--- | :--- |
-| **I: Library-First** | PASSED | Implemented as standalone package |
+| **I: Library-First** | PASSED | %s |
 | **II: CLI Consumer** | PASSED | CLI exposed with stdout/stderr separation |
 | **III: Test-First** | PASSED | Tests written before implementation |
 | **VII: Simplicity** | PASSED | 0 new external dependencies |
 
 ## 3. Complexity Tracking
 *None. All proposed changes strictly adhere to Articles I through IX.*
-`, dirName)
+`, dirName, scaffoldPlanPlaceholder)
 
 	// 4. data-model.md
 	dataModelContent := `# Data Model
@@ -137,15 +158,15 @@ paths: {}
 	tasksContent := fmt.Sprintf(`# Tasks: %s
 
 ## Phase 1: Setup & Shared Infrastructure
-- [ ] [T-001] Initialize data models and interface boundaries
-- [ ] [T-002] [P] Scaffold unit and integration test fixtures
+- [ ] [T-001] %s
+- [ ] [T-002] [P] %s
 
 ## Phase 2: Foundational Prerequisites
-- [ ] [T-003] Implement core library logic
+- [ ] [T-003] %s
 
 ## Phase 3: User Story 1 - Primary Capability (P1 MVP)
-- [ ] [T-004] [US1] Wire CLI commands and verify tests pass
-`, dirName)
+- [ ] [T-004] [US1] %s
+`, dirName, scaffoldTask1Placeholder, scaffoldTask2Placeholder, scaffoldTask3Placeholder, scaffoldTask4Placeholder)
 
 	// 7. quickstart.md
 	quickstartContent := fmt.Sprintf(`# Quickstart: %s

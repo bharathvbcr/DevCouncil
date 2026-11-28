@@ -556,9 +556,22 @@ describe("ci:local declared dependencies", () => {
       // `go test ./...` includes ./cmd/devcouncil and ./gussetfn, which link libgusset.a.
       "go host tests": ["gusset engine"],
       "go orchestrator tests": ["gusset engine"],
+      // Built from this checkout's source, so it links libgusset.a too.
+      "spec gate": ["gusset engine"],
     });
     const labels = STEPS.map((s) => s.label);
     assert.equal(new Set(labels).size, labels.length);
+  });
+
+  it("gates every specs/NNN-* spec under --strict with the source-built CLI, never skipping", () => {
+    const step = STEPS.find((s) => s.label === "spec gate");
+    assert.ok(step, "ci:local has no `spec gate` step");
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    assert.equal(step.command, "go");
+    assert.equal(step.cwd, GO_MODULE);
+    assert.deepEqual(step.args, ["run", "./cmd/devcouncil", "spec", "validate", "--all", "--strict", "--project-root", repoRoot]);
+    // A spec gate that could not run must fail, not report N/A.
+    assert.equal(step.requires, undefined);
   });
 
   it("asks for devmap before the selector's end-to-end tests", () => {

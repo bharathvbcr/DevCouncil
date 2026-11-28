@@ -2,7 +2,10 @@ package spec
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -146,6 +149,13 @@ func ValidateSpecification(spec *Specification, strict bool) (*ValidationResult,
 		})
 	}
 
+	// 6. Unedited scaffold text from `spec init`
+	placeholderFindings, err := scaffoldPlaceholderFindings(spec, strict)
+	if err != nil {
+		return nil, err
+	}
+	res.Findings = append(res.Findings, placeholderFindings...)
+
 	// Set overall validity: valid if zero blocking findings
 	for _, f := range res.Findings {
 		if f.Severity == "blocking" {
@@ -154,5 +164,142 @@ func ValidateSpecification(spec *Specification, strict bool) (*ValidationResult,
 		}
 	}
 
+	return res, nil
+}
+
+// scaffoldPlaceholderFindings reports spec.md, plan.md and tasks.md files that
+// still carry the placeholder text ScaffoldFeature writes: one finding per
+// file, at the line of its earliest placeholder. Blocking under strict,
+// advisory otherwise. A file that exists but cannot be read is an error, not
+// a pass.
+func scaffoldPlaceholderFindings(spec *Specification, strict bool) ([]ValidationFinding, error) {
+	severity := "advisory"
+	if strict {
+		severity = "blocking"
+	}
+	var out []ValidationFinding
+	for _, f := range []struct{ name, path string }{
+		{"spec.md", spec.SpecPath},
+		{"plan.md", spec.PlanPath},
+		{"tasks.md", spec.TasksPath},
+	} {
+		if f.path == "" || !fileExists(f.path) {
+			continue
+		}
+		raw, err := os.ReadFile(f.path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f.path, err)
+		}
+		text := string(raw)
+		count, first, firstIdx := 0, "", -1
+		for _, marker := range scaffoldPlaceholders[f.name] {
+			idx := strings.Index(text, marker)
+			if idx < 0 {
+				continue
+			}
+			count++
+			if firstIdx < 0 || idx < firstIdx {
+				first, firstIdx = marker, idx
+			}
+		}
+		if count == 0 {
+			continue
+		}
+		out = append(out, ValidationFinding{
+			Severity: severity,
+			Rule:     "scaffold_placeholder",
+			File:     f.path,
+			Line:     strings.Count(text[:firstIdx], "\n") + 1,
+			Message:  fmt.Sprintf("%s still contains %d unedited `spec init` placeholder(s), first %q; replace them with the feature's real content", f.name, count, first),
+		})
+	}
+	return out, nil
+}
+
+// reSpecDirName matches the directories `spec validate --all` checks:
+// specs/NNN-<name>. Other entries under specs/ (READMEs, a Lean project,
+// NNN_<name>) are not specifications and are left alone.
+var reSpecDirName = regexp.MustCompile(`^\d{3}-`)
+
+// ValidateSpecDir parses and validates the specification in specDir. Both the
+// single-spec and the repository-wide form of `spec validate` go through it.
+func ValidateSpecDir(specDir string, strict bool) (*ValidationResult, error) {
+	parsed, err := ParseSpecification(specDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse: %w", err)
+	}
+	return ValidateSpecification(parsed, strict)
+}
+
+// ListSpecDirs returns <projectRoot>/specs/NNN-* directories in name order.
+// A missing specs/ or one holding no NNN- directory is an error: a gate that
+// found nothing to check must not read as a pass. A symlink whose target
+// cannot be read is kept, so validating it fails rather than skipping it.
+func ListSpecDirs(projectRoot string) ([]string, error) {
+	specsRoot := filepath.Join(projectRoot, "specs")
+	entries, err := os.ReadDir(specsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read specs directory %s: %w", specsRoot, err)
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !reSpecDirName.MatchString(e.Name()) {
+			continue
+		}
+		p := filepath.Join(specsRoot, e.Name())
+		switch {
+		case e.IsDir():
+			dirs = append(dirs, p)
+		case e.Type()&fs.ModeSymlink != 0:
+			if fi, err := os.Stat(p); err != nil || fi.IsDir() {
+				dirs = append(dirs, p)
+			}
+		}
+	}
+	if len(dirs) == 0 {
+		return nil, fmt.Errorf("%s contains no NNN- spec directories (e.g. 001-feature); nothing to validate", specsRoot)
+	}
+	return dirs, nil
+}
+
+// ValidateAllSpecifications validates every specs/NNN-* directory under
+// projectRoot. A specification that cannot be parsed is reported as invalid
+// with a blocking validation_error finding, never skipped. The returned error
+// is non-nil only when there was nothing to validate; the result then carries
+// the same message in Error and Valid is false.
+func ValidateAllSpecifications(projectRoot string, strict bool) (*SuiteValidationResult, error) {
+	res := &SuiteValidationResult{
+		SpecsRoot: filepath.Join(projectRoot, "specs"),
+		Strict:    strict,
+		Specs:     []ValidationResult{},
+	}
+	dirs, err := ListSpecDirs(projectRoot)
+	if err != nil {
+		res.Error = err.Error()
+		return res, err
+	}
+	for _, dir := range dirs {
+		r, err := ValidateSpecDir(dir, strict)
+		if err != nil {
+			r = &ValidationResult{
+				FeatureID: filepath.Base(dir),
+				SpecPath:  filepath.Join(dir, "spec.md"),
+				Findings: []ValidationFinding{{
+					Severity: "blocking",
+					Rule:     "validation_error",
+					File:     dir,
+					Message:  err.Error(),
+				}},
+			}
+		}
+		res.Specs = append(res.Specs, *r)
+		if r.Valid {
+			res.ValidCount++
+		} else {
+			res.InvalidCount++
+		}
+	}
+	res.Total = len(res.Specs)
+	res.Valid = res.Total > 0 && res.InvalidCount == 0
 	return res, nil
 }

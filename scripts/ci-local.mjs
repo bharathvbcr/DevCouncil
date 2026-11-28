@@ -356,6 +356,12 @@ export const STEPS = [
   { label: "gofmt", needs: [], run: gofmtClean },
   { label: "gusset engine", needs: [], run: ensureGussetEngine },
   commandStep("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], { cwd: GO_MODULE, needs: ["gusset engine"] }),
+  // Every specs/NNN-* spec must pass --strict, judged by the CLI built from this
+  // checkout (not whatever devcouncil is on PATH). Zero specs is a failure.
+  commandStep("spec gate", "go", ["run", "./cmd/devcouncil", "spec", "validate", "--all", "--strict", "--project-root", REPO_ROOT], {
+    cwd: GO_MODULE,
+    needs: ["gusset engine"],
+  }),
   // The DevMap test selector's end-to-end tests (selected-tests.yml runs them
   // on every push). They are behind the e2e tag, so `./...` below does not
   // compile them, and this is their only run here; the selector's unit tests

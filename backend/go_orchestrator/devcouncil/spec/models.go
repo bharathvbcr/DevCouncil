@@ -82,3 +82,17 @@ type ValidationResult struct {
 	TaskCount   int                 `json:"task_count"`
 	MetricCount int                 `json:"metric_count"`
 }
+
+// SuiteValidationResult summarizes validating every specs/NNN-* directory in
+// a project. Valid is true only when at least one specification was checked
+// and none failed; Total always equals ValidCount + InvalidCount.
+type SuiteValidationResult struct {
+	Valid        bool               `json:"valid"`
+	SpecsRoot    string             `json:"specs_root"`
+	Strict       bool               `json:"strict"`
+	Total        int                `json:"total"`
+	ValidCount   int                `json:"valid_count"`
+	InvalidCount int                `json:"invalid_count"`
+	Error        string             `json:"error,omitempty"`
+	Specs        []ValidationResult `json:"specs"`
+}
