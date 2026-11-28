@@ -1759,9 +1759,12 @@ impl Store {
         // The extraction gaps carry forward exactly as the file rows above do,
         // and for the same reason: a differential write is handed only the
         // extractions it re-read, so deriving the whole inventory from them
-        // would drop every gap in a file this batch did not touch. Skipping
-        // `affected` and `deleted` is what lets a file that used to fail to
-        // parse leave the list on the build that parses it.
+        // would drop every gap in a file this batch did not touch. Gating on
+        // `carry` (not just `deleted || affected`) ensures that any file whose
+        // content hash or extractor identity moved — even when omitted from
+        // `affected_paths`, such as a full-slice write with `deleted_paths`
+        // non-empty — drops its stale gap from `prev_gen` and relies on its
+        // fresh extraction below.
         if let Some(prev) = prev_gen {
             if !full_rewrite {
                 let mut stmt = tx.prepare(
@@ -1786,7 +1789,7 @@ impl Store {
                 )?;
                 for row in rows {
                     let (gap, path, reason) = row?;
-                    if deleted.contains(&path) || affected.contains(&path) {
+                    if !carry.contains(&path) {
                         continue;
                     }
                     gap_rows.push((gap, path, reason));
